@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
+  <title>Crate</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- CRATE Header Bar -->
+    <div class="app-header">
+      <span class="app-logo">CRATE</span>
+      <span class="app-badge" id="header-badge">Free Plan</span>
+    </div>
+
+    <!-- Tab Bar -->
+    <div class="app-tabs">
+      <button class="app-tab active" data-tab="projects">Projects</button>
+      <button class="app-tab" data-tab="files">Files</button>
+      <button class="app-tab" data-tab="settings">Settings</button>
+    </div>
+
+    <!-- Scrollable Content Area -->
+    <div class="app-content">
+      <!-- Projects Tab -->
+      <div class="tab-content active" id="tab-projects">
+        <!-- Empty State -->
+        <div id="projects-empty" class="app-empty">
+          <div class="app-empty-icon">&#x1F4C2;</div>
+          <div class="app-empty-title">No active projects</div>
+          <div class="app-empty-desc">Start a project and Crate will automatically track every file you open.</div>
+          <button class="app-btn" id="btn-start-project">+ Start Project</button>
+        </div>
+
+        <!-- Projects List -->
+        <div id="projects-list" class="hidden">
+          <div id="project-rows"></div>
+          <button class="app-btn outline" id="btn-add-project">+ Add Project</button>
+        </div>
+
+        <!-- New Project Form -->
+        <div id="new-project-form" class="hidden">
+          <div class="app-label">New Project</div>
+          <div class="form-subtitle">Name your project &mdash; Crate will start watching every file you open.</div>
+          <div class="form-field">
+            <div class="app-label">Project Name</div>
+            <div class="form-input-wrap">
+              <input type="text" id="input-project-name" class="form-input" placeholder="e.g. Nike &mdash; Brand Refresh">
+            </div>
+          </div>
+          <div class="form-field">
+            <div class="app-label">Project Type</div>
+            <div class="project-type-selector" id="project-type-selector">
+              <button class="type-pill active" data-type="branding">Branding</button>
+              <button class="type-pill" data-type="print">Print</button>
+              <button class="type-pill" data-type="presentation">Presentation</button>
+              <button class="type-pill" data-type="web">Web</button>
+            </div>
+          </div>
+          <div class="form-field">
+            <div class="app-label">Naming Template</div>
+            <div class="naming-template-box" id="naming-template-display">{Project}_{Date}</div>
+            <div class="naming-preview-hint">&rarr; <span id="naming-preview-text">Project_2026-02-20</span></div>
+          </div>
+          <button class="app-btn" id="btn-create-project">&#9654; Start Watching</button>
+          <button class="app-btn outline" id="btn-cancel-project" style="margin-top:8px;">Cancel</button>
+          <div class="privacy-hint">
+            &#x1F512; Crate only tracks files opened by design apps. It cannot see your browser, keyboard, or anything outside your project.
+          </div>
+        </div>
+      </div>
+
+      <!-- Files Tab -->
+      <div class="tab-content" id="tab-files">
+        <div id="files-no-project" class="app-empty">
+          <div class="app-empty-icon">&#x1F4C2;</div>
+          <div class="app-empty-title">No project selected</div>
+          <div class="app-empty-desc">Select a project from the Projects tab to view its files.</div>
+        </div>
+
+        <div id="files-view" class="hidden">
+          <div class="app-label">Current Project</div>
+          <div class="app-project-name" id="files-project-name"></div>
+          <div class="app-status" id="files-status-bar">
+            <div class="app-dot" id="files-status-dot"></div>
+            <span class="app-status-text" id="files-status-text">Watching &middot; 0 files tracked</span>
+          </div>
+          <div class="privacy-hint subtle">
+            Crate only sees files opened by design apps during this session.
+          </div>
+
+          <!-- Tier 2: files awaiting user review -->
+          <div id="pending-section" class="hidden">
+            <div class="pending-header">Review</div>
+            <div id="pending-file-list"></div>
+          </div>
+
+          <div class="app-files" id="file-list-container">
+            <div id="file-list"></div>
+          </div>
+          <button class="app-btn" id="btn-package">&#x1F4E6; Package Project</button>
+          <button class="app-btn outline" id="btn-add-files" style="margin-top:8px;">+ Add files</button>
+        </div>
+      </div>
+
+      <!-- Settings Tab -->
+      <div class="tab-content" id="tab-settings">
+        <div class="settings-section">
+          <div class="settings-section-title">Naming Template</div>
+          <div class="settings-row">
+            <div class="settings-label">Template</div>
+          </div>
+          <input class="settings-input" id="input-naming-template" value="{Project}_{Date}">
+          <div class="settings-preview-text">Preview: <span id="settings-naming-preview">Nike_BrandRefresh_2026-02-20</span></div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Preferences</div>
+          <div class="settings-row">
+            <div class="settings-label-wrap">
+              <div class="settings-label">Notifications</div>
+              <div class="settings-desc">Get alerts when a package is complete or Crate notices you've stopped working.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="toggle-notifications">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Account</div>
+          <div class="settings-plan">
+            <span class="settings-plan-name" id="plan-info">Free Plan &middot; 0/10 packages</span>
+            <span class="settings-plan-badge">Upgrade</span>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Data</div>
+          <button class="btn-danger-outline" id="btn-clear-all">Clear All Projects</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer Usage Strip -->
+    <div class="app-footer">
+      <span class="app-usage" id="footer-usage">0 of 10 packages used this month</span>
+      <a class="app-upgrade" href="#">Go Pro &rarr;</a>
+    </div>
+
+    <!-- Package Confirmation Modal -->
+    <div class="modal-overlay hidden" id="modal-package">
+      <div class="modal">
+        <div class="modal-header-area">
+          <div class="modal-title">Package Project</div>
+          <div class="modal-subtitle">Review and confirm your package settings.</div>
+        </div>
+        <div class="modal-body">
+          <div class="modal-info-row">
+            <div class="modal-row-label">Project</div>
+            <div class="modal-row-value" id="modal-project-name"></div>
+          </div>
+          <div class="modal-file-list" id="modal-file-list"></div>
+          <div class="modal-naming-box">
+            <div class="modal-naming-label">Output Folder Name</div>
+            <div class="modal-naming-preview" id="modal-folder-name"></div>
+          </div>
+          <div class="modal-folder-row">
+            <span class="modal-folder-path" id="modal-dest-path">~/Desktop/</span>
+            <span class="modal-folder-change" id="btn-change-dest">Change &rarr;</span>
+          </div>
+          <div class="modal-actions">
+            <button class="modal-btn-secondary" id="btn-cancel-package">Cancel</button>
+            <button class="modal-btn-primary" id="btn-confirm-package">&#x1F4E6; Package Now</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Success Modal -->
+    <div class="modal-overlay hidden" id="modal-success">
+      <div class="modal modal-centered">
+        <div class="success-icon-wrap">&#x2705;</div>
+        <div class="success-title">Project Packaged!</div>
+        <div class="success-desc" id="success-message">14 files gathered. Your project is ready.</div>
+        <div class="success-path" id="success-path"></div>
+        <div class="modal-actions">
+          <button class="modal-btn-secondary" id="btn-success-done">Done</button>
+          <button class="modal-btn-primary" id="btn-open-folder">Open Folder &rarr;</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Upgrade Modal -->
+    <div class="modal-overlay hidden" id="modal-upgrade">
+      <div class="modal">
+        <div class="modal-header-area">
+          <div class="modal-title">You've used all 10 packages</div>
+          <div class="modal-subtitle">Upgrade to Crate Pro for unlimited packaging.</div>
+        </div>
+        <div class="modal-body">
+          <ul class="feature-list">
+            <li>Unlimited packages per month</li>
+            <li>AI-powered naming suggestions</li>
+            <li>Custom naming templates</li>
+            <li>Priority support</li>
+          </ul>
+          <button class="app-btn" disabled>Upgrade to Pro &rarr;</button>
+          <div class="dismiss-link" id="btn-dismiss-upgrade">Maybe later &middot; resets in <span id="upgrade-days-left">30</span> days</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Packaging Progress -->
+    <div class="modal-overlay hidden" id="modal-progress">
+      <div class="modal modal-centered">
+        <div class="spinner"></div>
+        <p class="progress-text">Packaging project...</p>
+      </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div class="modal-overlay hidden" id="modal-delete-confirm">
+      <div class="modal modal-centered">
+        <div class="confirm-title" id="delete-confirm-title">Remove project?</div>
+        <div class="confirm-desc" id="delete-confirm-desc">The files on your computer are not affected.</div>
+        <div class="modal-actions">
+          <button class="modal-btn-secondary" id="btn-delete-cancel">Cancel</button>
+          <button class="modal-btn-danger" id="btn-delete-confirm">Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clear All Confirmation Modal -->
+    <div class="modal-overlay hidden" id="modal-clear-all">
+      <div class="modal modal-centered">
+        <div class="confirm-title">Remove all projects from Crate?</div>
+        <div class="confirm-desc">This does not delete any files from your computer. Your work stays safe.</div>
+        <div class="modal-actions">
+          <button class="modal-btn-secondary" id="btn-clear-all-cancel">Cancel</button>
+          <button class="modal-btn-danger" id="btn-clear-all-confirm">Remove All</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
