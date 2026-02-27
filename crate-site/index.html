@@ -537,6 +537,152 @@
       font-weight: 400;
     }
 
+    /* ═══════════════════════════════════════════
+       MOBILE — Jenna's design (≤768px only)
+       Desktop layout is completely untouched.
+    ═══════════════════════════════════════════ */
+    @media (max-width: 768px) {
+
+      /* ── NAV ── */
+      nav {
+        padding: 0 20px;
+        height: 52px;
+      }
+      /* Hide Features / Pricing / Log in — keep only logo + download CTA */
+      .nav-links li:not(:last-child) { display: none; }
+      .nav-links { gap: 0; }
+      .nav-cta {
+        font-size: 12px !important;
+        padding: 7px 14px;
+      }
+
+      /* ── HERO ── */
+      .hero {
+        padding: 56px 24px 36px;
+      }
+      .hero-eyebrow { margin-bottom: 16px; }
+      .hero h1 {
+        font-size: 34px;
+        line-height: 1.15;
+        max-width: 100%;
+        margin-bottom: 16px;
+      }
+      .hero p {
+        font-size: 15px;
+        max-width: 100%;
+        margin-bottom: 28px;
+      }
+      .hero-actions {
+        flex-direction: column;
+        gap: 12px;
+        align-items: stretch;
+      }
+      .btn-primary, .btn-secondary {
+        width: 100%;
+        justify-content: center;
+        text-align: center;
+        padding: 14px 20px;
+        font-size: 15px;
+      }
+      .hero-note { margin-top: 8px; }
+
+      /* ── APP MOCKUP ── */
+      .mockup-wrap {
+        padding: 10px 20px 56px;
+      }
+      .plugin-mock {
+        width: 100%;
+        max-width: 100%;
+      }
+
+      /* ── FEATURES ── */
+      .features-section {
+        padding: 56px 20px;
+      }
+      .features-inner {
+        background: rgba(255,255,255,0.82);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-radius: 20px;
+        padding: 32px 24px 36px;
+        border: 1px solid rgba(255,255,255,0.65);
+        box-shadow: 0 20px 60px rgba(0,0,0,0.1), 0 6px 20px rgba(0,0,0,0.06);
+      }
+      .section-title {
+        font-size: 28px;
+        max-width: 100%;
+        margin-bottom: 32px;
+      }
+      .features-grid {
+        grid-template-columns: 1fr;
+        gap: 28px;
+      }
+      .features-grid > div {
+        display: block;
+      }
+      .feature-icon { font-size: 22px; margin-bottom: 10px; }
+      .feature-title { font-size: 16px; }
+
+      /* ── HOW IT WORKS ── */
+      .how {
+        padding: 56px 20px;
+      }
+      .how-inner .section-title {
+        font-size: 28px;
+        max-width: 100%;
+      }
+      .steps {
+        grid-template-columns: 1fr;
+        gap: 14px;
+        margin-top: 32px;
+      }
+      .step {
+        padding: 26px 24px;
+        border-radius: 16px;
+      }
+      .step-num {
+        font-size: 40px;
+        margin-bottom: 12px;
+      }
+      .step h3 { font-size: 16px; }
+
+      /* ── PRICING ── */
+      .pricing {
+        padding: 56px 20px 72px;
+      }
+      .pricing-inner .section-title {
+        font-size: 28px;
+      }
+      .pricing-cards {
+        grid-template-columns: 1fr;
+        gap: 16px;
+        margin-top: 32px;
+      }
+      .pricing-card {
+        padding: 28px 24px;
+        border-radius: 16px;
+      }
+      .pricing-price { font-size: 44px; }
+
+      /* ── FOOTER ── */
+      footer {
+        padding: 40px 20px 32px;
+      }
+      .footer-inner {
+        flex-direction: column;
+        align-items: center;
+        gap: 20px;
+        text-align: center;
+      }
+      .footer-links {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 14px 20px;
+      }
+      .footer-copy { margin-top: 20px; }
+
+    } /* end @media mobile */
+
     /* ─── PRICING ─── */
     .pricing {
       padding: 80px 48px 100px;
@@ -714,7 +860,7 @@
       <li><a href="#">Features</a></li>
       <li><a href="#">Pricing</a></li>
       <li><a href="#">Log in</a></li>
-      <li><a href="Crate-mac.zip" download class="nav-cta">Download for Mac →</a></li>
+      <li><a href="https://github.com/bfeintuch123/crate-app/releases/download/v1.3.40/Crate v1.3.40-signed.zip" download class="nav-cta">Download for Mac →</a></li>
     </ul>
   </nav>
 
@@ -724,7 +870,7 @@
     <h1>Your projects,<br/><em>perfectly packaged.</em></h1>
     <p>The project packaging tool every designer deserves — every app, every file type, one click. Everything in one place.</p>
     <div class="hero-actions">
-      <a href="Crate-mac.zip" download class="btn-primary">⬇ Download for Mac</a>
+      <a href="https://github.com/bfeintuch123/crate-app/releases/download/v1.3.40/Crate v1.3.40-signed.zip" download class="btn-primary">⬇ Download for Mac</a>
       <a href="#" class="btn-secondary">See how it works →</a>
     </div>
     <p class="hero-note">Free · 10 packages/month · No credit card required</p>
@@ -848,7 +994,7 @@
             <li>✓ Basic naming templates</li>
             <li>✓ All file types supported</li>
           </ul>
-          <a href="Crate-mac.zip" download class="pricing-btn">Download for Mac</a>
+          <a href="https://github.com/bfeintuch123/crate-app/releases/download/v1.3.40/Crate v1.3.40-signed.zip" download class="pricing-btn">Download for Mac</a>
         </div>
         <div class="pricing-card featured">
           <div class="pricing-plan">Pro ⭐</div>
