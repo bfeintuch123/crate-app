@@ -4,3 +4,5 @@ dist/
 *.zip
 *.blockmap
 .DS_Store
+installer/
+.env

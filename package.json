@@ -1,7 +1,7 @@
 {
   "name": "crate-app",
-  "version": "1.3.34",
-  "productName": "Crate v1.3.34",
+  "version": "1.3.40",
+  "productName": "Crate v1.3.40",
   "description": "Universal project file packager for graphic designers — macOS menu bar app",
   "main": "main.js",
   "scripts": {
@@ -20,7 +20,19 @@
     "appId": "com.crate.app",
     "mac": {
       "icon": "assets/icon.icns",
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "identity": "Bryant Feintuch (YY7WDMUFWJ)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.plist",
+      "entitlementsInherit": "entitlements.plist"
+    },
+    "dmg": {
+      "title": "Crate",
+      "contents": [
+        { "x": 130, "y": 220, "type": "file" },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
     }
   }
 }

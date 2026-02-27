@@ -202,9 +202,8 @@ async function createProject() {
   }
 
   const result = await window.crate.createProject(name, state.projectType);
-  if (result && result.error === 'max_projects_reached') {
-    return;
-  }
+  // FIX 6 (M3): Guard against null/error IPC response
+  if (!result || result.error) return;
 
   state.projects = await window.crate.getProjects();
   state.selectedProjectId = result.id;
@@ -486,10 +485,10 @@ async function confirmPackage() {
   $('#modal-progress').classList.remove('hidden');
 
   // Run pre-scan now (user already confirmed, progress spinner is showing)
-  // Hard 5s timeout so it never hangs
+  // FIX 2 (C2): Increased timeout from 5s to 12s to accommodate scan + package coordination
   const scanResult = await Promise.race([
     window.crate.preScanSession(project.id),
-    new Promise(resolve => setTimeout(() => resolve(null), 5000))
+    new Promise(resolve => setTimeout(() => resolve(null), 12000))
   ]);
   if (scanResult) {
     state.projects = await window.crate.getProjects();
@@ -521,7 +520,8 @@ async function confirmPackage() {
   }
 
   // Show success
-  $('#success-message').textContent = `${result.copiedCount} file${result.copiedCount !== 1 ? 's' : ''} gathered and renamed. Your project is ready to archive or hand off.`;
+  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
   $('#success-path').textContent = result.folderPath;
   state.lastPackagedPath = result.folderPath;
   $('#modal-success').classList.remove('hidden');
@@ -730,16 +730,51 @@ function setupMainProcessListeners() {
   });
 
   // Handle "Package Now" from inactivity dialog
+  // FIX 5 (H4): Run pre-scan before packaging, handle errors, show progress/success modals
   window.crate.onPackageTrigger(async (data) => {
     const project = state.projects.find(p => p.id === data.projectId);
     if (project) {
       state.selectedProjectId = data.projectId;
       const outputPath = await window.crate.selectOutputFolder();
       if (outputPath) {
-        await window.crate.packageProject(data.projectId, outputPath);
+        $('#modal-progress').classList.remove('hidden');
+
+        // Run pre-scan with 12s timeout (same as confirmPackage)
+        const scanResult = await Promise.race([
+          window.crate.preScanSession(data.projectId),
+          new Promise(resolve => setTimeout(() => resolve(null), 12000))
+        ]);
+        if (scanResult) {
+          state.projects = await window.crate.getProjects();
+        }
+
+        const result = await window.crate.packageProject(data.projectId, outputPath);
+
+        $('#modal-progress').classList.add('hidden');
+
+        if (result.error === 'limit_reached') {
+          $('#upgrade-days-left').textContent = result.daysLeft;
+          $('#modal-upgrade').classList.remove('hidden');
+          return;
+        }
+
+        if (result.error) {
+          alert('Error packaging: ' + result.error);
+          return;
+        }
+
+        // Show success
+        const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
+        $('#success-path').textContent = result.folderPath;
+        state.lastPackagedPath = result.folderPath;
+        $('#modal-success').classList.remove('hidden');
+
         state.projects = await window.crate.getProjects();
+        state.usage = await window.crate.getUsage();
         renderProjects();
         renderFiles();
+        renderFooter();
       }
     }
   });
