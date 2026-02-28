@@ -710,8 +710,8 @@ function stopFigmaPolling(projectId) {
 }
 
 // --- Pre-Session Scanner ---
-// Scans ~/Downloads, ~/Desktop, ~/Documents (depth 2) for design-related files
-// modified in the past 7 days. Runs once at watch session start.
+// Scans ~/Downloads, ~/Desktop, ~/Documents (depth 2) for ALL design-related files.
+// Runs once at watch session start to catch pre-existing files.
 
 const PRE_SESSION_SCAN_EXTENSIONS = new Set([
   '.psd', '.ai', '.indd', '.sketch', '.fig', '.xd', '.pdf', '.eps', '.svg',
@@ -726,7 +726,6 @@ function runPreSessionScan(projectId) {
     path.join(homedir, 'Desktop'),
     path.join(homedir, 'Documents')
   ];
-  const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
   const discovered = [];
 
   const scanDir = (dir, depth) => {
@@ -746,20 +745,13 @@ function runPreSessionScan(projectId) {
         if (!PRE_SESSION_SCAN_EXTENSIONS.has(ext)) continue;
         if (entry.name.startsWith('~$')) continue;
 
-        try {
-          const stat = fs.statSync(fullPath);
-          if (stat.mtimeMs >= sevenDaysAgo) {
-            discovered.push({
-              path: fullPath,
-              name: entry.name,
-              ext,
-              addedAt: Date.now(),
-              source: 'pre-session-scan'
-            });
-          }
-        } catch (e) {
-          // can't stat — skip
-        }
+        discovered.push({
+          path: fullPath,
+          name: entry.name,
+          ext,
+          addedAt: Date.now(),
+          source: 'pre-session-scan'
+        });
       }
     }
   };
@@ -928,7 +920,7 @@ async function startWatching(projectId) {
     console.error('[crate] initial lsof snapshot error:', e.message);
   }
 
-  // Pre-session scan: find design files modified in the past 7 days
+  // Pre-session scan: find ALL design files in watched dirs (no date limit)
   runPreSessionScan(projectId);
 
   // Stop existing watcher if any
@@ -1208,62 +1200,6 @@ ipcMain.handle('projects:reject-pending', (event, projectId, filePath) => {
   }
 
   return result.pendingFiles;
-});
-
-ipcMain.handle('projects:add-files', async (event, projectId) => {
-  const dialogResult = await dialog.showOpenDialog({
-    properties: ['openFile', 'multiSelections'],
-    title: 'Add Files to Project'
-  });
-  // Re-show tray window after native dialog closes (window hides on blur)
-  showTrayWindow();
-
-  if (dialogResult.canceled) return null;
-
-  const filePaths = dialogResult.filePaths;
-  const result = mutateProject(projectId, (project) => {
-    for (const filePath of filePaths) {
-      if (!project.files.some(f => f.path === filePath)) {
-        project.files.push({
-          path: filePath,
-          name: path.basename(filePath),
-          ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now(),
-          source: 'manual'
-        });
-      }
-    }
-    project.files = deduplicateFiles(project.files);
-    return project.files;
-  });
-
-  return result;
-});
-
-ipcMain.handle('projects:add-files-by-paths', async (event, projectId, filePaths) => {
-  if (!Array.isArray(filePaths) || filePaths.length === 0) return null;
-
-  const result = mutateProject(projectId, (project) => {
-    for (const filePath of filePaths) {
-      if (!project.files.some(f => f.path === filePath)) {
-        project.files.push({
-          path: filePath,
-          name: path.basename(filePath),
-          ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now(),
-          source: 'manual'
-        });
-      }
-    }
-    project.files = deduplicateFiles(project.files);
-    return project.files;
-  });
-
-  if (result && trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send('files:updated', { projectId, files: result });
-  }
-
-  return result;
 });
 
 // --- Session file scan (Spotlight-based, runs at package time) ---

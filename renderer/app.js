@@ -331,18 +331,8 @@ function renderFileList(files) {
     meta.className = 'app-file-meta';
     meta.innerHTML = `
       <span class="app-file-count">+ ${remainingCount} more file${remainingCount !== 1 ? 's' : ''}</span>
-      <span class="app-file-add" id="files-add-more">+ Add files</span>
     `;
     container.appendChild(meta);
-
-    meta.querySelector('#files-add-more').addEventListener('click', async () => {
-      if (!state.selectedProjectId) return;
-      const files = await window.crate.addFiles(state.selectedProjectId);
-      if (files) {
-        state.projects = await window.crate.getProjects();
-        renderFiles();
-      }
-    });
   }
 }
 
@@ -627,22 +617,13 @@ function setupEventListeners() {
   });
 
   // Files tab
-  $('#btn-add-files').addEventListener('click', async () => {
-    if (!state.selectedProjectId) return;
-    const files = await window.crate.addFiles(state.selectedProjectId);
-    if (files) {
-      state.projects = await window.crate.getProjects();
-      renderFiles();
-    }
-  });
-
   $('#btn-package').addEventListener('click', async () => {
     const projectId = state.selectedProjectId;
     if (!projectId) return;
 
     const project = state.projects.find(p => p.id === projectId);
     if (!project || project.files.length === 0) {
-      showToast('No files captured yet. Keep watching or tap + Files to add manually.');
+      showToast('No files captured yet. Keep watching — files will appear automatically.');
       return;
     }
     showPackageModal();
@@ -715,39 +696,6 @@ function setupEventListeners() {
   });
 
   $('#btn-delete-confirm').addEventListener('click', confirmDeleteProject);
-
-  // File list drop zone — drag-and-drop files onto the file list
-  const fileListContainer = $('#file-list-container');
-  if (fileListContainer) {
-    fileListContainer.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      fileListContainer.classList.add('drag-over');
-    });
-
-    fileListContainer.addEventListener('dragleave', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      fileListContainer.classList.remove('drag-over');
-    });
-
-    fileListContainer.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      fileListContainer.classList.remove('drag-over');
-
-      if (!state.selectedProjectId) return;
-      const files = e.dataTransfer.files;
-      if (files.length === 0) return;
-
-      const filePaths = Array.from(files).map(f => f.path);
-      const result = await window.crate.addFilesByPaths(state.selectedProjectId, filePaths);
-      if (result) {
-        state.projects = await window.crate.getProjects();
-        renderFiles();
-      }
-    });
-  }
 
   // V2 Quick Package - Drop zone
   const dropZone = $('#v2-drop-zone');
