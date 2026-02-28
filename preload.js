@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('crate', {
   getFiles: (id) => ipcRenderer.invoke('projects:get-files', id),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
   addFiles: (projectId) => ipcRenderer.invoke('projects:add-files', projectId),
+  addFilesByPaths: (projectId, filePaths) => ipcRenderer.invoke('projects:add-files-by-paths', projectId, filePaths),
   packageProject: (id, outputPath) => ipcRenderer.invoke('projects:package', id, outputPath),
   selectOutputFolder: () => ipcRenderer.invoke('projects:select-output'),
   deleteProject: (id) => ipcRenderer.invoke('projects:delete', id),

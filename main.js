@@ -709,6 +709,89 @@ function stopFigmaPolling(projectId) {
   figmaScanTimestamps.delete(projectId);
 }
 
+// --- Pre-Session Scanner ---
+// Scans ~/Downloads, ~/Desktop, ~/Documents (depth 2) for design-related files
+// modified in the past 7 days. Runs once at watch session start.
+
+const PRE_SESSION_SCAN_EXTENSIONS = new Set([
+  '.psd', '.ai', '.indd', '.sketch', '.fig', '.xd', '.pdf', '.eps', '.svg',
+  '.png', '.jpg', '.jpeg', '.gif', '.tiff', '.tif', '.webp', '.bmp',
+  '.pptx', '.key', '.afdesign', '.afphoto', '.afpub'
+]);
+
+function runPreSessionScan(projectId) {
+  const homedir = os.homedir();
+  const scanRoots = [
+    path.join(homedir, 'Downloads'),
+    path.join(homedir, 'Desktop'),
+    path.join(homedir, 'Documents')
+  ];
+  const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+  const discovered = [];
+
+  const scanDir = (dir, depth) => {
+    if (depth > 2) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { return; }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        scanDir(fullPath, depth + 1);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!PRE_SESSION_SCAN_EXTENSIONS.has(ext)) continue;
+        if (entry.name.startsWith('~$')) continue;
+
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.mtimeMs >= sevenDaysAgo) {
+            discovered.push({
+              path: fullPath,
+              name: entry.name,
+              ext,
+              addedAt: Date.now(),
+              source: 'pre-session-scan'
+            });
+          }
+        } catch (e) {
+          // can't stat — skip
+        }
+      }
+    }
+  };
+
+  for (const root of scanRoots) {
+    scanDir(root, 0);
+  }
+
+  if (discovered.length === 0) return;
+
+  const result = mutateProject(projectId, (project) => {
+    const existingPaths = new Set(project.files.map(f => f.path));
+    let added = false;
+
+    for (const file of discovered) {
+      if (existingPaths.has(file.path)) continue;
+      project.files.push(file);
+      existingPaths.add(file.path);
+      added = true;
+    }
+
+    if (added) {
+      project.files = deduplicateFiles(project.files);
+    }
+    return added ? { files: project.files } : null;
+  });
+
+  if (result && result.files && trayWindow && !trayWindow.isDestroyed()) {
+    trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+  }
+}
+
 // --- File Watching ---
 
 async function startWatching(projectId) {
@@ -844,6 +927,9 @@ async function startWatching(projectId) {
   } catch (e) {
     console.error('[crate] initial lsof snapshot error:', e.message);
   }
+
+  // Pre-session scan: find design files modified in the past 7 days
+  runPreSessionScan(projectId);
 
   // Stop existing watcher if any
   stopWatching(projectId);
@@ -1142,12 +1228,40 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
           path: filePath,
           name: path.basename(filePath),
           ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now()
+          addedAt: Date.now(),
+          source: 'manual'
         });
       }
     }
+    project.files = deduplicateFiles(project.files);
     return project.files;
   });
+
+  return result;
+});
+
+ipcMain.handle('projects:add-files-by-paths', async (event, projectId, filePaths) => {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) return null;
+
+  const result = mutateProject(projectId, (project) => {
+    for (const filePath of filePaths) {
+      if (!project.files.some(f => f.path === filePath)) {
+        project.files.push({
+          path: filePath,
+          name: path.basename(filePath),
+          ext: path.extname(filePath).toLowerCase(),
+          addedAt: Date.now(),
+          source: 'manual'
+        });
+      }
+    }
+    project.files = deduplicateFiles(project.files);
+    return project.files;
+  });
+
+  if (result && trayWindow && !trayWindow.isDestroyed()) {
+    trayWindow.webContents.send('files:updated', { projectId, files: result });
+  }
 
   return result;
 });

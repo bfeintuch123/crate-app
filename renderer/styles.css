@@ -533,6 +533,13 @@ body {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
+  border: 2px solid transparent;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.app-files.drag-over {
+  border-color: var(--black);
+  background: rgba(0, 0, 0, 0.03);
 }
 
 .app-file {
