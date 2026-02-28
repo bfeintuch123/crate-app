@@ -185,6 +185,7 @@ const lsofInProgress = new Set(); // projectIds currently mid-poll (prevent over
 
 // --- Figma Auto-Tracking ---
 const figmaPollers = new Map();    // projectId -> setInterval id
+const figmaPollerStarting = new Set(); // guard: projectIds with initial poll in progress
 const figmaInProgress = new Set(); // projectIds currently mid-poll
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
@@ -526,6 +527,11 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   figmaInProgress.add(projectId);
 
   try {
+    // Read Figma configuration from settings
+    const settings = store.get('settings') || {};
+    const teamIds = settings.figmaTeamIds || [];
+    const fileKeys = settings.figmaTrackedFiles || [];
+
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
     const sinceMs = isInitialScan
@@ -538,18 +544,26 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     const scanResult = await parser.autoTrackScan({
       sinceMs,
       maxAgeDays: isInitialScan ? 30 : 7,
-      maxFiles: isInitialScan ? 20 : 10
+      maxFiles: isInitialScan ? 20 : 10,
+      teamIds,
+      fileKeys
     });
 
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', scanResult.errors);
       // Detect token expiry / auth failures — stop polling instead of retrying every 60s
-      const authError = scanResult.errors.find(e =>
-        typeof e === 'string' && (e.includes('401') || e.includes('403') || e.toLowerCase().includes('unauthorized') || e.toLowerCase().includes('forbidden'))
-      );
+      const authError = scanResult.errors.find(e => {
+        const msg = typeof e === 'string' ? e : (e && e.message) || '';
+        const type = (e && e.type) || '';
+        return type === 'auth' || msg.includes('401') || msg.includes('403') ||
+               msg.toLowerCase().includes('unauthorized') || msg.toLowerCase().includes('forbidden') ||
+               msg.toLowerCase().includes('token invalid');
+      });
       if (authError) {
         console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
         stopFigmaPolling(projectId);
+        // Notify renderer about auth failure
+        sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
         return;
       }
     }
@@ -614,9 +628,11 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', e.message);
     // Detect token expiry / auth failures at the network level
-    if (e.message && (e.message.includes('401') || e.message.includes('403') || e.message.toLowerCase().includes('unauthorized'))) {
+    const msg = (e.message || '').toLowerCase();
+    if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized') || msg.includes('token invalid') || msg.includes('invalid figma')) {
       console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
       stopFigmaPolling(projectId);
+      sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
     }
   } finally {
     figmaInProgress.delete(projectId);
@@ -627,8 +643,19 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
  * Start Figma polling for a project.
  */
 async function startFigmaPolling(projectId) {
-  // Run initial scan immediately
-  await pollFigmaForProject(projectId, true);
+  // Guard: prevent duplicate pollers if called while initial poll is in progress
+  if (figmaPollers.has(projectId) || figmaPollerStarting.has(projectId)) return;
+  figmaPollerStarting.add(projectId);
+
+  try {
+    // Run initial scan immediately
+    await pollFigmaForProject(projectId, true);
+  } finally {
+    figmaPollerStarting.delete(projectId);
+  }
+
+  // Guard again after async: another caller may have set up a poller while we awaited
+  if (figmaPollers.has(projectId)) return;
 
   // Start 60-second polling interval
   const intervalId = setInterval(() => {
@@ -647,6 +674,7 @@ function stopFigmaPolling(projectId) {
     clearInterval(intervalId);
     figmaPollers.delete(projectId);
   }
+  figmaPollerStarting.delete(projectId);
   figmaInProgress.delete(projectId);
   figmaScanTimestamps.delete(projectId);
 }
@@ -1847,6 +1875,7 @@ ipcMain.handle('projects:delete-all', () => {
     clearInterval(intervalId);
   }
   figmaPollers.clear();
+  figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaScanTimestamps.clear();
   lastFileActivity.clear();
@@ -1862,7 +1891,7 @@ ipcMain.handle('settings:get', () => {
 
 ipcMain.handle('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "figmaTeamIds", "figmaTrackedFiles"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   store.set(`settings.${key}`, value);
   return store.get('settings');
@@ -2009,6 +2038,7 @@ ipcMain.handle('figma:disconnect', async () => {
     clearInterval(intervalId);
   }
   figmaPollers.clear();
+  figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaScanTimestamps.clear();
 
@@ -2055,6 +2085,64 @@ ipcMain.handle('figma:project-assets', async (event, projectId) => {
       figmaFileKey: f.figmaFileKey
     }))
   };
+});
+
+// Add a Figma file URL for direct tracking (works on ALL Figma plans)
+ipcMain.handle('figma:add-tracked-file', async (event, figmaUrl) => {
+  const { FigmaParser } = require('./parsers/figma');
+  const fileKey = FigmaParser.extractFileKey(figmaUrl);
+  if (!fileKey) {
+    return { success: false, error: 'Invalid Figma URL' };
+  }
+
+  const settings = store.get('settings') || {};
+  const tracked = settings.figmaTrackedFiles || [];
+  if (tracked.includes(fileKey)) {
+    return { success: true, fileKey, alreadyTracked: true };
+  }
+
+  tracked.push(fileKey);
+  store.set('settings.figmaTrackedFiles', tracked);
+  return { success: true, fileKey };
+});
+
+// Remove a tracked Figma file
+ipcMain.handle('figma:remove-tracked-file', async (event, fileKey) => {
+  const settings = store.get('settings') || {};
+  const tracked = (settings.figmaTrackedFiles || []).filter(k => k !== fileKey);
+  store.set('settings.figmaTrackedFiles', tracked);
+  return { success: true };
+});
+
+// Set Figma team ID for auto-discovery (requires Professional+ plan)
+ipcMain.handle('figma:set-team-id', async (event, teamUrl) => {
+  // Accept team URL or raw ID
+  // URL format: https://www.figma.com/files/team/123456789/Team-Name
+  let teamId = teamUrl;
+  const match = teamUrl.match(/figma\.com\/files\/team\/(\d+)/);
+  if (match) teamId = match[1];
+
+  if (!teamId || !/^\d+$/.test(teamId)) {
+    return { success: false, error: 'Invalid team URL or ID' };
+  }
+
+  const settings = store.get('settings') || {};
+  const teamIds = settings.figmaTeamIds || [];
+  if (teamIds.includes(teamId)) {
+    return { success: true, teamId, alreadyAdded: true };
+  }
+
+  teamIds.push(teamId);
+  store.set('settings.figmaTeamIds', teamIds);
+  return { success: true, teamId };
+});
+
+// Remove a Figma team ID
+ipcMain.handle('figma:remove-team-id', async (event, teamId) => {
+  const settings = store.get('settings') || {};
+  const teamIds = (settings.figmaTeamIds || []).filter(id => id !== teamId);
+  store.set('settings.figmaTeamIds', teamIds);
+  return { success: true };
 });
 
 // --- App Lifecycle ---
@@ -2122,6 +2210,7 @@ app.on('before-quit', () => {
     clearInterval(intervalId);
   }
   figmaPollers.clear();
+  figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaScanTimestamps.clear();
   // Clean up remaining state

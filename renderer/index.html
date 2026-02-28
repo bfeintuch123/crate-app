@@ -147,7 +147,7 @@
 
         <div class="settings-section">
           <div class="settings-section-title">Figma Integration</div>
-          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account &mdash; Crate will automatically track all your Figma files.</div>
+          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account &mdash; Crate will automatically track your Figma files.</div>
           <div id="figma-status">
             <div id="figma-connected" class="hidden">
               <div class="figma-status-row">
@@ -166,7 +166,23 @@
               </div>
               <div class="figma-auto-info">
                 <div class="figma-auto-title">&#x2705; Auto-tracking active</div>
-                <div class="figma-auto-desc">Crate scans your Figma activity every 60 seconds and automatically captures assets from files you work on &mdash; desktop app or web.</div>
+                <div class="figma-auto-desc">Crate scans your tracked Figma files every 60 seconds and automatically captures assets &mdash; desktop app or web.</div>
+              </div>
+              <div class="figma-files-section" style="margin-top:12px;">
+                <div class="settings-desc" style="margin-bottom:6px;"><strong>Track a Figma file</strong> &mdash; paste any Figma file URL:</div>
+                <div style="display:flex;gap:6px;">
+                  <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="flex:1;">
+                  <button class="app-btn" id="btn-figma-add-file" style="white-space:nowrap;">Add File</button>
+                </div>
+                <div id="figma-tracked-files-list" style="margin-top:8px;"></div>
+              </div>
+              <div class="figma-team-section" style="margin-top:12px;">
+                <div class="settings-desc" style="margin-bottom:6px;"><strong>Auto-discover</strong> (Professional plan) &mdash; paste your team URL for auto-discovery:</div>
+                <div style="display:flex;gap:6px;">
+                  <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="flex:1;">
+                  <button class="app-btn" id="btn-figma-add-team" style="white-space:nowrap;">Add Team</button>
+                </div>
+                <div id="figma-team-ids-list" style="margin-top:8px;"></div>
               </div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
@@ -183,12 +199,12 @@
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx">
               <button class="app-btn" id="btn-figma-connect" style="margin-top:8px;">Connect Figma</button>
               <div class="figma-benefit-hint">
-                Once connected, Crate will automatically track <strong>all</strong> your Figma files &mdash; no manual URL entry needed.
+                Once connected, add Figma file URLs to track &mdash; Crate will automatically capture assets from them.
               </div>
             </div>
           </div>
           <div class="privacy-hint" style="margin-top:12px;">
-            &#x1F512; Your token is stored securely in macOS Keychain and never leaves your computer.
+            &#x1F512; Your token is stored locally at ~/.crate/figma-token (permissions 0600) and never leaves your computer.
           </div>
         </div>
 

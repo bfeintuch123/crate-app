@@ -426,35 +426,25 @@ class FigmaParser extends BaseParser {
   }
 
   /**
-   * Get all teams the user belongs to.
-   * @returns {Promise<Array<{id: string, name: string}>>}
+   * Get team info for a known team ID.
+   * NOTE: The Figma /v1/me endpoint does NOT return team_id (despite earlier assumptions).
+   * Team IDs must be provided by the user from their Figma team URL.
+   *
+   * @param {string} teamId - Team ID (from URL: figma.com/files/team/{teamId}/...)
+   * @returns {Promise<{id: string, name: string}|null>}
    */
-  async getUserTeams() {
+  async getTeamInfo(teamId) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return [];
+    if (!token || !fetch || !teamId) return null;
 
     try {
-      const userData = await this._fetchAPI('/me', token);
-      // The /me endpoint returns team_id for personal team
-      // We need to query teams via /v1/teams/:team_id for each team
-      const teams = [];
-
-      // Get user's teams - Figma API v1 doesn't have a direct "list my teams" endpoint
-      // but we can get team info from user's team_id
-      if (userData.team_id) {
-        try {
-          const teamData = await this._fetchAPI(`/teams/${userData.team_id}`, token);
-          if (teamData && teamData.name) {
-            teams.push({ id: userData.team_id, name: teamData.name });
-          }
-        } catch (e) {
-          // Team may not exist or user doesn't have access
-        }
+      const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
+      if (teamData && teamData.name) {
+        return { id: teamId, name: teamData.name };
       }
-
-      return teams;
+      return null;
     } catch (e) {
-      return [];
+      return null;
     }
   }
 
@@ -498,12 +488,64 @@ class FigmaParser extends BaseParser {
   }
 
   /**
-   * Discover ALL Figma files the user has worked on recently.
-   * Scans all teams → projects → files and returns files modified within the time window.
+   * Get metadata for a single Figma file by its key.
+   * Works on ALL Figma plans (free, starter, professional).
+   *
+   * @param {string} fileKey - Figma file key
+   * @returns {Promise<{key: string, name: string, lastModified: string, lastModifiedMs: number}|null>}
+   */
+  async getFileMetadata(fileKey) {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return null;
+
+    try {
+      // Use the lightweight metadata endpoint (doesn't download full file tree)
+      const data = await this._fetchAPI(`/files/${fileKey}/metadata`, token);
+      return {
+        key: fileKey,
+        name: data.name,
+        lastModified: data.lastModified,
+        lastModifiedMs: new Date(data.lastModified).getTime(),
+        thumbnailUrl: data.thumbnailUrl || null,
+        projectName: 'Tracked File',
+        teamName: 'Manual'
+      };
+    } catch (metaErr) {
+      // Fallback: /files/{key} with minimal depth (metadata endpoint may not exist on older API)
+      try {
+        const data = await this._fetchAPI(`/files/${fileKey}?depth=1`, token);
+        return {
+          key: fileKey,
+          name: data.name,
+          lastModified: data.lastModified,
+          lastModifiedMs: new Date(data.lastModified).getTime(),
+          thumbnailUrl: data.thumbnailUrl || null,
+          projectName: 'Tracked File',
+          teamName: 'Manual'
+        };
+      } catch (e) {
+        console.error(`[crate][figma] getFileMetadata error for ${fileKey}:`, e.message);
+        return null;
+      }
+    }
+  }
+
+  /**
+   * Discover Figma files the user has access to.
+   *
+   * Two modes:
+   *   1. Team-based discovery (requires Professional+ plan): provide teamIds
+   *   2. Direct file tracking (works on ALL plans): provide fileKeys
+   *
+   * NOTE: The Figma /v1/me endpoint does NOT return team_id.
+   * There is no API to list a user's files without a team_id.
+   * Team IDs must be provided by the user from their Figma team URL.
    *
    * @param {Object} options
    * @param {number} [options.sinceMs] - Only include files modified after this timestamp (ms)
    * @param {number} [options.maxAgeDays=7] - If sinceMs not provided, look back this many days
+   * @param {string[]} [options.teamIds=[]] - Team IDs to scan (Professional+ plan required)
+   * @param {string[]} [options.fileKeys=[]] - Individual file keys to check (works on ALL plans)
    * @returns {Promise<Array<{key: string, name: string, lastModified: string, projectName: string, teamName: string}>>}
    */
   async discoverRecentFiles(options = {}) {
@@ -511,48 +553,42 @@ class FigmaParser extends BaseParser {
     if (!token || !fetch) return [];
 
     const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
+    const teamIds = options.teamIds || [];
+    const fileKeys = options.fileKeys || [];
     const recentFiles = [];
+    const seenKeys = new Set();
 
     try {
-      // Get user data to find their teams
-      const userData = await this._fetchAPI('/me', token);
-
-      // Approach: Fetch user's recent files through multiple methods
-      // Method 1: Try /v1/me endpoint's linked teams
-      const teamsToScan = new Set();
-
-      if (userData.team_id) {
-        teamsToScan.add(userData.team_id);
-      }
-
-      // Scan each team
-      for (const teamId of teamsToScan) {
-        let teamName = 'Personal';
+      // --- Method 1: Team-based discovery (Professional+ plan) ---
+      for (const teamId of teamIds) {
+        let teamName = 'Team';
         try {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
           teamName = teamData.name || teamName;
         } catch (e) {
-          // Use default team name
+          console.warn(`[crate][figma] Cannot access team ${teamId} — may require Professional plan`);
+          continue;
         }
 
-        // Get projects in team
         let projects = [];
         try {
           const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
           projects = projectsData.projects || [];
         } catch (e) {
-          continue; // Skip team if can't access projects
+          console.warn(`[crate][figma] Cannot list projects for team ${teamId} — requires Professional+ plan`);
+          continue;
         }
 
-        // Get files in each project
         for (const project of projects) {
           try {
             const filesData = await this._fetchAPI(`/projects/${project.id}/files`, token);
             const files = filesData.files || [];
 
             for (const file of files) {
+              if (seenKeys.has(file.key)) continue;
               const lastModifiedMs = new Date(file.last_modified).getTime();
               if (lastModifiedMs >= sinceMs) {
+                seenKeys.add(file.key);
                 recentFiles.push({
                   key: file.key,
                   name: file.name,
@@ -569,6 +605,16 @@ class FigmaParser extends BaseParser {
           } catch (e) {
             // Skip project on error
           }
+        }
+      }
+
+      // --- Method 2: Direct file tracking (ALL plans) ---
+      for (const fileKey of fileKeys) {
+        if (seenKeys.has(fileKey)) continue;
+        const meta = await this.getFileMetadata(fileKey);
+        if (meta && meta.lastModifiedMs >= sinceMs) {
+          seenKeys.add(fileKey);
+          recentFiles.push(meta);
         }
       }
 
@@ -649,6 +695,8 @@ class FigmaParser extends BaseParser {
    * @param {number} [options.sinceMs] - Only scan files modified after this timestamp
    * @param {number} [options.maxAgeDays=7] - Fallback: look back this many days
    * @param {number} [options.maxFiles=20] - Maximum number of files to process
+   * @param {string[]} [options.teamIds=[]] - Team IDs for discovery (Professional+ plan)
+   * @param {string[]} [options.fileKeys=[]] - Direct file keys to track (ALL plans)
    * @returns {Promise<{files: Array, assets: Array, errors: Array}>}
    */
   async autoTrackScan(options = {}) {
@@ -657,14 +705,24 @@ class FigmaParser extends BaseParser {
     // Verify token first
     const tokenStatus = await this.verifyToken();
     if (!tokenStatus.valid) {
-      result.errors.push('Figma token invalid or not set');
+      result.errors.push({ type: 'auth', message: 'Figma token invalid or not set' });
+      return result;
+    }
+
+    const teamIds = options.teamIds || [];
+    const fileKeys = options.fileKeys || [];
+
+    if (teamIds.length === 0 && fileKeys.length === 0) {
+      result.errors.push({ type: 'config', message: 'No Figma team IDs or file URLs configured — add files in Settings → Figma' });
       return result;
     }
 
     // Discover recent files
     const files = await this.discoverRecentFiles({
       sinceMs: options.sinceMs,
-      maxAgeDays: options.maxAgeDays || 7
+      maxAgeDays: options.maxAgeDays || 7,
+      teamIds,
+      fileKeys
     });
 
     result.files = files.slice(0, options.maxFiles || 20);

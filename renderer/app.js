@@ -432,6 +432,51 @@ async function renderFigmaSettings() {
     if (assetCountEl) {
       assetCountEl.textContent = status.totalFigmaAssets || 0;
     }
+
+    // Render tracked files list
+    const settings = await window.crate.getSettings();
+    const trackedFiles = (settings && settings.figmaTrackedFiles) || [];
+    const teamIds = (settings && settings.figmaTeamIds) || [];
+
+    const filesListEl = $('#figma-tracked-files-list');
+    if (filesListEl) {
+      if (trackedFiles.length === 0) {
+        filesListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No files tracked yet</div>';
+      } else {
+        filesListEl.innerHTML = trackedFiles.map(key =>
+          `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${key}</span>
+            <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-file="${key}">Remove</button>
+          </div>`
+        ).join('');
+        filesListEl.querySelectorAll('[data-figma-remove-file]').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            await window.crate.removeFigmaTrackedFile(btn.dataset.figmaRemoveFile);
+            renderFigmaSettings();
+          });
+        });
+      }
+    }
+
+    const teamListEl = $('#figma-team-ids-list');
+    if (teamListEl) {
+      if (teamIds.length === 0) {
+        teamListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No teams added (optional &mdash; requires Professional plan)</div>';
+      } else {
+        teamListEl.innerHTML = teamIds.map(id =>
+          `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+            <span style="font-size:12px;opacity:0.7;flex:1;">Team ${id}</span>
+            <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-team="${id}">Remove</button>
+          </div>`
+        ).join('');
+        teamListEl.querySelectorAll('[data-figma-remove-team]').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            await window.crate.removeFigmaTeamId(btn.dataset.figmaRemoveTeam);
+            renderFigmaSettings();
+          });
+        });
+      }
+    }
   } else {
     connected.classList.add('hidden');
     disconnected.classList.remove('hidden');
@@ -773,6 +818,46 @@ function setupEventListeners() {
       renderFigmaSettings();
       showToast('Figma disconnected');
     }
+  });
+
+  // Figma add tracked file
+  $('#btn-figma-add-file').addEventListener('click', async () => {
+    const url = $('#input-figma-file-url').value.trim();
+    if (!url) {
+      showToast('Please paste a Figma file URL');
+      return;
+    }
+    const result = await window.crate.addFigmaTrackedFile(url);
+    if (result.success) {
+      $('#input-figma-file-url').value = '';
+      renderFigmaSettings();
+      showToast(result.alreadyTracked ? 'File already tracked' : 'Figma file added');
+    } else {
+      showToast(result.error || 'Invalid Figma URL');
+    }
+  });
+
+  // Figma add team
+  $('#btn-figma-add-team').addEventListener('click', async () => {
+    const url = $('#input-figma-team-url').value.trim();
+    if (!url) {
+      showToast('Please paste a Figma team URL or ID');
+      return;
+    }
+    const result = await window.crate.setFigmaTeamId(url);
+    if (result.success) {
+      $('#input-figma-team-url').value = '';
+      renderFigmaSettings();
+      showToast(result.alreadyAdded ? 'Team already added' : 'Figma team added');
+    } else {
+      showToast(result.error || 'Invalid team URL');
+    }
+  });
+
+  // Figma auth error notification
+  window.crate.onFigmaAuthError((data) => {
+    showToast(data.error || 'Figma token expired — reconnect in Settings');
+    renderFigmaSettings();
   });
 
 }
