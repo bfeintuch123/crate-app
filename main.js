@@ -4,7 +4,7 @@ const fs = require('fs');
 const Store = require('electron-store');
 const chokidar = require('chokidar');
 const { v4: uuidv4 } = require('uuid');
-const { execSync, exec, execFile, execFileSync } = require('child_process');
+const { exec, execFile } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -31,11 +31,14 @@ async function getXattrLastUsedMs(filePath) {
 }
 
 function deduplicateFiles(files) {
-  // Pass 1: exact path dedup
-  const seenPaths = new Set();
+  // Pass 1: real-path dedup — resolves symlinks so the same file reached via
+  // different paths (e.g. symlink vs canonical) is only kept once.
+  const seenRealPaths = new Set();
   const pathDeduped = files.filter(f => {
-    if (seenPaths.has(f.path)) return false;
-    seenPaths.add(f.path);
+    let realPath;
+    try { realPath = fs.realpathSync(f.path); } catch (e) { realPath = f.path; }
+    if (seenRealPaths.has(realPath)) return false;
+    seenRealPaths.add(realPath);
     return true;
   });
 
@@ -136,11 +139,12 @@ const DESIGN_APP_PROCESS_NAMES = {
   web:      ['Figma', 'Sketch', 'Adobe XD', 'Affinity Designer', 'Visual Studio Code'],
 };
 
-function getFileCreatorApp(filePath) {
+async function getFileCreatorApp(filePath) {
   try {
-    const result = execFileSync("/usr/bin/mdls", ["-name", "kMDItemCreatorApplicationIdentifier", "-raw", filePath], {
+    const { stdout } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemCreatorApplicationIdentifier", "-raw", filePath], {
       timeout: 2000, encoding: 'utf8'
-    }).trim();
+    });
+    const result = stdout.trim();
     if (!result || result === '(null)') return null;
     return result || null;
   } catch (e) {
@@ -150,11 +154,11 @@ function getFileCreatorApp(filePath) {
 
 // projectType: optional — if provided, Check 1 is scoped to that type's app list.
 // Extension fallback (Check 2) always applies regardless of type.
-function isDesignAppFile(filePath, projectType = null) {
+async function isDesignAppFile(filePath, projectType = null) {
   const ext = path.extname(filePath).toLowerCase();
 
   // Check 1: Was this file created/modified by a known design app?
-  const creatorApp = getFileCreatorApp(filePath);
+  const creatorApp = await getFileCreatorApp(filePath);
   if (creatorApp) {
     // Use type-specific app list if available, otherwise accept any design app
     const relevantApps = (projectType && PROJECT_TYPE_APPS[projectType])
@@ -232,6 +236,7 @@ function mutateProject(projectId, fn) {
 
 // FIX 2 (C2): Track in-flight pre-package scans
 const scanInFlight = new Set();
+const scanWaiters = new Map(); // projectId -> [resolve, ...] — proper event-based waiting
 
 let tray = null;
 let trayWindow = null;
@@ -596,7 +601,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
     const sinceMs = isInitialScan
-      ? Date.now() - (7 * 24 * 60 * 60 * 1000) // Initial: last 7 days
+      ? Date.now() - (30 * 24 * 60 * 60 * 1000) // Initial: last 30 days
       : lastScanMs; // Subsequent: since last scan
 
     console.log(`[crate][figma] Scanning Figma files for project ${projectId} (since ${new Date(sinceMs).toISOString()})`);
@@ -604,12 +609,21 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     // Run auto-track scan
     const scanResult = await parser.autoTrackScan({
       sinceMs,
-      maxAgeDays: isInitialScan ? 7 : 1,
+      maxAgeDays: isInitialScan ? 30 : 7,
       maxFiles: isInitialScan ? 20 : 10
     });
 
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', scanResult.errors);
+      // Detect token expiry / auth failures — stop polling instead of retrying every 60s
+      const authError = scanResult.errors.find(e =>
+        typeof e === 'string' && (e.includes('401') || e.includes('403') || e.toLowerCase().includes('unauthorized') || e.toLowerCase().includes('forbidden'))
+      );
+      if (authError) {
+        console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
+        stopFigmaPolling(projectId);
+        return;
+      }
     }
 
     if (scanResult.assets.length === 0) {
@@ -676,6 +690,11 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     figmaScanTimestamps.set(projectId, Date.now());
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', e.message);
+    // Detect token expiry / auth failures at the network level
+    if (e.message && (e.message.includes('401') || e.message.includes('403') || e.message.toLowerCase().includes('unauthorized'))) {
+      console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
+      stopFigmaPolling(projectId);
+    }
   } finally {
     figmaInProgress.delete(projectId);
   }
@@ -719,7 +738,7 @@ const PRE_SESSION_SCAN_EXTENSIONS = new Set([
   '.pptx', '.key', '.afdesign', '.afphoto', '.afpub'
 ]);
 
-function runPreSessionScan(projectId) {
+async function runPreSessionScan(projectId) {
   const homedir = os.homedir();
   const scanRoots = [
     path.join(homedir, 'Downloads'),
@@ -727,19 +746,22 @@ function runPreSessionScan(projectId) {
     path.join(homedir, 'Documents')
   ];
   const discovered = [];
+  const FILE_CAP = 500; // Prevent UI freezing on machines with huge directories
 
-  const scanDir = (dir, depth) => {
+  const scanDir = async (dir, depth) => {
     if (depth > 2) return;
+    if (discovered.length >= FILE_CAP) return;
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
     catch (e) { return; }
 
     for (const entry of entries) {
+      if (discovered.length >= FILE_CAP) return;
       if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
       const fullPath = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
-        scanDir(fullPath, depth + 1);
+        await scanDir(fullPath, depth + 1);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (!PRE_SESSION_SCAN_EXTENSIONS.has(ext)) continue;
@@ -757,7 +779,11 @@ function runPreSessionScan(projectId) {
   };
 
   for (const root of scanRoots) {
-    scanDir(root, 0);
+    await scanDir(root, 0);
+    if (discovered.length >= FILE_CAP) {
+      console.warn(`[crate] Pre-session scan hit ${FILE_CAP}-file cap — some files may not be auto-detected`);
+      break;
+    }
   }
 
   if (discovered.length === 0) return;
@@ -787,6 +813,8 @@ function runPreSessionScan(projectId) {
 // --- File Watching ---
 
 async function startWatching(projectId) {
+  const scanStart = Date.now();
+
   // FIX 1: Use mutateProject for initial watchStartedAt write
   const projectSnapshot = mutateProject(projectId, (project) => {
     project.watchStartedAt = Date.now();
@@ -821,11 +849,12 @@ async function startWatching(projectId) {
         });
 
         // FIX 1: Use mutateProject to atomically apply snapshot results
-        mutateProject(projectId, (project) => {
+        // Phase 1: Parse lsof output, add direct files, collect linkable files for async read
+        const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
+        const lsofResult = mutateProject(projectId, (project) => {
           const existingPaths = new Set(project.files.map(f => f.path));
           let snapshotChanged = false;
           let currentType = null;
-          const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
           const linkableForParse = [];
 
           for (const line of lsofOut.trim().split('\n')) {
@@ -879,41 +908,55 @@ async function startWatching(projectId) {
             }
           }
 
-          // Parse linked assets from any linkable design files found in the snapshot
-          if (linkableForParse.length > 0) {
-            const LINKED_ASSET_REGEX_SNAPSHOT = /\/Users\/[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig)/gi;
-            for (const designFile of linkableForParse) {
-              try {
-                if (!fs.existsSync(designFile.path)) continue;
-                const buf = fs.readFileSync(designFile.path);
-                const content = buf.toString('utf8');
-                let match;
-                LINKED_ASSET_REGEX_SNAPSHOT.lastIndex = 0;
-                while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
-                  const linkedPath = match[0];
-                  if (existingPaths.has(linkedPath)) continue;
-                  if (!fs.existsSync(linkedPath)) continue;
-
-                  project.files.push({
-                    path: linkedPath,
-                    name: path.basename(linkedPath),
-                    ext: path.extname(linkedPath).toLowerCase(),
-                    addedAt: Date.now(),
-                    source: 'linked-asset',
-                  });
-                  existingPaths.add(linkedPath);
-                  snapshotChanged = true;
-                }
-              } catch (e) {
-                // read error — continue with others
-              }
-            }
-          }
-
           if (snapshotChanged) {
             project.files = deduplicateFiles(project.files);
           }
+          return { linkableForParse, existingPaths: [...existingPaths] };
         });
+
+        // Phase 2: Async read of design files to extract linked asset paths
+        if (lsofResult && lsofResult.linkableForParse.length > 0) {
+          const LINKED_ASSET_REGEX_SNAPSHOT = /\/Users\/[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig)/gi;
+          const knownPaths = new Set(lsofResult.existingPaths);
+          const discoveredLinkedPaths = [];
+
+          for (const designFile of lsofResult.linkableForParse) {
+            try {
+              if (!fs.existsSync(designFile.path)) continue;
+              const buf = await fs.promises.readFile(designFile.path);
+              const content = buf.toString('utf8');
+              let match;
+              LINKED_ASSET_REGEX_SNAPSHOT.lastIndex = 0;
+              while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
+                const linkedPath = match[0];
+                if (knownPaths.has(linkedPath)) continue;
+                if (!fs.existsSync(linkedPath)) continue;
+                discoveredLinkedPaths.push(linkedPath);
+                knownPaths.add(linkedPath);
+              }
+            } catch (e) {
+              // read error — continue with others
+            }
+          }
+
+          // Phase 3: Atomically add linked assets
+          if (discoveredLinkedPaths.length > 0) {
+            mutateProject(projectId, (project) => {
+              const projectPaths = new Set(project.files.map(f => f.path));
+              for (const linkedPath of discoveredLinkedPaths) {
+                if (projectPaths.has(linkedPath)) continue;
+                project.files.push({
+                  path: linkedPath,
+                  name: path.basename(linkedPath),
+                  ext: path.extname(linkedPath).toLowerCase(),
+                  addedAt: Date.now(),
+                  source: 'linked-asset',
+                });
+              }
+              project.files = deduplicateFiles(project.files);
+            });
+          }
+        }
       }
     }
   } catch (e) {
@@ -921,7 +964,13 @@ async function startWatching(projectId) {
   }
 
   // Pre-session scan: find ALL design files in watched dirs (no date limit)
-  runPreSessionScan(projectId);
+  await runPreSessionScan(projectId);
+
+  // Log scan summary
+  const scanDuration = Date.now() - scanStart;
+  const scannedProject = store.get('projects').find(p => p.id === projectId);
+  const preExistingCount = scannedProject ? scannedProject.files.length : 0;
+  console.log(`[crate] Watch started for "${scannedProject?.name || projectId}": ${preExistingCount} pre-existing files found in ${scanDuration}ms`);
 
   // Stop existing watcher if any
   stopWatching(projectId);
@@ -1493,7 +1542,7 @@ end tell`;
     for (const designFile of linkableFiles) {
       try {
         if (!fs.existsSync(designFile.path)) continue;
-        const buf = fs.readFileSync(designFile.path);
+        const buf = await fs.promises.readFile(designFile.path);
         const content = buf.toString('utf8');
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
@@ -1525,8 +1574,13 @@ end tell`;
 
   return { files: project.files, newCount };
   } finally {
-    // FIX 2 (C2): Always clear scan-in-flight flag
+    // FIX 2 (C2): Always clear scan-in-flight flag + notify waiters
     scanInFlight.delete(projectId);
+    const waiters = scanWaiters.get(projectId);
+    if (waiters) {
+      for (const resolve of waiters) resolve();
+      scanWaiters.delete(projectId);
+    }
   }
 });
 
@@ -1598,7 +1652,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
   if ((ext === '.pptx' || ext === '.ppt') && projectFiles) {
     for (const f of projectFiles) {
       try {
-        const buf = fs.readFileSync(f.path);
+        const buf = await fs.promises.readFile(f.path);
         const size = buf.length;
         capturedSizes.add(size);
         const hash = crypto.createHash('md5').update(buf).digest('hex');
@@ -1758,11 +1812,17 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
 
 ipcMain.handle('projects:package', async (event, id, outputPath) => {
   // FIX 2 (C2): Wait for in-flight pre-scan to complete before packaging
+  // v2.1.2: Replaced polling busy-wait with proper promise/event pattern
   if (scanInFlight.has(id)) {
-    const scanWaitStart = Date.now();
-    while (scanInFlight.has(id) && Date.now() - scanWaitStart < 10000) {
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
+    await Promise.race([
+      new Promise(resolve => {
+        // Double-check — scan may have finished between the if-check and here
+        if (!scanInFlight.has(id)) { resolve(); return; }
+        if (!scanWaiters.has(id)) scanWaiters.set(id, []);
+        scanWaiters.get(id).push(resolve);
+      }),
+      new Promise(resolve => setTimeout(resolve, 10000)) // 10s safety timeout
+    ]);
   }
 
   checkAndResetUsage();
@@ -1924,6 +1984,13 @@ ipcMain.handle('projects:delete-all', () => {
   }
   lsofPollers.clear();
   lsofInProgress.clear();
+  // Stop all Figma pollers (was missing — memory leak)
+  for (const [id, intervalId] of figmaPollers) {
+    clearInterval(intervalId);
+  }
+  figmaPollers.clear();
+  figmaInProgress.clear();
+  figmaScanTimestamps.clear();
   lastFileActivity.clear();
   inactivityNotified.clear();
 
@@ -2154,12 +2221,11 @@ app.whenReady().then(async () => {
   createTrayWindow();
   createTray();
 
-  // Resume watching for any active projects (FIX 4: await async startWatching)
+  // Resume watching for any active projects — run in parallel for faster startup
   const projects = store.get('projects');
-  for (const project of projects) {
-    if (project.status === 'watching') {
-      await startWatching(project.id);
-    }
+  const watchingProjects = projects.filter(p => p.status === 'watching');
+  if (watchingProjects.length > 0) {
+    await Promise.all(watchingProjects.map(p => startWatching(p.id)));
   }
 
   // Start inactivity checker
