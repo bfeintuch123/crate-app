@@ -1724,6 +1724,86 @@ ipcMain.handle('inactivity:pause', (event, projectId) => {
   return project;
 });
 
+// --- V2 Quick Package ---
+
+ipcMain.handle('v2:browse-file', async () => {
+  const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
+  const result = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    title: 'Select Master Design File',
+    filters: [
+      { name: 'Design Files', extensions: SUPPORTED_EXTENSIONS.map(e => e.slice(1)) }
+    ]
+  });
+  showTrayWindow();
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('v2:package-file', async (event, filePath) => {
+  const { packageMasterFile } = require('./parsers/index.js');
+
+  // Let user choose output directory
+  const outputResult = await dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Choose Package Destination',
+    defaultPath: path.join(os.homedir(), 'Desktop')
+  });
+  showTrayWindow();
+  if (outputResult.canceled) return { canceled: true };
+
+  const outputDir = outputResult.filePaths[0];
+
+  // Generate folder name based on master file
+  const baseName = path.basename(filePath, path.extname(filePath));
+  const dateStr = new Date().toISOString().split('T')[0];
+  const folderName = `${baseName}_${dateStr}`;
+  const destFolder = path.join(outputDir, folderName);
+
+  try {
+    const result = await packageMasterFile(filePath, destFolder);
+    return {
+      success: true,
+      masterFile: result.masterFile,
+      assetsFound: result.assetsFound,
+      assetsCopied: result.assetsCopied,
+      assetsMissing: result.assetsMissing,
+      outputDir: destFolder,
+      files: result.files
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('v2:supported-extensions', () => {
+  const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
+  return SUPPORTED_EXTENSIONS;
+});
+
+// --- Figma Integration ---
+
+ipcMain.handle('figma:status', async () => {
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  const token = await parser.getStoredToken();
+  return { connected: !!token };
+});
+
+ipcMain.handle('figma:connect', async (event, token) => {
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  const stored = await parser.storeToken(token);
+  return { success: stored };
+});
+
+ipcMain.handle('figma:disconnect', async () => {
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  const deleted = await parser.deleteToken();
+  return { success: deleted };
+});
+
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {

@@ -35,6 +35,16 @@ contextBridge.exposeInMainWorld('crate', {
   acceptPending: (projectId, filePath) => ipcRenderer.invoke('projects:accept-pending', projectId, filePath),
   rejectPending: (projectId, filePath) => ipcRenderer.invoke('projects:reject-pending', projectId, filePath),
 
+  // V2 Quick Package
+  v2BrowseFile: () => ipcRenderer.invoke('v2:browse-file'),
+  v2PackageFile: (filePath) => ipcRenderer.invoke('v2:package-file', filePath),
+  v2GetSupportedExtensions: () => ipcRenderer.invoke('v2:supported-extensions'),
+
+  // Figma Integration
+  getFigmaStatus: () => ipcRenderer.invoke('figma:status'),
+  connectFigma: (token) => ipcRenderer.invoke('figma:connect', token),
+  disconnectFigma: () => ipcRenderer.invoke('figma:disconnect'),
+
   // Events from main
   onFilesUpdated: (callback) => {
     ipcRenderer.on('files:updated', (event, data) => callback(data));

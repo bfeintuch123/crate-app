@@ -43,6 +43,19 @@
           <button class="app-btn outline" id="btn-add-project">+ Add Project</button>
         </div>
 
+        <!-- V2 Quick Package -->
+        <div class="v2-quick-package">
+          <div class="settings-section-title">Quick Package</div>
+          <div class="v2-desc">Drop a design file to trace and package all linked assets.</div>
+          <div class="v2-drop-zone" id="v2-drop-zone">
+            <div class="v2-drop-icon">&#x1F4E6;</div>
+            <div class="v2-drop-text">Drop your master file here</div>
+            <div class="v2-drop-formats">.ai .psd .indd .pptx .key .prproj .aep</div>
+            <div class="v2-drop-or">or</div>
+            <button class="app-btn outline" id="btn-v2-browse">Browse Files</button>
+          </div>
+        </div>
+
         <!-- New Project Form -->
         <div id="new-project-form" class="hidden">
           <div class="app-label">New Project</div>
@@ -130,6 +143,36 @@
               <input type="checkbox" id="toggle-notifications">
               <span class="toggle-slider"></span>
             </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Figma Integration</div>
+          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account to package design files directly from Figma.</div>
+          <div id="figma-status">
+            <div id="figma-connected" class="hidden">
+              <div class="figma-status-row">
+                <span class="figma-status-dot connected"></span>
+                <span>Connected</span>
+              </div>
+              <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:8px;">Disconnect Figma</button>
+            </div>
+            <div id="figma-disconnected">
+              <div class="figma-status-row">
+                <span class="figma-status-dot"></span>
+                <span>Not connected</span>
+              </div>
+              <div class="figma-setup-steps">
+                <div class="figma-step">1. Go to <strong>figma.com/developers/api</strong></div>
+                <div class="figma-step">2. Generate a Personal Access Token</div>
+                <div class="figma-step">3. Paste it below</div>
+              </div>
+              <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx">
+              <button class="app-btn" id="btn-figma-connect" style="margin-top:8px;">Connect Figma</button>
+            </div>
+          </div>
+          <div class="privacy-hint" style="margin-top:12px;">
+            &#x1F512; Your token is stored securely in macOS Keychain and never leaves your computer.
           </div>
         </div>
 
@@ -245,6 +288,24 @@
         <div class="modal-actions">
           <button class="modal-btn-secondary" id="btn-clear-all-cancel">Cancel</button>
           <button class="modal-btn-danger" id="btn-clear-all-confirm">Remove All</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V2 Results Modal -->
+    <div class="modal-overlay hidden" id="modal-v2-results">
+      <div class="modal">
+        <div class="modal-header-area">
+          <div class="modal-title" id="v2-result-title">Package Complete</div>
+          <div class="modal-subtitle" id="v2-result-subtitle"></div>
+        </div>
+        <div class="modal-body">
+          <div class="v2-result-stats" id="v2-result-stats"></div>
+          <div class="v2-result-missing" id="v2-result-missing"></div>
+          <div class="modal-actions">
+            <button class="modal-btn-secondary" id="btn-v2-done">Done</button>
+            <button class="modal-btn-primary" id="btn-v2-open-folder">Open Folder &rarr;</button>
+          </div>
         </div>
       </div>
     </div>
