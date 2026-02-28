@@ -11,6 +11,7 @@
     "canvas": "^3.2.1",
     "chokidar": "^3.6.0",
     "electron-store": "^8.2.0",
+    "node-fetch": "^2.7.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {
@@ -30,8 +31,17 @@
     "dmg": {
       "title": "Crate",
       "contents": [
-        { "x": 130, "y": 220, "type": "file" },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+        {
+          "x": 130,
+          "y": 220,
+          "type": "file"
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     }
   }
