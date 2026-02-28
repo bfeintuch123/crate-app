@@ -148,14 +148,28 @@
 
         <div class="settings-section">
           <div class="settings-section-title">Figma Integration</div>
-          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account to package design files directly from Figma.</div>
+          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account &mdash; Crate will automatically track all your Figma files.</div>
           <div id="figma-status">
             <div id="figma-connected" class="hidden">
               <div class="figma-status-row">
                 <span class="figma-status-dot connected"></span>
-                <span>Connected</span>
+                <span>Connected &mdash; Auto-tracking enabled</span>
               </div>
-              <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:8px;">Disconnect Figma</button>
+              <div class="figma-tracking-info" id="figma-tracking-info">
+                <div class="figma-tracking-stat">
+                  <span class="figma-tracking-label">Projects tracking:</span>
+                  <span class="figma-tracking-value" id="figma-project-count">0</span>
+                </div>
+                <div class="figma-tracking-stat">
+                  <span class="figma-tracking-label">Assets captured:</span>
+                  <span class="figma-tracking-value" id="figma-asset-count">0</span>
+                </div>
+              </div>
+              <div class="figma-auto-info">
+                <div class="figma-auto-title">&#x2705; Auto-tracking active</div>
+                <div class="figma-auto-desc">Crate scans your Figma activity every 60 seconds and automatically captures assets from files you work on &mdash; desktop app or web.</div>
+              </div>
+              <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
             <div id="figma-disconnected">
               <div class="figma-status-row">
@@ -165,10 +179,13 @@
               <div class="figma-setup-steps">
                 <div class="figma-step">1. Go to <strong>figma.com/developers/api</strong></div>
                 <div class="figma-step">2. Generate a Personal Access Token</div>
-                <div class="figma-step">3. Paste it below</div>
+                <div class="figma-step">3. Paste it below &mdash; that's it!</div>
               </div>
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx">
               <button class="app-btn" id="btn-figma-connect" style="margin-top:8px;">Connect Figma</button>
+              <div class="figma-benefit-hint">
+                Once connected, Crate will automatically track <strong>all</strong> your Figma files &mdash; no manual URL entry needed.
+              </div>
             </div>
           </div>
           <div class="privacy-hint" style="margin-top:12px;">

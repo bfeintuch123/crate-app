@@ -434,6 +434,17 @@ async function renderFigmaSettings() {
   if (status.connected) {
     connected.classList.remove('hidden');
     disconnected.classList.add('hidden');
+
+    // Update auto-tracking stats
+    const projectCountEl = $('#figma-project-count');
+    const assetCountEl = $('#figma-asset-count');
+
+    if (projectCountEl) {
+      projectCountEl.textContent = status.activeProjectCount || 0;
+    }
+    if (assetCountEl) {
+      assetCountEl.textContent = status.totalFigmaAssets || 0;
+    }
   } else {
     connected.classList.add('hidden');
     disconnected.classList.remove('hidden');

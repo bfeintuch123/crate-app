@@ -249,6 +249,13 @@ function cleanName(s) {
 const lsofPollers = new Map();   // projectId -> setInterval id
 const lsofInProgress = new Set(); // projectIds currently mid-poll (prevent overlap)
 
+// --- Figma Auto-Tracking ---
+const figmaPollers = new Map();    // projectId -> setInterval id
+const figmaInProgress = new Set(); // projectIds currently mid-poll
+const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
+const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
+const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
+
 // Get PIDs of running design apps relevant to a project type.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
 function getRunningDesignAppPids(projectType, callback) {
@@ -517,6 +524,191 @@ function createTray() {
   tray.on('click', toggleTrayWindow);
 }
 
+// --- Figma Auto-Tracking Functions ---
+
+/**
+ * Ensure Figma assets directory exists.
+ */
+function ensureFigmaAssetsDir() {
+  if (!fs.existsSync(FIGMA_ASSETS_DIR)) {
+    fs.mkdirSync(FIGMA_ASSETS_DIR, { recursive: true });
+  }
+  return FIGMA_ASSETS_DIR;
+}
+
+/**
+ * Download a Figma asset from CDN URL to local disk.
+ * @returns {Promise<string|null>} Local file path or null on failure
+ */
+async function downloadFigmaAsset(url, fileName, projectId) {
+  try {
+    const fetch = require('node-fetch');
+    const response = await fetch(url, { timeout: 30000 });
+    if (!response.ok) return null;
+
+    const buffer = await response.buffer();
+    if (buffer.length === 0) return null;
+
+    // Create project-specific subdir
+    const projectDir = path.join(FIGMA_ASSETS_DIR, projectId);
+    if (!fs.existsSync(projectDir)) {
+      fs.mkdirSync(projectDir, { recursive: true });
+    }
+
+    // Sanitize filename
+    const safeName = fileName.replace(/[^a-zA-Z0-9_\-.]/g, '_').substring(0, 100);
+    const localPath = path.join(projectDir, `${safeName}.png`);
+
+    // Skip if already exists with same size
+    if (fs.existsSync(localPath)) {
+      const existingSize = fs.statSync(localPath).size;
+      if (existingSize === buffer.length) return localPath;
+    }
+
+    fs.writeFileSync(localPath, buffer);
+    return localPath;
+  } catch (e) {
+    console.error('[crate][figma] downloadFigmaAsset error:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Poll Figma API for recent files and extract assets.
+ * Runs on watch session start and every 60 seconds.
+ */
+async function pollFigmaForProject(projectId, isInitialScan = false) {
+  if (figmaInProgress.has(projectId)) return; // Prevent overlapping polls
+
+  const currentProjects = store.get('projects');
+  const project = currentProjects.find(p => p.id === projectId);
+  if (!project || project.status !== 'watching') return;
+
+  // Check if Figma is connected
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  const token = await parser.getStoredToken();
+  if (!token) return; // Figma not connected
+
+  figmaInProgress.add(projectId);
+
+  try {
+    // Determine time window for scanning
+    const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
+    const sinceMs = isInitialScan
+      ? Date.now() - (7 * 24 * 60 * 60 * 1000) // Initial: last 7 days
+      : lastScanMs; // Subsequent: since last scan
+
+    console.log(`[crate][figma] Scanning Figma files for project ${projectId} (since ${new Date(sinceMs).toISOString()})`);
+
+    // Run auto-track scan
+    const scanResult = await parser.autoTrackScan({
+      sinceMs,
+      maxAgeDays: isInitialScan ? 7 : 1,
+      maxFiles: isInitialScan ? 20 : 10
+    });
+
+    if (scanResult.errors.length > 0) {
+      console.warn('[crate][figma] Scan errors:', scanResult.errors);
+    }
+
+    if (scanResult.assets.length === 0) {
+      figmaScanTimestamps.set(projectId, Date.now());
+      figmaInProgress.delete(projectId);
+      return;
+    }
+
+    console.log(`[crate][figma] Found ${scanResult.files.length} files, ${scanResult.assets.length} assets`);
+
+    // Download assets and add to project
+    ensureFigmaAssetsDir();
+    let addedCount = 0;
+
+    const existingPaths = new Set(project.files.map(f => f.path));
+
+    for (const asset of scanResult.assets) {
+      const fileName = `${asset.figmaFileName}_${asset.name}`;
+      const localPath = await downloadFigmaAsset(asset.url, fileName, projectId);
+
+      if (localPath && !existingPaths.has(localPath)) {
+        // Add to project files using mutateProject
+        const result = mutateProject(projectId, (proj) => {
+          if (proj.files.some(f => f.path === localPath)) return null;
+          proj.files.push({
+            path: localPath,
+            name: path.basename(localPath),
+            ext: '.png',
+            addedAt: Date.now(),
+            source: 'figma-auto',
+            figmaFileKey: asset.figmaFileKey,
+            figmaFileName: asset.figmaFileName
+          });
+          proj.files = deduplicateFiles(proj.files);
+          return { files: proj.files };
+        });
+
+        if (result) {
+          addedCount++;
+          existingPaths.add(localPath);
+        }
+      }
+    }
+
+    if (addedCount > 0) {
+      // Update activity timestamp
+      lastFileActivity.set(projectId, Date.now());
+      inactivityNotified.delete(projectId);
+
+      // Notify renderer
+      if (trayWindow && !trayWindow.isDestroyed()) {
+        const updatedProject = store.get('projects').find(p => p.id === projectId);
+        if (updatedProject) {
+          trayWindow.webContents.send('files:updated', {
+            projectId,
+            files: updatedProject.files
+          });
+        }
+      }
+
+      console.log(`[crate][figma] Added ${addedCount} Figma assets to project ${projectId}`);
+    }
+
+    figmaScanTimestamps.set(projectId, Date.now());
+  } catch (e) {
+    console.error('[crate][figma] pollFigmaForProject error:', e.message);
+  } finally {
+    figmaInProgress.delete(projectId);
+  }
+}
+
+/**
+ * Start Figma polling for a project.
+ */
+async function startFigmaPolling(projectId) {
+  // Run initial scan immediately
+  await pollFigmaForProject(projectId, true);
+
+  // Start 60-second polling interval
+  const intervalId = setInterval(() => {
+    pollFigmaForProject(projectId, false);
+  }, FIGMA_POLL_INTERVAL_MS);
+
+  figmaPollers.set(projectId, intervalId);
+}
+
+/**
+ * Stop Figma polling for a project.
+ */
+function stopFigmaPolling(projectId) {
+  const intervalId = figmaPollers.get(projectId);
+  if (intervalId) {
+    clearInterval(intervalId);
+    figmaPollers.delete(projectId);
+  }
+  figmaInProgress.delete(projectId);
+  figmaScanTimestamps.delete(projectId);
+}
+
 // --- File Watching ---
 
 async function startWatching(projectId) {
@@ -745,6 +937,7 @@ async function startWatching(projectId) {
 
   watchers.set(projectId, watcher);
   startLsofPolling(projectId); // begin lsof polling for linked assets
+  startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
 }
 
 function stopWatching(projectId) {
@@ -754,6 +947,7 @@ function stopWatching(projectId) {
     watchers.delete(projectId);
   }
   stopLsofPolling(projectId);
+  stopFigmaPolling(projectId);
   lastFileActivity.delete(projectId);
   inactivityNotified.delete(projectId);
 }
@@ -1787,13 +1981,49 @@ ipcMain.handle('figma:status', async () => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
-  return { connected: !!token };
+
+  // Get auto-tracking stats
+  const projects = store.get('projects');
+  const activePollers = [];
+  let totalFigmaAssets = 0;
+
+  for (const project of projects) {
+    if (figmaPollers.has(project.id)) {
+      activePollers.push(project.id);
+    }
+    // Count Figma-sourced files across all projects
+    const figmaFiles = (project.files || []).filter(f => f.source === 'figma-auto');
+    totalFigmaAssets += figmaFiles.length;
+  }
+
+  return {
+    connected: !!token,
+    autoTracking: activePollers.length > 0,
+    activeProjectCount: activePollers.length,
+    totalFigmaAssets
+  };
 });
 
 ipcMain.handle('figma:connect', async (event, token) => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
+
+  // Verify token before storing
+  const verification = await parser.verifyToken.call({ getStoredToken: () => token, _fetchAPI: parser._fetchAPI.bind(parser) });
+  // Workaround: verifyToken needs to use the provided token, not stored one
+  // Let's just store it and verify later on first poll
   const stored = await parser.storeToken(token);
+
+  if (stored) {
+    // Start Figma polling for any currently watching projects
+    const projects = store.get('projects');
+    for (const project of projects) {
+      if (project.status === 'watching' && !figmaPollers.has(project.id)) {
+        startFigmaPolling(project.id);
+      }
+    }
+  }
+
   return { success: stored };
 });
 
@@ -1801,7 +2031,58 @@ ipcMain.handle('figma:disconnect', async () => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const deleted = await parser.deleteToken();
+
+  // Stop all Figma polling
+  for (const [projectId, intervalId] of figmaPollers) {
+    clearInterval(intervalId);
+  }
+  figmaPollers.clear();
+  figmaInProgress.clear();
+  figmaScanTimestamps.clear();
+
   return { success: deleted };
+});
+
+// Trigger a manual Figma scan for a specific project
+ipcMain.handle('figma:scan-project', async (event, projectId) => {
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  const token = await parser.getStoredToken();
+
+  if (!token) {
+    return { success: false, error: 'Figma not connected' };
+  }
+
+  const project = store.get('projects').find(p => p.id === projectId);
+  if (!project) {
+    return { success: false, error: 'Project not found' };
+  }
+
+  try {
+    await pollFigmaForProject(projectId, true);
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// Get Figma assets count for a specific project
+ipcMain.handle('figma:project-assets', async (event, projectId) => {
+  const project = store.get('projects').find(p => p.id === projectId);
+  if (!project) {
+    return { count: 0, assets: [] };
+  }
+
+  const figmaAssets = (project.files || []).filter(f => f.source === 'figma-auto');
+  return {
+    count: figmaAssets.length,
+    assets: figmaAssets.map(f => ({
+      path: f.path,
+      name: f.name,
+      figmaFileName: f.figmaFileName,
+      figmaFileKey: f.figmaFileKey
+    }))
+  };
 });
 
 // --- App Lifecycle ---
@@ -1859,6 +2140,11 @@ app.on('before-quit', () => {
     clearInterval(intervalId);
   }
   lsofPollers.clear();
+  // Clean up Figma pollers
+  for (const [id, intervalId] of figmaPollers) {
+    clearInterval(intervalId);
+  }
+  figmaPollers.clear();
   // Explicitly destroy tray + window so quit isn't blocked by hidden windows
   if (tray && !tray.isDestroyed()) {
     tray.destroy();

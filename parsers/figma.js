@@ -395,6 +395,296 @@ class FigmaParser extends BaseParser {
   static get displayName() {
     return 'Figma';
   }
+
+  // =========================================================================
+  // AUTO-TRACKING: Discover all Figma files the user has access to
+  // =========================================================================
+
+  /**
+   * Verify the stored token is valid and get user info.
+   * @returns {Promise<{valid: boolean, user?: {id: string, handle: string, email: string}}>}
+   */
+  async verifyToken() {
+    const token = await this.getStoredToken();
+    if (!token) return { valid: false };
+
+    if (!fetch) return { valid: false, error: 'node-fetch not installed' };
+
+    try {
+      const userData = await this._fetchAPI('/me', token);
+      return {
+        valid: true,
+        user: {
+          id: userData.id,
+          handle: userData.handle,
+          email: userData.email
+        }
+      };
+    } catch (e) {
+      return { valid: false, error: e.message };
+    }
+  }
+
+  /**
+   * Get all teams the user belongs to.
+   * @returns {Promise<Array<{id: string, name: string}>>}
+   */
+  async getUserTeams() {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return [];
+
+    try {
+      const userData = await this._fetchAPI('/me', token);
+      // The /me endpoint returns team_id for personal team
+      // We need to query teams via /v1/teams/:team_id for each team
+      const teams = [];
+
+      // Get user's teams - Figma API v1 doesn't have a direct "list my teams" endpoint
+      // but we can get team info from user's team_id
+      if (userData.team_id) {
+        try {
+          const teamData = await this._fetchAPI(`/teams/${userData.team_id}`, token);
+          if (teamData && teamData.name) {
+            teams.push({ id: userData.team_id, name: teamData.name });
+          }
+        } catch (e) {
+          // Team may not exist or user doesn't have access
+        }
+      }
+
+      return teams;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * Get all projects in a team.
+   * @param {string} teamId
+   * @returns {Promise<Array<{id: string, name: string}>>}
+   */
+  async getTeamProjects(teamId) {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return [];
+
+    try {
+      const data = await this._fetchAPI(`/teams/${teamId}/projects`, token);
+      return (data.projects || []).map(p => ({ id: p.id, name: p.name }));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * Get all files in a project.
+   * @param {string} projectId
+   * @returns {Promise<Array<{key: string, name: string, lastModified: string, thumbnailUrl: string}>>}
+   */
+  async getProjectFiles(projectId) {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return [];
+
+    try {
+      const data = await this._fetchAPI(`/projects/${projectId}/files`, token);
+      return (data.files || []).map(f => ({
+        key: f.key,
+        name: f.name,
+        lastModified: f.last_modified,
+        thumbnailUrl: f.thumbnail_url
+      }));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * Discover ALL Figma files the user has worked on recently.
+   * Scans all teams → projects → files and returns files modified within the time window.
+   *
+   * @param {Object} options
+   * @param {number} [options.sinceMs] - Only include files modified after this timestamp (ms)
+   * @param {number} [options.maxAgeDays=7] - If sinceMs not provided, look back this many days
+   * @returns {Promise<Array<{key: string, name: string, lastModified: string, projectName: string, teamName: string}>>}
+   */
+  async discoverRecentFiles(options = {}) {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return [];
+
+    const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
+    const recentFiles = [];
+
+    try {
+      // Get user data to find their teams
+      const userData = await this._fetchAPI('/me', token);
+
+      // Approach: Fetch user's recent files through multiple methods
+      // Method 1: Try /v1/me endpoint's linked teams
+      const teamsToScan = new Set();
+
+      if (userData.team_id) {
+        teamsToScan.add(userData.team_id);
+      }
+
+      // Scan each team
+      for (const teamId of teamsToScan) {
+        let teamName = 'Personal';
+        try {
+          const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
+          teamName = teamData.name || teamName;
+        } catch (e) {
+          // Use default team name
+        }
+
+        // Get projects in team
+        let projects = [];
+        try {
+          const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
+          projects = projectsData.projects || [];
+        } catch (e) {
+          continue; // Skip team if can't access projects
+        }
+
+        // Get files in each project
+        for (const project of projects) {
+          try {
+            const filesData = await this._fetchAPI(`/projects/${project.id}/files`, token);
+            const files = filesData.files || [];
+
+            for (const file of files) {
+              const lastModifiedMs = new Date(file.last_modified).getTime();
+              if (lastModifiedMs >= sinceMs) {
+                recentFiles.push({
+                  key: file.key,
+                  name: file.name,
+                  lastModified: file.last_modified,
+                  lastModifiedMs,
+                  thumbnailUrl: file.thumbnail_url,
+                  projectId: project.id,
+                  projectName: project.name,
+                  teamId,
+                  teamName
+                });
+              }
+            }
+          } catch (e) {
+            // Skip project on error
+          }
+        }
+      }
+
+      // Sort by most recently modified first
+      recentFiles.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+
+      return recentFiles;
+    } catch (e) {
+      console.error('[crate][figma] discoverRecentFiles error:', e.message);
+      return [];
+    }
+  }
+
+  /**
+   * Extract image assets from a Figma file by its key.
+   * Returns CDN URLs that can be downloaded.
+   *
+   * @param {string} fileKey - Figma file key
+   * @returns {Promise<Array<{url: string, nodeId: string, name: string}>>}
+   */
+  async extractAssetsFromFileKey(fileKey) {
+    const token = await this.getStoredToken();
+    if (!token || !fetch) return [];
+
+    try {
+      // Fetch file structure
+      const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
+
+      // Find all exportable nodes
+      const imageNodeIds = [];
+      const nodeNames = {};
+      this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
+
+      if (imageNodeIds.length === 0) return [];
+
+      const assets = [];
+
+      // Request image exports (batch, max 500 per request)
+      const batches = this._chunkArray(imageNodeIds, 500);
+
+      for (const batch of batches) {
+        try {
+          const imagesData = await this._fetchAPI(
+            `/images/${fileKey}?ids=${batch.join(',')}&format=png&scale=2`,
+            token
+          );
+
+          if (imagesData.images) {
+            for (const [nodeId, url] of Object.entries(imagesData.images)) {
+              if (url) {
+                assets.push({
+                  url,
+                  nodeId,
+                  name: nodeNames[nodeId] || nodeId,
+                  fileKey,
+                  source: 'figma-auto'
+                });
+              }
+            }
+          }
+        } catch (err) {
+          // Continue with other batches
+        }
+      }
+
+      return assets;
+    } catch (e) {
+      console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
+      return [];
+    }
+  }
+
+  /**
+   * Full auto-tracking scan: discover recent files and extract assets.
+   * This is the main entry point for the auto-tracking feature.
+   *
+   * @param {Object} options
+   * @param {number} [options.sinceMs] - Only scan files modified after this timestamp
+   * @param {number} [options.maxAgeDays=7] - Fallback: look back this many days
+   * @param {number} [options.maxFiles=20] - Maximum number of files to process
+   * @returns {Promise<{files: Array, assets: Array, errors: Array}>}
+   */
+  async autoTrackScan(options = {}) {
+    const result = { files: [], assets: [], errors: [] };
+
+    // Verify token first
+    const tokenStatus = await this.verifyToken();
+    if (!tokenStatus.valid) {
+      result.errors.push('Figma token invalid or not set');
+      return result;
+    }
+
+    // Discover recent files
+    const files = await this.discoverRecentFiles({
+      sinceMs: options.sinceMs,
+      maxAgeDays: options.maxAgeDays || 7
+    });
+
+    result.files = files.slice(0, options.maxFiles || 20);
+
+    // Extract assets from each file
+    for (const file of result.files) {
+      try {
+        const assets = await this.extractAssetsFromFileKey(file.key);
+        for (const asset of assets) {
+          asset.figmaFileName = file.name;
+          asset.figmaFileKey = file.key;
+          result.assets.push(asset);
+        }
+      } catch (e) {
+        result.errors.push(`Error extracting from ${file.name}: ${e.message}`);
+      }
+    }
+
+    return result;
+  }
 }
 
 module.exports = { FigmaParser };

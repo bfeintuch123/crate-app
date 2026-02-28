@@ -40,10 +40,12 @@ contextBridge.exposeInMainWorld('crate', {
   v2PackageFile: (filePath) => ipcRenderer.invoke('v2:package-file', filePath),
   v2GetSupportedExtensions: () => ipcRenderer.invoke('v2:supported-extensions'),
 
-  // Figma Integration
+  // Figma Integration (Auto-Tracking)
   getFigmaStatus: () => ipcRenderer.invoke('figma:status'),
   connectFigma: (token) => ipcRenderer.invoke('figma:connect', token),
   disconnectFigma: () => ipcRenderer.invoke('figma:disconnect'),
+  scanFigmaProject: (projectId) => ipcRenderer.invoke('figma:scan-project', projectId),
+  getFigmaProjectAssets: (projectId) => ipcRenderer.invoke('figma:project-assets', projectId),
 
   // Events from main
   onFilesUpdated: (callback) => {
