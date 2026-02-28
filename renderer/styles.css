@@ -940,10 +940,6 @@ body {
   gap: 10px;
 }
 
-.modal-actions-vertical {
-  flex-direction: column;
-  gap: 8px;
-}
 
 .modal-btn-primary {
   flex: 1;
@@ -1034,8 +1030,7 @@ body {
   word-break: break-all;
 }
 
-/* Inactivity / Confirm Modals */
-.inactivity-title,
+/* Confirm Modals */
 .confirm-title {
   font-family: 'Playfair Display', serif;
   font-size: 18px;
@@ -1044,7 +1039,6 @@ body {
   margin-bottom: 8px;
 }
 
-.inactivity-desc,
 .confirm-desc {
   font-size: 13px;
   color: var(--gray-500);

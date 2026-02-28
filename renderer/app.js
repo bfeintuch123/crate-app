@@ -382,17 +382,14 @@ function renderPendingFiles(project) {
 }
 
 function getFileEmoji(ext) {
-  const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.tiff', '.bmp', '.ico'];
-  const designExts = ['.psd', '.ai', '.sketch', '.fig', '.xd', '.indd', '.eps', '.afdesign'];
-  const pdfExts = ['.pdf'];
-  const docExts = ['.doc', '.docx', '.txt', '.rtf', '.pages', '.odt'];
+  const visualExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.tiff', '.bmp', '.ico',
+                      '.psd', '.ai', '.sketch', '.fig', '.xd', '.indd', '.eps', '.afdesign'];
+  const docExts = ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.pages', '.odt'];
   const fontExts = ['.otf', '.ttf', '.woff', '.woff2'];
   const videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
   const audioExts = ['.mp3', '.wav', '.aac', '.flac', '.ogg'];
 
-  if (imageExts.includes(ext)) return '\uD83D\uDDBC';
-  if (designExts.includes(ext)) return '\uD83D\uDDBC';
-  if (pdfExts.includes(ext)) return '\uD83D\uDCC4';
+  if (visualExts.includes(ext)) return '\uD83D\uDDBC';
   if (docExts.includes(ext)) return '\uD83D\uDCC4';
   if (fontExts.includes(ext)) return '\uD83D\uDD24';
   if (videoExts.includes(ext)) return '\uD83C\uDFAC';
@@ -455,6 +452,46 @@ async function renderFooter() {
 }
 
 // ===== Package Flow =====
+
+// Shared: run pre-scan with 12s timeout
+async function runPreScanWithTimeout(projectId) {
+  const scanResult = await Promise.race([
+    window.crate.preScanSession(projectId),
+    new Promise(resolve => setTimeout(() => resolve(null), 12000))
+  ]);
+  if (scanResult) {
+    state.projects = await window.crate.getProjects();
+  }
+}
+
+// Shared: handle package result (error, success, refresh)
+async function handlePackageResult(result) {
+  $('#modal-progress').classList.add('hidden');
+
+  if (result.error === 'limit_reached') {
+    $('#upgrade-days-left').textContent = result.daysLeft;
+    $('#modal-upgrade').classList.remove('hidden');
+    return false;
+  }
+
+  if (result.error) {
+    alert('Error packaging: ' + result.error);
+    return false;
+  }
+
+  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
+  $('#success-path').textContent = result.folderPath;
+  state.lastPackagedPath = result.folderPath;
+  $('#modal-success').classList.remove('hidden');
+
+  state.projects = await window.crate.getProjects();
+  state.usage = await window.crate.getUsage();
+  renderFiles();
+  renderFooter();
+  return true;
+}
+
 function showPackageModal() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) return;
@@ -501,15 +538,7 @@ async function confirmPackage() {
   $('#modal-package').classList.add('hidden');
   $('#modal-progress').classList.remove('hidden');
 
-  // Run pre-scan now (user already confirmed, progress spinner is showing)
-  // FIX 2 (C2): Increased timeout from 5s to 12s to accommodate scan + package coordination
-  const scanResult = await Promise.race([
-    window.crate.preScanSession(project.id),
-    new Promise(resolve => setTimeout(() => resolve(null), 12000))
-  ]);
-  if (scanResult) {
-    state.projects = await window.crate.getProjects();
-  }
+  await runPreScanWithTimeout(project.id);
 
   let outputPath = state.packageOutputPath;
   if (!outputPath) {
@@ -522,32 +551,7 @@ async function confirmPackage() {
   }
 
   const result = await window.crate.packageProject(project.id, outputPath);
-
-  $('#modal-progress').classList.add('hidden');
-
-  if (result.error === 'limit_reached') {
-    $('#upgrade-days-left').textContent = result.daysLeft;
-    $('#modal-upgrade').classList.remove('hidden');
-    return;
-  }
-
-  if (result.error) {
-    alert('Error packaging: ' + result.error);
-    return;
-  }
-
-  // Show success
-  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
-  $('#success-path').textContent = result.folderPath;
-  state.lastPackagedPath = result.folderPath;
-  $('#modal-success').classList.remove('hidden');
-
-  // Refresh data
-  state.projects = await window.crate.getProjects();
-  state.usage = await window.crate.getUsage();
-  renderFiles();
-  renderFooter();
+  await handlePackageResult(result);
 }
 
 // ===== Delete Project =====
@@ -812,53 +816,20 @@ function setupMainProcessListeners() {
   });
 
   // Handle "Package Now" from inactivity dialog
-  // FIX 5 (H4): Run pre-scan before packaging, handle errors, show progress/success modals
   window.crate.onPackageTrigger(async (data) => {
     const project = state.projects.find(p => p.id === data.projectId);
-    if (project) {
-      state.selectedProjectId = data.projectId;
-      const outputPath = await window.crate.selectOutputFolder();
-      if (outputPath) {
-        $('#modal-progress').classList.remove('hidden');
+    if (!project) return;
 
-        // Run pre-scan with 12s timeout (same as confirmPackage)
-        const scanResult = await Promise.race([
-          window.crate.preScanSession(data.projectId),
-          new Promise(resolve => setTimeout(() => resolve(null), 12000))
-        ]);
-        if (scanResult) {
-          state.projects = await window.crate.getProjects();
-        }
+    state.selectedProjectId = data.projectId;
+    const outputPath = await window.crate.selectOutputFolder();
+    if (!outputPath) return;
 
-        const result = await window.crate.packageProject(data.projectId, outputPath);
+    $('#modal-progress').classList.remove('hidden');
+    await runPreScanWithTimeout(data.projectId);
 
-        $('#modal-progress').classList.add('hidden');
-
-        if (result.error === 'limit_reached') {
-          $('#upgrade-days-left').textContent = result.daysLeft;
-          $('#modal-upgrade').classList.remove('hidden');
-          return;
-        }
-
-        if (result.error) {
-          alert('Error packaging: ' + result.error);
-          return;
-        }
-
-        // Show success
-        const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
-        $('#success-path').textContent = result.folderPath;
-        state.lastPackagedPath = result.folderPath;
-        $('#modal-success').classList.remove('hidden');
-
-        state.projects = await window.crate.getProjects();
-        state.usage = await window.crate.getUsage();
-        renderProjects();
-        renderFiles();
-        renderFooter();
-      }
-    }
+    const result = await window.crate.packageProject(data.projectId, outputPath);
+    const success = await handlePackageResult(result);
+    if (success) renderProjects();
   });
 }
 

@@ -104,24 +104,9 @@ function getParserInfo(extOrPath) {
 
   if (!ParserClass) return null;
 
-  // Check if the parser is a stub by trying to create and call it
-  let implemented = true;
-  try {
-    const instance = new ParserClass();
-    // If extractAssets throws an Error that says "not yet implemented" or "requires:",
-    // it's a stub
-    // We can't actually call it here, so check for known stub classes
-    if (ParserClass === PSDParser || ParserClass === AfterEffectsParser || ParserClass === FigmaParser) {
-      implemented = false;
-    }
-  } catch (e) {
-    implemented = false;
-  }
-
   return {
     displayName: ParserClass.displayName,
-    extensions: ParserClass.extensions,
-    implemented
+    extensions: ParserClass.extensions
   };
 }
 
