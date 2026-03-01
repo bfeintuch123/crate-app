@@ -1210,3 +1210,108 @@ body {
 .btn-reject-pending:hover {
   opacity: 0.8;
 }
+
+/* ===== Figma Settings ===== */
+.figma-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--black);
+}
+
+.figma-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--gray-300);
+}
+
+.figma-status-dot.connected {
+  background: #22c55e;
+}
+
+.figma-setup-steps {
+  background: var(--gray-50);
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.figma-step {
+  font-size: 12px;
+  color: var(--gray-600);
+  margin-bottom: 4px;
+  line-height: 1.5;
+}
+
+.figma-step:last-child {
+  margin-bottom: 0;
+}
+
+.figma-step strong {
+  color: var(--black);
+}
+
+/* Figma Auto-Tracking Info */
+.figma-tracking-info {
+  display: flex;
+  gap: 16px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  background: var(--green-light);
+  border: 1px solid var(--green-border);
+  border-radius: 8px;
+}
+
+.figma-tracking-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.figma-tracking-label {
+  font-size: 10px;
+  color: var(--gray-500);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.figma-tracking-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--green-text);
+}
+
+.figma-auto-info {
+  background: var(--gray-50);
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 8px;
+}
+
+.figma-auto-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green-text);
+  margin-bottom: 4px;
+}
+
+.figma-auto-desc {
+  font-size: 11px;
+  color: var(--gray-500);
+  line-height: 1.5;
+}
+
+.figma-benefit-hint {
+  font-size: 11px;
+  color: var(--gray-500);
+  margin-top: 10px;
+  line-height: 1.5;
+}
+
+.figma-benefit-hint strong {
+  color: var(--black);
+}

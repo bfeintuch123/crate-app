@@ -35,6 +35,17 @@ contextBridge.exposeInMainWorld('crate', {
   acceptPending: (projectId, filePath) => ipcRenderer.invoke('projects:accept-pending', projectId, filePath),
   rejectPending: (projectId, filePath) => ipcRenderer.invoke('projects:reject-pending', projectId, filePath),
 
+  // Figma Integration (Auto-Tracking)
+  getFigmaStatus: () => ipcRenderer.invoke('figma:status'),
+  connectFigma: (token) => ipcRenderer.invoke('figma:connect', token),
+  disconnectFigma: () => ipcRenderer.invoke('figma:disconnect'),
+  scanFigmaProject: (projectId) => ipcRenderer.invoke('figma:scan-project', projectId),
+  getFigmaProjectAssets: (projectId) => ipcRenderer.invoke('figma:project-assets', projectId),
+  addFigmaTrackedFile: (url) => ipcRenderer.invoke('figma:add-tracked-file', url),
+  removeFigmaTrackedFile: (fileKey) => ipcRenderer.invoke('figma:remove-tracked-file', fileKey),
+  setFigmaTeamId: (teamUrl) => ipcRenderer.invoke('figma:set-team-id', teamUrl),
+  removeFigmaTeamId: (teamId) => ipcRenderer.invoke('figma:remove-team-id', teamId),
+
   // Events from main
   onFilesUpdated: (callback) => {
     ipcRenderer.on('files:updated', (event, data) => callback(data));
@@ -47,5 +58,8 @@ contextBridge.exposeInMainWorld('crate', {
   },
   onPendingFilesUpdated: (callback) => {
     ipcRenderer.on('files:pending', (event, data) => callback(data));
+  },
+  onFigmaAuthError: (callback) => {
+    ipcRenderer.on('figma:auth-error', (event, data) => callback(data));
   },
 });

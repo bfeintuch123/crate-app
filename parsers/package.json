@@ -1,0 +1,17 @@
+{
+  "name": "parsers",
+  "version": "1.0.0",
+  "description": "Modular parser system for extracting linked/embedded assets from design files.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "psd": "^3.4.0"
+  }
+}
