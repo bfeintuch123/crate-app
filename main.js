@@ -1394,17 +1394,32 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
       }
     }
 
-    // v1.3.25: kMDItemLastUsedDate scan for branding projects.
-    // Walk Desktop/Documents/Downloads (depth 3) and check Spotlight's
-    // kMDItemLastUsedDate for design files opened during this session.
-    // This catches files opened in design apps that chokidar/lsof missed
-    // (e.g. files already on disk that were opened but not modified).
-    // v1.3.26: Also covers .fig files — the mtime-based scan above only
-    // catches .fig files modified/created during the session, but a
-    // pre-existing .fig file opened (imported) in Figma only updates
-    // kMDItemLastUsedDate, not mtime. Removing the .fig skip lets this
-    // scan catch those imports. Dedup via existingPaths prevents doubles.
-    for (const dir of scanDirs) {
+      })(),
+      new Promise(resolve => setTimeout(resolve, 8000))
+    ]);
+
+  }
+
+  // v2.2.1: kMDItemLastUsedDate scan — runs for ALL project types.
+  // Walk Desktop/Documents/Downloads (depth 3) and check Spotlight's
+  // kMDItemLastUsedDate for design files opened during this session.
+  // This catches files opened in design apps that chokidar/lsof missed
+  // (e.g. files already on disk that were opened but not modified).
+  // Previously branding-only (v1.3.25); now universal so print, web,
+  // and presentation projects also benefit from the package-time scan.
+  {
+    const homedir = os.homedir();
+    const lastUsedScanDirs = [
+      path.join(homedir, 'Desktop'),
+      path.join(homedir, 'Documents'),
+      path.join(homedir, 'Downloads'),
+    ];
+    const watchStart = project.watchStartedAt || project.createdAt;
+    const existingPaths = new Set(project.files.map(f => f.path));
+
+    await Promise.race([
+      (async () => {
+    for (const dir of lastUsedScanDirs) {
       try {
         if (!fs.existsSync(dir)) continue;
         const scanFolderLastUsed = async (folder, depth) => {
@@ -1462,7 +1477,6 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
       })(),
       new Promise(resolve => setTimeout(resolve, 8000))
     ]);
-
   }
 
   // v1.3.39: AppleScript query to Illustrator for linked files.
