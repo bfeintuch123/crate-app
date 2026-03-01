@@ -185,7 +185,7 @@ const store = new Store({
     projects: [],
     settings: {
       namingTemplate: '{Project}_{Date}',
-      notifications: false
+      notifications: true
     },
     usage: {
       packagesThisMonth: 0,
@@ -283,6 +283,13 @@ function getRunningDesignAppPids(projectType, callback) {
       }
     }
     callback(pids);
+  });
+}
+
+// Async wrapper around getRunningDesignAppPids for use in chokidar handlers
+async function getDesignAppPids(projectType) {
+  return new Promise((resolve) => {
+    getRunningDesignAppPids(projectType, (pids) => resolve(pids));
   });
 }
 
@@ -930,6 +937,33 @@ async function startWatching(projectId) {
     await new Promise(resolve => setTimeout(resolve, 500));
 
     if (DESIGN_FILE_EXTENSIONS.has(ext)) {
+      // lsof security gate: verify a design app actually has this file open
+      const proj = store.get('projects').find(p => p.id === projectId);
+      if (proj) {
+        const pids = await getDesignAppPids(proj.type);
+        if (pids.length > 0) {
+          let isOpen = false;
+          try {
+            const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
+            const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
+            isOpen = openFiles.includes(filePath);
+          } catch (e) { /* lsof failed, skip */ }
+
+          if (!isOpen) {
+            // Retry once after 2s — design app may still be opening the file
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
+              const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
+              isOpen = openFiles.includes(filePath);
+            } catch (e) { /* skip */ }
+          }
+
+          if (!isOpen) return; // Design app never opened it — silently skip
+        }
+        // If no design apps running (pids.length === 0), fall through and add normally
+      }
+
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
@@ -959,6 +993,33 @@ async function startWatching(projectId) {
     await new Promise(resolve => setTimeout(resolve, 500));
 
     if (DESIGN_FILE_EXTENSIONS.has(ext)) {
+      // lsof security gate: verify a design app actually has this file open
+      const proj = store.get('projects').find(p => p.id === projectId);
+      if (proj) {
+        const pids = await getDesignAppPids(proj.type);
+        if (pids.length > 0) {
+          let isOpen = false;
+          try {
+            const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
+            const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
+            isOpen = openFiles.includes(filePath);
+          } catch (e) { /* lsof failed, skip */ }
+
+          if (!isOpen) {
+            // Retry once after 2s — design app may still be opening the file
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
+              const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
+              isOpen = openFiles.includes(filePath);
+            } catch (e) { /* skip */ }
+          }
+
+          if (!isOpen) return; // Design app never opened it — silently skip
+        }
+        // If no design apps running (pids.length === 0), fall through and add normally
+      }
+
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
