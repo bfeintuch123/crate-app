@@ -10,6 +10,8 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
 const os = require('os');
+const { readPsd } = require('ag-psd');
+const fetch = require('node-fetch');
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -31,11 +33,16 @@ async function getXattrLastUsedMs(filePath) {
 }
 
 function deduplicateFiles(files) {
-  // Pass 1: exact path dedup
+  // v2.4.0: Normalize paths before comparing — resolve to absolute, lowercase
+  // for case-insensitive macOS filesystem, strip trailing slashes.
+  const normalizePath = (p) => path.resolve(p).replace(/\/+$/, '').toLowerCase();
+
+  // Pass 1: normalized path dedup (catches case/trailing-slash/relative variants)
   const seenPaths = new Set();
   const pathDeduped = files.filter(f => {
-    if (seenPaths.has(f.path)) return false;
-    seenPaths.add(f.path);
+    const norm = normalizePath(f.path);
+    if (seenPaths.has(norm)) return false;
+    seenPaths.add(norm);
     return true;
   });
 
@@ -82,15 +89,14 @@ const DESIGN_APP_BUNDLE_IDS = new Set([
   'com.apple.Preview'
 ]);
 
-// Design-relevant file extensions — captured by chokidar when they land in watched dirs.
-// v1.3.5: Added common image formats. Designers downloading assets while a session is
-// active are almost certainly downloading them for the project. The session-active window
-// provides sufficient context — no need for app-creator checks on these formats.
+// Design-relevant file extensions — the full set used by lsof polling and scan-on-open.
+// v2.2.6: chokidar 'add'/'change' handlers now only act on PRIMARY_DESIGN_EXTENSIONS.
+// Image/media/font/pdf files are captured exclusively by lsof polling, which is reliable.
 const DESIGN_FILE_EXTENSIONS = new Set([
   // Native design app formats
   '.psd', '.ai', '.indd', '.idml', '.sketch', '.fig', '.xd',
   '.afdesign', '.afphoto', '.afpub',
-  '.procreate',
+  // .procreate removed — no parser exists (zip archive with proprietary binary)
   // Vector / structured graphics
   '.svg', '.eps',
   // Common image formats — captured during active watch sessions
@@ -101,6 +107,22 @@ const DESIGN_FILE_EXTENSIONS = new Set([
   '.ttf', '.otf', '.woff', '.woff2',
   // Documents
   '.pdf',
+]);
+
+// Primary design source files — the ONLY extensions captured by chokidar 'add'/'change'.
+// All other file types (images, video, audio, pdf, svg, fonts) are captured exclusively
+// by lsof polling, which correctly detects when a design app actually opens them.
+const PRIMARY_DESIGN_EXTENSIONS = new Set([
+  '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
+  '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.pxd',
+]);
+
+// v2.3.2: Image/media extensions captured by chokidar ONLY when a design app is running.
+// Restores Photoshop drag-and-embed capture (macOS records no lsof/mtime for embedded images)
+// while avoiding false positives from Finder thumbnail generation.
+const CHOKIDAR_IMAGE_EXTENSIONS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
+  '.svg', '.eps', '.pdf', '.mp4', '.mov', '.m4v',
 ]);
 
 // Project type → relevant bundle IDs (for isDesignAppFile type-aware filtering)
@@ -150,6 +172,7 @@ function getFileCreatorApp(filePath) {
 
 // projectType: optional — if provided, Check 1 is scoped to that type's app list.
 // Extension fallback (Check 2) always applies regardless of type.
+// Renderer-callable utility — may be invoked via IPC from the renderer process
 function isDesignAppFile(filePath, projectType = null) {
   const ext = path.extname(filePath).toLowerCase();
 
@@ -170,8 +193,63 @@ function isDesignAppFile(filePath, projectType = null) {
   return false;
 }
 
+// Async Check-1-only variant: verifies the file was created/last-used by a known
+// design app (via mdls). Does NOT fall back to extension matching — used by the
+// chokidar 'add' handler to reject files that merely have a design extension but
+// were never touched by a design app (e.g. browser downloads).
+// Renderer-callable utility — may be invoked via IPC from the renderer process
+async function isCreatedByDesignApp(filePath, projectType = null) {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemCreatorApplicationIdentifier", "-raw", filePath], {
+      timeout: 2000, encoding: 'utf8'
+    });
+    const creatorApp = stdout.trim();
+    if (!creatorApp || creatorApp === '(null)') return false;
+    const relevantApps = (projectType && PROJECT_TYPE_APPS[projectType])
+      ? PROJECT_TYPE_APPS[projectType]
+      : DESIGN_APP_BUNDLE_IDS;
+    return relevantApps.has(creatorApp);
+  } catch (e) {
+    return false;
+  }
+}
+
+// v2.2.5: Real-time check — is a design app currently holding this file open?
+// Uses lsof to get PIDs with the file open, then cross-references with ps
+// to identify design app processes (avoids lsof COMMAND truncation issues).
+// Renderer-callable utility — may be invoked via IPC from the renderer process
+async function isFileOpenByDesignApp(filePath) {
+  try {
+    const { stdout: lsofOut } = await execFileAsync('/usr/sbin/lsof', ['-F', 'p', filePath], {
+      timeout: 3000, encoding: 'utf8'
+    });
+    if (!lsofOut || !lsofOut.trim()) return false;
+    const filePids = new Set();
+    for (const line of lsofOut.trim().split('\n')) {
+      if (line.startsWith('p')) filePids.add(parseInt(line.substring(1)));
+    }
+    if (filePids.size === 0) return false;
+    const { stdout: psOut } = await execFileAsync('/bin/ps', ['ax', '-o', 'pid=', '-o', 'command='], {
+      timeout: 5000, encoding: 'utf8'
+    });
+    if (!psOut) return false;
+    const allKeywords = Object.values(DESIGN_APP_PROCESS_NAMES).flat();
+    for (const line of psOut.trim().split('\n')) {
+      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = parseInt(m[1]);
+      if (!filePids.has(pid)) continue;
+      if (allKeywords.some(kw => m[2].includes(kw))) return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Inactivity threshold — configurable constant
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024; // 300MB — guard against OOM on huge PSD/AI files
 const MAX_PROJECTS = 7;
 
 // Single instance lock
@@ -185,7 +263,7 @@ const store = new Store({
     projects: [],
     settings: {
       namingTemplate: '{Project}_{Date}',
-      notifications: true
+      notifications: false
     },
     usage: {
       packagesThisMonth: 0,
@@ -220,9 +298,15 @@ function checkAndResetUsage() {
   }
 }
 
+// v2.4.2: Validated accessor — always returns an array even if store is corrupted/missing
+function getProjects() {
+  const val = store.get('projects', []);
+  return Array.isArray(val) ? val : [];
+}
+
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
 function mutateProject(projectId, fn) {
-  const projects = store.get('projects');
+  const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
   const result = fn(project, projects);
@@ -254,6 +338,7 @@ function cleanName(s) {
 
 const lsofPollers = new Map();   // projectId -> setInterval id
 const lsofInProgress = new Set(); // projectIds currently mid-poll (prevent overlap)
+const designAppRunningCache = new Map(); // v2.4.2: per-project, keyed by projectId
 
 // --- Figma Auto-Tracking ---
 const figmaPollers = new Map();    // projectId -> setInterval id
@@ -262,6 +347,19 @@ const figmaInProgress = new Set(); // projectIds currently mid-poll
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
+
+// --- Photoshop + InDesign Polling (v2.3.0) ---
+const psPollers = new Map();          // projectId -> setInterval id
+const psPollerStarting = new Set();   // guard: projectIds with initial poll in progress
+const psInProgress = new Set();       // projectIds currently mid-poll
+const PS_POLL_INTERVAL_MS = 3000;     // 3 seconds
+
+// --- PSD binary parser debounce (v2.3.6) ---
+const psdParseDebounce = new Map();   // psdFilePath -> lastParsedTimestamp
+
+// --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
+const lastUsedPollers = new Map();    // projectId -> intervalId
+const LAST_USED_POLL_MS = 10000;      // 10 seconds
 
 // Get PIDs of running design apps relevant to a project type.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
@@ -286,25 +384,19 @@ function getRunningDesignAppPids(projectType, callback) {
   });
 }
 
-// Async wrapper around getRunningDesignAppPids for use in chokidar handlers
-async function getDesignAppPids(projectType) {
-  return new Promise((resolve) => {
-    getRunningDesignAppPids(projectType, (pids) => resolve(pids));
-  });
-}
-
 // Poll lsof for a single watching project. Runs every LSOF_POLL_MS.
 // Finds files that design apps have open (reads + writes) in watched dirs → Tier 1 auto-capture.
 function pollLsofForProject(projectId) {
   if (lsofInProgress.has(projectId)) return; // skip if already running for this project
 
-  const currentProjects = store.get('projects');
+  const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
   if (!project || project.status !== 'watching') return;
 
   lsofInProgress.add(projectId);
 
   getRunningDesignAppPids(project.type, (pids) => {
+    designAppRunningCache.set(projectId, pids.length > 0); // v2.4.2: per-project
     if (pids.length === 0) {
       lsofInProgress.delete(projectId);
       return;
@@ -323,13 +415,90 @@ function pollLsofForProject(projectId) {
     // on its own line with a single-character tag prefix — no column alignment issues.
     //   p = PID, f = FD, t = file type, n = file name/path
     // We only need 't' (type) and 'n' (name) to filter and capture files.
-    const cmd = `/usr/sbin/lsof -F tn -p ${pidArg} 2>/dev/null`;
+    // v2.2.2: Include PID in lsof output for scan-on-open re-open detection.
+    const cmd = `/usr/sbin/lsof -F ptn -p ${pidArg} 2>/dev/null`;
 
     exec(cmd, { timeout: 12000 }, (err, stdout) => {
       lsofInProgress.delete(projectId);
       if (!stdout) return;
 
       const parsedLines = stdout.trim().split('\n');
+
+      // v2.2.2: Build a map of filePath -> Set<pid> from this poll cycle
+      // for scan-on-open re-open detection.
+      const currentPollFiles = new Map(); // filePath -> Set<pid>
+      let currentPid = null;
+      let currentType = null;
+
+      // First pass: collect all design files and their PIDs
+      for (const line of parsedLines) {
+        if (line.length === 0) continue;
+        const tag = line[0];
+        const value = line.slice(1);
+
+        if (tag === 'p') {
+          currentPid = parseInt(value);
+          currentType = null;
+          continue;
+        }
+        if (tag === 'f') { currentType = null; continue; }
+        if (tag === 't') { currentType = value; continue; }
+        if (tag !== 'n') continue;
+        if (currentType !== 'REG') { currentType = null; continue; }
+
+        const filePath = value;
+        currentType = null;
+
+        const ext = path.extname(filePath).toLowerCase();
+        if (SCAN_ON_OPEN_EXTENSIONS.has(ext) && currentPid) {
+          if (!currentPollFiles.has(filePath)) currentPollFiles.set(filePath, new Set());
+          currentPollFiles.get(filePath).add(currentPid);
+        }
+      }
+
+      // v2.2.2: Detect first-open and re-open for scan-on-open
+      if (!scannedDesignFiles.has(projectId)) scannedDesignFiles.set(projectId, new Set());
+      if (!designFilePids.has(projectId)) designFilePids.set(projectId, new Map());
+      const scanned = scannedDesignFiles.get(projectId);
+      const prevPids = designFilePids.get(projectId);
+
+      const filesToScan = [];
+      for (const [filePath, pids] of currentPollFiles) {
+        const wasScanned = scanned.has(filePath);
+        const prevFilePids = prevPids.get(filePath);
+
+        if (!wasScanned) {
+          // First time seeing this design file open → scan it
+          filesToScan.push(filePath);
+          scanned.add(filePath);
+        } else if (prevFilePids && prevFilePids.size === 0 && pids.size > 0) {
+          // File was closed (no PIDs last cycle) and re-opened → re-scan
+          filesToScan.push(filePath);
+        }
+      }
+
+      // Update PID tracking: mark files no longer open as having empty PID set
+      for (const [filePath, prevPidSet] of prevPids) {
+        if (!currentPollFiles.has(filePath)) {
+          // v2.2.3: Scan-on-close — re-scan file that just closed to catch final-save assets
+          if (prevPidSet.size > 0) {
+            runScanOnOpen(projectId, filePath).catch(() => {});
+          }
+          prevPids.set(filePath, new Set()); // closed
+        }
+      }
+      for (const [filePath, pids] of currentPollFiles) {
+        prevPids.set(filePath, pids);
+      }
+
+      // Fire-and-forget: run scan-on-open for newly detected design files
+      for (const filePath of filesToScan) {
+        runScanOnOpen(projectId, filePath).catch(() => {});
+      }
+
+      // Second pass: standard lsof file capture (same as before, minus mtime filter)
+      currentPid = null;
+      currentType = null;
 
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return { changed: false };
@@ -339,45 +508,37 @@ function pollLsofForProject(projectId) {
 
         let changed = false;
 
-        // -F output: each file descriptor produces a 't' line (type) then 'n' line (name).
-        // Walk the lines and pair each tTYPE with the nPATH that follows it.
-        let currentType = null;
-
         for (const line of parsedLines) {
           if (line.length === 0) continue;
           const tag = line[0];
           const value = line.slice(1);
 
           if (tag === 'p' || tag === 'f') {
-            // New PID or new FD — reset state
             currentType = null;
             continue;
           }
 
           if (tag === 't') {
-            currentType = value;  // e.g. "REG", "DIR", "CHR"
+            currentType = value;
             continue;
           }
 
-          if (tag !== 'n') continue;              // only process name lines
-          if (currentType !== 'REG') {            // regular files only
+          if (tag !== 'n') continue;
+          if (currentType !== 'REG') {
             currentType = null;
             continue;
           }
 
           const filePath = value;
-          currentType = null;                     // consumed — reset for next FD
+          currentType = null;
 
-          if (!filePath.startsWith(home + '/')) continue;      // must be in user home dir
-          // v1.3.27: Allow .fig files through ~/Library/ — Figma stores local files in
-          // ~/Library/Application Support/Figma/ and lsof needs to capture them.
+          if (!filePath.startsWith(home + '/')) continue;
           if (filePath.startsWith(home + '/Library/')) {
-            if (path.extname(filePath).toLowerCase() !== '.fig') continue; // skip app data/caches
+            if (path.extname(filePath).toLowerCase() !== '.fig') continue;
           }
-          if (filePath.includes('/.')) continue;               // skip hidden folders
-          if (filePath.includes('.app/Contents/')) continue;   // skip app bundles
+          if (filePath.includes('/.')) continue;
+          if (filePath.includes('.app/Contents/')) continue;
 
-          // v1.3.5: scope lsof by project type.
           const RESTRICTED_LSOF_TYPES = new Set(['presentation']);
           if (RESTRICTED_LSOF_TYPES.has(proj.type)) {
             const isInWatchedDir = filePath.startsWith(home + '/Desktop/') ||
@@ -386,28 +547,17 @@ function pollLsofForProject(projectId) {
             if (!isInWatchedDir) continue;
           }
 
-          if (existingPaths.has(filePath)) continue;           // already tracked
-          if (pendingPaths.has(filePath)) continue;            // already pending
+          if (existingPaths.has(filePath)) continue;
+          if (pendingPaths.has(filePath)) continue;
 
-          // v1.3.16: Skip Microsoft Office lock/temp files (e.g. '~$Presentation.pptx')
           if (path.basename(filePath).startsWith('~$')) continue;
 
-          // Filter to design-relevant extensions only.
           const ext = path.extname(filePath).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-          // v1.3.16: Skip lsof-captured files not modified during this watch session.
-          if (proj.type === 'presentation') {
-            try {
-              const stat = fs.statSync(filePath);
-              const watchStart = proj.watchStartedAt || proj.createdAt;
-              if (stat.mtimeMs < watchStart) continue;
-            } catch (e) {
-              continue; // can't stat → skip
-            }
-          }
+          // v2.2.2: Removed presentation mtime filter — old files on disk placed
+          // mid-session should be captured when opened by a design app.
 
-          // Tier 1: confirmed open by a design app with a relevant extension — auto-add
           const fileEntry = {
             path: filePath,
             name: path.basename(filePath),
@@ -471,9 +621,8 @@ function ensureFigmaAssetsDir() {
  * Download a Figma asset from CDN URL to local disk.
  * @returns {Promise<string|null>} Local file path or null on failure
  */
-async function downloadFigmaAsset(url, fileName, projectId) {
+async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
   try {
-    const fetch = require('node-fetch');
     const response = await fetch(url, { timeout: 30000 });
     if (!response.ok) return null;
 
@@ -486,9 +635,10 @@ async function downloadFigmaAsset(url, fileName, projectId) {
       fs.mkdirSync(projectDir, { recursive: true });
     }
 
-    // Sanitize filename
+    // v2.4.2: Use actual format from Figma API if available, fall back to png
+    const ext = format || 'png';
     const safeName = fileName.replace(/[^a-zA-Z0-9_\-.]/g, '_').substring(0, 100);
-    const localPath = path.join(projectDir, `${safeName}.png`);
+    const localPath = path.join(projectDir, `${safeName}.${ext}`);
 
     // Skip if already exists with same size
     if (fs.existsSync(localPath)) {
@@ -511,7 +661,7 @@ async function downloadFigmaAsset(url, fileName, projectId) {
 async function pollFigmaForProject(projectId, isInitialScan = false) {
   if (figmaInProgress.has(projectId)) return; // Prevent overlapping polls
 
-  const currentProjects = store.get('projects');
+  const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
   if (!project || project.status !== 'watching') return;
 
@@ -581,7 +731,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
 
     for (const asset of scanResult.assets) {
       const fileName = `${asset.figmaFileName}_${asset.name}`;
-      const localPath = await downloadFigmaAsset(asset.url, fileName, projectId);
+      const assetFormat = asset.format || 'png'; // v2.4.2: use actual format from Figma API
+      const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
 
       if (localPath && !existingPaths.has(localPath)) {
         // Add to project files using mutateProject
@@ -590,7 +741,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
           proj.files.push({
             path: localPath,
             name: path.basename(localPath),
-            ext: '.png',
+            ext: `.${assetFormat}`,
             addedAt: Date.now(),
             source: 'figma-auto',
             figmaFileKey: asset.figmaFileKey,
@@ -613,7 +764,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       inactivityNotified.delete(projectId);
 
       // Notify renderer
-      const updatedProject = store.get('projects').find(p => p.id === projectId);
+      const updatedProject = getProjects().find(p => p.id === projectId);
       if (updatedProject) {
         sendToRenderer('files:updated', { projectId, files: updatedProject.files });
       }
@@ -674,6 +825,895 @@ function stopFigmaPolling(projectId) {
   figmaPollerStarting.delete(projectId);
   figmaInProgress.delete(projectId);
   figmaScanTimestamps.delete(projectId);
+}
+
+// --- Photoshop + InDesign Polling (v2.3.0) ---
+
+// v2.3.4: Photoshop JS DOM script — 'do javascript' exposes embedded smart object
+// source paths via layer.smartObject.fileReference, which AppleScript cannot reach.
+const PS_DOJAVASCRIPT = `(function() {
+  var paths = [];
+  try {
+    for (var d = 0; d < app.documents.length; d++) {
+      var doc = app.documents[d];
+      collectLayers(doc.layers, paths);
+    }
+  } catch(e) {}
+  function collectLayers(layers, paths) {
+    for (var i = 0; i < layers.length; i++) {
+      var layer = layers[i];
+      try {
+        if (layer.kind === LayerKind.SMARTOBJECT) {
+          try {
+            var ref = layer.smartObject.fileReference;
+            if (ref && ref !== '') paths.push(ref);
+          } catch(e) {}
+        }
+      } catch(e) {}
+      try {
+        if (layer.layers && layer.layers.length > 0) {
+          collectLayers(layer.layers, paths);
+        }
+      } catch(e) {}
+    }
+  }
+  return paths.join('\\n');
+})();`;
+
+function psDoJavascriptAS(jsFilePath) {
+  return `tell application "Adobe Photoshop"
+  try
+    set jsFile to POSIX file "${jsFilePath}" as alias
+    set result to do javascript jsFile
+    return result
+  on error
+    return ""
+  end try
+end tell`;
+}
+
+const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
+  try
+    set pathList to {}
+    repeat with aDoc in every document
+      repeat with aLink in every link of aDoc
+        try
+          set fp to file path of aLink
+          if fp is not missing value then
+            set end of pathList to POSIX path of (fp as alias)
+          end if
+        end try
+      end repeat
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return pathList as text
+  on error
+    return ""
+  end try
+end tell`;
+
+/**
+ * Poll Photoshop and InDesign for open smart objects / linked assets (embedded + linked).
+ * Fires every 3 seconds; skips silently if neither app is running.
+ */
+async function pollPsForProject(projectId) {
+  if (psInProgress.has(projectId)) return;
+
+  const currentProjects = getProjects();
+  const project = currentProjects.find(p => p.id === projectId);
+  if (!project || project.status !== 'watching') return;
+
+  psInProgress.add(projectId);
+
+  try {
+    const discoveredPaths = [];
+
+    // --- Photoshop ---
+    const { stdout: psCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (psCheck.trim()) {
+      const jsPath = path.join(os.tmpdir(), `crate-ps-poll-${projectId}.js`);
+      const asPath = path.join(os.tmpdir(), `crate-ps-poll-${projectId}.applescript`);
+      try {
+        await fs.promises.writeFile(jsPath, PS_DOJAVASCRIPT, 'utf8');
+        await fs.promises.writeFile(asPath, psDoJavascriptAS(jsPath), 'utf8');
+        const { stdout: psOut } = await execAsync(
+          `/usr/bin/osascript "${asPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        );
+        for (const p of psOut.split('\n').filter(Boolean)) {
+          discoveredPaths.push({ filePath: p, source: 'ps-poll' });
+        }
+      } catch (e) {
+        // Photoshop may be busy or script timed out — skip silently
+      } finally {
+        try { fs.unlinkSync(jsPath); } catch (_) {}
+        try { fs.unlinkSync(asPath); } catch (_) {}
+      }
+    }
+
+    // --- InDesign ---
+    const { stdout: inddCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (inddCheck.trim()) {
+      const scriptPath = path.join(os.tmpdir(), `crate-indd-poll-${projectId}.applescript`);
+      try {
+        await fs.promises.writeFile(scriptPath, INDD_APPLESCRIPT, 'utf8');
+        const { stdout: inddOut } = await execAsync(
+          `/usr/bin/osascript "${scriptPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        );
+        for (const line of inddOut.split('\n')) {
+          const p = line.trim();
+          if (p) discoveredPaths.push({ filePath: p, source: 'indd-poll' });
+        }
+      } catch (e) {
+        // InDesign may be busy or script timed out — skip silently
+      } finally {
+        try { fs.unlinkSync(scriptPath); } catch (_) {}
+      }
+    }
+
+    if (discoveredPaths.length === 0) return;
+
+    // Deduplicate against existing project files
+    const existingPaths = new Set(project.files.map(f => f.path));
+    const newFiles = [];
+
+    for (const { filePath, source } of discoveredPaths) {
+      if (existingPaths.has(filePath)) continue;
+      const ext = path.extname(filePath).toLowerCase();
+      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      try {
+        fs.accessSync(filePath, fs.constants.R_OK);
+      } catch (_) {
+        continue; // File doesn't exist or not readable
+      }
+      newFiles.push({ filePath, source, ext });
+      existingPaths.add(filePath); // prevent dupes within this batch
+    }
+
+    if (newFiles.length === 0) return;
+
+    let addedCount = 0;
+    for (const { filePath, source, ext } of newFiles) {
+      const result = mutateProject(projectId, (proj) => {
+        if (proj.files.some(f => f.path === filePath)) return null;
+        proj.files.push({
+          path: filePath,
+          name: path.basename(filePath),
+          ext,
+          addedAt: Date.now(),
+          source,
+        });
+        proj.files = deduplicateFiles(proj.files);
+        return { files: proj.files };
+      });
+      if (result) addedCount++;
+    }
+
+    if (addedCount > 0) {
+      lastFileActivity.set(projectId, Date.now());
+      inactivityNotified.delete(projectId);
+
+      const updatedProject = getProjects().find(p => p.id === projectId);
+      if (updatedProject) {
+        sendToRenderer('files:updated', { projectId, files: updatedProject.files });
+      }
+      console.log(`[crate][ps-poll] Added ${addedCount} linked assets to project ${projectId}`);
+    }
+  } catch (e) {
+    console.error('[crate][ps-poll] pollPsForProject error:', e.message);
+  } finally {
+    psInProgress.delete(projectId);
+  }
+}
+
+/**
+ * Start Photoshop + InDesign polling for a project.
+ */
+async function startPsPolling(projectId) {
+  if (psPollers.has(projectId) || psPollerStarting.has(projectId)) return;
+  psPollerStarting.add(projectId);
+
+  try {
+    await pollPsForProject(projectId);
+  } finally {
+    psPollerStarting.delete(projectId);
+  }
+
+  if (psPollers.has(projectId)) return;
+
+  const intervalId = setInterval(() => {
+    pollPsForProject(projectId);
+  }, PS_POLL_INTERVAL_MS);
+
+  psPollers.set(projectId, intervalId);
+}
+
+/**
+ * Stop Photoshop + InDesign polling for a project.
+ */
+function stopPsPolling(projectId) {
+  const intervalId = psPollers.get(projectId);
+  if (intervalId) {
+    clearInterval(intervalId);
+    psPollers.delete(projectId);
+  }
+  psPollerStarting.delete(projectId);
+  psInProgress.delete(projectId);
+}
+
+// --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
+// When a user drags a pre-existing image into a design app, macOS updates
+// kMDItemLastUsedDate on that file but lsof misses it (<1 sec open).
+// This poller runs every 10s during active watch sessions to catch those files.
+
+async function pollLastUsedForProject(projectId) {
+  try {
+  const projects = getProjects();
+  const project = projects.find(p => p.id === projectId);
+  if (!project || project.status !== 'watching') return;
+  if (!designAppRunningCache.get(projectId)) return; // only run when a design app is open
+
+  const homedir = os.homedir();
+  const scanDirs = [
+    path.join(homedir, 'Desktop'),
+    path.join(homedir, 'Documents'),
+    path.join(homedir, 'Downloads'),
+  ];
+  const watchStart = project.watchStartedAt || project.createdAt;
+  const existingPaths = new Set(project.files.map(f => f.path));
+  const newFiles = [];
+
+  // v2.4.2: Single mdfind query instead of per-file mdls spawning.
+  // Asks Spotlight for all files with kMDItemLastUsedDate >= watchStart in one shot.
+  const watchStartDate = new Date(watchStart);
+  const mdfindTimestamp = `$time.iso(${watchStartDate.toISOString()})`;
+  const onlyinArgs = scanDirs.filter(d => fs.existsSync(d)).flatMap(d => ['-onlyin', d]);
+  if (onlyinArgs.length === 0) return;
+
+  try {
+    const { stdout: mdfindOut } = await execFileAsync('/usr/bin/mdfind', [
+      ...onlyinArgs,
+      `kMDItemLastUsedDate >= ${mdfindTimestamp}`
+    ], { timeout: 15000, encoding: 'utf8' });
+
+    for (const line of mdfindOut.split('\n')) {
+      const fullPath = line.trim();
+      if (!fullPath) continue;
+      const name = path.basename(fullPath);
+      if (name.startsWith('.') || name.startsWith('~') || name.startsWith('._')) continue;
+      const ext = path.extname(name).toLowerCase();
+      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      if (existingPaths.has(fullPath)) continue;
+      newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
+      existingPaths.add(fullPath);
+    }
+  } catch (e) {
+    // mdfind failed — skip this poll cycle
+  }
+
+  if (newFiles.length === 0) return;
+
+  const result = mutateProject(projectId, (proj) => {
+    if (proj.status !== 'watching') return null;
+    const existingSet = new Set(proj.files.map(f => f.path));
+    let added = 0;
+    for (const f of newFiles) {
+      if (existingSet.has(f.path)) continue;
+      proj.files.push(f);
+      existingSet.add(f.path);
+      added++;
+    }
+    if (added === 0) return null;
+    proj.files = deduplicateFiles(proj.files);
+    return { files: proj.files };
+  });
+
+  if (result && trayWindow && !trayWindow.isDestroyed()) {
+    trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+  }
+  } catch (e) {
+    console.error('[crate][lastused-poll] pollLastUsedForProject error:', e.message);
+  }
+}
+
+function startLastUsedPolling(projectId) {
+  if (lastUsedPollers.has(projectId)) return;
+  setTimeout(() => pollLastUsedForProject(projectId), 2000); // initial run after 2s
+  const intervalId = setInterval(() => pollLastUsedForProject(projectId), LAST_USED_POLL_MS);
+  lastUsedPollers.set(projectId, intervalId);
+}
+
+function stopLastUsedPolling(projectId) {
+  const intervalId = lastUsedPollers.get(projectId);
+  if (intervalId !== undefined) { clearInterval(intervalId); lastUsedPollers.delete(projectId); }
+}
+
+// --- Scan-on-Open: per-format asset extractors ---
+// v2.2.2: When a design file is first detected open by lsof (or re-opened after close),
+// parse it for linked/embedded asset paths and merge them into the project.
+
+// Track which design files have been scanned this session (per project).
+// Key: projectId, Value: Set of filePaths already scanned.
+const scannedDesignFiles = new Map(); // projectId -> Set<filePath>
+
+// Track PIDs holding design files so we can detect close→re-open.
+// Key: projectId, Value: Map<filePath, Set<pid>>
+const designFilePids = new Map(); // projectId -> Map<filePath, Set<pid>>
+
+// Extensions that support scan-on-open asset extraction
+const SCAN_ON_OPEN_EXTENSIONS = new Set([
+  '.ai', '.psd', '.indd', '.idml', '.sketch',
+  '.afdesign', '.afphoto', '.afpub',
+  '.key', '.pptx', '.ppt', '.pxd',
+  '.fig', '.pdf', '.xd',
+]);
+
+/**
+ * Extract linked/embedded asset paths from a design file.
+ * Routes to per-format extractors. Returns array of absolute file paths.
+ * All I/O is async — never blocks the main process.
+ */
+async function extractLinkedAssets(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    switch (ext) {
+      case '.ai':
+      case '.pdf':
+      case '.xd':
+        return await extractLinkedAssetsRegex(filePath);
+      case '.psd':
+        return await extractLinkedAssetsPhotoshop(filePath);
+      case '.indd':
+      case '.idml':
+        return await extractLinkedAssetsInDesign(filePath);
+      case '.sketch':
+        return await extractLinkedAssetsSketch(filePath);
+      case '.afdesign':
+      case '.afphoto':
+      case '.afpub':
+        return await extractLinkedAssetsAffinity(filePath);
+      case '.key':
+      case '.pptx':
+      case '.ppt':
+        return await extractLinkedAssetsZipMedia(filePath);
+      case '.pxd':
+        return await extractLinkedAssetsPxd(filePath);
+      case '.fig':
+        return await extractLinkedAssetsRegex(filePath);
+      default:
+        return [];
+    }
+  } catch (e) {
+    console.error(`[crate] scan-on-open: extractLinkedAssets error for ${path.basename(filePath)}:`, e.message);
+    return [];
+  }
+}
+
+/**
+ * Regex-based extractor: reads binary file as UTF-8 and greps for absolute paths.
+ * Works for .ai, .psd, .pdf, .xd, .fig, .indd (binary InDesign).
+ */
+async function extractLinkedAssetsRegex(filePath) {
+  const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+  const results = [];
+  try {
+    // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size > MAX_PARSE_FILE_SIZE) {
+      console.warn(`[crate] extractLinkedAssetsRegex: skipping ${path.basename(filePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
+      return results;
+    }
+    const buf = await fs.promises.readFile(filePath);
+    const content = buf.toString('utf8');
+    let match;
+    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
+      const linkedPath = match[0];
+      if (linkedPath === filePath) continue; // skip self-reference
+      results.push(linkedPath);
+    }
+  } catch (e) {
+    // read error — return empty
+  }
+  return results;
+}
+
+/**
+ * v2.2.7: Photoshop AppleScript extractor.
+ * Photoshop EMBEDS images on placement — lsof misses the brief file read,
+ * and regex fails because paths live in binary smart-object sections.
+ * AppleScript bypasses this by querying Photoshop directly for smart object
+ * file paths and placed items.
+ * Falls back to extractLinkedAssetsRegex() if Photoshop is not running or
+ * AppleScript returns nothing.
+ */
+async function extractLinkedAssetsPhotoshop(filePath) {
+  try {
+    // Check if Photoshop is running
+    const { stdout: psCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (psCheck.trim()) {
+      // v2.3.4: do javascript — exposes embedded smart object paths
+      const jsPath = path.join(os.tmpdir(), 'crate-ps-scan.js');
+      const asPath = path.join(os.tmpdir(), 'crate-ps-scan.applescript');
+
+      await fs.promises.writeFile(jsPath, PS_DOJAVASCRIPT, 'utf8');
+      await fs.promises.writeFile(asPath, psDoJavascriptAS(jsPath), 'utf8');
+      try {
+        const { stdout: psPaths } = await execAsync(
+          `/usr/bin/osascript "${asPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        ).catch(() => ({ stdout: '' }));
+
+        if (psPaths.trim()) {
+          const results = [];
+          for (const p of psPaths.split('\n').filter(Boolean)) {
+            if (p === filePath) continue;
+            if (fs.existsSync(p)) results.push(p);
+          }
+          if (results.length > 0) {
+            await fs.promises.unlink(jsPath).catch(() => {});
+            await fs.promises.unlink(asPath).catch(() => {});
+            return results;
+          }
+        }
+      } finally {
+        await fs.promises.unlink(jsPath).catch(() => {});
+        await fs.promises.unlink(asPath).catch(() => {});
+      }
+    }
+  } catch (e) {
+    // do javascript failed — fall through to regex
+  }
+  return extractLinkedAssetsRegex(filePath);
+}
+
+/**
+ * v2.3.6: PSD binary parser using ag-psd.
+ * Extracts linked file paths from layers (layer.linkedFile.fullPath) and
+ * embedded smart object data from psd.linkedFiles (written to temp dir).
+ * Complements the AppleScript/do-javascript approach — works even when
+ * Photoshop is not running.
+ */
+async function extractPsdAssets(psdFilePath, projectId) {
+  try {
+    // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
+    const stat = await fs.promises.stat(psdFilePath);
+    if (stat.size > MAX_PARSE_FILE_SIZE) {
+      console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
+      return [];
+    }
+    const buf = await fs.promises.readFile(psdFilePath);
+    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+    const discoveredPaths = [];
+
+    // Walk layers for linkedFile.fullPath
+    function walkLayers(layers) {
+      if (!layers) return;
+      for (const layer of layers) {
+        if (layer.linkedFile && layer.linkedFile.fullPath) {
+          const fp = layer.linkedFile.fullPath;
+          if (fs.existsSync(fp)) {
+            discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+          }
+        }
+        if (layer.children) walkLayers(layer.children);
+      }
+    }
+    walkLayers(psd.children);
+
+    // Extract embedded files from psd.linkedFiles
+    if (psd.linkedFiles && psd.linkedFiles.length > 0) {
+      const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+      await fs.promises.mkdir(extractDir, { recursive: true });
+      for (const lf of psd.linkedFiles) {
+        if (!lf.data || !lf.name) continue;
+        const extractPath = path.join(extractDir, lf.name);
+        await fs.promises.writeFile(extractPath, Buffer.from(lf.data));
+        discoveredPaths.push({ filePath: extractPath, source: 'psd-embedded' });
+      }
+    }
+
+    return discoveredPaths;
+  } catch (e) {
+    console.error('[crate][psd-parser] Error parsing PSD:', e.message);
+    return [];
+  }
+}
+
+/**
+ * v2.2.7: InDesign AppleScript extractor.
+ * InDesign has excellent scripting support — query all links of each open document.
+ * Falls back to extractLinkedAssetsRegex() for .indd or extractLinkedAssetsIdml()
+ * for .idml if InDesign is not running or AppleScript returns nothing.
+ */
+async function extractLinkedAssetsInDesign(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    // Check if InDesign is running
+    const { stdout: psCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (psCheck.trim()) {
+      const scriptPath = path.join(os.tmpdir(), 'crate-indd-query.applescript');
+      const appleScript = `tell application "Adobe InDesign"
+  try
+    set pathList to {}
+    repeat with aDoc in every document
+      repeat with aLink in every link of aDoc
+        try
+          set filePath to POSIX path of (file path of aLink as alias)
+          set end of pathList to filePath
+        end try
+      end repeat
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return pathList as text
+  on error
+    return ""
+  end try
+end tell`;
+
+      await fs.promises.writeFile(scriptPath, appleScript, 'utf8');
+      try {
+        const { stdout: inddPaths } = await execAsync(
+          `/usr/bin/osascript "${scriptPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        ).catch(() => ({ stdout: '' }));
+
+        if (inddPaths.trim()) {
+          const results = [];
+          for (const line of inddPaths.trim().split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            if (trimmed === filePath) continue;
+            if (fs.existsSync(trimmed)) results.push(trimmed);
+          }
+          if (results.length > 0) {
+            await fs.promises.unlink(scriptPath).catch(() => {});
+            return results;
+          }
+        }
+      } finally {
+        await fs.promises.unlink(scriptPath).catch(() => {});
+      }
+    }
+  } catch (e) {
+    // AppleScript failed — fall through to file-based extractor
+  }
+  // Fallback: .idml → zip-based XML parser, .indd → binary regex
+  if (ext === '.idml') return extractLinkedAssetsIdml(filePath);
+  return extractLinkedAssetsRegex(filePath);
+}
+
+/**
+ * IDML extractor: .idml is a zip; unzip and parse XML for <Link> elements.
+ */
+async function extractLinkedAssetsIdml(filePath) {
+  const results = [];
+  try {
+    // List zip contents and find Spreads/*.xml or Resources/*.xml
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8'
+    });
+    const xmlEntries = [];
+    for (const line of listing.split('\n')) {
+      const m = line.match(/^\s+\d+\s+\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\s+(.+)$/);
+      if (!m) continue;
+      const entry = m[1].trim();
+      // Grab all XML files — links can be in Spreads, Stories, or designmap
+      if (entry.endsWith('.xml')) xmlEntries.push(entry);
+    }
+
+    for (const entry of xmlEntries) {
+      try {
+        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8'
+        });
+        // Look for LinkResourceURI attributes
+        const uriRegex = /LinkResourceURI="file:([^"]+)"/gi;
+        let match;
+        while ((match = uriRegex.exec(data)) !== null) {
+          let uri = match[1];
+          // Decode URI-encoded paths
+          try { uri = decodeURIComponent(uri); } catch (e) {}
+          // Normalize: remove leading slashes from file: scheme
+          if (uri.startsWith('//')) uri = uri.slice(1);
+          if (uri.startsWith('/Users/') || uri.startsWith('/Volumes/')) {
+            results.push(uri);
+          }
+        }
+        // Also try the regex approach for any raw absolute paths
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27<>]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+          results.push(match[0]);
+        }
+      } catch (e) {
+        // extraction error for this entry — continue
+      }
+    }
+  } catch (e) {
+    // fallback: try regex on the raw zip
+    return await extractLinkedAssetsRegex(filePath);
+  }
+  return [...new Set(results)];
+}
+
+/**
+ * Sketch extractor: .sketch is a zip; parse document.json and pages for image refs.
+ */
+async function extractLinkedAssetsSketch(filePath) {
+  const results = [];
+  try {
+    // List zip contents
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8'
+    });
+    const jsonEntries = [];
+    for (const line of listing.split('\n')) {
+      const m = line.match(/^\s+\d+\s+\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\s+(.+)$/);
+      if (!m) continue;
+      const entry = m[1].trim();
+      if (entry.endsWith('.json')) jsonEntries.push(entry);
+    }
+
+    for (const entry of jsonEntries) {
+      try {
+        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8'
+        });
+        // Scan for absolute file paths in JSON
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        let match;
+        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+          results.push(match[0]);
+        }
+      } catch (e) {
+        // extraction error — continue
+      }
+    }
+  } catch (e) {
+    // fallback: try regex on the raw zip
+    return await extractLinkedAssetsRegex(filePath);
+  }
+  return [...new Set(results)];
+}
+
+/**
+ * Affinity extractor: .afdesign/.afphoto/.afpub are zip-based.
+ * Parse internal files for linked asset references.
+ */
+async function extractLinkedAssetsAffinity(filePath) {
+  const results = [];
+  try {
+    // List zip contents
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8'
+    });
+    const entries = [];
+    for (const line of listing.split('\n')) {
+      const m = line.match(/^\s+\d+\s+\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\s+(.+)$/);
+      if (!m) continue;
+      const entry = m[1].trim();
+      if (entry.endsWith('/')) continue;
+      // Check text-parseable entries (XML, JSON, plist, or smaller binary files)
+      const entryExt = path.extname(entry).toLowerCase();
+      if (['.xml', '.json', '.plist', '.dat'].includes(entryExt) || entry === 'metadata') {
+        entries.push(entry);
+      }
+    }
+
+    for (const entry of entries) {
+      try {
+        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8'
+        });
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        let match;
+        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+          results.push(match[0]);
+        }
+      } catch (e) {
+        // continue
+      }
+    }
+
+    // Also try regex on the raw binary (Affinity often stores paths in binary blobs)
+    const rawResults = await extractLinkedAssetsRegex(filePath);
+    results.push(...rawResults);
+  } catch (e) {
+    return await extractLinkedAssetsRegex(filePath);
+  }
+  return [...new Set(results)];
+}
+
+/**
+ * Zip media extractor for .key/.pptx/.ppt: lists embedded media files
+ * and returns their paths after extracting to a temp location.
+ * Unlike the package-time extractEmbeddedMedia, this returns references
+ * to the presentation file itself (the design file IS the asset container).
+ * For scan-on-open, we just add the presentation file — embedded media
+ * extraction happens at package time via extractEmbeddedMedia().
+ *
+ * However, we also scan the zip for any absolute path references to
+ * externally linked files (rare but possible in Keynote).
+ */
+async function extractLinkedAssetsZipMedia(filePath) {
+  const results = [];
+  try {
+    const buf = await fs.promises.readFile(filePath);
+    const content = buf.toString('utf8');
+    const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+    let match;
+    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
+      if (match[0] === filePath) continue;
+      results.push(match[0]);
+    }
+  } catch (e) {
+    // read error
+  }
+  return results;
+}
+
+/**
+ * Pixelmator Pro extractor: .pxd is a zip-based package.
+ * Parse for linked asset references.
+ */
+async function extractLinkedAssetsPxd(filePath) {
+  // .pxd is zip-based — try both structured and regex approaches
+  const results = [];
+  try {
+    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8'
+    });
+    const entries = [];
+    for (const line of listing.split('\n')) {
+      const m = line.match(/^\s+\d+\s+\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}\s+(.+)$/);
+      if (!m) continue;
+      const entry = m[1].trim();
+      if (entry.endsWith('/')) continue;
+      const entryExt = path.extname(entry).toLowerCase();
+      if (['.xml', '.json', '.plist'].includes(entryExt) || entry === 'metadata.info') {
+        entries.push(entry);
+      }
+    }
+
+    for (const entry of entries) {
+      try {
+        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8'
+        });
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        let match;
+        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+          results.push(match[0]);
+        }
+      } catch (e) {
+        // continue
+      }
+    }
+  } catch (e) {
+    // fallback
+  }
+  // Also try raw binary regex
+  const rawResults = await extractLinkedAssetsRegex(filePath);
+  results.push(...rawResults);
+  return [...new Set(results)];
+}
+
+/**
+ * Run scan-on-open for a design file: extract linked assets and merge into project.
+ * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
+ */
+async function runScanOnOpen(projectId, filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
+
+  console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
+  const linkedPaths = await extractLinkedAssets(filePath);
+
+  // Filter to existing files on disk with design-relevant extensions
+  const validPaths = [];
+  for (const p of linkedPaths) {
+    if (!p.startsWith('/Users/')) continue;
+    const pExt = path.extname(p).toLowerCase();
+    if (!DESIGN_FILE_EXTENSIONS.has(pExt)) continue;
+    try {
+      await fs.promises.access(p, fs.constants.F_OK);
+      validPaths.push(p);
+    } catch (e) {
+      // file doesn't exist — skip
+    }
+  }
+
+  if (validPaths.length === 0) {
+    console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
+    return;
+  }
+
+  console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
+
+  const result = mutateProject(projectId, (proj) => {
+    if (proj.status !== 'watching') return null;
+    // v2.4.0: normalize paths before comparing to prevent duplicates
+    const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
+    let changed = false;
+
+    for (const linkedPath of validPaths) {
+      if (existingPaths.has(path.resolve(linkedPath).toLowerCase())) continue;
+
+      proj.files.push({
+        path: linkedPath,
+        name: path.basename(linkedPath),
+        ext: path.extname(linkedPath).toLowerCase(),
+        addedAt: Date.now(),
+        source: 'scan-on-open',
+      });
+      existingPaths.add(path.resolve(linkedPath).toLowerCase());
+      changed = true;
+    }
+
+    if (changed) {
+      proj.files = deduplicateFiles(proj.files);
+    }
+    return changed ? { files: proj.files } : null;
+  });
+
+  if (result) {
+    lastFileActivity.set(projectId, Date.now());
+    inactivityNotified.delete(projectId);
+    sendToRenderer('files:updated', { projectId, files: result.files });
+  }
+
+  // v2.3.6: PSD binary parse — extract embedded smart object assets via ag-psd.
+  // Runs in addition to the AppleScript/do-javascript path above.
+  // Debounce: skip if same PSD was parsed less than 5 seconds ago.
+  if (ext === '.psd') {
+    const lastParsed = psdParseDebounce.get(filePath) || 0;
+    if (Date.now() - lastParsed < 5000) return;
+    psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
+    const psdAssets = await extractPsdAssets(filePath, projectId);
+    if (psdAssets.length > 0) {
+      const psdResult = mutateProject(projectId, (proj) => {
+        if (proj.status !== 'watching') return null;
+        // v2.4.0: normalize paths before comparing to prevent duplicates
+        const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
+        let changed = false;
+        for (const asset of psdAssets) {
+          if (existingPaths.has(path.resolve(asset.filePath).toLowerCase())) continue;
+          proj.files.push({
+            path: asset.filePath,
+            name: path.basename(asset.filePath),
+            ext: path.extname(asset.filePath).toLowerCase(),
+            addedAt: Date.now(),
+            source: asset.source,
+          });
+          existingPaths.add(path.resolve(asset.filePath).toLowerCase());
+          changed = true;
+        }
+        if (changed) proj.files = deduplicateFiles(proj.files);
+        return changed ? { files: proj.files } : null;
+      });
+      if (psdResult) {
+        lastFileActivity.set(projectId, Date.now());
+        inactivityNotified.delete(projectId);
+        sendToRenderer('files:updated', { projectId, files: psdResult.files });
+      }
+    }
+  }
 }
 
 function createTrayWindow() {
@@ -796,6 +1836,9 @@ async function startWatching(projectId) {
         });
 
         // FIX 1: Use mutateProject to atomically apply snapshot results
+        // v2.2.2: Collect design files for scan-on-open
+        const snapshotDesignFiles = [];
+
         mutateProject(projectId, (project) => {
           const existingPaths = new Set(project.files.map(f => f.path));
           let snapshotChanged = false;
@@ -831,11 +1874,18 @@ async function startWatching(projectId) {
               if (!isInWatchedDir) continue;
             }
 
-            if (existingPaths.has(filePath)) continue;
             if (path.basename(filePath).startsWith('~$')) continue;
 
             const ext = path.extname(filePath).toLowerCase();
             if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+
+            // v2.3.9: Mark for scan-on-open BEFORE existingPaths check —
+            // pre-session files already in project still need asset extraction.
+            if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
+              snapshotDesignFiles.push(filePath);
+            }
+
+            if (existingPaths.has(filePath)) continue;
 
             const fileEntry = {
               path: filePath,
@@ -856,7 +1906,7 @@ async function startWatching(projectId) {
 
           // Parse linked assets from any linkable design files found in the snapshot
           if (linkableForParse.length > 0) {
-            const LINKED_ASSET_REGEX_SNAPSHOT = /\/Users\/[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig)/gi;
+            const LINKED_ASSET_REGEX_SNAPSHOT = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
             for (const designFile of linkableForParse) {
               try {
                 if (!fs.existsSync(designFile.path)) continue;
@@ -889,6 +1939,17 @@ async function startWatching(projectId) {
             project.files = deduplicateFiles(project.files);
           }
         });
+
+        // v2.2.2: Fire-and-forget scan-on-open for design files found in initial snapshot.
+        // Initialize scannedDesignFiles for this project and mark these as scanned.
+        if (snapshotDesignFiles.length > 0) {
+          if (!scannedDesignFiles.has(projectId)) scannedDesignFiles.set(projectId, new Set());
+          const scanned = scannedDesignFiles.get(projectId);
+          for (const fp of snapshotDesignFiles) {
+            scanned.add(fp);
+            runScanOnOpen(projectId, fp).catch(() => {});
+          }
+        }
       }
     }
   } catch (e) {
@@ -930,44 +1991,25 @@ async function startWatching(projectId) {
   watcher.on('add', async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
-    if (name.startsWith('.') || name === 'Thumbs.db') return;
+    if (name.startsWith('.') || name.startsWith('._') || name === 'Thumbs.db') return;
     if (name.startsWith('~$')) return;
+    // v2.2.5: Skip temp/backup files from all design apps (Illustrator ~, Photoshop .tmp, etc.)
+    if (name.includes('~') || name.endsWith('.tmp')) return;
 
     // Small delay to let macOS write file metadata
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    if (DESIGN_FILE_EXTENSIONS.has(ext)) {
-      // lsof security gate: verify a design app actually has this file open
-      const proj = store.get('projects').find(p => p.id === projectId);
-      if (proj) {
-        const pids = await getDesignAppPids(proj.type);
-        if (pids.length > 0) {
-          let isOpen = false;
-          try {
-            const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
-            const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
-            isOpen = openFiles.includes(filePath);
-          } catch (e) { /* lsof failed, skip */ }
-
-          if (!isOpen) {
-            // Retry once after 2s — design app may still be opening the file
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-              const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
-              const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
-              isOpen = openFiles.includes(filePath);
-            } catch (e) { /* skip */ }
-          }
-
-          if (!isOpen) return; // Design app never opened it — silently skip
-        }
-        // If no design apps running (pids.length === 0), fall through and add normally
-      }
-
+    // v2.2.6: Only capture PRIMARY design source files via chokidar 'add'.
+    // Image/media/font/pdf files are NOT captured here — they produce false positives
+    // because Finder and design app browsers briefly open images for thumbnails.
+    // lsof polling is the reliable mechanism for capturing those files.
+    if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
+      // v2.4.0: normalize path comparison to prevent duplicates
+      const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => f.path === filePath)) return null;
+        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
         proj.files.push(fileEntry);
         proj.files = deduplicateFiles(proj.files);
         return { files: proj.files };
@@ -981,9 +2023,32 @@ async function startWatching(projectId) {
         }
       }
     }
+
+    // v2.3.2: Image/media files — capture if a design app is currently running (updated every 3s by lsof poller).
+    // Restores Photoshop drag-and-embed capture without Finder thumbnail false positives.
+    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
+      // v2.4.0: normalize path comparison to prevent duplicates
+      const normFilePath = path.resolve(filePath).toLowerCase();
+      const result = mutateProject(projectId, (proj) => {
+        if (proj.status !== 'watching') return null;
+        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
+        if (name.startsWith('~') || name.startsWith('._')) return null;
+        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
+        proj.files = deduplicateFiles(proj.files);
+        return { files: proj.files };
+      });
+      if (result) {
+        lastFileActivity.set(projectId, Date.now());
+        inactivityNotified.delete(projectId);
+        if (trayWindow && !trayWindow.isDestroyed()) {
+          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+        }
+      }
+    }
   });
 
   // FIX 1: chokidar change handler uses mutateProject
+  // v2.2.2: Also triggers scan-on-open when a design file is modified
   watcher.on('change', async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
@@ -992,43 +2057,48 @@ async function startWatching(projectId) {
 
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    if (DESIGN_FILE_EXTENSIONS.has(ext)) {
-      // lsof security gate: verify a design app actually has this file open
-      const proj = store.get('projects').find(p => p.id === projectId);
-      if (proj) {
-        const pids = await getDesignAppPids(proj.type);
-        if (pids.length > 0) {
-          let isOpen = false;
-          try {
-            const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
-            const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
-            isOpen = openFiles.includes(filePath);
-          } catch (e) { /* lsof failed, skip */ }
-
-          if (!isOpen) {
-            // Retry once after 2s — design app may still be opening the file
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-              const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-F', 'n', '-p', pids.join(',')], { timeout: 3000 });
-              const openFiles = stdout.split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1));
-              isOpen = openFiles.includes(filePath);
-            } catch (e) { /* skip */ }
-          }
-
-          if (!isOpen) return; // Design app never opened it — silently skip
-        }
-        // If no design apps running (pids.length === 0), fall through and add normally
-      }
-
+    // v2.2.6: Only re-scan PRIMARY design source files on change.
+    // Same rationale as the 'add' handler — image/media changes are noise here.
+    if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
+      // v2.4.0: normalize path comparison to prevent duplicates
+      const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => f.path === filePath)) return null;
+        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
         proj.files.push(fileEntry);
         proj.files = deduplicateFiles(proj.files);
         return { files: proj.files };
       });
 
+      if (result) {
+        lastFileActivity.set(projectId, Date.now());
+        inactivityNotified.delete(projectId);
+        if (trayWindow && !trayWindow.isDestroyed()) {
+          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+        }
+      }
+
+      // v2.2.2: When a design file changes, re-scan for linked assets
+      // (designer may have added new links). Fire-and-forget.
+      // PSD ag-psd parsing is handled inside runScanOnOpen — no separate inline block needed.
+      if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
+        runScanOnOpen(projectId, filePath).catch(() => {});
+      }
+    }
+
+    // v2.3.2: Image/media files — capture on change if a design app is running.
+    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
+      // v2.4.0: normalize path comparison to prevent duplicates
+      const normFilePath = path.resolve(filePath).toLowerCase();
+      const result = mutateProject(projectId, (proj) => {
+        if (proj.status !== 'watching') return null;
+        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
+        if (name.startsWith('~') || name.startsWith('._')) return null;
+        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
+        proj.files = deduplicateFiles(proj.files);
+        return { files: proj.files };
+      });
       if (result) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
@@ -1042,6 +2112,8 @@ async function startWatching(projectId) {
   watchers.set(projectId, watcher);
   startLsofPolling(projectId); // begin lsof polling for linked assets
   startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+  startPsPolling(projectId);    // begin Photoshop + InDesign polling (v2.3.0)
+  startLastUsedPolling(projectId); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
 }
 
 function stopWatching(projectId) {
@@ -1052,15 +2124,21 @@ function stopWatching(projectId) {
   }
   stopLsofPolling(projectId);
   stopFigmaPolling(projectId);
+  stopPsPolling(projectId);
+  stopLastUsedPolling(projectId); // v2.3.3
   lastFileActivity.delete(projectId);
   inactivityNotified.delete(projectId);
+  designAppRunningCache.delete(projectId); // v2.4.2: clean up per-project cache
+  // v2.2.2: Clean up scan-on-open state
+  scannedDesignFiles.delete(projectId);
+  designFilePids.delete(projectId);
 }
 
 // --- Inactivity Checker ---
 
 function startInactivityChecker() {
   setInterval(() => {
-    const projects = store.get('projects');
+    const projects = getProjects();
     const settings = store.get('settings');
 
     for (const project of projects) {
@@ -1076,8 +2154,24 @@ function startInactivityChecker() {
           continue;
         }
 
-        // Guard: skip if tray window not visible
+        // v2.4.2: Fallback — if tray window not visible, show native Notification
         if (!trayWindow || trayWindow.isDestroyed() || !trayWindow.isVisible()) {
+          inactivityNotified.add(project.id);
+          if (Notification.isSupported()) {
+            const notif = new Notification({
+              title: 'Crate — Still working?',
+              body: `No new design files for "${project.name}" in 10 minutes. Click to open Crate.`,
+              silent: false,
+            });
+            notif.on('click', () => {
+              lastFileActivity.set(project.id, Date.now());
+              inactivityNotified.delete(project.id);
+              if (trayWindow && !trayWindow.isDestroyed()) {
+                trayWindow.show();
+              }
+            });
+            notif.show();
+          }
           continue;
         }
 
@@ -1121,11 +2215,11 @@ function startInactivityChecker() {
 // --- IPC Handlers ---
 
 ipcMain.handle('projects:get-all', () => {
-  return store.get('projects');
+  return getProjects();
 });
 
 ipcMain.handle('projects:create', async (event, name, projectType = 'branding') => {
-  const projects = store.get('projects');
+  const projects = getProjects();
 
   // Enforce project cap
   if (projects.length >= MAX_PROJECTS) {
@@ -1172,7 +2266,7 @@ ipcMain.handle('projects:pause', (event, id) => {
 });
 
 ipcMain.handle('projects:get-files', (event, id) => {
-  const projects = store.get('projects');
+  const projects = getProjects();
   const project = projects.find(p => p.id === id);
   return project ? project.files : [];
 });
@@ -1196,6 +2290,7 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
 
     if (!project.files.some(f => f.path === filePath)) {
       project.files.push(file);
+      project.files = deduplicateFiles(project.files);
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
     }
@@ -1250,6 +2345,7 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
         });
       }
     }
+    project.files = deduplicateFiles(project.files);
     return project.files;
   });
 
@@ -1281,7 +2377,7 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
   try {
-  const projects = store.get('projects');
+  const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
 
@@ -1290,211 +2386,197 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
   // v1.3.20: Targeted .fig scan for branding projects at package time.
   // v1.3.33: Entire scan block wrapped in 8-second timeout guard so the
   // backend never blocks the renderer for longer than that.
-  if (project.type === 'branding') {
-    const homedir = os.homedir();
-    const scanDirs = [
-      path.join(homedir, 'Desktop'),
-      path.join(homedir, 'Documents'),
-      path.join(homedir, 'Downloads'),
-      // v1.3.27: Figma Desktop stores local files in ~/Library/Application Support/Figma/
-      path.join(homedir, 'Library', 'Application Support', 'Figma'),
-    ];
-    const watchStart = project.watchStartedAt || project.createdAt;
-    const existingPaths = new Set(project.files.map(f => f.path));
+  const homedir = os.homedir();
+  const scanDirs = [
+    path.join(homedir, 'Desktop'),
+    path.join(homedir, 'Documents'),
+    path.join(homedir, 'Downloads'),
+    // v1.3.27: Figma Desktop stores local files in ~/Library/Application Support/Figma/
+    path.join(homedir, 'Library', 'Application Support', 'Figma'),
+  ];
+  const watchStart = project.watchStartedAt || project.createdAt;
+  const existingPaths = new Set(project.files.map(f => f.path));
 
-    await Promise.race([
-      (async () => {
-    // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
-    // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
-    try {
-      const figmaPids = [];
-      const { stdout: psOut } = await execAsync("/bin/ps ax -o pid= -o command= 2>/dev/null", { timeout: 5000, encoding: "utf8" });
-      for (const line of psOut.trim().split("\n")) {
-        const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
-        if (m && m[2].includes("Figma")) figmaPids.push(m[1]);
-      }
-      if (figmaPids.length > 0) {
-        const { stdout: lsofOut } = await execAsync(
-          `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
-          { timeout: 10000, encoding: "utf8" }
-        );
-        for (const line of lsofOut.trim().split("\n")) {
-          if (!line.startsWith("n")) continue;
-          const filePath = line.slice(1);
-          if (!filePath.endsWith(".fig")) continue;
-          // Only capture .fig files within known scan dirs — prevents false positives
-          // if Figma has unrelated project files open simultaneously.
-          if (!scanDirs.some(dir => filePath.startsWith(dir + "/"))) continue;
-          if (existingPaths.has(filePath)) continue;
-          if (!fs.existsSync(filePath)) continue;
-          project.files.push({
-            path: filePath,
-            name: path.basename(filePath),
-            ext: ".fig",
-            addedAt: Date.now(),
-            source: "lsof-package-scan",
-          });
-          existingPaths.add(filePath);
-          newCount++;
-        }
-      }
-    } catch (e) {
-      // lsof pass failed — continue with other scan methods
+  await Promise.race([
+    (async () => {
+  // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
+  // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
+  try {
+    const figmaPids = [];
+    const { stdout: psOut } = await execAsync("/bin/ps ax -o pid= -o command= 2>/dev/null", { timeout: 5000, encoding: "utf8" });
+    for (const line of psOut.trim().split("\n")) {
+      const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+      if (m && m[2].includes("Figma")) figmaPids.push(m[1]);
     }
-
-    for (const dir of scanDirs) {
-      try {
-        if (!fs.existsSync(dir)) continue;
-        // Scan at depth 0 (direct children) and depth 1 (one subfolder deep)
-        const scanFolder = (folder, depth) => {
-          let entries;
-          try { entries = fs.readdirSync(folder, { withFileTypes: true }); }
-          catch (e) { return; }
-
-          for (const entry of entries) {
-            const fullPath = path.join(folder, entry.name);
-            if (entry.name.startsWith('.')) continue; // skip dotfiles/folders
-
-            if (entry.isDirectory() && depth < 3) {
-              scanFolder(fullPath, depth + 1);
-              continue;
-            }
-
-            if (!entry.isFile()) continue;
-            if (path.extname(entry.name).toLowerCase() !== '.fig') continue;
-            if (existingPaths.has(fullPath)) continue;
-
-            // Only include .fig files created or modified during this watch session.
-            // v1.3.26: Also check birthtimeMs — Figma Desktop is cloud-first and
-            // may preserve the original mtime from the cloud version when saving a
-            // local copy. macOS sets birthtimeMs to the actual disk-creation time,
-            // so a file saved locally during the session will have a recent birthtime
-            // even if its mtime predates the session.
-            try {
-              const stat = fs.statSync(fullPath);
-              if (stat.mtimeMs < watchStart && stat.birthtimeMs < watchStart) continue;
-            } catch (e) {
-              continue;
-            }
-
-            project.files.push({
-              path: fullPath,
-              name: entry.name,
-              ext: '.fig',
-              addedAt: Date.now(),
-              source: 'fig-scan',
-            });
-            existingPaths.add(fullPath);
-            newCount++;
-          }
-        };
-        scanFolder(dir, 0);
-      } catch (e) {
-        // scan error for this dir — continue with others
+    if (figmaPids.length > 0) {
+      const { stdout: lsofOut } = await execAsync(
+        `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
+        { timeout: 10000, encoding: "utf8" }
+      );
+      for (const line of lsofOut.trim().split("\n")) {
+        if (!line.startsWith("n")) continue;
+        const filePath = line.slice(1);
+        if (!filePath.endsWith(".fig")) continue;
+        // Only capture .fig files within known scan dirs — prevents false positives
+        // if Figma has unrelated project files open simultaneously.
+        if (!scanDirs.some(dir => filePath.startsWith(dir + "/"))) continue;
+        if (existingPaths.has(filePath)) continue;
+        if (!fs.existsSync(filePath)) continue;
+        project.files.push({
+          path: filePath,
+          name: path.basename(filePath),
+          ext: ".fig",
+          addedAt: Date.now(),
+          source: "lsof-package-scan",
+        });
+        existingPaths.add(filePath);
+        newCount++;
       }
     }
-
-      })(),
-      new Promise(resolve => setTimeout(resolve, 8000))
-    ]);
-
+  } catch (e) {
+    // lsof pass failed — continue with other scan methods
   }
 
-  // v2.2.1: kMDItemLastUsedDate scan — runs for ALL project types.
+  for (const dir of scanDirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      // Scan at depth 0 (direct children) and depth 1 (one subfolder deep)
+      const scanFolder = (folder, depth) => {
+        let entries;
+        try { entries = fs.readdirSync(folder, { withFileTypes: true }); }
+        catch (e) { return; }
+
+        for (const entry of entries) {
+          const fullPath = path.join(folder, entry.name);
+          if (entry.name.startsWith('.')) continue; // skip dotfiles/folders
+
+          if (entry.isDirectory() && depth < 3) {
+            scanFolder(fullPath, depth + 1);
+            continue;
+          }
+
+          if (!entry.isFile()) continue;
+          if (path.extname(entry.name).toLowerCase() !== '.fig') continue;
+          if (existingPaths.has(fullPath)) continue;
+
+          // Only include .fig files created or modified during this watch session.
+          // v1.3.26: Also check birthtimeMs — Figma Desktop is cloud-first and
+          // may preserve the original mtime from the cloud version when saving a
+          // local copy. macOS sets birthtimeMs to the actual disk-creation time,
+          // so a file saved locally during the session will have a recent birthtime
+          // even if its mtime predates the session.
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.mtimeMs < watchStart && stat.birthtimeMs < watchStart) continue;
+          } catch (e) {
+            continue;
+          }
+
+          if (!project.pendingFiles) project.pendingFiles = [];
+          project.pendingFiles.push({
+            path: fullPath,
+            name: entry.name,
+            ext: '.fig',
+            addedAt: Date.now(),
+            source: 'fig-scan',
+          });
+          existingPaths.add(fullPath);
+          newCount++;
+        }
+      };
+      scanFolder(dir, 0);
+    } catch (e) {
+      // scan error for this dir — continue with others
+    }
+  }
+
+  // v1.3.25: kMDItemLastUsedDate scan for branding projects.
   // Walk Desktop/Documents/Downloads (depth 3) and check Spotlight's
   // kMDItemLastUsedDate for design files opened during this session.
   // This catches files opened in design apps that chokidar/lsof missed
   // (e.g. files already on disk that were opened but not modified).
-  // Previously branding-only (v1.3.25); now universal so print, web,
-  // and presentation projects also benefit from the package-time scan.
-  {
-    const homedir = os.homedir();
-    const lastUsedScanDirs = [
-      path.join(homedir, 'Desktop'),
-      path.join(homedir, 'Documents'),
-      path.join(homedir, 'Downloads'),
-    ];
-    const watchStart = project.watchStartedAt || project.createdAt;
-    const existingPaths = new Set(project.files.map(f => f.path));
+  // v1.3.26: Also covers .fig files — the mtime-based scan above only
+  // catches .fig files modified/created during the session, but a
+  // pre-existing .fig file opened (imported) in Figma only updates
+  // kMDItemLastUsedDate, not mtime. Removing the .fig skip lets this
+  // scan catch those imports. Dedup via existingPaths prevents doubles.
+  for (const dir of scanDirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const scanFolderLastUsed = async (folder, depth) => {
+        let entries;
+        try { entries = fs.readdirSync(folder, { withFileTypes: true }); }
+        catch (e) { return; }
 
-    await Promise.race([
-      (async () => {
-    for (const dir of lastUsedScanDirs) {
-      try {
-        if (!fs.existsSync(dir)) continue;
-        const scanFolderLastUsed = async (folder, depth) => {
-          let entries;
-          try { entries = fs.readdirSync(folder, { withFileTypes: true }); }
-          catch (e) { return; }
+        for (const entry of entries) {
+          const fullPath = path.join(folder, entry.name);
+          if (entry.name.startsWith('.')) continue;
 
-          for (const entry of entries) {
-            const fullPath = path.join(folder, entry.name);
-            if (entry.name.startsWith('.')) continue;
-
-            if (entry.isDirectory() && depth < 3) {
-              await scanFolderLastUsed(fullPath, depth + 1);
-              continue;
-            }
-
-            if (!entry.isFile()) continue;
-            const ext = path.extname(entry.name).toLowerCase();
-            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-            if (existingPaths.has(fullPath)) continue;
-
-            try {
-              const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
-                timeout: 2000, encoding: 'utf8'
-              });
-              const mdlsOut = mdlsRaw.trim();
-              if (!mdlsOut || mdlsOut === '(null)') continue;
-
-              const lastUsedTime = new Date(mdlsOut).getTime();
-              if (isNaN(lastUsedTime) || lastUsedTime < watchStart) {
-                // Fallback: check xattr directly — no Spotlight delay
-                const xattrTime = await getXattrLastUsedMs(fullPath);
-                if (!xattrTime || xattrTime < watchStart) continue;
-              }
-            } catch (e) {
-              continue;
-            }
-
-            project.files.push({
-              path: fullPath,
-              name: entry.name,
-              ext,
-              addedAt: Date.now(),
-              source: 'lastused-scan',
-            });
-            existingPaths.add(fullPath);
-            newCount++;
+          if (entry.isDirectory() && depth < 3) {
+            await scanFolderLastUsed(fullPath, depth + 1);
+            continue;
           }
-        };
-        await scanFolderLastUsed(dir, 0);
-      } catch (e) {
-        // scan error — continue with others
-      }
-    }
-      })(),
-      new Promise(resolve => setTimeout(resolve, 8000))
-    ]);
-  }
 
-  // v1.3.39: AppleScript query to Illustrator for linked files.
+          if (!entry.isFile()) continue;
+          const ext = path.extname(entry.name).toLowerCase();
+          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+          if (existingPaths.has(fullPath)) continue;
+
+          try {
+            const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
+              timeout: 2000, encoding: 'utf8'
+            });
+            const mdlsOut = mdlsRaw.trim();
+            if (!mdlsOut || mdlsOut === '(null)') continue;
+
+            const lastUsedTime = new Date(mdlsOut).getTime();
+            if (isNaN(lastUsedTime) || lastUsedTime < watchStart) {
+              // Fallback: check xattr directly — no Spotlight delay
+              const xattrTime = await getXattrLastUsedMs(fullPath);
+              if (!xattrTime || xattrTime < watchStart) continue;
+            }
+          } catch (e) {
+            continue;
+          }
+
+          if (!project.pendingFiles) project.pendingFiles = [];
+          project.pendingFiles.push({
+            path: fullPath,
+            name: entry.name,
+            ext,
+            addedAt: Date.now(),
+            source: 'lastused-scan',
+          });
+          existingPaths.add(fullPath);
+          newCount++;
+        }
+      };
+      await scanFolderLastUsed(dir, 0);
+    } catch (e) {
+      // scan error — continue with others
+    }
+  }
+    })(),
+    new Promise(resolve => setTimeout(resolve, 8000))
+  ]);
+
+  // v2.4.2: 30s aggregate timeout wrapping all AppleScript + ag-psd queries
+  await Promise.race([
+    (async () => {
+  // v1.3.39 / v2.2.7: AppleScript query to Illustrator for linked files.
   // The regex approach fails on modern .ai files because PDF 1.6 compresses object
   // streams (FlateDecode), making linked paths unreadable from raw bytes.
   // AppleScript bypasses this entirely by asking Illustrator directly.
-  // Runs for any project that has a running Illustrator instance.
+  // v2.2.7: Write AppleScript to temp file instead of inline osascript -e.
   try {
-    // Check if Illustrator is running
-    const { stdout: psCheck } = await execAsync(
+    const { stdout: aiPsCheck } = await execAsync(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
 
-    if (psCheck.trim()) {
-      // Illustrator is running — query it for all linked file paths
-      const appleScript = `
-tell application "Adobe Illustrator"
+    if (aiPsCheck.trim()) {
+      const aiScriptPath = path.join(os.tmpdir(), `crate-ai-scan-${projectId}.applescript`);
+      const aiAppleScript = `tell application "Adobe Illustrator"
   try
     set pathList to {}
     repeat with aDoc in documents
@@ -1514,36 +2596,182 @@ tell application "Adobe Illustrator"
   end try
 end tell`;
 
-      const { stdout: aiPaths } = await execAsync(
-        `osascript -e ${JSON.stringify(appleScript)}`,
-        { timeout: 8000, encoding: 'utf8' }
-      ).catch(() => ({ stdout: '' }));
+      await fs.promises.writeFile(aiScriptPath, aiAppleScript, 'utf8');
+      try {
+        const { stdout: aiPaths } = await execAsync(
+          `/usr/bin/osascript "${aiScriptPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        ).catch(() => ({ stdout: '' }));
 
-      if (aiPaths.trim()) {
-        const existingPaths = new Set(project.files.map(f => f.path));
-        for (const linkedPath of aiPaths.trim().split('\n')) {
-          const trimmed = linkedPath.trim();
-          if (!trimmed) continue;
-          if (existingPaths.has(trimmed)) continue;
-          if (!fs.existsSync(trimmed)) continue;
-          const ext = path.extname(trimmed).toLowerCase();
-          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+        if (aiPaths.trim()) {
+          const existingPaths = new Set(project.files.map(f => f.path));
+          for (const linkedPath of aiPaths.trim().split('\n')) {
+            const trimmed = linkedPath.trim();
+            if (!trimmed) continue;
+            if (existingPaths.has(trimmed)) continue;
+            if (!fs.existsSync(trimmed)) continue;
+            const ext = path.extname(trimmed).toLowerCase();
+            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-          project.files.push({
-            path: trimmed,
-            name: path.basename(trimmed),
-            ext,
-            addedAt: Date.now(),
-            source: 'ai-linked',
-          });
-          existingPaths.add(trimmed);
-          newCount++;
+            project.files.push({
+              path: trimmed,
+              name: path.basename(trimmed),
+              ext,
+              addedAt: Date.now(),
+              source: 'ai-linked',
+            });
+            existingPaths.add(trimmed);
+            newCount++;
+          }
         }
+      } finally {
+        await fs.promises.unlink(aiScriptPath).catch(() => {});
       }
     }
   } catch (e) {
     // AppleScript failed or Illustrator not responding — fall through to regex
   }
+
+  // v2.3.4: do javascript query to Photoshop for smart object / placed item paths.
+  // Photoshop embeds images on placement — lsof misses the brief file read,
+  // and regex fails because paths live in binary smart-object sections.
+  // do javascript exposes embedded smart object paths via layer.smartObject.fileReference.
+  try {
+    const { stdout: psPsCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (psPsCheck.trim()) {
+      const psJsPath = path.join(os.tmpdir(), `crate-ps-scan-${projectId}.js`);
+      const psAsPath = path.join(os.tmpdir(), `crate-ps-scan-${projectId}.applescript`);
+
+      await fs.promises.writeFile(psJsPath, PS_DOJAVASCRIPT, 'utf8');
+      await fs.promises.writeFile(psAsPath, psDoJavascriptAS(psJsPath), 'utf8');
+      try {
+        const { stdout: psPaths } = await execAsync(
+          `/usr/bin/osascript "${psAsPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        ).catch(() => ({ stdout: '' }));
+
+        if (psPaths.trim()) {
+          const existingPaths = new Set(project.files.map(f => f.path));
+          for (const trimmed of psPaths.split('\n').filter(Boolean)) {
+            if (existingPaths.has(trimmed)) continue;
+            if (!fs.existsSync(trimmed)) continue;
+            const ext = path.extname(trimmed).toLowerCase();
+            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+
+            project.files.push({
+              path: trimmed,
+              name: path.basename(trimmed),
+              ext,
+              addedAt: Date.now(),
+              source: 'psd-linked',
+            });
+            existingPaths.add(trimmed);
+            newCount++;
+          }
+        }
+      } finally {
+        await fs.promises.unlink(psJsPath).catch(() => {});
+        await fs.promises.unlink(psAsPath).catch(() => {});
+      }
+    }
+  } catch (e) {
+    // do javascript failed or Photoshop not responding — fall through to regex
+  }
+
+  // v2.3.6: ag-psd binary parse — extract embedded smart objects from all .psd files.
+  // Works even when Photoshop is not running.
+  try {
+    const psdFiles = project.files.filter(f => f.ext === '.psd');
+    for (const psdFile of psdFiles) {
+      if (!fs.existsSync(psdFile.path)) continue;
+      const psdAssets = await extractPsdAssets(psdFile.path, projectId);
+      for (const asset of psdAssets) {
+        if (existingPaths.has(asset.filePath)) continue;
+        project.files.push({
+          path: asset.filePath,
+          name: path.basename(asset.filePath),
+          ext: path.extname(asset.filePath).toLowerCase(),
+          addedAt: Date.now(),
+          source: asset.source,
+        });
+        existingPaths.add(asset.filePath);
+        newCount++;
+      }
+    }
+  } catch (e) {
+    // ag-psd parse failed — non-fatal
+  }
+
+  // v2.2.7: AppleScript query to InDesign for linked files.
+  // InDesign has excellent scripting support — query all links of each document.
+  try {
+    const { stdout: inddPsCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (inddPsCheck.trim()) {
+      const inddScriptPath = path.join(os.tmpdir(), `crate-indd-scan-${projectId}.applescript`);
+      const inddAppleScript = `tell application "Adobe InDesign"
+  try
+    set pathList to {}
+    repeat with aDoc in every document
+      repeat with aLink in every link of aDoc
+        try
+          set filePath to POSIX path of (file path of aLink as alias)
+          set end of pathList to filePath
+        end try
+      end repeat
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return pathList as text
+  on error
+    return ""
+  end try
+end tell`;
+
+      await fs.promises.writeFile(inddScriptPath, inddAppleScript, 'utf8');
+      try {
+        const { stdout: inddPaths } = await execAsync(
+          `/usr/bin/osascript "${inddScriptPath}"`,
+          { timeout: 10000, encoding: 'utf8' }
+        ).catch(() => ({ stdout: '' }));
+
+        if (inddPaths.trim()) {
+          const existingPaths = new Set(project.files.map(f => f.path));
+          for (const linkedPath of inddPaths.trim().split('\n')) {
+            const trimmed = linkedPath.trim();
+            if (!trimmed) continue;
+            if (existingPaths.has(trimmed)) continue;
+            if (!fs.existsSync(trimmed)) continue;
+            const ext = path.extname(trimmed).toLowerCase();
+            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+
+            project.files.push({
+              path: trimmed,
+              name: path.basename(trimmed),
+              ext,
+              addedAt: Date.now(),
+              source: 'indd-linked',
+            });
+            existingPaths.add(trimmed);
+            newCount++;
+          }
+        }
+      } finally {
+        await fs.promises.unlink(inddScriptPath).catch(() => {});
+      }
+    }
+  } catch (e) {
+    // AppleScript failed or InDesign not responding — fall through to regex
+  }
+    })(),
+    new Promise(resolve => setTimeout(resolve, 30000))
+  ]);
 
   // v1.3.24: Extract linked file paths from design files in the project.
   // Adobe/Affinity apps store absolute paths of linked/placed files as text
@@ -1552,7 +2780,7 @@ end tell`;
   // v1.3.36: Extended from .ai-only to full Adobe suite + Affinity.
   // Pattern: if we parse the file format to extract links, those links are
   // always relevant — never filter by date.
-  const LINKED_ASSET_REGEX = /\/Users\/[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig)/gi;
+  const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
   const LINKABLE_EXTENSIONS = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
   if (linkableFiles.length > 0) {
@@ -1561,7 +2789,7 @@ end tell`;
     for (const designFile of linkableFiles) {
       try {
         if (!fs.existsSync(designFile.path)) continue;
-        const buf = fs.readFileSync(designFile.path);
+        const buf = await fs.promises.readFile(designFile.path);
         const content = buf.toString('utf8');
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
@@ -1588,7 +2816,74 @@ end tell`;
 
   if (newCount > 0) {
     project.files = deduplicateFiles(project.files);
-    store.set('projects', projects);
+  }
+
+  // v2.2.3: Pre-package double-check — re-extract linked assets from all scannable
+  // design files in the project to catch anything missed during the session.
+  try {
+    const existingPathsCheck = new Set(project.files.map(f => f.path));
+    let doubleCheckCount = 0;
+    for (const file of project.files.slice()) {
+      if (!SCAN_ON_OPEN_EXTENSIONS.has(file.ext)) continue;
+      try {
+        if (!fs.existsSync(file.path)) continue;
+        const linkedPaths = await extractLinkedAssets(file.path);
+        for (const lp of linkedPaths) {
+          if (existingPathsCheck.has(lp)) continue;
+          if (!lp.startsWith('/Users/')) continue;
+          const lpExt = path.extname(lp).toLowerCase();
+          if (!DESIGN_FILE_EXTENSIONS.has(lpExt)) continue;
+          if (!fs.existsSync(lp)) continue;
+          project.files.push({
+            path: lp,
+            name: path.basename(lp),
+            ext: lpExt,
+            addedAt: Date.now(),
+            source: 'pre-package-doublecheck',
+          });
+          existingPathsCheck.add(lp);
+          doubleCheckCount++;
+        }
+      } catch (e) {
+        // extract error for this file — continue with others
+      }
+    }
+    if (doubleCheckCount > 0) {
+      project.files = deduplicateFiles(project.files);
+      newCount += doubleCheckCount;
+    }
+  } catch (e) {
+    // double-check pass failed — non-fatal
+  }
+
+  // Atomic merge: write scan results to store without overwriting concurrent poller changes.
+  // The stale `projects` array was read at the start of this handler — pollers may have
+  // added files via mutateProject during the scan. Using mutateProject here re-reads the
+  // latest store state and merges in only the new files this scan discovered.
+  if (newCount > 0) {
+    const scanFiles = project.files;
+    const scanPending = project.pendingFiles || [];
+    const merged = mutateProject(projectId, (proj) => {
+      const existingPaths = new Set(proj.files.map(f => f.path));
+      for (const f of scanFiles) {
+        if (!existingPaths.has(f.path)) {
+          proj.files.push(f);
+          existingPaths.add(f.path);
+        }
+      }
+      if (scanPending.length > 0) {
+        if (!proj.pendingFiles) proj.pendingFiles = [];
+        const existPendingPaths = new Set(proj.pendingFiles.map(f => f.path));
+        for (const f of scanPending) {
+          if (!existPendingPaths.has(f.path) && !existingPaths.has(f.path)) {
+            proj.pendingFiles.push(f);
+          }
+        }
+      }
+      proj.files = deduplicateFiles(proj.files);
+      return { files: proj.files };
+    });
+    if (merged) project.files = merged.files;
   }
 
   return { files: project.files, newCount };
@@ -1842,7 +3137,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     return { error: 'limit_reached', daysLeft };
   }
 
-  const projects = store.get('projects');
+  const projects = getProjects();
   const project = projects.find(p => p.id === id);
   if (!project) return { error: 'not_found' };
 
@@ -1978,7 +3273,7 @@ ipcMain.handle('projects:delete', (event, id) => {
     return projects;
   });
   // If project wasn't found, return current state
-  return result || store.get('projects');
+  return result || getProjects();
 });
 
 ipcMain.handle('projects:delete-all', () => {
@@ -1999,11 +3294,84 @@ ipcMain.handle('projects:delete-all', () => {
   figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaScanTimestamps.clear();
+  // Clean up PS/InDesign pollers (v2.3.0)
+  for (const [, intervalId] of psPollers) {
+    clearInterval(intervalId);
+  }
+  psPollers.clear();
+  psPollerStarting.clear();
+  psInProgress.clear();
+  // Clean up lastUsed pollers (v2.3.3)
+  for (const [, intervalId] of lastUsedPollers) {
+    clearInterval(intervalId);
+  }
+  lastUsedPollers.clear();
   lastFileActivity.clear();
   inactivityNotified.clear();
+  designAppRunningCache.clear(); // v2.4.2
+  // v2.2.2: Clean up scan-on-open state
+  scannedDesignFiles.clear();
+  designFilePids.clear();
 
   store.set('projects', []);
   return [];
+});
+
+// --- V2 Quick Package ---
+
+ipcMain.handle('v2:browse-file', async () => {
+  const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
+  const result = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    title: 'Select Master Design File',
+    filters: [
+      { name: 'Design Files', extensions: SUPPORTED_EXTENSIONS.map(e => e.slice(1)) }
+    ]
+  });
+  showTrayWindow();
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('v2:package-file', async (event, filePath) => {
+  const { packageMasterFile } = require('./parsers/index.js');
+
+  // Let user choose output directory
+  const outputResult = await dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Choose Package Destination',
+    defaultPath: path.join(os.homedir(), 'Desktop')
+  });
+  showTrayWindow();
+  if (outputResult.canceled) return { canceled: true };
+
+  const outputDir = outputResult.filePaths[0];
+
+  // Generate folder name based on master file
+  const baseName = path.basename(filePath, path.extname(filePath));
+  const dateStr = new Date().toISOString().split('T')[0];
+  const folderName = `${baseName}_${dateStr}`;
+  const destFolder = path.join(outputDir, folderName);
+
+  try {
+    const result = await packageMasterFile(filePath, destFolder);
+    return {
+      success: true,
+      masterFile: result.masterFile,
+      assetsFound: result.assetsFound,
+      assetsCopied: result.assetsCopied,
+      assetsMissing: result.assetsMissing,
+      outputDir: destFolder,
+      files: result.files
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('v2:supported-extensions', () => {
+  const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
+  return SUPPORTED_EXTENSIONS;
 });
 
 // --- Figma Integration ---
@@ -2014,7 +3382,7 @@ ipcMain.handle('figma:status', async () => {
   const token = await parser.getStoredToken();
 
   // Get auto-tracking stats
-  const projects = store.get('projects');
+  const projects = getProjects();
   const activePollers = [];
   let totalFigmaAssets = 0;
 
@@ -2044,7 +3412,7 @@ ipcMain.handle('figma:connect', async (event, token) => {
 
   if (stored) {
     // Start Figma polling for any currently watching projects
-    const projects = store.get('projects');
+    const projects = getProjects();
     for (const project of projects) {
       if (project.status === 'watching' && !figmaPollers.has(project.id)) {
         startFigmaPolling(project.id);
@@ -2082,7 +3450,7 @@ ipcMain.handle('figma:scan-project', async (event, projectId) => {
     return { success: false, error: 'Figma not connected' };
   }
 
-  const project = store.get('projects').find(p => p.id === projectId);
+  const project = getProjects().find(p => p.id === projectId);
   if (!project) {
     return { success: false, error: 'Project not found' };
   }
@@ -2097,7 +3465,7 @@ ipcMain.handle('figma:scan-project', async (event, projectId) => {
 
 // Get Figma assets count for a specific project
 ipcMain.handle('figma:project-assets', async (event, projectId) => {
-  const project = store.get('projects').find(p => p.id === projectId);
+  const project = getProjects().find(p => p.id === projectId);
   if (!project) {
     return { count: 0, assets: [] };
   }
@@ -2229,7 +3597,7 @@ app.whenReady().then(async () => {
   createTray();
 
   // Resume watching for any active projects (FIX 4: await async startWatching)
-  const projects = store.get('projects');
+  const projects = getProjects();
   for (const project of projects) {
     if (project.status === 'watching') {
       await startWatching(project.id);
@@ -2272,6 +3640,21 @@ app.on('before-quit', () => {
   figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaScanTimestamps.clear();
+  // Clean up PS/InDesign pollers (v2.3.0)
+  for (const [, intervalId] of psPollers) {
+    clearInterval(intervalId);
+  }
+  psPollers.clear();
+  psPollerStarting.clear();
+  psInProgress.clear();
+  // Clean up lastUsed pollers (v2.3.3)
+  for (const [, intervalId] of lastUsedPollers) {
+    clearInterval(intervalId);
+  }
+  lastUsedPollers.clear();
+  // v2.2.2: Clean up scan-on-open state
+  scannedDesignFiles.clear();
+  designFilePids.clear();
   // Explicitly destroy tray + window so quit isn't blocked by hidden windows
   if (tray && !tray.isDestroyed()) {
     tray.destroy();

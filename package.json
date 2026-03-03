@@ -1,22 +1,25 @@
 {
   "name": "crate-app",
-  "version": "2.2.1",
-  "productName": "Crate v2.2.1",
+  "version": "2.4.4",
+  "productName": "Crate v2.4.4",
   "description": "Universal project file packager for graphic designers — macOS menu bar app",
   "main": "main.js",
   "scripts": {
     "start": "electron ."
   },
   "dependencies": {
+    "ag-psd": "^30.1.0",
     "canvas": "^3.2.1",
     "chokidar": "^3.6.0",
     "electron-store": "^8.2.0",
     "node-fetch": "^2.7.0",
+    "pako": "^2.1.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
-    "electron": "^33.2.1"
+    "electron": "^33.2.1",
+    "electron-builder": "^24.13.3"
   },
   "build": {
     "appId": "com.crate.app",

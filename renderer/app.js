@@ -761,6 +761,54 @@ function setupEventListeners() {
 
   $('#btn-delete-confirm').addEventListener('click', confirmDeleteProject);
 
+  // V2 Quick Package - Drop zone
+  const dropZone = $('#v2-drop-zone');
+  if (dropZone) {
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.add('drag-over');
+    });
+
+    dropZone.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.remove('drag-over');
+    });
+
+    dropZone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.remove('drag-over');
+
+      const files = e.dataTransfer.files;
+      if (files.length > 0) {
+        const filePath = files[0].path;
+        handleV2FileDrop(filePath);
+      }
+    });
+  }
+
+  // V2 Browse button
+  $('#btn-v2-browse').addEventListener('click', async () => {
+    const filePath = await window.crate.v2BrowseFile();
+    if (filePath) {
+      handleV2FileDrop(filePath);
+    }
+  });
+
+  // V2 Results modal
+  $('#btn-v2-done').addEventListener('click', () => {
+    $('#modal-v2-results').classList.add('hidden');
+  });
+
+  $('#btn-v2-open-folder').addEventListener('click', () => {
+    if (v2LastResult && v2LastResult.outputDir) {
+      window.crate.openFolder(v2LastResult.outputDir);
+    }
+    $('#modal-v2-results').classList.add('hidden');
+  });
+
   // Figma connect
   $('#btn-figma-connect').addEventListener('click', async () => {
     const token = $('#input-figma-token').value.trim();
@@ -947,6 +995,63 @@ function showToast(message) {
   toast.style.opacity = '1';
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 3000);
+}
+
+// ===== V2 Results Modal =====
+let v2LastResult = null;
+
+function showV2Results(result) {
+  v2LastResult = result;
+
+  const masterName = result.masterFile.split('/').pop();
+  $('#v2-result-subtitle').textContent = masterName;
+
+  // Stats
+  const statsEl = $('#v2-result-stats');
+  statsEl.innerHTML = `
+    <div class="v2-result-stat">
+      <span class="v2-result-stat-label">Assets found</span>
+      <span class="v2-result-stat-value">${result.assetsFound}</span>
+    </div>
+    <div class="v2-result-stat">
+      <span class="v2-result-stat-label">Assets copied</span>
+      <span class="v2-result-stat-value">${result.assetsCopied}</span>
+    </div>
+  `;
+
+  // Missing assets
+  const missingEl = $('#v2-result-missing');
+  if (result.assetsMissing && result.assetsMissing.length > 0) {
+    missingEl.innerHTML = `
+      <div class="v2-result-missing-header">\u26A0 Missing Assets</div>
+      <div class="v2-result-missing-list">
+        ${result.assetsMissing.map(m => `<div class="v2-result-missing-item" title="${escapeHtml(m.path)}">${escapeHtml(m.path.split('/').pop())}</div>`).join('')}
+      </div>
+    `;
+  } else {
+    missingEl.innerHTML = '';
+  }
+
+  $('#modal-v2-results').classList.remove('hidden');
+}
+
+async function handleV2FileDrop(filePath) {
+  if (!filePath) return;
+
+  $('#modal-progress').classList.remove('hidden');
+
+  const result = await window.crate.v2PackageFile(filePath);
+
+  $('#modal-progress').classList.add('hidden');
+
+  if (result.canceled) return;
+
+  if (result.error) {
+    showToast('Error: ' + result.error);
+    return;
+  }
+
+  showV2Results(result);
 }
 
 // ===== Helpers =====
