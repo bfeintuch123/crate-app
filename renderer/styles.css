@@ -530,9 +530,6 @@ body {
   border-radius: 8px;
   padding: 10px 12px;
   margin-bottom: 12px;
-  flex: 1;
-  overflow-y: auto;
-  min-height: 0;
 }
 
 .app-file {
@@ -1314,4 +1311,57 @@ body {
 
 .figma-benefit-hint strong {
   color: var(--black);
+}
+
+/* ===== Files Drop Zone ===== */
+.files-drop-zone {
+  border: 1.5px dashed var(--gray-300);
+  border-radius: 10px;
+  background: var(--gray-50);
+  margin-top: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.files-drop-zone:hover {
+  border-color: var(--gray-400);
+}
+
+.files-drop-plus {
+  font-size: 28px;
+  font-weight: 300;
+  color: var(--gray-400);
+  line-height: 1;
+}
+
+.files-drop-text {
+  font-size: 12px;
+  color: var(--gray-400);
+  margin-top: 4px;
+}
+
+.files-drop-or {
+  font-size: 11px;
+  color: var(--gray-400);
+  margin-top: 4px;
+}
+
+.files-drop-browse {
+  color: var(--black);
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.files-drop-browse:hover {
+  text-decoration: underline;
+}
+
+.files-drop-zone.drag-over {
+  border-color: var(--black);
+  background: rgba(0, 0, 0, 0.03);
 }

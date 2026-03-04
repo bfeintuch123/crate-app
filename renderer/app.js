@@ -761,6 +761,44 @@ function setupEventListeners() {
 
   $('#btn-delete-confirm').addEventListener('click', confirmDeleteProject);
 
+  // Files tab - Drop zone
+  const filesDropZone = $('#files-drop-zone');
+  if (filesDropZone) {
+    filesDropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      filesDropZone.classList.add('drag-over');
+    });
+
+    filesDropZone.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      filesDropZone.classList.remove('drag-over');
+    });
+
+    filesDropZone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      filesDropZone.classList.remove('drag-over');
+
+      if (!state.selectedProjectId) return;
+
+      const files = e.dataTransfer.files;
+      if (files.length > 0) {
+        const filePaths = Array.from(files).map(f => f.path);
+        await window.crate.addFilesFromPaths(state.selectedProjectId, filePaths);
+        state.projects = await window.crate.getProjects();
+        renderFiles();
+      }
+    });
+
+    filesDropZone.addEventListener('click', (e) => {
+      if (e.target.id === 'btn-add-files') return;
+      const browseSpan = $('#btn-add-files');
+      if (browseSpan) browseSpan.click();
+    });
+  }
+
   // V2 Quick Package - Drop zone
   const dropZone = $('#v2-drop-zone');
   if (dropZone) {

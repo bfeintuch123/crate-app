@@ -1628,7 +1628,7 @@ async function runScanOnOpen(projectId, filePath) {
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
   for (const p of linkedPaths) {
-    if (!p.startsWith('/Users/')) continue;
+    if (!p.startsWith('/Users/') && !p.startsWith('/private/') && !p.startsWith(os.tmpdir())) continue;
     const pExt = path.extname(p).toLowerCase();
     if (!DESIGN_FILE_EXTENSIONS.has(pExt)) continue;
     try {
@@ -1686,6 +1686,29 @@ async function runScanOnOpen(projectId, filePath) {
     if (Date.now() - lastParsed < 5000) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
     const psdAssets = await extractPsdAssets(filePath, projectId);
+
+    // v2.4.5: For psd-embedded assets extracted to tmp, try to resolve to original source file
+    const homeDir = os.homedir();
+    const searchDirs = [
+      path.join(homeDir, 'Downloads'),
+      path.join(homeDir, 'Desktop'),
+      path.join(homeDir, 'Documents'),
+    ];
+    for (const asset of psdAssets) {
+      if (asset.source !== 'psd-embedded') continue;
+      const baseName = path.basename(asset.filePath);
+      for (const dir of searchDirs) {
+        const candidate = path.join(dir, baseName);
+        try {
+          await fs.promises.access(candidate, fs.constants.F_OK);
+          asset.filePath = candidate;
+          break;
+        } catch (e) {
+          // not found in this dir — try next
+        }
+      }
+    }
+
     if (psdAssets.length > 0) {
       const psdResult = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
@@ -2024,27 +2047,6 @@ async function startWatching(projectId) {
       }
     }
 
-    // v2.3.2: Image/media files — capture if a design app is currently running (updated every 3s by lsof poller).
-    // Restores Photoshop drag-and-embed capture without Finder thumbnail false positives.
-    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
-      const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        if (name.startsWith('~') || name.startsWith('._')) return null;
-        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
-      });
-      if (result) {
-        lastFileActivity.set(projectId, Date.now());
-        inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-        }
-      }
-    }
   });
 
   // FIX 1: chokidar change handler uses mutateProject
@@ -2087,26 +2089,6 @@ async function startWatching(projectId) {
       }
     }
 
-    // v2.3.2: Image/media files — capture on change if a design app is running.
-    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
-      const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        if (name.startsWith('~') || name.startsWith('._')) return null;
-        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
-      });
-      if (result) {
-        lastFileActivity.set(projectId, Date.now());
-        inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-        }
-      }
-    }
   });
 
   watchers.set(projectId, watcher);
@@ -2349,6 +2331,24 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
     return project.files;
   });
 
+  return result;
+});
+
+ipcMain.handle('projects:add-files-from-paths', async (event, projectId, filePaths) => {
+  const result = mutateProject(projectId, (project) => {
+    for (const filePath of filePaths) {
+      if (!project.files.some(f => f.path === filePath)) {
+        project.files.push({
+          path: filePath,
+          name: path.basename(filePath),
+          ext: path.extname(filePath).toLowerCase(),
+          addedAt: Date.now()
+        });
+      }
+    }
+    project.files = deduplicateFiles(project.files);
+    return project.files;
+  });
   return result;
 });
 
@@ -3336,16 +3336,8 @@ ipcMain.handle('v2:browse-file', async () => {
 ipcMain.handle('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
-  // Let user choose output directory
-  const outputResult = await dialog.showOpenDialog({
-    properties: ['openDirectory', 'createDirectory'],
-    title: 'Choose Package Destination',
-    defaultPath: path.join(os.homedir(), 'Desktop')
-  });
-  showTrayWindow();
-  if (outputResult.canceled) return { canceled: true };
-
-  const outputDir = outputResult.filePaths[0];
+  // Default output to Desktop — no second dialog
+  const outputDir = path.join(os.homedir(), 'Desktop');
 
   // Generate folder name based on master file
   const baseName = path.basename(filePath, path.extname(filePath));
