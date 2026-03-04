@@ -158,6 +158,10 @@ const DESIGN_APP_PROCESS_NAMES = {
   web:      ['Figma', 'Sketch', 'Adobe XD', 'Affinity Designer', 'Visual Studio Code'],
 };
 
+// v2.3.9: Screenshot filenames to exclude from all capture paths.
+// macOS names screenshots "Screenshot YYYY-MM-DD at H.MM.SS AM/PM.png"
+const SCREENSHOT_NAME_REGEX = /^Screenshot \d{4}-\d{2}-\d{2} at \d+\.\d+\.\d+( [AP]M)?\.png$/i;
+
 function getFileCreatorApp(filePath) {
   try {
     const result = execFileSync("/usr/bin/mdls", ["-name", "kMDItemCreatorApplicationIdentifier", "-raw", filePath], {
@@ -359,6 +363,7 @@ const psdParseDebounce = new Map();   // psdFilePath -> lastParsedTimestamp
 
 // --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
 const lastUsedPollers = new Map();    // projectId -> intervalId
+const lastUsedPollTimes = new Map();  // projectId -> timestamp of last poll start (v2.3.9)
 const LAST_USED_POLL_MS = 10000;      // 10 seconds
 
 // Get PIDs of running design apps relevant to a project type.
@@ -554,6 +559,7 @@ function pollLsofForProject(projectId) {
 
           const ext = path.extname(filePath).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+          if (SCREENSHOT_NAME_REGEX.test(path.basename(filePath))) continue; // v2.3.9: never capture macOS screenshots
 
           // v2.2.2: Removed presentation mtime filter — old files on disk placed
           // mid-session should be captured when opened by a design app.
@@ -1057,6 +1063,7 @@ function stopPsPolling(projectId) {
 
 async function pollLastUsedForProject(projectId) {
   try {
+  const pollStart = Date.now(); // capture before any async work
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project || project.status !== 'watching') return;
@@ -1072,10 +1079,17 @@ async function pollLastUsedForProject(projectId) {
   const existingPaths = new Set(project.files.map(f => f.path));
   const newFiles = [];
 
-  // v2.4.2: Single mdfind query instead of per-file mdls spawning.
-  // Asks Spotlight for all files with kMDItemLastUsedDate >= watchStart in one shot.
-  const watchStartDate = new Date(watchStart);
-  const mdfindTimestamp = `$time.iso(${watchStartDate.toISOString()})`;
+  // v2.3.9: Sliding-window lookback — only capture files used since the LAST poll,
+  // not since session start. The old approach (kMDItemLastUsedDate >= watchStart)
+  // was cumulative: after 30 min every poll swept 30 min of activity from ANY app
+  // (Finder, Preview, browsers) causing false positives of random images/files.
+  // Now each poll only looks back 1.5x the poll interval (+ 5s buffer) so we
+  // catch genuine drag-and-drop activity without accumulating session history.
+  const lastPollTime = lastUsedPollTimes.get(projectId);
+  const lookbackMs = lastPollTime
+    ? Math.max(watchStart, lastPollTime - 5000)
+    : watchStart;
+  const mdfindTimestamp = `$time.iso(${new Date(lookbackMs).toISOString()})`;
   const onlyinArgs = scanDirs.filter(d => fs.existsSync(d)).flatMap(d => ['-onlyin', d]);
   if (onlyinArgs.length === 0) return;
 
@@ -1090,6 +1104,7 @@ async function pollLastUsedForProject(projectId) {
       if (!fullPath) continue;
       const name = path.basename(fullPath);
       if (name.startsWith('.') || name.startsWith('~') || name.startsWith('._')) continue;
+      if (SCREENSHOT_NAME_REGEX.test(name)) continue; // v2.3.9: never capture macOS screenshots
       const ext = path.extname(name).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
@@ -1099,6 +1114,10 @@ async function pollLastUsedForProject(projectId) {
   } catch (e) {
     // mdfind failed — skip this poll cycle
   }
+
+  // v2.3.9: Always update lastPollTime so the next poll uses the sliding window,
+  // even if this poll found nothing (prevents window from drifting on quiet polls).
+  lastUsedPollTimes.set(projectId, pollStart);
 
   if (newFiles.length === 0) return;
 
@@ -1135,6 +1154,7 @@ function startLastUsedPolling(projectId) {
 function stopLastUsedPolling(projectId) {
   const intervalId = lastUsedPollers.get(projectId);
   if (intervalId !== undefined) { clearInterval(intervalId); lastUsedPollers.delete(projectId); }
+  lastUsedPollTimes.delete(projectId); // v2.3.9: clear sliding-window state
 }
 
 // --- Scan-on-Open: per-format asset extractors ---
@@ -1182,9 +1202,16 @@ async function extractLinkedAssets(filePath) {
       case '.afpub':
         return await extractLinkedAssetsAffinity(filePath);
       case '.key':
+        return await extractLinkedAssetsZipMedia(filePath);
       case '.pptx':
       case '.ppt':
-        return await extractLinkedAssetsZipMedia(filePath);
+        // v2.3.9: PPTX/PPT embed their media inside the zip — there are no external
+        // linked file references in the normal workflow. The old regex scan on the
+        // raw binary was finding historical source-path metadata stored in the PPTX
+        // XML (the path where an image was originally inserted from), causing "random
+        // images I've never seen before" false positives. Embedded images are extracted
+        // correctly at package time by extractEmbeddedMedia(), so skip scan-on-open here.
+        return [];
       case '.pxd':
         return await extractLinkedAssetsPxd(filePath);
       case '.fig':
@@ -2500,6 +2527,9 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
   // pre-existing .fig file opened (imported) in Figma only updates
   // kMDItemLastUsedDate, not mtime. Removing the .fig skip lets this
   // scan catch those imports. Dedup via existingPaths prevents doubles.
+  // v2.3.9: Gate to branding/print only — presentation projects don't need this
+  // sweep, and it causes false positives (random Desktop/Downloads images).
+  if (project.type === "branding" || project.type === "print") {
   for (const dir of scanDirs) {
     try {
       if (!fs.existsSync(dir)) continue;
@@ -2518,6 +2548,7 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
           }
 
           if (!entry.isFile()) continue;
+          if (SCREENSHOT_NAME_REGEX.test(entry.name)) continue; // v2.3.9: never capture macOS screenshots
           const ext = path.extname(entry.name).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
           if (existingPaths.has(fullPath)) continue;
@@ -2556,6 +2587,7 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
       // scan error — continue with others
     }
   }
+  } // end branding/print type guard
     })(),
     new Promise(resolve => setTimeout(resolve, 8000))
   ]);
@@ -3306,6 +3338,7 @@ ipcMain.handle('projects:delete-all', () => {
     clearInterval(intervalId);
   }
   lastUsedPollers.clear();
+  lastUsedPollTimes.clear(); // v2.3.9
   lastFileActivity.clear();
   inactivityNotified.clear();
   designAppRunningCache.clear(); // v2.4.2
@@ -3644,6 +3677,7 @@ app.on('before-quit', () => {
     clearInterval(intervalId);
   }
   lastUsedPollers.clear();
+  lastUsedPollTimes.clear(); // v2.3.9
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
