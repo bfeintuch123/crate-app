@@ -1146,7 +1146,13 @@ async function pollLastUsedForProject(projectId) {
 
 function startLastUsedPolling(projectId) {
   if (lastUsedPollers.has(projectId)) return;
-  setTimeout(() => pollLastUsedForProject(projectId), 2000); // initial run after 2s
+  // v2.3.9: Delay first poll by 30s (was 2s) to skip design app startup noise.
+  // When PS/PP/Illustrator open they touch recently-used images in the first ~10s,
+  // bumping kMDItemLastUsedDate to "now" (after watchStart). A 2s first-poll
+  // would sweep all of those as session files. At T+30s the sliding window only
+  // looks back ~15s, safely past the startup burst. Legitimate drag-and-drops
+  // in the first 30s are still captured by lsof polling.
+  setTimeout(() => pollLastUsedForProject(projectId), 30000);
   const intervalId = setInterval(() => pollLastUsedForProject(projectId), LAST_USED_POLL_MS);
   lastUsedPollers.set(projectId, intervalId);
 }
