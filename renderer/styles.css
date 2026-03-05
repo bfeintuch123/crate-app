@@ -1332,33 +1332,50 @@ body {
   border-color: var(--gray-400);
 }
 
-.files-drop-plus {
-  font-size: 28px;
+.files-drop-icon-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+.files-drop-icon-square {
+  width: 44px;
+  height: 44px;
+  border: 1.5px dashed var(--gray-300);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--white);
+  transition: border-color 0.15s;
+}
+
+.files-drop-zone:hover .files-drop-icon-square,
+.files-drop-zone.drag-over .files-drop-icon-square {
+  border-color: var(--black);
+}
+
+.files-drop-icon-plus {
+  font-size: 24px;
   font-weight: 300;
   color: var(--gray-400);
   line-height: 1;
 }
 
+.files-drop-zone.drag-over .files-drop-icon-plus {
+  color: var(--black);
+}
+
 .files-drop-text {
   font-size: 12px;
-  color: var(--gray-400);
-  margin-top: 4px;
+  color: var(--gray-500);
+  margin-bottom: 2px;
 }
 
 .files-drop-or {
   font-size: 11px;
   color: var(--gray-400);
-  margin-top: 4px;
-}
-
-.files-drop-browse {
-  color: var(--black);
-  cursor: pointer;
-  font-weight: 500;
-}
-
-.files-drop-browse:hover {
-  text-decoration: underline;
 }
 
 .files-drop-zone.drag-over {

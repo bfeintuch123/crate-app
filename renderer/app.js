@@ -416,7 +416,7 @@ async function renderSettings() {
   state.usage = await window.crate.getUsage();
 
   $('#input-naming-template').value = state.settings.namingTemplate;
-  $('#toggle-notifications').checked = state.settings.notifications || false;
+  $('#toggle-notifications').checked = state.settings.notifications !== false;
 
   const used = state.usage.packagesThisMonth;
   $('#plan-info').textContent = `Free Plan \u00B7 ${used}/10 packages`;
