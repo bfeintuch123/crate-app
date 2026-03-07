@@ -1093,11 +1093,6 @@ async function pollLastUsedForProject(projectId) {
       const ext = path.extname(name).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
-      // v2.4.6: only capture files actually touched by a design app
-      try {
-        const createdByDesign = await isCreatedByDesignApp(fullPath, project.type);
-        if (!createdByDesign) continue;
-      } catch (e) { continue; }
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
     }
@@ -2032,10 +2027,11 @@ async function startWatching(projectId) {
     // v2.3.2: Image/media files — capture if a design app is currently running (updated every 3s by lsof poller).
     // Restores Photoshop drag-and-embed capture without Finder thumbnail false positives.
     if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.6: gate on isCreatedByDesignApp to prevent browser downloads from being captured
-      const proj = getProjects().find(p => p.id === projectId);
-      const createdByDesign = await isCreatedByDesignApp(filePath, proj?.type);
-      if (!createdByDesign) return;
+      // v2.4.7: gate on isFileOpenByDesignApp (lsof real-time check) instead of creator metadata.
+      // Creator is always the browser for downloaded images — lsof tells us if a design app is
+      // actually holding the file open right now (drag-in, link, etc). Works for all design apps.
+      const openByDesign = await isFileOpenByDesignApp(filePath);
+      if (!openByDesign) return;
       // v2.4.0: normalize path comparison to prevent duplicates
       const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
@@ -2098,10 +2094,9 @@ async function startWatching(projectId) {
 
     // v2.3.2: Image/media files — capture on change if a design app is running.
     if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.6: gate on isCreatedByDesignApp to prevent browser downloads from being captured
-      const proj = getProjects().find(p => p.id === projectId);
-      const createdByDesign = await isCreatedByDesignApp(filePath, proj?.type);
-      if (!createdByDesign) return;
+      // v2.4.7: gate on isFileOpenByDesignApp (lsof real-time check). Works for all design apps.
+      const openByDesign = await isFileOpenByDesignApp(filePath);
+      if (!openByDesign) return;
       // v2.4.0: normalize path comparison to prevent duplicates
       const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
@@ -2534,12 +2529,6 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
           const ext = path.extname(entry.name).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
           if (existingPaths.has(fullPath)) continue;
-
-          // v2.4.6: gate on isCreatedByDesignApp to prevent pre-session browser downloads from being captured
-          try {
-            const createdByDesign = await isCreatedByDesignApp(fullPath, project.type);
-            if (!createdByDesign) continue;
-          } catch (e) { continue; }
 
           try {
             const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
