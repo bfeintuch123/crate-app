@@ -2026,29 +2026,10 @@ async function startWatching(projectId) {
       }
     }
 
-    // v2.3.2: Image/media files — capture if a design app is currently running (updated every 3s by lsof poller).
-    // Restores Photoshop drag-and-embed capture without Finder thumbnail false positives.
-    // v2.4.8: reverted lsof gate — AI/PS don't keep linked/embedded image handles open long enough.
-    // designAppRunningCache is the correct gate here; pre-session false positives are fixed in the lastUsed poller.
-    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
-      const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        if (name.startsWith('~') || name.startsWith('._')) return null;
-        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
-      });
-      if (result) {
-        lastFileActivity.set(projectId, Date.now());
-        inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-        }
-      }
-    }
+    // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed.
+    // Images are NEVER captured by chokidar — produces false positives (browser downloads).
+    // Image capture paths: lsof poller, scan-on-open, lastUsed poller, ag-psd/extractEmbeddedMedia at package time.
+    // See LEARNINGS.md: "Chokidar must NEVER capture image files."
   });
 
   // FIX 1: chokidar change handler uses mutateProject
@@ -2091,27 +2072,7 @@ async function startWatching(projectId) {
       }
     }
 
-    // v2.3.2: Image/media files — capture on change if a design app is running.
-    // v2.4.8: reverted lsof gate — same reasoning as 'add' handler above.
-    if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
-      const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        if (name.startsWith('~') || name.startsWith('._')) return null;
-        proj.files.push({ path: filePath, name, ext, addedAt: Date.now(), source: 'chokidar-image' });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
-      });
-      if (result) {
-        lastFileActivity.set(projectId, Date.now());
-        inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-        }
-      }
-    }
+    // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed from 'change' handler too.
   });
 
   watchers.set(projectId, watcher);
