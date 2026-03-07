@@ -32,6 +32,9 @@ async function getXattrLastUsedMs(filePath) {
   }
 }
 
+// L1: Cache stat results to avoid redundant fs.statSync calls across invocations.
+// The cache is short-lived (cleared each call) — just prevents re-stat of the same
+// path within a single dedup pass.
 function deduplicateFiles(files) {
   // v2.4.0: Normalize paths before comparing — resolve to absolute, lowercase
   // for case-insensitive macOS filesystem, strip trailing slashes.
@@ -51,10 +54,17 @@ function deduplicateFiles(files) {
   // files, which caused lsof-tracked and linked-asset files with the same basename
   // and size (legitimately different project assets) to be incorrectly merged.
   const seenNameSize = new Set();
+  const statCache = new Map(); // L1: cache stat results within this call
   return pathDeduped.filter(f => {
     if (f.source !== 'embedded-media') return true; // skip dedup for non-embedded files
     let size = -1;
-    try { size = fs.statSync(f.path).size; } catch (e) {}
+    const cached = statCache.get(f.path);
+    if (cached !== undefined) {
+      size = cached;
+    } else {
+      try { size = fs.statSync(f.path).size; } catch (e) {}
+      statCache.set(f.path, size);
+    }
     if (size < 0) return true; // can't stat → keep
     const key = `${path.basename(f.path).toLowerCase()}:${size}`;
     if (seenNameSize.has(key)) return false;
@@ -317,6 +327,9 @@ function mutateProject(projectId, fn) {
 // FIX 2 (C2): Track in-flight pre-package scans
 const scanInFlight = new Set();
 
+// C1: In-flight lock for confirmPackage / projects:package
+let packageInFlight = false;
+
 let tray = null;
 let trayWindow = null;
 const watchers = new Map(); // projectId -> chokidar watcher
@@ -338,7 +351,9 @@ function cleanName(s) {
 
 const lsofPollers = new Map();   // projectId -> setInterval id
 const lsofInProgress = new Set(); // projectIds currently mid-poll (prevent overlap)
-const designAppRunningCache = new Map(); // v2.4.2: per-project, keyed by projectId
+// v2.4.2: per-project, keyed by projectId. Intentional ~3s staleness (lsof poll interval)
+// — acceptable trade-off to avoid calling ps on every file event.
+const designAppRunningCache = new Map();
 
 // --- Figma Auto-Tracking ---
 const figmaPollers = new Map();    // projectId -> setInterval id
@@ -356,6 +371,9 @@ const PS_POLL_INTERVAL_MS = 3000;     // 3 seconds
 
 // --- PSD binary parser debounce (v2.3.6) ---
 const psdParseDebounce = new Map();   // psdFilePath -> lastParsedTimestamp
+
+// v2.5.0: Scan-on-save debounce timers for PSD files (2-second debounce)
+const scanOnSaveTimers = new Map();   // psdFilePath -> setTimeout id
 
 // --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
 const lastUsedPollers = new Map();    // projectId -> intervalId
@@ -1718,6 +1736,109 @@ async function runScanOnOpen(projectId, filePath) {
   }
 }
 
+/**
+ * v2.5.0: Scan-on-save for PSD files — COMPLETELY ISOLATED from existing capture pipeline.
+ * When a .psd is saved, runs ag-psd async to extract file references and adds them
+ * to project.files mid-session. Debounced: waits 2s after last save before running.
+ * For linked smart objects: adds file path to project.files (source: 'scan-on-save-linked').
+ * For embedded smart objects: marks as embedded (source: 'scan-on-save-embedded', embedded: true).
+ * Never breaks the session — all errors caught silently.
+ */
+function scheduleScanOnSave(projectId, psdFilePath) {
+  const key = `${projectId}:${psdFilePath}`;
+  if (scanOnSaveTimers.has(key)) {
+    clearTimeout(scanOnSaveTimers.get(key));
+  }
+  scanOnSaveTimers.set(key, setTimeout(() => {
+    scanOnSaveTimers.delete(key);
+    runScanOnSave(projectId, psdFilePath).catch(() => {});
+  }, 2000));
+}
+
+async function runScanOnSave(projectId, psdFilePath) {
+  try {
+    const stat = await fs.promises.stat(psdFilePath);
+    if (stat.size > MAX_PARSE_FILE_SIZE) return;
+
+    const buf = await fs.promises.readFile(psdFilePath);
+    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+
+    const newEntries = [];
+
+    // Walk layers for linked smart objects (linkedFile.fullPath)
+    function walkLayers(layers) {
+      if (!layers) return;
+      for (const layer of layers) {
+        if (layer.linkedFile && layer.linkedFile.fullPath) {
+          const fp = layer.linkedFile.fullPath;
+          if (fs.existsSync(fp)) {
+            newEntries.push({
+              path: fp,
+              name: path.basename(fp),
+              ext: path.extname(fp).toLowerCase(),
+              addedAt: Date.now(),
+              source: 'scan-on-save-linked',
+            });
+          }
+        }
+        if (layer.children) walkLayers(layer.children);
+      }
+    }
+    walkLayers(psd.children);
+
+    // Mark embedded smart objects (extracted at package time as normal)
+    if (psd.linkedFiles && psd.linkedFiles.length > 0) {
+      for (const lf of psd.linkedFiles) {
+        if (!lf.name) continue;
+        newEntries.push({
+          path: psdFilePath, // parent PSD — physical extraction happens at package time
+          name: lf.name,
+          ext: path.extname(lf.name).toLowerCase(),
+          addedAt: Date.now(),
+          source: 'scan-on-save-embedded',
+          embedded: true,
+          parentPsd: psdFilePath,
+          fileId: uuidv4(), // C2: unique key so embedded entries can be individually removed
+        });
+      }
+    }
+
+    if (newEntries.length === 0) return;
+
+    const result = mutateProject(projectId, (proj) => {
+      if (proj.status !== 'watching') return null;
+      const existingPaths = new Set(proj.files.map(f =>
+        f.embedded ? `embedded:${f.name}:${f.parentPsd || ''}` : path.resolve(f.path).toLowerCase()
+      ));
+      let changed = false;
+
+      for (const entry of newEntries) {
+        const key = entry.embedded
+          ? `embedded:${entry.name}:${entry.parentPsd || ''}`
+          : path.resolve(entry.path).toLowerCase();
+        if (existingPaths.has(key)) continue;
+        proj.files.push(entry);
+        existingPaths.add(key);
+        changed = true;
+      }
+
+      if (changed) {
+        proj.files = deduplicateFiles(proj.files);
+      }
+      return changed ? { files: proj.files } : null;
+    });
+
+    if (result) {
+      lastFileActivity.set(projectId, Date.now());
+      inactivityNotified.delete(projectId);
+      sendToRenderer('files:updated', { projectId, files: result.files });
+    }
+  } catch (e) {
+    // L2: Log so failures are debuggable — never break the session
+    console.log('[scan-on-save] ag-psd parse failed:', e.message);
+  }
+}
+
 function createTrayWindow() {
   trayWindow = new BrowserWindow({
     width: 360,
@@ -2066,9 +2187,15 @@ async function startWatching(projectId) {
 
       // v2.2.2: When a design file changes, re-scan for linked assets
       // (designer may have added new links). Fire-and-forget.
-      // PSD ag-psd parsing is handled inside runScanOnOpen — no separate inline block needed.
-      if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
+      // C3: Skip runScanOnOpen for .psd — scheduleScanOnSave handles it with debounce
+      // to avoid double ag-psd parse on every .psd save event.
+      if (SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
         runScanOnOpen(projectId, filePath).catch(() => {});
+      }
+
+      // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
+      if (ext === '.psd') {
+        scheduleScanOnSave(projectId, filePath);
       }
     }
 
@@ -2098,12 +2225,21 @@ function stopWatching(projectId) {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.delete(projectId);
   designFilePids.delete(projectId);
+  // v2.5.0: Clean up scan-on-save timers for this project
+  for (const [key, timerId] of scanOnSaveTimers) {
+    if (key.startsWith(projectId + ':')) {
+      clearTimeout(timerId);
+      scanOnSaveTimers.delete(key);
+    }
+  }
 }
 
 // --- Inactivity Checker ---
 
+let inactivityCheckerInterval = null; // C4: stored so it can be cleared on quit
+
 function startInactivityChecker() {
-  setInterval(() => {
+  inactivityCheckerInterval = setInterval(() => {
     const projects = getProjects();
     const settings = store.get('settings');
 
@@ -2237,9 +2373,15 @@ ipcMain.handle('projects:get-files', (event, id) => {
   return project ? project.files : [];
 });
 
-ipcMain.handle('projects:remove-file', (event, projectId, filePath) => {
+ipcMain.handle('projects:remove-file', (event, projectId, fileIdOrPath) => {
   const result = mutateProject(projectId, (project) => {
-    project.files = project.files.filter(f => f.path !== filePath);
+    // C2: Use fileId for removal when available (embedded files share the parent PSD path).
+    // Fall back to path match for non-embedded files.
+    project.files = project.files.filter(f => {
+      if (f.fileId && f.fileId === fileIdOrPath) return false;
+      if (!f.fileId && f.path === fileIdOrPath) return false;
+      return true;
+    });
     return project.files;
   });
   return result || [];
@@ -2290,9 +2432,16 @@ ipcMain.handle('projects:reject-pending', (event, projectId, filePath) => {
 });
 
 ipcMain.handle('projects:add-files', async (event, projectId) => {
+  // M6: Filter to supported design + image file types
+  const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
+    .map(e => e.slice(1)); // strip leading dot
   const dialogResult = await dialog.showOpenDialog({
     properties: ['openFile', 'multiSelections'],
-    title: 'Add Files to Project'
+    title: 'Add Files to Project',
+    filters: [
+      { name: 'Design & Image Files', extensions: [...new Set(supportedExts)] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
   });
   // Re-show tray window after native dialog closes (window hides on blur)
   showTrayWindow();
@@ -2307,7 +2456,8 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
           path: filePath,
           name: path.basename(filePath),
           ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now()
+          addedAt: Date.now(),
+          source: 'manual-browse', // M1
         });
       }
     }
@@ -3086,6 +3236,11 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
 }
 
 ipcMain.handle('projects:package', async (event, id, outputPath) => {
+  // C1: Prevent double-click / concurrent packaging
+  if (packageInFlight) return { error: 'package_in_flight' };
+  packageInFlight = true;
+
+  try {
   // FIX 2 (C2): Wait for in-flight pre-scan to complete before packaging
   if (scanInFlight.has(id)) {
     const scanWaitStart = Date.now();
@@ -3165,19 +3320,26 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     for (const file of project.files) {
       const fileExt = path.extname(file.name).toLowerCase();
       if (ZIP_BASED_FORMATS.has(fileExt) && fs.existsSync(file.path)) {
-        const baseName = path.basename(file.name).toLowerCase();
+        // M3: Use full normalized path as dedup key, not just basename,
+        // so files with the same name in different directories aren't merged.
+        const dedupKey = path.resolve(file.path).toLowerCase();
         let mtime = 0;
         try { mtime = fs.statSync(file.path).mtimeMs; } catch (e) {}
-        const existing = presentationsByName.get(baseName);
+        const existing = presentationsByName.get(dedupKey);
         if (!existing || mtime > existing.mtime) {
-          presentationsByName.set(baseName, { file, mtime });
+          presentationsByName.set(dedupKey, { file, mtime });
         }
       }
     }
 
     for (const { file } of presentationsByName.values()) {
-      const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, project.files);
-      embeddedCount += embeddedFiles.length;
+      try {
+        const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, project.files);
+        embeddedCount += embeddedFiles.length;
+      } catch (embedErr) {
+        // M7: Report embedded extraction errors so user sees 'X files packaged, Y errors'
+        errors.push(`Embedded media extraction failed for ${file.name}: ${embedErr.message}`);
+      }
     }
 
     // Auto-stop watcher — SECURITY REQUIREMENT
@@ -3216,6 +3378,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   } catch (err) {
     showTrayWindow();
     return { error: err.message };
+  }
+  } finally {
+    packageInFlight = false;
   }
 });
 
@@ -3302,16 +3467,10 @@ ipcMain.handle('v2:browse-file', async () => {
 ipcMain.handle('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
-  // Let user choose output directory
-  const outputResult = await dialog.showOpenDialog({
-    properties: ['openDirectory', 'createDirectory'],
-    title: 'Choose Package Destination',
-    defaultPath: path.join(os.homedir(), 'Desktop')
-  });
-  showTrayWindow();
-  if (outputResult.canceled) return { canceled: true };
-
-  const outputDir = outputResult.filePaths[0];
+  // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
+  // Previously showed an output directory picker, which combined with the browse file
+  // picker created a double-prompt regression.
+  const outputDir = path.join(os.homedir(), 'Desktop');
 
   // Generate folder name based on master file
   const baseName = path.basename(filePath, path.extname(filePath));
@@ -3621,6 +3780,16 @@ app.on('before-quit', () => {
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
   designFilePids.clear();
+  // C4: Clean up inactivity checker
+  if (inactivityCheckerInterval) {
+    clearInterval(inactivityCheckerInterval);
+    inactivityCheckerInterval = null;
+  }
+  // v2.5.0: Clean up scan-on-save timers
+  for (const [, timerId] of scanOnSaveTimers) {
+    clearTimeout(timerId);
+  }
+  scanOnSaveTimers.clear();
   // Explicitly destroy tray + window so quit isn't blocked by hidden windows
   if (tray && !tray.isDestroyed()) {
     tray.destroy();

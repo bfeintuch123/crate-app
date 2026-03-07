@@ -127,7 +127,8 @@ function getStatusLabel(project) {
   const filesText = `${fileCount} file${fileCount !== 1 ? 's' : ''}`;
 
   if (project.status === 'watching') {
-    return `Watching \u00B7 ${filesText}`;
+    // v2.5.0: Remove mid-session file counter — only show count after packaging
+    return `Watching`;
   } else if (project.status === 'paused') {
     return `Paused \u00B7 ${filesText} so far`;
   } else {
@@ -270,7 +271,8 @@ async function renderFiles() {
   statusDot.className = `app-dot ${project.status !== 'watching' ? project.status : ''}`;
 
   if (project.status === 'watching') {
-    statusText.textContent = `Watching \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''} tracked`;
+    // v2.5.0: No mid-session counter — count shown only after packaging
+    statusText.textContent = `Watching`;
   } else if (project.status === 'paused') {
     statusText.textContent = `Paused \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
   } else {
@@ -288,6 +290,9 @@ async function renderFiles() {
   packageBtn.disabled = false;
 }
 
+// v2.5.0: Track expanded state for file list
+let fileListExpanded = false;
+
 function renderFileList(files) {
   const container = $('#file-list');
   container.innerHTML = '';
@@ -297,53 +302,67 @@ function renderFileList(files) {
     return;
   }
 
-  const visibleFiles = files.slice(0, MAX_VISIBLE_FILES);
-  const remainingCount = files.length - MAX_VISIBLE_FILES;
+  const previewFiles = files.slice(0, MAX_VISIBLE_FILES);
+  const hasMore = files.length > MAX_VISIBLE_FILES;
 
-  for (const file of visibleFiles) {
-    const row = document.createElement('div');
-    row.className = 'app-file';
-    const emoji = getFileEmoji(file.ext);
-
-    row.innerHTML = `
-      <span class="app-file-icon">${emoji}</span>
-      <span class="app-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
-      <button class="app-file-remove" data-path="${escapeHtml(file.path)}" title="Remove">&times;</button>
-    `;
-
-    const removeBtn = row.querySelector('.app-file-remove');
-    removeBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      await window.crate.removeFile(state.selectedProjectId, file.path);
-      state.projects = await window.crate.getProjects();
-      renderFiles();
-    });
-
-    container.appendChild(row);
+  // Render preview files (always visible)
+  for (const file of previewFiles) {
+    container.appendChild(createFileRow(file));
   }
 
-  if (remainingCount > 0) {
-    const divider = document.createElement('hr');
-    divider.className = 'app-file-divider';
-    container.appendChild(divider);
+  if (hasMore) {
+    // Expand/collapse toggle
+    const toggle = document.createElement('div');
+    toggle.className = 'file-list-toggle';
+    toggle.innerHTML = fileListExpanded
+      ? `<span class="file-list-toggle-icon">\u25B4</span> Hide files`
+      : `<span class="file-list-toggle-icon">\u25BE</span> Show all ${files.length} files`;
+    toggle.addEventListener('click', () => {
+      fileListExpanded = !fileListExpanded;
+      // M2: Re-fetch current files from state instead of closing over stale `files` array
+      const project = state.projects.find(p => p.id === state.selectedProjectId);
+      renderFileList(project ? project.files : files);
+    });
+    container.appendChild(toggle);
 
-    const meta = document.createElement('div');
-    meta.className = 'app-file-meta';
-    meta.innerHTML = `
-      <span class="app-file-count">+ ${remainingCount} more file${remainingCount !== 1 ? 's' : ''}</span>
-      <span class="app-file-add" id="files-add-more">+ Add files</span>
-    `;
-    container.appendChild(meta);
-
-    meta.querySelector('#files-add-more').addEventListener('click', async () => {
-      if (!state.selectedProjectId) return;
-      const files = await window.crate.addFiles(state.selectedProjectId);
-      if (files) {
-        state.projects = await window.crate.getProjects();
-        renderFiles();
+    // Expanded drawer
+    if (fileListExpanded) {
+      const drawer = document.createElement('div');
+      drawer.className = 'file-list-drawer';
+      for (const file of files.slice(MAX_VISIBLE_FILES)) {
+        drawer.appendChild(createFileRow(file));
       }
-    });
+      container.appendChild(drawer);
+    }
   }
+}
+
+function createFileRow(file) {
+  const row = document.createElement('div');
+  row.className = 'app-file';
+  const emoji = getFileEmoji(file.ext);
+  const statusBadge = file.embedded
+    ? '<span class="file-status-badge embedded" title="Embedded — extracted at package time">EMB</span>'
+    : (file.source && file.source.includes('linked')
+      ? '<span class="file-status-badge linked" title="Linked file — confirmed path">LNK</span>'
+      : '');
+
+  row.innerHTML = `
+    <span class="app-file-icon">${emoji}</span>
+    <span class="app-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
+    ${statusBadge}
+    <button class="app-file-remove" title="Remove">&times;</button>
+  `;
+
+  const removeBtn = row.querySelector('.app-file-remove');
+  removeBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await window.crate.removeFile(state.selectedProjectId, file.fileId || file.path);
+    state.projects = await window.crate.getProjects();
+    renderFiles();
+  });
+
+  return row;
 }
 
 // ===== Render Pending (Tier 2) Files =====
@@ -554,6 +573,18 @@ async function confirmPackage() {
   if (!project) return;
 
   $('#modal-package').classList.add('hidden');
+
+  // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
+  let outputPath = state.packageOutputPath;
+  if (!outputPath) {
+    outputPath = await window.crate.selectOutputFolder();
+    if (!outputPath) {
+      return;
+    }
+    state.packageOutputPath = outputPath;
+  }
+
+  // Now show progress — user has confirmed a destination
   $('#modal-progress').classList.remove('hidden');
 
   // Run pre-scan now (user already confirmed, progress spinner is showing)
@@ -564,16 +595,6 @@ async function confirmPackage() {
   ]);
   if (scanResult) {
     state.projects = await window.crate.getProjects();
-  }
-
-  let outputPath = state.packageOutputPath;
-  if (!outputPath) {
-    outputPath = await window.crate.selectOutputFolder();
-    if (!outputPath) {
-      $('#modal-progress').classList.add('hidden');
-      return;
-    }
-    state.packageOutputPath = outputPath;
   }
 
   const result = await window.crate.packageProject(project.id, outputPath);
@@ -591,9 +612,9 @@ async function confirmPackage() {
     return;
   }
 
-  // Show success
+  // Show success — v2.5.0: final accurate count shown only after packaging
   const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
+  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
   $('#success-path').textContent = result.folderPath;
   state.lastPackagedPath = result.folderPath;
   $('#modal-success').classList.remove('hidden');
@@ -673,7 +694,10 @@ function setupEventListeners() {
 
   // Files tab
   $('#btn-add-files').addEventListener('click', async () => {
-    if (!state.selectedProjectId) return;
+    if (!state.selectedProjectId) {
+      showToast('Select a project first');
+      return;
+    }
     const files = await window.crate.addFiles(state.selectedProjectId);
     if (files) {
       state.projects = await window.crate.getProjects();
@@ -689,6 +713,11 @@ function setupEventListeners() {
     if (!project || project.files.length === 0) {
       showToast('No files captured yet. Keep watching or tap + Files to add manually.');
       return;
+    }
+    // M4: Confirm before re-packaging an already-packaged project
+    if (project.status === 'packaged') {
+      const ok = confirm('This project was already packaged. Package again?');
+      if (!ok) return;
     }
     showPackageModal();
   });
@@ -800,6 +829,7 @@ function setupEventListeners() {
   // V2 Results modal
   $('#btn-v2-done').addEventListener('click', () => {
     $('#modal-v2-results').classList.add('hidden');
+    v2LastResult = null; // L8: release reference
   });
 
   $('#btn-v2-open-folder').addEventListener('click', () => {
@@ -807,6 +837,7 @@ function setupEventListeners() {
       window.crate.openFolder(v2LastResult.outputDir);
     }
     $('#modal-v2-results').classList.add('hidden');
+    v2LastResult = null; // L8: release reference
   });
 
   // Figma connect
@@ -943,9 +974,9 @@ function setupMainProcessListeners() {
           return;
         }
 
-        // Show success
+        // Show success — v2.5.0: final accurate count
         const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
+        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
         $('#success-path').textContent = result.folderPath;
         state.lastPackagedPath = result.folderPath;
         $('#modal-success').classList.remove('hidden');
@@ -1035,23 +1066,27 @@ function showV2Results(result) {
   $('#modal-v2-results').classList.remove('hidden');
 }
 
+let v2PackageInFlight = false;
 async function handleV2FileDrop(filePath) {
-  if (!filePath) return;
+  if (!filePath || v2PackageInFlight) return;
+  v2PackageInFlight = true;
 
-  $('#modal-progress').classList.remove('hidden');
+  try {
+    $('#modal-progress').classList.remove('hidden');
 
-  const result = await window.crate.v2PackageFile(filePath);
+    const result = await window.crate.v2PackageFile(filePath);
 
-  $('#modal-progress').classList.add('hidden');
+    $('#modal-progress').classList.add('hidden');
 
-  if (result.canceled) return;
+    if (result.error) {
+      showToast('Error: ' + result.error);
+      return;
+    }
 
-  if (result.error) {
-    showToast('Error: ' + result.error);
-    return;
+    showV2Results(result);
+  } finally {
+    v2PackageInFlight = false;
   }
-
-  showV2Results(result);
 }
 
 // ===== Helpers =====
