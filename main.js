@@ -1068,7 +1068,9 @@ async function pollLastUsedForProject(projectId) {
     path.join(homedir, 'Documents'),
     path.join(homedir, 'Downloads'),
   ];
-  const watchStart = project.watchStartedAt || project.createdAt;
+  // v2.4.8: never fall back to createdAt (days old) — if watchStartedAt missing, skip cycle
+  const watchStart = project.watchStartedAt;
+  if (!watchStart) return;
   const existingPaths = new Set(project.files.map(f => f.path));
   const newFiles = [];
 
@@ -1127,7 +1129,7 @@ async function pollLastUsedForProject(projectId) {
 
 function startLastUsedPolling(projectId) {
   if (lastUsedPollers.has(projectId)) return;
-  setTimeout(() => pollLastUsedForProject(projectId), 2000); // initial run after 2s
+  setTimeout(() => pollLastUsedForProject(projectId), 10000); // v2.4.8: 10s delay — ensures watchStartedAt is written before first poll
   const intervalId = setInterval(() => pollLastUsedForProject(projectId), LAST_USED_POLL_MS);
   lastUsedPollers.set(projectId, intervalId);
 }
@@ -2026,12 +2028,9 @@ async function startWatching(projectId) {
 
     // v2.3.2: Image/media files — capture if a design app is currently running (updated every 3s by lsof poller).
     // Restores Photoshop drag-and-embed capture without Finder thumbnail false positives.
+    // v2.4.8: reverted lsof gate — AI/PS don't keep linked/embedded image handles open long enough.
+    // designAppRunningCache is the correct gate here; pre-session false positives are fixed in the lastUsed poller.
     if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.7: gate on isFileOpenByDesignApp (lsof real-time check) instead of creator metadata.
-      // Creator is always the browser for downloaded images — lsof tells us if a design app is
-      // actually holding the file open right now (drag-in, link, etc). Works for all design apps.
-      const openByDesign = await isFileOpenByDesignApp(filePath);
-      if (!openByDesign) return;
       // v2.4.0: normalize path comparison to prevent duplicates
       const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
@@ -2093,10 +2092,8 @@ async function startWatching(projectId) {
     }
 
     // v2.3.2: Image/media files — capture on change if a design app is running.
+    // v2.4.8: reverted lsof gate — same reasoning as 'add' handler above.
     if (CHOKIDAR_IMAGE_EXTENSIONS.has(ext) && designAppRunningCache.get(projectId)) {
-      // v2.4.7: gate on isFileOpenByDesignApp (lsof real-time check). Works for all design apps.
-      const openByDesign = await isFileOpenByDesignApp(filePath);
-      if (!openByDesign) return;
       // v2.4.0: normalize path comparison to prevent duplicates
       const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
