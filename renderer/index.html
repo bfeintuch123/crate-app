@@ -171,18 +171,14 @@
               </div>
               <div class="figma-files-section" style="margin-top:12px;">
                 <div class="settings-desc" style="margin-bottom:6px;"><strong>Track a Figma file</strong> &mdash; paste any Figma file URL:</div>
-                <div style="display:flex;gap:6px;">
-                  <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="flex:1;">
-                  <button class="app-btn" id="btn-figma-add-file" style="white-space:nowrap;">Add File</button>
-                </div>
+                <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
+                <button class="app-btn" id="btn-figma-add-file" style="width:100%;margin-top:6px;">Add File</button>
                 <div id="figma-tracked-files-list" style="margin-top:8px;"></div>
               </div>
               <div class="figma-team-section" style="margin-top:12px;">
                 <div class="settings-desc" style="margin-bottom:6px;"><strong>Auto-discover</strong> (Professional plan) &mdash; paste your team URL for auto-discovery:</div>
-                <div style="display:flex;gap:6px;">
-                  <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="flex:1;">
-                  <button class="app-btn" id="btn-figma-add-team" style="white-space:nowrap;">Add Team</button>
-                </div>
+                <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="width:100%;box-sizing:border-box;">
+                <button class="app-btn" id="btn-figma-add-team" style="width:100%;margin-top:6px;">Add Team</button>
                 <div id="figma-team-ids-list" style="margin-top:8px;"></div>
               </div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
@@ -197,8 +193,8 @@
                 <div class="figma-step">2. Generate a Personal Access Token</div>
                 <div class="figma-step">3. Paste it below &mdash; that's it!</div>
               </div>
-              <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx">
-              <button class="app-btn" id="btn-figma-connect" style="margin-top:8px;">Connect Figma</button>
+              <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
+              <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Connect Figma</button>
               <div class="figma-benefit-hint">
                 Once connected, add Figma file URLs to track &mdash; Crate will automatically capture assets from them.
               </div>

@@ -273,7 +273,7 @@ const store = new Store({
     projects: [],
     settings: {
       namingTemplate: '{Project}_{Date}',
-      notifications: false
+      notifications: true
     },
     usage: {
       packagesThisMonth: 0,
