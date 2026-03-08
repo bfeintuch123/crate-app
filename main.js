@@ -1969,6 +1969,14 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     for (const f of projectFiles) {
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
+      // v2.6.1: scan-on-save prefixes filenames with "{PresentationName} — ".
+      // On subsequent saves, Keynote dedup checks the raw embedded name (e.g. "image-001")
+      // which never matches the prefixed form ("mykeynote — image-001"). Strip the prefix
+      // so existing files are recognised and not re-extracted.
+      if (f.source === 'scan-on-save-presentation') {
+        const separatorIdx = n.indexOf(' — ');
+        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
+      }
     }
 
     // Content-based dedup for .pptx files
