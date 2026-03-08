@@ -1191,6 +1191,10 @@ async function pollLastUsedForProject(projectId) {
       if (!fullPath) continue;
       const name = path.basename(fullPath);
       if (name.startsWith('.') || name.startsWith('~') || name.startsWith('._')) continue;
+      // v2.5.5: Skip macOS screenshots — they appear in kMDItemLastUsedDate because WhatsApp,
+      // Telegram, or any app that displays the file updates the last-used timestamp. Screenshots
+      // are never intentional project assets.
+      if (/^Screen.?Shot/i.test(name)) continue;
       const ext = path.extname(name).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
