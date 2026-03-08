@@ -546,9 +546,23 @@ function pollLsofForProject(projectId) {
         // explicitly tied to this project. Fall back to lsof-sourced files if that's all we have.
         const nonLsofFiles = proj.files.filter(f => f.source && f.source !== 'lsof');
         const anchorFiles = nonLsofFiles.length > 0 ? nonLsofFiles : proj.files;
-        // projectRoot: directory of the first anchor file, or null if project has no files yet.
-        // null means no scoping (empty project — allow all, fall through to existing behavior).
-        const projectRoot = anchorFiles.length > 0 ? path.dirname(anchorFiles[0].path) : null;
+        // Compute shortest common ancestor of ALL anchor files (not just the first).
+        // This prevents locking onto a deep subdirectory if the first anchor happened to be
+        // nested (e.g. /Project/assets/icons/logo.png → root should be /Project/, not /icons/).
+        // projectRoot = null when project has no files yet — scoping is skipped entirely.
+        let projectRoot = null;
+        if (anchorFiles.length > 0) {
+          const anchorDirs = anchorFiles.map(f => path.dirname(f.path).split('/'));
+          const firstParts = anchorDirs[0];
+          let commonDepth = firstParts.length;
+          for (let i = 1; i < anchorDirs.length; i++) {
+            const parts = anchorDirs[i];
+            let j = 0;
+            while (j < commonDepth && j < parts.length && parts[j] === firstParts[j]) j++;
+            commonDepth = j;
+          }
+          projectRoot = firstParts.slice(0, commonDepth).join('/') || '/';
+        }
 
         let changed = false;
 
