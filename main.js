@@ -539,6 +539,17 @@ function pollLsofForProject(projectId) {
         const existingPaths = new Set(proj.files.map(f => f.path));
         const pendingPaths = new Set((proj.pendingFiles || []).map(f => f.path));
 
+        // v2.5.3: Directory scoping — derive project root from existing files to prevent
+        // cross-project contamination when multiple projects are open in the same design app
+        // (e.g. Photoshop with two projects open: lsof sees ALL files from BOTH).
+        // Prefer non-lsof sources (scan-on-save, scan-on-open, etc.) as anchors since they're
+        // explicitly tied to this project. Fall back to lsof-sourced files if that's all we have.
+        const nonLsofFiles = proj.files.filter(f => f.source && f.source !== 'lsof');
+        const anchorFiles = nonLsofFiles.length > 0 ? nonLsofFiles : proj.files;
+        // projectRoot: directory of the first anchor file, or null if project has no files yet.
+        // null means no scoping (empty project — allow all, fall through to existing behavior).
+        const projectRoot = anchorFiles.length > 0 ? path.dirname(anchorFiles[0].path) : null;
+
         let changed = false;
 
         for (const line of parsedLines) {
@@ -584,6 +595,12 @@ function pollLsofForProject(projectId) {
                                    filePath.startsWith(home + '/Downloads/');
             if (!isInWatchedDir) continue;
           }
+
+          // v2.5.3: Directory scoping — reject lsof hits that fall outside the project's
+          // derived root directory. Prevents cross-project contamination when the user has
+          // multiple unrelated projects open simultaneously in the same design app.
+          // Skipped when projectRoot is null (empty project with no files yet).
+          if (projectRoot !== null && !filePath.startsWith(projectRoot + '/')) continue;
 
           if (existingPaths.has(filePath)) continue;
           if (pendingPaths.has(filePath)) continue;
