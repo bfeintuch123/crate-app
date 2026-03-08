@@ -4011,7 +4011,52 @@ ipcMain.handle('inactivity:pause', (event, projectId) => {
 
 // --- App Lifecycle ---
 
+// v2.6.2: Prompt to move app to /Applications/ if running from Downloads or anywhere else.
+// Non-technical users often run apps directly from Downloads without realising.
+// This fires once on launch, copies the .app bundle, relaunches, and deletes the old copy.
+function checkAndPromptMoveToApplications() {
+  if (!app.isPackaged) return; // skip in dev
+  const appPath = path.dirname(path.dirname(path.dirname(app.getPath('exe')))); // .app bundle (exe → MacOS → Contents → .app)
+  const applicationsDir = '/Applications';
+  if (appPath.startsWith(applicationsDir)) return; // already in /Applications
+
+  const { response } = require('electron').dialog.showMessageBoxSync({
+    type: 'question',
+    buttons: ['Move to Applications', 'Not Now'],
+    defaultId: 0,
+    cancelId: 1,
+    message: 'Move Crate to Applications?',
+    detail: 'Crate works best when run from your Applications folder. Move it there now?',
+    icon: undefined,
+  });
+
+  if (response !== 0) return; // user said Not Now
+
+  const appName = path.basename(appPath); // e.g. "Crate v2.6.2.app"
+  const destPath = path.join(applicationsDir, appName);
+
+  try {
+    // Remove existing copy in /Applications if present (handles re-install)
+    if (fs.existsSync(destPath)) {
+      execFileSync('/bin/rm', ['-rf', destPath]);
+    }
+    // Copy .app bundle to /Applications
+    execFileSync('/bin/cp', ['-R', appPath, destPath]);
+    // Move original to Trash so Downloads stays clean
+    require('electron').shell.trashItem(appPath).catch(() => {});
+    // Relaunch from /Applications
+    app.relaunch({ execPath: path.join(destPath, 'Contents', 'MacOS', path.basename(app.getPath('exe'))) });
+    app.exit(0);
+  } catch (e) {
+    // If copy fails (e.g. permissions), just continue — don't block launch
+    console.error('[crate] move-to-applications failed:', e.message);
+  }
+}
+
 app.whenReady().then(async () => {
+  // Prompt to move to /Applications if running from Downloads or Desktop
+  checkAndPromptMoveToApplications();
+
   // Show in Dock so users can right-click → Quit
   // NOTE: Do NOT manually set dock icon — let Electron use the .icns from the packager
   // which macOS renders with proper squircle mask (no white corners)
