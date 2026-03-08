@@ -1202,6 +1202,10 @@ async function pollLastUsedForProject(projectId) {
       // or scan-on-save. Using DESIGN_FILE_EXTENSIONS was too broad and caused false captures
       // from Chrome downloads, messaging apps, and any app that touches a file in Desktop/Downloads.
       if (!PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
+      // v2.5.9: Presentation source files (.pptx, .key, etc.) are in PRIMARY_DESIGN_EXTENSIONS
+      // but must still be excluded — their content is extracted via scan-on-save, not polling.
+      const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
+      if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
