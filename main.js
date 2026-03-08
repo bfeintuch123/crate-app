@@ -1196,12 +1196,12 @@ async function pollLastUsedForProject(projectId) {
       // are never intentional project assets.
       if (/^Screen.?Shot/i.test(name)) continue;
       const ext = path.extname(name).toLowerCase();
-      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-      // v2.5.7: Exclude presentation source files from lastUsed poller — same rule as lsof.
-      // Opening a second .pptx/.key in the same app updates its kMDItemLastUsedDate and
-      // mdfind returns it, causing false captures.
-      const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
-      if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
+      // v2.5.8: lastUsed poller only captures PRIMARY design source files.
+      // Per the original design intent (see DESIGN_FILE_EXTENSIONS comment): images, fonts,
+      // PDFs, and presentation source files are NOT captured here — they come from lsof
+      // or scan-on-save. Using DESIGN_FILE_EXTENSIONS was too broad and caused false captures
+      // from Chrome downloads, messaging apps, and any app that touches a file in Desktop/Downloads.
+      if (!PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
