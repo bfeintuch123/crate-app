@@ -2260,6 +2260,15 @@ async function startWatching(projectId) {
 
             if (path.basename(filePath).startsWith('~$')) continue;
 
+            // v2.5.5: Never capture presentation source files via lsof snapshot.
+            // Same rule as the ongoing poller — .pptx/.key files are source files,
+            // not linked assets. Their content is extracted via scan-on-save.
+            const PRESENTATION_SOURCE_EXTS_SNAP = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
+            if (PRESENTATION_SOURCE_EXTS_SNAP.has(path.extname(filePath).toLowerCase())) continue;
+
+            // v2.5.5: Skip macOS screenshots at snapshot time — same filter as ongoing poller.
+            if (/^Screen.?Shot/i.test(path.basename(filePath))) continue;
+
             const ext = path.extname(filePath).toLowerCase();
             if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
