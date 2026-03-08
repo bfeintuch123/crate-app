@@ -610,6 +610,13 @@ function pollLsofForProject(projectId) {
             if (!isInWatchedDir) continue;
           }
 
+          // v2.5.5: Never capture presentation source files (.pptx, .key, etc.) via lsof.
+          // When PowerPoint or Keynote has multiple presentations open, lsof sees all of them.
+          // These source files are not linked assets — their embedded content is extracted via
+          // scan-on-save instead. Capturing a second open presentation is always a false positive.
+          const PRESENTATION_SOURCE_EXTS = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
+          if (PRESENTATION_SOURCE_EXTS.has(path.extname(filePath).toLowerCase())) continue;
+
           // v2.5.3: Directory scoping — reject lsof hits that fall outside the project's
           // derived root directory. Prevents cross-project contamination when the user has
           // multiple unrelated projects open simultaneously in the same design app.
