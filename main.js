@@ -3355,6 +3355,14 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
     for (const f of projectFiles) {
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
+      // v2.5.9: scan-on-save-presentation prefixes filenames with "{PresentationName} — ".
+      // At package time the Keynote dedup checks the raw embedded name (e.g. "image-001"),
+      // which never matches the prefixed version ("mypresentation — image-001"). Strip the
+      // prefix so both forms are in the set and dedup works correctly.
+      if (f.source === 'scan-on-save-presentation') {
+        const separatorIdx = n.indexOf(' — ');
+        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
+      }
     }
   }
 
