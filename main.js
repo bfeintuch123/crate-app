@@ -635,6 +635,12 @@ function pollLsofForProject(projectId) {
                                    filePath.startsWith(home + '/Downloads/');
             if (!isInAllowedDir) continue;
 
+            // v2.5.4: Skip macOS screenshots — always named "Screenshot..." or "Screen Shot..."
+            // Design apps (e.g. Keynote) can briefly open screenshots during thumbnail/paste
+            // operations, causing false captures. Screenshots are never intentional project assets.
+            const basename = path.basename(filePath);
+            if (/^Screen.?Shot/i.test(basename)) continue;
+
             const cmd = currentPid ? pidToCmd.get(currentPid) || '' : '';
             if (LSOF_SKIP_APPS.some(app => cmd.includes(app))) {
               continue;
