@@ -1197,6 +1197,11 @@ async function pollLastUsedForProject(projectId) {
       if (/^Screen.?Shot/i.test(name)) continue;
       const ext = path.extname(name).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      // v2.5.7: Exclude presentation source files from lastUsed poller — same rule as lsof.
+      // Opening a second .pptx/.key in the same app updates its kMDItemLastUsedDate and
+      // mdfind returns it, causing false captures.
+      const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
+      if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
