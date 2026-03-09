@@ -2,7 +2,7 @@
   "name": "crate-app",
   "version": "2.6.2",
   "productName": "Crate v2.6.2",
-  "description": "Universal project file packager for graphic designers — macOS menu bar app",
+  "description": "Universal project file packager for graphic designers \u2014 macOS menu bar app",
   "main": "main.js",
   "scripts": {
     "start": "electron ."
@@ -48,7 +48,8 @@
       ]
     },
     "dmg": {
-      "title": "Crate",
+      "title": "Install Crate",
+      "background": "build/dmg-background.png",
       "window": {
         "width": 540,
         "height": 360
@@ -56,12 +57,12 @@
       "iconSize": 120,
       "contents": [
         {
-          "x": 145,
+          "x": 135,
           "y": 180,
           "type": "file"
         },
         {
-          "x": 395,
+          "x": 405,
           "y": 180,
           "type": "link",
           "path": "/Applications"
