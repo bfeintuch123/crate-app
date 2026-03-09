@@ -31,19 +31,38 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "entitlements.plist",
-      "entitlementsInherit": "entitlements.plist"
+      "entitlementsInherit": "entitlements.plist",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
     },
     "dmg": {
       "title": "Crate",
+      "window": {
+        "width": 540,
+        "height": 360
+      },
+      "iconSize": 120,
       "contents": [
         {
-          "x": 130,
-          "y": 220,
+          "x": 145,
+          "y": 180,
           "type": "file"
         },
         {
-          "x": 410,
-          "y": 220,
+          "x": 395,
+          "y": 180,
           "type": "link",
           "path": "/Applications"
         }
