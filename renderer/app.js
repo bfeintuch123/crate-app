@@ -242,7 +242,16 @@ async function renderFiles() {
   const noProject = $('#files-no-project');
   const filesView = $('#files-view');
 
+  // If no project is selected, try to auto-select an active one
   if (!state.selectedProjectId) {
+    const watching = state.projects.find(p => p.status === 'watching');
+    if (watching) {
+      state.selectedProjectId = watching.id;
+    }
+  }
+
+  if (!state.selectedProjectId) {
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -250,6 +259,7 @@ async function renderFiles() {
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -908,6 +918,23 @@ function setupEventListeners() {
     }
   });
 
+  // Figma scan now
+  $('#btn-figma-scan-now').addEventListener('click', async () => {
+    $('#btn-figma-scan-now').disabled = true;
+    $('#btn-figma-scan-now').textContent = 'Scanning...';
+    try {
+      const result = await window.crate.figmaScanNow();
+      if (result.triggered === 0) {
+        showToast('No active projects to scan');
+      }
+    } catch (e) {
+      showToast('Scan failed: ' + (e.message || 'Unknown error'));
+    } finally {
+      $('#btn-figma-scan-now').disabled = false;
+      $('#btn-figma-scan-now').textContent = 'Scan Now';
+    }
+  });
+
 }
 
 // ===== Tab State Helper =====
@@ -1011,12 +1038,30 @@ function setupMainProcessListeners() {
     } else if (data.addedCount > 0) {
       showToast(`Figma scan: ${data.addedCount} new asset${data.addedCount !== 1 ? 's' : ''} added`);
     }
+    // Update scan status line
+    updateFigmaScanStatus(data);
   });
 
   // Figma scan error notification
   window.crate.onFigmaScanError((data) => {
     showToast(`Figma scan error: ${data.error || 'Unknown error'}`);
+    updateFigmaScanStatus({ errors: [data.error || 'Unknown error'], timestamp: Date.now() });
   });
+}
+
+// ===== Figma Scan Status =====
+function updateFigmaScanStatus(data) {
+  const el = $('#figma-scan-status');
+  if (!el) return;
+  const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : 'just now';
+  const errors = data.errors || [];
+  if (errors.length > 0) {
+    el.style.color = '#f59e0b';
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}`;
+  } else {
+    el.style.color = '#9ca3af';
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new`;
+  }
 }
 
 // ===== Toast =====

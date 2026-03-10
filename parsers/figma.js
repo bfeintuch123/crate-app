@@ -561,12 +561,13 @@ class FigmaParser extends BaseParser {
    */
   async discoverRecentFiles(options = {}) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return [];
+    if (!token || !fetch) return { recentFiles: [], errors: [] };
 
     const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
     const teamIds = options.teamIds || [];
     const fileKeys = options.fileKeys || [];
     const recentFiles = [];
+    const errors = [];
     const seenKeys = new Set();
 
     try {
@@ -577,7 +578,9 @@ class FigmaParser extends BaseParser {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
           teamName = teamData.name || teamName;
         } catch (e) {
-          console.warn(`[crate][figma] Cannot access team ${teamId} — may require Professional plan`);
+          const msg = `Cannot access team ${teamId}: ${e.message}`;
+          console.warn(`[crate][figma] ${msg}`);
+          errors.push(msg);
           continue;
         }
 
@@ -586,7 +589,9 @@ class FigmaParser extends BaseParser {
           const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
           projects = projectsData.projects || [];
         } catch (e) {
-          console.warn(`[crate][figma] Cannot list projects for team ${teamId} — requires Professional+ plan`);
+          const msg = `Cannot list projects for team ${teamId} (${teamName}): ${e.message}`;
+          console.warn(`[crate][figma] ${msg}`);
+          errors.push(msg);
           continue;
         }
 
@@ -614,7 +619,7 @@ class FigmaParser extends BaseParser {
               }
             }
           } catch (e) {
-            // Skip project on error
+            errors.push(`Error listing files in project ${project.name}: ${e.message}`);
           }
         }
       }
@@ -632,10 +637,11 @@ class FigmaParser extends BaseParser {
       // Sort by most recently modified first
       recentFiles.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
 
-      return recentFiles;
+      return { recentFiles, errors };
     } catch (e) {
       console.error('[crate][figma] discoverRecentFiles error:', e.message);
-      return [];
+      errors.push(`discoverRecentFiles failed: ${e.message}`);
+      return { recentFiles, errors };
     }
   }
 
@@ -729,14 +735,20 @@ class FigmaParser extends BaseParser {
     }
 
     // Discover recent files
-    const files = await this.discoverRecentFiles({
+    const discovery = await this.discoverRecentFiles({
       sinceMs: options.sinceMs,
       maxAgeDays: options.maxAgeDays || 7,
       teamIds,
       fileKeys
     });
 
-    result.files = files.slice(0, options.maxFiles || 20);
+    // Collect discovery errors
+    const files = discovery.recentFiles || discovery;
+    if (discovery.errors && discovery.errors.length > 0) {
+      result.errors.push(...discovery.errors);
+    }
+
+    result.files = (Array.isArray(files) ? files : []).slice(0, options.maxFiles || 20);
 
     // Extract assets from each file
     for (const file of result.files) {

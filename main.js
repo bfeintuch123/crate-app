@@ -748,14 +748,17 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
 
     if (scanResult.assets.length === 0) {
       // Notify renderer even when no assets found
+      const scanErrors = scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
       if (scanResult.files.length === 0 && (teamIds.length > 0 || fileKeys.length > 0)) {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
+          errors: scanErrors, timestamp: Date.now(),
           warning: 'No recent Figma files found. Make sure your file was modified recently.'
         });
       } else {
         sendToRenderer('figma:scan-complete', {
-          projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0
+          projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0,
+          errors: scanErrors, timestamp: Date.now()
         });
       }
       figmaScanTimestamps.set(projectId, Date.now());
@@ -818,7 +821,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       projectId,
       filesFound: scanResult.files.length,
       assetsFound: scanResult.assets.length,
-      addedCount
+      addedCount,
+      errors: scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e)),
+      timestamp: Date.now()
     });
 
     figmaScanTimestamps.set(projectId, Date.now());
@@ -3702,6 +3707,15 @@ ipcMain.handle('figma:remove-team-id', async (event, teamId) => {
   const teamIds = (settings.figmaTeamIds || []).filter(id => id !== teamId);
   store.set('settings.figmaTeamIds', teamIds);
   return { success: true };
+});
+
+ipcMain.handle('figma:scan-now', async (event) => {
+  const projects = getProjects().filter(p => p.status === 'watching');
+  for (const project of projects) {
+    stopFigmaPolling(project.id);
+    await startFigmaPolling(project.id);
+  }
+  return { triggered: projects.length };
 });
 
 ipcMain.handle('settings:get', () => {

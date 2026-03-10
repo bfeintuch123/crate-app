@@ -49,6 +49,7 @@ contextBridge.exposeInMainWorld('crate', {
   removeFigmaTrackedFile: (fileKey) => ipcRenderer.invoke('figma:remove-tracked-file', fileKey),
   setFigmaTeamId: (teamUrl) => ipcRenderer.invoke('figma:set-team-id', teamUrl),
   removeFigmaTeamId: (teamId) => ipcRenderer.invoke('figma:remove-team-id', teamId),
+  figmaScanNow: () => ipcRenderer.invoke('figma:scan-now'),
 
   // Events from main
   onFilesUpdated: (callback) => {
