@@ -617,14 +617,15 @@ function pollLsofForProject(projectId) {
           const PRESENTATION_SOURCE_EXTS = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
           if (PRESENTATION_SOURCE_EXTS.has(path.extname(filePath).toLowerCase())) continue;
 
-          // v2.5.3: Directory scoping — reject lsof hits that fall outside the project's
-          // derived root directory. Prevents cross-project contamination when the user has
-          // multiple unrelated projects open simultaneously in the same design app.
-          // Skipped when projectRoot is null (empty project with no files yet).
-          // v2.6.4: Only scope non-image files — images have their own isInAllowedDir guard
-          // (Desktop/Documents/Downloads). The old check dropped images placed in Figma from
-          // ~/Downloads because they fell outside projectRoot.
-          if (projectRoot !== null && !LSOF_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase()) && !filePath.startsWith(projectRoot + '/')) continue;
+          // v2.5.3: Directory scoping — reject lsof hits outside project root.
+          // v2.6.4: Also exempt files in Desktop/Documents/Downloads — these are the user's
+          // intentional workspace dirs (same ones chokidar watches). Scoping was dropping images
+          // dragged from ~/Downloads into Figma because ~/Downloads is outside the project root.
+          const extForScope = path.extname(filePath).toLowerCase();
+          const isInAllowedDirForScope = filePath.startsWith(home + '/Desktop/') ||
+                                          filePath.startsWith(home + '/Documents/') ||
+                                          filePath.startsWith(home + '/Downloads/');
+          if (projectRoot !== null && !isInAllowedDirForScope && !filePath.startsWith(projectRoot + '/')) continue;
 
           if (existingPaths.has(filePath)) continue;
           if (pendingPaths.has(filePath)) continue;
