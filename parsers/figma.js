@@ -204,7 +204,7 @@ class FigmaParser extends BaseParser {
     const assets = [];
 
     // Fetch file structure
-    const fileData = await this._fetchAPI(`/files/${fileKey}?depth=2`, token);
+    const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
 
     // Find all nodes with image fills or that are exportable
     const imageNodeIds = [];
@@ -561,7 +561,7 @@ class FigmaParser extends BaseParser {
    */
   async discoverRecentFiles(options = {}) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return { recentFiles: [], errors: [] };
+    if (!token || !fetch) return { recentFiles: [], errors: ['No token or fetch available'] };
 
     const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
     const teamIds = options.teamIds || [];
@@ -658,7 +658,7 @@ class FigmaParser extends BaseParser {
 
     try {
       // Fetch file structure
-      const fileData = await this._fetchAPI(`/files/${fileKey}?depth=2`, token);
+      const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
 
       // Find all exportable nodes
       const imageNodeIds = [];
@@ -742,13 +742,13 @@ class FigmaParser extends BaseParser {
       fileKeys
     });
 
-    // Collect discovery errors
-    const files = discovery.recentFiles || discovery;
+    // Handle both old array format and new {recentFiles, errors} format
+    const files = Array.isArray(discovery) ? discovery : (discovery.recentFiles || []);
     if (discovery.errors && discovery.errors.length > 0) {
       result.errors.push(...discovery.errors);
     }
 
-    result.files = (Array.isArray(files) ? files : []).slice(0, options.maxFiles || 20);
+    result.files = files.slice(0, options.maxFiles || 20);
 
     // Extract assets from each file
     for (const file of result.files) {
