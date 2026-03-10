@@ -135,16 +135,6 @@ const CHOKIDAR_IMAGE_EXTENSIONS = new Set([
   '.svg', '.eps', '.pdf', '.mp4', '.mov', '.m4v',
 ]);
 
-// v2.5.3: Apps whose lsof entries should NOT capture image files.
-// Preview, Quick Look, and Finder open screenshots/PSDs for thumbnails — not real design work.
-const LSOF_SKIP_APPS = ['Preview', 'QuickLookUIService', 'QuickLookSatellite', 'Finder', 'mdworker', 'mds', 'mds_stores', 'com.apple.quicklook'];
-
-// v2.5.3: Image extensions subject to stricter lsof filtering (app + directory check).
-// Design source files (.psd, .ai, .key, .pptx, etc.) are NOT filtered — only common images.
-const LSOF_IMAGE_EXTENSIONS = new Set([
-  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
-]);
-
 // Project type → relevant bundle IDs (for isDesignAppFile type-aware filtering)
 const PROJECT_TYPE_APPS = {
   branding: new Set([
@@ -385,9 +375,6 @@ const psdParseDebounce = new Map();   // psdFilePath -> lastParsedTimestamp
 // v2.5.0: Scan-on-save debounce timers for PSD files (2-second debounce)
 const scanOnSaveTimers = new Map();   // psdFilePath -> setTimeout id
 
-// v2.5.3: Scan-on-save debounce timers for presentation files (2-second debounce)
-const scanOnSavePresentationTimers = new Map(); // key -> setTimeout id
-
 // --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
 const lastUsedPollers = new Map();    // projectId -> intervalId
 const LAST_USED_POLL_MS = 10000;      // 10 seconds
@@ -400,9 +387,8 @@ function getRunningDesignAppPids(projectType, callback) {
     || Object.values(DESIGN_APP_PROCESS_NAMES).flat();
 
   exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
-    if (err && !stdout) { callback([], new Map()); return; }
+    if (err && !stdout) { callback([]); return; }
     const pids = [];
-    const pidToCmd = new Map(); // v2.5.3: PID → command string for lsof image filtering
     for (const line of stdout.trim().split('\n')) {
       const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
       if (!m) continue;
@@ -410,10 +396,9 @@ function getRunningDesignAppPids(projectType, callback) {
       const cmd = m[2];
       if (keywords.some(kw => cmd.includes(kw))) {
         pids.push(pid);
-        pidToCmd.set(pid, cmd);
       }
     }
-    callback(pids, pidToCmd);
+    callback(pids);
   });
 }
 
@@ -428,7 +413,7 @@ function pollLsofForProject(projectId) {
 
   lsofInProgress.add(projectId);
 
-  getRunningDesignAppPids(project.type, (pids, pidToCmd) => {
+  getRunningDesignAppPids(project.type, (pids) => {
     designAppRunningCache.set(projectId, pids.length > 0); // v2.4.2: per-project
     if (pids.length === 0) {
       lsofInProgress.delete(projectId);
@@ -539,31 +524,6 @@ function pollLsofForProject(projectId) {
         const existingPaths = new Set(proj.files.map(f => f.path));
         const pendingPaths = new Set((proj.pendingFiles || []).map(f => f.path));
 
-        // v2.5.3: Directory scoping — derive project root from existing files to prevent
-        // cross-project contamination when multiple projects are open in the same design app
-        // (e.g. Photoshop with two projects open: lsof sees ALL files from BOTH).
-        // Prefer non-lsof sources (scan-on-save, scan-on-open, etc.) as anchors since they're
-        // explicitly tied to this project. Fall back to lsof-sourced files if that's all we have.
-        const nonLsofFiles = proj.files.filter(f => f.source && f.source !== 'lsof');
-        const anchorFiles = nonLsofFiles.length > 0 ? nonLsofFiles : proj.files;
-        // Compute shortest common ancestor of ALL anchor files (not just the first).
-        // This prevents locking onto a deep subdirectory if the first anchor happened to be
-        // nested (e.g. /Project/assets/icons/logo.png → root should be /Project/, not /icons/).
-        // projectRoot = null when project has no files yet — scoping is skipped entirely.
-        let projectRoot = null;
-        if (anchorFiles.length > 0) {
-          const anchorDirs = anchorFiles.map(f => path.dirname(f.path).split('/'));
-          const firstParts = anchorDirs[0];
-          let commonDepth = firstParts.length;
-          for (let i = 1; i < anchorDirs.length; i++) {
-            const parts = anchorDirs[i];
-            let j = 0;
-            while (j < commonDepth && j < parts.length && parts[j] === firstParts[j]) j++;
-            commonDepth = j;
-          }
-          projectRoot = firstParts.slice(0, commonDepth).join('/') || '/';
-        }
-
         let changed = false;
 
         for (const line of parsedLines) {
@@ -571,12 +531,7 @@ function pollLsofForProject(projectId) {
           const tag = line[0];
           const value = line.slice(1);
 
-          if (tag === 'p') {
-            currentPid = parseInt(value);
-            currentType = null;
-            continue;
-          }
-          if (tag === 'f') {
+          if (tag === 'p' || tag === 'f') {
             currentType = null;
             continue;
           }
@@ -610,23 +565,6 @@ function pollLsofForProject(projectId) {
             if (!isInWatchedDir) continue;
           }
 
-          // v2.5.5: Never capture presentation source files (.pptx, .key, etc.) via lsof.
-          // When PowerPoint or Keynote has multiple presentations open, lsof sees all of them.
-          // These source files are not linked assets — their embedded content is extracted via
-          // scan-on-save instead. Capturing a second open presentation is always a false positive.
-          const PRESENTATION_SOURCE_EXTS = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
-          if (PRESENTATION_SOURCE_EXTS.has(path.extname(filePath).toLowerCase())) continue;
-
-          // v2.5.3: Directory scoping — reject lsof hits outside project root.
-          // v2.6.4: Also exempt files in Desktop/Documents/Downloads — these are the user's
-          // intentional workspace dirs (same ones chokidar watches). Scoping was dropping images
-          // dragged from ~/Downloads into Figma because ~/Downloads is outside the project root.
-          const extForScope = path.extname(filePath).toLowerCase();
-          const isInAllowedDirForScope = filePath.startsWith(home + '/Desktop/') ||
-                                          filePath.startsWith(home + '/Documents/') ||
-                                          filePath.startsWith(home + '/Downloads/');
-          if (projectRoot !== null && !isInAllowedDirForScope && !filePath.startsWith(projectRoot + '/')) continue;
-
           if (existingPaths.has(filePath)) continue;
           if (pendingPaths.has(filePath)) continue;
 
@@ -634,29 +572,6 @@ function pollLsofForProject(projectId) {
 
           const ext = path.extname(filePath).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-
-          // v2.5.3: Stricter filtering for image files captured via lsof.
-          // Preview, Quick Look, Finder, and Spotlight open images for thumbnails —
-          // these are NOT real design-app usage. Only capture images if:
-          //   (a) the file is in ~/Desktop, ~/Documents, or ~/Downloads
-          //   (b) AND the process is NOT a known thumbnail/preview app
-          if (LSOF_IMAGE_EXTENSIONS.has(ext)) {
-            const isInAllowedDir = filePath.startsWith(home + '/Desktop/') ||
-                                   filePath.startsWith(home + '/Documents/') ||
-                                   filePath.startsWith(home + '/Downloads/');
-            if (!isInAllowedDir) continue;
-
-            // v2.5.4: Skip macOS screenshots — always named "Screenshot..." or "Screen Shot..."
-            // Design apps (e.g. Keynote) can briefly open screenshots during thumbnail/paste
-            // operations, causing false captures. Screenshots are never intentional project assets.
-            const basename = path.basename(filePath);
-            if (/^Screen.?Shot/i.test(basename)) continue;
-
-            const cmd = currentPid ? pidToCmd.get(currentPid) || '' : '';
-            if (LSOF_SKIP_APPS.some(app => cmd.includes(app))) {
-              continue;
-            }
-          }
 
           // v2.2.2: Removed presentation mtime filter — old files on disk placed
           // mid-session should be captured when opened by a design app.
@@ -1195,23 +1110,8 @@ async function pollLastUsedForProject(projectId) {
       if (!fullPath) continue;
       const name = path.basename(fullPath);
       if (name.startsWith('.') || name.startsWith('~') || name.startsWith('._')) continue;
-      // v2.5.5: Skip macOS screenshots — they appear in kMDItemLastUsedDate because WhatsApp,
-      // Telegram, or any app that displays the file updates the last-used timestamp. Screenshots
-      // are never intentional project assets.
-      if (/^Screen.?Shot/i.test(name)) continue;
       const ext = path.extname(name).toLowerCase();
-      // v2.5.8: lastUsed poller only captures PRIMARY design source files.
-      // Per the original design intent (see DESIGN_FILE_EXTENSIONS comment): fonts,
-      // PDFs, and presentation source files are NOT captured here — they come from lsof
-      // or scan-on-save. Using DESIGN_FILE_EXTENSIONS was too broad and caused false captures
-      // from Chrome downloads, messaging apps, and any app that touches a file in Desktop/Downloads.
-      // v2.6.4: Also allow LSOF_IMAGE_EXTENSIONS — the mdfind -onlyin already restricts
-      // location to Desktop/Documents/Downloads, so images are safe here.
-      if (!PRIMARY_DESIGN_EXTENSIONS.has(ext) && !LSOF_IMAGE_EXTENSIONS.has(ext)) continue;
-      // v2.5.9: Presentation source files (.pptx, .key, etc.) are in PRIMARY_DESIGN_EXTENSIONS
-      // but must still be excluded — their content is extracted via scan-on-save, not polling.
-      const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
-      if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
+      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
@@ -1939,190 +1839,6 @@ async function runScanOnSave(projectId, psdFilePath) {
   }
 }
 
-/**
- * v2.5.3: Scan-on-save for presentation files (.pptx, .key, .ppt).
- * When a presentation is saved (Cmd+S), extract embedded media immediately
- * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
- */
-function scheduleScanOnSavePresentation(projectId, filePath) {
-  const key = `${projectId}:${filePath}`;
-  if (scanOnSavePresentationTimers.has(key)) {
-    clearTimeout(scanOnSavePresentationTimers.get(key));
-  }
-  scanOnSavePresentationTimers.set(key, setTimeout(() => {
-    scanOnSavePresentationTimers.delete(key);
-    runScanOnSavePresentation(projectId, filePath).catch(() => {});
-  }, 2000));
-}
-
-async function runScanOnSavePresentation(projectId, presentationPath) {
-  try {
-    const ext = path.extname(presentationPath).toLowerCase();
-    const base = path.basename(presentationPath, ext);
-
-    // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
-    const tempDir = path.join(os.homedir(), '.crate', 'presentation-assets', projectId);
-    await fs.promises.mkdir(tempDir, { recursive: true });
-
-    // Build dedup sets from existing project files
-    const currentProjects = getProjects();
-    const project = currentProjects.find(p => p.id === projectId);
-    if (!project || project.status !== 'watching') return;
-    const projectFiles = project.files || [];
-
-    // Name-based dedup for .key files
-    const alreadyCapturedBases = new Set();
-    for (const f of projectFiles) {
-      const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
-      alreadyCapturedBases.add(n);
-      // v2.6.1: scan-on-save prefixes filenames with "{PresentationName} — ".
-      // On subsequent saves, Keynote dedup checks the raw embedded name (e.g. "image-001")
-      // which never matches the prefixed form ("mykeynote — image-001"). Strip the prefix
-      // so existing files are recognised and not re-extracted.
-      if (f.source === 'scan-on-save-presentation') {
-        const separatorIdx = n.indexOf(' — ');
-        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
-      }
-    }
-
-    // Content-based dedup for .pptx files
-    const contentFingerprints = new Set();
-    const capturedSizes = new Set();
-    if (ext === '.pptx' || ext === '.ppt') {
-      for (const f of projectFiles) {
-        try {
-          const buf = fs.readFileSync(f.path);
-          const size = buf.length;
-          capturedSizes.add(size);
-          const hash = crypto.createHash('md5').update(buf).digest('hex');
-          contentFingerprints.add(`${size}:${hash}`);
-        } catch (e) { /* file may no longer exist */ }
-      }
-    }
-
-    // List zip contents
-    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', presentationPath], {
-      timeout: 10000, encoding: 'utf8'
-    });
-
-    const newEntries = [];
-
-    for (const line of listing.split('\n')) {
-      const m = line.match(/^\s+(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\s+(.+)$/);
-      if (!m) continue;
-
-      const fileSize = parseInt(m[1], 10);
-      const zipPath = m[4].trim();
-
-      if (zipPath.endsWith('/')) continue;
-      if (zipPath.includes('__MACOSX')) continue;
-      if (path.basename(zipPath).startsWith('.')) continue;
-
-      const fileExt = path.extname(zipPath).toLowerCase();
-      if (!EMBEDDED_MEDIA_EXTENSIONS.has(fileExt)) continue;
-
-      // Scope to known media folders
-      const inMediaFolder =
-        (ext === '.pptx' || ext === '.ppt') ? zipPath.startsWith('ppt/media/') :
-        (ext === '.key')                     ? zipPath.startsWith('Data/')       :
-        false;
-      if (!inMediaFolder) continue;
-
-      if (fileSize < 500) continue;
-
-      // Keynote-specific junk filtering (same as extractEmbeddedMedia)
-      if (ext === '.key') {
-        const entryName = path.basename(zipPath);
-
-        if (/^st-[0-9a-f-]+\.jpe?g$/i.test(entryName)) continue;
-        if (/^(mt|bg|tx)-[0-9a-f-]+\.jpe?g$/i.test(entryName)) continue;
-        if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) continue;
-
-        // Cross-reference dedup: strip Keynote's numeric suffix
-        const cleanedName = entryName
-          .replace(/-\d{3,6}(\.[a-z]+)$/i, '$1')
-          .replace(/-small(\.[a-z]+)$/i, '$1');
-        const baseName = path.basename(cleanedName, path.extname(cleanedName))
-          .toLowerCase().replace(/\s+/g, ' ').trim();
-        if (alreadyCapturedBases.has(baseName)) continue;
-      }
-
-      try {
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
-          timeout: 10000, maxBuffer: 50 * 1024 * 1024,
-          encoding: 'buffer'
-        });
-
-        // Content-based dedup for .pptx
-        if ((ext === '.pptx' || ext === '.ppt') && contentFingerprints.size > 0) {
-          const extractedSize = data.length;
-          if (capturedSizes.has(extractedSize)) {
-            const extractedHash = crypto.createHash('md5').update(data).digest('hex');
-            if (contentFingerprints.has(`${extractedSize}:${extractedHash}`)) continue;
-          }
-        }
-
-        // Recover original filename (strip Keynote's trailing -NNNN suffix)
-        let outputName = path.basename(zipPath);
-        if (ext === '.key') {
-          outputName = outputName.replace(/-\d{3,6}(\.[a-z]+)$/i, '$1');
-        }
-        outputName = `${base} — ${outputName}`;
-
-        // Write to temp dir, handle collisions
-        let destPath = path.join(tempDir, outputName);
-        let counter = 1;
-        while (fs.existsSync(destPath)) {
-          const e = path.extname(outputName);
-          const b = path.basename(outputName, e);
-          destPath = path.join(tempDir, `${b}_${counter}${e}`);
-          counter++;
-        }
-
-        fs.writeFileSync(destPath, data);
-        console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
-
-        newEntries.push({
-          path: destPath,
-          name: path.basename(destPath),
-          ext: path.extname(destPath).toLowerCase(),
-          addedAt: Date.now(),
-          source: 'scan-on-save-presentation',
-        });
-      } catch (e) {
-        console.error(`[crate] scan-on-save-presentation: failed to extract ${zipPath}:`, e.message);
-      }
-    }
-
-    if (newEntries.length === 0) return;
-
-    const result = mutateProject(projectId, (proj) => {
-      if (proj.status !== 'watching') return null;
-      const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
-      let changed = false;
-
-      for (const entry of newEntries) {
-        const normPath = path.resolve(entry.path).toLowerCase();
-        if (existingPaths.has(normPath)) continue;
-        proj.files.push(entry);
-        existingPaths.add(normPath);
-        changed = true;
-      }
-
-      if (changed) proj.files = deduplicateFiles(proj.files);
-      return changed ? { files: proj.files } : null;
-    });
-
-    if (result) {
-      lastFileActivity.set(projectId, Date.now());
-      inactivityNotified.delete(projectId);
-      sendToRenderer('files:updated', { projectId, files: result.files });
-    }
-  } catch (e) {
-    console.log('[scan-on-save-presentation] extraction failed:', e.message);
-  }
-}
-
 function createTrayWindow() {
   trayWindow = new BrowserWindow({
     width: 360,
@@ -2283,15 +1999,6 @@ async function startWatching(projectId) {
 
             if (path.basename(filePath).startsWith('~$')) continue;
 
-            // v2.5.5: Never capture presentation source files via lsof snapshot.
-            // Same rule as the ongoing poller — .pptx/.key files are source files,
-            // not linked assets. Their content is extracted via scan-on-save.
-            const PRESENTATION_SOURCE_EXTS_SNAP = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
-            if (PRESENTATION_SOURCE_EXTS_SNAP.has(path.extname(filePath).toLowerCase())) continue;
-
-            // v2.5.5: Skip macOS screenshots at snapshot time — same filter as ongoing poller.
-            if (/^Screen.?Shot/i.test(path.basename(filePath))) continue;
-
             const ext = path.extname(filePath).toLowerCase();
             if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
@@ -2381,18 +2088,6 @@ async function startWatching(projectId) {
     path.join(homedir, 'Documents'),
     path.join(homedir, 'Downloads')
   ];
-
-  // v2.6.3: Watch iCloud Drive synced Desktop & Documents folders.
-  // When iCloud Drive "Desktop & Documents" sync is enabled, files land in
-  // ~/Library/Mobile Documents/com~apple~CloudDocs/Desktop (and Documents)
-  // instead of ~/Desktop, so chokidar must watch both locations.
-  const iCloudBase = path.join(homedir, 'Library', 'Mobile Documents', 'com~apple~CloudDocs');
-  for (const folder of ['Desktop', 'Documents']) {
-    const iCloudFolder = path.join(iCloudBase, folder);
-    if (fs.existsSync(iCloudFolder)) {
-      watchPaths.push(iCloudFolder);
-    }
-  }
 
   // v1.3.27: Watch Figma's local file storage for .fig files.
   const figmaDir = path.join(homedir, 'Library', 'Application Support', 'Figma');
@@ -2502,11 +2197,6 @@ async function startWatching(projectId) {
       if (ext === '.psd') {
         scheduleScanOnSave(projectId, filePath);
       }
-
-      // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
-      if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
-        scheduleScanOnSavePresentation(projectId, filePath);
-      }
     }
 
     // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed from 'change' handler too.
@@ -2540,13 +2230,6 @@ function stopWatching(projectId) {
     if (key.startsWith(projectId + ':')) {
       clearTimeout(timerId);
       scanOnSaveTimers.delete(key);
-    }
-  }
-  // v2.5.3: Clean up presentation scan-on-save timers
-  for (const [key, timerId] of scanOnSavePresentationTimers) {
-    if (key.startsWith(projectId + ':')) {
-      clearTimeout(timerId);
-      scanOnSavePresentationTimers.delete(key);
     }
   }
 }
@@ -3381,14 +3064,6 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
     for (const f of projectFiles) {
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
-      // v2.5.9: scan-on-save-presentation prefixes filenames with "{PresentationName} — ".
-      // At package time the Keynote dedup checks the raw embedded name (e.g. "image-001"),
-      // which never matches the prefixed version ("mypresentation — image-001"). Strip the
-      // prefix so both forms are in the set and dedup works correctly.
-      if (f.source === 'scan-on-save-presentation') {
-        const separatorIdx = n.indexOf(' — ');
-        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
-      }
     }
   }
 
@@ -4115,10 +3790,6 @@ app.on('before-quit', () => {
     clearTimeout(timerId);
   }
   scanOnSaveTimers.clear();
-  for (const [, timerId] of scanOnSavePresentationTimers) {
-    clearTimeout(timerId);
-  }
-  scanOnSavePresentationTimers.clear();
   // Explicitly destroy tray + window so quit isn't blocked by hidden windows
   if (tray && !tray.isDestroyed()) {
     tray.destroy();
