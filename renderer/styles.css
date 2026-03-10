@@ -254,7 +254,7 @@ body {
   padding: 11px 12px;
   margin-bottom: 8px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, border-color 0.15s ease; /* L10 */
   position: relative;
 }
 
@@ -325,7 +325,7 @@ body {
   white-space: nowrap;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
   flex-shrink: 0;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, opacity 0.15s ease; /* L10 */
 }
 
 .project-pill.watching {
@@ -533,10 +533,7 @@ body {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
-  border: 2px solid transparent;
-  transition: border-color 0.2s ease, background 0.2s ease;
 }
-
 
 .app-file {
   display: flex;
@@ -568,7 +565,7 @@ body {
   padding: 2px 4px;
   border-radius: 3px;
   opacity: 0;
-  transition: all 0.1s ease;
+  transition: opacity 0.1s ease, color 0.1s ease, background-color 0.1s ease; /* L10 */
 }
 
 .app-file:hover .app-file-remove {
@@ -597,12 +594,68 @@ body {
   color: var(--gray-400);
 }
 
+.app-file-add {
+  color: var(--gray-500);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.app-file-add:hover {
+  color: var(--black);
+}
 
 .files-empty {
   text-align: center;
   color: var(--gray-400);
   font-size: 12px;
   padding: 20px 0;
+}
+
+/* v2.5.0: Expandable file list */
+.file-list-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--gray-500);
+  cursor: pointer;
+  padding: 6px 0;
+  margin-top: 4px;
+  border-top: 1px solid var(--gray-200);
+  transition: color 0.15s;
+}
+
+.file-list-toggle:hover {
+  color: var(--black);
+}
+
+.file-list-toggle-icon {
+  font-size: 10px;
+}
+
+/* L4: Removed duplicate .file-list-drawer — canonical definition is in the v2.5.0 section below */
+
+/* File status badges */
+.file-status-badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.file-status-badge.linked {
+  background: var(--green-light);
+  color: var(--green-text);
+  border: 1px solid var(--green-border);
+}
+
+.file-status-badge.embedded {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
 }
 
 /* ===== Settings ===== */
@@ -940,6 +993,10 @@ body {
   gap: 10px;
 }
 
+.modal-actions-vertical {
+  flex-direction: column;
+  gap: 8px;
+}
 
 .modal-btn-primary {
   flex: 1;
@@ -1030,7 +1087,8 @@ body {
   word-break: break-all;
 }
 
-/* Confirm Modals */
+/* Inactivity / Confirm Modals */
+.inactivity-title,
 .confirm-title {
   font-family: 'Playfair Display', serif;
   font-size: 18px;
@@ -1039,6 +1097,7 @@ body {
   margin-bottom: 8px;
 }
 
+.inactivity-desc,
 .confirm-desc {
   font-size: 13px;
   color: var(--gray-500);
@@ -1199,125 +1258,6 @@ body {
   opacity: 0.8;
 }
 
-/* ===== V2 Quick Package ===== */
-.v2-quick-package {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--gray-100);
-}
-
-.v2-desc {
-  font-size: 12px;
-  color: var(--gray-500);
-  margin-bottom: 12px;
-  line-height: 1.5;
-}
-
-.v2-drop-zone {
-  border: 2px dashed var(--gray-300);
-  border-radius: 12px;
-  padding: 24px 16px;
-  text-align: center;
-  transition: all 0.2s ease;
-  background: var(--gray-50);
-}
-
-.v2-drop-zone:hover {
-  border-color: var(--gray-400);
-  background: var(--white);
-}
-
-.v2-drop-zone.drag-over {
-  border-color: var(--black);
-  background: rgba(0, 0, 0, 0.02);
-}
-
-.v2-drop-icon {
-  font-size: 28px;
-  margin-bottom: 8px;
-}
-
-.v2-drop-text {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--black);
-  margin-bottom: 4px;
-}
-
-.v2-drop-formats {
-  font-size: 11px;
-  color: var(--gray-400);
-  font-family: 'Courier New', monospace;
-  margin-bottom: 8px;
-}
-
-.v2-drop-or {
-  font-size: 11px;
-  color: var(--gray-400);
-  margin-bottom: 8px;
-}
-
-.v2-drop-zone .app-btn {
-  width: auto;
-  display: inline-flex;
-  padding: 8px 16px;
-}
-
-/* ===== V2 Results Modal ===== */
-.v2-result-stats {
-  background: var(--gray-50);
-  border-radius: 10px;
-  padding: 14px 16px;
-  margin-bottom: 12px;
-}
-
-.v2-result-stat {
-  display: flex;
-  justify-content: space-between;
-  padding: 4px 0;
-  font-size: 13px;
-}
-
-.v2-result-stat-label {
-  color: var(--gray-500);
-}
-
-.v2-result-stat-value {
-  font-weight: 600;
-  color: var(--black);
-}
-
-.v2-result-missing {
-  margin-bottom: 16px;
-}
-
-.v2-result-missing-header {
-  font-size: 11px;
-  font-weight: 600;
-  color: #d97706;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: 6px;
-}
-
-.v2-result-missing-list {
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 8px;
-  padding: 10px 12px;
-  max-height: 100px;
-  overflow-y: auto;
-}
-
-.v2-result-missing-item {
-  font-size: 11px;
-  color: #92400e;
-  padding: 2px 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* ===== Figma Settings ===== */
 .figma-status-row {
   display: flex;
@@ -1421,4 +1361,148 @@ body {
 
 .figma-benefit-hint strong {
   color: var(--black);
+}
+
+/* ===== V2 Quick Package ===== */
+.v2-quick-package {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.v2-desc {
+  font-size: 12px;
+  color: var(--gray-500);
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.v2-drop-zone {
+  border: 2px dashed var(--gray-300);
+  border-radius: 12px;
+  padding: 20px 16px;
+  text-align: center;
+  transition: all 0.15s ease;
+  cursor: default;
+}
+
+.v2-drop-zone.drag-over {
+  border-color: var(--black);
+  background: var(--gray-50);
+}
+
+.v2-drop-icon {
+  font-size: 28px;
+  margin-bottom: 6px;
+}
+
+.v2-drop-text {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--black);
+  margin-bottom: 4px;
+}
+
+.v2-drop-formats {
+  font-size: 11px;
+  color: var(--gray-400);
+  font-family: 'Courier New', monospace;
+  margin-bottom: 8px;
+}
+
+.v2-drop-or {
+  font-size: 11px;
+  color: var(--gray-400);
+  margin-bottom: 8px;
+}
+
+/* ===== V2 Results Stats ===== */
+.v2-result-stats {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.v2-result-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.v2-result-stat-label {
+  font-size: 10px;
+  color: var(--gray-400);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.v2-result-stat-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--black);
+}
+
+.v2-result-missing-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b45309;
+  margin-bottom: 6px;
+}
+
+.v2-result-missing-item {
+  font-size: 11px;
+  color: var(--gray-500);
+  padding: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== Expandable File List (v2.5.0) ===== */
+.file-list-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--gray-500);
+  cursor: pointer;
+  padding: 6px 0 2px;
+  transition: color 0.15s ease;
+}
+
+.file-list-toggle:hover {
+  color: var(--black);
+}
+
+.file-list-toggle-icon {
+  font-size: 10px;
+}
+
+.file-list-drawer {
+  max-height: 180px;
+  overflow-y: auto;
+  padding-top: 2px;
+  border-top: 1px solid var(--gray-200);
+  margin-top: 4px;
+}
+
+/* ===== File Status Badges (v2.5.0) ===== */
+.file-status-badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.file-status-badge.embedded {
+  background: rgba(251, 191, 36, 0.15);
+  color: #b45309;
+}
+
+.file-status-badge.linked {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--green-text);
 }

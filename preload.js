@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('crate', {
   pauseProject: (id) => ipcRenderer.invoke('projects:pause', id),
   getFiles: (id) => ipcRenderer.invoke('projects:get-files', id),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
+  addFiles: (projectId) => ipcRenderer.invoke('projects:add-files', projectId),
   packageProject: (id, outputPath) => ipcRenderer.invoke('projects:package', id, outputPath),
   selectOutputFolder: () => ipcRenderer.invoke('projects:select-output'),
   deleteProject: (id) => ipcRenderer.invoke('projects:delete', id),
@@ -37,7 +38,6 @@ contextBridge.exposeInMainWorld('crate', {
   // V2 Quick Package
   v2BrowseFile: () => ipcRenderer.invoke('v2:browse-file'),
   v2PackageFile: (filePath) => ipcRenderer.invoke('v2:package-file', filePath),
-  v2GetSupportedExtensions: () => ipcRenderer.invoke('v2:supported-extensions'),
 
   // Figma Integration (Auto-Tracking)
   getFigmaStatus: () => ipcRenderer.invoke('figma:status'),
@@ -49,6 +49,7 @@ contextBridge.exposeInMainWorld('crate', {
   removeFigmaTrackedFile: (fileKey) => ipcRenderer.invoke('figma:remove-tracked-file', fileKey),
   setFigmaTeamId: (teamUrl) => ipcRenderer.invoke('figma:set-team-id', teamUrl),
   removeFigmaTeamId: (teamId) => ipcRenderer.invoke('figma:remove-team-id', teamId),
+  figmaScanNow: () => ipcRenderer.invoke('figma:scan-now'),
 
   // Events from main
   onFilesUpdated: (callback) => {
@@ -65,5 +66,11 @@ contextBridge.exposeInMainWorld('crate', {
   },
   onFigmaAuthError: (callback) => {
     ipcRenderer.on('figma:auth-error', (event, data) => callback(data));
+  },
+  onFigmaScanComplete: (callback) => {
+    ipcRenderer.on('figma:scan-complete', (event, data) => callback(data));
+  },
+  onFigmaScanError: (callback) => {
+    ipcRenderer.on('figma:scan-error', (event, data) => callback(data));
   },
 });

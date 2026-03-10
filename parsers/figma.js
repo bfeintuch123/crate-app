@@ -32,6 +32,9 @@ try {
 } catch (e) {
   // node-fetch not installed
 }
+if (!fetch && typeof globalThis.fetch === 'function') {
+  fetch = globalThis.fetch.bind(globalThis);
+}
 
 try {
   keytar = require('keytar');
@@ -296,28 +299,36 @@ class FigmaParser extends BaseParser {
    */
   async _fetchAPI(endpoint, token) {
     const url = `${FIGMA_API_BASE}${endpoint}`;
-    const response = await fetch(url, {
-      headers: {
-        'X-Figma-Token': token
-      }
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(url, {
+        headers: { 'X-Figma-Token': token },
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-    if (!response.ok) {
-      const status = response.status;
-      if (status === 401) {
-        throw new Error('Invalid Figma API token. Please check your Personal Access Token.');
-      } else if (status === 403) {
-        throw new Error('Access denied. You may not have permission to view this Figma file.');
-      } else if (status === 404) {
-        throw new Error('Figma file not found. Check that the file URL is correct and the file still exists.');
-      } else if (status === 429) {
-        throw new Error('Rate limit exceeded. Please wait a moment and try again.');
-      } else {
-        throw new Error(`Figma API error: ${status} ${response.statusText}`);
+      if (!response.ok) {
+        const status = response.status;
+        if (status === 401) {
+          throw new Error('Invalid Figma API token. Please check your Personal Access Token.');
+        } else if (status === 403) {
+          throw new Error('Access denied. You may not have permission to view this Figma file.');
+        } else if (status === 404) {
+          throw new Error('Figma file not found. Check that the file URL is correct and the file still exists.');
+        } else if (status === 429) {
+          throw new Error('Rate limit exceeded. Please wait a moment and try again.');
+        } else {
+          throw new Error(`Figma API error: ${status} ${response.statusText}`);
+        }
       }
+
+      return response.json();
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e.name === 'AbortError') throw new Error('Figma API request timed out after 30s');
+      throw e;
     }
-
-    return response.json();
   }
 
   /**
@@ -330,9 +341,7 @@ class FigmaParser extends BaseParser {
     // Check if node has export settings or image fills
     const hasExport = node.exportSettings && node.exportSettings.length > 0;
     const hasImageFill = node.fills && node.fills.some(f => f.type === 'IMAGE');
-    const isFrame = node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE';
-
-    if (hasExport || hasImageFill || isFrame) {
+    if (hasExport || hasImageFill) {
       nodeIds.push(node.id);
       nodeNames[node.id] = node.name || node.id;
     }
@@ -550,12 +559,13 @@ class FigmaParser extends BaseParser {
    */
   async discoverRecentFiles(options = {}) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return [];
+    if (!token || !fetch) return { recentFiles: [], errors: ['No token or fetch available'] };
 
     const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
     const teamIds = options.teamIds || [];
     const fileKeys = options.fileKeys || [];
     const recentFiles = [];
+    const errors = [];
     const seenKeys = new Set();
 
     try {
@@ -566,7 +576,12 @@ class FigmaParser extends BaseParser {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
           teamName = teamData.name || teamName;
         } catch (e) {
-          console.warn(`[crate][figma] Cannot access team ${teamId} — may require Professional plan`);
+          const hint = e.message.toLowerCase().includes('not found')
+            ? 'Team not found or not accessible via API. If this is a personal workspace, paste a direct Figma file URL instead.'
+            : e.message;
+          const msg = `Cannot access team ${teamId}: ${hint}`;
+          console.warn(`[crate][figma] ${msg}`);
+          errors.push(msg);
           continue;
         }
 
@@ -575,7 +590,9 @@ class FigmaParser extends BaseParser {
           const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
           projects = projectsData.projects || [];
         } catch (e) {
-          console.warn(`[crate][figma] Cannot list projects for team ${teamId} — requires Professional+ plan`);
+          const msg = `Cannot list projects for team ${teamId} (${teamName}): ${e.message}`;
+          console.warn(`[crate][figma] ${msg}`);
+          errors.push(msg);
           continue;
         }
 
@@ -603,7 +620,7 @@ class FigmaParser extends BaseParser {
               }
             }
           } catch (e) {
-            // Skip project on error
+            errors.push(`Error listing files in project ${project.name}: ${e.message}`);
           }
         }
       }
@@ -621,10 +638,11 @@ class FigmaParser extends BaseParser {
       // Sort by most recently modified first
       recentFiles.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
 
-      return recentFiles;
+      return { recentFiles, errors };
     } catch (e) {
       console.error('[crate][figma] discoverRecentFiles error:', e.message);
-      return [];
+      errors.push(`discoverRecentFiles failed: ${e.message}`);
+      return { recentFiles, errors };
     }
   }
 
@@ -637,7 +655,7 @@ class FigmaParser extends BaseParser {
    */
   async extractAssetsFromFileKey(fileKey) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return [];
+    if (!token || !fetch) return { assets: [], errors: ["No token or fetch available"] };
 
     try {
       // Fetch file structure
@@ -648,9 +666,10 @@ class FigmaParser extends BaseParser {
       const nodeNames = {};
       this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
 
-      if (imageNodeIds.length === 0) return [];
+      if (imageNodeIds.length === 0) return { assets: [], errors: [] };
 
       const assets = [];
+      const errors = [];
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -676,14 +695,14 @@ class FigmaParser extends BaseParser {
             }
           }
         } catch (err) {
-          // Continue with other batches
+          errors.push("Batch image export failed for " + fileKey + ": " + err.message);
         }
       }
 
-      return assets;
+      return { assets, errors };
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
-      return [];
+      return { assets: [], errors: [e.message] };
     }
   }
 
@@ -718,20 +737,27 @@ class FigmaParser extends BaseParser {
     }
 
     // Discover recent files
-    const files = await this.discoverRecentFiles({
+    const discovery = await this.discoverRecentFiles({
       sinceMs: options.sinceMs,
       maxAgeDays: options.maxAgeDays || 7,
       teamIds,
       fileKeys
     });
 
+    // Handle both old array format and new {recentFiles, errors} format
+    const files = Array.isArray(discovery) ? discovery : (discovery.recentFiles || []);
+    if (discovery.errors && discovery.errors.length > 0) {
+      result.errors.push(...discovery.errors);
+    }
+
     result.files = files.slice(0, options.maxFiles || 20);
 
     // Extract assets from each file
     for (const file of result.files) {
       try {
-        const assets = await this.extractAssetsFromFileKey(file.key);
-        for (const asset of assets) {
+        const extractResult = await this.extractAssetsFromFileKey(file.key);
+        if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...extractResult.errors); }
+        for (const asset of extractResult.assets) {
           asset.figmaFileName = file.name;
           asset.figmaFileKey = file.key;
           result.assets.push(asset);

@@ -43,19 +43,6 @@
           <button class="app-btn outline" id="btn-add-project">+ Add Project</button>
         </div>
 
-        <!-- V2 Quick Package -->
-        <div class="v2-quick-package">
-          <div class="settings-section-title">Quick Package</div>
-          <div class="v2-desc">Drop a design file to trace and package all linked assets.</div>
-          <div class="v2-drop-zone" id="v2-drop-zone">
-            <div class="v2-drop-icon">&#x1F4E6;</div>
-            <div class="v2-drop-text">Drop your master file here</div>
-            <div class="v2-drop-formats">.ai .psd .indd .pptx .key .prproj .aep</div>
-            <div class="v2-drop-or">or</div>
-            <button class="app-btn outline" id="btn-v2-browse">Browse Files</button>
-          </div>
-        </div>
-
         <!-- New Project Form -->
         <div id="new-project-form" class="hidden">
           <div class="app-label">New Project</div>
@@ -84,6 +71,19 @@
           <button class="app-btn outline" id="btn-cancel-project" style="margin-top:8px;">Cancel</button>
           <div class="privacy-hint">
             &#x1F512; Crate only tracks files opened by design apps. It cannot see your browser, keyboard, or anything outside your project.
+          </div>
+        </div>
+
+        <!-- V2 Quick Package -->
+        <div class="v2-quick-package">
+          <div class="settings-section-title">Quick Package</div>
+          <div class="v2-desc">Drop a design file to trace and package all linked assets.</div>
+          <div class="v2-drop-zone" id="v2-drop-zone">
+            <div class="v2-drop-icon">&#x1F4E6;</div>
+            <div class="v2-drop-text">Drop your master file here</div>
+            <div class="v2-drop-formats">.ai .psd .indd .pptx .key .prproj .aep</div>
+            <div class="v2-drop-or">or</div>
+            <button class="app-btn outline" id="btn-v2-browse">Browse Files</button>
           </div>
         </div>
       </div>
@@ -117,6 +117,7 @@
             <div id="file-list"></div>
           </div>
           <button class="app-btn" id="btn-package">&#x1F4E6; Package Project</button>
+          <button class="app-btn outline" id="btn-add-files" style="margin-top:8px;">+ Add files</button>
         </div>
       </div>
 
@@ -168,20 +169,18 @@
                 <div class="figma-auto-title">&#x2705; Auto-tracking active</div>
                 <div class="figma-auto-desc">Crate scans your tracked Figma files every 60 seconds and automatically captures assets &mdash; desktop app or web.</div>
               </div>
+              <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
+              <button class="app-btn outline" id="btn-figma-scan-now" style="width:100%;margin-top:8px;">Scan Now</button>
               <div class="figma-files-section" style="margin-top:12px;">
                 <div class="settings-desc" style="margin-bottom:6px;"><strong>Track a Figma file</strong> &mdash; paste any Figma file URL:</div>
-                <div style="display:flex;gap:6px;">
-                  <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="flex:1;">
-                  <button class="app-btn" id="btn-figma-add-file" style="white-space:nowrap;">Add File</button>
-                </div>
+                <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
+                <button class="app-btn" id="btn-figma-add-file" style="width:100%;margin-top:6px;">Add File</button>
                 <div id="figma-tracked-files-list" style="margin-top:8px;"></div>
               </div>
               <div class="figma-team-section" style="margin-top:12px;">
                 <div class="settings-desc" style="margin-bottom:6px;"><strong>Auto-discover</strong> (Professional plan) &mdash; paste your team URL for auto-discovery:</div>
-                <div style="display:flex;gap:6px;">
-                  <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="flex:1;">
-                  <button class="app-btn" id="btn-figma-add-team" style="white-space:nowrap;">Add Team</button>
-                </div>
+                <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="width:100%;box-sizing:border-box;">
+                <button class="app-btn" id="btn-figma-add-team" style="width:100%;margin-top:6px;">Add Team</button>
                 <div id="figma-team-ids-list" style="margin-top:8px;"></div>
               </div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
@@ -196,8 +195,8 @@
                 <div class="figma-step">2. Generate a Personal Access Token</div>
                 <div class="figma-step">3. Paste it below &mdash; that's it!</div>
               </div>
-              <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx">
-              <button class="app-btn" id="btn-figma-connect" style="margin-top:8px;">Connect Figma</button>
+              <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
+              <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Connect Figma</button>
               <div class="figma-benefit-hint">
                 Once connected, add Figma file URLs to track &mdash; Crate will automatically capture assets from them.
               </div>
@@ -323,6 +322,7 @@
         </div>
       </div>
     </div>
+  </div>
 
     <!-- V2 Results Modal -->
     <div class="modal-overlay hidden" id="modal-v2-results">
@@ -341,7 +341,6 @@
         </div>
       </div>
     </div>
-  </div>
 
   <script src="app.js"></script>
 </body>

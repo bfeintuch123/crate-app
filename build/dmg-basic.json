@@ -1,0 +1,10 @@
+{
+  "title": "Crate",
+  "icon": "icon.icns",
+  "icon-size": 120,
+  "window": { "size": { "width": 540, "height": 360 } },
+  "contents": [
+    { "x": 135, "y": 180, "type": "file",  "path": "../dist/mac-arm64/Crate v2.6.2.app" },
+    { "x": 405, "y": 180, "type": "link",  "path": "/Applications" }
+  ]
+}

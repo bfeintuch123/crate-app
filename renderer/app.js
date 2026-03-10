@@ -127,7 +127,8 @@ function getStatusLabel(project) {
   const filesText = `${fileCount} file${fileCount !== 1 ? 's' : ''}`;
 
   if (project.status === 'watching') {
-    return `Watching \u00B7 ${filesText}`;
+    // v2.5.0: Remove mid-session file counter — only show count after packaging
+    return `Watching`;
   } else if (project.status === 'paused') {
     return `Paused \u00B7 ${filesText} so far`;
   } else {
@@ -241,7 +242,16 @@ async function renderFiles() {
   const noProject = $('#files-no-project');
   const filesView = $('#files-view');
 
+  // If no project is selected, try to auto-select an active one
   if (!state.selectedProjectId) {
+    const watching = state.projects.find(p => p.status === 'watching');
+    if (watching) {
+      state.selectedProjectId = watching.id;
+    }
+  }
+
+  if (!state.selectedProjectId) {
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -249,6 +259,15 @@ async function renderFiles() {
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
+    noProject.classList.remove('hidden');
+    filesView.classList.add('hidden');
+    return;
+  }
+
+  // Show empty state when project is packaged or not actively watching
+  if (project.status === 'packaged') {
+    noProject.innerHTML = '<p style="color:#9ca3af;font-size:13px;text-align:center;padding:32px 16px;">This project has been packaged.<br>Start a new project to begin tracking files.</p>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -270,7 +289,8 @@ async function renderFiles() {
   statusDot.className = `app-dot ${project.status !== 'watching' ? project.status : ''}`;
 
   if (project.status === 'watching') {
-    statusText.textContent = `Watching \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''} tracked`;
+    // v2.5.0: No mid-session counter — count shown only after packaging
+    statusText.textContent = `Watching`;
   } else if (project.status === 'paused') {
     statusText.textContent = `Paused \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
   } else {
@@ -288,6 +308,9 @@ async function renderFiles() {
   packageBtn.disabled = false;
 }
 
+// v2.5.0: Track expanded state for file list
+let fileListExpanded = false;
+
 function renderFileList(files) {
   const container = $('#file-list');
   container.innerHTML = '';
@@ -297,43 +320,67 @@ function renderFileList(files) {
     return;
   }
 
-  const visibleFiles = files.slice(0, MAX_VISIBLE_FILES);
-  const remainingCount = files.length - MAX_VISIBLE_FILES;
+  const previewFiles = files.slice(0, MAX_VISIBLE_FILES);
+  const hasMore = files.length > MAX_VISIBLE_FILES;
 
-  for (const file of visibleFiles) {
-    const row = document.createElement('div');
-    row.className = 'app-file';
-    const emoji = getFileEmoji(file.ext);
+  // Render preview files (always visible)
+  for (const file of previewFiles) {
+    container.appendChild(createFileRow(file));
+  }
 
-    row.innerHTML = `
-      <span class="app-file-icon">${emoji}</span>
-      <span class="app-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
-      <button class="app-file-remove" data-path="${escapeHtml(file.path)}" title="Remove">&times;</button>
-    `;
-
-    const removeBtn = row.querySelector('.app-file-remove');
-    removeBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      await window.crate.removeFile(state.selectedProjectId, file.path);
-      state.projects = await window.crate.getProjects();
-      renderFiles();
+  if (hasMore) {
+    // Expand/collapse toggle
+    const toggle = document.createElement('div');
+    toggle.className = 'file-list-toggle';
+    toggle.innerHTML = fileListExpanded
+      ? `<span class="file-list-toggle-icon">\u25B4</span> Hide files`
+      : `<span class="file-list-toggle-icon">\u25BE</span> Show all ${files.length} files`;
+    toggle.addEventListener('click', () => {
+      fileListExpanded = !fileListExpanded;
+      // M2: Re-fetch current files from state instead of closing over stale `files` array
+      const project = state.projects.find(p => p.id === state.selectedProjectId);
+      renderFileList(project ? project.files : files);
     });
+    container.appendChild(toggle);
 
-    container.appendChild(row);
+    // Expanded drawer
+    if (fileListExpanded) {
+      const drawer = document.createElement('div');
+      drawer.className = 'file-list-drawer';
+      for (const file of files.slice(MAX_VISIBLE_FILES)) {
+        drawer.appendChild(createFileRow(file));
+      }
+      container.appendChild(drawer);
+    }
   }
+}
 
-  if (remainingCount > 0) {
-    const divider = document.createElement('hr');
-    divider.className = 'app-file-divider';
-    container.appendChild(divider);
+function createFileRow(file) {
+  const row = document.createElement('div');
+  row.className = 'app-file';
+  const emoji = getFileEmoji(file.ext);
+  const statusBadge = file.embedded
+    ? '<span class="file-status-badge embedded" title="Embedded — extracted at package time">EMB</span>'
+    : (file.source && file.source.includes('linked')
+      ? '<span class="file-status-badge linked" title="Linked file — confirmed path">LNK</span>'
+      : '');
 
-    const meta = document.createElement('div');
-    meta.className = 'app-file-meta';
-    meta.innerHTML = `
-      <span class="app-file-count">+ ${remainingCount} more file${remainingCount !== 1 ? 's' : ''}</span>
-    `;
-    container.appendChild(meta);
-  }
+  row.innerHTML = `
+    <span class="app-file-icon">${emoji}</span>
+    <span class="app-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
+    ${statusBadge}
+    <button class="app-file-remove" title="Remove">&times;</button>
+  `;
+
+  const removeBtn = row.querySelector('.app-file-remove');
+  removeBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await window.crate.removeFile(state.selectedProjectId, file.fileId || file.path);
+    state.projects = await window.crate.getProjects();
+    renderFiles();
+  });
+
+  return row;
 }
 
 // ===== Render Pending (Tier 2) Files =====
@@ -382,14 +429,17 @@ function renderPendingFiles(project) {
 }
 
 function getFileEmoji(ext) {
-  const visualExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.tiff', '.bmp', '.ico',
-                      '.psd', '.ai', '.sketch', '.fig', '.xd', '.indd', '.eps', '.afdesign'];
-  const docExts = ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.pages', '.odt'];
+  const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.tiff', '.bmp', '.ico'];
+  const designExts = ['.psd', '.ai', '.sketch', '.fig', '.xd', '.indd', '.eps', '.afdesign'];
+  const pdfExts = ['.pdf'];
+  const docExts = ['.doc', '.docx', '.txt', '.rtf', '.pages', '.odt'];
   const fontExts = ['.otf', '.ttf', '.woff', '.woff2'];
   const videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
   const audioExts = ['.mp3', '.wav', '.aac', '.flac', '.ogg'];
 
-  if (visualExts.includes(ext)) return '\uD83D\uDDBC';
+  if (imageExts.includes(ext)) return '\uD83D\uDDBC';
+  if (designExts.includes(ext)) return '\uD83D\uDDBC';
+  if (pdfExts.includes(ext)) return '\uD83D\uDCC4';
   if (docExts.includes(ext)) return '\uD83D\uDCC4';
   if (fontExts.includes(ext)) return '\uD83D\uDD24';
   if (videoExts.includes(ext)) return '\uD83C\uDFAC';
@@ -443,12 +493,14 @@ async function renderFigmaSettings() {
       if (trackedFiles.length === 0) {
         filesListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No files tracked yet</div>';
       } else {
-        filesListEl.innerHTML = trackedFiles.map(key =>
-          `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${key}</span>
+        filesListEl.innerHTML = trackedFiles.map(entry => {
+          const key = typeof entry === 'string' ? entry : entry.key;
+          const display = typeof entry === 'string' ? entry : (entry.url || entry.key);
+          return `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${display}</span>
             <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-file="${key}">Remove</button>
-          </div>`
-        ).join('');
+          </div>`;
+        }).join('');
         filesListEl.querySelectorAll('[data-figma-remove-file]').forEach(btn => {
           btn.addEventListener('click', async () => {
             await window.crate.removeFigmaTrackedFile(btn.dataset.figmaRemoveFile);
@@ -497,46 +549,6 @@ async function renderFooter() {
 }
 
 // ===== Package Flow =====
-
-// Shared: run pre-scan with 12s timeout
-async function runPreScanWithTimeout(projectId) {
-  const scanResult = await Promise.race([
-    window.crate.preScanSession(projectId),
-    new Promise(resolve => setTimeout(() => resolve(null), 12000))
-  ]);
-  if (scanResult) {
-    state.projects = await window.crate.getProjects();
-  }
-}
-
-// Shared: handle package result (error, success, refresh)
-async function handlePackageResult(result) {
-  $('#modal-progress').classList.add('hidden');
-
-  if (result.error === 'limit_reached') {
-    $('#upgrade-days-left').textContent = result.daysLeft;
-    $('#modal-upgrade').classList.remove('hidden');
-    return false;
-  }
-
-  if (result.error) {
-    alert('Error packaging: ' + result.error);
-    return false;
-  }
-
-  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} ready to go. Your project is ready to archive or hand off.`;
-  $('#success-path').textContent = result.folderPath;
-  state.lastPackagedPath = result.folderPath;
-  $('#modal-success').classList.remove('hidden');
-
-  state.projects = await window.crate.getProjects();
-  state.usage = await window.crate.getUsage();
-  renderFiles();
-  renderFooter();
-  return true;
-}
-
 function showPackageModal() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) return;
@@ -581,22 +593,57 @@ async function confirmPackage() {
   if (!project) return;
 
   $('#modal-package').classList.add('hidden');
-  $('#modal-progress').classList.remove('hidden');
 
-  await runPreScanWithTimeout(project.id);
-
+  // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
   let outputPath = state.packageOutputPath;
   if (!outputPath) {
     outputPath = await window.crate.selectOutputFolder();
     if (!outputPath) {
-      $('#modal-progress').classList.add('hidden');
       return;
     }
     state.packageOutputPath = outputPath;
   }
 
+  // Now show progress — user has confirmed a destination
+  $('#modal-progress').classList.remove('hidden');
+
+  // Run pre-scan now (user already confirmed, progress spinner is showing)
+  // FIX 2 (C2): Increased timeout from 5s to 12s to accommodate scan + package coordination
+  const scanResult = await Promise.race([
+    window.crate.preScanSession(project.id),
+    new Promise(resolve => setTimeout(() => resolve(null), 12000))
+  ]);
+  if (scanResult) {
+    state.projects = await window.crate.getProjects();
+  }
+
   const result = await window.crate.packageProject(project.id, outputPath);
-  await handlePackageResult(result);
+
+  $('#modal-progress').classList.add('hidden');
+
+  if (result.error === 'limit_reached') {
+    $('#upgrade-days-left').textContent = result.daysLeft;
+    $('#modal-upgrade').classList.remove('hidden');
+    return;
+  }
+
+  if (result.error) {
+    alert('Error packaging: ' + result.error);
+    return;
+  }
+
+  // Show success — v2.5.0: final accurate count shown only after packaging
+  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
+  $('#success-path').textContent = result.folderPath;
+  state.lastPackagedPath = result.folderPath;
+  $('#modal-success').classList.remove('hidden');
+
+  // Refresh data
+  state.projects = await window.crate.getProjects();
+  state.usage = await window.crate.getUsage();
+  renderFiles();
+  renderFooter();
 }
 
 // ===== Delete Project =====
@@ -666,14 +713,31 @@ function setupEventListeners() {
   });
 
   // Files tab
+  $('#btn-add-files').addEventListener('click', async () => {
+    if (!state.selectedProjectId) {
+      showToast('Select a project first');
+      return;
+    }
+    const files = await window.crate.addFiles(state.selectedProjectId);
+    if (files) {
+      state.projects = await window.crate.getProjects();
+      renderFiles();
+    }
+  });
+
   $('#btn-package').addEventListener('click', async () => {
     const projectId = state.selectedProjectId;
     if (!projectId) return;
 
     const project = state.projects.find(p => p.id === projectId);
     if (!project || project.files.length === 0) {
-      showToast('No files captured yet. Keep watching — files will appear automatically.');
+      showToast('No files captured yet. Keep watching or tap + Files to add manually.');
       return;
+    }
+    // M4: Confirm before re-packaging an already-packaged project
+    if (project.status === 'packaged') {
+      const ok = confirm('This project was already packaged. Package again?');
+      if (!ok) return;
     }
     showPackageModal();
   });
@@ -785,6 +849,7 @@ function setupEventListeners() {
   // V2 Results modal
   $('#btn-v2-done').addEventListener('click', () => {
     $('#modal-v2-results').classList.add('hidden');
+    v2LastResult = null; // L8: release reference
   });
 
   $('#btn-v2-open-folder').addEventListener('click', () => {
@@ -792,6 +857,7 @@ function setupEventListeners() {
       window.crate.openFolder(v2LastResult.outputDir);
     }
     $('#modal-v2-results').classList.add('hidden');
+    v2LastResult = null; // L8: release reference
   });
 
   // Figma connect
@@ -854,10 +920,21 @@ function setupEventListeners() {
     }
   });
 
-  // Figma auth error notification
-  window.crate.onFigmaAuthError((data) => {
-    showToast(data.error || 'Figma token expired — reconnect in Settings');
-    renderFigmaSettings();
+  // Figma scan now
+  $('#btn-figma-scan-now').addEventListener('click', async () => {
+    $('#btn-figma-scan-now').disabled = true;
+    $('#btn-figma-scan-now').textContent = 'Scanning...';
+    try {
+      const result = await window.crate.figmaScanNow();
+      if (result.triggered === 0) {
+        showToast('No active projects to scan');
+      }
+    } catch (e) {
+      showToast('Scan failed: ' + (e.message || 'Unknown error'));
+    } finally {
+      $('#btn-figma-scan-now').disabled = false;
+      $('#btn-figma-scan-now').textContent = 'Scan Now';
+    }
   });
 
 }
@@ -901,21 +978,92 @@ function setupMainProcessListeners() {
   });
 
   // Handle "Package Now" from inactivity dialog
+  // FIX 5 (H4): Run pre-scan before packaging, handle errors, show progress/success modals
   window.crate.onPackageTrigger(async (data) => {
     const project = state.projects.find(p => p.id === data.projectId);
-    if (!project) return;
+    if (project) {
+      state.selectedProjectId = data.projectId;
+      const outputPath = await window.crate.selectOutputFolder();
+      if (outputPath) {
+        $('#modal-progress').classList.remove('hidden');
 
-    state.selectedProjectId = data.projectId;
-    const outputPath = await window.crate.selectOutputFolder();
-    if (!outputPath) return;
+        // Run pre-scan with 12s timeout (same as confirmPackage)
+        const scanResult = await Promise.race([
+          window.crate.preScanSession(data.projectId),
+          new Promise(resolve => setTimeout(() => resolve(null), 12000))
+        ]);
+        if (scanResult) {
+          state.projects = await window.crate.getProjects();
+        }
 
-    $('#modal-progress').classList.remove('hidden');
-    await runPreScanWithTimeout(data.projectId);
+        const result = await window.crate.packageProject(data.projectId, outputPath);
 
-    const result = await window.crate.packageProject(data.projectId, outputPath);
-    const success = await handlePackageResult(result);
-    if (success) renderProjects();
+        $('#modal-progress').classList.add('hidden');
+
+        if (result.error === 'limit_reached') {
+          $('#upgrade-days-left').textContent = result.daysLeft;
+          $('#modal-upgrade').classList.remove('hidden');
+          return;
+        }
+
+        if (result.error) {
+          alert('Error packaging: ' + result.error);
+          return;
+        }
+
+        // Show success — v2.5.0: final accurate count
+        const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
+        $('#success-path').textContent = result.folderPath;
+        state.lastPackagedPath = result.folderPath;
+        $('#modal-success').classList.remove('hidden');
+
+        state.projects = await window.crate.getProjects();
+        state.usage = await window.crate.getUsage();
+        renderProjects();
+        renderFiles();
+        renderFooter();
+      }
+    }
   });
+
+  // Figma auth error notification
+  window.crate.onFigmaAuthError((data) => {
+    showToast(data.error || 'Figma token expired — reconnect in Settings');
+    renderFigmaSettings();
+  });
+
+  // Figma scan complete notification
+  window.crate.onFigmaScanComplete((data) => {
+    if (data.warning) {
+      showToast(data.warning);
+    } else if (data.addedCount > 0) {
+      showToast(`Figma scan: ${data.addedCount} new asset${data.addedCount !== 1 ? 's' : ''} added`);
+    }
+    // Update scan status line
+    updateFigmaScanStatus(data);
+  });
+
+  // Figma scan error notification
+  window.crate.onFigmaScanError((data) => {
+    showToast(`Figma scan error: ${data.error || 'Unknown error'}`);
+    updateFigmaScanStatus({ errors: [data.error || 'Unknown error'], timestamp: Date.now() });
+  });
+}
+
+// ===== Figma Scan Status =====
+function updateFigmaScanStatus(data) {
+  const el = $('#figma-scan-status');
+  if (!el) return;
+  const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : 'just now';
+  const errors = data.errors || [];
+  if (errors.length > 0) {
+    el.style.color = '#f59e0b';
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}`;
+  } else {
+    el.style.color = '#9ca3af';
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new`;
+  }
 }
 
 // ===== Toast =====
@@ -987,23 +1135,27 @@ function showV2Results(result) {
   $('#modal-v2-results').classList.remove('hidden');
 }
 
+let v2PackageInFlight = false;
 async function handleV2FileDrop(filePath) {
-  if (!filePath) return;
+  if (!filePath || v2PackageInFlight) return;
+  v2PackageInFlight = true;
 
-  $('#modal-progress').classList.remove('hidden');
+  try {
+    $('#modal-progress').classList.remove('hidden');
 
-  const result = await window.crate.v2PackageFile(filePath);
+    const result = await window.crate.v2PackageFile(filePath);
 
-  $('#modal-progress').classList.add('hidden');
+    $('#modal-progress').classList.add('hidden');
 
-  if (result.canceled) return;
+    if (result.error) {
+      showToast('Error: ' + result.error);
+      return;
+    }
 
-  if (result.error) {
-    showToast('Error: ' + result.error);
-    return;
+    showV2Results(result);
+  } finally {
+    v2PackageInFlight = false;
   }
-
-  showV2Results(result);
 }
 
 // ===== Helpers =====

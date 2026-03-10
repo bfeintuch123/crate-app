@@ -1,0 +1,27 @@
+{
+  "title": "Crate",
+  "icon": "../assets/icon.icns",
+  "background": "dmg-background.png",
+  "icon-size": 120,
+  "window": {
+    "size": {
+      "width": 540,
+      "height": 380
+    }
+  },
+  "contents": [
+    {
+      "x": 135,
+      "y": 210,
+      "type": "file",
+      "path": "../dist/mac-arm64/Crate.app"
+    },
+    {
+      "x": 405,
+      "y": 210,
+      "type": "link",
+      "path": "/Applications",
+      "custom-icon": "ApplicationsFolderIcon.icns"
+    }
+  ]
+}
