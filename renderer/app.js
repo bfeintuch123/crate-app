@@ -255,6 +255,14 @@ async function renderFiles() {
     return;
   }
 
+  // Show empty state when project is packaged or not actively watching
+  if (project.status === 'packaged') {
+    noProject.innerHTML = '<p style="color:#9ca3af;font-size:13px;text-align:center;padding:32px 16px;">This project has been packaged.<br>Start a new project to begin tracking files.</p>';
+    noProject.classList.remove('hidden');
+    filesView.classList.add('hidden');
+    return;
+  }
+
   noProject.classList.add('hidden');
   filesView.classList.remove('hidden');
 
@@ -994,6 +1002,20 @@ function setupMainProcessListeners() {
   window.crate.onFigmaAuthError((data) => {
     showToast(data.error || 'Figma token expired — reconnect in Settings');
     renderFigmaSettings();
+  });
+
+  // Figma scan complete notification
+  window.crate.onFigmaScanComplete((data) => {
+    if (data.warning) {
+      showToast(data.warning);
+    } else if (data.addedCount > 0) {
+      showToast(`Figma scan: ${data.addedCount} new asset${data.addedCount !== 1 ? 's' : ''} added`);
+    }
+  });
+
+  // Figma scan error notification
+  window.crate.onFigmaScanError((data) => {
+    showToast(`Figma scan error: ${data.error || 'Unknown error'}`);
   });
 }
 

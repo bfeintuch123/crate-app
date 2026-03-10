@@ -32,6 +32,9 @@ try {
 } catch (e) {
   // node-fetch not installed
 }
+if (!fetch && typeof globalThis.fetch === 'function') {
+  fetch = globalThis.fetch.bind(globalThis);
+}
 
 try {
   keytar = require('keytar');
@@ -201,7 +204,7 @@ class FigmaParser extends BaseParser {
     const assets = [];
 
     // Fetch file structure
-    const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
+    const fileData = await this._fetchAPI(`/files/${fileKey}?depth=2`, token);
 
     // Find all nodes with image fills or that are exportable
     const imageNodeIds = [];
@@ -296,28 +299,36 @@ class FigmaParser extends BaseParser {
    */
   async _fetchAPI(endpoint, token) {
     const url = `${FIGMA_API_BASE}${endpoint}`;
-    const response = await fetch(url, {
-      headers: {
-        'X-Figma-Token': token
-      }
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(url, {
+        headers: { 'X-Figma-Token': token },
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-    if (!response.ok) {
-      const status = response.status;
-      if (status === 401) {
-        throw new Error('Invalid Figma API token. Please check your Personal Access Token.');
-      } else if (status === 403) {
-        throw new Error('Access denied. You may not have permission to view this Figma file.');
-      } else if (status === 404) {
-        throw new Error('Figma file not found. Check that the file URL is correct and the file still exists.');
-      } else if (status === 429) {
-        throw new Error('Rate limit exceeded. Please wait a moment and try again.');
-      } else {
-        throw new Error(`Figma API error: ${status} ${response.statusText}`);
+      if (!response.ok) {
+        const status = response.status;
+        if (status === 401) {
+          throw new Error('Invalid Figma API token. Please check your Personal Access Token.');
+        } else if (status === 403) {
+          throw new Error('Access denied. You may not have permission to view this Figma file.');
+        } else if (status === 404) {
+          throw new Error('Figma file not found. Check that the file URL is correct and the file still exists.');
+        } else if (status === 429) {
+          throw new Error('Rate limit exceeded. Please wait a moment and try again.');
+        } else {
+          throw new Error(`Figma API error: ${status} ${response.statusText}`);
+        }
       }
+
+      return response.json();
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e.name === 'AbortError') throw new Error('Figma API request timed out after 30s');
+      throw e;
     }
-
-    return response.json();
   }
 
   /**
@@ -641,7 +652,7 @@ class FigmaParser extends BaseParser {
 
     try {
       // Fetch file structure
-      const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
+      const fileData = await this._fetchAPI(`/files/${fileKey}?depth=2`, token);
 
       // Find all exportable nodes
       const imageNodeIds = [];

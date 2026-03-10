@@ -135,6 +135,12 @@ const CHOKIDAR_IMAGE_EXTENSIONS = new Set([
   '.svg', '.eps', '.pdf', '.mp4', '.mov', '.m4v',
 ]);
 
+// v2.6.4: Image extensions captured by lsof polling and lastUsed poller.
+const LSOF_IMAGE_EXTENSIONS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
+  '.svg', '.eps', '.pdf',
+]);
+
 // Project type → relevant bundle IDs (for isDesignAppFile type-aware filtering)
 const PROJECT_TYPE_APPS = {
   branding: new Set([
@@ -565,6 +571,13 @@ function pollLsofForProject(projectId) {
             if (!isInWatchedDir) continue;
           }
 
+          // v2.6.4: Exempt Desktop/Documents/Downloads from project-root scoping
+          const projectRoot = proj.root || null;
+          const isInAllowedDirForScope = filePath.startsWith(home + '/Desktop/') ||
+                                          filePath.startsWith(home + '/Documents/') ||
+                                          filePath.startsWith(home + '/Downloads/');
+          if (projectRoot !== null && !isInAllowedDirForScope && !filePath.startsWith(projectRoot + '/')) continue;
+
           if (existingPaths.has(filePath)) continue;
           if (pendingPaths.has(filePath)) continue;
 
@@ -734,6 +747,17 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     }
 
     if (scanResult.assets.length === 0) {
+      // Notify renderer even when no assets found
+      if (scanResult.files.length === 0 && (teamIds.length > 0 || fileKeys.length > 0)) {
+        sendToRenderer('figma:scan-complete', {
+          projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
+          warning: 'No recent Figma files found. Make sure your file was modified recently.'
+        });
+      } else {
+        sendToRenderer('figma:scan-complete', {
+          projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0
+        });
+      }
       figmaScanTimestamps.set(projectId, Date.now());
       figmaInProgress.delete(projectId);
       return;
@@ -790,9 +814,17 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       console.log(`[crate][figma] Added ${addedCount} Figma assets to project ${projectId}`);
     }
 
+    sendToRenderer('figma:scan-complete', {
+      projectId,
+      filesFound: scanResult.files.length,
+      assetsFound: scanResult.assets.length,
+      addedCount
+    });
+
     figmaScanTimestamps.set(projectId, Date.now());
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', e.message);
+    sendToRenderer('figma:scan-error', { projectId, error: e.message });
     // Detect token expiry / auth failures at the network level
     const msg = (e.message || '').toLowerCase();
     if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized') || msg.includes('token invalid') || msg.includes('invalid figma')) {
@@ -1111,7 +1143,7 @@ async function pollLastUsedForProject(projectId) {
       const name = path.basename(fullPath);
       if (name.startsWith('.') || name.startsWith('~') || name.startsWith('._')) continue;
       const ext = path.extname(name).toLowerCase();
-      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      if (!PRIMARY_DESIGN_EXTENSIONS.has(ext) && !LSOF_IMAGE_EXTENSIONS.has(ext)) continue;
       if (existingPaths.has(fullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
       existingPaths.add(fullPath);
@@ -2088,6 +2120,13 @@ async function startWatching(projectId) {
     path.join(homedir, 'Documents'),
     path.join(homedir, 'Downloads')
   ];
+
+  // v2.6.3: Watch iCloud Desktop/Documents if iCloud Drive is enabled
+  const iCloudBase = path.join(homedir, 'Library', 'Mobile Documents', 'com~apple~CloudDocs');
+  for (const folder of ['Desktop', 'Documents']) {
+    const iCloudFolder = path.join(iCloudBase, folder);
+    if (fs.existsSync(iCloudFolder)) watchPaths.push(iCloudFolder);
+  }
 
   // v1.3.27: Watch Figma's local file storage for .fig files.
   const figmaDir = path.join(homedir, 'Library', 'Application Support', 'Figma');
