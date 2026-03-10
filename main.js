@@ -621,7 +621,10 @@ function pollLsofForProject(projectId) {
           // derived root directory. Prevents cross-project contamination when the user has
           // multiple unrelated projects open simultaneously in the same design app.
           // Skipped when projectRoot is null (empty project with no files yet).
-          if (projectRoot !== null && !filePath.startsWith(projectRoot + '/')) continue;
+          // v2.6.4: Only scope non-image files — images have their own isInAllowedDir guard
+          // (Desktop/Documents/Downloads). The old check dropped images placed in Figma from
+          // ~/Downloads because they fell outside projectRoot.
+          if (projectRoot !== null && !LSOF_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase()) && !filePath.startsWith(projectRoot + '/')) continue;
 
           if (existingPaths.has(filePath)) continue;
           if (pendingPaths.has(filePath)) continue;
@@ -1197,11 +1200,13 @@ async function pollLastUsedForProject(projectId) {
       if (/^Screen.?Shot/i.test(name)) continue;
       const ext = path.extname(name).toLowerCase();
       // v2.5.8: lastUsed poller only captures PRIMARY design source files.
-      // Per the original design intent (see DESIGN_FILE_EXTENSIONS comment): images, fonts,
+      // Per the original design intent (see DESIGN_FILE_EXTENSIONS comment): fonts,
       // PDFs, and presentation source files are NOT captured here — they come from lsof
       // or scan-on-save. Using DESIGN_FILE_EXTENSIONS was too broad and caused false captures
       // from Chrome downloads, messaging apps, and any app that touches a file in Desktop/Downloads.
-      if (!PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
+      // v2.6.4: Also allow LSOF_IMAGE_EXTENSIONS — the mdfind -onlyin already restricts
+      // location to Desktop/Documents/Downloads, so images are safe here.
+      if (!PRIMARY_DESIGN_EXTENSIONS.has(ext) && !LSOF_IMAGE_EXTENSIONS.has(ext)) continue;
       // v2.5.9: Presentation source files (.pptx, .key, etc.) are in PRIMARY_DESIGN_EXTENSIONS
       // but must still be excluded — their content is extracted via scan-on-save, not polling.
       const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
@@ -2375,6 +2380,18 @@ async function startWatching(projectId) {
     path.join(homedir, 'Documents'),
     path.join(homedir, 'Downloads')
   ];
+
+  // v2.6.3: Watch iCloud Drive synced Desktop & Documents folders.
+  // When iCloud Drive "Desktop & Documents" sync is enabled, files land in
+  // ~/Library/Mobile Documents/com~apple~CloudDocs/Desktop (and Documents)
+  // instead of ~/Desktop, so chokidar must watch both locations.
+  const iCloudBase = path.join(homedir, 'Library', 'Mobile Documents', 'com~apple~CloudDocs');
+  for (const folder of ['Desktop', 'Documents']) {
+    const iCloudFolder = path.join(iCloudBase, folder);
+    if (fs.existsSync(iCloudFolder)) {
+      watchPaths.push(iCloudFolder);
+    }
+  }
 
   // v1.3.27: Watch Figma's local file storage for .fig files.
   const figmaDir = path.join(homedir, 'Library', 'Application Support', 'Figma');

@@ -1,7 +1,7 @@
 {
   "name": "crate-app",
-  "version": "2.6.2",
-  "productName": "Crate v2.6.2",
+  "version": "2.6.4",
+  "productName": "Crate",
   "description": "Universal project file packager for graphic designers \u2014 macOS menu bar app",
   "main": "main.js",
   "scripts": {
@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
+    "appdmg": "^0.6.6",
     "electron": "^33.2.1",
     "electron-builder": "^24.13.3"
   },
@@ -52,7 +53,7 @@
       "background": "build/dmg-background.png",
       "window": {
         "width": 540,
-        "height": 360
+        "height": 380
       },
       "iconSize": 120,
       "contents": [
