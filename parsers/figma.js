@@ -341,9 +341,7 @@ class FigmaParser extends BaseParser {
     // Check if node has export settings or image fills
     const hasExport = node.exportSettings && node.exportSettings.length > 0;
     const hasImageFill = node.fills && node.fills.some(f => f.type === 'IMAGE');
-    const isFrame = node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE';
-
-    if (hasExport || hasImageFill || isFrame) {
+    if (hasExport || hasImageFill) {
       nodeIds.push(node.id);
       nodeNames[node.id] = node.name || node.id;
     }
@@ -578,7 +576,10 @@ class FigmaParser extends BaseParser {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
           teamName = teamData.name || teamName;
         } catch (e) {
-          const msg = `Cannot access team ${teamId}: ${e.message}`;
+          const hint = e.message.toLowerCase().includes('not found')
+            ? 'Team not found or not accessible via API. If this is a personal workspace, paste a direct Figma file URL instead.'
+            : e.message;
+          const msg = `Cannot access team ${teamId}: ${hint}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
           continue;
@@ -654,7 +655,7 @@ class FigmaParser extends BaseParser {
    */
   async extractAssetsFromFileKey(fileKey) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return [];
+    if (!token || !fetch) return { assets: [], errors: ["No token or fetch available"] };
 
     try {
       // Fetch file structure
@@ -665,9 +666,10 @@ class FigmaParser extends BaseParser {
       const nodeNames = {};
       this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
 
-      if (imageNodeIds.length === 0) return [];
+      if (imageNodeIds.length === 0) return { assets: [], errors: [] };
 
       const assets = [];
+      const errors = [];
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -693,14 +695,14 @@ class FigmaParser extends BaseParser {
             }
           }
         } catch (err) {
-          // Continue with other batches
+          errors.push("Batch image export failed for " + fileKey + ": " + err.message);
         }
       }
 
-      return assets;
+      return { assets, errors };
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
-      return [];
+      return { assets: [], errors: [e.message] };
     }
   }
 
@@ -753,8 +755,9 @@ class FigmaParser extends BaseParser {
     // Extract assets from each file
     for (const file of result.files) {
       try {
-        const assets = await this.extractAssetsFromFileKey(file.key);
-        for (const asset of assets) {
+        const extractResult = await this.extractAssetsFromFileKey(file.key);
+        if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...extractResult.errors); }
+        for (const asset of extractResult.assets) {
           asset.figmaFileName = file.name;
           asset.figmaFileKey = file.key;
           result.assets.push(asset);

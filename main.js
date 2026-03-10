@@ -298,6 +298,43 @@ function migrateSettings() {
   if (settings.namingTemplate && settings.namingTemplate.includes('{Client}')) {
     store.set('settings.namingTemplate', '{Project}_{Date}');
   }
+
+  // Migrate figmaTeamIds and figmaTrackedFiles from older Crate versions
+  const hasTeamIds = Array.isArray(settings.figmaTeamIds) && settings.figmaTeamIds.length > 0;
+  const hasTrackedFiles = Array.isArray(settings.figmaTrackedFiles) && settings.figmaTrackedFiles.length > 0;
+  if (!hasTeamIds && !hasTrackedFiles) {
+    try {
+      const configDir = path.join(os.homedir(), 'Library', 'Application Support');
+      const currentUserDataBase = path.basename(app.getPath('userData'));
+      const entries = fs.readdirSync(configDir)
+        .filter(name => name.startsWith('Crate v') && name !== currentUserDataBase)
+        .map(name => {
+          const configPath = path.join(configDir, name, 'config.json');
+          try {
+            const stat = fs.statSync(configPath);
+            return { path: configPath, mtime: stat.mtimeMs };
+          } catch (e) { return null; }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.mtime - a.mtime);
+
+      for (const entry of entries) {
+        try {
+          const oldConfig = JSON.parse(fs.readFileSync(entry.path, 'utf8'));
+          const oldSettings = oldConfig.settings || {};
+          const oldTeamIds = oldSettings.figmaTeamIds || [];
+          const oldTrackedFiles = oldSettings.figmaTrackedFiles || [];
+          if (oldTeamIds.length > 0 || oldTrackedFiles.length > 0) {
+            if (oldTeamIds.length > 0) store.set('settings.figmaTeamIds', oldTeamIds);
+            if (oldTrackedFiles.length > 0) store.set('settings.figmaTrackedFiles', oldTrackedFiles);
+            break;
+          }
+        } catch (e) { /* skip unreadable configs */ }
+      }
+    } catch (e) {
+      console.warn('[crate] Figma settings migration failed:', e.message);
+    }
+  }
 }
 migrateSettings();
 
@@ -780,7 +817,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     // Read Figma configuration from settings
     const settings = store.get('settings') || {};
     const teamIds = settings.figmaTeamIds || [];
-    const fileKeys = settings.figmaTrackedFiles || [];
+    const fileKeys = (settings.figmaTrackedFiles || []).map(entry => typeof entry === 'string' ? entry : entry.key);
 
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
@@ -3966,11 +4003,14 @@ ipcMain.handle('figma:add-tracked-file', async (event, figmaUrl) => {
 
   const settings = store.get('settings') || {};
   const tracked = settings.figmaTrackedFiles || [];
-  if (tracked.includes(fileKey)) {
+  const alreadyTracked = tracked.some(entry =>
+    (typeof entry === 'string' ? entry : entry.key) === fileKey
+  );
+  if (alreadyTracked) {
     return { success: true, fileKey, alreadyTracked: true };
   }
 
-  tracked.push(fileKey);
+  tracked.push({ key: fileKey, url: figmaUrl });
   store.set('settings.figmaTrackedFiles', tracked);
   return { success: true, fileKey };
 });
@@ -3978,7 +4018,7 @@ ipcMain.handle('figma:add-tracked-file', async (event, figmaUrl) => {
 // Remove a tracked Figma file
 ipcMain.handle('figma:remove-tracked-file', async (event, fileKey) => {
   const settings = store.get('settings') || {};
-  const tracked = (settings.figmaTrackedFiles || []).filter(k => k !== fileKey);
+  const tracked = (settings.figmaTrackedFiles || []).filter(entry => (typeof entry === 'string' ? entry : entry.key) !== fileKey);
   store.set('settings.figmaTrackedFiles', tracked);
   return { success: true };
 });
@@ -4018,7 +4058,7 @@ ipcMain.handle('figma:scan-now', async (event) => {
   const projects = getProjects().filter(p => p.status === 'watching');
   for (const project of projects) {
     stopFigmaPolling(project.id);
-    await startFigmaPolling(project.id);
+    startFigmaPolling(project.id);
   }
   return { triggered: projects.length };
 });

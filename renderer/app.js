@@ -493,12 +493,14 @@ async function renderFigmaSettings() {
       if (trackedFiles.length === 0) {
         filesListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No files tracked yet</div>';
       } else {
-        filesListEl.innerHTML = trackedFiles.map(key =>
-          `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${key}</span>
+        filesListEl.innerHTML = trackedFiles.map(entry => {
+          const key = typeof entry === 'string' ? entry : entry.key;
+          const display = typeof entry === 'string' ? entry : (entry.url || entry.key);
+          return `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${display}</span>
             <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-file="${key}">Remove</button>
-          </div>`
-        ).join('');
+          </div>`;
+        }).join('');
         filesListEl.querySelectorAll('[data-figma-remove-file]').forEach(btn => {
           btn.addEventListener('click', async () => {
             await window.crate.removeFigmaTrackedFile(btn.dataset.figmaRemoveFile);
