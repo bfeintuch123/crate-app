@@ -355,6 +355,30 @@ class FigmaParser extends BaseParser {
   }
 
   /**
+   * Recursively collect IMAGE fill refs from the file tree.
+   * @private
+   */
+  _findImageFillRefs(node, imageRefs, refNames) {
+    if (!node) return;
+
+    if (Array.isArray(node.fills)) {
+      for (const fill of node.fills) {
+        if (!fill || fill.type !== 'IMAGE' || !fill.imageRef) continue;
+        imageRefs.add(fill.imageRef);
+        if (!refNames[fill.imageRef]) {
+          refNames[fill.imageRef] = node.name || node.id || fill.imageRef;
+        }
+      }
+    }
+
+    if (node.children) {
+      for (const child of node.children) {
+        this._findImageFillRefs(child, imageRefs, refNames);
+      }
+    }
+  }
+
+  /**
    * Split array into chunks.
    * @private
    */
@@ -661,15 +685,65 @@ class FigmaParser extends BaseParser {
       // Fetch file structure
       const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
 
-      // Find all exportable nodes
+      const assets = [];
+      const errors = [];
+
+      // Primary path: recover original placed image-fill assets via imageRef mapping
+      const imageRefs = new Set();
+      const refNames = {};
+      this._findImageFillRefs(fileData.document, imageRefs, refNames);
+      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found=${imageRefs.size}`);
+
+      if (imageRefs.size > 0) {
+        try {
+          const imageMapData = await this._fetchAPI(`/files/${fileKey}/images`, token);
+          const imageMap = (imageMapData && imageMapData.meta && imageMapData.meta.images)
+            || imageMapData.images
+            || {};
+
+          let resolvedCount = 0;
+          for (const imageRef of imageRefs) {
+            const url = imageMap[imageRef];
+            if (!url) continue;
+            let inferredFormat = null;
+            try {
+              const pathname = new URL(url).pathname || '';
+              const match = pathname.toLowerCase().match(/\.([a-z0-9]{2,5})$/);
+              if (match) inferredFormat = match[1];
+            } catch (e) {
+              const bareUrl = String(url).split('?')[0].toLowerCase();
+              const match = bareUrl.match(/\.([a-z0-9]{2,5})$/);
+              if (match) inferredFormat = match[1];
+            }
+            resolvedCount++;
+            assets.push({
+              url,
+              nodeId: imageRef,
+              name: refNames[imageRef] || imageRef,
+              imageRef,
+              format: inferredFormat,
+              fileKey,
+              source: 'figma-auto'
+            });
+          }
+          console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved=${resolvedCount}`);
+        } catch (err) {
+          errors.push(`Image-fill recovery failed for ${fileKey}: ${err.message}`);
+        }
+      }
+
+      if (assets.length > 0) {
+        console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: using image-fill recovery path`);
+        return { assets: this.deduplicateAssets(assets), errors };
+      }
+
+      // Fallback path: node render exports (legacy behavior)
       const imageNodeIds = [];
       const nodeNames = {};
       this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
+      if (imageNodeIds.length === 0) return { assets: [], errors };
 
-      if (imageNodeIds.length === 0) return { assets: [], errors: [] };
-
-      const assets = [];
-      const errors = [];
+      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node export path used`);
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -688,6 +762,7 @@ class FigmaParser extends BaseParser {
                   url,
                   nodeId,
                   name: nodeNames[nodeId] || nodeId,
+                  format: 'png',
                   fileKey,
                   source: 'figma-auto'
                 });
@@ -699,7 +774,7 @@ class FigmaParser extends BaseParser {
         }
       }
 
-      return { assets, errors };
+      return { assets: this.deduplicateAssets(assets), errors };
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
       return { assets: [], errors: [e.message] };
