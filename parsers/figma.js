@@ -47,6 +47,39 @@ const TOKEN_FILE_PATH = path.join(os.homedir(), '.crate', 'figma-token');
 
 class FigmaParser extends BaseParser {
   /**
+   * Figma-specific dedupe.
+   * Base parser dedupe is path-based, but Figma assets are URL/imageRef objects.
+   *
+   * Priority:
+   *   1) imageRef
+   *   2) url
+   *   3) nodeId
+   */
+  deduplicateFigmaAssets(assets) {
+    const seen = new Set();
+    return assets.filter((asset) => {
+      const key = asset.imageRef || asset.url || asset.nodeId;
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  /**
+   * Build a stable per-asset display name and include a short unique salt.
+   * This keeps distinct Figma assets from collapsing later when filenames are derived from `asset.name`.
+   */
+  buildFigmaAssetName(baseName, stableKey) {
+    const safeBase = String(baseName || stableKey || 'figma-asset').trim();
+    const key = String(stableKey || '').trim();
+    if (!key) return safeBase;
+    const shortKey = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12);
+    if (!shortKey) return safeBase;
+    return `${safeBase}__${shortKey}`;
+  }
+
+  /**
    * Get stored Figma Personal Access Token.
    * Tries multiple sources in order:
    *   1. macOS Keychain (via keytar)
@@ -801,7 +834,7 @@ class FigmaParser extends BaseParser {
             assets.push({
               url,
               nodeId: imageRef,
-              name: refNames[imageRef] || imageRef,
+              name: this.buildFigmaAssetName(refNames[imageRef] || imageRef, imageRef),
               imageRef,
               format: inferredFormat,
               fileKey,
@@ -818,8 +851,13 @@ class FigmaParser extends BaseParser {
       }
 
       if (assets.length > 0) {
+        const dedupedAssets = this.deduplicateFigmaAssets(assets);
+        console.log(
+          `[crate][figma] extractAssetsFromFileKey ${fileKey}: image-fill pipeline counts ` +
+          `resolved=${assets.length} deduped=${dedupedAssets.length} passed_to_ingestion=${dedupedAssets.length}`
+        );
         console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=no`);
-        return { assets: this.deduplicateAssets(assets), errors };
+        return { assets: dedupedAssets, errors };
       }
 
       // Fallback path: node render exports (legacy behavior)
@@ -846,7 +884,7 @@ class FigmaParser extends BaseParser {
                 assets.push({
                   url,
                   nodeId,
-                  name: nodeNames[nodeId] || nodeId,
+                  name: this.buildFigmaAssetName(nodeNames[nodeId] || nodeId, nodeId),
                   format: 'png',
                   fileKey,
                   source: 'figma-auto'
@@ -859,7 +897,12 @@ class FigmaParser extends BaseParser {
         }
       }
 
-      return { assets: this.deduplicateAssets(assets), errors };
+      const dedupedFallbackAssets = this.deduplicateFigmaAssets(assets);
+      console.log(
+        `[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback pipeline counts ` +
+        `resolved=${assets.length} deduped=${dedupedFallbackAssets.length} passed_to_ingestion=${dedupedFallbackAssets.length}`
+      );
+      return { assets: dedupedFallbackAssets, errors };
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
       return { assets: [], errors: [e.message] };
