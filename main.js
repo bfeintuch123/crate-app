@@ -787,11 +787,67 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
     }
 
     fs.writeFileSync(localPath, buffer);
+    console.log(`[crate][figma] downloaded asset: ${path.basename(localPath)}`);
     return localPath;
   } catch (e) {
     console.error('[crate][figma] downloadFigmaAsset error:', e.message);
     return null;
   }
+}
+
+/**
+ * Download Figma scan assets and insert them into project state.
+ * @returns {Promise<number>} count of inserted assets
+ */
+async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextLabel = 'scan') {
+  if (!assets || assets.length === 0) return 0;
+
+  ensureFigmaAssetsDir();
+  const existingPaths = new Set((project.files || []).map(f => f.path));
+  let addedCount = 0;
+
+  for (const asset of assets) {
+    const fileName = `${asset.figmaFileName}_${asset.name}`;
+    const assetFormat = asset.format || 'png';
+    const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
+
+    if (!localPath || existingPaths.has(localPath)) continue;
+
+    const result = mutateProject(projectId, (proj) => {
+      if (proj.files.some(f => f.path === localPath)) return null;
+      const fileRecord = {
+        path: localPath,
+        name: path.basename(localPath),
+        ext: `.${assetFormat}`,
+        addedAt: Date.now(),
+        source: 'figma-auto',
+        figmaFileKey: asset.figmaFileKey,
+        figmaFileName: asset.figmaFileName
+      };
+      proj.files.push(fileRecord);
+      proj.files = deduplicateFiles(proj.files);
+      console.log(`[crate][figma] inserted asset (${contextLabel}): ${fileRecord.name}`);
+      return { files: proj.files };
+    });
+
+    if (result) {
+      if (!project.files.some(f => f.path === localPath)) {
+        project.files.push({
+          path: localPath,
+          name: path.basename(localPath),
+          ext: `.${assetFormat}`,
+          addedAt: Date.now(),
+          source: 'figma-auto',
+          figmaFileKey: asset.figmaFileKey,
+          figmaFileName: asset.figmaFileName
+        });
+      }
+      addedCount++;
+      existingPaths.add(localPath);
+    }
+  }
+
+  return addedCount;
 }
 
 /**
@@ -878,39 +934,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     console.log(`[crate][figma] Found ${scanResult.files.length} files, ${scanResult.assets.length} assets`);
 
     // Download assets and add to project
-    ensureFigmaAssetsDir();
-    let addedCount = 0;
-
-    const existingPaths = new Set(project.files.map(f => f.path));
-
-    for (const asset of scanResult.assets) {
-      const fileName = `${asset.figmaFileName}_${asset.name}`;
-      const assetFormat = asset.format || 'png'; // v2.4.2: use actual format from Figma API
-      const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
-
-      if (localPath && !existingPaths.has(localPath)) {
-        // Add to project files using mutateProject
-        const result = mutateProject(projectId, (proj) => {
-          if (proj.files.some(f => f.path === localPath)) return null;
-          proj.files.push({
-            path: localPath,
-            name: path.basename(localPath),
-            ext: `.${assetFormat}`,
-            addedAt: Date.now(),
-            source: 'figma-auto',
-            figmaFileKey: asset.figmaFileKey,
-            figmaFileName: asset.figmaFileName
-          });
-          proj.files = deduplicateFiles(proj.files);
-          return { files: proj.files };
-        });
-
-        if (result) {
-          addedCount++;
-          existingPaths.add(localPath);
-        }
-      }
-    }
+    const addedCount = await ingestFigmaAssetsIntoProject(projectId, project, scanResult.assets, 'poll');
 
     if (addedCount > 0) {
       // Update activity timestamp
@@ -3379,6 +3403,39 @@ end tell`;
     });
     if (merged) project.files = merged.files;
   }
+
+  // Figma authoritative recovery pass for package-time scan.
+  // Keeps local lsof/.fig heuristics as-is and supplements with cloud originals.
+  try {
+    const settings = store.get('settings') || {};
+    const teamIds = settings.figmaTeamIds || [];
+    const fileKeys = (settings.figmaTrackedFiles || []).map(entry => typeof entry === 'string' ? entry : entry.key);
+
+    if (teamIds.length > 0 || fileKeys.length > 0) {
+      const { FigmaParser } = require('./parsers/figma');
+      const parser = new FigmaParser();
+      const figmaScanResult = await parser.autoTrackScan({
+        sinceMs: watchStart,
+        maxAgeDays: 30,
+        maxFiles: 20,
+        teamIds,
+        fileKeys
+      });
+
+      if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
+        console.warn('[crate][figma] pre-package scan errors:', figmaScanResult.errors);
+      }
+
+      if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
+        const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, figmaScanResult.assets, 'pre-package');
+        newCount += figmaAdded;
+      }
+    }
+  } catch (e) {
+    console.warn('[crate][figma] pre-package recovery failed:', e.message);
+  }
+
+  project.files = deduplicateFiles(project.files);
 
   return { files: project.files, newCount };
   } finally {
