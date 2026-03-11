@@ -811,7 +811,20 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     const assetFormat = asset.format || 'png';
     const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
 
-    if (!localPath || existingPaths.has(localPath)) continue;
+    if (!localPath) {
+      console.log(
+        `[crate][figma] asset skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
+        `name=${asset.name || 'unknown'} reason=download_failed`
+      );
+      continue;
+    }
+    if (existingPaths.has(localPath)) {
+      console.log(
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
+        `localPath=${localPath} reason=existing_path`
+      );
+      continue;
+    }
 
     const result = mutateProject(projectId, (proj) => {
       if (proj.files.some(f => f.path === localPath)) return null;
@@ -826,7 +839,10 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       };
       proj.files.push(fileRecord);
       proj.files = deduplicateFiles(proj.files);
-      console.log(`[crate][figma] inserted asset (${contextLabel}): ${fileRecord.name}`);
+      console.log(
+        `[crate][figma] asset inserted (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
+        `name=${fileRecord.name} localPath=${localPath}`
+      );
       return { files: proj.files };
     });
 
@@ -844,6 +860,11 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       }
       addedCount++;
       existingPaths.add(localPath);
+    } else {
+      console.log(
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
+        `localPath=${localPath} reason=already_in_project`
+      );
     }
   }
 
@@ -872,8 +893,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   try {
     // Read Figma configuration from settings
     const settings = store.get('settings') || {};
+    const rawTrackedFiles = settings.figmaTrackedFiles || [];
     const teamIds = settings.figmaTeamIds || [];
-    const fileKeys = (settings.figmaTrackedFiles || []).map(entry => typeof entry === 'string' ? entry : entry.key);
+    const fileKeys = rawTrackedFiles.map(entry => typeof entry === 'string' ? entry : entry.key);
+    const normalizedTrackedFileKeys = Array.from(new Set(
+      fileKeys.filter(key => typeof key === 'string' && key.trim())
+    ));
 
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
@@ -882,6 +907,13 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       : lastScanMs; // Subsequent: since last scan
 
     console.log(`[crate][figma] Scanning Figma files for project ${projectId} (since ${new Date(sinceMs).toISOString()})`);
+    console.log(
+      `[crate][figma] scan config (${isInitialScan ? 'live-initial' : 'live-incremental'}): ` +
+      `rawTrackedFiles=${JSON.stringify(rawTrackedFiles)} ` +
+      `trackedFileKeys=${JSON.stringify(normalizedTrackedFileKeys)} ` +
+      `teamIds=${JSON.stringify(teamIds)} ` +
+      `sinceMs=${sinceMs} lastScanMs=${lastScanMs} watchStart=${project.watchStartedAt || null}`
+    );
 
     // Run auto-track scan
     const scanResult = await parser.autoTrackScan({
@@ -3408,12 +3440,23 @@ end tell`;
   // Keeps local lsof/.fig heuristics as-is and supplements with cloud originals.
   try {
     const settings = store.get('settings') || {};
+    const rawTrackedFiles = settings.figmaTrackedFiles || [];
     const teamIds = settings.figmaTeamIds || [];
-    const fileKeys = (settings.figmaTrackedFiles || []).map(entry => typeof entry === 'string' ? entry : entry.key);
+    const fileKeys = rawTrackedFiles.map(entry => typeof entry === 'string' ? entry : entry.key);
+    const normalizedTrackedFileKeys = Array.from(new Set(
+      fileKeys.filter(key => typeof key === 'string' && key.trim())
+    ));
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
       const { FigmaParser } = require('./parsers/figma');
       const parser = new FigmaParser();
+      console.log(
+        `[crate][figma] scan config (pre-package): ` +
+        `rawTrackedFiles=${JSON.stringify(rawTrackedFiles)} ` +
+        `trackedFileKeys=${JSON.stringify(normalizedTrackedFileKeys)} ` +
+        `teamIds=${JSON.stringify(teamIds)} ` +
+        `sinceMs=${watchStart} lastScanMs=null watchStart=${watchStart}`
+      );
       const figmaScanResult = await parser.autoTrackScan({
         sinceMs: watchStart,
         maxAgeDays: 30,

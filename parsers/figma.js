@@ -587,10 +587,52 @@ class FigmaParser extends BaseParser {
 
     const sinceMs = options.sinceMs || (Date.now() - (options.maxAgeDays || 7) * 24 * 60 * 60 * 1000);
     const teamIds = options.teamIds || [];
-    const fileKeys = options.fileKeys || [];
+    const fileKeys = Array.from(new Set((options.fileKeys || []).filter(key => typeof key === 'string' && key.trim())));
     const recentFiles = [];
     const errors = [];
     const seenKeys = new Set();
+    const trackedKeySet = new Set(fileKeys);
+    const trackedKeyIndex = new Map(fileKeys.map((key, index) => [key, index]));
+
+    const mergeDiscoverySources = (existingSource, nextSource) => {
+      const parts = new Set([
+        ...(existingSource ? String(existingSource).split('+') : []),
+        ...(nextSource ? String(nextSource).split('+') : [])
+      ].filter(Boolean));
+      return parts.size > 0 ? Array.from(parts).join('+') : undefined;
+    };
+
+    const upsertRecentFile = (fileRecord, { isTracked = false, discoverySource } = {}) => {
+      if (!fileRecord || !fileRecord.key) return null;
+
+      const existingIndex = recentFiles.findIndex(file => file.key === fileRecord.key);
+      if (existingIndex >= 0) {
+        const existing = recentFiles[existingIndex];
+        if (!existing.name && fileRecord.name) existing.name = fileRecord.name;
+        if (!existing.lastModified && fileRecord.lastModified) existing.lastModified = fileRecord.lastModified;
+        if (!Number.isFinite(existing.lastModifiedMs) && Number.isFinite(fileRecord.lastModifiedMs)) {
+          existing.lastModifiedMs = fileRecord.lastModifiedMs;
+        }
+        if (!existing.thumbnailUrl && fileRecord.thumbnailUrl) existing.thumbnailUrl = fileRecord.thumbnailUrl;
+        if (!existing.projectId && fileRecord.projectId) existing.projectId = fileRecord.projectId;
+        if (!existing.projectName && fileRecord.projectName) existing.projectName = fileRecord.projectName;
+        if (!existing.teamId && fileRecord.teamId) existing.teamId = fileRecord.teamId;
+        if (!existing.teamName && fileRecord.teamName) existing.teamName = fileRecord.teamName;
+        if (existing.trackedIndex == null && fileRecord.trackedIndex != null) existing.trackedIndex = fileRecord.trackedIndex;
+        existing.isTracked = existing.isTracked || isTracked;
+        existing.discoverySource = mergeDiscoverySources(existing.discoverySource, discoverySource);
+        return existing;
+      }
+
+      const record = {
+        ...fileRecord,
+        isTracked,
+        discoverySource,
+      };
+      recentFiles.push(record);
+      seenKeys.add(fileRecord.key);
+      return record;
+    };
 
     try {
       // --- Method 1: Team-based discovery (Professional+ plan) ---
@@ -629,8 +671,7 @@ class FigmaParser extends BaseParser {
               if (seenKeys.has(file.key)) continue;
               const lastModifiedMs = new Date(file.last_modified).getTime();
               if (lastModifiedMs >= sinceMs) {
-                seenKeys.add(file.key);
-                recentFiles.push({
+                upsertRecentFile({
                   key: file.key,
                   name: file.name,
                   lastModified: file.last_modified,
@@ -640,6 +681,9 @@ class FigmaParser extends BaseParser {
                   projectName: project.name,
                   teamId,
                   teamName
+                }, {
+                  isTracked: trackedKeySet.has(file.key),
+                  discoverySource: 'team'
                 });
               }
             }
@@ -649,18 +693,52 @@ class FigmaParser extends BaseParser {
         }
       }
 
-      // --- Method 2: Direct file tracking (ALL plans) ---
-      for (const fileKey of fileKeys) {
-        if (seenKeys.has(fileKey)) continue;
+      // --- Method 2: Direct file tracking (ALL plans, authoritative) ---
+      for (const [trackedIndex, fileKey] of fileKeys.entries()) {
         const meta = await this.getFileMetadata(fileKey);
-        if (meta && meta.lastModifiedMs >= sinceMs) {
-          seenKeys.add(fileKey);
-          recentFiles.push(meta);
+        if (meta) {
+          upsertRecentFile({
+            ...meta,
+            trackedIndex
+          }, {
+            isTracked: true,
+            discoverySource: 'tracked'
+          });
+          console.log(
+            `[crate][figma] tracked file ${fileKey}: lastModifiedMs=${meta.lastModifiedMs} included=yes reason=direct-tracked authoritative`
+          );
+          continue;
         }
+
+        upsertRecentFile({
+          key: fileKey,
+          name: `Tracked File ${trackedKeyIndex.get(fileKey) != null ? trackedKeyIndex.get(fileKey) + 1 : ''}`.trim(),
+          lastModified: null,
+          lastModifiedMs: Number.NEGATIVE_INFINITY,
+          thumbnailUrl: null,
+          projectName: 'Tracked File',
+          teamName: 'Manual',
+          trackedIndex
+        }, {
+          isTracked: true,
+          discoverySource: 'tracked'
+        });
+        errors.push(`Metadata fetch failed for tracked file ${fileKey}; proceeding to extraction anyway.`);
+        console.log(
+          `[crate][figma] tracked file ${fileKey}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
+        );
       }
 
-      // Sort by most recently modified first
-      recentFiles.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+      // Sort tracked files first (authoritative), then most-recent non-tracked files.
+      recentFiles.sort((a, b) => {
+        if (!!a.isTracked !== !!b.isTracked) return a.isTracked ? -1 : 1;
+        if (a.isTracked && b.isTracked) {
+          return (a.trackedIndex ?? Number.MAX_SAFE_INTEGER) - (b.trackedIndex ?? Number.MAX_SAFE_INTEGER);
+        }
+        const aLastModified = Number.isFinite(a.lastModifiedMs) ? a.lastModifiedMs : Number.NEGATIVE_INFINITY;
+        const bLastModified = Number.isFinite(b.lastModifiedMs) ? b.lastModifiedMs : Number.NEGATIVE_INFINITY;
+        return bLastModified - aLastModified;
+      });
 
       return { recentFiles, errors };
     } catch (e) {
@@ -692,7 +770,11 @@ class FigmaParser extends BaseParser {
       const imageRefs = new Set();
       const refNames = {};
       this._findImageFillRefs(fileData.document, imageRefs, refNames);
-      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found=${imageRefs.size}`);
+      const imageRefList = Array.from(imageRefs);
+      console.log(
+        `[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found (${imageRefList.length})` +
+        `${imageRefList.length > 0 ? `: ${imageRefList.join(', ')}` : ''}`
+      );
 
       if (imageRefs.size > 0) {
         try {
@@ -701,7 +783,7 @@ class FigmaParser extends BaseParser {
             || imageMapData.images
             || {};
 
-          let resolvedCount = 0;
+          const resolvedUrls = [];
           for (const imageRef of imageRefs) {
             const url = imageMap[imageRef];
             if (!url) continue;
@@ -715,7 +797,7 @@ class FigmaParser extends BaseParser {
               const match = bareUrl.match(/\.([a-z0-9]{2,5})$/);
               if (match) inferredFormat = match[1];
             }
-            resolvedCount++;
+            resolvedUrls.push(url);
             assets.push({
               url,
               nodeId: imageRef,
@@ -726,14 +808,17 @@ class FigmaParser extends BaseParser {
               source: 'figma-auto'
             });
           }
-          console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved=${resolvedCount}`);
+          console.log(
+            `[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved (${resolvedUrls.length})` +
+            `${resolvedUrls.length > 0 ? `: ${resolvedUrls.join(', ')}` : ''}`
+          );
         } catch (err) {
           errors.push(`Image-fill recovery failed for ${fileKey}: ${err.message}`);
         }
       }
 
       if (assets.length > 0) {
-        console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: using image-fill recovery path`);
+        console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=no`);
         return { assets: this.deduplicateAssets(assets), errors };
       }
 
@@ -743,7 +828,7 @@ class FigmaParser extends BaseParser {
       this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
       if (imageNodeIds.length === 0) return { assets: [], errors };
 
-      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node export path used`);
+      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=yes`);
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -825,7 +910,14 @@ class FigmaParser extends BaseParser {
       result.errors.push(...discovery.errors);
     }
 
-    result.files = files.slice(0, options.maxFiles || 20);
+    const trackedFiles = files.filter(file => file.isTracked);
+    const nonTrackedFiles = files.filter(file => !file.isTracked);
+    const cappedNonTrackedFiles = nonTrackedFiles.slice(0, options.maxFiles || 20);
+    result.files = [...trackedFiles, ...cappedNonTrackedFiles];
+    console.log(
+      `[crate][figma] autoTrackScan final file keys scanned (${result.files.length}): ` +
+      `${result.files.map(file => file.key).join(', ')}`
+    );
 
     // Extract assets from each file
     for (const file of result.files) {
