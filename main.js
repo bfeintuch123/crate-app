@@ -32,18 +32,49 @@ async function getXattrLastUsedMs(filePath) {
   }
 }
 
+function normalizeTrackedFilePath(filePath) {
+  return path.resolve(filePath).replace(/\/+$/, '').toLowerCase();
+}
+
+function getFigmaAssetDedupKey(record) {
+  if (!record) return null;
+
+  const figmaFileKey = typeof record.figmaFileKey === 'string' && record.figmaFileKey.trim()
+    ? record.figmaFileKey.trim()
+    : (typeof record.fileKey === 'string' && record.fileKey.trim()
+      ? record.fileKey.trim()
+      : '');
+
+  let assetKey = null;
+  if (typeof record.figmaAssetKey === 'string' && record.figmaAssetKey.trim()) {
+    assetKey = record.figmaAssetKey.trim();
+  } else if (typeof record.imageRef === 'string' && record.imageRef.trim()) {
+    assetKey = record.imageRef.trim();
+  } else if (typeof record.nodeId === 'string' && record.nodeId.trim()) {
+    assetKey = record.nodeId.trim();
+  } else if (typeof record.url === 'string' && record.url.trim()) {
+    try {
+      const parsed = new URL(record.url.trim());
+      parsed.search = '';
+      assetKey = parsed.toString();
+    } catch (e) {
+      assetKey = record.url.trim().split('?')[0];
+    }
+  }
+
+  if (!assetKey) return null;
+  return figmaFileKey ? `${figmaFileKey}:${assetKey}` : assetKey;
+}
+
 // L1: Cache stat results to avoid redundant fs.statSync calls across invocations.
 // The cache is short-lived (cleared each call) — just prevents re-stat of the same
 // path within a single dedup pass.
 function deduplicateFiles(files) {
-  // v2.4.0: Normalize paths before comparing — resolve to absolute, lowercase
-  // for case-insensitive macOS filesystem, strip trailing slashes.
-  const normalizePath = (p) => path.resolve(p).replace(/\/+$/, '').toLowerCase();
 
   // Pass 1: normalized path dedup (catches case/trailing-slash/relative variants)
   const seenPaths = new Set();
   const pathDeduped = files.filter(f => {
-    const norm = normalizePath(f.path);
+    const norm = normalizeTrackedFilePath(f.path);
     if (seenPaths.has(norm)) return false;
     seenPaths.add(norm);
     return true;
@@ -55,7 +86,7 @@ function deduplicateFiles(files) {
   // and size (legitimately different project assets) to be incorrectly merged.
   const seenNameSize = new Set();
   const statCache = new Map(); // L1: cache stat results within this call
-  return pathDeduped.filter(f => {
+  const embeddedDeduped = pathDeduped.filter(f => {
     if (f.source !== 'embedded-media') return true; // skip dedup for non-embedded files
     let size = -1;
     const cached = statCache.get(f.path);
@@ -69,6 +100,18 @@ function deduplicateFiles(files) {
     const key = `${path.basename(f.path).toLowerCase()}:${size}`;
     if (seenNameSize.has(key)) return false;
     seenNameSize.add(key);
+    return true;
+  });
+
+  // Pass 3: Figma asset identity dedup — protects startup scans from adding the
+  // same cloud asset more than once under different local filenames.
+  const seenFigmaAssets = new Set();
+  return embeddedDeduped.filter(f => {
+    if (f.source !== 'figma-auto') return true;
+    const figmaKey = getFigmaAssetDedupKey(f);
+    if (!figmaKey) return true;
+    if (seenFigmaAssets.has(figmaKey)) return false;
+    seenFigmaAssets.add(figmaKey);
     return true;
   });
 }
@@ -809,10 +852,26 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
   if (!assets || assets.length === 0) return 0;
 
   ensureFigmaAssetsDir();
-  const existingPaths = new Set((project.files || []).map(f => f.path));
+  const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
+  const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
   let addedCount = 0;
 
   for (const asset of assets) {
+    const figmaAssetKey = getFigmaAssetDedupKey({
+      figmaFileKey: asset.figmaFileKey,
+      figmaAssetKey: asset.imageRef || asset.nodeId || asset.url,
+      imageRef: asset.imageRef,
+      nodeId: asset.nodeId,
+      url: asset.url
+    });
+    if (figmaAssetKey && existingFigmaAssetKeys.has(figmaAssetKey)) {
+      console.log(
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
+        `assetKey=${figmaAssetKey} reason=existing_asset_key`
+      );
+      continue;
+    }
+
     const fileName = `${asset.figmaFileName}_${asset.name}`;
     const assetFormat = asset.format || 'png';
     const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
@@ -824,7 +883,8 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       );
       continue;
     }
-    if (existingPaths.has(localPath)) {
+    const normalizedLocalPath = normalizeTrackedFilePath(localPath);
+    if (existingPaths.has(normalizedLocalPath)) {
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
         `localPath=${localPath} reason=existing_path`
@@ -833,7 +893,12 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     }
 
     const result = mutateProject(projectId, (proj) => {
-      if (proj.files.some(f => f.path === localPath)) return null;
+      const projectPaths = new Set(proj.files.map(f => normalizeTrackedFilePath(f.path)));
+      if (projectPaths.has(normalizedLocalPath)) return null;
+      if (figmaAssetKey) {
+        const projectFigmaKeys = new Set(proj.files.map(getFigmaAssetDedupKey).filter(Boolean));
+        if (projectFigmaKeys.has(figmaAssetKey)) return null;
+      }
       const fileRecord = {
         path: localPath,
         name: path.basename(localPath),
@@ -841,7 +906,8 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         addedAt: Date.now(),
         source: 'figma-auto',
         figmaFileKey: asset.figmaFileKey,
-        figmaFileName: asset.figmaFileName
+        figmaFileName: asset.figmaFileName,
+        figmaAssetKey
       };
       proj.files.push(fileRecord);
       proj.files = deduplicateFiles(proj.files);
@@ -853,7 +919,9 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     });
 
     if (result) {
-      if (!project.files.some(f => f.path === localPath)) {
+      const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
+      const projectHasFigmaKey = figmaAssetKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetKey);
+      if (!projectHasLocalPath && !projectHasFigmaKey) {
         project.files.push({
           path: localPath,
           name: path.basename(localPath),
@@ -861,15 +929,18 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
           addedAt: Date.now(),
           source: 'figma-auto',
           figmaFileKey: asset.figmaFileKey,
-          figmaFileName: asset.figmaFileName
+          figmaFileName: asset.figmaFileName,
+          figmaAssetKey
         });
+        project.files = deduplicateFiles(project.files);
       }
       addedCount++;
-      existingPaths.add(localPath);
+      existingPaths.add(normalizedLocalPath);
+      if (figmaAssetKey) existingFigmaAssetKeys.add(figmaAssetKey);
     } else {
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `localPath=${localPath} reason=already_in_project`
+        `${figmaAssetKey ? `assetKey=${figmaAssetKey} ` : ''}localPath=${localPath} reason=already_in_project`
       );
     }
   }
@@ -3772,6 +3843,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
   if (!project) return { error: 'not_found' };
+  const packageFiles = deduplicateFiles(project.files || []);
 
   // Build folder name from naming template
   const settings = store.get('settings');
@@ -3795,7 +3867,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     let copiedCount = 0;
     const errors = [];
 
-    for (const file of project.files) {
+    for (const file of packageFiles) {
       try {
         if (fs.existsSync(file.path)) {
           const destPath = path.join(destFolder, file.name);
@@ -3828,7 +3900,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     // be tracked. Group by base filename and only extract from the newest (by mtime)
     // to avoid double-counting embedded media.
     const presentationsByName = new Map();
-    for (const file of project.files) {
+    for (const file of packageFiles) {
       const fileExt = path.extname(file.name).toLowerCase();
       if (ZIP_BASED_FORMATS.has(fileExt) && fs.existsSync(file.path)) {
         // M3: Use full normalized path as dedup key, not just basename,
@@ -3845,7 +3917,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
     for (const { file } of presentationsByName.values()) {
       try {
-        const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, project.files);
+        const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, packageFiles);
         embeddedCount += embeddedFiles.length;
       } catch (embedErr) {
         // M7: Report embedded extraction errors so user sees 'X files packaged, Y errors'
@@ -3882,7 +3954,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
       success: true,
       copiedCount,
       embeddedCount,
-      totalFiles: project.files.length,
+      totalFiles: packageFiles.length,
       folderPath: destFolder,
       errors
     };
