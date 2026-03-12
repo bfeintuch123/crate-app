@@ -67,6 +67,9 @@ contextBridge.exposeInMainWorld('crate', {
   onFigmaAuthError: (callback) => {
     ipcRenderer.on('figma:auth-error', (event, data) => callback(data));
   },
+  onFigmaScanStarted: (callback) => {
+    ipcRenderer.on('figma:scan-started', (event, data) => callback(data));
+  },
   onFigmaScanComplete: (callback) => {
     ipcRenderer.on('figma:scan-complete', (event, data) => callback(data));
   },

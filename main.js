@@ -406,6 +406,7 @@ const designAppRunningCache = new Map();
 const figmaPollers = new Map();    // projectId -> setInterval id
 const figmaPollerStarting = new Set(); // guard: projectIds with initial poll in progress
 const figmaInProgress = new Set(); // projectIds currently mid-poll
+const figmaManualScanInFlight = new Set(); // projectIds currently running a manual Scan Now
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
@@ -876,17 +877,17 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
  * Runs on watch session start and every 60 seconds.
  */
 async function pollFigmaForProject(projectId, isInitialScan = false) {
-  if (figmaInProgress.has(projectId)) return; // Prevent overlapping polls
+  if (figmaInProgress.has(projectId)) return { skipped: true, reason: 'in-progress' }; // Prevent overlapping polls
 
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
-  if (!project || project.status !== 'watching') return;
+  if (!project || project.status !== 'watching') return { skipped: true, reason: 'not-watching' };
 
   // Check if Figma is connected
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
-  if (!token) return; // Figma not connected
+  if (!token) return { skipped: true, reason: 'not-connected' }; // Figma not connected
 
   figmaInProgress.add(projectId);
 
@@ -939,7 +940,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
         stopFigmaPolling(projectId);
         // Notify renderer about auth failure
         sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
-        return;
+        return { projectId, error: 'Figma token expired or invalid — reconnect in Settings' };
       }
     }
 
@@ -959,8 +960,13 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
         });
       }
       figmaScanTimestamps.set(projectId, Date.now());
-      figmaInProgress.delete(projectId);
-      return;
+      return {
+        projectId,
+        filesFound: scanResult.files.length,
+        assetsFound: 0,
+        addedCount: 0,
+        errors: scanErrors
+      };
     }
 
     console.log(`[crate][figma] Found ${scanResult.files.length} files, ${scanResult.assets.length} assets`);
@@ -982,16 +988,24 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       console.log(`[crate][figma] Added ${addedCount} Figma assets to project ${projectId}`);
     }
 
+    const errors = scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
     sendToRenderer('figma:scan-complete', {
       projectId,
       filesFound: scanResult.files.length,
       assetsFound: scanResult.assets.length,
       addedCount,
-      errors: scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e)),
+      errors,
       timestamp: Date.now()
     });
 
     figmaScanTimestamps.set(projectId, Date.now());
+    return {
+      projectId,
+      filesFound: scanResult.files.length,
+      assetsFound: scanResult.assets.length,
+      addedCount,
+      errors
+    };
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', e.message);
     sendToRenderer('figma:scan-error', { projectId, error: e.message });
@@ -1002,6 +1016,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       stopFigmaPolling(projectId);
       sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
     }
+    return { projectId, error: e.message };
   } finally {
     figmaInProgress.delete(projectId);
   }
@@ -4156,11 +4171,39 @@ ipcMain.handle('figma:remove-team-id', async (event, teamId) => {
 
 ipcMain.handle('figma:scan-now', async (event) => {
   const projects = getProjects().filter(p => p.status === 'watching');
-  for (const project of projects) {
-    stopFigmaPolling(project.id);
-    startFigmaPolling(project.id);
+  if (projects.length === 0) {
+    return { triggered: 0, skipped: 0, totalAddedCount: 0 };
   }
-  return { triggered: projects.length };
+
+  const scannableProjects = projects.filter(project => !figmaManualScanInFlight.has(project.id));
+  const skipped = projects.length - scannableProjects.length;
+
+  if (scannableProjects.length === 0) {
+    return { triggered: 0, skipped, totalAddedCount: 0, inFlight: true };
+  }
+
+  scannableProjects.forEach(project => {
+    figmaManualScanInFlight.add(project.id);
+    sendToRenderer('figma:scan-started', {
+      projectId: project.id,
+      source: 'manual',
+      timestamp: Date.now()
+    });
+  });
+
+  const scanResults = await Promise.all(
+    scannableProjects.map(async (project) => {
+      try {
+        return await pollFigmaForProject(project.id, false);
+      } finally {
+        figmaManualScanInFlight.delete(project.id);
+      }
+    })
+  );
+
+  const totalAddedCount = scanResults.reduce((sum, result) => sum + (result?.addedCount || 0), 0);
+
+  return { triggered: scannableProjects.length, skipped, totalAddedCount };
 });
 
 ipcMain.handle('settings:get', () => {
