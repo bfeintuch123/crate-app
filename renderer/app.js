@@ -11,7 +11,8 @@ let state = {
   packageOutputPath: null,
   lastPackagedPath: null,
   pendingDeleteId: null,
-  projectType: 'branding'
+  projectType: 'branding',
+  figmaScanInFlight: false
 };
 
 // ===== DOM Helpers =====
@@ -922,18 +923,24 @@ function setupEventListeners() {
 
   // Figma scan now
   $('#btn-figma-scan-now').addEventListener('click', async () => {
-    $('#btn-figma-scan-now').disabled = true;
-    $('#btn-figma-scan-now').textContent = 'Scanning...';
+    if (state.figmaScanInFlight) return;
+
+    setFigmaScanButtonLoading(true);
+    updateFigmaScanStatus({ phase: 'started', timestamp: Date.now(), source: 'manual' });
+
     try {
       const result = await window.crate.figmaScanNow();
       if (result.triggered === 0) {
-        showToast('No active projects to scan');
+        if (result.inFlight || result.skipped > 0) {
+          showToast('Figma scan already in progress');
+        } else {
+          showToast('No active projects to scan');
+        }
       }
     } catch (e) {
       showToast('Scan failed: ' + (e.message || 'Unknown error'));
     } finally {
-      $('#btn-figma-scan-now').disabled = false;
-      $('#btn-figma-scan-now').textContent = 'Scan Now';
+      setFigmaScanButtonLoading(false);
     }
   });
 
@@ -944,6 +951,14 @@ const isFilesTabActive = () => {
   const tab = document.querySelector("#tab-files");
   return tab && tab.classList.contains("active");
 };
+
+function setFigmaScanButtonLoading(isLoading) {
+  const button = $('#btn-figma-scan-now');
+  if (!button) return;
+  state.figmaScanInFlight = isLoading;
+  button.disabled = isLoading;
+  button.textContent = isLoading ? 'Scanning...' : 'Scan Now';
+}
 
 // ===== Main Process Listeners =====
 function setupMainProcessListeners() {
@@ -1033,6 +1048,10 @@ function setupMainProcessListeners() {
     renderFigmaSettings();
   });
 
+  window.crate.onFigmaScanStarted((data) => {
+    updateFigmaScanStatus({ ...data, phase: 'started' });
+  });
+
   // Figma scan complete notification
   window.crate.onFigmaScanComplete((data) => {
     if (data.warning) {
@@ -1055,14 +1074,21 @@ function setupMainProcessListeners() {
 function updateFigmaScanStatus(data) {
   const el = $('#figma-scan-status');
   if (!el) return;
+
   const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : 'just now';
+  if (data.phase === 'started') {
+    el.style.color = '#60a5fa';
+    el.textContent = `Scan started (${time})...`;
+    return;
+  }
+
   const errors = data.errors || [];
   if (errors.length > 0) {
     el.style.color = '#f59e0b';
     el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}`;
   } else {
     el.style.color = '#9ca3af';
-    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new`;
+    el.textContent = `Scan completed (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new`;
   }
 }
 
