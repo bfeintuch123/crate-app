@@ -467,6 +467,9 @@ const figmaInProgress = new Set(); // projectIds currently mid-poll
 const figmaManualScanInFlight = new Set(); // projectIds currently running a manual Scan Now
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
+// Keep a narrow overlap between incremental polls so a just-added image ref can't
+// fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
+const FIGMA_INCREMENTAL_OVERLAP_MS = FIGMA_POLL_INTERVAL_MS * 2; // 2 minutes
 const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
 
 // --- Photoshop + InDesign Polling (v2.3.0) ---
@@ -973,6 +976,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
   if (!project || project.status !== 'watching') return { skipped: true, reason: 'not-watching' };
+  const scanStartedAt = Date.now();
 
   // Check if Figma is connected
   const { FigmaParser } = require('./parsers/figma');
@@ -993,10 +997,11 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     ));
 
     // Determine time window for scanning
-    const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || Date.now();
+    const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || scanStartedAt;
+    const watchStartMs = project.watchStartedAt || 0;
     const sinceMs = isInitialScan
-      ? Date.now() - (30 * 24 * 60 * 60 * 1000) // Initial: last 30 days
-      : lastScanMs; // Subsequent: since last scan
+      ? scanStartedAt - (30 * 24 * 60 * 60 * 1000) // Initial: last 30 days
+      : Math.max(watchStartMs, lastScanMs - FIGMA_INCREMENTAL_OVERLAP_MS);
 
     console.log(`[crate][figma] Scanning Figma files for project ${projectId} (since ${new Date(sinceMs).toISOString()})`);
     console.log(
@@ -1004,7 +1009,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       `rawTrackedFiles=${JSON.stringify(rawTrackedFiles)} ` +
       `trackedFileKeys=${JSON.stringify(normalizedTrackedFileKeys)} ` +
       `teamIds=${JSON.stringify(teamIds)} ` +
-      `sinceMs=${sinceMs} lastScanMs=${lastScanMs} watchStart=${project.watchStartedAt || null}`
+      `sinceMs=${sinceMs} lastScanMs=${lastScanMs} watchStart=${project.watchStartedAt || null} ` +
+      `scanStartedAt=${scanStartedAt} overlapMs=${isInitialScan ? 0 : FIGMA_INCREMENTAL_OVERLAP_MS}`
     );
 
     // Run auto-track scan
@@ -1050,7 +1056,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
           errors: scanErrors, timestamp: Date.now()
         });
       }
-      figmaScanTimestamps.set(projectId, Date.now());
+      figmaScanTimestamps.set(projectId, scanStartedAt);
       return {
         projectId,
         filesFound: scanResult.files.length,
@@ -1089,7 +1095,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       timestamp: Date.now()
     });
 
-    figmaScanTimestamps.set(projectId, Date.now());
+    figmaScanTimestamps.set(projectId, scanStartedAt);
     return {
       projectId,
       filesFound: scanResult.files.length,
