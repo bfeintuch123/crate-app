@@ -673,6 +673,11 @@ function pollLsofForProject(projectId) {
           const ext = path.extname(filePath).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
+          // New project guard: when no file anchors exist yet, only allow primary
+          // design source files to seed the project. This prevents stale open image
+          // handles (e.g. old Figma cache assets) from populating a brand-new project.
+          if (projectRoot === null && !PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
+
           // v2.5.3: Stricter filtering for image files captured via lsof.
           // Preview, Quick Look, Finder, and Spotlight open images for thumbnails —
           // these are NOT real design-app usage. Only capture images if:
@@ -2426,6 +2431,11 @@ async function startWatching(projectId) {
 
             const ext = path.extname(filePath).toLowerCase();
             if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+
+            // New project guard: for an empty project, the initial snapshot should
+            // only seed with primary source files (.fig/.psd/.ai/etc.), not old
+            // image/font/pdf handles that an app may still have open.
+            if (project.files.length === 0 && !PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
 
             // v2.3.9: Mark for scan-on-open BEFORE existingPaths check —
             // pre-session files already in project still need asset extraction.
