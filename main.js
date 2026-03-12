@@ -33,7 +33,17 @@ async function getXattrLastUsedMs(filePath) {
 }
 
 function normalizeTrackedFilePath(filePath) {
-  return path.resolve(filePath).replace(/\/+$/, '').toLowerCase();
+  if (typeof filePath !== 'string' || filePath.trim() === '') return '';
+
+  const resolvedPath = path.resolve(filePath.trim()).replace(/\/+$/, '');
+
+  // Canonicalize to the real on-disk path when possible so later scans can't
+  // re-add the same file through an alternate alias (case, symlink, iCloud path, etc.).
+  try {
+    return fs.realpathSync.native(resolvedPath).replace(/\/+$/, '').toLowerCase();
+  } catch (e) {
+    return resolvedPath.toLowerCase();
+  }
 }
 
 function getFigmaAssetDedupKey(record) {
@@ -410,6 +420,11 @@ function mutateProject(projectId, fn) {
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
   const result = fn(project, projects);
+  if (!Array.isArray(project.files)) {
+    project.files = [];
+  } else {
+    project.files = deduplicateFiles(project.files);
+  }
   store.set('projects', projects);
   return result;
 }
