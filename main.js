@@ -32,6 +32,20 @@ async function getXattrLastUsedMs(filePath) {
   }
 }
 
+async function getMdlsLastUsedMs(filePath) {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", filePath], {
+      timeout: 2000, encoding: 'utf8'
+    });
+    const rawValue = stdout.trim();
+    if (!rawValue || rawValue === '(null)') return null;
+    const parsedTime = new Date(rawValue).getTime();
+    return Number.isNaN(parsedTime) ? null : parsedTime;
+  } catch (e) {
+    return null;
+  }
+}
+
 function normalizeTrackedFilePath(filePath) {
   if (typeof filePath !== 'string' || filePath.trim() === '') return '';
 
@@ -180,6 +194,11 @@ const PRIMARY_DESIGN_EXTENSIONS = new Set([
   '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.pxd',
 ]);
 
+// Package-time confirmation window for source docs that were only observed via lsof.
+// We keep downstream/derived assets intact and only require extra proof for plain
+// source files that could have been admitted because another supported app was open.
+const PACKAGE_LSOF_SOURCE_CONFIRMATION_GRACE_MS = 5000;
+
 // v2.3.2: Image/media extensions captured by chokidar ONLY when a design app is running.
 // Restores Photoshop drag-and-embed capture (macOS records no lsof/mtime for embedded images)
 // while avoiding false positives from Finder thumbnail generation.
@@ -241,6 +260,73 @@ function getFileCreatorApp(filePath) {
   } catch (e) {
     return null;
   }
+}
+
+function isObservedPrimarySourceFile(file) {
+  if (!file || file.embedded) return false;
+  const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
+  return file.source === 'lsof' && PRIMARY_DESIGN_EXTENSIONS.has(ext);
+}
+
+async function getSourceFileSessionEvidence(filePath) {
+  const evidence = {
+    mtimeMs: 0,
+    birthtimeMs: 0,
+    lastUsedMs: 0,
+  };
+
+  try {
+    const stat = await fs.promises.stat(filePath);
+    evidence.mtimeMs = stat.mtimeMs || 0;
+    evidence.birthtimeMs = stat.birthtimeMs || 0;
+  } catch (e) {
+    // File may have been deleted between capture and package time.
+  }
+
+  evidence.lastUsedMs = await getMdlsLastUsedMs(filePath) || await getXattrLastUsedMs(filePath) || 0;
+  return evidence;
+}
+
+async function shouldKeepObservedSourceFileForPackaging(file, project) {
+  const watchStart = project.watchStartedAt || project.createdAt || 0;
+  if (!watchStart || !file || !file.path) return true;
+
+  const evidence = await getSourceFileSessionEvidence(file.path);
+  const savedDuringSession = evidence.mtimeMs >= watchStart || evidence.birthtimeMs >= watchStart;
+  if (savedDuringSession) return true;
+
+  const firstObservedAt = typeof file.addedAt === 'number' ? file.addedAt : 0;
+  const confirmationThreshold = firstObservedAt > (watchStart + PACKAGE_LSOF_SOURCE_CONFIRMATION_GRACE_MS)
+    ? watchStart
+    : (watchStart + PACKAGE_LSOF_SOURCE_CONFIRMATION_GRACE_MS);
+
+  // Plain lsof hits are the contamination path: require a post-startup last-used signal
+  // before we package a primary source doc that was only "seen open".
+  return evidence.lastUsedMs >= confirmationThreshold;
+}
+
+async function selectProjectFilesForPackaging(project) {
+  const dedupedFiles = deduplicateFiles(project.files || []);
+  const packageFiles = [];
+
+  for (const file of dedupedFiles) {
+    if (!isObservedPrimarySourceFile(file)) {
+      packageFiles.push(file);
+      continue;
+    }
+
+    if (await shouldKeepObservedSourceFileForPackaging(file, project)) {
+      packageFiles.push(file);
+      continue;
+    }
+
+    console.log(
+      `[crate][package] filtered stale observed source file: ${file.path} ` +
+      `(source=${file.source || 'unknown'} ext=${file.ext || path.extname(file.path || '').toLowerCase()})`
+    );
+  }
+
+  return deduplicateFiles(packageFiles);
 }
 
 // projectType: optional — if provided, Check 1 is scoped to that type's app list.
@@ -3864,7 +3950,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
   if (!project) return { error: 'not_found' };
-  const packageFiles = deduplicateFiles(project.files || []);
+  const packageFiles = await selectProjectFilesForPackaging(project);
 
   // Build folder name from naming template
   const settings = store.get('settings');
