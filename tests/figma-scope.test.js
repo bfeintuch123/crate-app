@@ -1,0 +1,131 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const { FigmaParser } = require('../parsers/figma');
+
+const FILE_KEY = 'FILE123';
+const DOCUMENT_FIXTURE = {
+  id: '0:0',
+  type: 'DOCUMENT',
+  name: 'Fixture',
+  children: [
+    {
+      id: '1:1',
+      type: 'CANVAS',
+      name: 'Page One',
+      children: [
+        {
+          id: '2:1',
+          type: 'RECTANGLE',
+          name: 'Hero',
+          fills: [{ type: 'IMAGE', imageRef: 'img-ref-page-one' }]
+        }
+      ]
+    },
+    {
+      id: '1:2',
+      type: 'CANVAS',
+      name: 'Page Two',
+      children: [
+        {
+          id: '2:2',
+          type: 'RECTANGLE',
+          name: 'Alt',
+          fills: [{ type: 'IMAGE', imageRef: 'img-ref-page-two' }]
+        }
+      ]
+    }
+  ]
+};
+
+class StubFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async verifyToken() {
+    return { valid: true, user: { id: '1', handle: 'tester', email: 'tester@example.com' } };
+  }
+
+  async discoverRecentFiles() {
+    return {
+      recentFiles: [
+        {
+          key: FILE_KEY,
+          name: 'Fixture File',
+          isTracked: true,
+          trackedIndex: 0,
+          lastModifiedMs: Date.now()
+        }
+      ],
+      errors: []
+    };
+  }
+
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}`) {
+      return { document: DOCUMENT_FIXTURE };
+    }
+    if (endpoint === `/files/${FILE_KEY}/images`) {
+      return {
+        images: {
+          'img-ref-page-one': 'https://cdn.example.com/page-one.png',
+          'img-ref-page-two': 'https://cdn.example.com/page-two.png'
+        }
+      };
+    }
+
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+test('current-page node lock extracts only the locked page assets', async () => {
+  const parser = new StubFigmaParser();
+
+  const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  });
+
+  assert.equal(result.assets.length, 1);
+  assert.equal(result.assets[0].figmaPageId, '1:1');
+  assert.equal(result.assets[0].figmaPageName, 'Page One');
+  assert.equal(result.scope.lockStatus, 'locked');
+  assert.equal(result.scope.lockedPageId, '1:1');
+});
+
+test('entire-file scope still includes assets from multiple pages', async () => {
+  const parser = new StubFigmaParser();
+
+  const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'entire-file'
+  });
+
+  assert.equal(result.assets.length, 2);
+  assert.deepEqual(
+    result.assets.map(asset => asset.imageRef).sort(),
+    ['img-ref-page-one', 'img-ref-page-two']
+  );
+});
+
+test('unresolved current-page lock never widens to entire-file', async () => {
+  const parser = new StubFigmaParser();
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [
+      {
+        key: FILE_KEY,
+        scopeMode: 'current-page',
+        requestedPageId: '9:9'
+      }
+    ]
+  });
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries.length, 1);
+  assert.equal(result.scopeEntries[0].lockStatus, 'unresolved');
+  assert.match(result.scopeEntries[0].warning || '', /could not resolve the starting page/i);
+});

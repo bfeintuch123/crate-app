@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('crate', {
   // Projects
   getProjects: () => ipcRenderer.invoke('projects:get-all'),
-  createProject: (name, type) => ipcRenderer.invoke('projects:create', name, type),
+  createProject: (name, type, figmaScopeMode) => ipcRenderer.invoke('projects:create', name, type, figmaScopeMode),
   startWatching: (id) => ipcRenderer.invoke('projects:start-watching', id),
   pauseProject: (id) => ipcRenderer.invoke('projects:pause', id),
   getFiles: (id) => ipcRenderer.invoke('projects:get-files', id),
