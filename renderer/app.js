@@ -12,7 +12,9 @@ let state = {
   lastPackagedPath: null,
   pendingDeleteId: null,
   projectType: 'branding',
-  figmaScanInFlight: false
+  figmaScopeMode: 'current-page',
+  figmaScanInFlight: false,
+  lastFigmaWarning: null
 };
 
 // ===== DOM Helpers =====
@@ -177,9 +179,14 @@ function showNewProjectForm() {
 
   // Reset project type to default
   state.projectType = 'branding';
+  state.figmaScopeMode = 'current-page';
   $$('.type-pill').forEach(p => p.classList.remove('active'));
   const defaultPill = document.querySelector('.type-pill[data-type="branding"]');
   if (defaultPill) defaultPill.classList.add('active');
+  const figmaScopeInput = $('#input-figma-scope');
+  if (figmaScopeInput) {
+    figmaScopeInput.value = 'current-page';
+  }
 
   // Update template display from current settings
   const templateDisplay = $('#naming-template-display');
@@ -203,7 +210,10 @@ async function createProject() {
     return;
   }
 
-  const result = await window.crate.createProject(name, state.projectType);
+  const figmaScopeInput = $('#input-figma-scope');
+  state.figmaScopeMode = figmaScopeInput ? figmaScopeInput.value : 'current-page';
+
+  const result = await window.crate.createProject(name, state.projectType, state.figmaScopeMode);
   // FIX 6 (M3): Guard against null/error IPC response
   if (!result || result.error) return;
 
@@ -226,6 +236,41 @@ function resolveNamingTemplate(template, name) {
   return template
     .replace('{Project}', cleanName(name || 'Project'))
     .replace('{Date}', dateStr);
+}
+
+function getProjectFigmaScopeMode(project) {
+  const sessionMode = project && project.figmaSession && project.figmaSession.scopeMode;
+  if (sessionMode === 'current-page' || sessionMode === 'entire-file') return sessionMode;
+
+  const projectMode = project && project.figmaScopeMode;
+  if (projectMode === 'current-page' || projectMode === 'entire-file') return projectMode;
+
+  return 'entire-file';
+}
+
+function getProjectFigmaScopeLabel(project) {
+  const scopeMode = getProjectFigmaScopeMode(project);
+  if (scopeMode === 'entire-file') return 'Entire File';
+
+  const trackedFiles = (project && project.figmaSession && project.figmaSession.trackedFiles) || [];
+  const lockedPageNames = Array.from(new Set(
+    trackedFiles
+      .map(file => file && file.lockedPageName)
+      .filter(Boolean)
+  ));
+
+  if (lockedPageNames.length === 1) {
+    return `Current Page Only - ${lockedPageNames[0]}`;
+  }
+  if (lockedPageNames.length > 1) {
+    return `Current Page Only - ${lockedPageNames.length} locked pages`;
+  }
+  return 'Current Page Only (locked at session start)';
+}
+
+function getProjectFigmaWarning(project) {
+  const warnings = (project && project.figmaSession && project.figmaSession.warnings) || [];
+  return warnings[0] || '';
 }
 
 function updateNamingPreview() {
@@ -284,6 +329,8 @@ async function renderFiles() {
   const statusBar = $('#files-status-bar');
   const statusDot = $('#files-status-dot');
   const statusText = $('#files-status-text');
+  const figmaScopeText = $('#files-figma-scope');
+  const figmaWarningText = $('#files-figma-warning');
   const fileCount = project.files.length;
 
   statusBar.className = `app-status ${project.status !== 'watching' ? project.status : ''}`;
@@ -296,6 +343,15 @@ async function renderFiles() {
     statusText.textContent = `Paused \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
   } else {
     statusText.textContent = `Packaged \u2713 \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
+  }
+
+  if (figmaScopeText) {
+    figmaScopeText.textContent = `Figma scope: ${getProjectFigmaScopeLabel(project)}`;
+  }
+  if (figmaWarningText) {
+    const warning = getProjectFigmaWarning(project);
+    figmaWarningText.textContent = warning;
+    figmaWarningText.style.display = warning ? 'block' : 'none';
   }
 
   // Pending files (Tier 2)
@@ -555,6 +611,13 @@ function showPackageModal() {
   if (!project) return;
 
   $('#modal-project-name').textContent = project.name;
+  $('#modal-figma-scope').textContent = getProjectFigmaScopeLabel(project);
+  const modalWarning = $('#modal-figma-warning');
+  if (modalWarning) {
+    const warning = getProjectFigmaWarning(project);
+    modalWarning.textContent = warning;
+    modalWarning.style.display = warning ? 'block' : 'none';
+  }
 
   // File list
   const fileListEl = $('#modal-file-list');
@@ -1055,8 +1118,12 @@ function setupMainProcessListeners() {
   // Figma scan complete notification
   window.crate.onFigmaScanComplete((data) => {
     if (data.warning) {
-      showToast(data.warning);
+      if (state.lastFigmaWarning !== data.warning) {
+        showToast(data.warning);
+        state.lastFigmaWarning = data.warning;
+      }
     } else if (data.addedCount > 0) {
+      state.lastFigmaWarning = null;
       showToast(`Figma scan: ${data.addedCount} new asset${data.addedCount !== 1 ? 's' : ''} added`);
     }
     // Update scan status line

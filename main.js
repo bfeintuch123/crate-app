@@ -140,6 +140,218 @@ function deduplicateFiles(files) {
   });
 }
 
+const FIGMA_SCOPE_CURRENT_PAGE = 'current-page';
+const FIGMA_SCOPE_ENTIRE_FILE = 'entire-file';
+const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
+
+function getProjectFigmaScopeMode(project) {
+  const sessionMode = project && project.figmaSession && project.figmaSession.scopeMode;
+  if (VALID_FIGMA_SCOPE_MODES.has(sessionMode)) return sessionMode;
+
+  const projectMode = project && project.figmaScopeMode;
+  if (VALID_FIGMA_SCOPE_MODES.has(projectMode)) return projectMode;
+
+  return FIGMA_SCOPE_ENTIRE_FILE;
+}
+
+function normalizeTrackedFigmaFiles(rawTrackedFiles) {
+  const { FigmaParser } = require('./parsers/figma');
+
+  return (Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [])
+    .map((entry) => {
+      if (typeof entry === 'string') {
+        const trimmed = entry.trim();
+        if (!trimmed) return null;
+        const parsedKey = FigmaParser.extractFileKey(trimmed);
+        return {
+          key: parsedKey || trimmed,
+          url: parsedKey ? trimmed : null,
+        };
+      }
+
+      if (!entry || typeof entry !== 'object') return null;
+      const key = typeof entry.key === 'string' ? entry.key.trim() : '';
+      if (!key) return null;
+      const url = typeof entry.url === 'string' && entry.url.trim() ? entry.url.trim() : null;
+      return { key, url };
+    })
+    .filter(Boolean);
+}
+
+function rebuildFigmaSessionWarnings(session) {
+  if (!session || typeof session !== 'object') return [];
+
+  const warnings = [];
+  const seen = new Set();
+  const pushWarning = (warning) => {
+    if (typeof warning !== 'string') return;
+    const trimmed = warning.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    warnings.push(trimmed);
+    seen.add(trimmed);
+  };
+
+  for (const warning of session.sessionWarnings || []) {
+    pushWarning(warning);
+  }
+  for (const trackedFile of session.trackedFiles || []) {
+    pushWarning(trackedFile && trackedFile.warning);
+  }
+
+  return warnings;
+}
+
+function buildFigmaSessionSnapshot(project, settings = {}) {
+  const { FigmaParser } = require('./parsers/figma');
+
+  const scopeMode = VALID_FIGMA_SCOPE_MODES.has(project && project.figmaScopeMode)
+    ? project.figmaScopeMode
+    : FIGMA_SCOPE_ENTIRE_FILE;
+  const trackedFiles = normalizeTrackedFigmaFiles(settings.figmaTrackedFiles || []);
+  const rawTeamIds = Array.isArray(settings.figmaTeamIds) ? settings.figmaTeamIds : [];
+  const sessionWarnings = [];
+
+  if (scopeMode === FIGMA_SCOPE_CURRENT_PAGE && rawTeamIds.length > 0) {
+    sessionWarnings.push('Current Page Only only uses directly tracked Figma file URLs. Auto-discover teams are ignored for this session.');
+  }
+
+  const snapshot = {
+    scopeMode,
+    startedAt: project.watchStartedAt || Date.now(),
+    teamIds: scopeMode === FIGMA_SCOPE_ENTIRE_FILE ? [...rawTeamIds] : [],
+    trackedFiles: trackedFiles.map((trackedFile) => {
+      const parsedScope = trackedFile.url
+        ? FigmaParser.parseScopeFromTrackedUrl(trackedFile.url)
+        : { requestedPageId: null, requestedNodeId: null };
+
+      let lockStatus = scopeMode === FIGMA_SCOPE_CURRENT_PAGE ? 'pending' : 'entire-file';
+      let warning = null;
+      let lockedPageId = null;
+
+      if (scopeMode === FIGMA_SCOPE_CURRENT_PAGE) {
+        if (!trackedFile.url) {
+          lockStatus = 'unresolved';
+          warning = `Current Page Only could not be locked for Figma file ${trackedFile.key} because this session does not have a page-linked URL snapshot. No Figma assets will be captured for this file in this session.`;
+        } else if (!parsedScope.requestedPageId && !parsedScope.requestedNodeId) {
+          lockStatus = 'unresolved';
+          warning = `Current Page Only could not be locked from the tracked Figma URL for file ${trackedFile.key}. No Figma assets will be captured for this file in this session.`;
+        } else if (parsedScope.requestedPageId) {
+          lockStatus = 'locked';
+          lockedPageId = parsedScope.requestedPageId;
+        }
+      }
+
+      return {
+        key: trackedFile.key,
+        url: trackedFile.url,
+        requestedPageId: parsedScope.requestedPageId || null,
+        requestedNodeId: parsedScope.requestedNodeId || null,
+        lockStatus,
+        lockedPageId,
+        lockedPageName: null,
+        scopeMode,
+        warning,
+      };
+    }),
+    sessionWarnings,
+  };
+
+  snapshot.warnings = rebuildFigmaSessionWarnings(snapshot);
+  return snapshot;
+}
+
+function ensureProjectFigmaSession(projectId) {
+  const project = getProjects().find(p => p.id === projectId);
+  if (!project) return null;
+
+  const existingSession = project.figmaSession;
+  const currentScopeMode = getProjectFigmaScopeMode(project);
+  if (
+    existingSession &&
+    existingSession.startedAt === project.watchStartedAt &&
+    existingSession.scopeMode === currentScopeMode
+  ) {
+    return existingSession;
+  }
+
+  const settings = store.get('settings') || {};
+  return mutateProject(projectId, (proj) => {
+    proj.figmaSession = buildFigmaSessionSnapshot(proj, settings);
+    return proj.figmaSession;
+  });
+}
+
+function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
+  if (!Array.isArray(scopeEntries) || scopeEntries.length === 0) return null;
+
+  return mutateProject(projectId, (project) => {
+    if (!project.figmaSession || !Array.isArray(project.figmaSession.trackedFiles)) return null;
+
+    const scopeByKey = new Map(
+      scopeEntries
+        .filter(entry => entry && typeof entry.fileKey === 'string' && entry.fileKey.trim())
+        .map(entry => [entry.fileKey.trim(), entry])
+    );
+
+    let changed = false;
+    for (const trackedFile of project.figmaSession.trackedFiles) {
+      const nextScope = scopeByKey.get(trackedFile.key);
+      if (!nextScope) continue;
+
+      const nextLockStatus = typeof nextScope.lockStatus === 'string' ? nextScope.lockStatus : trackedFile.lockStatus;
+      const nextLockedPageId = nextScope.lockedPageId != null ? nextScope.lockedPageId : trackedFile.lockedPageId;
+      const nextLockedPageName = nextScope.lockedPageName != null ? nextScope.lockedPageName : trackedFile.lockedPageName;
+      const nextWarning = nextScope.warning != null ? nextScope.warning : trackedFile.warning;
+
+      if (trackedFile.lockStatus !== nextLockStatus) {
+        trackedFile.lockStatus = nextLockStatus;
+        changed = true;
+      }
+      if (trackedFile.lockedPageId !== nextLockedPageId) {
+        trackedFile.lockedPageId = nextLockedPageId;
+        changed = true;
+      }
+      if (trackedFile.lockedPageName !== nextLockedPageName) {
+        trackedFile.lockedPageName = nextLockedPageName;
+        changed = true;
+      }
+      if (trackedFile.warning !== nextWarning) {
+        trackedFile.warning = nextWarning;
+        changed = true;
+      }
+    }
+
+    const nextWarnings = rebuildFigmaSessionWarnings(project.figmaSession);
+    const previousWarnings = Array.isArray(project.figmaSession.warnings) ? project.figmaSession.warnings : [];
+    if (JSON.stringify(previousWarnings) !== JSON.stringify(nextWarnings)) {
+      project.figmaSession.warnings = nextWarnings;
+      changed = true;
+    }
+
+    return changed ? { figmaSession: project.figmaSession } : null;
+  });
+}
+
+function shouldIncludeFigmaAssetForPackaging(file, project) {
+  if (!file || file.source !== 'figma-auto') return true;
+
+  if (getProjectFigmaScopeMode(project) !== FIGMA_SCOPE_CURRENT_PAGE) {
+    return true;
+  }
+
+  const session = project && project.figmaSession;
+  if (!session || !Array.isArray(session.trackedFiles)) {
+    return false;
+  }
+
+  const trackedFile = session.trackedFiles.find(entry => entry.key === file.figmaFileKey);
+  if (!trackedFile || trackedFile.lockStatus !== 'locked' || !trackedFile.lockedPageId) {
+    return false;
+  }
+
+  return file.figmaPageId === trackedFile.lockedPageId;
+}
+
 // Design app bundle IDs for two-tier file tracking
 const DESIGN_APP_BUNDLE_IDS = new Set([
   'com.figma.Desktop',
@@ -310,6 +522,19 @@ async function selectProjectFilesForPackaging(project) {
   const packageFiles = [];
 
   for (const file of dedupedFiles) {
+    if (getProjectFigmaScopeMode(project) === FIGMA_SCOPE_CURRENT_PAGE && file.ext === '.fig') {
+      console.log(`[crate][package] skipped .fig file for current-page Figma session: ${file.path}`);
+      continue;
+    }
+
+    if (!shouldIncludeFigmaAssetForPackaging(file, project)) {
+      console.log(
+        `[crate][package] filtered out-of-scope Figma asset: ${file.path} ` +
+        `(fileKey=${file.figmaFileKey || 'unknown'} pageId=${file.figmaPageId || 'unknown'})`
+      );
+      continue;
+    }
+
     if (!isObservedPrimarySourceFile(file)) {
       packageFiles.push(file);
       continue;
@@ -1011,6 +1236,9 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         source: 'figma-auto',
         figmaFileKey: asset.figmaFileKey,
         figmaFileName: asset.figmaFileName,
+        figmaPageId: asset.figmaPageId || null,
+        figmaPageName: asset.figmaPageName || null,
+        figmaScopeMode: asset.figmaScopeMode || null,
         figmaAssetKey
       };
       proj.files.push(fileRecord);
@@ -1034,6 +1262,9 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
           source: 'figma-auto',
           figmaFileKey: asset.figmaFileKey,
           figmaFileName: asset.figmaFileName,
+          figmaPageId: asset.figmaPageId || null,
+          figmaPageName: asset.figmaPageName || null,
+          figmaScopeMode: asset.figmaScopeMode || null,
           figmaAssetKey
         });
         project.files = deduplicateFiles(project.files);
@@ -1073,11 +1304,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   figmaInProgress.add(projectId);
 
   try {
-    // Read Figma configuration from settings
-    const settings = store.get('settings') || {};
-    const rawTrackedFiles = settings.figmaTrackedFiles || [];
-    const teamIds = settings.figmaTeamIds || [];
-    const fileKeys = rawTrackedFiles.map(entry => typeof entry === 'string' ? entry : entry.key);
+    const ensuredSession = ensureProjectFigmaSession(projectId);
+    const latestProject = getProjects().find(p => p.id === projectId) || project;
+    const figmaSession = latestProject.figmaSession || ensuredSession || null;
+    const rawTrackedFiles = (figmaSession && Array.isArray(figmaSession.trackedFiles)) ? figmaSession.trackedFiles : [];
+    const teamIds = (figmaSession && Array.isArray(figmaSession.teamIds)) ? figmaSession.teamIds : [];
+    const fileKeys = rawTrackedFiles.map(entry => entry.key);
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
@@ -1105,8 +1337,13 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       maxAgeDays: isInitialScan ? 30 : 7,
       maxFiles: isInitialScan ? 20 : 10,
       teamIds,
-      fileKeys
+      fileKeys,
+      scopeEntries: rawTrackedFiles
     });
+
+    const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
+    const activeProject = getProjects().find(p => p.id === projectId) || latestProject;
+    const activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
 
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', scanResult.errors);
@@ -1130,17 +1367,22 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     if (scanResult.assets.length === 0) {
       // Notify renderer even when no assets found
       const scanErrors = scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
+      const sessionWarning = activeWarnings[0] || (scanResult.warnings && scanResult.warnings[0]) || null;
       if (scanResult.files.length === 0 && (teamIds.length > 0 || fileKeys.length > 0)) {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
           errors: scanErrors, timestamp: Date.now(),
-          warning: 'No recent Figma files found. Make sure your file was modified recently.'
+          warning: sessionWarning || 'No recent Figma files found. Make sure your file was modified recently.'
         });
       } else {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0,
-          errors: scanErrors, timestamp: Date.now()
+          errors: scanErrors, timestamp: Date.now(),
+          warning: sessionWarning
         });
+      }
+      if (scopeStateResult) {
+        sendToRenderer('project:updated', { projectId });
       }
       figmaScanTimestamps.set(projectId, scanStartedAt);
       return {
@@ -1148,14 +1390,19 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
         filesFound: scanResult.files.length,
         assetsFound: 0,
         addedCount: 0,
-        errors: scanErrors
+        errors: scanErrors,
+        warning: sessionWarning
       };
     }
 
     console.log(`[crate][figma] Found ${scanResult.files.length} files, ${scanResult.assets.length} assets`);
 
     // Download assets and add to project
-    const addedCount = await ingestFigmaAssetsIntoProject(projectId, project, scanResult.assets, 'poll');
+    const scopedAssets = scanResult.assets.map((asset) => ({
+      ...asset,
+      figmaScopeMode: (figmaSession && figmaSession.scopeMode) || FIGMA_SCOPE_ENTIRE_FILE
+    }));
+    const addedCount = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'poll');
 
     if (addedCount > 0) {
       // Update activity timestamp
@@ -1170,15 +1417,20 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
 
       console.log(`[crate][figma] Added ${addedCount} Figma assets to project ${projectId}`);
     }
+    if (scopeStateResult) {
+      sendToRenderer('project:updated', { projectId });
+    }
 
     const errors = scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
+    const warning = activeWarnings[0] || (scanResult.warnings && scanResult.warnings[0]) || null;
     sendToRenderer('figma:scan-complete', {
       projectId,
       filesFound: scanResult.files.length,
       assetsFound: scanResult.assets.length,
       addedCount,
       errors,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      warning
     });
 
     figmaScanTimestamps.set(projectId, scanStartedAt);
@@ -1187,7 +1439,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       filesFound: scanResult.files.length,
       assetsFound: scanResult.assets.length,
       addedCount,
-      errors
+      errors,
+      warning
     };
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', e.message);
@@ -2524,10 +2777,18 @@ function createTray() {
 // --- File Watching ---
 
 async function startWatching(projectId) {
+  const settings = store.get('settings') || {};
   // FIX 1: Use mutateProject for initial watchStartedAt write
   const projectSnapshot = mutateProject(projectId, (project) => {
     project.watchStartedAt = Date.now();
-    return { type: project.type, files: project.files, createdAt: project.createdAt, watchStartedAt: project.watchStartedAt };
+    project.figmaSession = buildFigmaSessionSnapshot(project, settings);
+    return {
+      type: project.type,
+      files: project.files,
+      createdAt: project.createdAt,
+      watchStartedAt: project.watchStartedAt,
+      figmaSession: project.figmaSession
+    };
   });
   if (!projectSnapshot) return;
 
@@ -2957,7 +3218,7 @@ ipcMain.handle('projects:get-all', () => {
   return getProjects();
 });
 
-ipcMain.handle('projects:create', async (event, name, projectType = 'branding') => {
+ipcMain.handle('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE) => {
   const projects = getProjects();
 
   // Enforce project cap
@@ -2971,6 +3232,7 @@ ipcMain.handle('projects:create', async (event, name, projectType = 'branding') 
     id: uuidv4(),
     name: cleanedName,
     type: projectType,
+    figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
     status: 'watching',
     files: [],
     pendingFiles: [], // Tier 2 candidates awaiting user review
@@ -3642,10 +3904,12 @@ end tell`;
   // Figma authoritative recovery pass for package-time scan.
   // Keeps local lsof/.fig heuristics as-is and supplements with cloud originals.
   try {
-    const settings = store.get('settings') || {};
-    const rawTrackedFiles = settings.figmaTrackedFiles || [];
-    const teamIds = settings.figmaTeamIds || [];
-    const fileKeys = rawTrackedFiles.map(entry => typeof entry === 'string' ? entry : entry.key);
+    const ensuredSession = ensureProjectFigmaSession(projectId);
+    const latestProject = getProjects().find(p => p.id === projectId) || project;
+    const figmaSession = latestProject.figmaSession || ensuredSession || null;
+    const rawTrackedFiles = (figmaSession && Array.isArray(figmaSession.trackedFiles)) ? figmaSession.trackedFiles : [];
+    const teamIds = (figmaSession && Array.isArray(figmaSession.teamIds)) ? figmaSession.teamIds : [];
+    const fileKeys = rawTrackedFiles.map(entry => entry.key);
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
@@ -3665,15 +3929,22 @@ end tell`;
         maxAgeDays: 30,
         maxFiles: 20,
         teamIds,
-        fileKeys
+        fileKeys,
+        scopeEntries: rawTrackedFiles
       });
+
+      mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
 
       if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
         console.warn('[crate][figma] pre-package scan errors:', figmaScanResult.errors);
       }
 
       if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
-        const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, figmaScanResult.assets, 'pre-package');
+        const scopedAssets = figmaScanResult.assets.map((asset) => ({
+          ...asset,
+          figmaScopeMode: (figmaSession && figmaSession.scopeMode) || FIGMA_SCOPE_ENTIRE_FILE
+        }));
+        const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'pre-package');
         newCount += figmaAdded;
       }
     }

@@ -412,6 +412,44 @@ class FigmaParser extends BaseParser {
   }
 
   /**
+   * Recursively find a node by id.
+   * @private
+   */
+  _findNodeById(node, targetId) {
+    if (!node || !targetId) return null;
+    if (node.id === targetId) return node;
+    if (!Array.isArray(node.children)) return null;
+
+    for (const child of node.children) {
+      const match = this._findNodeById(child, targetId);
+      if (match) return match;
+    }
+
+    return null;
+  }
+
+  /**
+   * Recursively find the top-level CANVAS page containing the target node.
+   * @private
+   */
+  _findEnclosingPage(node, targetId, currentPage = null) {
+    if (!node || !targetId) return null;
+
+    const nextPage = node.type === 'CANVAS' ? node : currentPage;
+    if (node.id === targetId) {
+      return node.type === 'CANVAS' ? node : nextPage;
+    }
+    if (!Array.isArray(node.children)) return null;
+
+    for (const child of node.children) {
+      const match = this._findEnclosingPage(child, targetId, nextPage);
+      if (match) return match;
+    }
+
+    return null;
+  }
+
+  /**
    * Split array into chunks.
    * @private
    */
@@ -450,6 +488,109 @@ class FigmaParser extends BaseParser {
     }
 
     return null;
+  }
+
+  /**
+   * Normalize a Figma node/page id from a URL query parameter.
+   */
+  static normalizeNodeId(value) {
+    if (!value || typeof value !== 'string') return null;
+
+    let normalized = value.trim();
+    if (!normalized) return null;
+
+    try {
+      normalized = decodeURIComponent(normalized);
+    } catch (e) {
+      // Keep the raw value when decoding fails.
+    }
+
+    if (!normalized.includes(':') && /^[0-9]+(?:-[0-9]+)+$/.test(normalized)) {
+      normalized = normalized.replace(/-/g, ':');
+    }
+
+    return normalized || null;
+  }
+
+  /**
+   * Parse the page/node lock encoded in a tracked Figma URL snapshot.
+   */
+  static parseScopeFromTrackedUrl(url) {
+    const fileKey = FigmaParser.extractFileKey(url);
+    const result = {
+      fileKey,
+      requestedPageId: null,
+      requestedNodeId: null,
+    };
+
+    if (!url || typeof url !== 'string') {
+      return result;
+    }
+
+    try {
+      const parsed = new URL(url);
+      result.requestedPageId = FigmaParser.normalizeNodeId(parsed.searchParams.get('page-id'));
+      result.requestedNodeId = FigmaParser.normalizeNodeId(parsed.searchParams.get('node-id'));
+      return result;
+    } catch (e) {
+      const pageMatch = url.match(/[?&]page-id=([^&#]+)/i);
+      const nodeMatch = url.match(/[?&]node-id=([^&#]+)/i);
+      result.requestedPageId = FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
+      result.requestedNodeId = FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
+      return result;
+    }
+  }
+
+  _resolveScopeRoot(document, scopeEntry = null) {
+    const scopeMode = scopeEntry && scopeEntry.scopeMode === 'current-page'
+      ? 'current-page'
+      : 'entire-file';
+
+    const scope = {
+      scopeMode,
+      lockStatus: scopeMode === 'current-page' ? 'unresolved' : 'entire-file',
+      lockedPageId: null,
+      lockedPageName: null,
+      warning: null,
+      rootNode: document,
+    };
+
+    if (scopeMode !== 'current-page') {
+      return scope;
+    }
+
+    const requestedPageId = FigmaParser.normalizeNodeId(scopeEntry && scopeEntry.requestedPageId);
+    const requestedNodeId = FigmaParser.normalizeNodeId(scopeEntry && scopeEntry.requestedNodeId);
+    const existingWarning = scopeEntry && scopeEntry.warning;
+
+    if (!requestedPageId && !requestedNodeId) {
+      scope.warning = existingWarning || 'Current Page Only could not be locked from the tracked Figma URL. No Figma assets will be captured for this file in this session.';
+      return scope;
+    }
+
+    let pageNode = null;
+    if (requestedPageId) {
+      const matchedNode = this._findNodeById(document, requestedPageId);
+      if (matchedNode && matchedNode.type === 'CANVAS') {
+        pageNode = matchedNode;
+      }
+    }
+
+    if (!pageNode && requestedNodeId) {
+      pageNode = this._findEnclosingPage(document, requestedNodeId);
+    }
+
+    if (!pageNode) {
+      const lockRef = requestedPageId || requestedNodeId;
+      scope.warning = existingWarning || `Current Page Only is locked for this session, but Crate could not resolve the starting page (${lockRef}). No Figma assets will be captured for this file in this session.`;
+      return scope;
+    }
+
+    scope.lockStatus = 'locked';
+    scope.lockedPageId = pageNode.id || null;
+    scope.lockedPageName = pageNode.name || null;
+    scope.rootNode = pageNode;
+    return scope;
   }
 
   static get extensions() {
@@ -788,9 +929,22 @@ class FigmaParser extends BaseParser {
    * @param {string} fileKey - Figma file key
    * @returns {Promise<Array<{url: string, nodeId: string, name: string}>>}
    */
-  async extractAssetsFromFileKey(fileKey) {
+  async extractAssetsFromFileKey(fileKey, scopeEntry = null) {
     const token = await this.getStoredToken();
-    if (!token || !fetch) return { assets: [], errors: ["No token or fetch available"] };
+    if (!token || !fetch) {
+      return {
+        assets: [],
+        errors: ["No token or fetch available"],
+        warnings: [],
+        scope: {
+          scopeMode: scopeEntry && scopeEntry.scopeMode === 'current-page' ? 'current-page' : 'entire-file',
+          lockStatus: 'unresolved',
+          lockedPageId: null,
+          lockedPageName: null,
+          warning: null
+        }
+      };
+    }
 
     try {
       // Fetch file structure
@@ -798,11 +952,32 @@ class FigmaParser extends BaseParser {
 
       const assets = [];
       const errors = [];
+      const warnings = [];
+      const scope = this._resolveScopeRoot(fileData.document, scopeEntry);
+      const scopedRoot = scope.rootNode || fileData.document;
+
+      if (scope.warning) {
+        warnings.push(scope.warning);
+      }
+      if (scope.scopeMode === 'current-page' && scope.lockStatus !== 'locked') {
+        return {
+          assets: [],
+          errors,
+          warnings,
+          scope: {
+            scopeMode: scope.scopeMode,
+            lockStatus: scope.lockStatus,
+            lockedPageId: scope.lockedPageId,
+            lockedPageName: scope.lockedPageName,
+            warning: scope.warning
+          }
+        };
+      }
 
       // Primary path: recover original placed image-fill assets via imageRef mapping
       const imageRefs = new Set();
       const refNames = {};
-      this._findImageFillRefs(fileData.document, imageRefs, refNames);
+      this._findImageFillRefs(scopedRoot, imageRefs, refNames);
       const imageRefList = Array.from(imageRefs);
       console.log(
         `[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found (${imageRefList.length})` +
@@ -838,6 +1013,8 @@ class FigmaParser extends BaseParser {
               imageRef,
               format: inferredFormat,
               fileKey,
+              figmaPageId: scope.lockedPageId,
+              figmaPageName: scope.lockedPageName,
               source: 'figma-auto'
             });
           }
@@ -857,14 +1034,38 @@ class FigmaParser extends BaseParser {
           `resolved=${assets.length} deduped=${dedupedAssets.length} passed_to_ingestion=${dedupedAssets.length}`
         );
         console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=no`);
-        return { assets: dedupedAssets, errors };
+        return {
+          assets: dedupedAssets,
+          errors,
+          warnings,
+          scope: {
+            scopeMode: scope.scopeMode,
+            lockStatus: scope.lockStatus,
+            lockedPageId: scope.lockedPageId,
+            lockedPageName: scope.lockedPageName,
+            warning: scope.warning
+          }
+        };
       }
 
       // Fallback path: node render exports (legacy behavior)
       const imageNodeIds = [];
       const nodeNames = {};
-      this._findImageNodes(fileData.document, imageNodeIds, nodeNames);
-      if (imageNodeIds.length === 0) return { assets: [], errors };
+      this._findImageNodes(scopedRoot, imageNodeIds, nodeNames);
+      if (imageNodeIds.length === 0) {
+        return {
+          assets: [],
+          errors,
+          warnings,
+          scope: {
+            scopeMode: scope.scopeMode,
+            lockStatus: scope.lockStatus,
+            lockedPageId: scope.lockedPageId,
+            lockedPageName: scope.lockedPageName,
+            warning: scope.warning
+          }
+        };
+      }
 
       console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=yes`);
 
@@ -887,6 +1088,8 @@ class FigmaParser extends BaseParser {
                   name: this.buildFigmaAssetName(nodeNames[nodeId] || nodeId, nodeId),
                   format: 'png',
                   fileKey,
+                  figmaPageId: scope.lockedPageId,
+                  figmaPageName: scope.lockedPageName,
                   source: 'figma-auto'
                 });
               }
@@ -902,10 +1105,32 @@ class FigmaParser extends BaseParser {
         `[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback pipeline counts ` +
         `resolved=${assets.length} deduped=${dedupedFallbackAssets.length} passed_to_ingestion=${dedupedFallbackAssets.length}`
       );
-      return { assets: dedupedFallbackAssets, errors };
+      return {
+        assets: dedupedFallbackAssets,
+        errors,
+        warnings,
+        scope: {
+          scopeMode: scope.scopeMode,
+          lockStatus: scope.lockStatus,
+          lockedPageId: scope.lockedPageId,
+          lockedPageName: scope.lockedPageName,
+          warning: scope.warning
+        }
+      };
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
-      return { assets: [], errors: [e.message] };
+      return {
+        assets: [],
+        errors: [e.message],
+        warnings: [],
+        scope: {
+          scopeMode: scopeEntry && scopeEntry.scopeMode === 'current-page' ? 'current-page' : 'entire-file',
+          lockStatus: 'unresolved',
+          lockedPageId: null,
+          lockedPageName: null,
+          warning: null
+        }
+      };
     }
   }
 
@@ -922,7 +1147,7 @@ class FigmaParser extends BaseParser {
    * @returns {Promise<{files: Array, assets: Array, errors: Array}>}
    */
   async autoTrackScan(options = {}) {
-    const result = { files: [], assets: [], errors: [] };
+    const result = { files: [], assets: [], errors: [], warnings: [], scopeEntries: [] };
 
     // Verify token first
     const tokenStatus = await this.verifyToken();
@@ -933,6 +1158,12 @@ class FigmaParser extends BaseParser {
 
     const teamIds = options.teamIds || [];
     const fileKeys = options.fileKeys || [];
+    const scopeEntries = Array.isArray(options.scopeEntries) ? options.scopeEntries : [];
+    const scopeEntriesByKey = new Map(
+      scopeEntries
+        .filter(entry => entry && typeof entry.key === 'string' && entry.key.trim())
+        .map(entry => [entry.key.trim(), entry])
+    );
 
     if (teamIds.length === 0 && fileKeys.length === 0) {
       result.errors.push({ type: 'config', message: 'No Figma team IDs or file URLs configured — add files in Settings → Figma' });
@@ -965,8 +1196,20 @@ class FigmaParser extends BaseParser {
     // Extract assets from each file
     for (const file of result.files) {
       try {
-        const extractResult = await this.extractAssetsFromFileKey(file.key);
+        const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntriesByKey.get(file.key) || null);
         if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...extractResult.errors); }
+        if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...extractResult.warnings); }
+        if (extractResult.scope) {
+          result.scopeEntries.push({
+            fileKey: file.key,
+            fileName: file.name,
+            scopeMode: extractResult.scope.scopeMode,
+            lockStatus: extractResult.scope.lockStatus,
+            lockedPageId: extractResult.scope.lockedPageId,
+            lockedPageName: extractResult.scope.lockedPageName,
+            warning: extractResult.scope.warning || null
+          });
+        }
         for (const asset of extractResult.assets) {
           asset.figmaFileName = file.name;
           asset.figmaFileKey = file.key;

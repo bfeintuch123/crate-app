@@ -67,6 +67,13 @@
             <div class="naming-template-box" id="naming-template-display">{Project}_{Date}</div>
             <div class="naming-preview-hint">&rarr; <span id="naming-preview-text">Project_2026-02-20</span></div>
           </div>
+          <div class="form-field">
+            <div class="app-label">Figma Scope</div>
+            <select id="input-figma-scope" class="settings-input" style="width:100%;">
+              <option value="current-page" selected>Current Page Only</option>
+              <option value="entire-file">Entire File</option>
+            </select>
+          </div>
           <button class="app-btn" id="btn-create-project">&#9654; Start Watching</button>
           <button class="app-btn outline" id="btn-cancel-project" style="margin-top:8px;">Cancel</button>
           <div class="privacy-hint">
@@ -106,6 +113,8 @@
           <div class="privacy-hint subtle">
             Crate only sees files opened by design apps during this session.
           </div>
+          <div id="files-figma-scope" class="privacy-hint subtle" style="margin-top:8px;"></div>
+          <div id="files-figma-warning" class="privacy-hint" style="margin-top:8px;color:#f59e0b;"></div>
 
           <!-- Tier 2: files awaiting user review -->
           <div id="pending-section" class="hidden">
@@ -240,6 +249,11 @@
             <div class="modal-row-label">Project</div>
             <div class="modal-row-value" id="modal-project-name"></div>
           </div>
+          <div class="modal-info-row">
+            <div class="modal-row-label">Figma Scope</div>
+            <div class="modal-row-value" id="modal-figma-scope"></div>
+          </div>
+          <div id="modal-figma-warning" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
           <div class="modal-file-list" id="modal-file-list"></div>
           <div class="modal-naming-box">
             <div class="modal-naming-label">Output Folder Name</div>
