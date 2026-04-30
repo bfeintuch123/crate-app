@@ -3,7 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('crate', {
   // Projects
   getProjects: () => ipcRenderer.invoke('projects:get-all'),
-  createProject: (name, type, figmaScopeMode) => ipcRenderer.invoke('projects:create', name, type, figmaScopeMode),
+  createProject: (name, type, figmaScopeMode, figmaUrl) => ipcRenderer.invoke('projects:create', name, type, figmaScopeMode, figmaUrl),
+  setProjectFigmaLink: (projectId, payload) => ipcRenderer.invoke('projects:set-figma-link', projectId, payload),
   startWatching: (id) => ipcRenderer.invoke('projects:start-watching', id),
   pauseProject: (id) => ipcRenderer.invoke('projects:pause', id),
   getFiles: (id) => ipcRenderer.invoke('projects:get-files', id),
@@ -45,10 +46,6 @@ contextBridge.exposeInMainWorld('crate', {
   disconnectFigma: () => ipcRenderer.invoke('figma:disconnect'),
   scanFigmaProject: (projectId) => ipcRenderer.invoke('figma:scan-project', projectId),
   getFigmaProjectAssets: (projectId) => ipcRenderer.invoke('figma:project-assets', projectId),
-  addFigmaTrackedFile: (url) => ipcRenderer.invoke('figma:add-tracked-file', url),
-  removeFigmaTrackedFile: (fileKey) => ipcRenderer.invoke('figma:remove-tracked-file', fileKey),
-  setFigmaTeamId: (teamUrl) => ipcRenderer.invoke('figma:set-team-id', teamUrl),
-  removeFigmaTeamId: (teamId) => ipcRenderer.invoke('figma:remove-team-id', teamId),
   figmaScanNow: () => ipcRenderer.invoke('figma:scan-now'),
 
   // Events from main

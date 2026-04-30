@@ -63,16 +63,28 @@
             </div>
           </div>
           <div class="form-field">
+            <div class="figma-section" id="figma-section">
+              <button class="figma-section-toggle" id="figma-section-toggle" type="button" aria-expanded="false">
+                <span class="figma-section-icon">&#x25B6;</span>
+                <span class="figma-section-logo">F</span>
+                <span class="figma-section-label">Link a Figma file (optional)</span>
+              </button>
+              <div class="figma-section-body hidden" id="figma-section-body">
+                <input type="text" id="input-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
+                <div class="form-subtitle" style="margin-top:6px;">Scope</div>
+                <select id="input-figma-scope" class="settings-input" style="width:100%;">
+                  <option value="current-page" selected>Current Page Only</option>
+                  <option value="entire-file">Entire File</option>
+                </select>
+                <div class="figma-section-help">Open your Figma page first, then copy the URL from your browser bar &mdash; that lets Crate scope to the page you are working on.</div>
+                <div class="figma-section-error hidden" id="figma-section-error"></div>
+              </div>
+            </div>
+          </div>
+          <div class="form-field">
             <div class="app-label">Naming Template</div>
             <div class="naming-template-box" id="naming-template-display">{Project}_{Date}</div>
             <div class="naming-preview-hint">&rarr; <span id="naming-preview-text">Project_2026-02-20</span></div>
-          </div>
-          <div class="form-field">
-            <div class="app-label">Figma Scope</div>
-            <select id="input-figma-scope" class="settings-input" style="width:100%;">
-              <option value="current-page" selected>Current Page Only</option>
-              <option value="entire-file">Entire File</option>
-            </select>
           </div>
           <button class="app-btn" id="btn-create-project">&#9654; Start Watching</button>
           <button class="app-btn outline" id="btn-cancel-project" style="margin-top:8px;">Cancel</button>
@@ -113,7 +125,7 @@
           <div class="privacy-hint subtle">
             Crate only sees files opened by design apps during this session.
           </div>
-          <div id="files-figma-scope" class="privacy-hint subtle" style="margin-top:8px;"></div>
+          <div id="files-figma-scope" class="figma-link-row" style="margin-top:8px;" title="Edit Figma link"></div>
           <div id="files-figma-warning" class="privacy-hint" style="margin-top:8px;color:#f59e0b;"></div>
 
           <!-- Tier 2: files awaiting user review -->
@@ -180,18 +192,7 @@
               </div>
               <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
               <button class="app-btn outline" id="btn-figma-scan-now" style="width:100%;margin-top:8px;">Scan Now</button>
-              <div class="figma-files-section" style="margin-top:12px;">
-                <div class="settings-desc" style="margin-bottom:6px;"><strong>Track a Figma file</strong> &mdash; paste any Figma file URL:</div>
-                <input type="text" class="settings-input" id="input-figma-file-url" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
-                <button class="app-btn" id="btn-figma-add-file" style="width:100%;margin-top:6px;">Add File</button>
-                <div id="figma-tracked-files-list" style="margin-top:8px;"></div>
-              </div>
-              <div class="figma-team-section" style="margin-top:12px;">
-                <div class="settings-desc" style="margin-bottom:6px;"><strong>Auto-discover</strong> (Professional plan) &mdash; paste your team URL for auto-discovery:</div>
-                <input type="text" class="settings-input" id="input-figma-team-url" placeholder="https://www.figma.com/files/team/123456/Team-Name" style="width:100%;box-sizing:border-box;">
-                <button class="app-btn" id="btn-figma-add-team" style="width:100%;margin-top:6px;">Add Team</button>
-                <div id="figma-team-ids-list" style="margin-top:8px;"></div>
-              </div>
+              <div class="settings-desc" style="margin-top:12px;">Link a Figma file to a project from the project itself &mdash; open a project's Files tab and click the Figma link row to add or change it.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
             <div id="figma-disconnected">
@@ -321,6 +322,34 @@
         <div class="modal-actions">
           <button class="modal-btn-secondary" id="btn-delete-cancel">Cancel</button>
           <button class="modal-btn-danger" id="btn-delete-confirm">Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit Figma Link Modal (per-project, Phase 2) -->
+    <div class="modal-overlay hidden" id="modal-edit-figma-link">
+      <div class="modal">
+        <div class="modal-header-area">
+          <div class="modal-title">Edit Figma Link</div>
+          <div class="modal-subtitle">Paste a Figma file URL for this project, or clear it to remove the link.</div>
+        </div>
+        <div class="modal-body">
+          <div class="form-field">
+            <div class="app-label">Figma URL</div>
+            <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
+          </div>
+          <div class="form-field">
+            <div class="app-label">Scope</div>
+            <select id="edit-figma-scope" class="settings-input" style="width:100%;">
+              <option value="current-page">Current Page Only</option>
+              <option value="entire-file">Entire File</option>
+            </select>
+          </div>
+          <div id="edit-figma-error" style="font-size:12px;color:#f87171;margin-bottom:8px;display:none;"></div>
+          <div class="modal-actions">
+            <button class="modal-btn-secondary" id="btn-edit-figma-cancel">Cancel</button>
+            <button class="modal-btn-primary" id="btn-edit-figma-save">Save</button>
+          </div>
         </div>
       </div>
     </div>
