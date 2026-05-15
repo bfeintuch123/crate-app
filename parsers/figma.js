@@ -411,6 +411,78 @@ class FigmaParser extends BaseParser {
     }
   }
 
+  _isLikelyNodeReference(value) {
+    if (typeof value !== 'string' || !value.trim()) return false;
+    const normalized = FigmaParser.normalizeNodeId(value);
+    return !!normalized && /^\d+:\d+(?::\d+)*$/.test(normalized);
+  }
+
+  _addNodeReference(value, nodeIds) {
+    if (!this._isLikelyNodeReference(value)) return;
+    nodeIds.add(FigmaParser.normalizeNodeId(value));
+  }
+
+  _findReferencedNodeIds(node, nodeIds) {
+    if (!node) return;
+
+    this._addNodeReference(node.componentId, nodeIds);
+
+    if (node.componentProperties && typeof node.componentProperties === 'object') {
+      for (const property of Object.values(node.componentProperties)) {
+        if (!property || typeof property !== 'object') continue;
+        this._addNodeReference(property.value, nodeIds);
+        this._addNodeReference(property.defaultValue, nodeIds);
+      }
+    }
+
+    if (node.componentPropertyDefinitions && typeof node.componentPropertyDefinitions === 'object') {
+      for (const definition of Object.values(node.componentPropertyDefinitions)) {
+        if (!definition || typeof definition !== 'object') continue;
+        this._addNodeReference(definition.defaultValue, nodeIds);
+      }
+    }
+
+    if (node.children) {
+      for (const child of node.children) {
+        this._findReferencedNodeIds(child, nodeIds);
+      }
+    }
+  }
+
+  /**
+   * Collect image fills from a scoped page plus local component nodes reachable from it.
+   * Preserves Current Page Only while keeping instance/component dependencies intact.
+   * @private
+   */
+  _findScopedImageFillRefs(scopedRoot, document, imageRefs, refNames) {
+    this._findImageFillRefs(scopedRoot, imageRefs, refNames);
+
+    const pendingNodeIds = new Set();
+    const visitedNodeIds = new Set();
+    this._findReferencedNodeIds(scopedRoot, pendingNodeIds);
+
+    while (pendingNodeIds.size > 0) {
+      const nodeId = pendingNodeIds.values().next().value;
+      pendingNodeIds.delete(nodeId);
+
+      if (visitedNodeIds.has(nodeId)) continue;
+      visitedNodeIds.add(nodeId);
+
+      const referencedNode = this._findNodeById(document, nodeId);
+      if (!referencedNode) continue;
+
+      this._findImageFillRefs(referencedNode, imageRefs, refNames);
+
+      const nestedNodeIds = new Set();
+      this._findReferencedNodeIds(referencedNode, nestedNodeIds);
+      for (const nestedNodeId of nestedNodeIds) {
+        if (!visitedNodeIds.has(nestedNodeId)) {
+          pendingNodeIds.add(nestedNodeId);
+        }
+      }
+    }
+  }
+
   /**
    * Recursively find a node by id.
    * @private
@@ -977,7 +1049,11 @@ class FigmaParser extends BaseParser {
       // Primary path: recover original placed image-fill assets via imageRef mapping
       const imageRefs = new Set();
       const refNames = {};
-      this._findImageFillRefs(scopedRoot, imageRefs, refNames);
+      if (scope.scopeMode === 'current-page') {
+        this._findScopedImageFillRefs(scopedRoot, fileData.document, imageRefs, refNames);
+      } else {
+        this._findImageFillRefs(scopedRoot, imageRefs, refNames);
+      }
       const imageRefList = Array.from(imageRefs);
       console.log(
         `[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found (${imageRefList.length})` +

@@ -178,6 +178,14 @@ function normalizeTrackedFigmaFiles(rawTrackedFiles) {
     .filter(Boolean);
 }
 
+function projectHasFigmaTrackedFiles(project) {
+  if (!project || !Array.isArray(project.figmaTrackedFiles)) return false;
+  return project.figmaTrackedFiles.some((entry) => {
+    if (typeof entry === 'string') return !!entry.trim();
+    return !!(entry && typeof entry.key === 'string' && entry.key.trim());
+  });
+}
+
 function rebuildFigmaSessionWarnings(session) {
   if (!session || typeof session !== 'object') return [];
 
@@ -201,24 +209,19 @@ function rebuildFigmaSessionWarnings(session) {
   return warnings;
 }
 
-function buildFigmaSessionSnapshot(project, settings = {}) {
+function buildFigmaSessionSnapshot(project, _settings = {}) {
   const { FigmaParser } = require('./parsers/figma');
 
   const scopeMode = VALID_FIGMA_SCOPE_MODES.has(project && project.figmaScopeMode)
     ? project.figmaScopeMode
     : FIGMA_SCOPE_ENTIRE_FILE;
-  const trackedFiles = normalizeTrackedFigmaFiles(settings.figmaTrackedFiles || []);
-  const rawTeamIds = Array.isArray(settings.figmaTeamIds) ? settings.figmaTeamIds : [];
+  const trackedFiles = normalizeTrackedFigmaFiles((project && project.figmaTrackedFiles) || []);
   const sessionWarnings = [];
-
-  if (scopeMode === FIGMA_SCOPE_CURRENT_PAGE && rawTeamIds.length > 0) {
-    sessionWarnings.push('Current Page Only only uses directly tracked Figma file URLs. Auto-discover teams are ignored for this session.');
-  }
 
   const snapshot = {
     scopeMode,
     startedAt: project.watchStartedAt || Date.now(),
-    teamIds: scopeMode === FIGMA_SCOPE_ENTIRE_FILE ? [...rawTeamIds] : [],
+    teamIds: [],
     trackedFiles: trackedFiles.map((trackedFile) => {
       const parsedScope = trackedFile.url
         ? FigmaParser.parseScopeFromTrackedUrl(trackedFile.url)
@@ -663,41 +666,14 @@ function migrateSettings() {
     store.set('settings.namingTemplate', '{Project}_{Date}');
   }
 
-  // Migrate figmaTeamIds and figmaTrackedFiles from older Crate versions
-  const hasTeamIds = Array.isArray(settings.figmaTeamIds) && settings.figmaTeamIds.length > 0;
-  const hasTrackedFiles = Array.isArray(settings.figmaTrackedFiles) && settings.figmaTrackedFiles.length > 0;
-  if (!hasTeamIds && !hasTrackedFiles) {
-    try {
-      const configDir = path.join(os.homedir(), 'Library', 'Application Support');
-      const currentUserDataBase = path.basename(app.getPath('userData'));
-      const entries = fs.readdirSync(configDir)
-        .filter(name => name.startsWith('Crate v') && name !== currentUserDataBase)
-        .map(name => {
-          const configPath = path.join(configDir, name, 'config.json');
-          try {
-            const stat = fs.statSync(configPath);
-            return { path: configPath, mtime: stat.mtimeMs };
-          } catch (e) { return null; }
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.mtime - a.mtime);
-
-      for (const entry of entries) {
-        try {
-          const oldConfig = JSON.parse(fs.readFileSync(entry.path, 'utf8'));
-          const oldSettings = oldConfig.settings || {};
-          const oldTeamIds = oldSettings.figmaTeamIds || [];
-          const oldTrackedFiles = oldSettings.figmaTrackedFiles || [];
-          if (oldTeamIds.length > 0 || oldTrackedFiles.length > 0) {
-            if (oldTeamIds.length > 0) store.set('settings.figmaTeamIds', oldTeamIds);
-            if (oldTrackedFiles.length > 0) store.set('settings.figmaTrackedFiles', oldTrackedFiles);
-            break;
-          }
-        } catch (e) { /* skip unreadable configs */ }
-      }
-    } catch (e) {
-      console.warn('[crate] Figma settings migration failed:', e.message);
-    }
+  // v2.7.0 (Phase 2): Figma link moved per-project. Drop deprecated global
+  // settings.figmaTrackedFiles and settings.figmaTeamIds — users re-link
+  // through the per-project Edit Figma Link UI.
+  if (settings.figmaTrackedFiles !== undefined) {
+    store.delete('settings.figmaTrackedFiles');
+  }
+  if (settings.figmaTeamIds !== undefined) {
+    store.delete('settings.figmaTeamIds');
   }
 }
 migrateSettings();
@@ -1462,6 +1438,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
  * Start Figma polling for a project.
  */
 async function startFigmaPolling(projectId) {
+  const project = getProjects().find(p => p.id === projectId);
+  if (!project || project.status !== 'watching' || !projectHasFigmaTrackedFiles(project)) {
+    stopFigmaPolling(projectId);
+    return;
+  }
+
   // Guard: prevent duplicate pollers if called while initial poll is in progress
   if (figmaPollers.has(projectId) || figmaPollerStarting.has(projectId)) return;
   figmaPollerStarting.add(projectId);
@@ -1475,6 +1457,11 @@ async function startFigmaPolling(projectId) {
 
   // Guard again after async: another caller may have set up a poller while we awaited
   if (figmaPollers.has(projectId)) return;
+
+  const latestProject = getProjects().find(p => p.id === projectId);
+  if (!latestProject || latestProject.status !== 'watching' || !projectHasFigmaTrackedFiles(latestProject)) {
+    return;
+  }
 
   // Start 60-second polling interval
   const intervalId = setInterval(() => {
@@ -2787,6 +2774,7 @@ async function startWatching(projectId) {
       files: project.files,
       createdAt: project.createdAt,
       watchStartedAt: project.watchStartedAt,
+      figmaTrackedFiles: project.figmaTrackedFiles,
       figmaSession: project.figmaSession
     };
   });
@@ -3095,7 +3083,9 @@ async function startWatching(projectId) {
 
   watchers.set(projectId, watcher);
   startLsofPolling(projectId); // begin lsof polling for linked assets
-  startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+  if (projectHasFigmaTrackedFiles(projectSnapshot)) {
+    startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+  }
   startPsPolling(projectId);    // begin Photoshop + InDesign polling (v2.3.0)
   startLastUsedPolling(projectId); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
 }
@@ -3218,7 +3208,7 @@ ipcMain.handle('projects:get-all', () => {
   return getProjects();
 });
 
-ipcMain.handle('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE) => {
+ipcMain.handle('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
   const projects = getProjects();
 
   // Enforce project cap
@@ -3228,11 +3218,23 @@ ipcMain.handle('projects:create', async (event, name, projectType = 'branding', 
 
   const cleanedName = (name || '').trim() || 'Untitled Project';
 
+  let figmaTrackedFiles = [];
+  if (typeof figmaUrl === 'string' && figmaUrl.trim()) {
+    const { FigmaParser } = require('./parsers/figma');
+    const trimmedUrl = figmaUrl.trim();
+    const fileKey = FigmaParser.extractFileKey(trimmedUrl);
+    if (!fileKey) {
+      return { error: 'invalid_figma_url' };
+    }
+    figmaTrackedFiles = [{ key: fileKey, url: trimmedUrl }];
+  }
+
   const newProject = {
     id: uuidv4(),
     name: cleanedName,
     type: projectType,
     figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
+    figmaTrackedFiles,
     status: 'watching',
     files: [],
     pendingFiles: [], // Tier 2 candidates awaiting user review
@@ -3244,6 +3246,51 @@ ipcMain.handle('projects:create', async (event, name, projectType = 'branding', 
   store.set('projects', projects);
   await startWatching(newProject.id);
   return newProject;
+});
+
+// Phase 2: per-project Figma link.
+// payload: { url: string|null, scopeMode: 'current-page'|'entire-file' }
+// Empty/null url clears the project's Figma link.
+ipcMain.handle('projects:set-figma-link', async (event, projectId, payload = {}) => {
+  const project = getProjects().find(p => p.id === projectId);
+  if (!project) return { success: false, error: 'project_not_found' };
+
+  const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
+  const scopeMode = VALID_FIGMA_SCOPE_MODES.has(payload.scopeMode)
+    ? payload.scopeMode
+    : FIGMA_SCOPE_CURRENT_PAGE;
+
+  let figmaTrackedFiles = [];
+  if (rawUrl) {
+    const { FigmaParser } = require('./parsers/figma');
+    const fileKey = FigmaParser.extractFileKey(rawUrl);
+    if (!fileKey) {
+      return { success: false, error: 'invalid_figma_url' };
+    }
+    figmaTrackedFiles = [{ key: fileKey, url: rawUrl }];
+  }
+
+  const settings = store.get('settings') || {};
+  const updated = mutateProject(projectId, (proj) => {
+    proj.figmaTrackedFiles = figmaTrackedFiles;
+    proj.figmaScopeMode = scopeMode;
+    proj.figmaSession = buildFigmaSessionSnapshot(proj, settings);
+    return proj;
+  });
+
+  if (updated && trayWindow && !trayWindow.isDestroyed()) {
+    trayWindow.webContents.send('project:updated', { projectId });
+  }
+
+  if (updated && updated.status === 'watching') {
+    if (projectHasFigmaTrackedFiles(updated)) {
+      startFigmaPolling(projectId);
+    } else {
+      stopFigmaPolling(projectId);
+    }
+  }
+
+  return { success: true, project: updated };
 });
 
 ipcMain.handle('projects:start-watching', async (event, id) => {
@@ -4500,7 +4547,7 @@ ipcMain.handle('figma:connect', async (event, token) => {
     // Start Figma polling for any currently watching projects
     const projects = getProjects();
     for (const project of projects) {
-      if (project.status === 'watching' && !figmaPollers.has(project.id)) {
+      if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
         startFigmaPolling(project.id);
       }
     }
@@ -4568,69 +4615,12 @@ ipcMain.handle('figma:project-assets', async (event, projectId) => {
   };
 });
 
-// Add a Figma file URL for direct tracking (works on ALL Figma plans)
-ipcMain.handle('figma:add-tracked-file', async (event, figmaUrl) => {
-  const { FigmaParser } = require('./parsers/figma');
-  const fileKey = FigmaParser.extractFileKey(figmaUrl);
-  if (!fileKey) {
-    return { success: false, error: 'Invalid Figma URL' };
-  }
-
-  const settings = store.get('settings') || {};
-  const tracked = settings.figmaTrackedFiles || [];
-  const alreadyTracked = tracked.some(entry =>
-    (typeof entry === 'string' ? entry : entry.key) === fileKey
-  );
-  if (alreadyTracked) {
-    return { success: true, fileKey, alreadyTracked: true };
-  }
-
-  tracked.push({ key: fileKey, url: figmaUrl });
-  store.set('settings.figmaTrackedFiles', tracked);
-  return { success: true, fileKey };
-});
-
-// Remove a tracked Figma file
-ipcMain.handle('figma:remove-tracked-file', async (event, fileKey) => {
-  const settings = store.get('settings') || {};
-  const tracked = (settings.figmaTrackedFiles || []).filter(entry => (typeof entry === 'string' ? entry : entry.key) !== fileKey);
-  store.set('settings.figmaTrackedFiles', tracked);
-  return { success: true };
-});
-
-// Set Figma team ID for auto-discovery (requires Professional+ plan)
-ipcMain.handle('figma:set-team-id', async (event, teamUrl) => {
-  // Accept team URL or raw ID
-  // URL format: https://www.figma.com/files/team/123456789/Team-Name
-  let teamId = teamUrl;
-  const match = teamUrl.match(/figma\.com\/files\/team\/(\d+)/);
-  if (match) teamId = match[1];
-
-  if (!teamId || !/^\d+$/.test(teamId)) {
-    return { success: false, error: 'Invalid team URL or ID' };
-  }
-
-  const settings = store.get('settings') || {};
-  const teamIds = settings.figmaTeamIds || [];
-  if (teamIds.includes(teamId)) {
-    return { success: true, teamId, alreadyAdded: true };
-  }
-
-  teamIds.push(teamId);
-  store.set('settings.figmaTeamIds', teamIds);
-  return { success: true, teamId };
-});
-
-// Remove a Figma team ID
-ipcMain.handle('figma:remove-team-id', async (event, teamId) => {
-  const settings = store.get('settings') || {};
-  const teamIds = (settings.figmaTeamIds || []).filter(id => id !== teamId);
-  store.set('settings.figmaTeamIds', teamIds);
-  return { success: true };
-});
-
 ipcMain.handle('figma:scan-now', async (event) => {
-  const projects = getProjects().filter(p => p.status === 'watching');
+  // Phase 2: only scan watching projects that have a per-project Figma link.
+  const projects = getProjects().filter(p =>
+    p.status === 'watching' &&
+    projectHasFigmaTrackedFiles(p)
+  );
   if (projects.length === 0) {
     return { triggered: 0, skipped: 0, totalAddedCount: 0 };
   }
@@ -4672,7 +4662,7 @@ ipcMain.handle('settings:get', () => {
 
 ipcMain.handle('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "figmaTeamIds", "figmaTrackedFiles"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   store.set(`settings.${key}`, value);
   return store.get('settings');

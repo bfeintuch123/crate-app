@@ -110,6 +110,182 @@ test('entire-file scope still includes assets from multiple pages', async () => 
   );
 });
 
+const DEPS_FILE_KEY = 'FILE_DEPS';
+const DEPS_DOCUMENT_FIXTURE = {
+  id: '0:0',
+  type: 'DOCUMENT',
+  name: 'Deps Fixture',
+  children: [
+    {
+      id: '10:1',
+      type: 'CANVAS',
+      name: 'Locked Page',
+      children: [
+        {
+          id: '11:1',
+          type: 'RECTANGLE',
+          name: 'Local Image',
+          fills: [{ type: 'IMAGE', imageRef: 'img-locked-local' }]
+        },
+        {
+          id: '11:2',
+          type: 'INSTANCE',
+          name: 'Hero Instance',
+          componentId: '20:1'
+        },
+        {
+          id: '11:3',
+          type: 'INSTANCE',
+          name: 'Card Instance',
+          componentId: '20:2'
+        },
+        {
+          id: '11:4',
+          type: 'INSTANCE',
+          name: 'Swap Instance',
+          componentId: '20:3',
+          componentProperties: {
+            'icon#1': { type: 'INSTANCE_SWAP', value: '20:5' }
+          }
+        }
+      ]
+    },
+    {
+      id: '10:2',
+      type: 'CANVAS',
+      name: 'Components',
+      children: [
+        {
+          id: '20:1',
+          type: 'COMPONENT',
+          name: 'Hero Component',
+          fills: [{ type: 'IMAGE', imageRef: 'img-shared-hero' }]
+        },
+        {
+          id: '20:2',
+          type: 'COMPONENT',
+          name: 'Card Component',
+          children: [
+            {
+              id: '21:1',
+              type: 'INSTANCE',
+              name: 'Nested Inner',
+              componentId: '20:4'
+            }
+          ]
+        },
+        {
+          id: '20:3',
+          type: 'COMPONENT',
+          name: 'Swap Host Component'
+        },
+        {
+          id: '20:4',
+          type: 'COMPONENT',
+          name: 'Nested Component',
+          fills: [{ type: 'IMAGE', imageRef: 'img-nested-component' }]
+        },
+        {
+          id: '20:5',
+          type: 'COMPONENT',
+          name: 'Swapped Component',
+          fills: [{ type: 'IMAGE', imageRef: 'img-swapped-component' }]
+        },
+        {
+          id: '20:99',
+          type: 'COMPONENT',
+          name: 'Unused Component',
+          fills: [{ type: 'IMAGE', imageRef: 'img-unused-component' }]
+        }
+      ]
+    },
+    {
+      id: '10:3',
+      type: 'CANVAS',
+      name: 'Unrelated Page',
+      children: [
+        {
+          id: '30:1',
+          type: 'RECTANGLE',
+          name: 'Unrelated',
+          fills: [{ type: 'IMAGE', imageRef: 'img-unrelated-page' }]
+        }
+      ]
+    }
+  ]
+};
+
+class DepsStubFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async verifyToken() {
+    return { valid: true, user: { id: '1', handle: 'tester', email: 'tester@example.com' } };
+  }
+
+  async discoverRecentFiles() {
+    return {
+      recentFiles: [
+        {
+          key: DEPS_FILE_KEY,
+          name: 'Deps Fixture File',
+          isTracked: true,
+          trackedIndex: 0,
+          lastModifiedMs: Date.now()
+        }
+      ],
+      errors: []
+    };
+  }
+
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${DEPS_FILE_KEY}`) {
+      return { document: DEPS_DOCUMENT_FIXTURE };
+    }
+    if (endpoint === `/files/${DEPS_FILE_KEY}/images`) {
+      return {
+        images: {
+          'img-locked-local': 'https://cdn.example.com/locked-local.png',
+          'img-shared-hero': 'https://cdn.example.com/shared-hero.png',
+          'img-nested-component': 'https://cdn.example.com/nested.png',
+          'img-swapped-component': 'https://cdn.example.com/swapped.png',
+          'img-unused-component': 'https://cdn.example.com/unused.png',
+          'img-unrelated-page': 'https://cdn.example.com/unrelated.png'
+        }
+      };
+    }
+
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+test('current-page scope follows component dependencies reachable from the locked page', async () => {
+  const parser = new DepsStubFigmaParser();
+
+  const result = await parser.extractAssetsFromFileKey(DEPS_FILE_KEY, {
+    key: DEPS_FILE_KEY,
+    scopeMode: 'current-page',
+    requestedPageId: '10:1'
+  });
+
+  const refs = result.assets.map(asset => asset.imageRef).sort();
+  assert.deepEqual(refs, [
+    'img-locked-local',
+    'img-nested-component',
+    'img-shared-hero',
+    'img-swapped-component'
+  ]);
+
+  for (const asset of result.assets) {
+    assert.equal(asset.figmaPageId, '10:1');
+    assert.equal(asset.figmaPageName, 'Locked Page');
+  }
+
+  assert.equal(refs.includes('img-unrelated-page'), false);
+  assert.equal(refs.includes('img-unused-component'), false);
+});
+
 test('unresolved current-page lock never widens to entire-file', async () => {
   const parser = new StubFigmaParser();
 

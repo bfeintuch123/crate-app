@@ -13,9 +13,17 @@ let state = {
   pendingDeleteId: null,
   projectType: 'branding',
   figmaScopeMode: 'current-page',
+  figmaSectionExpanded: false,
   figmaScanInFlight: false,
-  lastFigmaWarning: null
+  lastFigmaWarning: null,
+  editFigmaProjectId: null
 };
+
+// Lightweight Figma URL validator — must match the patterns the main process accepts.
+const FIGMA_URL_PATTERN = /figma\.com\/(file|design|proto)\/([a-zA-Z0-9]+)/;
+function isValidFigmaUrl(url) {
+  return typeof url === 'string' && FIGMA_URL_PATTERN.test(url.trim());
+}
 
 // ===== DOM Helpers =====
 const $ = (sel) => document.querySelector(sel);
@@ -187,6 +195,15 @@ function showNewProjectForm() {
   if (figmaScopeInput) {
     figmaScopeInput.value = 'current-page';
   }
+  const figmaUrlInput = $('#input-figma-url');
+  if (figmaUrlInput) figmaUrlInput.value = '';
+  const figmaError = $('#figma-section-error');
+  if (figmaError) {
+    figmaError.classList.add('hidden');
+    figmaError.textContent = '';
+  }
+  state.figmaSectionExpanded = false;
+  setFigmaSectionExpanded(false);
 
   // Update template display from current settings
   const templateDisplay = $('#naming-template-display');
@@ -213,15 +230,53 @@ async function createProject() {
   const figmaScopeInput = $('#input-figma-scope');
   state.figmaScopeMode = figmaScopeInput ? figmaScopeInput.value : 'current-page';
 
-  const result = await window.crate.createProject(name, state.projectType, state.figmaScopeMode);
+  const figmaUrlInput = $('#input-figma-url');
+  const figmaError = $('#figma-section-error');
+  let figmaUrl = null;
+  if (state.figmaSectionExpanded && figmaUrlInput) {
+    const candidate = figmaUrlInput.value.trim();
+    if (candidate) {
+      if (!isValidFigmaUrl(candidate)) {
+        if (figmaError) {
+          figmaError.textContent = "That doesn't look like a Figma file URL. Try a URL like https://www.figma.com/file/ABC123/My-File.";
+          figmaError.classList.remove('hidden');
+        }
+        return;
+      }
+      figmaUrl = candidate;
+    }
+  }
+
+  if (figmaError) {
+    figmaError.classList.add('hidden');
+    figmaError.textContent = '';
+  }
+
+  const result = await window.crate.createProject(name, state.projectType, state.figmaScopeMode, figmaUrl);
   // FIX 6 (M3): Guard against null/error IPC response
-  if (!result || result.error) return;
+  if (!result || result.error) {
+    if (result && result.error === 'invalid_figma_url' && figmaError) {
+      figmaError.textContent = 'Crate could not read that Figma URL. Please double-check and try again.';
+      figmaError.classList.remove('hidden');
+    }
+    return;
+  }
 
   state.projects = await window.crate.getProjects();
   state.selectedProjectId = result.id;
   hideNewProjectForm();
   renderProjects();
   switchTab('files');
+}
+
+function setFigmaSectionExpanded(expanded) {
+  state.figmaSectionExpanded = !!expanded;
+  const body = $('#figma-section-body');
+  const toggle = $('#figma-section-toggle');
+  const icon = toggle ? toggle.querySelector('.figma-section-icon') : null;
+  if (body) body.classList.toggle('hidden', !expanded);
+  if (toggle) toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  if (icon) icon.innerHTML = expanded ? '&#x25BC;' : '&#x25B6;';
 }
 
 // ===== Naming Preview =====
@@ -346,7 +401,20 @@ async function renderFiles() {
   }
 
   if (figmaScopeText) {
-    figmaScopeText.textContent = `Figma scope: ${getProjectFigmaScopeLabel(project)}`;
+    const trackedFiles = (project.figmaTrackedFiles || []);
+    const hasLink = trackedFiles.length > 0;
+    figmaScopeText.innerHTML = '';
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'figma-link-label';
+    if (hasLink) {
+      labelSpan.textContent = `Figma scope: ${getProjectFigmaScopeLabel(project)}`;
+    } else {
+      labelSpan.textContent = '+ Link a Figma file (optional)';
+    }
+    figmaScopeText.appendChild(labelSpan);
+    figmaScopeText.classList.toggle('linked', hasLink);
+    figmaScopeText.classList.toggle('unlinked', !hasLink);
+    figmaScopeText.onclick = () => openEditFigmaLinkModal(project.id);
   }
   if (figmaWarningText) {
     const warning = getProjectFigmaWarning(project);
@@ -538,53 +606,6 @@ async function renderFigmaSettings() {
     }
     if (assetCountEl) {
       assetCountEl.textContent = status.totalFigmaAssets || 0;
-    }
-
-    // Render tracked files list
-    const settings = await window.crate.getSettings();
-    const trackedFiles = (settings && settings.figmaTrackedFiles) || [];
-    const teamIds = (settings && settings.figmaTeamIds) || [];
-
-    const filesListEl = $('#figma-tracked-files-list');
-    if (filesListEl) {
-      if (trackedFiles.length === 0) {
-        filesListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No files tracked yet</div>';
-      } else {
-        filesListEl.innerHTML = trackedFiles.map(entry => {
-          const key = typeof entry === 'string' ? entry : entry.key;
-          const display = typeof entry === 'string' ? entry : (entry.url || entry.key);
-          return `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-            <span style="font-size:12px;opacity:0.7;flex:1;overflow:hidden;text-overflow:ellipsis;">${display}</span>
-            <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-file="${key}">Remove</button>
-          </div>`;
-        }).join('');
-        filesListEl.querySelectorAll('[data-figma-remove-file]').forEach(btn => {
-          btn.addEventListener('click', async () => {
-            await window.crate.removeFigmaTrackedFile(btn.dataset.figmaRemoveFile);
-            renderFigmaSettings();
-          });
-        });
-      }
-    }
-
-    const teamListEl = $('#figma-team-ids-list');
-    if (teamListEl) {
-      if (teamIds.length === 0) {
-        teamListEl.innerHTML = '<div class="settings-desc" style="opacity:0.6;">No teams added (optional &mdash; requires Professional plan)</div>';
-      } else {
-        teamListEl.innerHTML = teamIds.map(id =>
-          `<div class="figma-tracked-item" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-            <span style="font-size:12px;opacity:0.7;flex:1;">Team ${id}</span>
-            <button class="btn-danger-outline" style="font-size:11px;padding:2px 8px;" data-figma-remove-team="${id}">Remove</button>
-          </div>`
-        ).join('');
-        teamListEl.querySelectorAll('[data-figma-remove-team]').forEach(btn => {
-          btn.addEventListener('click', async () => {
-            await window.crate.removeFigmaTeamId(btn.dataset.figmaRemoveTeam);
-            renderFigmaSettings();
-          });
-        });
-      }
     }
   } else {
     connected.classList.add('hidden');
@@ -950,39 +971,23 @@ function setupEventListeners() {
     }
   });
 
-  // Figma add tracked file
-  $('#btn-figma-add-file').addEventListener('click', async () => {
-    const url = $('#input-figma-file-url').value.trim();
-    if (!url) {
-      showToast('Please paste a Figma file URL');
-      return;
-    }
-    const result = await window.crate.addFigmaTrackedFile(url);
-    if (result.success) {
-      $('#input-figma-file-url').value = '';
-      renderFigmaSettings();
-      showToast(result.alreadyTracked ? 'File already tracked' : 'Figma file added');
-    } else {
-      showToast(result.error || 'Invalid Figma URL');
-    }
-  });
+  // Figma section toggle on new project form
+  const figmaToggle = $('#figma-section-toggle');
+  if (figmaToggle) {
+    figmaToggle.addEventListener('click', () => {
+      setFigmaSectionExpanded(!state.figmaSectionExpanded);
+    });
+  }
 
-  // Figma add team
-  $('#btn-figma-add-team').addEventListener('click', async () => {
-    const url = $('#input-figma-team-url').value.trim();
-    if (!url) {
-      showToast('Please paste a Figma team URL or ID');
-      return;
-    }
-    const result = await window.crate.setFigmaTeamId(url);
-    if (result.success) {
-      $('#input-figma-team-url').value = '';
-      renderFigmaSettings();
-      showToast(result.alreadyAdded ? 'Team already added' : 'Figma team added');
-    } else {
-      showToast(result.error || 'Invalid team URL');
-    }
-  });
+  // Per-project Edit Figma Link modal
+  const editCancel = $('#btn-edit-figma-cancel');
+  if (editCancel) {
+    editCancel.addEventListener('click', closeEditFigmaLinkModal);
+  }
+  const editSave = $('#btn-edit-figma-save');
+  if (editSave) {
+    editSave.addEventListener('click', saveEditFigmaLinkModal);
+  }
 
   // Figma scan now
   $('#btn-figma-scan-now').addEventListener('click', async () => {
@@ -1007,6 +1012,77 @@ function setupEventListeners() {
     }
   });
 
+}
+
+// ===== Edit Figma Link Modal (per-project) =====
+function openEditFigmaLinkModal(projectId) {
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return;
+  state.editFigmaProjectId = projectId;
+
+  const tracked = (project.figmaTrackedFiles || [])[0];
+  const urlInput = $('#edit-figma-url');
+  const scopeInput = $('#edit-figma-scope');
+  const errorEl = $('#edit-figma-error');
+
+  if (urlInput) urlInput.value = tracked && tracked.url ? tracked.url : '';
+  if (scopeInput) {
+    const scope = project.figmaScopeMode === 'entire-file' ? 'entire-file' : 'current-page';
+    scopeInput.value = scope;
+  }
+  if (errorEl) {
+    errorEl.style.display = 'none';
+    errorEl.textContent = '';
+  }
+
+  $('#modal-edit-figma-link').classList.remove('hidden');
+  if (urlInput) urlInput.focus();
+}
+
+function closeEditFigmaLinkModal() {
+  state.editFigmaProjectId = null;
+  $('#modal-edit-figma-link').classList.add('hidden');
+}
+
+async function saveEditFigmaLinkModal() {
+  const projectId = state.editFigmaProjectId;
+  if (!projectId) return;
+
+  const urlInput = $('#edit-figma-url');
+  const scopeInput = $('#edit-figma-scope');
+  const errorEl = $('#edit-figma-error');
+
+  const rawUrl = urlInput ? urlInput.value.trim() : '';
+  const scopeMode = scopeInput ? scopeInput.value : 'current-page';
+
+  if (rawUrl && !isValidFigmaUrl(rawUrl)) {
+    if (errorEl) {
+      errorEl.textContent = "That doesn't look like a Figma file URL.";
+      errorEl.style.display = 'block';
+    }
+    return;
+  }
+
+  const result = await window.crate.setProjectFigmaLink(projectId, {
+    url: rawUrl || null,
+    scopeMode
+  });
+
+  if (!result || !result.success) {
+    if (errorEl) {
+      errorEl.textContent = result && result.error === 'invalid_figma_url'
+        ? 'Crate could not read that Figma URL. Please double-check and try again.'
+        : 'Failed to save Figma link.';
+      errorEl.style.display = 'block';
+    }
+    return;
+  }
+
+  state.projects = await window.crate.getProjects();
+  closeEditFigmaLinkModal();
+  renderFiles();
+  renderProjects();
+  showToast(rawUrl ? 'Figma link updated' : 'Figma link removed');
 }
 
 // ===== Tab State Helper =====
