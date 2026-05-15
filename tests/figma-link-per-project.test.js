@@ -125,6 +125,11 @@ async function callIpc(channel, ...args) {
   return fn({}, ...args);
 }
 
+async function getActiveFigmaPollerCount() {
+  const status = await callIpc('figma:status');
+  return status.activeProjectCount || 0;
+}
+
 async function resetProjects() {
   const projects = await callIpc('projects:get-all');
   for (const project of [...projects]) {
@@ -139,6 +144,7 @@ async function resetProjects() {
 // ---------- Tests ----------
 
 test('projects:create with a Figma URL stores per-project tracked file', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
   const url = 'https://www.figma.com/file/ABC123/My-File?page-id=1%3A1';
   const project = await callIpc(
     'projects:create',
@@ -160,9 +166,11 @@ test('projects:create with a Figma URL stores per-project tracked file', async (
   assert.ok(fresh.figmaSession, 'figmaSession should be populated');
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, 'ABC123');
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
 });
 
 test('projects:create without a Figma URL leaves figmaTrackedFiles empty', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(
     'projects:create',
     'Phase2-create-without-url',
@@ -176,6 +184,7 @@ test('projects:create without a Figma URL leaves figmaTrackedFiles empty', async
 
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
   assert.equal(fresh.figmaSession.trackedFiles.length, 0);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
 test('projects:create rejects an invalid Figma URL', async () => {
@@ -195,6 +204,7 @@ test('projects:create rejects an invalid Figma URL', async () => {
 });
 
 test('projects:set-figma-link clears the link when url is empty', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(
     'projects:create',
     'Phase2-clear-link',
@@ -203,6 +213,7 @@ test('projects:set-figma-link clears the link when url is empty', async () => {
     'https://www.figma.com/file/CLEARME/My-File'
   );
   assert.equal(project.figmaTrackedFiles.length, 1);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
 
   const cleared = await callIpc('projects:set-figma-link', project.id, { url: '', scopeMode: 'current-page' });
   assert.equal(cleared.success, true);
@@ -210,9 +221,11 @@ test('projects:set-figma-link clears the link when url is empty', async () => {
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
   assert.deepEqual(fresh.figmaTrackedFiles, []);
   assert.equal(fresh.figmaSession.trackedFiles.length, 0);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
 test('projects:set-figma-link rebuilds figmaSession from the new url', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(
     'projects:create',
     'Phase2-rebuild-session',
@@ -221,6 +234,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
     null
   );
   assert.equal(project.figmaTrackedFiles.length, 0);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 
   const newUrl = 'https://www.figma.com/file/REBUILD9/Rebuilt-File?page-id=2%3A2';
   const result = await callIpc('projects:set-figma-link', project.id, {
@@ -239,6 +253,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   // Phase 1 page-lock behavior must still be applied to the per-project URL.
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '2:2');
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
 });
 
 test('figmaSession snapshot reads tracked files from the project, not settings', async () => {

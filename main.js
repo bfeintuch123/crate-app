@@ -178,6 +178,14 @@ function normalizeTrackedFigmaFiles(rawTrackedFiles) {
     .filter(Boolean);
 }
 
+function projectHasFigmaTrackedFiles(project) {
+  if (!project || !Array.isArray(project.figmaTrackedFiles)) return false;
+  return project.figmaTrackedFiles.some((entry) => {
+    if (typeof entry === 'string') return !!entry.trim();
+    return !!(entry && typeof entry.key === 'string' && entry.key.trim());
+  });
+}
+
 function rebuildFigmaSessionWarnings(session) {
   if (!session || typeof session !== 'object') return [];
 
@@ -1430,6 +1438,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
  * Start Figma polling for a project.
  */
 async function startFigmaPolling(projectId) {
+  const project = getProjects().find(p => p.id === projectId);
+  if (!project || project.status !== 'watching' || !projectHasFigmaTrackedFiles(project)) {
+    stopFigmaPolling(projectId);
+    return;
+  }
+
   // Guard: prevent duplicate pollers if called while initial poll is in progress
   if (figmaPollers.has(projectId) || figmaPollerStarting.has(projectId)) return;
   figmaPollerStarting.add(projectId);
@@ -1443,6 +1457,11 @@ async function startFigmaPolling(projectId) {
 
   // Guard again after async: another caller may have set up a poller while we awaited
   if (figmaPollers.has(projectId)) return;
+
+  const latestProject = getProjects().find(p => p.id === projectId);
+  if (!latestProject || latestProject.status !== 'watching' || !projectHasFigmaTrackedFiles(latestProject)) {
+    return;
+  }
 
   // Start 60-second polling interval
   const intervalId = setInterval(() => {
@@ -2755,6 +2774,7 @@ async function startWatching(projectId) {
       files: project.files,
       createdAt: project.createdAt,
       watchStartedAt: project.watchStartedAt,
+      figmaTrackedFiles: project.figmaTrackedFiles,
       figmaSession: project.figmaSession
     };
   });
@@ -3063,7 +3083,9 @@ async function startWatching(projectId) {
 
   watchers.set(projectId, watcher);
   startLsofPolling(projectId); // begin lsof polling for linked assets
-  startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+  if (projectHasFigmaTrackedFiles(projectSnapshot)) {
+    startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+  }
   startPsPolling(projectId);    // begin Photoshop + InDesign polling (v2.3.0)
   startLastUsedPolling(projectId); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
 }
@@ -3258,6 +3280,14 @@ ipcMain.handle('projects:set-figma-link', async (event, projectId, payload = {})
 
   if (updated && trayWindow && !trayWindow.isDestroyed()) {
     trayWindow.webContents.send('project:updated', { projectId });
+  }
+
+  if (updated && updated.status === 'watching') {
+    if (projectHasFigmaTrackedFiles(updated)) {
+      startFigmaPolling(projectId);
+    } else {
+      stopFigmaPolling(projectId);
+    }
   }
 
   return { success: true, project: updated };
@@ -4517,7 +4547,7 @@ ipcMain.handle('figma:connect', async (event, token) => {
     // Start Figma polling for any currently watching projects
     const projects = getProjects();
     for (const project of projects) {
-      if (project.status === 'watching' && !figmaPollers.has(project.id)) {
+      if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
         startFigmaPolling(project.id);
       }
     }
@@ -4589,8 +4619,7 @@ ipcMain.handle('figma:scan-now', async (event) => {
   // Phase 2: only scan watching projects that have a per-project Figma link.
   const projects = getProjects().filter(p =>
     p.status === 'watching' &&
-    Array.isArray(p.figmaTrackedFiles) &&
-    p.figmaTrackedFiles.length > 0
+    projectHasFigmaTrackedFiles(p)
   );
   if (projects.length === 0) {
     return { triggered: 0, skipped: 0, totalAddedCount: 0 };
