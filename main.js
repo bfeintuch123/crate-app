@@ -1275,7 +1275,10 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
-  if (!token) return { skipped: true, reason: 'not-connected' }; // Figma not connected
+  if (!token) {
+    stopFigmaPolling(projectId);
+    return { skipped: true, reason: 'not-connected' }; // Figma not connected
+  }
 
   figmaInProgress.add(projectId);
 
@@ -1448,11 +1451,16 @@ async function startFigmaPolling(projectId) {
   if (figmaPollers.has(projectId) || figmaPollerStarting.has(projectId)) return;
   figmaPollerStarting.add(projectId);
 
+  let initialResult;
   try {
     // Run initial scan immediately
-    await pollFigmaForProject(projectId, true);
+    initialResult = await pollFigmaForProject(projectId, true);
   } finally {
     figmaPollerStarting.delete(projectId);
+  }
+
+  if (initialResult && initialResult.reason === 'not-connected') {
+    return;
   }
 
   // Guard again after async: another caller may have set up a poller while we awaited
@@ -1482,6 +1490,7 @@ function stopFigmaPolling(projectId) {
   }
   figmaPollerStarting.delete(projectId);
   figmaInProgress.delete(projectId);
+  figmaManualScanInFlight.delete(projectId);
   figmaScanTimestamps.delete(projectId);
 }
 
@@ -4432,6 +4441,7 @@ ipcMain.handle('projects:delete-all', () => {
   figmaPollers.clear();
   figmaPollerStarting.clear();
   figmaInProgress.clear();
+  figmaManualScanInFlight.clear();
   figmaScanTimestamps.clear();
   // Clean up PS/InDesign pollers (v2.3.0)
   for (const [, intervalId] of psPollers) {
@@ -4568,6 +4578,7 @@ ipcMain.handle('figma:disconnect', async () => {
   figmaPollers.clear();
   figmaPollerStarting.clear();
   figmaInProgress.clear();
+  figmaManualScanInFlight.clear();
   figmaScanTimestamps.clear();
 
   return { success: deleted };
