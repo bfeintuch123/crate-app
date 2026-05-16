@@ -98,7 +98,7 @@ function deduplicateFiles(files) {
   // Pass 1: normalized path dedup (catches case/trailing-slash/relative variants)
   const seenPaths = new Set();
   const pathDeduped = files.filter(f => {
-    const norm = normalizeTrackedFilePath(f.path);
+    const norm = getTrackedFileDedupKey(f);
     if (seenPaths.has(norm)) return false;
     seenPaths.add(norm);
     return true;
@@ -737,6 +737,49 @@ function sendToRenderer(channel, data) {
 function cleanName(s) {
   const cleaned = s.replace(/[^a-zA-Z0-9 ._\-()]/g, '').replace(/\s+/g, ' ').trim();
   return cleaned || 'Untitled';
+}
+
+function sanitizeEmbeddedPsdAssetName(rawName, fallbackName = 'embedded-asset') {
+  const fallback = `${fallbackName}`.replace(/[^a-zA-Z0-9 ._\-()]/g, '').trim() || 'embedded-asset';
+  const normalized = `${rawName || ''}`.replace(/\\/g, '/');
+  let name = path.basename(normalized).replace(/[\x00-\x1f\x7f<>:"|?*]/g, '_').replace(/\s+/g, ' ').trim();
+  name = name.replace(/^\.+/, '');
+  if (!name) name = fallback;
+  if (name.length > 160) {
+    const ext = path.extname(name);
+    const base = path.basename(name, ext).slice(0, Math.max(1, 160 - ext.length));
+    name = `${base}${ext}`;
+  }
+  return name;
+}
+
+function reserveUniqueName(name, usedNames) {
+  const safeName = sanitizeEmbeddedPsdAssetName(name);
+  const ext = path.extname(safeName);
+  const base = path.basename(safeName, ext);
+  let candidate = safeName;
+  let counter = 1;
+  while (usedNames.has(candidate.toLowerCase())) {
+    candidate = `${base}_${counter}${ext}`;
+    counter++;
+  }
+  usedNames.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function getEmbeddedPsdDedupKey(file) {
+  const parent = normalizeTrackedFilePath(file.parentPsd || file.path || '');
+  const index = Number.isInteger(file.embeddedIndex) ? file.embeddedIndex : '';
+  const originalName = typeof file.embeddedOriginalName === 'string' ? file.embeddedOriginalName : '';
+  const safeName = sanitizeEmbeddedPsdAssetName(file.name || originalName);
+  return `embedded-psd:${parent}:${index}:${originalName || safeName}`;
+}
+
+function getTrackedFileDedupKey(file) {
+  if (file && file.embedded && file.source === 'scan-on-save-embedded') {
+    return getEmbeddedPsdDedupKey(file);
+  }
+  return normalizeTrackedFilePath(file.path);
 }
 
 // --- lsof Polling (Tier 1 linked-asset capture) ---
@@ -2001,11 +2044,17 @@ async function extractPsdAssets(psdFilePath, projectId) {
     if (psd.linkedFiles && psd.linkedFiles.length > 0) {
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       await fs.promises.mkdir(extractDir, { recursive: true });
+      const usedEmbeddedNames = new Set();
       for (const lf of psd.linkedFiles) {
-        if (!lf.data || !lf.name) continue;
-        const extractPath = path.join(extractDir, lf.name);
+        if (!lf.data) continue;
+        const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
+        const extractPath = path.join(extractDir, safeName);
         await fs.promises.writeFile(extractPath, Buffer.from(lf.data));
-        discoveredPaths.push({ filePath: extractPath, source: 'psd-embedded' });
+        discoveredPaths.push({
+          filePath: extractPath,
+          source: 'psd-embedded',
+          embeddedOriginalName: lf.name || '',
+        });
       }
     }
 
@@ -2452,16 +2501,20 @@ async function runScanOnSave(projectId, psdFilePath) {
 
     // Mark embedded smart objects (extracted at package time as normal)
     if (psd.linkedFiles && psd.linkedFiles.length > 0) {
-      for (const lf of psd.linkedFiles) {
-        if (!lf.name) continue;
+      const usedEmbeddedNames = new Set();
+      for (const [embeddedIndex, lf] of psd.linkedFiles.entries()) {
+        if (!lf.data) continue;
+        const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
         newEntries.push({
           path: psdFilePath, // parent PSD — physical extraction happens at package time
-          name: lf.name,
-          ext: path.extname(lf.name).toLowerCase(),
+          name: safeName,
+          ext: path.extname(safeName).toLowerCase(),
           addedAt: Date.now(),
           source: 'scan-on-save-embedded',
           embedded: true,
           parentPsd: psdFilePath,
+          embeddedOriginalName: lf.name || '',
+          embeddedIndex,
           fileId: uuidv4(), // C2: unique key so embedded entries can be individually removed
         });
       }
@@ -2472,13 +2525,15 @@ async function runScanOnSave(projectId, psdFilePath) {
     const result = mutateProject(projectId, (proj) => {
       if (proj.status !== 'watching') return null;
       const existingPaths = new Set(proj.files.map(f =>
-        f.embedded ? `embedded:${f.name}:${f.parentPsd || ''}` : path.resolve(f.path).toLowerCase()
+        f.embedded && f.source === 'scan-on-save-embedded'
+          ? getEmbeddedPsdDedupKey(f)
+          : path.resolve(f.path).toLowerCase()
       ));
       let changed = false;
 
       for (const entry of newEntries) {
         const key = entry.embedded
-          ? `embedded:${entry.name}:${entry.parentPsd || ''}`
+          ? getEmbeddedPsdDedupKey(entry)
           : path.resolve(entry.path).toLowerCase();
         if (existingPaths.has(key)) continue;
         proj.files.push(entry);
@@ -4251,6 +4306,65 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles) 
   return extracted;
 }
 
+function resolveUniquePackagePath(destFolder, fileName) {
+  const destPath = path.join(destFolder, fileName);
+  let finalPath = destPath;
+  let counter = 1;
+  while (fs.existsSync(finalPath)) {
+    const ext = path.extname(fileName);
+    const base = path.basename(fileName, ext);
+    finalPath = path.join(destFolder, `${base}_${counter}${ext}`);
+    counter++;
+  }
+  return finalPath;
+}
+
+function isScanOnSaveEmbeddedPsdFile(file) {
+  return !!(file && file.embedded && file.source === 'scan-on-save-embedded');
+}
+
+function findEmbeddedPsdLinkedFile(file, linkedFiles) {
+  if (!Array.isArray(linkedFiles)) return null;
+
+  const hasData = (linkedFile) => linkedFile && linkedFile.data !== undefined && linkedFile.data !== null;
+  const expectedOriginalName = typeof file.embeddedOriginalName === 'string' ? file.embeddedOriginalName : '';
+  const expectedSafeName = sanitizeEmbeddedPsdAssetName(file.name || expectedOriginalName);
+  const matchesFile = (linkedFile) => {
+    if (!linkedFile) return false;
+    if (expectedOriginalName && linkedFile.name === expectedOriginalName) return true;
+    return sanitizeEmbeddedPsdAssetName(linkedFile.name) === expectedSafeName;
+  };
+
+  if (Number.isInteger(file.embeddedIndex)) {
+    const linkedFile = linkedFiles[file.embeddedIndex];
+    return hasData(linkedFile) && matchesFile(linkedFile) ? linkedFile : null;
+  }
+
+  const matches = linkedFiles.filter(linkedFile => hasData(linkedFile) && matchesFile(linkedFile));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
+  const parentPsd = file.parentPsd || file.path;
+  if (!parentPsd || !fs.existsSync(parentPsd)) {
+    throw new Error('Parent PSD not found');
+  }
+
+  const stat = await fs.promises.stat(parentPsd);
+  if (stat.size > MAX_PARSE_FILE_SIZE) {
+    throw new Error('Parent PSD exceeds parse size limit');
+  }
+
+  const buf = await fs.promises.readFile(parentPsd);
+  const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+  const linkedFile = findEmbeddedPsdLinkedFile(file, psd.linkedFiles || []);
+  if (!linkedFile) {
+    throw new Error('Embedded PSD asset not found');
+  }
+
+  await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data));
+}
+
 ipcMain.handle('projects:package', async (event, id, outputPath) => {
   // C1: Prevent double-click / concurrent packaging
   if (packageInFlight) return { error: 'package_in_flight' };
@@ -4303,17 +4417,16 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
     for (const file of packageFiles) {
       try {
+        if (isScanOnSaveEmbeddedPsdFile(file)) {
+          const safeName = sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName);
+          const finalPath = resolveUniquePackagePath(destFolder, safeName);
+          await writeEmbeddedPsdAssetToPackage(file, finalPath);
+          copiedCount++;
+          continue;
+        }
+
         if (fs.existsSync(file.path)) {
-          const destPath = path.join(destFolder, file.name);
-          // Handle duplicate filenames
-          let finalPath = destPath;
-          let counter = 1;
-          while (fs.existsSync(finalPath)) {
-            const ext = path.extname(file.name);
-            const base = path.basename(file.name, ext);
-            finalPath = path.join(destFolder, `${base}_${counter}${ext}`);
-            counter++;
-          }
+          const finalPath = resolveUniquePackagePath(destFolder, file.name);
           fs.copyFileSync(file.path, finalPath);
           copiedCount++;
         } else {
