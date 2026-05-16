@@ -1,12 +1,57 @@
 // Phase 2 — Figma Link Per-Project tests.
 // Loads main.js with stubbed Electron / electron-store / chokidar / ag-psd /
 // node-fetch / uuid so we can exercise the IPC handlers in isolation. The
-// real parsers/figma.js is left untouched.
+// real Figma URL/scope parsing helpers are reused.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
 const path = require('path');
+const { promisify: nodePromisify } = require('util');
+
+// Track timers created by main.js so each test can prove it exits cleanly.
+const originalSetInterval = global.setInterval;
+const originalClearInterval = global.clearInterval;
+const originalSetTimeout = global.setTimeout;
+const originalClearTimeout = global.clearTimeout;
+const activeIntervals = new Set();
+const activeTimeouts = new Set();
+
+global.setInterval = function trackedSetInterval(fn, delay, ...args) {
+  const timer = originalSetInterval(fn, delay, ...args);
+  activeIntervals.add(timer);
+  return timer;
+};
+
+global.clearInterval = function trackedClearInterval(timer) {
+  activeIntervals.delete(timer);
+  return originalClearInterval(timer);
+};
+
+global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
+  let timer;
+  const wrapped = (...wrappedArgs) => {
+    activeTimeouts.delete(timer);
+    return fn(...wrappedArgs);
+  };
+  timer = originalSetTimeout(wrapped, delay, ...args);
+  activeTimeouts.add(timer);
+  return timer;
+};
+
+global.clearTimeout = function trackedClearTimeout(timer) {
+  activeTimeouts.delete(timer);
+  return originalClearTimeout(timer);
+};
+
+function clearTrackedTimers() {
+  for (const timer of [...activeIntervals]) {
+    global.clearInterval(timer);
+  }
+  for (const timer of [...activeTimeouts]) {
+    global.clearTimeout(timer);
+  }
+}
 
 // ---------- Module stub plumbing ----------
 const STUBS = new Map();
@@ -97,8 +142,70 @@ setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add:
 // ag-psd — not exercised in these tests.
 setStub('ag-psd', () => ({ readPsd: () => ({}) }));
 
+// child_process — watcher probes are outside this test's scope.
+function createChildProcessStub() {
+  return {
+    on: () => {},
+    kill: () => {},
+    stdout: { on: () => {} },
+    stderr: { on: () => {} },
+  };
+}
+
+function getCallback(args) {
+  return args.find(arg => typeof arg === 'function');
+}
+
+function execStub(...args) {
+  const callback = getCallback(args);
+  if (callback) queueMicrotask(() => callback(null, '', ''));
+  return createChildProcessStub();
+}
+execStub[nodePromisify.custom] = async () => ({ stdout: '', stderr: '' });
+
+function execFileStub(...args) {
+  const callback = getCallback(args);
+  if (callback) queueMicrotask(() => callback(null, '', ''));
+  return createChildProcessStub();
+}
+execFileStub[nodePromisify.custom] = async () => ({ stdout: '', stderr: '' });
+
+setStub('child_process', () => ({
+  execSync: () => '',
+  execFileSync: () => '',
+  exec: execStub,
+  execFile: execFileStub,
+}));
+
 // node-fetch — never called in these tests.
 setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+
+// Figma parser — keep the real URL/scope parsing helpers, but make auth and
+// polling deterministic instead of depending on the developer machine.
+const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
+let storedFigmaToken = null;
+class TestFigmaParser extends RealFigmaParser {
+  async getStoredToken() {
+    return storedFigmaToken;
+  }
+
+  async storeToken(token) {
+    if (!token || typeof token !== 'string') return false;
+    storedFigmaToken = token;
+    return true;
+  }
+
+  async deleteToken() {
+    const hadToken = !!storedFigmaToken;
+    storedFigmaToken = null;
+    return hadToken;
+  }
+
+  async autoTrackScan() {
+    return { files: [], assets: [], errors: [], warnings: [], scopeEntries: [] };
+  }
+}
+setStub('./parsers/figma', () => ({ FigmaParser: TestFigmaParser }));
 
 // Deterministic uuid.
 let uuidCounter = 0;
@@ -130,6 +237,16 @@ async function getActiveFigmaPollerCount() {
   return status.activeProjectCount || 0;
 }
 
+async function waitForActiveFigmaPollerCount(expected) {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const actual = await getActiveFigmaPollerCount();
+    if (actual === expected) return;
+    await new Promise(resolve => originalSetTimeout(resolve, 10));
+  }
+  assert.equal(await getActiveFigmaPollerCount(), expected);
+}
+
 async function resetProjects() {
   const projects = await callIpc('projects:get-all');
   for (const project of [...projects]) {
@@ -137,9 +254,20 @@ async function resetProjects() {
   }
 }
 
-// projects:delete is registered? Let's just reach into the store via a custom
-// channel: we don't have one, so fall back to manipulating handlers directly.
-// Easier: skip cross-test cleanup and let each test rely on uuids being unique.
+async function cleanupProjectsAndTimers() {
+  storedFigmaToken = null;
+  await callIpc('projects:delete-all');
+  clearTrackedTimers();
+}
+
+test.afterEach(cleanupProjectsAndTimers);
+test.after(() => {
+  clearTrackedTimers();
+  global.setInterval = originalSetInterval;
+  global.clearInterval = originalClearInterval;
+  global.setTimeout = originalSetTimeout;
+  global.clearTimeout = originalClearTimeout;
+});
 
 // ---------- Tests ----------
 
@@ -166,7 +294,7 @@ test('projects:create with a Figma URL stores per-project tracked file', async (
   assert.ok(fresh.figmaSession, 'figmaSession should be populated');
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, 'ABC123');
-  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
 test('projects:create without a Figma URL leaves figmaTrackedFiles empty', async () => {
@@ -213,7 +341,7 @@ test('projects:set-figma-link clears the link when url is empty', async () => {
     'https://www.figma.com/file/CLEARME/My-File'
   );
   assert.equal(project.figmaTrackedFiles.length, 1);
-  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 
   const cleared = await callIpc('projects:set-figma-link', project.id, { url: '', scopeMode: 'current-page' });
   assert.equal(cleared.success, true);
@@ -253,7 +381,29 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   // Phase 1 page-lock behavior must still be applied to the per-project URL.
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '2:2');
-  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore + 1);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('figma:connect starts polling for linked watching projects', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
+  const project = await callIpc(
+    'projects:create',
+    'Phase2-connect-starts-polling',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/CONNECT9/Connect-File?page-id=3%3A3'
+  );
+
+  assert.ok(project && project.id, 'project should be created');
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+
+  const connected = await callIpc('figma:connect', 'test-token');
+  assert.equal(connected.success, true);
+  await waitForActiveFigmaPollerCount(activePollersBefore + 1);
+
+  const disconnected = await callIpc('figma:disconnect');
+  assert.equal(disconnected.success, true);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
 test('figmaSession snapshot reads tracked files from the project, not settings', async () => {
