@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const Module = require('module');
 const path = require('path');
 const { promisify: nodePromisify } = require('util');
+const { PROVENANCE_SCHEMA_VERSION } = require('../provenance');
 
 // Track timers created by main.js so each test can prove it exits cleanly.
 const originalSetInterval = global.setInterval;
@@ -288,10 +289,13 @@ test('projects:create with a Figma URL stores per-project tracked file', async (
   assert.equal(project.figmaTrackedFiles[0].key, 'ABC123');
   assert.equal(project.figmaTrackedFiles[0].url, url);
   assert.equal(project.figmaScopeMode, 'current-page');
+  assert.equal(project.provenance.schemaVersion, PROVENANCE_SCHEMA_VERSION);
+  assert.deepEqual(project.provenance.observations, []);
 
   // Snapshot is built on startWatching — confirm the tracked file shows up there too.
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
   assert.ok(fresh.figmaSession, 'figmaSession should be populated');
+  assert.equal(fresh.provenance.schemaVersion, PROVENANCE_SCHEMA_VERSION);
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, 'ABC123');
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
