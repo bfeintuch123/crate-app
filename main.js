@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { readPsd } = require('ag-psd');
 const fetch = require('node-fetch');
+const { ensureProjectProvenance } = require('./provenance');
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -701,6 +702,14 @@ function getProjects() {
   return Array.isArray(val) ? val : [];
 }
 
+function safelyEnsureProjectProvenance(project) {
+  try {
+    ensureProjectProvenance(project);
+  } catch (e) {
+    console.warn('[crate][provenance] initialization skipped:', e.message);
+  }
+}
+
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
 function mutateProject(projectId, fn) {
   const projects = getProjects();
@@ -712,6 +721,7 @@ function mutateProject(projectId, fn) {
   } else {
     project.files = deduplicateFiles(project.files);
   }
+  safelyEnsureProjectProvenance(project);
   store.set('projects', projects);
   return result;
 }
@@ -3306,6 +3316,7 @@ ipcMain.handle('projects:create', async (event, name, projectType = 'branding', 
     packagedAt: null,
     outputPath: null
   };
+  safelyEnsureProjectProvenance(newProject);
   projects.push(newProject);
   store.set('projects', projects);
   await startWatching(newProject.id);
