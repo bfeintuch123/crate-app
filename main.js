@@ -12,7 +12,17 @@ const crypto = require('crypto');
 const os = require('os');
 const { readPsd } = require('ag-psd');
 const fetch = require('node-fetch');
-const { ensureProjectProvenance } = require('./provenance');
+const {
+  NODE_TYPES,
+  EDGE_TYPES,
+  OBSERVER_KINDS,
+  CONFIDENCE_BANDS,
+  createNodeId,
+  createDedupeKey,
+  createObservationRecord,
+  ensureProjectProvenance,
+  appendObservation,
+} = require('./provenance');
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -707,6 +717,92 @@ function safelyEnsureProjectProvenance(project) {
     ensureProjectProvenance(project);
   } catch (e) {
     console.warn('[crate][provenance] initialization skipped:', e.message);
+  }
+}
+
+function getProjectProvenanceSessionId(project, provenance) {
+  if (provenance && typeof provenance.sessionId === 'string' && provenance.sessionId.trim()) {
+    return provenance.sessionId.trim();
+  }
+
+  const sessionId = createNodeId(NODE_TYPES.SESSION, {
+    projectId: project.id || null,
+    watchStartedAt: project.watchStartedAt || null,
+    createdAt: project.createdAt || null,
+  });
+  if (provenance) provenance.sessionId = sessionId;
+  return sessionId;
+}
+
+function recordSessionObservedFile(project, fileEntry, observer = {}) {
+  try {
+    if (!project || !fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return;
+    const provenance = ensureProjectProvenance(project);
+    if (!provenance) return;
+
+    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+    if (!normalizedPath) return;
+
+    const sessionId = getProjectProvenanceSessionId(project, provenance);
+    const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+    const method = typeof observer.method === 'string' && observer.method.trim()
+      ? observer.method.trim()
+      : 'unknown';
+    const observerKind = typeof observer.kind === 'string' && observer.kind.trim()
+      ? observer.kind.trim()
+      : 'unknown';
+    const confidence = observerKind === OBSERVER_KINDS.MANUAL_USER_ACTION
+      ? CONFIDENCE_BANDS.CONFIRMED
+      : CONFIDENCE_BANDS.CANDIDATE;
+
+    provenance.nodes[sessionId] = {
+      ...(provenance.nodes[sessionId] || {}),
+      id: sessionId,
+      type: NODE_TYPES.SESSION,
+      projectId: project.id || null,
+      startedAt: project.watchStartedAt || project.createdAt || null,
+      status: project.status || null,
+    };
+    provenance.nodes[fileNodeId] = {
+      ...(provenance.nodes[fileNodeId] || {}),
+      id: fileNodeId,
+      type: NODE_TYPES.FILE,
+      path: fileEntry.path,
+      normalizedPath,
+      name: fileEntry.name || path.basename(fileEntry.path),
+      ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+      source: fileEntry.source || null,
+    };
+
+    const observedAt = fileEntry.addedAt || Date.now();
+    const observation = createObservationRecord({
+      projectId: project.id || null,
+      sessionId,
+      observedAt,
+      observer: {
+        ...observer,
+        kind: observerKind,
+        method,
+      },
+      kind: EDGE_TYPES.SESSION_OBSERVED_FILE,
+      subjectNodeId: sessionId,
+      objectNodeId: fileNodeId,
+      relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+      confidence,
+      dedupeKey: createDedupeKey(
+        project.id || 'unknown_project',
+        sessionId,
+        method,
+        EDGE_TYPES.SESSION_OBSERVED_FILE,
+        normalizedPath
+      ),
+      payload: {
+        source: fileEntry.source || null,
+      },
+    });
+    appendObservation(provenance, observation);
+  } catch (e) {
+    console.warn('[crate][provenance] session_observed_file skipped:', e.message);
   }
 }
 
@@ -3082,6 +3178,10 @@ async function startWatching(projectId) {
         if (proj.status !== 'watching') return null;
         if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
         proj.files.push(fileEntry);
+        recordSessionObservedFile(proj, fileEntry, {
+          kind: OBSERVER_KINDS.CHOKIDAR,
+          method: 'add',
+        });
         proj.files = deduplicateFiles(proj.files);
         return { files: proj.files };
       });
@@ -3121,6 +3221,10 @@ async function startWatching(projectId) {
         if (proj.status !== 'watching') return null;
         if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
         proj.files.push(fileEntry);
+        recordSessionObservedFile(proj, fileEntry, {
+          kind: OBSERVER_KINDS.CHOKIDAR,
+          method: 'change',
+        });
         proj.files = deduplicateFiles(proj.files);
         return { files: proj.files };
       });
@@ -3473,12 +3577,17 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
   const result = mutateProject(projectId, (project) => {
     for (const filePath of filePaths) {
       if (!project.files.some(f => f.path === filePath)) {
-        project.files.push({
+        const fileEntry = {
           path: filePath,
           name: path.basename(filePath),
           ext: path.extname(filePath).toLowerCase(),
           addedAt: Date.now(),
           source: 'manual-browse', // M1
+        };
+        project.files.push(fileEntry);
+        recordSessionObservedFile(project, fileEntry, {
+          kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+          method: 'projects:add-files',
         });
       }
     }
