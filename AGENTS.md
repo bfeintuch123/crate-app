@@ -67,6 +67,9 @@ Use:
 - `crate-benchmark-fixtures.md` for defining repeatable synthetic workflow fixtures and expected package/provenance outputs.
 - `crate-package-diff.md` for before/after package output comparisons.
 - `crate-provenance-snapshot.md` for provenance graph snapshot and confidence-diff reviews.
+- `crate-tester-intake.md` for turning external designer testing into structured, privacy-safe product feedback.
+- `crate-bug-triage.md` for converting tester feedback into actionable engineering scope, issue drafts, and next-playbook recommendations.
+- `crate-manual-qa-matrix.md` for repeatable manual QA workflows before tester rollout and releases.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 
