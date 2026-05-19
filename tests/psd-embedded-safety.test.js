@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { promisify: nodePromisify } = require('util');
+const { EDGE_TYPES } = require('../provenance');
 
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
@@ -224,6 +225,15 @@ function setProjects(projects) {
   storeInstance.set('projects', projects);
 }
 
+function getStoredProject(projectId) {
+  return (storeInstance.get('projects', []) || []).find(project => project.id === projectId);
+}
+
+function getProvenanceEdges(project, relationType) {
+  return Object.values((project && project.provenance && project.provenance.edges) || {})
+    .filter(edge => edge && edge.relationType === relationType);
+}
+
 function fixtureLinkedFiles() {
   return [
     { name: '../escape.png', data: Buffer.from('embedded escape bytes') },
@@ -248,6 +258,103 @@ test.after(() => {
   clearTrackedTimeouts();
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
+});
+
+test('package provenance records copied files and skips missing files', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const missingPath = path.join(tmpRoot, 'missing.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+
+    setProjects([
+      makeProject('package-provenance-copy', 'Package Provenance Copy', [
+        {
+          path: sourcePath,
+          name: 'logo.ai',
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: missingPath,
+          name: 'missing.ai',
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+      ]),
+    ]);
+
+    const result = await callIpc('projects:package', 'package-provenance-copy', outputDir);
+
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 2);
+    assert.deepEqual(result.errors, ['File not found: missing.ai']);
+
+    const destFolder = packageFolder(outputDir, 'Package Provenance Copy');
+    const copiedPath = path.join(destFolder, 'logo.ai');
+    assert.equal(fs.readFileSync(copiedPath, 'utf8'), 'logo bytes');
+
+    const project = getStoredProject('package-provenance-copy');
+    const includeEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_INCLUDES_FILE);
+    const extractEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE);
+    assert.equal(includeEdges.length, 1);
+    assert.equal(extractEdges.length, 0);
+    assert.equal(includeEdges[0].payload.outputPath, copiedPath);
+    assert.equal(includeEdges[0].payload.source, 'manual-browse');
+    assert.equal(includeEdges[0].confidence.band, 'confirmed');
+    assert.ok(project.provenance.nodes[includeEdges[0].subjectNodeId]);
+    assert.ok(project.provenance.nodes[includeEdges[0].objectNodeId]);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package provenance failure does not block package success', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+
+    const project = makeProject('package-provenance-failure', 'Package Provenance Failure', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }]);
+    project.provenance = {
+      schemaVersion: 1,
+      sessionId: null,
+      nodes: new Proxy({}, {
+        set() {
+          throw new Error('forced package provenance failure');
+        },
+      }),
+      edges: {},
+      observations: [],
+      evidence: {},
+    };
+    setProjects([project]);
+
+    const result = await callIpc('projects:package', 'package-provenance-failure', outputDir);
+
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(result.errors, []);
+    const destFolder = packageFolder(outputDir, 'Package Provenance Failure');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'logo.ai'), 'utf8'), 'logo bytes');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('pre-package PSD embedded extraction sanitizes unsafe names and preserves duplicate bytes', async () => {
@@ -332,6 +439,24 @@ test('package writes scan-on-save PSD embedded asset bytes with safe unique name
 
     for (const fileName of ['escape.png', 'absolute-path-like.png', 'duplicate.png', 'duplicate_1.png']) {
       assert.notEqual(fs.readFileSync(path.join(destFolder, fileName), 'utf8'), 'parent psd bytes');
+    }
+
+    const project = getStoredProject('psd-package-safety');
+    const includeEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_INCLUDES_FILE);
+    const extractEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE);
+    assert.equal(includeEdges.length, 0);
+    assert.equal(extractEdges.length, 4);
+    assert.equal(
+      extractEdges.every(edge => edge.confidence.band === 'confirmed' && edge.payload.source === 'scan-on-save-embedded'),
+      true
+    );
+    assert.deepEqual(
+      extractEdges.map(edge => path.basename(edge.payload.outputPath)).sort(),
+      ['absolute-path-like.png', 'duplicate.png', 'duplicate_1.png', 'escape.png']
+    );
+    for (const edge of extractEdges) {
+      assert.equal(project.provenance.nodes[edge.objectNodeId].type, 'embeddedResource');
+      assert.ok(project.provenance.nodes[edge.subjectNodeId]);
     }
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });

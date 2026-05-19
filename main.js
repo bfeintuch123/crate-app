@@ -18,7 +18,9 @@ const {
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
   createNodeId,
+  createEdgeId,
   createDedupeKey,
+  createConfidence,
   createObservationRecord,
   ensureProjectProvenance,
   appendObservation,
@@ -878,6 +880,117 @@ function recordPendingFileDecision(project, fileEntry, decision) {
     appendObservation(provenance, observation);
   } catch (e) {
     console.warn('[crate][provenance] pending decision skipped:', e.message);
+  }
+}
+
+function upsertPackageNode(provenance, project, packageInfo) {
+  const packageNodeId = createNodeId(NODE_TYPES.PACKAGE, {
+    projectId: project.id || null,
+    path: packageInfo.destFolder,
+    createdAt: packageInfo.createdAt,
+  });
+  provenance.nodes[packageNodeId] = {
+    ...(provenance.nodes[packageNodeId] || {}),
+    id: packageNodeId,
+    type: NODE_TYPES.PACKAGE,
+    projectId: project.id || null,
+    sessionId: getProjectProvenanceSessionId(project, provenance),
+    path: packageInfo.destFolder,
+    createdAt: packageInfo.createdAt,
+  };
+  return packageNodeId;
+}
+
+function upsertPackageSourceFileNode(provenance, fileEntry) {
+  const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+  if (!normalizedPath) return null;
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  provenance.nodes[fileNodeId] = {
+    ...(provenance.nodes[fileNodeId] || {}),
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: fileEntry.path,
+    normalizedPath,
+    name: fileEntry.name || path.basename(fileEntry.path),
+    ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+    source: fileEntry.source || null,
+  };
+  return fileNodeId;
+}
+
+function upsertPackageEmbeddedResourceNode(provenance, fileEntry) {
+  const parentPsd = normalizeTrackedFilePath(fileEntry.parentPsd || fileEntry.path);
+  const resourceKey = createDedupeKey(
+    'scan-on-save-psd',
+    parentPsd,
+    Number.isInteger(fileEntry.embeddedIndex) ? fileEntry.embeddedIndex : '',
+    fileEntry.embeddedOriginalName || fileEntry.name || ''
+  );
+  const resourceNodeId = createNodeId(NODE_TYPES.EMBEDDED_RESOURCE, { resourceKey });
+  provenance.nodes[resourceNodeId] = {
+    ...(provenance.nodes[resourceNodeId] || {}),
+    id: resourceNodeId,
+    type: NODE_TYPES.EMBEDDED_RESOURCE,
+    resourceKey,
+    name: fileEntry.name || fileEntry.embeddedOriginalName || null,
+    ext: fileEntry.ext || path.extname(fileEntry.name || '').toLowerCase(),
+    sourceMetadata: {
+      source: fileEntry.source || null,
+      parentPsd: fileEntry.parentPsd || fileEntry.path || null,
+      embeddedIndex: Number.isInteger(fileEntry.embeddedIndex) ? fileEntry.embeddedIndex : null,
+      embeddedOriginalName: fileEntry.embeddedOriginalName || null,
+    },
+  };
+  return resourceNodeId;
+}
+
+function recordPackageProvenance(projectId, packageInfo, events = []) {
+  try {
+    if (!Array.isArray(events) || events.length === 0) return;
+    mutateProject(projectId, (project) => {
+      const provenance = ensureProjectProvenance(project);
+      if (!provenance) return null;
+      const packageNodeId = upsertPackageNode(provenance, project, packageInfo);
+
+      for (const event of events) {
+        const relationType = event && event.relationType;
+        if (relationType !== EDGE_TYPES.PACKAGE_INCLUDES_FILE && relationType !== EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE) {
+          continue;
+        }
+
+        const objectNodeId = relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE
+          ? upsertPackageEmbeddedResourceNode(provenance, event.file)
+          : upsertPackageSourceFileNode(provenance, event.file);
+        if (!objectNodeId) continue;
+
+        const dedupeKey = createDedupeKey(
+          project.id || 'unknown_project',
+          packageNodeId,
+          relationType,
+          event.outputPath || '',
+          event.file && (event.file.fileId || event.file.path || event.file.name)
+        );
+        const edgeId = createEdgeId(relationType, packageNodeId, objectNodeId, dedupeKey);
+        provenance.edges[edgeId] = {
+          ...(provenance.edges[edgeId] || {}),
+          id: edgeId,
+          type: relationType,
+          relationType,
+          subjectNodeId: packageNodeId,
+          objectNodeId,
+          confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, 'package operation succeeded'),
+          evidenceIds: [],
+          dedupeKey,
+          payload: {
+            outputPath: event.outputPath || null,
+            source: event.file && event.file.source ? event.file.source : null,
+          },
+        };
+      }
+      return null;
+    });
+  } catch (e) {
+    console.warn('[crate][provenance] package provenance skipped:', e.message);
   }
 }
 
@@ -4614,6 +4727,11 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
     let copiedCount = 0;
     const errors = [];
+    const packageProvenanceEvents = [];
+    const packageProvenanceInfo = {
+      destFolder,
+      createdAt: Date.now(),
+    };
 
     for (const file of packageFiles) {
       try {
@@ -4621,6 +4739,11 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
           const safeName = sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName);
           const finalPath = resolveUniquePackagePath(destFolder, safeName);
           await writeEmbeddedPsdAssetToPackage(file, finalPath);
+          packageProvenanceEvents.push({
+            relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
+            file,
+            outputPath: finalPath,
+          });
           copiedCount++;
           continue;
         }
@@ -4628,6 +4751,11 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
         if (fs.existsSync(file.path)) {
           const finalPath = resolveUniquePackagePath(destFolder, file.name);
           fs.copyFileSync(file.path, finalPath);
+          packageProvenanceEvents.push({
+            relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
+            file,
+            outputPath: finalPath,
+          });
           copiedCount++;
         } else {
           errors.push(`File not found: ${file.name}`);
@@ -4671,6 +4799,8 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
         errors.push(`Embedded media extraction failed for ${file.name}: ${embedErr.message}`);
       }
     }
+
+    recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
