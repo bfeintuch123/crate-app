@@ -64,6 +64,9 @@ Use:
 - `crate-security-scan.md` for Crate-specific path, package, parser, token, manifest, and filesystem-boundary security scans.
 - `crate-release-gate.md` for strict release-readiness gates before any release mutation begins.
 - `crate-pr-documenter.md` for factual PR summaries, reviewer notes, tester notes, and release-note drafts.
+- `crate-benchmark-fixtures.md` for defining repeatable synthetic workflow fixtures and expected package/provenance outputs.
+- `crate-package-diff.md` for before/after package output comparisons.
+- `crate-provenance-snapshot.md` for provenance graph snapshot and confidence-diff reviews.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 
