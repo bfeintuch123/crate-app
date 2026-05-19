@@ -6,17 +6,29 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { promisify: nodePromisify } = require('util');
-const { PROVENANCE_SCHEMA_VERSION } = require('../provenance');
+const {
+  EDGE_TYPES,
+  NODE_TYPES,
+  PROVENANCE_SCHEMA_VERSION,
+} = require('../provenance');
 
 // Track timers created by main.js so each test can prove it exits cleanly.
 const originalSetInterval = global.setInterval;
 const originalClearInterval = global.clearInterval;
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
+const originalHomedir = os.homedir;
+const TEST_HOME = path.join(os.tmpdir(), 'crate-figma-provenance-test-home');
 const activeIntervals = new Set();
 const activeTimeouts = new Set();
+
+fs.rmSync(TEST_HOME, { recursive: true, force: true });
+fs.mkdirSync(TEST_HOME, { recursive: true });
+os.homedir = () => TEST_HOME;
 
 global.setInterval = function trackedSetInterval(fn, delay, ...args) {
   const timer = originalSetInterval(fn, delay, ...args);
@@ -97,7 +109,7 @@ const electronStub = {
   dialog: { showOpenDialog: async () => ({ canceled: true }), showSaveDialog: async () => ({ canceled: true }) },
   shell: { openPath: () => {} },
   nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
-  Notification: class { constructor() {} show() {} },
+  Notification: class { static isSupported() { return false; } constructor() {} show() {} },
   Menu: { buildFromTemplate: () => ({}) },
 };
 setStub('electron', () => electronStub);
@@ -178,13 +190,14 @@ setStub('child_process', () => ({
   execFile: execFileStub,
 }));
 
-// node-fetch — never called in these tests.
-setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+let fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
+setStub('node-fetch', () => (...args) => fetchHandler(...args));
 
 // Figma parser — keep the real URL/scope parsing helpers, but make auth and
 // polling deterministic instead of depending on the developer machine.
 const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
 let storedFigmaToken = null;
+let nextFigmaScanResult = null;
 class TestFigmaParser extends RealFigmaParser {
   async getStoredToken() {
     return storedFigmaToken;
@@ -203,7 +216,13 @@ class TestFigmaParser extends RealFigmaParser {
   }
 
   async autoTrackScan() {
-    return { files: [], assets: [], errors: [], warnings: [], scopeEntries: [] };
+    return JSON.parse(JSON.stringify(nextFigmaScanResult || {
+      files: [],
+      assets: [],
+      errors: [],
+      warnings: [],
+      scopeEntries: [],
+    }));
   }
 }
 setStub('./parsers/figma', () => ({ FigmaParser: TestFigmaParser }));
@@ -257,8 +276,12 @@ async function resetProjects() {
 
 async function cleanupProjectsAndTimers() {
   storedFigmaToken = null;
+  nextFigmaScanResult = null;
+  fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('projects:delete-all');
   clearTrackedTimers();
+  fs.rmSync(TEST_HOME, { recursive: true, force: true });
+  fs.mkdirSync(TEST_HOME, { recursive: true });
 }
 
 test.afterEach(cleanupProjectsAndTimers);
@@ -268,7 +291,72 @@ test.after(() => {
   global.clearInterval = originalClearInterval;
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
+  os.homedir = originalHomedir;
+  fs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
+
+async function waitForProject(projectId, predicate, message) {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const project = (await callIpc('projects:get-all')).find(p => p.id === projectId);
+    if (project && predicate(project)) return project;
+    await new Promise(resolve => originalSetTimeout(resolve, 10));
+  }
+  const project = (await callIpc('projects:get-all')).find(p => p.id === projectId);
+  assert.ok(project && predicate(project), message);
+  return project;
+}
+
+function getProvenanceEdges(project, relationType) {
+  return Object.values((project.provenance && project.provenance.edges) || {})
+    .filter(edge => edge && edge.relationType === relationType);
+}
+
+function getProvenanceNodes(project, type) {
+  return Object.values((project.provenance && project.provenance.nodes) || {})
+    .filter(node => node && node.type === type);
+}
+
+function setFigmaDownloadResponse(body = 'figma asset bytes') {
+  fetchHandler = async () => ({
+    ok: true,
+    status: 200,
+    buffer: async () => Buffer.from(body),
+    json: async () => ({}),
+  });
+}
+
+function figmaScanResult(assets, scopeEntries = []) {
+  return {
+    files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
+    assets,
+    errors: [],
+    warnings: [],
+    scopeEntries,
+  };
+}
+
+async function createLinkedFigmaProject(name = 'Figma Provenance') {
+  const project = await callIpc(
+    'projects:create',
+    name,
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  await new Promise(resolve => originalSetTimeout(resolve, 20));
+  storedFigmaToken = 'test-token';
+  return project;
+}
+
+function packageFolder(outputDir, projectName) {
+  const dateStr = new Date().toISOString().split('T')[0];
+  return path.join(outputDir, `${projectName}_${dateStr}`);
+}
+
+function readManifest(outputDir, projectName) {
+  return JSON.parse(fs.readFileSync(path.join(packageFolder(outputDir, projectName), 'crate-provenance.json'), 'utf8'));
+}
 
 // ---------- Tests ----------
 
@@ -435,4 +523,203 @@ test('figmaSession snapshot reads tracked files from the project, not settings',
   await callIpc('settings:update', 'figmaTrackedFiles', [{ key: 'INJECT', url: 'x' }]);
   const settingsAfter = await callIpc('settings:get');
   assert.equal(settingsAfter.figmaTrackedFiles, undefined);
+});
+
+test('Figma asset scan records cloud resource materialization provenance after ledger add', async () => {
+  const project = await createLinkedFigmaProject('Figma Provenance Materialized');
+  setFigmaDownloadResponse('hero image bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/signed/SHOULD_NOT_APPEAR_URL?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-hero',
+    imageRef: 'img-hero',
+    name: 'Hero Image',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const scan = await callIpc('figma:scan-project', project.id);
+  assert.equal(scan.success, true);
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should be added');
+  const file = fresh.files[0];
+  assert.equal(file.source, 'figma-auto');
+  assert.equal(file.figmaFileKey, 'FIG22');
+  assert.equal(file.figmaFileName, 'Brand Cloud');
+  assert.equal(file.figmaPageId, '1:1');
+  assert.equal(file.figmaPageName, 'Page One');
+  assert.equal(file.figmaScopeMode, 'current-page');
+  assert.equal(file.figmaAssetKey, 'FIG22:img-hero');
+  assert.equal(fs.readFileSync(file.path, 'utf8'), 'hero image bytes');
+
+  const cloudNodes = getProvenanceNodes(fresh, NODE_TYPES.CLOUD_DOCUMENT);
+  const resourceNodes = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE);
+  const materializedEdges = getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE);
+  assert.equal(cloudNodes.length, 1);
+  assert.equal(resourceNodes.length, 1);
+  assert.equal(materializedEdges.length, 1);
+  assert.equal(cloudNodes[0].provider, 'figma');
+  assert.equal(cloudNodes[0].fileKey, 'FIG22');
+  assert.equal(cloudNodes[0].pageId, '1:1');
+  assert.equal(resourceNodes[0].provider, 'figma');
+  assert.equal(resourceNodes[0].resourceKey, 'img-hero');
+  assert.equal(resourceNodes[0].cloudDocumentNodeId, cloudNodes[0].id);
+  assert.equal(materializedEdges[0].subjectNodeId, resourceNodes[0].id);
+  assert.equal(materializedEdges[0].confidence.band, 'confirmed');
+
+  const provenanceText = JSON.stringify(fresh.provenance);
+  assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_URL'), false);
+  assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+});
+
+test('Duplicate Figma asset scans do not duplicate files or provenance edges', async () => {
+  const project = await createLinkedFigmaProject('Figma Provenance Duplicate');
+  setFigmaDownloadResponse('duplicate image bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/duplicate.png',
+    nodeId: 'node-duplicate',
+    imageRef: 'img-duplicate',
+    name: 'Duplicate Image',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Duplicate scan should keep one file');
+  assert.equal(fresh.files.length, 1);
+  assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+});
+
+test('Figma download failure or duplicate skip does not create materialization provenance', async () => {
+  const project = await createLinkedFigmaProject('Figma Provenance Download Failure');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/fail.png',
+    nodeId: 'node-fail',
+    imageRef: 'img-fail',
+    name: 'Fail Image',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.CLOUD_DOCUMENT).length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE).length, 0);
+  assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+});
+
+test('Figma provenance failure does not block asset capture', async () => {
+  const project = await createLinkedFigmaProject('Figma Provenance Failure');
+  const freshBefore = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  freshBefore.provenance.nodes = new Proxy({}, {
+    set() {
+      throw new Error('forced Figma provenance failure');
+    },
+  });
+  setFigmaDownloadResponse('capture survives provenance failure');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/failure.png',
+    nodeId: 'node-failure',
+    imageRef: 'img-failure',
+    name: 'Failure Image',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset capture should survive provenance failure');
+  assert.equal(fresh.files[0].source, 'figma-auto');
+  assert.equal(fs.readFileSync(fresh.files[0].path, 'utf8'), 'capture survives provenance failure');
+});
+
+test('Package manifest includes Figma graph only for packaged scoped assets', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-manifest-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Manifest Scope');
+    const outputDir = path.join(tmpRoot, 'out');
+    setFigmaDownloadResponse('manifest asset bytes');
+    nextFigmaScanResult = figmaScanResult([
+      {
+        url: 'https://cdn.figma.example/in-scope.png?token=SHOULD_NOT_APPEAR_TOKEN',
+        nodeId: 'node-in-scope',
+        imageRef: 'img-in-scope',
+        name: 'In Scope',
+        format: 'png',
+        figmaFileKey: 'FIG22',
+        figmaFileName: 'Brand Cloud',
+        figmaPageId: '1:1',
+        figmaPageName: 'Page One',
+      },
+      {
+        url: 'https://cdn.figma.example/out-of-scope.png?token=SHOULD_NOT_APPEAR_TOKEN',
+        nodeId: 'node-out-of-scope',
+        imageRef: 'img-out-of-scope',
+        name: 'Out Of Scope',
+        format: 'png',
+        figmaFileKey: 'FIG22',
+        figmaFileName: 'Brand Cloud',
+        figmaPageId: '2:2',
+        figmaPageName: 'Page Two',
+      },
+    ], [{
+      fileKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      warning: null,
+    }]);
+
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+    const scanned = await waitForProject(project.id, item => item.files.length === 2, 'Both Figma assets should enter the ledger');
+    assert.equal(scanned.files.filter(file => file.source === 'figma-auto').length, 2);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const manifest = readManifest(outputDir, 'Figma Manifest Scope');
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.CLOUD_DOCUMENT).length, 1);
+    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.EMBEDDED_RESOURCE && node.provider === 'figma').length, 1);
+
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('img-in-scope'), true);
+    assert.equal(manifestText.includes('img-out-of-scope'), false);
+    assert.equal(manifestText.includes('Out Of Scope'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+    assert.equal(manifestText.includes('cdn.figma.example'), false);
+    assert.equal(manifestText.includes('/usr/sbin/lsof'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
