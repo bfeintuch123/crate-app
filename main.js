@@ -25,6 +25,7 @@ const {
   createObservationRecord,
   ensureProjectProvenance,
   appendObservation,
+  upsertEvidence,
 } = require('./provenance');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -886,6 +887,182 @@ function recordPendingFileDecision(project, fileEntry, decision) {
   }
 }
 
+function getSafeFigmaAssetKey(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const trimmed = value.trim();
+  if (trimmed.includes('://')) return null;
+  return trimmed;
+}
+
+function getFigmaResourceIdentity(asset = {}, fileEntry = {}) {
+  const imageRef = typeof asset.imageRef === 'string' && asset.imageRef.trim()
+    ? asset.imageRef.trim()
+    : null;
+  const nodeId = typeof asset.nodeId === 'string' && asset.nodeId.trim()
+    ? asset.nodeId.trim()
+    : null;
+  const resourceKey = imageRef || nodeId;
+  if (!resourceKey) return null;
+
+  return {
+    resourceKey,
+    resourceKind: imageRef ? 'imageRef' : 'node',
+    figmaAssetKey: getSafeFigmaAssetKey(fileEntry.figmaAssetKey || asset.figmaAssetKey || null),
+  };
+}
+
+function recordFigmaAssetProvenance(project, fileEntry, asset = {}, contextLabel = 'scan') {
+  try {
+    if (!project || !fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return;
+    const provenance = ensureProjectProvenance(project);
+    if (!provenance) return;
+
+    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+    if (!normalizedPath) return;
+
+    const figmaFileKey = typeof fileEntry.figmaFileKey === 'string' && fileEntry.figmaFileKey.trim()
+      ? fileEntry.figmaFileKey.trim()
+      : (typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
+        ? asset.figmaFileKey.trim()
+        : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null));
+    if (!figmaFileKey) return;
+
+    const resource = getFigmaResourceIdentity(asset, fileEntry);
+    if (!resource) return;
+
+    const sessionId = getProjectProvenanceSessionId(project, provenance);
+    const figmaFileName = fileEntry.figmaFileName || asset.figmaFileName || null;
+    const figmaPageId = fileEntry.figmaPageId || asset.figmaPageId || null;
+    const figmaPageName = fileEntry.figmaPageName || asset.figmaPageName || null;
+    const figmaScopeMode = fileEntry.figmaScopeMode || asset.figmaScopeMode || null;
+    const cloudDocumentNodeId = createNodeId(NODE_TYPES.CLOUD_DOCUMENT, {
+      provider: 'figma',
+      fileKey: figmaFileKey,
+      pageId: figmaPageId,
+      scopeMode: figmaScopeMode,
+    });
+    const resourceNodeId = createNodeId(NODE_TYPES.EMBEDDED_RESOURCE, {
+      provider: 'figma',
+      fileKey: figmaFileKey,
+      resourceKey: resource.resourceKey,
+    });
+    const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+
+    provenance.nodes[cloudDocumentNodeId] = {
+      ...(provenance.nodes[cloudDocumentNodeId] || {}),
+      id: cloudDocumentNodeId,
+      type: NODE_TYPES.CLOUD_DOCUMENT,
+      provider: 'figma',
+      fileKey: figmaFileKey,
+      name: figmaFileName,
+      pageId: figmaPageId,
+      pageName: figmaPageName,
+      scopeMode: figmaScopeMode,
+      lockStatus: null,
+      projectId: project.id || null,
+    };
+    provenance.nodes[resourceNodeId] = {
+      ...(provenance.nodes[resourceNodeId] || {}),
+      id: resourceNodeId,
+      type: NODE_TYPES.EMBEDDED_RESOURCE,
+      provider: 'figma',
+      resourceKey: resource.resourceKey,
+      resourceKind: resource.resourceKind,
+      figmaAssetKey: resource.figmaAssetKey,
+      cloudDocumentNodeId,
+      name: asset.name || fileEntry.name || null,
+      ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+      sourceMetadata: {
+        source: fileEntry.source || null,
+        figmaFileKey,
+        figmaFileName,
+        figmaPageId,
+        figmaPageName,
+        figmaScopeMode,
+      },
+    };
+    provenance.nodes[fileNodeId] = {
+      ...(provenance.nodes[fileNodeId] || {}),
+      id: fileNodeId,
+      type: NODE_TYPES.FILE,
+      path: fileEntry.path,
+      normalizedPath,
+      name: fileEntry.name || path.basename(fileEntry.path),
+      ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+      source: fileEntry.source || null,
+    };
+
+    const evidence = upsertEvidence(provenance, {
+      kind: OBSERVER_KINDS.FIGMA_API,
+      observer: {
+        kind: OBSERVER_KINDS.FIGMA_API,
+        method: 'asset-download',
+        context: contextLabel || 'scan',
+      },
+      observedAt: fileEntry.addedAt || Date.now(),
+      identity: {
+        projectId: project.id || null,
+        figmaFileKey,
+        resourceKey: resource.resourceKey,
+        normalizedPath,
+      },
+      summary: 'Figma API asset was downloaded and added to the project file ledger',
+      payload: {
+        figmaFileKey,
+        figmaFileName,
+        figmaPageId,
+        figmaPageName,
+        figmaScopeMode,
+        resourceKey: resource.resourceKey,
+        resourceKind: resource.resourceKind,
+        figmaAssetKey: resource.figmaAssetKey,
+        localPath: fileEntry.path,
+        context: contextLabel || 'scan',
+      },
+    });
+
+    const dedupeKey = createDedupeKey(
+      project.id || 'unknown_project',
+      sessionId,
+      figmaFileKey,
+      resource.resourceKey,
+      normalizedPath,
+      EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE
+    );
+    const edgeId = createEdgeId(EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE, resourceNodeId, fileNodeId, dedupeKey);
+    provenance.edges[edgeId] = {
+      ...(provenance.edges[edgeId] || {}),
+      id: edgeId,
+      type: EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE,
+      relationType: EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE,
+      subjectNodeId: resourceNodeId,
+      objectNodeId: fileNodeId,
+      confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, 'Figma API asset download succeeded and file ledger was updated'),
+      evidenceIds: evidence && evidence.id ? [evidence.id] : [],
+      dedupeKey,
+      payload: {
+        observer: {
+          kind: OBSERVER_KINDS.FIGMA_API,
+          method: 'asset-download',
+          context: contextLabel || 'scan',
+        },
+        source: fileEntry.source || null,
+        figmaFileKey,
+        figmaFileName,
+        figmaPageId,
+        figmaPageName,
+        figmaScopeMode,
+        resourceKey: resource.resourceKey,
+        resourceKind: resource.resourceKind,
+        figmaAssetKey: resource.figmaAssetKey,
+        localPath: fileEntry.path,
+      },
+    };
+  } catch (e) {
+    console.warn('[crate][provenance] Figma asset provenance skipped:', e.message);
+  }
+}
+
 function upsertPsdParserContainerNode(provenance, project, psdFilePath) {
   const normalizedPath = normalizeTrackedFilePath(psdFilePath);
   if (!normalizedPath) return null;
@@ -1267,6 +1444,13 @@ function collectPackageManifestGraph(provenance, packageNodeId, warnings) {
     includedEdges[edge.id] = edge;
   }
 
+  for (const edge of Object.values(edges)) {
+    if (!edge || includedEdges[edge.id]) continue;
+    if (edge.relationType !== EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE) continue;
+    if (!packagedObjectNodeIds.has(edge.objectNodeId)) continue;
+    includedEdges[edge.id] = edge;
+  }
+
   for (const edge of Object.values(includedEdges)) {
     if (edge.subjectNodeId && nodes[edge.subjectNodeId]) includedNodes[edge.subjectNodeId] = nodes[edge.subjectNodeId];
     if (edge.objectNodeId && nodes[edge.objectNodeId]) includedNodes[edge.objectNodeId] = nodes[edge.objectNodeId];
@@ -1278,6 +1462,9 @@ function collectPackageManifestGraph(provenance, packageNodeId, warnings) {
   for (const node of Object.values(includedNodes)) {
     if (node && node.type === NODE_TYPES.CONTAINER && node.fileNodeId && nodes[node.fileNodeId]) {
       includedNodes[node.fileNodeId] = nodes[node.fileNodeId];
+    }
+    if (node && node.type === NODE_TYPES.EMBEDDED_RESOURCE && node.cloudDocumentNodeId && nodes[node.cloudDocumentNodeId]) {
+      includedNodes[node.cloudDocumentNodeId] = nodes[node.cloudDocumentNodeId];
     }
   }
 
@@ -1917,28 +2104,24 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         `[crate][figma] asset inserted (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
         `name=${fileRecord.name} localPath=${localPath}`
       );
-      return { files: proj.files };
+      return { files: proj.files, fileRecord };
     });
 
     if (result) {
       const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
       const projectHasFigmaKey = figmaAssetKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetKey);
       if (!projectHasLocalPath && !projectHasFigmaKey) {
-        project.files.push({
-          path: localPath,
-          name: path.basename(localPath),
-          ext: `.${assetFormat}`,
-          addedAt: Date.now(),
-          source: 'figma-auto',
-          figmaFileKey: asset.figmaFileKey,
-          figmaFileName: asset.figmaFileName,
-          figmaPageId: asset.figmaPageId || null,
-          figmaPageName: asset.figmaPageName || null,
-          figmaScopeMode: asset.figmaScopeMode || null,
-          figmaAssetKey
-        });
+        project.files.push({ ...result.fileRecord });
         project.files = deduplicateFiles(project.files);
       }
+      mutateProject(projectId, (proj) => {
+        const storedFile = (proj.files || []).find(file => (
+          normalizeTrackedFilePath(file.path) === normalizedLocalPath &&
+          (!figmaAssetKey || getFigmaAssetDedupKey(file) === figmaAssetKey)
+        )) || result.fileRecord;
+        recordFigmaAssetProvenance(proj, storedFile, asset, contextLabel);
+        return null;
+      });
       addedCount++;
       existingPaths.add(normalizedLocalPath);
       if (figmaAssetKey) existingFigmaAssetKeys.add(figmaAssetKey);
