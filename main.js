@@ -15,6 +15,7 @@ const fetch = require('node-fetch');
 const {
   NODE_TYPES,
   EDGE_TYPES,
+  PROVENANCE_SCHEMA_VERSION,
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
   createNodeId,
@@ -25,6 +26,8 @@ const {
   ensureProjectProvenance,
   appendObservation,
 } = require('./provenance');
+
+const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -1140,6 +1143,211 @@ function recordPackageProvenance(projectId, packageInfo, events = []) {
     });
   } catch (e) {
     console.warn('[crate][provenance] package provenance skipped:', e.message);
+  }
+}
+
+function getCrateVersion() {
+  try {
+    if (app && typeof app.getVersion === 'function') return app.getVersion();
+  } catch (e) {}
+
+  try {
+    const packageJson = require('./package.json');
+    return typeof packageJson.version === 'string' ? packageJson.version : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function normalizeManifestPathString(value) {
+  if (typeof value !== 'string' || value.length === 0) return value;
+
+  const homeDir = os.homedir().replace(/\/+$/, '');
+  if (!homeDir) return value;
+
+  const normalizedValue = value.replace(/\\/g, '/');
+  const normalizedHome = homeDir.replace(/\\/g, '/');
+  const lowerValue = normalizedValue.toLowerCase();
+  const lowerHome = normalizedHome.toLowerCase();
+
+  if (lowerValue === lowerHome) return '~';
+  if (lowerValue.startsWith(`${lowerHome}/`)) {
+    return `~/${normalizedValue.slice(normalizedHome.length + 1)}`;
+  }
+
+  return normalizedValue
+    .split(normalizedHome)
+    .join('~')
+    .split(lowerHome)
+    .join('~');
+}
+
+function isSensitiveManifestKey(key = '') {
+  const lowerKey = key.toLowerCase();
+  return (
+    lowerKey.includes('token') ||
+    lowerKey.includes('secret') ||
+    lowerKey.includes('apikey') ||
+    lowerKey.includes('api_key') ||
+    lowerKey.includes('command') ||
+    lowerKey.includes('raw') ||
+    lowerKey.includes('stdout') ||
+    lowerKey.includes('stderr') ||
+    lowerKey.includes('apiresponse') ||
+    lowerKey.includes('api_response')
+  );
+}
+
+function sanitizeManifestValue(value, key = '') {
+  if (isSensitiveManifestKey(key)) {
+    return '[redacted]';
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeManifestValue(item));
+  }
+
+  if (value && typeof value === 'object') {
+    const sanitized = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      sanitized[childKey] = sanitizeManifestValue(childValue, childKey);
+    }
+    return sanitized;
+  }
+
+  if (typeof value !== 'string') return value;
+
+  return normalizeManifestPathString(value);
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function sortedManifestRecords(recordsById) {
+  return Object.values(recordsById)
+    .filter(isRecord)
+    .sort((a, b) => `${a.id || ''}`.localeCompare(`${b.id || ''}`));
+}
+
+function collectPackageManifestGraph(provenance, packageNodeId, warnings) {
+  const nodes = isRecord(provenance && provenance.nodes) ? provenance.nodes : {};
+  const edges = isRecord(provenance && provenance.edges) ? provenance.edges : {};
+  const evidence = isRecord(provenance && provenance.evidence) ? provenance.evidence : {};
+  const includedEdges = {};
+  const includedNodes = {};
+  const includedEvidence = {};
+  const packagedObjectNodeIds = new Set();
+
+  if (nodes[packageNodeId]) {
+    includedNodes[packageNodeId] = nodes[packageNodeId];
+  }
+
+  for (const edge of Object.values(edges)) {
+    if (!edge || edge.subjectNodeId !== packageNodeId) continue;
+    if (
+      edge.relationType !== EDGE_TYPES.PACKAGE_INCLUDES_FILE &&
+      edge.relationType !== EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE
+    ) {
+      continue;
+    }
+    includedEdges[edge.id] = edge;
+    if (edge.objectNodeId) packagedObjectNodeIds.add(edge.objectNodeId);
+  }
+
+  for (const edge of Object.values(edges)) {
+    if (!edge || includedEdges[edge.id]) continue;
+    if (
+      edge.relationType !== EDGE_TYPES.CONTAINER_REFERENCES_FILE &&
+      edge.relationType !== EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE
+    ) {
+      continue;
+    }
+    if (!packagedObjectNodeIds.has(edge.objectNodeId)) continue;
+    includedEdges[edge.id] = edge;
+  }
+
+  for (const edge of Object.values(includedEdges)) {
+    if (edge.subjectNodeId && nodes[edge.subjectNodeId]) includedNodes[edge.subjectNodeId] = nodes[edge.subjectNodeId];
+    if (edge.objectNodeId && nodes[edge.objectNodeId]) includedNodes[edge.objectNodeId] = nodes[edge.objectNodeId];
+    for (const evidenceId of Array.isArray(edge.evidenceIds) ? edge.evidenceIds : []) {
+      if (evidence[evidenceId]) includedEvidence[evidenceId] = evidence[evidenceId];
+    }
+  }
+
+  for (const node of Object.values(includedNodes)) {
+    if (node && node.type === NODE_TYPES.CONTAINER && node.fileNodeId && nodes[node.fileNodeId]) {
+      includedNodes[node.fileNodeId] = nodes[node.fileNodeId];
+    }
+  }
+
+  if (Object.keys(includedEdges).length === 0) {
+    warnings.push('No package provenance edges were available for this package.');
+  }
+
+  return {
+    nodes: sortedManifestRecords(includedNodes),
+    edges: sortedManifestRecords(includedEdges),
+    evidence: sortedManifestRecords(includedEvidence),
+  };
+}
+
+function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
+  const provenance = isRecord(project && project.provenance) ? project.provenance : null;
+  const warnings = [
+    'Partial package-relevant provenance manifest only; this is not a full project graph.',
+    'Non-package graph records and raw capture observations are intentionally omitted.',
+  ];
+  if (!provenance) {
+    warnings.push('Project provenance sidecar was missing or invalid when this manifest was written.');
+  }
+
+  const packageNodeId = createNodeId(NODE_TYPES.PACKAGE, {
+    projectId: project && project.id ? project.id : null,
+    path: packageInfo.destFolder,
+    createdAt: packageInfo.createdAt,
+  });
+  const graph = collectPackageManifestGraph(provenance, packageNodeId, warnings);
+  const createdAt = Number.isFinite(packageInfo.createdAt)
+    ? new Date(packageInfo.createdAt).toISOString()
+    : null;
+
+  return sanitizeManifestValue({
+    schemaVersion: PROVENANCE_SCHEMA_VERSION,
+    scope: 'partial_package_relevant',
+    generatedAt: new Date().toISOString(),
+    generatedBy: {
+      app: 'Crate',
+      version: getCrateVersion(),
+    },
+    project: {
+      id: project && project.id ? project.id : null,
+      name: project && project.name ? project.name : null,
+      sessionId: provenance && typeof provenance.sessionId === 'string' ? provenance.sessionId : null,
+    },
+    package: {
+      path: packageInfo.destFolder,
+      createdAt,
+      copiedCount: packageResult.copiedCount,
+      embeddedCount: packageResult.embeddedCount,
+      totalFiles: packageResult.totalFiles,
+      errors: Array.isArray(packageResult.errors) ? packageResult.errors : [],
+    },
+    nodes: graph.nodes,
+    edges: graph.edges,
+    evidence: graph.evidence,
+    warnings,
+  });
+}
+
+function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {
+  try {
+    const project = getProjects().find(p => p.id === projectId) || null;
+    const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
+    const manifestPath = path.join(packageInfo.destFolder, PROVENANCE_MANIFEST_FILENAME);
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  } catch (e) {
+    console.warn('[crate][provenance] manifest write skipped:', e.message);
   }
 }
 
@@ -4951,6 +5159,12 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     }
 
     recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
+    writePackageProvenanceManifest(id, packageProvenanceInfo, {
+      copiedCount,
+      embeddedCount,
+      totalFiles: packageFiles.length,
+      errors,
+    });
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
