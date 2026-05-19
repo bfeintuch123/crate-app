@@ -259,6 +259,25 @@ function manualDialogFor(filePaths) {
   nextOpenDialogResult = { canceled: false, filePaths };
 }
 
+function makePendingFile(filePath, source = 'lastused-scan') {
+  return {
+    path: filePath,
+    name: path.basename(filePath),
+    ext: path.extname(filePath).toLowerCase(),
+    addedAt: Date.now(),
+    source,
+  };
+}
+
+async function setProjectFiles(projectId, { files = [], pendingFiles = [] } = {}) {
+  const projects = await callIpc('projects:get-all');
+  const project = projects.find(item => item.id === projectId);
+  assert.ok(project, 'expected project to exist');
+  project.files = files;
+  project.pendingFiles = pendingFiles;
+  return project;
+}
+
 function assertSessionObservedFile(project, observerKind, method, confidenceBand) {
   const observations = project.provenance.observations;
   assert.equal(observations.length, 1);
@@ -269,6 +288,24 @@ function assertSessionObservedFile(project, observerKind, method, confidenceBand
   assert.equal(observation.observer.method, method);
   assert.equal(observation.confidence.band, confidenceBand);
   assert.notEqual(observation.relationType, EDGE_TYPES.APP_OPENED_FILE);
+  assert.deepEqual(project.provenance.edges, {});
+  assert.ok(project.provenance.nodes[observation.subjectNodeId]);
+  assert.ok(project.provenance.nodes[observation.objectNodeId]);
+}
+
+function assertPendingRejectedObservation(project) {
+  const observations = project.provenance.observations;
+  assert.equal(observations.length, 1);
+  const observation = observations[0];
+  assert.equal(observation.kind, 'pending_file_rejected');
+  assert.equal(observation.relationType, 'pending_file_rejected');
+  assert.equal(observation.observer.kind, OBSERVER_KINDS.MANUAL_USER_ACTION);
+  assert.equal(observation.observer.method, 'projects:reject-pending');
+  assert.equal(observation.confidence.band, CONFIDENCE_BANDS.WEAK);
+  assert.deepEqual(observation.payload, {
+    decision: 'rejected',
+    source: 'lastused-scan',
+  });
   assert.deepEqual(project.provenance.edges, {});
   assert.ok(project.provenance.nodes[observation.subjectNodeId]);
   assert.ok(project.provenance.nodes[observation.objectNodeId]);
@@ -324,6 +361,139 @@ test('duplicate manual add does not duplicate session observations', async () =>
   const fresh = await getProject(project.id);
   assert.equal(fresh.files.length, 1);
   assert.equal(fresh.provenance.observations.length, 1);
+});
+
+test('accept pending preserves file ledger entry and records one confirmed session observation', async () => {
+  const project = await createProject('Accept pending provenance');
+  const filePath = path.join(os.tmpdir(), 'accepted-pending.ai');
+  const pendingFile = makePendingFile(filePath);
+  await setProjectFiles(project.id, { pendingFiles: [pendingFile] });
+
+  const result = await callIpc('projects:accept-pending', project.id, filePath);
+
+  assert.equal(result.files.length, 1);
+  assert.deepEqual(result.files[0], pendingFile);
+  assert.deepEqual(result.pendingFiles, []);
+
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, [pendingFile]);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assertSessionObservedFile(
+    fresh,
+    OBSERVER_KINDS.MANUAL_USER_ACTION,
+    'projects:accept-pending',
+    CONFIDENCE_BANDS.CONFIRMED
+  );
+});
+
+test('duplicate or already-present pending accept does not duplicate observations', async () => {
+  const project = await createProject('Duplicate pending accept provenance');
+  const filePath = path.join(os.tmpdir(), 'duplicate-pending.ai');
+  const pendingFile = makePendingFile(filePath);
+  await setProjectFiles(project.id, { pendingFiles: [pendingFile] });
+
+  await callIpc('projects:accept-pending', project.id, filePath);
+  const duplicateResult = await callIpc('projects:accept-pending', project.id, filePath);
+
+  assert.equal(duplicateResult, null);
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.files.length, 1);
+  assert.equal(fresh.provenance.observations.length, 1);
+
+  const alreadyPresentProject = await createProject('Already-present pending accept provenance');
+  const alreadyPresentPath = path.join(os.tmpdir(), 'already-present-pending.ai');
+  const alreadyPresentFile = makePendingFile(alreadyPresentPath);
+  await setProjectFiles(alreadyPresentProject.id, {
+    files: [alreadyPresentFile],
+    pendingFiles: [alreadyPresentFile],
+  });
+
+  const result = await callIpc('projects:accept-pending', alreadyPresentProject.id, alreadyPresentPath);
+
+  assert.equal(result.files.length, 1);
+  assert.deepEqual(result.pendingFiles, []);
+  fresh = await getProject(alreadyPresentProject.id);
+  assert.equal(fresh.files.length, 1);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.deepEqual(fresh.provenance.observations, []);
+});
+
+test('reject pending removes pending file and records evidence-only rejection', async () => {
+  const project = await createProject('Reject pending provenance');
+  const filePath = path.join(os.tmpdir(), 'rejected-pending.ai');
+  const pendingFile = makePendingFile(filePath);
+  await setProjectFiles(project.id, { pendingFiles: [pendingFile] });
+
+  const pendingFiles = await callIpc('projects:reject-pending', project.id, filePath);
+
+  assert.deepEqual(pendingFiles, []);
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assertPendingRejectedObservation(fresh);
+});
+
+test('duplicate or missing pending reject does not create observations', async () => {
+  const project = await createProject('Duplicate pending reject provenance');
+  const filePath = path.join(os.tmpdir(), 'duplicate-reject.ai');
+  const pendingFile = makePendingFile(filePath);
+  await setProjectFiles(project.id, { pendingFiles: [pendingFile] });
+
+  await callIpc('projects:reject-pending', project.id, filePath);
+  await callIpc('projects:reject-pending', project.id, filePath);
+
+  let fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(fresh.provenance.observations.length, 1);
+
+  const missingProject = await createProject('Missing pending reject provenance');
+  const missingResult = await callIpc(
+    'projects:reject-pending',
+    missingProject.id,
+    path.join(os.tmpdir(), 'missing-pending.ai')
+  );
+
+  assert.deepEqual(missingResult, []);
+  fresh = await getProject(missingProject.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.deepEqual(fresh.provenance.observations, []);
+});
+
+test('provenance recording failure does not block pending accept or reject', async () => {
+  const acceptProject = await createProject('Pending accept provenance failure');
+  const acceptPath = path.join(os.tmpdir(), 'accept-failure.ai');
+  const acceptFile = makePendingFile(acceptPath);
+  const storedAcceptProject = await setProjectFiles(acceptProject.id, { pendingFiles: [acceptFile] });
+  storedAcceptProject.provenance.observations = [];
+  storedAcceptProject.provenance.observations.find = () => {
+    throw new Error('forced pending accept provenance failure');
+  };
+
+  const acceptResult = await callIpc('projects:accept-pending', acceptProject.id, acceptPath);
+
+  assert.equal(acceptResult.files.length, 1);
+  assert.deepEqual(acceptResult.pendingFiles, []);
+  let fresh = await getProject(acceptProject.id);
+  assert.equal(fresh.files.length, 1);
+  assert.deepEqual(fresh.pendingFiles, []);
+
+  const rejectProject = await createProject('Pending reject provenance failure');
+  const rejectPath = path.join(os.tmpdir(), 'reject-failure.ai');
+  const rejectFile = makePendingFile(rejectPath);
+  const storedRejectProject = await setProjectFiles(rejectProject.id, { pendingFiles: [rejectFile] });
+  storedRejectProject.provenance.observations = [];
+  storedRejectProject.provenance.observations.find = () => {
+    throw new Error('forced pending reject provenance failure');
+  };
+
+  const rejectResult = await callIpc('projects:reject-pending', rejectProject.id, rejectPath);
+
+  assert.deepEqual(rejectResult, []);
+  fresh = await getProject(rejectProject.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
 });
 
 test('provenance recording failure does not block manual file capture', async () => {

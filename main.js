@@ -806,6 +806,81 @@ function recordSessionObservedFile(project, fileEntry, observer = {}) {
   }
 }
 
+function recordPendingFileDecision(project, fileEntry, decision) {
+  try {
+    if (!project || !fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return;
+
+    if (decision === 'accepted') {
+      recordSessionObservedFile(project, fileEntry, {
+        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+        method: 'projects:accept-pending',
+      });
+      return;
+    }
+
+    if (decision !== 'rejected') return;
+
+    const provenance = ensureProjectProvenance(project);
+    if (!provenance) return;
+
+    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+    if (!normalizedPath) return;
+
+    const sessionId = getProjectProvenanceSessionId(project, provenance);
+    const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+    const method = 'projects:reject-pending';
+    const relationType = 'pending_file_rejected';
+
+    provenance.nodes[sessionId] = {
+      ...(provenance.nodes[sessionId] || {}),
+      id: sessionId,
+      type: NODE_TYPES.SESSION,
+      projectId: project.id || null,
+      startedAt: project.watchStartedAt || project.createdAt || null,
+      status: project.status || null,
+    };
+    provenance.nodes[fileNodeId] = {
+      ...(provenance.nodes[fileNodeId] || {}),
+      id: fileNodeId,
+      type: NODE_TYPES.FILE,
+      path: fileEntry.path,
+      normalizedPath,
+      name: fileEntry.name || path.basename(fileEntry.path),
+      ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+      source: fileEntry.source || null,
+    };
+
+    const observation = createObservationRecord({
+      projectId: project.id || null,
+      sessionId,
+      observedAt: Date.now(),
+      observer: {
+        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+        method,
+      },
+      kind: relationType,
+      subjectNodeId: sessionId,
+      objectNodeId: fileNodeId,
+      relationType,
+      confidence: CONFIDENCE_BANDS.WEAK,
+      dedupeKey: createDedupeKey(
+        project.id || 'unknown_project',
+        sessionId,
+        method,
+        relationType,
+        normalizedPath
+      ),
+      payload: {
+        decision: 'rejected',
+        source: fileEntry.source || null,
+      },
+    });
+    appendObservation(provenance, observation);
+  } catch (e) {
+    console.warn('[crate][provenance] pending decision skipped:', e.message);
+  }
+}
+
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
 function mutateProject(projectId, fn) {
   const projects = getProjects();
@@ -3523,6 +3598,7 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
 
     if (!project.files.some(f => f.path === filePath)) {
       project.files.push(file);
+      recordPendingFileDecision(project, file, 'accepted');
       project.files = deduplicateFiles(project.files);
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
@@ -3543,7 +3619,11 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
 
 ipcMain.handle('projects:reject-pending', (event, projectId, filePath) => {
   const result = mutateProject(projectId, (project) => {
+    const file = (project.pendingFiles || []).find(f => f.path === filePath);
     project.pendingFiles = (project.pendingFiles || []).filter(f => f.path !== filePath);
+    if (file) {
+      recordPendingFileDecision(project, file, 'rejected');
+    }
     return { pendingFiles: project.pendingFiles };
   });
 
