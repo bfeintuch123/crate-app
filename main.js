@@ -883,6 +883,155 @@ function recordPendingFileDecision(project, fileEntry, decision) {
   }
 }
 
+function upsertPsdParserContainerNode(provenance, project, psdFilePath) {
+  const normalizedPath = normalizeTrackedFilePath(psdFilePath);
+  if (!normalizedPath) return null;
+
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  const containerNodeId = createNodeId(NODE_TYPES.CONTAINER, { normalizedPath });
+
+  provenance.nodes[fileNodeId] = {
+    ...(provenance.nodes[fileNodeId] || {}),
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: psdFilePath,
+    normalizedPath,
+    name: path.basename(psdFilePath),
+    ext: path.extname(psdFilePath).toLowerCase(),
+  };
+  provenance.nodes[containerNodeId] = {
+    ...(provenance.nodes[containerNodeId] || {}),
+    id: containerNodeId,
+    type: NODE_TYPES.CONTAINER,
+    fileNodeId,
+    path: psdFilePath,
+    normalizedPath,
+    format: path.extname(psdFilePath).toLowerCase().replace(/^\./, ''),
+    appFamily: 'photoshop',
+    containerKind: 'psd',
+    projectId: project.id || null,
+  };
+
+  return { containerNodeId, normalizedPath };
+}
+
+function upsertPsdParserLinkedFileNode(provenance, fileEntry) {
+  const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+  if (!normalizedPath) return null;
+
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  provenance.nodes[fileNodeId] = {
+    ...(provenance.nodes[fileNodeId] || {}),
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: fileEntry.path,
+    normalizedPath,
+    name: fileEntry.name || path.basename(fileEntry.path),
+    ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+    source: fileEntry.source || null,
+  };
+  return { fileNodeId, normalizedPath };
+}
+
+function upsertPsdParserEmbeddedResourceNode(provenance, psdFilePath, fileEntry) {
+  const parentPsd = normalizeTrackedFilePath(fileEntry.parentPsd || psdFilePath || fileEntry.path);
+  if (!parentPsd) return null;
+
+  const resourceKey = createDedupeKey(
+    'scan-on-save-psd',
+    parentPsd,
+    Number.isInteger(fileEntry.embeddedIndex) ? fileEntry.embeddedIndex : '',
+    fileEntry.embeddedOriginalName || fileEntry.name || ''
+  );
+  const resourceNodeId = createNodeId(NODE_TYPES.EMBEDDED_RESOURCE, { resourceKey });
+  provenance.nodes[resourceNodeId] = {
+    ...(provenance.nodes[resourceNodeId] || {}),
+    id: resourceNodeId,
+    type: NODE_TYPES.EMBEDDED_RESOURCE,
+    resourceKey,
+    name: fileEntry.name || fileEntry.embeddedOriginalName || null,
+    ext: fileEntry.ext || path.extname(fileEntry.name || '').toLowerCase(),
+    sourceMetadata: {
+      source: fileEntry.source || null,
+      parentPsd: fileEntry.parentPsd || psdFilePath || fileEntry.path || null,
+      embeddedIndex: Number.isInteger(fileEntry.embeddedIndex) ? fileEntry.embeddedIndex : null,
+      embeddedOriginalName: fileEntry.embeddedOriginalName || null,
+    },
+  };
+  return { resourceNodeId, resourceKey };
+}
+
+function recordPsdParserRelationship(project, psdFilePath, fileEntry) {
+  try {
+    if (!project || !psdFilePath || !fileEntry) return;
+    const provenance = ensureProjectProvenance(project);
+    if (!provenance) return;
+
+    const parserMethod = 'scan-on-save';
+    const parserName = 'ag-psd';
+    const sessionId = getProjectProvenanceSessionId(project, provenance);
+    const container = upsertPsdParserContainerNode(provenance, project, psdFilePath);
+    if (!container) return;
+
+    const relationType = fileEntry.source === 'scan-on-save-linked'
+      ? EDGE_TYPES.CONTAINER_REFERENCES_FILE
+      : (fileEntry.source === 'scan-on-save-embedded' && fileEntry.embedded
+        ? EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE
+        : null);
+    if (!relationType) return;
+
+    const object = relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE
+      ? upsertPsdParserLinkedFileNode(provenance, fileEntry)
+      : upsertPsdParserEmbeddedResourceNode(provenance, psdFilePath, fileEntry);
+    if (!object) return;
+
+    const objectNodeId = relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE
+      ? object.fileNodeId
+      : object.resourceNodeId;
+    const objectIdentity = relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE
+      ? object.normalizedPath
+      : object.resourceKey;
+    if (!objectNodeId || !objectIdentity) return;
+
+    const dedupeKey = createDedupeKey(
+      project.id || 'unknown_project',
+      sessionId,
+      parserName,
+      parserMethod,
+      relationType,
+      container.normalizedPath,
+      objectIdentity
+    );
+    const edgeId = createEdgeId(relationType, container.containerNodeId, objectNodeId, dedupeKey);
+    provenance.edges[edgeId] = {
+      ...(provenance.edges[edgeId] || {}),
+      id: edgeId,
+      type: relationType,
+      relationType,
+      subjectNodeId: container.containerNodeId,
+      objectNodeId,
+      confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, 'PSD parser returned structured smart object metadata'),
+      evidenceIds: [],
+      dedupeKey,
+      payload: {
+        observer: {
+          kind: OBSERVER_KINDS.PARSER,
+          parser: parserName,
+          method: parserMethod,
+        },
+        parser: parserName,
+        method: parserMethod,
+        source: fileEntry.source || null,
+        containerPath: psdFilePath,
+        embeddedIndex: Number.isInteger(fileEntry.embeddedIndex) ? fileEntry.embeddedIndex : null,
+        embeddedOriginalName: fileEntry.embeddedOriginalName || null,
+      },
+    };
+  } catch (e) {
+    console.warn('[crate][provenance] PSD parser relationship skipped:', e.message);
+  }
+}
+
 function upsertPackageNode(provenance, project, packageInfo) {
   const packageNodeId = createNodeId(NODE_TYPES.PACKAGE, {
     projectId: project.id || null,
@@ -2831,6 +2980,7 @@ async function runScanOnSave(projectId, psdFilePath) {
           : path.resolve(entry.path).toLowerCase();
         if (existingPaths.has(key)) continue;
         proj.files.push(entry);
+        recordPsdParserRelationship(proj, psdFilePath, entry);
         existingPaths.add(key);
         changed = true;
       }
