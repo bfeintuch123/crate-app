@@ -58,6 +58,12 @@ Use:
 - `security-audit.md` for shell, path, credential, watcher, parser, package, and dependency risk review.
 - `clawpatch-fix.md` for a small, targeted bug fix with narrow tests.
 - `mobile-codex-workflow.md` when Bryant is supervising Codex CLI from mobile.
+- `crate-regression-detector.md` for fail-fast branch or PR regression sweeps.
+- `crate-provenance-review.md` for provenance evidence, confidence, privacy, manifest, package, and Figma review.
+- `crate-reprobox.md` for isolated reproducibility work in temporary workspaces.
+- `crate-security-scan.md` for Crate-specific path, package, parser, token, manifest, and filesystem-boundary security scans.
+- `crate-release-gate.md` for strict release-readiness gates before any release mutation begins.
+- `crate-pr-documenter.md` for factual PR summaries, reviewer notes, tester notes, and release-note drafts.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 
