@@ -482,6 +482,34 @@ const DESIGN_APP_PROCESS_NAMES = {
   web:      ['Figma', 'Sketch', 'Adobe XD', 'Affinity Designer', 'Visual Studio Code'],
 };
 
+const DESIGN_APP_PROCESS_IDENTITIES = Object.freeze([
+  { keyword: 'Adobe Illustrator', name: 'Adobe Illustrator', appFamily: 'illustrator', bundleId: 'com.adobe.illustrator' },
+  { keyword: 'Adobe Photoshop', name: 'Adobe Photoshop', appFamily: 'photoshop', bundleId: 'com.adobe.Photoshop' },
+  { keyword: 'Adobe InDesign', name: 'Adobe InDesign', appFamily: 'indesign', bundleId: 'com.adobe.InDesign' },
+  { keyword: 'Adobe XD', name: 'Adobe XD', appFamily: 'adobe-xd', bundleId: 'com.adobe.xd' },
+  { keyword: 'Figma', name: 'Figma', appFamily: 'figma', bundleId: 'com.figma.Desktop' },
+  { keyword: 'Sketch', name: 'Sketch', appFamily: 'sketch', bundleId: 'com.bohemiancoding.sketch3' },
+  { keyword: 'Affinity Designer', name: 'Affinity Designer', appFamily: 'affinity-designer', bundleId: null },
+  { keyword: 'Affinity Photo', name: 'Affinity Photo', appFamily: 'affinity-photo', bundleId: null },
+  { keyword: 'Affinity Publisher', name: 'Affinity Publisher', appFamily: 'affinity-publisher', bundleId: null },
+  { keyword: 'Pixelmator Pro', name: 'Pixelmator Pro', appFamily: 'pixelmator-pro', bundleId: 'com.pixelmator.pro' },
+  { keyword: 'Acrobat', name: 'Adobe Acrobat', appFamily: 'acrobat', bundleId: null },
+  { keyword: 'Keynote', name: 'Keynote', appFamily: 'keynote', bundleId: 'com.apple.iWork.Keynote' },
+  { keyword: 'Microsoft PowerPoint', name: 'Microsoft PowerPoint', appFamily: 'powerpoint', bundleId: 'com.microsoft.Powerpoint' },
+  { keyword: 'Visual Studio Code', name: 'Visual Studio Code', appFamily: 'vscode', bundleId: 'com.microsoft.VSCode' },
+]);
+
+function getDesignAppProcessIdentity(commandText) {
+  if (typeof commandText !== 'string' || !commandText.trim()) return null;
+  const match = DESIGN_APP_PROCESS_IDENTITIES.find(identity => commandText.includes(identity.keyword));
+  if (!match) return null;
+  return {
+    name: match.name,
+    appFamily: match.appFamily,
+    bundleId: match.bundleId || null,
+  };
+}
+
 function getFileCreatorApp(filePath) {
   try {
     const result = execFileSync("/usr/bin/mdls", ["-name", "kMDItemCreatorApplicationIdentifier", "-raw", filePath], {
@@ -738,6 +766,160 @@ function getProjectProvenanceSessionId(project, provenance) {
   });
   if (provenance) provenance.sessionId = sessionId;
   return sessionId;
+}
+
+function recordLsofAppOpenedFile(project, fileEntry, processContext = {}) {
+  try {
+    if (!project || !fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return;
+
+    const pid = Number.parseInt(processContext.pid, 10);
+    if (!Number.isInteger(pid) || pid <= 0) return;
+
+    const appIdentity = getDesignAppProcessIdentity(processContext.command || '');
+    if (!appIdentity) return;
+
+    const provenance = ensureProjectProvenance(project);
+    if (!provenance) return;
+
+    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+    if (!normalizedPath) return;
+
+    const method = typeof processContext.method === 'string' && processContext.method.trim()
+      ? processContext.method.trim()
+      : 'unknown';
+    const observedAt = fileEntry.addedAt || Date.now();
+    const sessionId = getProjectProvenanceSessionId(project, provenance);
+    const appNodeId = createNodeId(NODE_TYPES.APP, {
+      bundleId: appIdentity.bundleId,
+      name: appIdentity.name,
+      appFamily: appIdentity.appFamily,
+    });
+    const processNodeId = createNodeId(NODE_TYPES.APP_PROCESS, {
+      sessionId,
+      pid,
+      appNodeId,
+    });
+    const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+
+    provenance.nodes[appNodeId] = {
+      ...(provenance.nodes[appNodeId] || {}),
+      id: appNodeId,
+      type: NODE_TYPES.APP,
+      bundleId: appIdentity.bundleId,
+      name: appIdentity.name,
+      appFamily: appIdentity.appFamily,
+    };
+
+    const existingProcessNode = provenance.nodes[processNodeId] || {};
+    const existingFirstAt = typeof existingProcessNode.observedFirstAt === 'number'
+      ? existingProcessNode.observedFirstAt
+      : observedAt;
+    const existingLastAt = typeof existingProcessNode.observedLastAt === 'number'
+      ? existingProcessNode.observedLastAt
+      : observedAt;
+    provenance.nodes[processNodeId] = {
+      ...existingProcessNode,
+      id: processNodeId,
+      type: NODE_TYPES.APP_PROCESS,
+      appNodeId,
+      pid,
+      appName: appIdentity.name,
+      appFamily: appIdentity.appFamily,
+      observedFirstAt: Math.min(existingFirstAt, observedAt),
+      observedLastAt: Math.max(existingLastAt, observedAt),
+      source: OBSERVER_KINDS.LSOF,
+      method,
+    };
+
+    provenance.nodes[fileNodeId] = {
+      ...(provenance.nodes[fileNodeId] || {}),
+      id: fileNodeId,
+      type: NODE_TYPES.FILE,
+      path: fileEntry.path,
+      normalizedPath,
+      name: fileEntry.name || path.basename(fileEntry.path),
+      ext: fileEntry.ext || path.extname(fileEntry.path).toLowerCase(),
+      source: fileEntry.source || null,
+    };
+
+    const evidence = upsertEvidence(provenance, {
+      kind: OBSERVER_KINDS.LSOF,
+      observer: {
+        kind: OBSERVER_KINDS.LSOF,
+        method,
+        pid,
+        appName: appIdentity.name,
+        appFamily: appIdentity.appFamily,
+      },
+      observedAt,
+      identity: {
+        projectId: project.id || null,
+        sessionId,
+        method,
+        pid,
+        normalizedPath,
+      },
+      summary: 'lsof observed a monitored app process with an accepted file path',
+      payload: {
+        source: fileEntry.source || null,
+        method,
+        pid,
+        appName: appIdentity.name,
+        appFamily: appIdentity.appFamily,
+      },
+    });
+
+    const dedupeKey = createDedupeKey(
+      project.id || 'unknown_project',
+      sessionId,
+      method,
+      EDGE_TYPES.APP_OPENED_FILE,
+      pid,
+      normalizedPath
+    );
+    const observation = createObservationRecord({
+      projectId: project.id || null,
+      sessionId,
+      observedAt,
+      observer: {
+        kind: OBSERVER_KINDS.LSOF,
+        method,
+        pid,
+        appName: appIdentity.name,
+        appFamily: appIdentity.appFamily,
+      },
+      kind: EDGE_TYPES.APP_OPENED_FILE,
+      subjectNodeId: processNodeId,
+      objectNodeId: fileNodeId,
+      relationType: EDGE_TYPES.APP_OPENED_FILE,
+      evidenceIds: evidence && evidence.id ? [evidence.id] : [],
+      confidence: createConfidence(
+        CONFIDENCE_BANDS.CANDIDATE,
+        'lsof observed a monitored app process with an accepted file path'
+      ),
+      dedupeKey,
+      payload: {
+        source: fileEntry.source || null,
+        method,
+        pid,
+        appName: appIdentity.name,
+        appFamily: appIdentity.appFamily,
+      },
+    });
+    appendObservation(provenance, observation);
+  } catch (e) {
+    console.warn('[crate][provenance] app_opened_file skipped:', e.message);
+  }
+}
+
+function recordLsofAcceptedFileProvenance(project, fileEntry, processContext = {}) {
+  recordSessionObservedFile(project, fileEntry, {
+    kind: OBSERVER_KINDS.LSOF,
+    method: typeof processContext.method === 'string' && processContext.method.trim()
+      ? processContext.method.trim()
+      : 'unknown',
+  });
+  recordLsofAppOpenedFile(project, fileEntry, processContext);
 }
 
 function recordSessionObservedFile(project, fileEntry, observer = {}) {
@@ -1942,6 +2124,11 @@ function pollLsofForProject(projectId) {
           };
 
           proj.files.push(fileEntry);
+          recordLsofAcceptedFileProvenance(proj, fileEntry, {
+            method: 'poll',
+            pid: currentPid,
+            command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+          });
           existingPaths.add(filePath);
           lastFileActivity.set(projectId, Date.now());
           inactivityNotified.delete(projectId);
@@ -3689,19 +3876,23 @@ async function startWatching(projectId) {
       timeout: 5000, encoding: 'utf8'
     });
     const pids = [];
+    const pidToCmd = new Map();
     for (const line of psOut.trim().split('\n')) {
       const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
       if (!m) continue;
       const pid = parseInt(m[1]);
       const cmd = m[2];
-      if (keywords.some(kw => cmd.includes(kw))) pids.push(pid);
+      if (keywords.some(kw => cmd.includes(kw))) {
+        pids.push(pid);
+        pidToCmd.set(pid, cmd);
+      }
     }
 
     if (pids.length > 0) {
       const home = os.homedir();
       const validPids = pids.filter(p => Number.isInteger(p) && p > 0);
       if (validPids.length > 0) {
-        const { stdout: lsofOut } = await execFileAsync('/usr/sbin/lsof', ['-F', 'tn', '-p', validPids.join(',')], {
+        const { stdout: lsofOut } = await execFileAsync('/usr/sbin/lsof', ['-F', 'ptn', '-p', validPids.join(',')], {
           timeout: 12000, encoding: 'utf8'
         });
 
@@ -3712,6 +3903,7 @@ async function startWatching(projectId) {
         mutateProject(projectId, (project) => {
           const existingPaths = new Set(project.files.map(f => f.path));
           let snapshotChanged = false;
+          let currentPid = null;
           let currentType = null;
           const LINKABLE_EXTS_SNAPSHOT = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
           const linkableForParse = [];
@@ -3721,7 +3913,8 @@ async function startWatching(projectId) {
             const tag = line[0];
             const value = line.slice(1);
 
-            if (tag === 'p' || tag === 'f') { currentType = null; continue; }
+            if (tag === 'p') { currentPid = parseInt(value); currentType = null; continue; }
+            if (tag === 'f') { currentType = null; continue; }
             if (tag === 't') { currentType = value; continue; }
             if (tag !== 'n') continue;
             if (currentType !== 'REG') { currentType = null; continue; }
@@ -3780,6 +3973,11 @@ async function startWatching(projectId) {
             };
 
             project.files.push(fileEntry);
+            recordLsofAcceptedFileProvenance(project, fileEntry, {
+              method: 'initial-snapshot',
+              pid: currentPid,
+              command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+            });
             existingPaths.add(filePath);
             snapshotChanged = true;
 
