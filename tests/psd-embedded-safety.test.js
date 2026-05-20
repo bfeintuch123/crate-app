@@ -437,6 +437,130 @@ test('package provenance records copied files and skips missing files', async ()
   }
 });
 
+test('package manifest excludes lsof app process evidence and raw process output', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+
+    const normalizedSourcePath = fs.realpathSync.native(sourcePath).replace(/\/+$/, '').toLowerCase();
+    const sourceNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizedSourcePath });
+    const appNodeId = createNodeId(NODE_TYPES.APP, {
+      bundleId: 'com.figma.Desktop',
+      name: 'Figma',
+      appFamily: 'figma',
+    });
+    const appProcessNodeId = createNodeId(NODE_TYPES.APP_PROCESS, {
+      sessionId: 'session_lsof_manifest',
+      pid: 987,
+      appNodeId,
+    });
+
+    const project = makeProject('lsof-manifest-exclusion', 'Lsof Manifest Exclusion', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }]);
+    project.provenance = {
+      schemaVersion: 1,
+      sessionId: 'session_lsof_manifest',
+      nodes: {
+        [sourceNodeId]: {
+          id: sourceNodeId,
+          type: NODE_TYPES.FILE,
+          path: sourcePath,
+          name: 'logo.ai',
+        },
+        [appNodeId]: {
+          id: appNodeId,
+          type: NODE_TYPES.APP,
+          bundleId: 'com.figma.Desktop',
+          name: 'Figma',
+          appFamily: 'figma',
+        },
+        [appProcessNodeId]: {
+          id: appProcessNodeId,
+          type: NODE_TYPES.APP_PROCESS,
+          appNodeId,
+          pid: 987,
+          appName: 'Figma',
+          appFamily: 'figma',
+          observedFirstAt: Date.now(),
+          observedLastAt: Date.now(),
+          method: 'poll',
+          source: 'lsof',
+        },
+      },
+      edges: {
+        edge_lsof_raw_fixture: {
+          id: 'edge_lsof_raw_fixture',
+          relationType: EDGE_TYPES.APP_OPENED_FILE,
+          subjectNodeId: appProcessNodeId,
+          objectNodeId: sourceNodeId,
+          evidenceIds: ['ev_lsof_raw_fixture'],
+          confidence: { score: 0.6, band: 'candidate', reasons: ['lsof fixture'] },
+          payload: {
+            command: '/usr/sbin/lsof SHOULD_NOT_APPEAR_COMMAND',
+            rawLsofOutput: 'SHOULD_NOT_APPEAR_RAW_LSOF_OUTPUT',
+            processArgs: ['SHOULD_NOT_APPEAR_PROCESS_ARG'],
+          },
+        },
+      },
+      observations: [{
+        id: 'obs_lsof_raw_fixture',
+        relationType: EDGE_TYPES.APP_OPENED_FILE,
+        subjectNodeId: appProcessNodeId,
+        objectNodeId: sourceNodeId,
+        evidenceIds: ['ev_lsof_raw_fixture'],
+        payload: {
+          command: '/usr/sbin/lsof SHOULD_NOT_APPEAR_OBSERVATION_COMMAND',
+          rawLsofOutput: 'SHOULD_NOT_APPEAR_OBSERVATION_RAW_LSOF',
+          processArgs: ['SHOULD_NOT_APPEAR_OBSERVATION_PROCESS_ARG'],
+        },
+      }],
+      evidence: {
+        ev_lsof_raw_fixture: {
+          id: 'ev_lsof_raw_fixture',
+          kind: 'lsof',
+          observer: { kind: 'lsof', method: 'poll' },
+          summary: 'SHOULD_NOT_APPEAR_RAW_LSOF_SUMMARY',
+          payload: {
+            command: '/usr/sbin/lsof SHOULD_NOT_APPEAR_EVIDENCE_COMMAND',
+            rawLsofOutput: 'SHOULD_NOT_APPEAR_EVIDENCE_RAW_LSOF',
+            processArgs: ['SHOULD_NOT_APPEAR_EVIDENCE_PROCESS_ARG'],
+          },
+        },
+      },
+    };
+    setProjects([project]);
+
+    const result = await callIpc('projects:package', 'lsof-manifest-exclusion', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    const manifest = readManifest(outputDir, 'Lsof Manifest Exclusion');
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.APP_OPENED_FILE).length, 0);
+    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.APP_PROCESS).length, 0);
+    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.APP).length, 0);
+    assert.equal(manifest.evidence.filter(evidence => evidence.kind === 'lsof').length, 0);
+
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_COMMAND'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_RAW_LSOF'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+    assert.equal(manifestText.includes('APP_OPENED_FILE'), false);
+    assert.equal(manifestText.includes(EDGE_TYPES.APP_OPENED_FILE), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('package provenance failure does not block package success', async () => {
   const tmpRoot = makeTempDir();
   try {
