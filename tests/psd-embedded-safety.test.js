@@ -463,7 +463,7 @@ test('package manifest excludes lsof app process evidence and raw process output
       name: 'logo.ai',
       ext: '.ai',
       addedAt: Date.now(),
-      source: 'lsof',
+      source: 'manual-browse',
     }]);
     project.provenance = {
       schemaVersion: 1,
