@@ -253,8 +253,12 @@ function packageFolder(outputDir, projectName) {
   return path.join(outputDir, `${projectName}_${dateStr}`);
 }
 
-function manifestPath(outputDir, projectName) {
+function rootManifestPath(outputDir, projectName) {
   return path.join(packageFolder(outputDir, projectName), 'crate-provenance.json');
+}
+
+function manifestPath(outputDir, projectName) {
+  return path.join(packageFolder(outputDir, projectName), 'Crate Diagnostics', 'crate-provenance.json');
 }
 
 function readManifest(outputDir, projectName) {
@@ -275,6 +279,7 @@ function assertPackageResultShape(result) {
 test.afterEach(() => {
   currentPsdFixture = { children: [], linkedFiles: [] };
   if (storeInstance) storeInstance.set('projects', []);
+  if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
   clearTrackedTimeouts();
 });
 
@@ -282,6 +287,40 @@ test.after(() => {
   clearTrackedTimeouts();
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
+});
+
+test('default package omits diagnostic report files but keeps package provenance records', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+
+    setProjects([makeProject('diagnostic-default-off', 'Diagnostic Default Off', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+
+    const result = await callIpc('projects:package', 'diagnostic-default-off', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Diagnostic Default Off')), false);
+    assert.equal(fs.existsSync(manifestPath(outputDir, 'Diagnostic Default Off')), false);
+
+    const project = getStoredProject('diagnostic-default-off');
+    assert.equal(getProvenanceEdges(project, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('package provenance records copied files and skips missing files', async () => {
@@ -376,6 +415,7 @@ test('package provenance records copied files and skips missing files', async ()
       },
     };
     setProjects([packageProject]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'package-provenance-copy', outputDir);
 
@@ -402,6 +442,7 @@ test('package provenance records copied files and skips missing files', async ()
     assert.ok(project.provenance.nodes[includeEdges[0].objectNodeId]);
 
     const manifest = readManifest(outputDir, 'Package Provenance Copy');
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Package Provenance Copy')), false);
     assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
     assert.equal(manifest.scope, 'partial_package_relevant');
     assert.equal(manifest.generatedBy.app, 'Crate');
@@ -537,6 +578,7 @@ test('package manifest excludes lsof app process evidence and raw process output
       },
     };
     setProjects([project]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'lsof-manifest-exclusion', outputDir);
 
@@ -589,6 +631,7 @@ test('package provenance failure does not block package success', async () => {
       evidence: {},
     };
     setProjects([project]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'package-provenance-failure', outputDir);
 
@@ -623,6 +666,7 @@ test('empty provenance writes minimal package manifest with warnings', async () 
       evidence: {},
     };
     setProjects([project]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'empty-provenance-manifest', outputDir);
 
@@ -653,9 +697,11 @@ test('manifest write failure does not block package success', async () => {
     const sourcePath = path.join(tmpRoot, 'logo.ai');
     const outputDir = path.join(tmpRoot, 'out');
     const destFolder = packageFolder(outputDir, 'Manifest Write Failure');
+    const diagnosticsFolder = path.join(destFolder, 'Crate Diagnostics');
     fs.mkdirSync(destFolder, { recursive: true });
     fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
-    fs.mkdirSync(path.join(destFolder, 'crate-provenance.json'));
+    fs.mkdirSync(diagnosticsFolder, { recursive: true });
+    fs.mkdirSync(path.join(diagnosticsFolder, 'crate-provenance.json'));
 
     setProjects([
       makeProject('manifest-write-failure', 'Manifest Write Failure', [{
@@ -666,6 +712,7 @@ test('manifest write failure does not block package success', async () => {
         source: 'manual-browse',
       }]),
     ]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'manifest-write-failure', outputDir);
 
@@ -675,7 +722,8 @@ test('manifest write failure does not block package success', async () => {
     assert.equal(result.embeddedCount, 0);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.readFileSync(path.join(destFolder, 'logo.ai'), 'utf8'), 'logo bytes');
-    assert.equal(fs.statSync(path.join(destFolder, 'crate-provenance.json')).isDirectory(), true);
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Manifest Write Failure')), false);
+    assert.equal(fs.statSync(path.join(diagnosticsFolder, 'crate-provenance.json')).isDirectory(), true);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -748,6 +796,7 @@ test('package writes scan-on-save PSD embedded asset bytes with safe unique name
     }));
 
     setProjects([makeProject('psd-package-safety', 'PSD Package Safety', entries)]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const result = await callIpc('projects:package', 'psd-package-safety', outputDir);
     assertPackageResultShape(result);
