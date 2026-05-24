@@ -70,6 +70,9 @@ Use:
 - `crate-tester-intake.md` for turning external designer testing into structured, privacy-safe product feedback.
 - `crate-bug-triage.md` for converting tester feedback into actionable engineering scope, issue drafts, and next-playbook recommendations.
 - `crate-manual-qa-matrix.md` for repeatable manual QA workflows before tester rollout and releases.
+- `crate-workstream-status.md` for read-only snapshots of branch, PR, release, QA, tester-feedback, and safe-next-action state.
+- `crate-decision-log.md` for preserving Bryant-approved Crate product, architecture, release, QA, provenance, and rollout decisions.
+- `crate-qa-results-synthesizer.md` for turning Jenna or tester QA artifacts into classifications, severity, next playbooks, and release recommendations.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 
