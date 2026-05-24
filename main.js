@@ -29,6 +29,7 @@ const {
 } = require('./provenance');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
+const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -695,7 +696,8 @@ const store = new Store({
     projects: [],
     settings: {
       namingTemplate: '{Project}_{Date}',
-      notifications: true
+      notifications: true,
+      includeDiagnosticReport: false
     },
     usage: {
       packagesThisMonth: 0,
@@ -709,6 +711,9 @@ function migrateSettings() {
   const settings = store.get('settings');
   if (settings.namingTemplate && settings.namingTemplate.includes('{Client}')) {
     store.set('settings.namingTemplate', '{Project}_{Date}');
+  }
+  if (settings.includeDiagnosticReport === undefined) {
+    store.set('settings.includeDiagnosticReport', false);
   }
 
   // v2.7.0 (Phase 2): Figma link moved per-project. Drop deprecated global
@@ -1713,7 +1718,9 @@ function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {
   try {
     const project = getProjects().find(p => p.id === projectId) || null;
     const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
-    const manifestPath = path.join(packageInfo.destFolder, PROVENANCE_MANIFEST_FILENAME);
+    const diagnosticsFolder = path.join(packageInfo.destFolder, DIAGNOSTICS_FOLDER_NAME);
+    fs.mkdirSync(diagnosticsFolder, { recursive: true });
+    const manifestPath = path.join(diagnosticsFolder, PROVENANCE_MANIFEST_FILENAME);
     fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   } catch (e) {
     console.warn('[crate][provenance] manifest write skipped:', e.message);
@@ -5540,12 +5547,14 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     }
 
     recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
-    writePackageProvenanceManifest(id, packageProvenanceInfo, {
-      copiedCount,
-      embeddedCount,
-      totalFiles: packageFiles.length,
-      errors,
-    });
+    if (settings.includeDiagnosticReport === true) {
+      writePackageProvenanceManifest(id, packageProvenanceInfo, {
+        copiedCount,
+        embeddedCount,
+        totalFiles: packageFiles.length,
+        errors,
+      });
+    }
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
@@ -5861,7 +5870,7 @@ ipcMain.handle('settings:get', () => {
 
 ipcMain.handle('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   store.set(`settings.${key}`, value);
   return store.get('settings');

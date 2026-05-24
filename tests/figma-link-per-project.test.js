@@ -278,6 +278,7 @@ async function cleanupProjectsAndTimers() {
   storedFigmaToken = null;
   nextFigmaScanResult = null;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
+  await callIpc('settings:update', 'includeDiagnosticReport', false);
   await callIpc('projects:delete-all');
   clearTrackedTimers();
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
@@ -354,8 +355,16 @@ function packageFolder(outputDir, projectName) {
   return path.join(outputDir, `${projectName}_${dateStr}`);
 }
 
+function rootManifestPath(outputDir, projectName) {
+  return path.join(packageFolder(outputDir, projectName), 'crate-provenance.json');
+}
+
+function manifestPath(outputDir, projectName) {
+  return path.join(packageFolder(outputDir, projectName), 'Crate Diagnostics', 'crate-provenance.json');
+}
+
 function readManifest(outputDir, projectName) {
-  return JSON.parse(fs.readFileSync(path.join(packageFolder(outputDir, projectName), 'crate-provenance.json'), 'utf8'));
+  return JSON.parse(fs.readFileSync(manifestPath(outputDir, projectName), 'utf8'));
 }
 
 // ---------- Tests ----------
@@ -509,7 +518,7 @@ test('figmaSession snapshot reads tracked files from the project, not settings',
     null
   );
 
-  // settings:update is whitelisted to namingTemplate / notifications, so we
+  // settings:update is whitelisted, so we
   // can't poison settings.figmaTrackedFiles via IPC. That's the point: even if
   // the legacy global tracking still existed in storage, the snapshot ignores it.
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
@@ -699,6 +708,7 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
     const scanned = await waitForProject(project.id, item => item.files.length === 2, 'Both Figma assets should enter the ledger');
     assert.equal(scanned.files.filter(file => file.source === 'figma-auto').length, 2);
 
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
     const result = await callIpc('projects:package', project.id, outputDir);
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
@@ -707,6 +717,7 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
     assert.deepEqual(result.errors, []);
 
     const manifest = readManifest(outputDir, 'Figma Manifest Scope');
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Figma Manifest Scope')), false);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
     assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.CLOUD_DOCUMENT).length, 1);

@@ -579,6 +579,7 @@ async function renderSettings() {
 
   $('#input-naming-template').value = state.settings.namingTemplate;
   $('#toggle-notifications').checked = state.settings.notifications || false;
+  $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
 
   const used = state.usage.packagesThisMonth;
   $('#plan-info').textContent = `Free Plan \u00B7 ${used}/10 packages`;
@@ -873,6 +874,12 @@ function setupEventListeners() {
   $('#toggle-notifications').addEventListener('change', () => {
     const checked = $('#toggle-notifications').checked;
     window.crate.updateSetting('notifications', checked);
+  });
+
+  $('#toggle-diagnostic-report').addEventListener('change', () => {
+    const checked = $('#toggle-diagnostic-report').checked;
+    window.crate.updateSetting('includeDiagnosticReport', checked);
+    state.settings.includeDiagnosticReport = checked;
   });
 
   // Clear all projects
