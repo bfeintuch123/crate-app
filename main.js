@@ -697,7 +697,8 @@ const store = new Store({
     settings: {
       namingTemplate: '{Project}_{Date}',
       notifications: true,
-      includeDiagnosticReport: false
+      includeDiagnosticReport: false,
+      showPackageDetails: true
     },
     usage: {
       packagesThisMonth: 0,
@@ -714,6 +715,9 @@ function migrateSettings() {
   }
   if (settings.includeDiagnosticReport === undefined) {
     store.set('settings.includeDiagnosticReport', false);
+  }
+  if (settings.showPackageDetails === undefined) {
+    store.set('settings.showPackageDetails', true);
   }
 
   // v2.7.0 (Phase 2): Figma link moved per-project. Drop deprecated global
@@ -5870,7 +5874,7 @@ ipcMain.handle('settings:get', () => {
 
 ipcMain.handle('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   store.set(`settings.${key}`, value);
   return store.get('settings');

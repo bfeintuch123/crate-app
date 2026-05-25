@@ -1087,6 +1087,46 @@ body {
   word-break: break-all;
 }
 
+.package-details {
+  width: 100%;
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  margin-bottom: 20px;
+  text-align: left;
+}
+
+.package-details summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  color: var(--black);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.package-details-body {
+  border-top: 1px solid var(--gray-200);
+  padding: 10px 14px 12px;
+}
+
+.package-details-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 12px;
+}
+
+.package-details-label {
+  color: var(--gray-500);
+  flex: 0 0 92px;
+}
+
+.package-details-value {
+  color: var(--black);
+  text-align: right;
+  line-height: 1.4;
+}
+
 /* Inactivity / Confirm Modals */
 .inactivity-title,
 .confirm-title {
