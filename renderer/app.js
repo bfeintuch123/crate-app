@@ -580,6 +580,7 @@ async function renderSettings() {
   $('#input-naming-template').value = state.settings.namingTemplate;
   $('#toggle-notifications').checked = state.settings.notifications || false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
+  $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
 
   const used = state.usage.packagesThisMonth;
   $('#plan-info').textContent = `Free Plan \u00B7 ${used}/10 packages`;
@@ -674,6 +675,38 @@ function showPackageModal() {
   $('#modal-package').classList.remove('hidden');
 }
 
+function formatFileCount(count, singular = 'file', plural = 'files') {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function renderPackageDetails(result) {
+  const details = $('#package-details');
+  if (!details) return;
+
+  details.open = false;
+  if (!result || state.settings.showPackageDetails === false) {
+    details.classList.add('hidden');
+    return;
+  }
+
+  const copiedCount = Math.max(0, Number(result.copiedCount) || 0);
+  const embeddedCount = Math.max(0, Number(result.embeddedCount) || 0);
+  const includedCount = copiedCount + embeddedCount;
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+
+  $('#package-details-included').textContent = `${formatFileCount(includedCount)} included`;
+
+  const sources = [`Gathered files: ${copiedCount}`];
+  if (embeddedCount > 0) sources.push(`Extracted media: ${embeddedCount}`);
+  $('#package-details-sources').textContent = sources.join(' | ');
+
+  $('#package-details-review').textContent = errors.length === 0
+    ? 'No issues found'
+    : `${formatFileCount(errors.length, 'issue', 'issues')} need review`;
+
+  details.classList.remove('hidden');
+}
+
 async function confirmPackage() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) return;
@@ -722,6 +755,7 @@ async function confirmPackage() {
   const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
   $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
   $('#success-path').textContent = result.folderPath;
+  renderPackageDetails(result);
   state.lastPackagedPath = result.folderPath;
   $('#modal-success').classList.remove('hidden');
 
@@ -880,6 +914,12 @@ function setupEventListeners() {
     const checked = $('#toggle-diagnostic-report').checked;
     window.crate.updateSetting('includeDiagnosticReport', checked);
     state.settings.includeDiagnosticReport = checked;
+  });
+
+  $('#toggle-package-details').addEventListener('change', () => {
+    const checked = $('#toggle-package-details').checked;
+    window.crate.updateSetting('showPackageDetails', checked);
+    state.settings.showPackageDetails = checked;
   });
 
   // Clear all projects
@@ -1176,6 +1216,7 @@ function setupMainProcessListeners() {
         const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
         $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
         $('#success-path').textContent = result.folderPath;
+        renderPackageDetails(result);
         state.lastPackagedPath = result.folderPath;
         $('#modal-success').classList.remove('hidden');
 
