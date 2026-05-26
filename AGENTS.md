@@ -73,6 +73,9 @@ Use:
 - `crate-workstream-status.md` for read-only snapshots of branch, PR, release, QA, tester-feedback, and safe-next-action state.
 - `crate-decision-log.md` for preserving Bryant-approved Crate product, architecture, release, QA, provenance, and rollout decisions.
 - `crate-qa-results-synthesizer.md` for turning Jenna or tester QA artifacts into classifications, severity, next playbooks, and release recommendations.
+- `crate-computer-use-qa.md` for scoped Codex Computer Use GUI QA of Crate, Finder, Figma, PowerPoint, Keynote, and browser-assisted flows.
+- `crate-gui-repro-flow.md` for reproducing GUI-only Crate bugs with exact steps, screenshots, package output, Package Details, and manifest comparison.
+- `crate-cmux-workbench.md` for optional cmux-style organization of multiple Codex CLI sessions while preserving Codex CLI, Computer Use, and Bryant approval boundaries.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 
