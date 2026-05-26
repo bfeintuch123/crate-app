@@ -1,9 +1,11 @@
 # Crate Computer Use QA Playbook
 
 ## Purpose
-Use Codex Computer Use to run scoped GUI QA flows for Crate across the desktop app, Finder, Figma, PowerPoint, Keynote, and browser-assisted setup.
+Use Codex Computer Use to run scoped GUI QA flows for Crate across Crate-supported creative apps and workflows.
 
 This playbook is for observing and recording Crate behavior in real GUI workflows. It does not replace Codex CLI tests, release gates, or code review. It gives Bryant evidence from the parts of Crate that automated tests cannot fully exercise: app launch, macOS dialogs, source-app state, package completion UI, package review, and Finder output.
+
+Start narrow, then expand by scoped app lane. Figma, PowerPoint, and Keynote are initial priority workflows, not the full long-term GUI QA scope.
 
 ## When To Use
 - Before tester rollout when Bryant wants GUI evidence for Crate workflows.
@@ -19,13 +21,47 @@ Use a prompt like:
 Use .codex/playbooks/crate-computer-use-qa.md to run scoped GUI QA for Crate. Use Codex Computer Use only for the approved apps and workflows, collect screenshots and results, do not modify code, and stop before any security, release, signing, deploy, or private-data boundary.
 ```
 
-## Apps Codex Computer Use May Use
+## Role Boundaries
+- Codex Computer Use is for GUI QA and visual evidence collection.
+- Codex CLI remains the source of truth for code, tests, git, release gates, and docs edits.
+- Codex App remains useful for planning, triage, supervision, and QA synthesis.
+- Bryant remains the human gate for sensitive actions, private assets, permissions, releases, signing, deploys, and broad scope changes.
+
+## App Scope Tiers
+Use the narrowest tier needed for the current QA task. Do not open apps outside the approved lane.
+
+Tier 1 - Core smoke tests:
 - Crate.
 - Finder.
+
+Tier 2 - Primary tester workflows:
 - Figma.
 - PowerPoint.
 - Keynote.
-- Browser only when needed for Figma authentication, Figma file access, fixture downloads, or approved download verification.
+
+Tier 3 - Adobe and design workflows:
+- Photoshop.
+- Illustrator.
+- InDesign.
+- After Effects, only if in supported workflow scope.
+- Acrobat.
+
+Tier 4 - Other supported creative workflows:
+- Sketch.
+- Affinity Designer.
+- Affinity Photo.
+- Affinity Publisher.
+- Pixelmator Pro.
+- browser-based Figma or download workflows.
+- local files.
+- Downloads/Desktop workflows.
+- external drive/custom folder workflows.
+
+## Apps Codex Computer Use May Use
+- Crate.
+- Finder.
+- Only the Crate-supported creative app or workflow lane Bryant approved for the current QA task.
+- Browser only when needed for Figma authentication, Figma file access, fixture downloads, approved download verification, or an approved browser-based creative workflow.
 
 ## Apps Codex Computer Use Must Never Use
 - Keychain Access.
@@ -33,9 +69,11 @@ Use .codex/playbooks/crate-computer-use-qa.md to run scoped GUI QA for Crate. Us
 - Cloudflare dashboard or deploy surfaces.
 - GitHub release creation or release upload pages.
 - Password managers.
+- Banking, payment, security, or identity apps.
 - Mail, Messages, Notes, Photos, Calendar, or other unrelated private apps.
 - Private browser windows, unrelated browser tabs, or authenticated accounts outside the approved QA flow.
 - Terminal for release, signing, notarization, deploy, tag, or mutation work.
+- Broad unrelated app access. App access must stay scoped to the current QA flow.
 
 ## Files Codex May Read
 - `AGENTS.md`.
@@ -96,6 +134,7 @@ rg -n "[^[:ascii:]]" AGENTS.md .codex/playbooks docs
 - Confirm the branch, build, or installed app version under test.
 - Confirm whether the app under test is a local dev run, installed QA build, or released build.
 - Confirm macOS version and source-app versions when relevant.
+- Confirm the approved app tier and exact app lane before opening source apps.
 - Confirm the package output folder before starting.
 - Use synthetic, minimal, or explicitly approved files.
 - Start a screen recording when Bryant approves recording.
@@ -230,6 +269,22 @@ Pass:
 Fail:
 - Only the current page is packaged, unrelated files appear, or Package Details overclaims page-level certainty.
 
+### Supported Creative App Lane QA
+Use this flow for approved Tier 3 or Tier 4 apps and workflows after the core Tier 1 smoke tests and any relevant Tier 2 priority workflows.
+
+Steps:
+- Open only the approved source app, document, folder, or browser workflow for the lane.
+- Record the app name, version when visible, document state, save state, linked/embedded media state, and relevant Crate settings.
+- Package the approved workflow in Crate.
+- Capture Package Complete, Package Details, Finder output, and manifest summary when present.
+- Compare included and missing files against the expected lane behavior.
+
+Pass:
+- The approved creative workflow packages expected eligible files, excludes unrelated files, and reports provenance or limitations accurately.
+
+Fail:
+- Crate packages unrelated app files, misses expected eligible files without warning, silently widens scope, or overclaims source evidence.
+
 ## Screenshot And Result Collection
 Collect only approved and privacy-safe artifacts:
 
@@ -250,7 +305,8 @@ Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only aft
 - A privacy, security, automation, file-access, keychain, signing, account, or update prompt appears.
 - The flow requires a private tester or client file that Bryant has not approved.
 - The flow would access unrelated apps, windows, accounts, tabs, or folders.
-- Figma, PowerPoint, Keynote, or Crate requests credentials or cloud-account changes.
+- The source app, browser, or Crate requests credentials or cloud-account changes.
+- The flow would require approving macOS security or privacy prompts through Computer Use.
 - A package appears to contain private, credential, or unrelated files.
 - Crate crashes, hangs, or appears to be using the wrong build.
 - A test requires changing app settings beyond the approved scope.
@@ -264,6 +320,7 @@ Codex may run read-only repository checks and operate only the approved GUI apps
 - writing screenshots, recordings, reports, or package summaries
 - changing Settings values beyond observation
 - granting macOS permissions
+- expanding app access beyond the current QA lane
 - using browser authentication
 - creating new package outputs from private files
 - installing, updating, or downloading apps
@@ -275,14 +332,15 @@ Codex may run read-only repository checks and operate only the approved GUI apps
 - Do not modify app code, tests, package files, release artifacts, or site files.
 - Do not edit `main.js`.
 - Do not approve privacy, security, automation, keychain, account, signing, or developer prompts.
-- Do not open Keychain, Apple Developer, Cloudflare, GitHub release pages, password managers, unrelated apps, private windows, or unrelated browser tabs.
+- Do not open Keychain, Apple Developer, Cloudflare, GitHub release pages, password managers, banking/payment/security apps, unrelated apps, private windows, or unrelated browser tabs.
 - Do not use private tester or client assets without approval.
 - Do not build, release, deploy, notarize, staple, tag, merge, commit, push, or mutate dependencies.
 - Do not claim a GUI flow passed without screenshots or an explicit observation record.
 - Do not generalize PowerPoint results to Keynote, or Keynote results to PowerPoint, without testing both.
+- Do not treat one creative app lane as coverage for another lane without evidence.
 
 ## Quality Impact
-- Catches launch, UI, Settings, Finder, Figma, PowerPoint, and Keynote failures that unit tests cannot see.
+- Catches launch, UI, Settings, Finder, source-app, and Crate-supported creative workflow failures that unit tests cannot see.
 - Reduces release risk by verifying Package Complete and Package Details from the designer's point of view.
 - Speeds debugging by pairing screenshots with package inventories and manifest summaries.
 - Protects privacy by making stop conditions explicit before sensitive prompts or files appear.
@@ -314,6 +372,7 @@ Codex may run read-only repository checks and operate only the approved GUI apps
   - Keynote:
   - Figma Current Page Only:
   - Figma Entire File:
+  - Creative app lane:
 - Artifacts:
   - Screenshots:
   - Recordings:
