@@ -3,7 +3,7 @@
 ## Purpose
 Use cmux-style workflows to organize multiple Codex CLI sessions for Crate engineering without changing the source of truth for code, GUI QA, or release decisions.
 
-cmux is optional. It can help Bryant supervise parallel Codex CLI sessions, but Crate does not depend on cmux to build, test, review, or QA the app. Codex CLI remains the source of truth for code, tests, git, and release gates. Codex Computer Use remains the source of truth for GUI QA. Bryant remains the human gate for merge, release, deploy, signing, notarization, and public rollout.
+cmux is optional. It can help Bryant supervise parallel Codex CLI sessions, but Crate does not depend on cmux to build, test, review, or QA the app. Codex CLI remains the source of truth for code, tests, git, and release gates. Codex Computer Use remains the source of truth for GUI QA across Crate-supported creative apps and workflows. Bryant remains the human gate for merge, release, deploy, signing, notarization, sensitive app access, and public rollout.
 
 ## When To Use
 - Multiple independent Crate tasks need separate Codex CLI sessions.
@@ -15,7 +15,7 @@ cmux is optional. It can help Bryant supervise parallel Codex CLI sessions, but 
 ## When Not To Use
 - A single small task is easier to complete in one Codex CLI session.
 - The work requires only Codex App reading, planning, or QA synthesis.
-- The task is GUI-only and should use Codex Computer Use.
+- The task is GUI-only and should use Codex Computer Use directly.
 - The repo has uncommitted app-code changes whose owner is unclear.
 - Multiple sessions would edit the same files or adjacent behavior.
 - Bryant is not available to approve merge, release, deploy, signing, notarization, or destructive git decisions.
@@ -28,11 +28,11 @@ Use .codex/playbooks/crate-cmux-workbench.md to organize Crate Codex CLI session
 ```
 
 ## Roles
-- Codex App: knowledge work, reading, planning, QA synthesis, prompt drafting, summaries, and remote supervision.
+- Codex App: knowledge work, reading, planning, triage, QA synthesis, prompt drafting, summaries, and remote supervision.
 - Codex CLI: implementation, tests, git operations, PR review, regression checks, release-gate checks, and docs edits.
-- Codex Computer Use: GUI QA of Crate, Finder, Figma, PowerPoint, Keynote, and approved browser flows.
+- Codex Computer Use: GUI QA of Crate, Finder, initial Figma/PowerPoint/Keynote priority workflows, and other approved Crate-supported creative app lanes.
 - cmux: optional workbench for organizing multiple Codex CLI sessions and their notifications.
-- Bryant: human decision gate for merge, release, deploy, signing, notarization, public rollout, private assets, and risky scope changes.
+- Bryant: human decision gate for merge, release, deploy, signing, notarization, public rollout, private assets, sensitive actions, and risky scope changes.
 
 ## Recommended Workspaces
 - Implementation: one builder agent edits code for one task or branch.
@@ -40,6 +40,7 @@ Use .codex/playbooks/crate-cmux-workbench.md to organize Crate Codex CLI session
 - Tests: runs focused and broad test commands; reports failures with exact command output summaries.
 - Release gate: read-only release-readiness checks only until Bryant approves release mutation.
 - QA artifacts: reads screenshots, package outputs, manifest summaries, and GUI repro reports.
+- GUI QA coordination: tracks which scoped creative app lane is approved for Codex Computer Use, but does not replace Computer Use for operating the GUI.
 - Docs/playbooks: edits only docs, process, and playbook files when scoped.
 
 Use one workspace per task and one branch per implementation stream. Do not let two workspaces edit overlapping files unless Bryant explicitly approves the ownership split.
@@ -173,6 +174,7 @@ Bryant must explicitly approve:
 - converting a read-only review, tests, release-gate, or QA-artifacts workspace into a builder workspace
 - touching private tester or client assets
 - launching GUI QA through Codex Computer Use
+- expanding GUI QA from one app lane to another
 - granting permissions or using authenticated browser sessions
 - dependency mutation
 - app-code changes when the current scope is docs/process only
@@ -182,6 +184,7 @@ Bryant must explicitly approve:
 - Do not treat cmux as required to test Crate.
 - Do not use cmux as a substitute for Codex CLI command logs, git status, tests, or release gates.
 - Do not use cmux as a substitute for Codex Computer Use GUI QA.
+- Do not use cmux organization as approval for broad app access; each GUI QA lane stays scoped to the current task.
 - Do not run unsupervised release, signing, notarization, deploy, tag, merge, or GitHub release commands.
 - Do not let multiple agents edit overlapping files without Bryant's explicit approval.
 - Do not touch `main` as a Crate release base unless Bryant explicitly says so.
