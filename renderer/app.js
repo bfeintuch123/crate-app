@@ -1,6 +1,7 @@
 // ===== Constants =====
 const MAX_PROJECTS = 7;
 const MAX_VISIBLE_FILES = 4;
+const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
 
 // ===== State =====
 let state = {
@@ -23,6 +24,25 @@ let state = {
 const FIGMA_URL_PATTERN = /figma\.com\/(file|design|proto)\/([a-zA-Z0-9]+)/;
 function isValidFigmaUrl(url) {
   return typeof url === 'string' && FIGMA_URL_PATTERN.test(url.trim());
+}
+
+function getFileExtension(file) {
+  if (!file) return '';
+
+  const ext = typeof file.ext === 'string' ? file.ext.trim().toLowerCase() : '';
+  if (ext) return ext.startsWith('.') ? ext : `.${ext}`;
+
+  const source = typeof file.name === 'string' && file.name
+    ? file.name
+    : (typeof file.path === 'string' ? file.path : '');
+  const match = source.toLowerCase().match(/(\.[^./\\]+)$/);
+  return match ? match[1] : '';
+}
+
+function isPresentationWorkflow(project) {
+  if (!project) return false;
+  if (project.type === 'presentation') return true;
+  return (project.files || []).some(file => PRESENTATION_FILE_EXTS.has(getFileExtension(file)));
 }
 
 // ===== DOM Helpers =====
@@ -640,6 +660,10 @@ function showPackageModal() {
     const warning = getProjectFigmaWarning(project);
     modalWarning.textContent = warning;
     modalWarning.style.display = warning ? 'block' : 'none';
+  }
+  const presentationReminder = $('#modal-presentation-reminder');
+  if (presentationReminder) {
+    presentationReminder.classList.toggle('hidden', !isPresentationWorkflow(project));
   }
 
   // File list
