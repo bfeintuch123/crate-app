@@ -11,6 +11,7 @@ const {
   EDGE_TYPES,
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
+  PROVENANCE_SCHEMA_VERSION,
 } = require('../provenance');
 
 const originalSetInterval = global.setInterval;
@@ -358,6 +359,53 @@ function getProvenanceObservations(project, relationType) {
     .filter(observation => observation && observation.relationType === relationType);
 }
 
+function packageFolder(outputDir, projectName) {
+  const dateStr = new Date().toISOString().split('T')[0];
+  return path.join(outputDir, `${projectName}_${dateStr}`);
+}
+
+function manifestPath(outputDir, projectName) {
+  return path.join(packageFolder(outputDir, projectName), 'Crate Diagnostics', 'crate-provenance.json');
+}
+
+function rootManifestPath(outputDir, projectName) {
+  return path.join(packageFolder(outputDir, projectName), 'crate-provenance.json');
+}
+
+function readManifest(outputDir, projectName) {
+  return JSON.parse(fs.readFileSync(manifestPath(outputDir, projectName), 'utf8'));
+}
+
+function assertPackageResultShape(result) {
+  assert.deepEqual(Object.keys(result).sort(), [
+    'copiedCount',
+    'embeddedCount',
+    'errors',
+    'folderPath',
+    'success',
+    'totalFiles',
+  ]);
+}
+
+function setPowerPointUnzipFixture(mediaEntries) {
+  const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind !== 'execFile' || command !== '/usr/bin/unzip') return { stdout: '', stderr: '' };
+    if (args[0] === '-l') {
+      const lines = mediaEntries.map(entry => {
+        const size = entry.data.length;
+        return `      ${size}  05-26-2026 12:34   ${entry.internalPath}`;
+      });
+      return { stdout: ['Archive: deck.pptx', ...lines, ''].join('\n'), stderr: '' };
+    }
+    if (args[0] === '-p') {
+      const entry = byInternalPath.get(args[2]);
+      return { stdout: entry ? entry.data : Buffer.alloc(0), stderr: '' };
+    }
+    return { stdout: '', stderr: '' };
+  });
+}
+
 function assertSessionObservedFile(project, observerKind, method, confidenceBand) {
   const observations = project.provenance.observations;
   assert.equal(observations.length, 1);
@@ -415,6 +463,7 @@ test.afterEach(async () => {
   nextOpenDialogResult = { canceled: true };
   currentPsdFixture = { children: [], linkedFiles: [] };
   if (storeInstance) storeInstance.set('projects', []);
+  if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
   watcherRecords.length = 0;
   clearTrackedTimers();
 });
@@ -427,6 +476,230 @@ test.after(() => {
   global.clearTimeout = originalClearTimeout;
   os.homedir = originalHomedir;
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
+});
+
+test('PowerPoint scan-on-save extraction records media provenance without ledger metadata leak', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Scan Save Provenance');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+
+    await emitWatcher('change', pptxPath);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'scan-on-save-presentation'),
+      5000
+    );
+    const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(extracted);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
+    assert.equal(extracted.name, 'Deck — image1.jpeg');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+
+    await emitWatcher('change', pptxPath);
+    await new Promise(resolve => originalSetTimeout(resolve, 2600));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PowerPoint package extraction records deterministic media provenance and diagnostics graph', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Media Provenance');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.jpeg',
+        data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 2);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'PowerPoint Media Provenance');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck.pptx'), 'utf8'), 'pptx container bytes');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — image1.jpeg'), 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — image2.png'), 'utf8'), 'PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+
+    let fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('ppt/media/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath).sort(),
+      ['ppt/media/image1.jpeg', 'ppt/media/image2.png']
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)
+        .every(edge => edge.confidence.band === CONFIDENCE_BANDS.CONFIRMED),
+      true
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE)
+        .every(edge => edge.confidence.band === CONFIDENCE_BANDS.CONFIRMED),
+      true
+    );
+
+    const manifest = readManifest(outputDir, 'PowerPoint Media Provenance');
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'PowerPoint Media Provenance')), false);
+    assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
+    assert.equal(manifest.package.copiedCount, 1);
+    assert.equal(manifest.package.embeddedCount, 2);
+    assert.equal(manifest.package.totalFiles, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('ppt/media/image1.jpeg'), true);
+    assert.equal(manifestText.includes('Deck — image1.jpeg'), true);
+    assert.equal(manifestText.includes('JPEG_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(manifestText.includes('PNG_BINARY_SHOULD_NOT_LEAK'), false);
+
+    const duplicateResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(duplicateResult);
+    assert.equal(duplicateResult.copiedCount, 1);
+    assert.equal(duplicateResult.embeddedCount, 2);
+    assert.equal(duplicateResult.totalFiles, 1);
+    fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PowerPoint provenance stays internal when diagnostic report is disabled', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Diagnostics Off');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'PowerPoint Diagnostics Off')), false);
+    assert.equal(fs.existsSync(manifestPath(outputDir, 'PowerPoint Diagnostics Off')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PowerPoint provenance failure does not block package extraction success', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Provenance Failure');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+    const projects = await callIpc('projects:get-all');
+    const stored = projects.find(item => item.id === project.id);
+    stored.files = [{
+      path: pptxPath,
+      name: 'Deck.pptx',
+      ext: '.pptx',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }];
+    stored.provenance = {
+      schemaVersion: 1,
+      sessionId: null,
+      nodes: new Proxy({}, {
+        set() {
+          throw new Error('forced PowerPoint provenance failure');
+        },
+      }),
+      edges: {},
+      observations: [],
+      evidence: {},
+    };
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'PowerPoint Provenance Failure'), 'Deck — image1.jpeg'), 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('manual add preserves file ledger entry and records one session observation', async () => {
