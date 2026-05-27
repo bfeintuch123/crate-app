@@ -32,6 +32,10 @@ const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const {
+  ensureSafePackageDirectory,
+  writeFileIntoPackage,
+} = require('./package-safety');
 
 const execFileAsync = promisify(execFile);
 
@@ -137,10 +141,7 @@ class PowerPointParser extends BaseParser {
     const baseName = path.basename(archivePath, ext);
     const extracted = [];
 
-    // Ensure destination directory exists
-    if (!fs.existsSync(destDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-    }
+    const outputRoot = ensureSafePackageDirectory(destDir);
 
     for (const asset of assets) {
       if (!asset.zipPath) continue;
@@ -164,17 +165,9 @@ class PowerPointParser extends BaseParser {
         // Prefix with presentation name to avoid collisions
         outputName = `${baseName} — ${outputName}`;
 
-        // Handle filename collisions
-        let destPath = path.join(destDir, outputName);
-        let counter = 1;
-        while (fs.existsSync(destPath)) {
-          const e = path.extname(outputName);
-          const b = path.basename(outputName, e);
-          destPath = path.join(destDir, `${b}_${counter}${e}`);
-          counter++;
-        }
-
-        fs.writeFileSync(destPath, data);
+        const destPath = writeFileIntoPackage(outputRoot, outputName, data, {
+          fallbackName: 'embedded-media'
+        });
         extracted.push({
           originalZipPath: asset.zipPath,
           extractedPath: destPath

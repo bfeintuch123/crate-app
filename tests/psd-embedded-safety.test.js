@@ -603,6 +603,168 @@ test('package manifest excludes lsof app process evidence and raw process output
   }
 });
 
+test('package copy sanitizes corrupt destination names and stays inside package folder', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    const files = [
+      { sourcePath: path.join(tmpRoot, 'source-safe.ai'), name: 'safe.ai', expectedName: 'safe.ai', bytes: 'safe bytes' },
+      { sourcePath: path.join(tmpRoot, 'source-escape.ai'), name: '../escape.ai', expectedName: 'escape.ai', bytes: 'escape bytes' },
+      { sourcePath: path.join(tmpRoot, 'source-absolute.ai'), name: '/tmp/absolute.ai', expectedName: 'absolute.ai', bytes: 'absolute bytes' },
+      { sourcePath: path.join(tmpRoot, 'source-nested.ai'), name: 'nested/name.ai', expectedName: 'name.ai', bytes: 'nested bytes' },
+      { sourcePath: path.join(tmpRoot, 'source-nul.ai'), name: 'nul\0name.ai', expectedName: 'nul_name.ai', bytes: 'nul bytes' },
+    ];
+
+    setProjects([makeProject('package-copy-containment', 'Package Copy Containment', files.map(file => {
+      fs.writeFileSync(file.sourcePath, Buffer.from(file.bytes));
+      return {
+        path: file.sourcePath,
+        name: file.name,
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      };
+    }))]);
+
+    const result = await callIpc('projects:package', 'package-copy-containment', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, files.length);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, files.length);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'Package Copy Containment');
+    for (const file of files) {
+      assert.equal(fs.readFileSync(path.join(destFolder, file.expectedName), 'utf8'), file.bytes);
+    }
+    assert.equal(fs.existsSync(path.join(outputDir, 'escape.ai')), false);
+    assert.equal(fs.existsSync(path.join(destFolder, 'nested')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package copy rejects symlinked selected output directories without writing through them', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const realOutputDir = path.join(tmpRoot, 'real-out');
+    const symlinkOutputDir = path.join(tmpRoot, 'out-link');
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    fs.mkdirSync(realOutputDir);
+    try {
+      fs.symlinkSync(realOutputDir, symlinkOutputDir, 'dir');
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') return;
+      throw e;
+    }
+
+    setProjects([makeProject('package-copy-symlink-output', 'Package Copy Symlink Output', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+
+    await assert.rejects(
+      () => callIpc('projects:package', 'package-copy-symlink-output', symlinkOutputDir),
+      (error) => {
+        assert.match(error.message, /Package output parent folder is a symlink/);
+        assert.equal(error.message.includes(realOutputDir), false);
+        return true;
+      }
+    );
+    assert.deepEqual(fs.readdirSync(realOutputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package copy rejects symlinked selected output ancestors without writing through them', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const realOutputDir = path.join(tmpRoot, 'real-out');
+    const symlinkOutputParent = path.join(tmpRoot, 'out-link');
+    const nestedOutputDir = path.join(symlinkOutputParent, 'nested');
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    fs.mkdirSync(realOutputDir);
+    try {
+      fs.symlinkSync(realOutputDir, symlinkOutputParent, 'dir');
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') return;
+      throw e;
+    }
+
+    setProjects([makeProject('package-copy-symlink-output-ancestor', 'Package Copy Symlink Output Ancestor', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+
+    await assert.rejects(
+      () => callIpc('projects:package', 'package-copy-symlink-output-ancestor', nestedOutputDir),
+      (error) => {
+        assert.match(error.message, /Package output parent folder is a symlink/);
+        assert.equal(error.message.includes(realOutputDir), false);
+        return true;
+      }
+    );
+    assert.deepEqual(fs.readdirSync(realOutputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package copy rejects symlink sources without copying target contents', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const targetPath = path.join(tmpRoot, 'outside-secret.ai');
+    const symlinkPath = path.join(tmpRoot, 'linked-secret.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(targetPath, Buffer.from('secret target bytes'));
+    try {
+      fs.symlinkSync(targetPath, symlinkPath);
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') return;
+      throw e;
+    }
+
+    setProjects([makeProject('package-copy-symlink', 'Package Copy Symlink', [{
+      path: symlinkPath,
+      name: 'linked-secret.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', 'package-copy-symlink', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 0);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, ['Failed to copy linked-secret.ai: Symlink source files are not copied']);
+
+    const destFolder = packageFolder(outputDir, 'Package Copy Symlink');
+    assert.equal(fs.existsSync(path.join(destFolder, 'linked-secret.ai')), false);
+    const manifestText = JSON.stringify(readManifest(outputDir, 'Package Copy Symlink'));
+    assert.equal(manifestText.includes(targetPath), false);
+    assert.equal(manifestText.includes('secret target bytes'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('package provenance failure does not block package success', async () => {
   const tmpRoot = makeTempDir();
   try {
