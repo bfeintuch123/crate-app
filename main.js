@@ -551,6 +551,61 @@ async function getSourceFileSessionEvidence(filePath) {
   return evidence;
 }
 
+function redactFigmaLogText(value) {
+  let text = '';
+  if (value instanceof Error) {
+    text = value.message || '';
+  } else if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch (e) {
+      text = String(value);
+    }
+  }
+
+  return text
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    .replace(/\bAuthorization\b\s*[:=]\s*[^,\s)]+/gi, 'Authorization=[redacted]')
+    .replace(/\bBearer\s+[^\s,)]+/gi, 'Bearer [redacted]')
+    .replace(/\bcookie\b\s*[:=]\s*[^,\s)]+/gi, 'cookie=[redacted]')
+    .replace(/\btoken\b\s*[:=]\s*[^,\s)]+/gi, 'token=[redacted]')
+    .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var)\/[^\s"'<>]+/g, '[redacted-path]');
+}
+
+function formatFigmaLogScalar(value, fallback = 'unknown') {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  const redacted = redactFigmaLogText(value.trim());
+  if (redacted.includes('[redacted')) return fallback;
+  const safe = redacted.replace(/[^\w:.-]/g, '_').slice(0, 120);
+  return safe || fallback;
+}
+
+function formatFigmaLocalNameForLog(filePath) {
+  if (typeof filePath !== 'string' || !filePath.trim()) return 'unknown';
+  return redactFigmaLogText(path.basename(filePath.trim())) || 'unknown';
+}
+
+function summarizeTrackedFigmaFilesForLog(rawTrackedFiles) {
+  return (Array.isArray(rawTrackedFiles) ? rawTrackedFiles : []).map((entry) => ({
+    key: formatFigmaLogScalar(entry && entry.key),
+    scopeMode: formatFigmaLogScalar(entry && entry.scopeMode),
+    lockStatus: formatFigmaLogScalar(entry && entry.lockStatus),
+    hasUrl: !!(entry && typeof entry.url === 'string' && entry.url.trim()),
+    hasRequestedScope: !!(entry && (entry.requestedPageId || entry.requestedNodeId)),
+    hasLockedPage: !!(entry && entry.lockedPageId),
+    hasWarning: !!(entry && entry.warning),
+  }));
+}
+
+function summarizeFigmaErrorsForLog(errors) {
+  return (Array.isArray(errors) ? errors : [errors])
+    .filter(error => error !== undefined && error !== null)
+    .map(error => redactFigmaLogText(error));
+}
+
 async function shouldKeepObservedSourceFileForPackaging(file, project) {
   const watchStart = project.watchStartedAt || project.createdAt || 0;
   if (!watchStart || !file || !file.path) return true;
@@ -575,14 +630,18 @@ async function selectProjectFilesForPackaging(project) {
 
   for (const file of dedupedFiles) {
     if (getProjectFigmaScopeMode(project) === FIGMA_SCOPE_CURRENT_PAGE && file.ext === '.fig') {
-      console.log(`[crate][package] skipped .fig file for current-page Figma session: ${file.path}`);
+      console.log(
+        `[crate][package] skipped .fig file for current-page Figma session: ` +
+        `localName=${formatFigmaLocalNameForLog(file.path)}`
+      );
       continue;
     }
 
     if (!shouldIncludeFigmaAssetForPackaging(file, project)) {
       console.log(
-        `[crate][package] filtered out-of-scope Figma asset: ${file.path} ` +
-        `(fileKey=${file.figmaFileKey || 'unknown'} pageId=${file.figmaPageId || 'unknown'})`
+        `[crate][package] filtered out-of-scope Figma asset: ` +
+        `localName=${formatFigmaLocalNameForLog(file.path)} ` +
+        `fileKey=${formatFigmaLogScalar(file.figmaFileKey)} hasPageId=${!!file.figmaPageId}`
       );
       continue;
     }
@@ -1253,7 +1312,7 @@ function recordFigmaAssetProvenance(project, fileEntry, asset = {}, contextLabel
       },
     };
   } catch (e) {
-    console.warn('[crate][provenance] Figma asset provenance skipped:', e.message);
+    console.warn('[crate][provenance] Figma asset provenance skipped:', redactFigmaLogText(e.message));
   }
 }
 
@@ -2542,10 +2601,10 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
     }
 
     fs.writeFileSync(localPath, buffer);
-    console.log(`[crate][figma] downloaded asset: ${path.basename(localPath)}`);
+    console.log(`[crate][figma] downloaded asset: ${formatFigmaLocalNameForLog(localPath)}`);
     return localPath;
   } catch (e) {
-    console.error('[crate][figma] downloadFigmaAsset error:', e.message);
+    console.error('[crate][figma] downloadFigmaAsset error:', redactFigmaLogText(e.message));
     return null;
   }
 }
@@ -2572,8 +2631,8 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     });
     if (figmaAssetKey && existingFigmaAssetKeys.has(figmaAssetKey)) {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `assetKey=${figmaAssetKey} reason=existing_asset_key`
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `assetKeyPresent=true reason=existing_asset_key`
       );
       continue;
     }
@@ -2584,16 +2643,16 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
 
     if (!localPath) {
       console.log(
-        `[crate][figma] asset skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `name=${asset.name || 'unknown'} reason=download_failed`
+        `[crate][figma] asset skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `name=${formatFigmaLogScalar(asset.name)} reason=download_failed`
       );
       continue;
     }
     const normalizedLocalPath = normalizeTrackedFilePath(localPath);
     if (existingPaths.has(normalizedLocalPath)) {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `localPath=${localPath} reason=existing_path`
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `localName=${formatFigmaLocalNameForLog(localPath)} reason=existing_path`
       );
       continue;
     }
@@ -2621,8 +2680,8 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       proj.files.push(fileRecord);
       proj.files = deduplicateFiles(proj.files);
       console.log(
-        `[crate][figma] asset inserted (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `name=${fileRecord.name} localPath=${localPath}`
+        `[crate][figma] asset inserted (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `name=${formatFigmaLocalNameForLog(fileRecord.name)} localName=${formatFigmaLocalNameForLog(localPath)}`
       );
       return { files: proj.files, fileRecord };
     });
@@ -2647,8 +2706,8 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       if (figmaAssetKey) existingFigmaAssetKeys.add(figmaAssetKey);
     } else {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${asset.figmaFileKey || 'unknown'} ` +
-        `${figmaAssetKey ? `assetKey=${figmaAssetKey} ` : ''}localPath=${localPath} reason=already_in_project`
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `assetKeyPresent=${!!figmaAssetKey} localName=${formatFigmaLocalNameForLog(localPath)} reason=already_in_project`
       );
     }
   }
@@ -2689,6 +2748,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
+    const safeTrackedFileSummaries = summarizeTrackedFigmaFilesForLog(rawTrackedFiles);
+    const safeTrackedFileKeys = normalizedTrackedFileKeys.map(key => formatFigmaLogScalar(key));
 
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || scanStartedAt;
@@ -2700,9 +2761,10 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     console.log(`[crate][figma] Scanning Figma files for project ${projectId} (since ${new Date(sinceMs).toISOString()})`);
     console.log(
       `[crate][figma] scan config (${isInitialScan ? 'live-initial' : 'live-incremental'}): ` +
-      `rawTrackedFiles=${JSON.stringify(rawTrackedFiles)} ` +
-      `trackedFileKeys=${JSON.stringify(normalizedTrackedFileKeys)} ` +
-      `teamIds=${JSON.stringify(teamIds)} ` +
+      `trackedFileCount=${safeTrackedFileSummaries.length} ` +
+      `trackedFiles=${JSON.stringify(safeTrackedFileSummaries)} ` +
+      `trackedFileKeys=${JSON.stringify(safeTrackedFileKeys)} ` +
+      `teamCount=${teamIds.length} ` +
       `sinceMs=${sinceMs} lastScanMs=${lastScanMs} watchStart=${project.watchStartedAt || null} ` +
       `scanStartedAt=${scanStartedAt} overlapMs=${isInitialScan ? 0 : FIGMA_INCREMENTAL_OVERLAP_MS}`
     );
@@ -2722,7 +2784,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     const activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
 
     if (scanResult.errors.length > 0) {
-      console.warn('[crate][figma] Scan errors:', scanResult.errors);
+      console.warn('[crate][figma] Scan errors:', summarizeFigmaErrorsForLog(scanResult.errors));
       // Detect token expiry / auth failures — stop polling instead of retrying every 60s
       const authError = scanResult.errors.find(e => {
         const msg = typeof e === 'string' ? e : (e && e.message) || '';
@@ -2819,7 +2881,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       warning
     };
   } catch (e) {
-    console.error('[crate][figma] pollFigmaForProject error:', e.message);
+    console.error('[crate][figma] pollFigmaForProject error:', redactFigmaLogText(e.message));
     sendToRenderer('figma:scan-error', { projectId, error: e.message });
     // Detect token expiry / auth failures at the network level
     const msg = (e.message || '').toLowerCase();
@@ -5419,15 +5481,18 @@ end tell`;
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
+    const safeTrackedFileSummaries = summarizeTrackedFigmaFilesForLog(rawTrackedFiles);
+    const safeTrackedFileKeys = normalizedTrackedFileKeys.map(key => formatFigmaLogScalar(key));
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
       const { FigmaParser } = require('./parsers/figma');
       const parser = new FigmaParser();
       console.log(
         `[crate][figma] scan config (pre-package): ` +
-        `rawTrackedFiles=${JSON.stringify(rawTrackedFiles)} ` +
-        `trackedFileKeys=${JSON.stringify(normalizedTrackedFileKeys)} ` +
-        `teamIds=${JSON.stringify(teamIds)} ` +
+        `trackedFileCount=${safeTrackedFileSummaries.length} ` +
+        `trackedFiles=${JSON.stringify(safeTrackedFileSummaries)} ` +
+        `trackedFileKeys=${JSON.stringify(safeTrackedFileKeys)} ` +
+        `teamCount=${teamIds.length} ` +
         `sinceMs=${watchStart} lastScanMs=null watchStart=${watchStart}`
       );
       const figmaScanResult = await parser.autoTrackScan({
@@ -5442,7 +5507,7 @@ end tell`;
       mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
 
       if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
-        console.warn('[crate][figma] pre-package scan errors:', figmaScanResult.errors);
+        console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
       }
 
       if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
@@ -5455,7 +5520,7 @@ end tell`;
       }
     }
   } catch (e) {
-    console.warn('[crate][figma] pre-package recovery failed:', e.message);
+    console.warn('[crate][figma] pre-package recovery failed:', redactFigmaLogText(e.message));
   }
 
   project.files = deduplicateFiles(project.files);
