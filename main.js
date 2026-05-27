@@ -1410,15 +1410,46 @@ function isPowerPointPresentationPath(filePath) {
   return ext === '.pptx' || ext === '.ppt';
 }
 
-function getPowerPointMediaResourceIdentity(presentationPath, internalPath) {
-  if (!isPowerPointPresentationPath(presentationPath)) return null;
-  if (typeof internalPath !== 'string' || !internalPath.startsWith('ppt/media/')) return null;
+function isKeynotePresentationPath(filePath) {
+  return path.extname(filePath || '').toLowerCase() === '.key';
+}
+
+function getPresentationMediaFormatInfo(presentationPath, internalPath) {
+  if (isPowerPointPresentationPath(presentationPath)) {
+    if (typeof internalPath !== 'string' || !internalPath.startsWith('ppt/media/')) return null;
+    return {
+      appFamily: 'powerpoint',
+      formatLabel: 'PowerPoint',
+      mediaPrefix: 'ppt/media',
+      parserName: 'powerpoint-zip-media',
+      resourceKeyPrefix: 'powerpoint-media',
+    };
+  }
+
+  if (isKeynotePresentationPath(presentationPath)) {
+    if (typeof internalPath !== 'string' || !internalPath.startsWith('Data/')) return null;
+    return {
+      appFamily: 'keynote',
+      formatLabel: 'Keynote',
+      mediaPrefix: 'Data',
+      parserName: 'keynote-zip-media',
+      resourceKeyPrefix: 'keynote-media',
+    };
+  }
+
+  return null;
+}
+
+function getPresentationMediaResourceIdentity(presentationPath, internalPath) {
+  const formatInfo = getPresentationMediaFormatInfo(presentationPath, internalPath);
+  if (!formatInfo) return null;
 
   const normalizedContainerPath = normalizeTrackedFilePath(presentationPath);
   if (!normalizedContainerPath) return null;
 
-  const resourceKey = createDedupeKey('powerpoint-media', normalizedContainerPath, internalPath);
+  const resourceKey = createDedupeKey(formatInfo.resourceKeyPrefix, normalizedContainerPath, internalPath);
   return {
+    ...formatInfo,
     resourceKey,
     normalizedContainerPath,
     internalPath,
@@ -1427,10 +1458,16 @@ function getPowerPointMediaResourceIdentity(presentationPath, internalPath) {
   };
 }
 
+function getPowerPointMediaResourceIdentity(presentationPath, internalPath) {
+  const resource = getPresentationMediaResourceIdentity(presentationPath, internalPath);
+  return resource && resource.appFamily === 'powerpoint' ? resource : null;
+}
+
 function upsertPresentationContainerNode(provenance, project, presentationPath) {
   const normalizedPath = normalizeTrackedFilePath(presentationPath);
   if (!normalizedPath) return null;
 
+  const ext = path.extname(presentationPath).toLowerCase();
   const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
   const containerNodeId = createNodeId(NODE_TYPES.CONTAINER, { normalizedPath });
   provenance.nodes[fileNodeId] = {
@@ -1449,8 +1486,8 @@ function upsertPresentationContainerNode(provenance, project, presentationPath) 
     fileNodeId,
     path: presentationPath,
     normalizedPath,
-    format: path.extname(presentationPath).toLowerCase().replace(/^\./, ''),
-    appFamily: 'powerpoint',
+    format: ext.replace(/^\./, ''),
+    appFamily: ext === '.key' ? 'keynote' : 'powerpoint',
     containerKind: 'presentation',
     projectId: project.id || null,
   };
@@ -1458,8 +1495,8 @@ function upsertPresentationContainerNode(provenance, project, presentationPath) 
   return { containerNodeId, normalizedPath };
 }
 
-function upsertPowerPointEmbeddedResourceNode(provenance, extraction) {
-  const resource = getPowerPointMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
+function upsertPresentationEmbeddedResourceNode(provenance, extraction) {
+  const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
   if (!resource) return null;
 
   const resourceNodeId = createNodeId(NODE_TYPES.EMBEDDED_RESOURCE, { resourceKey: resource.resourceKey });
@@ -1498,7 +1535,7 @@ function upsertMaterializedPackageFileNode(provenance, filePath, source = null) 
   return { fileNodeId, normalizedPath };
 }
 
-function recordPowerPointMediaExtractionProvenanceForProject(project, extractionEvents = []) {
+function recordPresentationMediaExtractionProvenanceForProject(project, extractionEvents = []) {
   try {
     if (!project || !Array.isArray(extractionEvents) || extractionEvents.length === 0) return;
     const provenance = ensureProjectProvenance(project);
@@ -1509,7 +1546,7 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
       if (!extraction || !extraction.materializedPath) continue;
 
       const container = upsertPresentationContainerNode(provenance, project, extraction.presentationPath);
-      const resource = upsertPowerPointEmbeddedResourceNode(provenance, extraction);
+      const resource = upsertPresentationEmbeddedResourceNode(provenance, extraction);
       const materializedFile = upsertMaterializedPackageFileNode(
         provenance,
         extraction.materializedPath,
@@ -1520,11 +1557,14 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
       const method = extraction.source === 'scan-on-save-presentation'
         ? 'scan-on-save'
         : 'package-extraction';
+      const evidenceSummary = resource.appFamily === 'powerpoint'
+        ? 'PowerPoint embedded media was extracted and written to a package file'
+        : 'Keynote embedded media was extracted and written to a file';
       const evidence = upsertEvidence(provenance, {
         kind: OBSERVER_KINDS.PARSER,
         observer: {
           kind: OBSERVER_KINDS.PARSER,
-          parser: 'powerpoint-zip-media',
+          parser: resource.parserName,
           method,
         },
         observedAt: extraction.observedAt || Date.now(),
@@ -1535,7 +1575,7 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
           internalPath: resource.internalPath,
           materializedPath: extraction.materializedPath,
         },
-        summary: 'PowerPoint embedded media was extracted and written to a package file',
+        summary: evidenceSummary,
         payload: {
           source: extraction.source || null,
           containerPath: extraction.presentationPath,
@@ -1548,7 +1588,7 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
       const embedsDedupeKey = createDedupeKey(
         project.id || 'unknown_project',
         sessionId,
-        'powerpoint-zip-media',
+        resource.parserName,
         EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE,
         container.normalizedPath,
         resource.internalPath
@@ -1566,13 +1606,13 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
         relationType: EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE,
         subjectNodeId: container.containerNodeId,
         objectNodeId: resource.resourceNodeId,
-        confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, 'PowerPoint archive listed the media resource under ppt/media'),
+        confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, `${resource.formatLabel} archive listed the media resource under ${resource.mediaPrefix}`),
         evidenceIds,
         dedupeKey: embedsDedupeKey,
         payload: {
           observer: {
             kind: OBSERVER_KINDS.PARSER,
-            parser: 'powerpoint-zip-media',
+            parser: resource.parserName,
             method,
           },
           source: extraction.source || null,
@@ -1584,7 +1624,7 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
       const materializedDedupeKey = createDedupeKey(
         project.id || 'unknown_project',
         sessionId,
-        'powerpoint-zip-media',
+        resource.parserName,
         EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE,
         resource.resourceKey,
         materializedFile.normalizedPath
@@ -1602,13 +1642,13 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
         relationType: EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE,
         subjectNodeId: resource.resourceNodeId,
         objectNodeId: materializedFile.fileNodeId,
-        confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, 'PowerPoint media resource was written to disk'),
+        confidence: createConfidence(CONFIDENCE_BANDS.CONFIRMED, `${resource.formatLabel} media resource was written to disk`),
         evidenceIds,
         dedupeKey: materializedDedupeKey,
         payload: {
           observer: {
             kind: OBSERVER_KINDS.PARSER,
-            parser: 'powerpoint-zip-media',
+            parser: resource.parserName,
             method,
           },
           source: extraction.source || null,
@@ -1618,20 +1658,28 @@ function recordPowerPointMediaExtractionProvenanceForProject(project, extraction
       };
     }
   } catch (e) {
-    console.warn('[crate][provenance] PowerPoint media provenance skipped:', e.message);
+    console.warn('[crate][provenance] presentation media provenance skipped:', e.message);
+  }
+}
+
+function recordPowerPointMediaExtractionProvenanceForProject(project, extractionEvents = []) {
+  recordPresentationMediaExtractionProvenanceForProject(project, extractionEvents);
+}
+
+function recordPresentationMediaExtractionProvenance(projectId, extractionEvents = []) {
+  try {
+    if (!Array.isArray(extractionEvents) || extractionEvents.length === 0) return;
+    mutateProject(projectId, (project) => {
+      recordPresentationMediaExtractionProvenanceForProject(project, extractionEvents);
+      return null;
+    });
+  } catch (e) {
+    console.warn('[crate][provenance] presentation media provenance skipped:', e.message);
   }
 }
 
 function recordPowerPointMediaExtractionProvenance(projectId, extractionEvents = []) {
-  try {
-    if (!Array.isArray(extractionEvents) || extractionEvents.length === 0) return;
-    mutateProject(projectId, (project) => {
-      recordPowerPointMediaExtractionProvenanceForProject(project, extractionEvents);
-      return null;
-    });
-  } catch (e) {
-    console.warn('[crate][provenance] PowerPoint media provenance skipped:', e.message);
-  }
+  recordPresentationMediaExtractionProvenance(projectId, extractionEvents);
 }
 
 function upsertPackageNode(provenance, project, packageInfo) {
@@ -1695,7 +1743,7 @@ function upsertPackageEmbeddedResourceNode(provenance, fileEntry) {
   return resourceNodeId;
 }
 
-function upsertPackagePowerPointResourceNode(provenance, resource = {}) {
+function upsertPackagePresentationResourceNode(provenance, resource = {}) {
   if (typeof resource.resourceKey !== 'string' || !resource.resourceKey.trim()) return null;
 
   const resourceNodeId = createNodeId(NODE_TYPES.EMBEDDED_RESOURCE, { resourceKey: resource.resourceKey });
@@ -1732,7 +1780,7 @@ function recordPackageProvenance(projectId, packageInfo, events = []) {
 
         const objectNodeId = relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE
           ? (event.resource
-            ? upsertPackagePowerPointResourceNode(provenance, event.resource)
+            ? upsertPackagePresentationResourceNode(provenance, event.resource)
             : upsertPackageEmbeddedResourceNode(provenance, event.file))
           : upsertPackageSourceFileNode(provenance, event.file);
         if (!objectNodeId) continue;
@@ -5621,7 +5669,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         const destPath = resolveUniquePackagePath(destFolder, outputName);
         fs.writeFileSync(destPath, data, { flag: 'wx' });
         extracted.push(destPath);
-        if ((ext === '.pptx' || ext === '.ppt') && typeof options.onExtracted === 'function') {
+        if (typeof options.onExtracted === 'function') {
           try {
             options.onExtracted({
               presentationPath,
@@ -5631,7 +5679,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
               observedAt: Date.now(),
             });
           } catch (provenanceErr) {
-            console.warn('[crate][provenance] PowerPoint media extraction callback skipped:', provenanceErr.message);
+            console.warn('[crate][provenance] presentation media extraction callback skipped:', provenanceErr.message);
           }
         }
         console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
@@ -5810,7 +5858,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     // These formats embed images internally as zip entries — lsof can't catch
     // the sub-100ms reads when assets are dragged in, so we pull them at package time.
     let embeddedCount = 0;
-    const powerPointExtractionEvents = [];
+    const presentationExtractionEvents = [];
     const ZIP_BASED_FORMATS = new Set(['.key', '.pptx', '.ppt']);
 
     // v1.3.37: When Keynote/PowerPoint re-saves, both old and new versions may
@@ -5837,9 +5885,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
         const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, packageFiles, {
           source: 'package-extraction',
           onExtracted: (extraction) => {
-            const resource = getPowerPointMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
+            const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
             if (!resource) return;
-            powerPointExtractionEvents.push(extraction);
+            presentationExtractionEvents.push(extraction);
             packageProvenanceEvents.push({
               relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
               resource: {
@@ -5862,7 +5910,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
       }
     }
 
-    recordPowerPointMediaExtractionProvenance(id, powerPointExtractionEvents);
+    recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents);
     recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
     if (settings.includeDiagnosticReport === true) {
       writePackageProvenanceManifest(id, packageProvenanceInfo, {

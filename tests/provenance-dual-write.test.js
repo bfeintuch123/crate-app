@@ -387,7 +387,7 @@ function assertPackageResultShape(result) {
   ]);
 }
 
-function setPowerPointUnzipFixture(mediaEntries) {
+function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
   const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
   setChildProcessHandler(({ kind, command, args }) => {
     if (kind !== 'execFile' || command !== '/usr/bin/unzip') return { stdout: '', stderr: '' };
@@ -396,7 +396,7 @@ function setPowerPointUnzipFixture(mediaEntries) {
         const size = entry.data.length;
         return `      ${size}  05-26-2026 12:34   ${entry.internalPath}`;
       });
-      return { stdout: ['Archive: deck.pptx', ...lines, ''].join('\n'), stderr: '' };
+      return { stdout: [`Archive: ${archiveName}`, ...lines, ''].join('\n'), stderr: '' };
     }
     if (args[0] === '-p') {
       const entry = byInternalPath.get(args[2]);
@@ -404,6 +404,14 @@ function setPowerPointUnzipFixture(mediaEntries) {
     }
     return { stdout: '', stderr: '' };
   });
+}
+
+function setPowerPointUnzipFixture(mediaEntries) {
+  setPresentationUnzipFixture(mediaEntries, 'deck.pptx');
+}
+
+function setKeynoteUnzipFixture(mediaEntries) {
+  setPresentationUnzipFixture(mediaEntries, 'deck.key');
 }
 
 function assertSessionObservedFile(project, observerKind, method, confidenceBand) {
@@ -577,8 +585,17 @@ test('PowerPoint package extraction records deterministic media provenance and d
       ['ppt/media/image1.jpeg', 'ppt/media/image2.png']
     );
     assert.equal(
+      embeddedResources.every(node => String(node.resourceKey || '').startsWith('powerpoint-media:')),
+      true
+    );
+    assert.equal(
       getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)
         .every(edge => edge.confidence.band === CONFIDENCE_BANDS.CONFIRMED),
+      true
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)
+        .every(edge => edge.payload.observer.parser === 'powerpoint-zip-media'),
       true
     );
     assert.equal(
@@ -697,6 +714,255 @@ test('PowerPoint provenance failure does not block package extraction success', 
     assert.equal(result.totalFiles, 1);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'PowerPoint Provenance Failure'), 'Deck — image1.jpeg'), 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Scan Save Provenance');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/photo-1234.jpeg',
+      data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+
+    await emitWatcher('change', keynotePath);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'scan-on-save-presentation'),
+      5000
+    );
+    const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(extracted);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
+    assert.equal(extracted.name, 'Deck — photo.jpeg');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath),
+      ['Data/photo-1234.jpeg']
+    );
+    assert.equal(embeddedResources[0].resourceKey.startsWith('keynote-media:'), true);
+    const embedsEdge = getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)[0];
+    assert.equal(embedsEdge.confidence.band, CONFIDENCE_BANDS.CONFIRMED);
+    assert.equal(embedsEdge.payload.observer.parser, 'keynote-zip-media');
+    assert.equal(embedsEdge.payload.internalPath, 'Data/photo-1234.jpeg');
+    const materializedEdge = getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE)[0];
+    assert.equal(materializedEdge.confidence.band, CONFIDENCE_BANDS.CONFIRMED);
+    assert.equal(materializedEdge.payload.observer.parser, 'keynote-zip-media');
+    assert.equal(materializedEdge.payload.internalPath, 'Data/photo-1234.jpeg');
+
+    await emitWatcher('change', keynotePath);
+    await new Promise(resolve => originalSetTimeout(resolve, 2600));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction records deterministic Data media provenance and diagnostics graph', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Media Provenance');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([
+      {
+        internalPath: 'Data/photo-1234.jpeg',
+        data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'Data/clip-5678.mov',
+        data: Buffer.from('KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 2);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Media Provenance');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck.key'), 'utf8'), 'keynote container bytes');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — photo.jpeg'), 'utf8'), 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — clip.mov'), 'utf8'), 'KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+
+    let fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath).sort(),
+      ['Data/clip-5678.mov', 'Data/photo-1234.jpeg']
+    );
+    assert.equal(
+      embeddedResources.every(node => String(node.resourceKey || '').startsWith('keynote-media:')),
+      true
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)
+        .every(edge => edge.confidence.band === CONFIDENCE_BANDS.CONFIRMED),
+      true
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE)
+        .every(edge => edge.confidence.band === CONFIDENCE_BANDS.CONFIRMED),
+      true
+    );
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)
+        .every(edge => edge.payload.observer.parser === 'keynote-zip-media'),
+      true
+    );
+
+    const manifest = readManifest(outputDir, 'Keynote Media Provenance');
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Keynote Media Provenance')), false);
+    assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
+    assert.equal(manifest.package.copiedCount, 1);
+    assert.equal(manifest.package.embeddedCount, 2);
+    assert.equal(manifest.package.totalFiles, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('Data/photo-1234.jpeg'), true);
+    assert.equal(manifestText.includes('Deck — photo.jpeg'), true);
+    assert.equal(manifestText.includes('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(manifestText.includes('KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'), false);
+
+    const duplicateResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(duplicateResult);
+    assert.equal(duplicateResult.copiedCount, 1);
+    assert.equal(duplicateResult.embeddedCount, 2);
+    assert.equal(duplicateResult.totalFiles, 1);
+    fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote provenance stays internal when diagnostic report is disabled', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Diagnostics Off');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/photo-1234.jpeg',
+      data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Keynote Diagnostics Off')), false);
+    assert.equal(fs.existsSync(manifestPath(outputDir, 'Keynote Diagnostics Off')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote provenance failure does not block package extraction success', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Provenance Failure');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/photo-1234.jpeg',
+      data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+    const projects = await callIpc('projects:get-all');
+    const stored = projects.find(item => item.id === project.id);
+    stored.files = [{
+      path: keynotePath,
+      name: 'Deck.key',
+      ext: '.key',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }];
+    stored.provenance = {
+      schemaVersion: 1,
+      sessionId: null,
+      nodes: new Proxy({}, {
+        set() {
+          throw new Error('forced Keynote provenance failure');
+        },
+      }),
+      edges: {},
+      observations: [],
+      evidence: {},
+    };
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'Keynote Provenance Failure'), 'Deck — photo.jpeg'), 'utf8'), 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
