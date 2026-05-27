@@ -891,6 +891,59 @@ test('manifest write failure does not block package success', async () => {
   }
 });
 
+test('diagnostic manifest skips symlinked diagnostics folder without escaping package root', async () => {
+  const tmpRoot = makeTempDir();
+  const originalWarn = console.warn;
+  const warnings = [];
+  try {
+    const sourcePath = path.join(tmpRoot, 'logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    const destFolder = packageFolder(outputDir, 'Manifest Symlink Safety');
+    const diagnosticsFolder = path.join(destFolder, 'Crate Diagnostics');
+    const symlinkTarget = path.join(tmpRoot, 'outside-diagnostics');
+    fs.mkdirSync(destFolder, { recursive: true });
+    fs.mkdirSync(symlinkTarget, { recursive: true });
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    fs.symlinkSync(symlinkTarget, diagnosticsFolder, 'dir');
+
+    setProjects([
+      makeProject('manifest-symlink-safety', 'Manifest Symlink Safety', [{
+        path: sourcePath,
+        name: 'logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }]),
+    ]);
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    console.warn = (...args) => {
+      warnings.push(args.map(arg => String(arg)).join(' '));
+    };
+    const result = await callIpc('projects:package', 'manifest-symlink-safety', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.readFileSync(path.join(destFolder, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Manifest Symlink Safety')), false);
+    assert.equal(fs.existsSync(path.join(symlinkTarget, 'crate-provenance.json')), false);
+    assert.equal(fs.lstatSync(diagnosticsFolder).isSymbolicLink(), true);
+    assert.equal(JSON.stringify(result).includes(symlinkTarget), false);
+
+    const warningText = warnings.join('\n');
+    assert.match(warningText, /manifest write skipped/);
+    assert.equal(warningText.includes(symlinkTarget), false);
+    assert.equal(warningText.includes(tmpRoot), false);
+  } finally {
+    console.warn = originalWarn;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('pre-package PSD embedded extraction sanitizes unsafe names and preserves duplicate bytes', async () => {
   const tmpRoot = makeTempDir();
   try {

@@ -33,6 +33,7 @@ const {
   resolveUniquePackagePath: resolveSafeUniquePackagePath,
   copyFileIntoPackage,
   assertSafeCopySource,
+  writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -2033,12 +2034,22 @@ function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {
   try {
     const project = getProjects().find(p => p.id === projectId) || null;
     const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
-    const diagnosticsFolder = path.join(packageInfo.destFolder, DIAGNOSTICS_FOLDER_NAME);
-    fs.mkdirSync(diagnosticsFolder, { recursive: true });
-    const manifestPath = path.join(diagnosticsFolder, PROVENANCE_MANIFEST_FILENAME);
-    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    writeFileIntoPackageExact(
+      packageInfo.destFolder,
+      path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      {
+        preserveRelativePath: true,
+        fallbackName: PROVENANCE_MANIFEST_FILENAME,
+        overwrite: true,
+      }
+    );
   } catch (e) {
-    console.warn('[crate][provenance] manifest write skipped:', e.message);
+    const message = e && typeof e.message === 'string' ? e.message : '';
+    const safeMessage = /^(Invalid package output folder|Package output |Package destination )/.test(message)
+      ? message
+      : 'Diagnostic manifest could not be written safely';
+    console.warn('[crate][provenance] manifest write skipped:', safeMessage);
   }
 }
 
