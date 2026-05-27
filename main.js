@@ -27,6 +27,13 @@ const {
   appendObservation,
   upsertEvidence,
 } = require('./provenance');
+const {
+  sanitizePackageFileName,
+  ensureSafePackageDirectory,
+  resolveUniquePackagePath: resolveSafeUniquePackagePath,
+  copyFileIntoPackage,
+  assertSafeCopySource,
+} = require('./parsers/package-safety');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
@@ -3987,7 +3994,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
           counter++;
         }
 
-        fs.writeFileSync(destPath, data);
+        fs.writeFileSync(destPath, data, { flag: 'wx' });
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
         newEntries.push({
@@ -5611,17 +5618,8 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         // Prefix with presentation name to avoid collisions with other files
         outputName = `${base} — ${outputName}`;
 
-        // Handle duplicate filenames using existing counter pattern
-        let destPath = path.join(destFolder, outputName);
-        let counter = 1;
-        while (fs.existsSync(destPath)) {
-          const e = path.extname(outputName);
-          const b = path.basename(outputName, e);
-          destPath = path.join(destFolder, `${b}_${counter}${e}`);
-          counter++;
-        }
-
-        fs.writeFileSync(destPath, data);
+        const destPath = resolveUniquePackagePath(destFolder, outputName);
+        fs.writeFileSync(destPath, data, { flag: 'wx' });
         extracted.push(destPath);
         if ((ext === '.pptx' || ext === '.ppt') && typeof options.onExtracted === 'function') {
           try {
@@ -5649,16 +5647,31 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 }
 
 function resolveUniquePackagePath(destFolder, fileName) {
-  const destPath = path.join(destFolder, fileName);
-  let finalPath = destPath;
-  let counter = 1;
-  while (fs.existsSync(finalPath)) {
-    const ext = path.extname(fileName);
-    const base = path.basename(fileName, ext);
-    finalPath = path.join(destFolder, `${base}_${counter}${ext}`);
-    counter++;
+  return resolveSafeUniquePackagePath(destFolder, fileName, {
+    fallbackName: 'file'
+  });
+}
+
+function getPackageFileDisplayName(file) {
+  const fallbackName = file && typeof file.path === 'string' ? path.basename(file.path) : 'file';
+  return sanitizePackageFileName(file && file.name, fallbackName || 'file');
+}
+
+function packageSourceExists(sourcePath) {
+  try {
+    return typeof sourcePath === 'string' && !sourcePath.includes('\0') && fs.existsSync(sourcePath);
+  } catch (e) {
+    return false;
   }
-  return finalPath;
+}
+
+function isSafePackageSourceFile(sourcePath) {
+  try {
+    assertSafeCopySource(sourcePath);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function isScanOnSaveEmbeddedPsdFile(file) {
@@ -5688,9 +5701,10 @@ function findEmbeddedPsdLinkedFile(file, linkedFiles) {
 
 async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
   const parentPsd = file.parentPsd || file.path;
-  if (!parentPsd || !fs.existsSync(parentPsd)) {
+  if (!parentPsd || !packageSourceExists(parentPsd)) {
     throw new Error('Parent PSD not found');
   }
+  assertSafeCopySource(parentPsd);
 
   const stat = await fs.promises.stat(parentPsd);
   if (stat.size > MAX_PARSE_FILE_SIZE) {
@@ -5704,7 +5718,7 @@ async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
     throw new Error('Embedded PSD asset not found');
   }
 
-  await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data));
+  await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data), { flag: 'wx' });
 }
 
 ipcMain.handle('projects:package', async (event, id, outputPath) => {
@@ -5747,13 +5761,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     .replace('{Project}', cleanName(project.name))
     .replace('{Date}', dateStr);
 
-  const destFolder = path.join(outputPath, folderName);
+  const destFolder = ensureSafePackageDirectory(path.join(outputPath, folderName));
 
   try {
-    if (!fs.existsSync(destFolder)) {
-      fs.mkdirSync(destFolder, { recursive: true });
-    }
-
     let copiedCount = 0;
     const errors = [];
     const packageProvenanceEvents = [];
@@ -5763,6 +5773,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     };
 
     for (const file of packageFiles) {
+      const packageFileName = getPackageFileDisplayName(file);
       try {
         if (isScanOnSaveEmbeddedPsdFile(file)) {
           const safeName = sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName);
@@ -5777,9 +5788,10 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
           continue;
         }
 
-        if (fs.existsSync(file.path)) {
-          const finalPath = resolveUniquePackagePath(destFolder, file.name);
-          fs.copyFileSync(file.path, finalPath);
+        if (packageSourceExists(file.path)) {
+          const finalPath = copyFileIntoPackage(file.path, destFolder, packageFileName, {
+            fallbackName: packageFileName
+          });
           packageProvenanceEvents.push({
             relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
             file,
@@ -5787,10 +5799,10 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
           });
           copiedCount++;
         } else {
-          errors.push(`File not found: ${file.name}`);
+          errors.push(`File not found: ${packageFileName}`);
         }
       } catch (err) {
-        errors.push(`Failed to copy ${file.name}: ${err.message}`);
+        errors.push(`Failed to copy ${packageFileName}: ${err.message}`);
       }
     }
 
@@ -5806,8 +5818,8 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     // to avoid double-counting embedded media.
     const presentationsByName = new Map();
     for (const file of packageFiles) {
-      const fileExt = path.extname(file.name).toLowerCase();
-      if (ZIP_BASED_FORMATS.has(fileExt) && fs.existsSync(file.path)) {
+      const fileExt = path.extname(getPackageFileDisplayName(file)).toLowerCase();
+      if (ZIP_BASED_FORMATS.has(fileExt) && isSafePackageSourceFile(file.path)) {
         // M3: Use full normalized path as dedup key, not just basename,
         // so files with the same name in different directories aren't merged.
         const dedupKey = path.resolve(file.path).toLowerCase();

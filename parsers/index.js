@@ -23,6 +23,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  assertSafeCopySource,
+  copyFileIntoPackage,
+  ensureSafePackageDirectory,
+} = require('./package-safety');
 
 // Import all parsers
 const { AIParser } = require('./ai');
@@ -179,11 +184,9 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   if (!parser) {
     throw new Error(`No parser available for file type: ${path.extname(filePath)}`);
   }
+  assertSafeCopySource(filePath);
 
-  // Create output directory
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  const outputRoot = ensureSafePackageDirectory(outputDir);
 
   // Report progress: starting
   if (onProgress) {
@@ -203,8 +206,9 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
 
   // Copy master file to output directory
   const masterFileName = path.basename(filePath);
-  const masterDestPath = path.join(outputDir, masterFileName);
-  fs.copyFileSync(filePath, masterDestPath);
+  const masterDestPath = copyFileIntoPackage(filePath, outputRoot, masterFileName, {
+    fallbackName: masterFileName || 'master-file'
+  });
   result.files.push({
     original: filePath,
     copied: masterDestPath,
@@ -242,10 +246,11 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
     }
 
     // Determine destination path
-    let destPath;
+    let destName;
+    let preserveRelativePath = false;
     if (flat) {
       // Flat mode: all files in root of outputDir
-      destPath = path.join(outputDir, path.basename(asset.path));
+      destName = path.basename(asset.path);
     } else {
       // Preserve relative structure
       // Calculate path relative to master file's directory
@@ -253,34 +258,20 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
 
       // If the asset is outside the master's directory tree (starts with ..),
       // fall back to flat mode for that file
-      if (relativePath.startsWith('..')) {
-        destPath = path.join(outputDir, path.basename(asset.path));
+      if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+        destName = path.basename(asset.path);
       } else {
-        destPath = path.join(outputDir, relativePath);
+        destName = relativePath;
+        preserveRelativePath = true;
       }
-    }
-
-    // Handle filename collisions
-    if (fs.existsSync(destPath)) {
-      const ext = path.extname(destPath);
-      const base = path.basename(destPath, ext);
-      const dir = path.dirname(destPath);
-      let counter = 1;
-      while (fs.existsSync(destPath)) {
-        destPath = path.join(dir, `${base}_${counter}${ext}`);
-        counter++;
-      }
-    }
-
-    // Ensure destination directory exists
-    const destDir = path.dirname(destPath);
-    if (!fs.existsSync(destDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
     }
 
     // Copy the file
     try {
-      fs.copyFileSync(asset.path, destPath);
+      const destPath = copyFileIntoPackage(asset.path, outputRoot, destName, {
+        preserveRelativePath,
+        fallbackName: path.basename(asset.path) || 'asset'
+      });
       result.assetsCopied++;
       result.files.push({
         original: asset.path,
@@ -297,7 +288,7 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   if (includeEmbedded && parser.extractToDirectory) {
     try {
       const embeddedAssets = await parser.extractAssets(filePath);
-      const extracted = await parser.extractToDirectory(filePath, outputDir, embeddedAssets);
+      const extracted = await parser.extractToDirectory(filePath, outputRoot, embeddedAssets);
 
       for (const item of extracted) {
         result.assetsCopied++;
