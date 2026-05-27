@@ -58,6 +58,7 @@ Use:
 - `security-audit.md` for shell, path, credential, watcher, parser, package, and dependency risk review.
 - `clawpatch-fix.md` for a small, targeted bug fix with narrow tests.
 - `mobile-codex-workflow.md` when Bryant is supervising Codex CLI from mobile.
+- `crate-autoreview.md` for long-running, adversarial, multi-pass pre-merge autoreview with concrete fix recommendations and no automatic code edits.
 - `crate-regression-detector.md` for fail-fast branch or PR regression sweeps.
 - `crate-provenance-review.md` for provenance evidence, confidence, privacy, manifest, package, and Figma review.
 - `crate-reprobox.md` for isolated reproducibility work in temporary workspaces.
