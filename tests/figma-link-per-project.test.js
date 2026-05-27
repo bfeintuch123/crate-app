@@ -396,6 +396,27 @@ function readManifest(outputDir, projectName) {
   return JSON.parse(fs.readFileSync(manifestPath(outputDir, projectName), 'utf8'));
 }
 
+async function captureConsole(fn) {
+  const messages = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const capture = (...args) => messages.push(args.map(arg => String(arg)).join(' '));
+  console.log = capture;
+  console.warn = capture;
+  console.error = capture;
+  try {
+    return {
+      result: await fn(),
+      output: messages.join('\n'),
+    };
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+}
+
 // ---------- Tests ----------
 
 test('projects:create with a Figma URL stores per-project tracked file', async () => {
@@ -783,6 +804,88 @@ test('Figma asset scan records cloud resource materialization provenance after l
   const provenanceText = JSON.stringify(fresh.provenance);
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_URL'), false);
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+});
+
+test('main-process Figma logs redact tracked URLs, signed URLs, and local asset paths', async () => {
+  const sensitiveFigmaUrl = 'https://www.figma.com/file/FIGLOG/Secret-File?page-id=1%3A1&token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
+  const sensitiveCdnUrl = 'https://cdn.figma.example/signed/SHOULD_NOT_APPEAR_URL?token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
+  const project = await callIpc(
+    'projects:create',
+    'Figma Main Log Privacy',
+    'branding',
+    'current-page',
+    sensitiveFigmaUrl
+  );
+  storedFigmaToken = 'test-token';
+  setFigmaDownloadResponse('log privacy asset bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: sensitiveCdnUrl,
+    nodeId: 'node-log-privacy',
+    imageRef: 'img-log-privacy',
+    name: 'Log Privacy Asset',
+    format: 'png',
+    figmaFileKey: 'FIGLOG',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIGLOG',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+  nextFigmaScanResult.errors = [
+    `scan failed ${sensitiveFigmaUrl} ${sensitiveCdnUrl} Authorization=Bearer SHOULD_NOT_APPEAR_AUTH cookie=SHOULD_NOT_APPEAR_COOKIE /Users/designer/private/log-asset.png`,
+  ];
+
+  const { output } = await captureConsole(async () => {
+    const scan = await callIpc('figma:scan-project', project.id);
+    assert.equal(scan.success, true);
+    await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should be added for log privacy test');
+
+    nextFigmaScanResult = figmaScanResult([], []);
+    nextFigmaScanResult.errors = [
+      `pre-package failed ${sensitiveFigmaUrl} ${sensitiveCdnUrl} Bearer SHOULD_NOT_APPEAR_AUTH cookie=SHOULD_NOT_APPEAR_COOKIE`,
+    ];
+    const prePackage = await callIpc('projects:pre-package-scan', project.id);
+    assert.ok(prePackage && Array.isArray(prePackage.files));
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const localAssetPath = fresh.files[0].path;
+
+  assert.match(output, /scan config \(live-initial\)/);
+  assert.match(output, /scan config \(pre-package\)/);
+  assert.match(output, /trackedFileCount=1/);
+  assert.match(output, /"hasUrl":true/);
+  assert.match(output, /fileKey=FIGLOG/);
+  assert.match(output, /localName=Brand_Cloud_Log_Privacy_Asset\.png/);
+  assert.match(output, /\[redacted-url\]/);
+
+  for (const forbidden of [
+    sensitiveFigmaUrl,
+    sensitiveCdnUrl,
+    'figma.com',
+    'cdn.figma.example',
+    'rawTrackedFiles',
+    'Secret-File',
+    'page-id',
+    '1%3A1',
+    '1:1',
+    'SHOULD_NOT_APPEAR',
+    'Authorization',
+    'Bearer',
+    'cookie',
+    localAssetPath,
+    path.dirname(localAssetPath),
+    TEST_HOME,
+    '/Users/designer/private/log-asset.png',
+  ]) {
+    assert.equal(output.includes(forbidden), false, `log output should not include ${forbidden}`);
+  }
 });
 
 test('Duplicate Figma asset scans do not duplicate files or provenance edges', async () => {
