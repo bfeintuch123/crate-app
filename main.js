@@ -163,13 +163,10 @@ const FIGMA_SCOPE_ENTIRE_FILE = 'entire-file';
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
 
 function getProjectFigmaScopeMode(project) {
-  const sessionMode = project && project.figmaSession && project.figmaSession.scopeMode;
-  if (VALID_FIGMA_SCOPE_MODES.has(sessionMode)) return sessionMode;
-
   const projectMode = project && project.figmaScopeMode;
   if (VALID_FIGMA_SCOPE_MODES.has(projectMode)) return projectMode;
 
-  return FIGMA_SCOPE_ENTIRE_FILE;
+  return FIGMA_SCOPE_CURRENT_PAGE;
 }
 
 function normalizeTrackedFigmaFiles(rawTrackedFiles) {
@@ -230,9 +227,7 @@ function rebuildFigmaSessionWarnings(session) {
 function buildFigmaSessionSnapshot(project, _settings = {}) {
   const { FigmaParser } = require('./parsers/figma');
 
-  const scopeMode = VALID_FIGMA_SCOPE_MODES.has(project && project.figmaScopeMode)
-    ? project.figmaScopeMode
-    : FIGMA_SCOPE_ENTIRE_FILE;
+  const scopeMode = getProjectFigmaScopeMode(project);
   const trackedFiles = normalizeTrackedFigmaFiles((project && project.figmaTrackedFiles) || []);
   const sessionWarnings = [];
 
@@ -2715,7 +2710,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     // Download assets and add to project
     const scopedAssets = scanResult.assets.map((asset) => ({
       ...asset,
-      figmaScopeMode: (figmaSession && figmaSession.scopeMode) || FIGMA_SCOPE_ENTIRE_FILE
+      figmaScopeMode: getProjectFigmaScopeMode(latestProject)
     }));
     const addedCount = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'poll');
 
@@ -5387,7 +5382,7 @@ end tell`;
       if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
         const scopedAssets = figmaScanResult.assets.map((asset) => ({
           ...asset,
-          figmaScopeMode: (figmaSession && figmaSession.scopeMode) || FIGMA_SCOPE_ENTIRE_FILE
+          figmaScopeMode: getProjectFigmaScopeMode(latestProject)
         }));
         const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'pre-package');
         newCount += figmaAdded;

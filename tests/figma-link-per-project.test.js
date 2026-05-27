@@ -350,6 +350,35 @@ async function createLinkedFigmaProject(name = 'Figma Provenance') {
   return project;
 }
 
+async function rebuildFigmaSessionViaScan(projectId) {
+  storedFigmaToken = 'test-token';
+  nextFigmaScanResult = figmaScanResult([], []);
+  const scan = await callIpc('figma:scan-project', projectId);
+  assert.equal(scan.success, true);
+  return (await callIpc('projects:get-all')).find(p => p.id === projectId);
+}
+
+async function addFigmaAutoFileToProject(projectId, filePath, overrides = {}) {
+  const project = (await callIpc('projects:get-all')).find(p => p.id === projectId);
+  assert.ok(project, 'project should exist');
+  const file = {
+    id: `figma-auto-${project.files.length + 1}`,
+    path: filePath,
+    name: path.basename(filePath),
+    ext: path.extname(filePath).toLowerCase(),
+    addedAt: Date.now(),
+    source: 'figma-auto',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+    figmaScopeMode: 'current-page',
+    ...overrides,
+  };
+  project.files.push(file);
+  return file;
+}
+
 function packageFolder(outputDir, projectName) {
   const dateStr = new Date().toISOString().split('T')[0];
   return path.join(outputDir, `${projectName}_${dateStr}`);
@@ -532,6 +561,171 @@ test('figmaSession snapshot reads tracked files from the project, not settings',
   await callIpc('settings:update', 'figmaTrackedFiles', [{ key: 'INJECT', url: 'x' }]);
   const settingsAfter = await callIpc('settings:get');
   assert.equal(settingsAfter.figmaTrackedFiles, undefined);
+});
+
+test('legacy Figma project without figmaScopeMode defaults its session to Current Page Only', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Missing Figma Scope',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+
+  const legacy = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+  delete legacy.figmaScopeMode;
+  delete legacy.figmaSession;
+
+  const fresh = await rebuildFigmaSessionViaScan(project.id);
+  assert.equal(fresh.figmaScopeMode, undefined);
+  assert.equal(fresh.figmaSession.scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles.length, 1);
+  assert.equal(fresh.figmaSession.trackedFiles[0].scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '1:1');
+});
+
+test('legacy Figma project with invalid figmaScopeMode defaults its session to Current Page Only', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Invalid Figma Scope',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+
+  const legacy = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+  legacy.figmaScopeMode = 'legacy-entire-file';
+  legacy.figmaSession = {
+    scopeMode: 'entire-file',
+    startedAt: legacy.watchStartedAt,
+    teamIds: [],
+    trackedFiles: [{
+      key: 'FIG22',
+      url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1',
+      scopeMode: 'entire-file',
+      lockStatus: 'entire-file',
+      lockedPageId: null,
+      lockedPageName: null,
+    }],
+    warnings: [],
+  };
+
+  const fresh = await rebuildFigmaSessionViaScan(project.id);
+  assert.equal(fresh.figmaScopeMode, 'legacy-entire-file');
+  assert.equal(fresh.figmaSession.scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles.length, 1);
+  assert.equal(fresh.figmaSession.trackedFiles[0].scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '1:1');
+});
+
+test('Current Page Only without a page-linked URL fails closed at package time', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-no-page-'));
+  try {
+    const project = await callIpc(
+      'projects:create',
+      'Figma No Page Lock',
+      'branding',
+      'current-page',
+      'https://www.figma.com/file/FIG22/Brand-Cloud'
+    );
+    const assetPath = path.join(tmpRoot, 'out-of-scope.png');
+    fs.writeFileSync(assetPath, 'out of scope asset');
+    await addFigmaAutoFileToProject(project.id, assetPath, {
+      figmaPageId: '2:2',
+      figmaPageName: 'Other Page',
+    });
+
+    const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+    assert.equal(fresh.figmaSession.scopeMode, 'current-page');
+    assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 0);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 0);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.existsSync(path.join(packageFolder(outputDir, 'Figma No Page Lock'), 'out-of-scope.png')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('explicit Entire File still packages Figma assets from any page', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-entire-'));
+  try {
+    const project = await callIpc(
+      'projects:create',
+      'Figma Explicit Entire',
+      'branding',
+      'entire-file',
+      'https://www.figma.com/file/FIG22/Brand-Cloud'
+    );
+    const assetPath = path.join(tmpRoot, 'entire-file-asset.png');
+    fs.writeFileSync(assetPath, 'entire file asset');
+    await addFigmaAutoFileToProject(project.id, assetPath, {
+      figmaPageId: '2:2',
+      figmaPageName: 'Other Page',
+      figmaScopeMode: 'entire-file',
+    });
+
+    const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+    assert.equal(fresh.figmaScopeMode, 'entire-file');
+    assert.equal(fresh.figmaSession.scopeMode, 'entire-file');
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Explicit Entire'), 'entire-file-asset.png'), 'utf8'), 'entire file asset');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('explicit Current Page Only packages only locked-page Figma assets', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-current-'));
+  try {
+    const project = await callIpc(
+      'projects:create',
+      'Figma Explicit Current',
+      'branding',
+      'current-page',
+      'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+    );
+    const inScopePath = path.join(tmpRoot, 'in-scope.png');
+    const outOfScopePath = path.join(tmpRoot, 'out-of-scope.png');
+    fs.writeFileSync(inScopePath, 'in scope asset');
+    fs.writeFileSync(outOfScopePath, 'out of scope asset');
+    await addFigmaAutoFileToProject(project.id, inScopePath, {
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    });
+    await addFigmaAutoFileToProject(project.id, outOfScopePath, {
+      figmaPageId: '2:2',
+      figmaPageName: 'Page Two',
+    });
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const packagedFolder = packageFolder(outputDir, 'Figma Explicit Current');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'in-scope.png'), 'utf8'), 'in scope asset');
+    assert.equal(fs.existsSync(path.join(packagedFolder, 'out-of-scope.png')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('Figma asset scan records cloud resource materialization provenance after ledger add', async () => {

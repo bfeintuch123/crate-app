@@ -314,13 +314,10 @@ function resolveNamingTemplate(template, name) {
 }
 
 function getProjectFigmaScopeMode(project) {
-  const sessionMode = project && project.figmaSession && project.figmaSession.scopeMode;
-  if (sessionMode === 'current-page' || sessionMode === 'entire-file') return sessionMode;
-
   const projectMode = project && project.figmaScopeMode;
   if (projectMode === 'current-page' || projectMode === 'entire-file') return projectMode;
 
-  return 'entire-file';
+  return 'current-page';
 }
 
 function getProjectFigmaScopeLabel(project) {
