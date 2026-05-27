@@ -247,6 +247,25 @@ function resolveUniquePackagePath(destFolder, rawName, options = {}) {
   return finalPath;
 }
 
+function resolveExactPackagePath(destFolder, rawName, options = {}) {
+  const root = ensureSafePackageDirectory(destFolder);
+  const realRoot = realpathSync(root);
+  const fallbackName = options.fallbackName || 'file';
+  const relativeName = options.preserveRelativePath
+    ? sanitizePackageRelativePath(rawName, fallbackName)
+    : sanitizePackageFileName(rawName, fallbackName);
+
+  const finalPath = path.resolve(root, relativeName);
+  if (!isPathInsideDirectory(root, finalPath)) {
+    throw new Error('Package destination escapes package folder');
+  }
+
+  const destDir = path.dirname(finalPath);
+  ensureSafeDestinationDirectory(root, realRoot, destDir);
+  assertFinalDestinationInsideRoot(realRoot, destDir, finalPath);
+  return finalPath;
+}
+
 function assertSafeCopySource(sourcePath) {
   if (!sourcePath || typeof sourcePath !== 'string' || sourcePath.includes('\0')) {
     throw new Error('Invalid source path');
@@ -274,13 +293,46 @@ function writeFileIntoPackage(destFolder, rawName, data, options = {}) {
   return finalPath;
 }
 
+function writeFileIntoPackageExact(destFolder, rawName, data, options = {}) {
+  const finalPath = resolveExactPackagePath(destFolder, rawName, options);
+  const existing = lstatIfExists(finalPath);
+  const overwrite = options.overwrite === true;
+
+  if (existing) {
+    if (existing.isSymbolicLink()) {
+      throw new Error('Package destination file is a symlink');
+    }
+    if (!existing.isFile()) {
+      throw new Error('Package destination is not a regular file');
+    }
+    if (!overwrite) {
+      throw new Error('Package destination already exists');
+    }
+  }
+
+  const flags = existing
+    ? fs.constants.O_WRONLY | fs.constants.O_TRUNC
+    : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL;
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  let fd = null;
+  try {
+    fd = fs.openSync(finalPath, flags | noFollow, 0o666);
+    fs.writeFileSync(fd, data);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+  return finalPath;
+}
+
 module.exports = {
   sanitizePackageFileName,
   sanitizePackageRelativePath,
   isPathInsideDirectory,
   ensureSafePackageDirectory,
   resolveUniquePackagePath,
+  resolveExactPackagePath,
   assertSafeCopySource,
   copyFileIntoPackage,
   writeFileIntoPackage,
+  writeFileIntoPackageExact,
 };
