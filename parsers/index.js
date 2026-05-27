@@ -66,6 +66,12 @@ const PARSER_REGISTRY = {
 // All supported file extensions
 const SUPPORTED_EXTENSIONS = Object.keys(PARSER_REGISTRY);
 
+function isArchiveEmbeddedAsset(asset) {
+  if (!asset || typeof asset !== 'object') return false;
+  if (typeof asset.zipPath === 'string' && asset.zipPath.length > 0) return true;
+  return asset.source === 'pptx-embedded' || asset.source === 'keynote-embedded';
+}
+
 /**
  * Get the appropriate parser for a file based on its extension.
  *
@@ -219,6 +225,10 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
 
     if (onProgress) {
       onProgress({ stage: 'copying', current: i + 1, total: assets.length, file: path.basename(asset.path) });
+    }
+
+    if (isArchiveEmbeddedAsset(asset)) {
+      continue;
     }
 
     // Handle missing assets
