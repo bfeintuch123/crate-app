@@ -141,11 +141,18 @@ class FigmaParser extends BaseParser {
     try {
       const dir = path.dirname(TOKEN_FILE_PATH);
       if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      }
+      try {
+        fs.chmodSync(dir, 0o700);
+      } catch (chmodDirError) {
+        console.warn(`[crate][figma] could not harden token directory permissions: ${chmodDirError.message}`);
       }
       fs.writeFileSync(TOKEN_FILE_PATH, token, { mode: 0o600 });
+      fs.chmodSync(TOKEN_FILE_PATH, 0o600);
       return true;
     } catch (e) {
+      console.warn(`[crate][figma] could not store token securely: ${e.message}`);
       return false;
     }
   }
@@ -1067,7 +1074,7 @@ class FigmaParser extends BaseParser {
             || imageMapData.images
             || {};
 
-          const resolvedUrls = [];
+          const resolvedImageRefs = [];
           for (const imageRef of imageRefs) {
             const url = imageMap[imageRef];
             if (!url) continue;
@@ -1081,7 +1088,7 @@ class FigmaParser extends BaseParser {
               const match = bareUrl.match(/\.([a-z0-9]{2,5})$/);
               if (match) inferredFormat = match[1];
             }
-            resolvedUrls.push(url);
+            resolvedImageRefs.push(imageRef);
             assets.push({
               url,
               nodeId: imageRef,
@@ -1095,8 +1102,8 @@ class FigmaParser extends BaseParser {
             });
           }
           console.log(
-            `[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved (${resolvedUrls.length})` +
-            `${resolvedUrls.length > 0 ? `: ${resolvedUrls.join(', ')}` : ''}`
+            `[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved (${resolvedImageRefs.length})` +
+            `${resolvedImageRefs.length > 0 ? ` for imageRefs: ${resolvedImageRefs.join(', ')}` : ''}`
           );
         } catch (err) {
           errors.push(`Image-fill recovery failed for ${fileKey}: ${err.message}`);

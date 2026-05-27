@@ -4,6 +4,24 @@ const assert = require('node:assert/strict');
 const { FigmaParser } = require('../parsers/figma');
 
 const FILE_KEY = 'FILE123';
+
+async function captureConsole(fn) {
+  const messages = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args) => messages.push(args.map(String).join(' '));
+  console.warn = (...args) => messages.push(args.map(String).join(' '));
+  try {
+    return {
+      result: await fn(),
+      output: messages.join('\n')
+    };
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+}
+
 const DOCUMENT_FIXTURE = {
   id: '0:0',
   type: 'DOCUMENT',
@@ -79,6 +97,20 @@ class StubFigmaParser extends FigmaParser {
   }
 }
 
+class SensitiveUrlFigmaParser extends StubFigmaParser {
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}/images`) {
+      return {
+        images: {
+          'img-ref-page-one': 'https://cdn.figma.example/page-one.png?token=SIGNED_QUERY_TOKEN&Authorization=Bearer%20SECRET&cookie=session%3DSECRET'
+        }
+      };
+    }
+
+    return super._fetchAPI(endpoint);
+  }
+}
+
 test('current-page node lock extracts only the locked page assets', async () => {
   const parser = new StubFigmaParser();
 
@@ -108,6 +140,25 @@ test('entire-file scope still includes assets from multiple pages', async () => 
     result.assets.map(asset => asset.imageRef).sort(),
     ['img-ref-page-one', 'img-ref-page-two']
   );
+});
+
+test('figma image resolution logs omit raw CDN URLs and signed query material', async () => {
+  const parser = new SensitiveUrlFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  }));
+
+  assert.equal(result.assets.length, 1);
+  assert.match(result.assets[0].url, /^https:\/\/cdn\.figma\.example\//);
+  assert.match(output, /imageRefs found \(1\): img-ref-page-one/);
+  assert.match(output, /image URLs resolved \(1\) for imageRefs: img-ref-page-one/);
+  assert.equal(output.includes(result.assets[0].url), false);
+  assert.equal(output.includes('https://'), false);
+  assert.equal(/cdn\.figma\.example/i.test(output), false);
+  assert.equal(/SIGNED_QUERY_TOKEN|Authorization|Bearer|cookie=/i.test(output), false);
 });
 
 const DEPS_FILE_KEY = 'FILE_DEPS';
