@@ -344,6 +344,14 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-parser-'));
 }
 
+function resetTestHomeWorkspace() {
+  for (const folder of ['Desktop', 'Documents', 'Downloads']) {
+    const folderPath = path.join(TEST_HOME, folder);
+    fs.rmSync(folderPath, { recursive: true, force: true });
+    fs.mkdirSync(folderPath, { recursive: true });
+  }
+}
+
 function getProvenanceEdges(project, relationType) {
   return Object.values((project && project.provenance && project.provenance.edges) || {})
     .filter(edge => edge && edge.relationType === relationType);
@@ -357,6 +365,11 @@ function getProvenanceNodes(project, nodeType) {
 function getProvenanceObservations(project, relationType) {
   return ((project && project.provenance && project.provenance.observations) || [])
     .filter(observation => observation && observation.relationType === relationType);
+}
+
+function getSessionObservedByMethod(project, method) {
+  return getProvenanceObservations(project, EDGE_TYPES.SESSION_OBSERVED_FILE)
+    .filter(observation => observation.observer && observation.observer.method === method);
 }
 
 function packageFolder(outputDir, projectName) {
@@ -1372,6 +1385,224 @@ test('lsof provenance failure does not block ledger capture', async () => {
   const fresh = await waitForProject(project.id, item => item.files.length === 1);
   assert.equal(fresh.files[0].path, filePath);
   assert.equal(fresh.files[0].source, 'lsof');
+});
+
+test('pre-package lsof package scan insertion records one deduped session observation', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Prepackage lsof provenance');
+  const figPath = path.join(TEST_HOME, 'Desktop', 'package-open.fig');
+  fs.writeFileSync(figPath, 'fig bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid=')) {
+      return { stdout: '246 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F n -p 246')) {
+      return { stdout: `n${figPath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(scan.newCount, 1);
+
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.files.length, 1);
+  assert.equal(fresh.files[0].source, 'lsof-package-scan');
+
+  const observations = getSessionObservedByMethod(fresh, 'lsof-package-scan');
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PACKAGE_RECOVERY);
+  assert.equal(Object.prototype.hasOwnProperty.call(observations[0].observer, 'payload'), false);
+  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.deepEqual(observations[0].payload, {
+    source: 'lsof-package-scan',
+    method: 'lsof-package-scan',
+    channel: 'pre-package-scan',
+    recoveryType: 'package-time-recovery',
+  });
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
+  assert.deepEqual(fresh.provenance.edges, {});
+
+  await callIpc('projects:pre-package-scan', project.id);
+  fresh = await getProject(project.id);
+  assert.equal(fresh.files.length, 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 1);
+});
+
+test('pre-package deduped-away recovery candidate does not record session observation', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Prepackage deduped candidate');
+  const targetPath = path.join(TEST_HOME, 'Desktop', 'canonical.fig');
+  const aliasPath = path.join(TEST_HOME, 'Desktop', 'canonical-alias.fig');
+  fs.writeFileSync(targetPath, 'fig bytes');
+  fs.symlinkSync(targetPath, aliasPath);
+  await setProjectFiles(project.id, {
+    files: [{
+      path: targetPath,
+      name: 'canonical.fig',
+      ext: '.fig',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }],
+  });
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid=')) {
+      return { stdout: '468 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F n -p 468')) {
+      return { stdout: `n${aliasPath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(scan.newCount, 1);
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.length, 1);
+  assert.equal(fresh.files[0].path, targetPath);
+  assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 0);
+});
+
+test('pre-package app-script parser and regex recovered additions record session observations without package count drift', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), '.test-prepackage-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  const tmpRoot = makeTempDir();
+  let project = null;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const userPathRoot = fs.mkdtempSync(path.join(repoTempRoot, 'case-'));
+    project = await createProject('Prepackage Recovery Provenance');
+    const aiPath = path.join(userPathRoot, 'layout.ai');
+    const psdPath = path.join(tmpRoot, 'source.psd');
+    const scriptLinkedPath = path.join(tmpRoot, 'script-linked.png');
+    const regexLinkedPath = path.join(userPathRoot, 'regex-linked.png');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+
+    fs.writeFileSync(scriptLinkedPath, 'script linked bytes');
+    fs.writeFileSync(regexLinkedPath, 'regex linked bytes');
+    fs.writeFileSync(aiPath, `ai bytes ${regexLinkedPath}`);
+    fs.writeFileSync(psdPath, 'psd bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'parser-embedded.png', data: Buffer.from('parser embedded bytes') }],
+    };
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: aiPath,
+          name: 'layout.ai',
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: psdPath,
+          name: 'source.psd',
+          ext: '.psd',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+      ],
+    });
+
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+        return { stdout: '/Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ai-scan')) {
+        return { stdout: `${scriptLinkedPath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpc('projects:pre-package-scan', project.id);
+    assert.equal(scan.newCount, 3);
+
+    let fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.source === 'ai-linked'), true);
+    assert.equal(fresh.files.some(file => file.source === 'psd-embedded'), true);
+    assert.equal(fresh.files.some(file => file.source === 'linked-asset'), true);
+
+    for (const method of ['ai-linked', 'psd-embedded', 'linked-asset']) {
+      const observations = getSessionObservedByMethod(fresh, method);
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PACKAGE_RECOVERY);
+      assert.equal(Object.prototype.hasOwnProperty.call(observations[0].observer, 'payload'), false);
+      assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+      assert.equal(observations[0].payload.method, method);
+      assert.equal(observations[0].payload.channel, 'pre-package-scan');
+    }
+
+    const packageResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(packageResult);
+    assert.equal(packageResult.success, true);
+    assert.equal(packageResult.totalFiles, fresh.files.length);
+    assert.equal(packageResult.copiedCount, fresh.files.length);
+    assert.equal(packageResult.embeddedCount, 0);
+    assert.deepEqual(packageResult.errors, []);
+
+    fresh = await getProject(project.id);
+    for (const method of ['ai-linked', 'psd-embedded', 'linked-asset']) {
+      assert.equal(getSessionObservedByMethod(fresh, method).length, 1);
+    }
+  } finally {
+    fs.rmSync(path.join(os.tmpdir(), `crate-psd-extract-${project ? project.id : ''}`), { recursive: true, force: true });
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package recovery provenance failure does not block recovered file insertion', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Prepackage provenance failure');
+  const figPath = path.join(TEST_HOME, 'Desktop', 'failure-open.fig');
+  fs.writeFileSync(figPath, 'fig bytes');
+  const storedProject = await getProject(project.id);
+  storedProject.provenance.nodes = new Proxy({}, {
+    set() {
+      throw new Error('forced pre-package provenance failure');
+    },
+  });
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid=')) {
+      return { stdout: '357 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F n -p 357')) {
+      return { stdout: `n${figPath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(scan.newCount, 1);
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.length, 1);
+  assert.equal(fresh.files[0].source, 'lsof-package-scan');
+});
+
+test('pre-package pending candidates do not create captured-file observations until accepted', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Prepackage pending provenance');
+  const figPath = path.join(TEST_HOME, 'Desktop', 'pending-candidate.fig');
+  fs.writeFileSync(figPath, 'fig bytes');
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(scan.newCount, 1);
+
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  assert.equal(fresh.pendingFiles[0].source, 'fig-scan');
+  assert.deepEqual(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE), []);
 });
 
 test('PSD scan-on-save linked asset preserves ledger entry and records one parser reference edge', async () => {
