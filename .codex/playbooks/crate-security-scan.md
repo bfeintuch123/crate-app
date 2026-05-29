@@ -7,7 +7,7 @@ This is the Crate-specific security lane for OpenClaw-style engineering loops: f
 
 ## When To Use
 - Before merging PRs that touch file IO, package generation, parsers, watchers, shell commands, Figma API handling, provenance, manifests, or release scripts.
-- When `crate-provenance.json` output changes.
+- When optional `Crate Diagnostics/crate-provenance.json` diagnostic output changes.
 - When a PR changes path normalization, symlink handling, copied package output, embedded asset extraction, or parser-controlled filenames.
 - Before release readiness if recent PRs touched security-sensitive surfaces.
 - When Bryant asks whether a change can leak tokens, private paths, raw API data, command output, or unrelated local files.
@@ -27,7 +27,7 @@ Use .codex/playbooks/crate-security-scan.md to scan this Crate PR for path trave
 - Any output path that could escape the package directory.
 - Raw token, API response, CDN URL, command output, local path, or credential handling.
 - Figma token, Figma API payload, Figma CDN URL, imageRef, file key, page ID, and downloaded asset handling.
-- `crate-provenance.json` privacy: compact evidence, redacted display paths, no raw lsof/mdls/ps/AppleScript output, no raw Figma API response, no secrets.
+- `Crate Diagnostics/crate-provenance.json` privacy: compact evidence, redacted display paths, no raw lsof/mdls/ps/AppleScript output, no raw Figma API response, no secrets.
 - Shell execution and whether arguments are structured and constrained.
 - Filesystem write boundaries for temp directories, package output, extracted resources, generated manifests, and release/site files.
 
@@ -100,11 +100,11 @@ Do not print secret values. If a command shows a possible secret, redact the val
 
 ## Required Checks
 - Path traversal: user-controlled, parser-controlled, archive-controlled, and API-controlled path segments cannot escape intended roots.
-- Package output escaping: copied files, extracted embedded resources, and `crate-provenance.json` writes remain under the package output directory.
+- Package output escaping: copied files, extracted embedded resources, and optional diagnostic manifest writes remain under the package output directory.
 - Symlink safety: package generation and extraction do not unexpectedly follow symlinks outside intended roots.
 - Raw leakage: logs, manifests, reports, and package files do not include raw tokens, raw Figma API responses, raw command output, cookies, credentials, unrelated open files, or private system scans.
 - Figma privacy: tokens are never written; API payloads and CDN URLs are minimized; file keys and page IDs are only included when needed and safe.
-- Manifest redaction: `crate-provenance.json` uses compact evidence and safe display paths rather than full raw system state.
+- Manifest redaction: `Crate Diagnostics/crate-provenance.json` uses compact evidence and safe display paths rather than full raw system state.
 - Shell safety: shell commands avoid interpolated untrusted input and prefer structured arguments.
 - Parser filenames: filenames derived from PSD, archive, Figma, or parser metadata are sanitized before filesystem writes.
 - Write boundaries: temp, package, manifest, site, and release writes are explicit and constrained.

@@ -9,7 +9,7 @@ This playbook is for the layered provenance architecture now landing across Crat
 - For any PR that adds or changes provenance helpers, nodes, edges, observations, evidence, or manifests.
 - For parser, package, pending accept/reject, PSD, or Figma provenance PRs.
 - Before merging a provenance PR into `v2.4.x`.
-- When a regression report mentions `crate-provenance.json`, missing edges, overconfident edges, privacy leakage, or package output explanation.
+- When a regression report mentions optional `Crate Diagnostics/crate-provenance.json`, missing edges, overconfident edges, privacy leakage, or package output explanation.
 - After stacked provenance PRs have merged and Bryant wants a consistency pass.
 
 ## Start Prompt
@@ -26,7 +26,7 @@ Use .codex/playbooks/crate-provenance-review.md to review this Crate provenance 
 - Whether `project.files` behavior remains preserved.
 - Whether provenance records are dual-written beside existing state rather than replacing existing behavior.
 - Whether new edges map to the documented edge types and confidence model.
-- Whether package-time edges are confirmed only when Crate performed the copy, extraction, or manifest write.
+- Whether package-time edges are confirmed only when Crate performed the copy or extraction. Treat `package_writes_manifest` as reserved/out-of-scope for v2.8.0 diagnostic exports unless a future implementation explicitly emits it.
 - Whether heuristic evidence remains `candidate` or `weak` unless structured evidence supports more confidence.
 - Whether evidence payloads are compact, privacy-filtered, and free of raw command output, raw Figma API responses, tokens, credentials, or unrelated open-file state.
 - Whether manifest output tolerates missing provenance and partial data.
@@ -102,7 +102,7 @@ node tests/figma-link-per-project.test.js
 - Confidence discipline: parser, package copy, package extraction, user accept, and Figma asset download can be confirmed when direct; lsof, Spotlight, basename, timing, and app-level evidence stay lower confidence.
 - Dedupe stability: observations and edges should not multiply across repeated watches or package runs.
 - Dual-write safety: provenance writes must not change `project.files`, package selection, pending-file decisions, or existing UI behavior unless Bryant explicitly scoped that change.
-- Manifest safety: `crate-provenance.json` must tolerate missing data, use compact evidence, and avoid secrets or raw local system state.
+- Manifest safety: optional `Crate Diagnostics/crate-provenance.json` must tolerate missing data, use compact evidence, and avoid secrets or raw local system state.
 - Figma safety: Figma provenance must not widen capture scope or weaken page lock fail-closed behavior.
 - Package safety: package provenance must describe copied or extracted output without changing which files are packaged.
 

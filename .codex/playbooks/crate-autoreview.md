@@ -231,8 +231,11 @@ Use package and provenance artifact checks only when artifacts are available or 
 ```sh
 find <package-output> -type f | sort
 rg -n "token|secret|credential|cdn\\.figma|Authorization|Bearer|rawTrackedFiles" <package-output>
-node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2));" <crate-provenance.json>
+diagnostic_manifest="<package-output>/Crate Diagnostics/crate-provenance.json"
+node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
 ```
+
+Diagnostic manifests are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 ## Check Selection
 - Docs-only or playbook-only: run docs checks, inspect the docs diff, and do not run app tests unless the docs make behavior claims that need verification.

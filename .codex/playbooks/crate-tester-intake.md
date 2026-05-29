@@ -16,17 +16,17 @@ Tester intake is process infrastructure. It should preserve real designer contex
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-tester-intake.md to turn this Crate tester session into structured feedback. Capture tester profile, creative stack, assigned workflow, expected versus actual behavior, package output, crate-provenance.json, privacy notes, severity hints, and do not expose private client assets.
+Use .codex/playbooks/crate-tester-intake.md to turn this Crate tester session into structured feedback. Capture tester profile, creative stack, assigned workflow, expected versus actual behavior, package output, optional Crate Diagnostics/crate-provenance.json when diagnostics were enabled, privacy notes, severity hints, and do not expose private client assets.
 ```
 
 ## Tester Onboarding
 Give each tester a short brief before they begin:
 
-- Crate packages creative project dependencies and writes `crate-provenance.json` so package contents can be reviewed.
+- Crate packages creative project dependencies. Optional diagnostic reports can write `Crate Diagnostics/crate-provenance.json` so package contents can be reviewed when the setting is enabled.
 - Testers should use real designer workflows where possible because real workflows expose cross-app, cloud-drive, and local-file behavior that synthetic demos miss.
 - Testers must not upload or share private, confidential, client-owned, credential-bearing, or personal documents unless Bryant explicitly clears that exact material.
 - Feedback is most useful when it says what the tester expected Crate to do, what Crate actually did, and what artifacts prove the result.
-- Crate package output and `crate-provenance.json` are key diagnostic artifacts.
+- Crate package output and optional diagnostic manifests are key diagnostic artifacts. Diagnostics are off by default, so testers must enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; default package output should not contain a package-root manifest.
 
 ## Tester Profile Capture
 Capture enough context to interpret the report without collecting unnecessary personal data:
@@ -109,7 +109,7 @@ Use these steps as the default structure:
 5. Open the package output folder after Crate finishes.
 6. Confirm whether expected files are present.
 7. Confirm whether unexpected private, out-of-scope, wrong-page, or unrelated files are absent.
-8. Locate `crate-provenance.json` if Crate wrote it.
+8. If `Include diagnostic report in packages` was enabled, locate `Crate Diagnostics/crate-provenance.json`.
 9. Record any warning, error, install prompt, security prompt, or confusing UI state.
 10. Fill out the tester feedback template.
 
@@ -138,7 +138,7 @@ When safe and approved, collect:
 
 - package output folder path
 - a zipped package output if the assets are synthetic or cleared
-- `crate-provenance.json`
+- optional `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled
 - screenshots of package contents
 - screenshots of missing or unexpected files
 - Crate error messages or warnings
@@ -147,8 +147,8 @@ When safe and approved, collect:
 
 If the package contains private or client-confidential material, do not upload the package. Instead collect a redacted inventory and keep the raw package local unless Bryant explicitly approves transfer.
 
-## crate-provenance.json Collection
-`crate-provenance.json` is one of the most useful artifacts. Ask for it whenever safe.
+## Crate Diagnostics/crate-provenance.json Collection
+`Crate Diagnostics/crate-provenance.json` is one of the most useful artifacts when diagnostic reports are enabled. Ask for it whenever safe, but do not expect a package-root manifest by default.
 
 Before sharing a manifest, check for:
 
@@ -206,7 +206,7 @@ Use these hints to label feedback before triage. They are not final engineering 
   - wrong asset included
   - confidential out-of-scope asset included
   - expected key asset missed
-  - `crate-provenance.json` contains private token-like data or materially wrong manifest claims
+  - `Crate Diagnostics/crate-provenance.json` contains private token-like data or materially wrong manifest claims
 - Medium:
   - provenance manifest issue that does not expose private data
   - missing secondary asset
@@ -268,7 +268,7 @@ Use this template for each session:
 - Screen recording:
 - Screenshots:
 - Package output path or archive:
-- crate-provenance.json:
+- Crate Diagnostics/crate-provenance.json:
 - Redactions applied:
 
 ## Privacy
@@ -288,7 +288,7 @@ Use this template for each session:
 - `docs/*.md`
 - tester-provided markdown, screenshots, package inventories, and redacted manifests
 - approved package output directories under `/private/tmp` or another Bryant-approved local path
-- `crate-provenance.json` files explicitly provided for intake
+- optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests explicitly provided for intake
 
 ## Files Codex May Modify
 - None by default.
@@ -323,10 +323,13 @@ Inspect approved tester artifacts:
 
 ```sh
 find <approved-package-output> -maxdepth 4 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2));" <approved-package-output>/crate-provenance.json
-rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey" <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey" "$diagnostic_manifest"
 ```
+
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 Inspect redacted intake notes:
 
@@ -341,7 +344,7 @@ rg -n "password|token|credential|Authorization|Bearer|cookie|confidential|privat
 - Workflow assignment is specific.
 - Expected versus actual Crate behavior is written down.
 - Package output status is captured.
-- `crate-provenance.json` status is captured or the reason it is unavailable is stated.
+- Optional `Crate Diagnostics/crate-provenance.json` status is captured or the reason it is unavailable is stated.
 - Privacy and sharing approval are explicit.
 - Severity hint and category are assigned.
 - Follow-up questions are listed.
@@ -379,14 +382,14 @@ npx wrangler pages deploy <directory>
 
 ## Quality Impact
 - Converts subjective tester reactions into expected versus actual behavior with evidence.
-- Speeds triage by collecting package output and `crate-provenance.json` up front.
+- Speeds triage by collecting package output and optional `Crate Diagnostics/crate-provenance.json` up front when diagnostics were enabled.
 - Reduces privacy risk by separating real workflow testing from artifact sharing.
 - Makes severity and category clear before engineering time is spent.
 - Helps Crate learn from real designer behavior without overcollecting sensitive material.
 
 ## Definition Of Done
 - Tester profile, stack, workflow, result, artifacts, privacy status, severity hint, and follow-up questions are captured.
-- Package output and `crate-provenance.json` are collected or explicitly unavailable.
+- Package output and optional `Crate Diagnostics/crate-provenance.json` are collected or explicitly unavailable.
 - Private and confidential materials are excluded, redacted, or explicitly approved.
 - The report says what the tester expected Crate to do and what actually happened.
 - No app code, tests, package files, release files, builds, tags, deploys, or dependencies are changed.

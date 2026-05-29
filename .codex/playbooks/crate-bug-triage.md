@@ -16,7 +16,7 @@ Bug triage should turn evidence into a clear next step without inventing reprodu
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-bug-triage.md to triage this Crate tester report. Classify the bug type, inspect package output and crate-provenance.json if provided, separate facts from assumptions, recommend next playbook, draft a GitHub issue if appropriate, and do not modify code.
+Use .codex/playbooks/crate-bug-triage.md to triage this Crate tester report. Classify the bug type, inspect package output and optional Crate Diagnostics/crate-provenance.json if provided, separate facts from assumptions, recommend next playbook, draft a GitHub issue if appropriate, and do not modify code.
 ```
 
 ## Triage Inputs
@@ -28,7 +28,7 @@ Collect and separate:
 - actual Crate behavior
 - screen recording or screenshots
 - package output path, archive, or redacted inventory
-- `crate-provenance.json` or redacted manifest summary
+- optional `Crate Diagnostics/crate-provenance.json` diagnostic manifest or redacted manifest summary
 - Crate version
 - macOS version
 - source app versions, if known
@@ -92,7 +92,7 @@ Before engineering work starts, identify what is needed to reproduce:
 - relevant scope setting
 - minimum synthetic or cleared fixture that can reproduce the behavior
 - package output or redacted inventory
-- `crate-provenance.json` or redacted summary
+- optional `Crate Diagnostics/crate-provenance.json` diagnostic manifest or redacted summary
 - screenshots or recording timestamps that show the critical moment
 - expected package contents
 - expected exclusions
@@ -106,7 +106,7 @@ Inspect package output only when Bryant has approved access to the artifact or t
 Package output checks:
 
 - Does the package folder exist?
-- Does it contain `crate-provenance.json`?
+- If diagnostic reports were enabled, does it contain `Crate Diagnostics/crate-provenance.json`?
 - Are expected assets present?
 - Are wrong, unrelated, private, or out-of-scope assets present?
 - Are extracted embedded resources present?
@@ -116,7 +116,7 @@ Package output checks:
 
 Manifest checks:
 
-- Does `crate-provenance.json` parse as JSON?
+- Does `Crate Diagnostics/crate-provenance.json` parse as JSON when a diagnostic manifest is provided?
 - Are `copiedCount`, `embeddedCount`, `totalFiles`, and `errors` present?
 - Do node and edge counts roughly match the package contents?
 - Are confidence bands appropriate, such as confirmed, likely, candidate, or weak?
@@ -197,7 +197,7 @@ Issue draft template:
 - Screen recording:
 - Screenshots:
 - Package output:
-- crate-provenance.json:
+- Crate Diagnostics/crate-provenance.json:
 
 ## Privacy
 - Artifacts cleared:
@@ -244,7 +244,7 @@ Release recommendation:
 - `docs/*.md`
 - tester intake notes
 - approved package output directories under `/private/tmp` or another Bryant-approved local path
-- approved `crate-provenance.json` files or redacted summaries
+- approved optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests or redacted summaries
 - changed files and tests read-only when needed to assess likely ownership
 - GitHub issue and PR metadata through `gh`
 - `package.json` read-only for version/script context
@@ -282,10 +282,13 @@ Inspect approved artifacts:
 
 ```sh
 find <approved-package-output> -maxdepth 4 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" <approved-package-output>/crate-provenance.json
-rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
+
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 Inspect related repo context without editing:
 
@@ -304,7 +307,7 @@ mkdir -p /private/tmp/crate-bug-triage-<id>
 - Bug type classified.
 - Reproduction requirements listed.
 - Package output inspected or marked unavailable.
-- `crate-provenance.json` inspected or marked unavailable.
+- Optional `Crate Diagnostics/crate-provenance.json` inspected or marked unavailable.
 - Real bug, expected limitation, tester setup issue, product requirement gap, or needs more evidence decision made.
 - Facts, assumptions, and unknowns are separated.
 - Next playbook is recommended.
@@ -368,7 +371,7 @@ npx wrangler pages deploy <directory>
 - Bug type classification.
 - Evidence received.
 - Package output findings.
-- `crate-provenance.json` findings.
+- `Crate Diagnostics/crate-provenance.json` findings when diagnostics were enabled.
 - Facts, assumptions, and unknowns.
 - Triage decision.
 - Priority, severity, and release recommendation.

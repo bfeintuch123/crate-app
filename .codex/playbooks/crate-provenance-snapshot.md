@@ -22,7 +22,7 @@ Use .codex/playbooks/crate-provenance-snapshot.md to snapshot and compare Crate 
 ## Inspect
 - Current branch, PR base, dirty state, and changed files.
 - Source fixture or package output used for the snapshot.
-- Before and after `crate-provenance.json` files.
+- Before and after optional `Crate Diagnostics/crate-provenance.json` files when diagnostic reports were enabled.
 - Nodes by type.
 - Edges by relation type.
 - Evidence by kind and observer.
@@ -54,7 +54,7 @@ If a graph includes additional edge types, report them separately and explain wh
 - `docs/*.md`
 - approved fixture docs and synthetic fixture assets
 - package output directories under `/private/tmp`
-- `crate-provenance.json` files from before and after package outputs
+- optional `Crate Diagnostics/crate-provenance.json` files from before and after package outputs when diagnostic reports were enabled
 - changed files and tests read-only when needed for provenance risk context
 - `package.json` read-only, for version/script context
 
@@ -103,6 +103,8 @@ Summarize manifests:
 node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); const nodes=m.nodes||[]; const edges=m.edges||[]; const evidence=m.evidence||[]; const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,nodesByType:count(nodes,'type'),edgesByType:count(edges,'relationType'),evidenceByKind:count(evidence,'kind'),confidenceBands:edges.reduce((a,e)=>{const k=e&&e.confidence&&e.confidence.band||'unknown'; a[k]=(a[k]||0)+1; return a;},{}),warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
 ```
 
+Use explicit manifest paths, typically `<package-output>/Crate Diagnostics/crate-provenance.json`, only when `Include diagnostic report in packages` was enabled for the snapshot package runs. Diagnostics are optional and off by default; do not expect a package-root manifest.
+
 Extract stable edge summaries:
 
 ```sh
@@ -143,7 +145,7 @@ diff -u /private/tmp/crate-provenance-snapshot-<id>/reports/before-edges.txt /pr
 - Absence of an edge may be normal if the source file, embedded resource, Figma asset, pending file, or package output is out of scope.
 - Do not overclaim provenance certainty.
 - Confirmed, likely, candidate, and weak evidence must remain distinct.
-- Package output edges are confirmed only when Crate performed the copy, extraction, or manifest write.
+- Package output edges are confirmed only when Crate performed the copy or extraction. Treat `package_writes_manifest` as future/reserved unless it appears in a manifest; v2.8.0 diagnostic exports do not currently emit that edge.
 - Figma materialization is confirmed only when download and file ledger add succeeded.
 - lsof, Spotlight, basename, timing, or app-level observations should not become confirmed relationships without stronger evidence.
 - Snapshot differences should be classified as expected, suspicious, or blocking.
