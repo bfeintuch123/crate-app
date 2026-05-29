@@ -3289,15 +3289,29 @@ async function pollLastUsedForProject(projectId) {
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching') return null;
     const existingSet = new Set(proj.files.map(f => f.path));
+    const acceptedFiles = [];
     let added = 0;
     for (const f of newFiles) {
       if (existingSet.has(f.path)) continue;
       proj.files.push(f);
       existingSet.add(f.path);
+      acceptedFiles.push(f);
       added++;
     }
     if (added === 0) return null;
     proj.files = deduplicateFiles(proj.files);
+    for (const file of acceptedFiles) {
+      const storedFile = proj.files.find(item => item.path === file.path && item.source === file.source);
+      if (!storedFile) continue;
+      recordSessionObservedFile(proj, storedFile, {
+        kind: OBSERVER_KINDS.SPOTLIGHT_LAST_USED,
+        method: 'lastused-poll',
+        payload: {
+          method: 'lastused-poll',
+          channel: 'live-lastused-poll',
+        },
+      });
+    }
     return { files: proj.files };
   });
 
@@ -3840,24 +3854,39 @@ async function runScanOnOpen(projectId, filePath) {
     if (proj.status !== 'watching') return null;
     // v2.4.0: normalize paths before comparing to prevent duplicates
     const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
+    const acceptedFiles = [];
     let changed = false;
 
     for (const linkedPath of validPaths) {
       if (existingPaths.has(path.resolve(linkedPath).toLowerCase())) continue;
 
-      proj.files.push({
+      const fileEntry = {
         path: linkedPath,
         name: path.basename(linkedPath),
         ext: path.extname(linkedPath).toLowerCase(),
         addedAt: Date.now(),
         source: 'scan-on-open',
-      });
+      };
+      proj.files.push(fileEntry);
+      acceptedFiles.push(fileEntry);
       existingPaths.add(path.resolve(linkedPath).toLowerCase());
       changed = true;
     }
 
     if (changed) {
       proj.files = deduplicateFiles(proj.files);
+      for (const file of acceptedFiles) {
+        const storedFile = proj.files.find(item => item.path === file.path && item.source === file.source);
+        if (!storedFile) continue;
+        recordSessionObservedFile(proj, storedFile, {
+          kind: OBSERVER_KINDS.PARSER,
+          method: 'scan-on-open',
+          payload: {
+            method: 'scan-on-open',
+            channel: 'live-scan-on-open',
+          },
+        });
+      }
     }
     return changed ? { files: proj.files } : null;
   });
@@ -3881,20 +3910,38 @@ async function runScanOnOpen(projectId, filePath) {
         if (proj.status !== 'watching') return null;
         // v2.4.0: normalize paths before comparing to prevent duplicates
         const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
+        const acceptedFiles = [];
         let changed = false;
         for (const asset of psdAssets) {
           if (existingPaths.has(path.resolve(asset.filePath).toLowerCase())) continue;
-          proj.files.push({
+          const fileEntry = {
             path: asset.filePath,
             name: path.basename(asset.filePath),
             ext: path.extname(asset.filePath).toLowerCase(),
             addedAt: Date.now(),
             source: asset.source,
-          });
+          };
+          proj.files.push(fileEntry);
+          acceptedFiles.push(fileEntry);
           existingPaths.add(path.resolve(asset.filePath).toLowerCase());
           changed = true;
         }
-        if (changed) proj.files = deduplicateFiles(proj.files);
+        if (changed) {
+          proj.files = deduplicateFiles(proj.files);
+          for (const file of acceptedFiles) {
+            const storedFile = proj.files.find(item => item.path === file.path && item.source === file.source);
+            if (!storedFile) continue;
+            recordSessionObservedFile(proj, storedFile, {
+              kind: OBSERVER_KINDS.PARSER,
+              method: 'scan-on-open-psd-parser',
+              payload: {
+                method: 'scan-on-open-psd-parser',
+                channel: 'live-scan-on-open',
+                parser: 'ag-psd',
+              },
+            });
+          }
+        }
         return changed ? { files: proj.files } : null;
       });
       if (psdResult) {
@@ -4435,6 +4482,7 @@ async function startWatching(projectId) {
           // Parse linked assets from any linkable design files found in the snapshot
           if (linkableForParse.length > 0) {
             const LINKED_ASSET_REGEX_SNAPSHOT = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+            const linkedRegexFiles = [];
             for (const designFile of linkableForParse) {
               try {
                 if (!fs.existsSync(designFile.path)) continue;
@@ -4447,18 +4495,35 @@ async function startWatching(projectId) {
                   if (existingPaths.has(linkedPath)) continue;
                   if (!fs.existsSync(linkedPath)) continue;
 
-                  project.files.push({
+                  const fileEntry = {
                     path: linkedPath,
                     name: path.basename(linkedPath),
                     ext: path.extname(linkedPath).toLowerCase(),
                     addedAt: Date.now(),
                     source: 'linked-asset',
-                  });
+                  };
+                  project.files.push(fileEntry);
+                  linkedRegexFiles.push(fileEntry);
                   existingPaths.add(linkedPath);
                   snapshotChanged = true;
                 }
               } catch (e) {
                 // read error — continue with others
+              }
+            }
+            if (linkedRegexFiles.length > 0) {
+              project.files = deduplicateFiles(project.files);
+              for (const file of linkedRegexFiles) {
+                const storedFile = project.files.find(item => item.path === file.path && item.source === file.source);
+                if (!storedFile) continue;
+                recordSessionObservedFile(project, storedFile, {
+                  kind: OBSERVER_KINDS.PARSER,
+                  method: 'initial-snapshot-linked-regex',
+                  payload: {
+                    method: 'initial-snapshot-linked-regex',
+                    channel: 'initial-lsof-snapshot',
+                  },
+                });
               }
             }
           }
