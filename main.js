@@ -3140,14 +3140,26 @@ async function pollPsForProject(projectId) {
     for (const { filePath, source, ext } of newFiles) {
       const result = mutateProject(projectId, (proj) => {
         if (proj.files.some(f => f.path === filePath)) return null;
-        proj.files.push({
+        const fileEntry = {
           path: filePath,
           name: path.basename(filePath),
           ext,
           addedAt: Date.now(),
           source,
-        });
+        };
+        proj.files.push(fileEntry);
         proj.files = deduplicateFiles(proj.files);
+        const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
+        if (storedFile) {
+          recordSessionObservedFile(proj, storedFile, {
+            kind: OBSERVER_KINDS.APP_SCRIPT,
+            method: source,
+            payload: {
+              method: source,
+              channel: 'live-app-poll',
+            },
+          });
+        }
         return { files: proj.files };
       });
       if (result) addedCount++;

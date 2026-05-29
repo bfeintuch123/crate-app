@@ -1387,6 +1387,139 @@ test('lsof provenance failure does not block ledger capture', async () => {
   assert.equal(fresh.files[0].source, 'lsof');
 });
 
+test('ps-poll accepted insertion records one session observation', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'ps-poll-logo.ai');
+  const unrelatedPath = path.join(TEST_HOME, 'Desktop', 'UNRELATED_FILE_LIST.ai');
+  fs.writeFileSync(filePath, 'ps linked bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+      return {
+        stdout: '123 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n',
+      };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
+      return { stdout: `${filePath}\n${unrelatedPath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('PS poll provenance');
+  const fresh = await waitForProject(project.id, item => item.files.length === 1);
+  assert.equal(fresh.files[0].path, filePath);
+  assert.equal(fresh.files[0].source, 'ps-poll');
+
+  const observations = getSessionObservedByMethod(fresh, 'ps-poll');
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
+  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
+  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.deepEqual(observations[0].payload, {
+    source: 'ps-poll',
+    method: 'ps-poll',
+    channel: 'live-app-poll',
+  });
+  assert.deepEqual(fresh.provenance.edges, {});
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
+
+  const provenanceText = JSON.stringify(fresh.provenance);
+  assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+  assert.equal(provenanceText.includes('/Applications/Adobe Photoshop.app'), false);
+  assert.equal(provenanceText.includes(unrelatedPath), false);
+  assert.equal(provenanceText.includes('raw'), false);
+  assert.equal(provenanceText.includes('stdout'), false);
+});
+
+test('indd-poll accepted insertion records one session observation', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'indd-poll-image.png');
+  fs.writeFileSync(filePath, 'indd linked bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return {
+        stdout: '456 /Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n',
+      };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-indd-poll')) {
+      return { stdout: `${filePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('INDD poll provenance');
+  const fresh = await waitForProject(project.id, item => item.files.length === 1);
+  assert.equal(fresh.files[0].path, filePath);
+  assert.equal(fresh.files[0].source, 'indd-poll');
+
+  const observations = getSessionObservedByMethod(fresh, 'indd-poll');
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
+  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
+  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.deepEqual(observations[0].payload, {
+    source: 'indd-poll',
+    method: 'indd-poll',
+    channel: 'live-app-poll',
+  });
+  assert.deepEqual(fresh.provenance.edges, {});
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
+  assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+});
+
+test('repeated ps-poll insertion does not duplicate session observations', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'dedupe-ps-poll-logo.ai');
+  fs.writeFileSync(filePath, 'ps linked bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+      return { stdout: '789 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
+      return { stdout: `${filePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('PS poll dedupe provenance');
+  let fresh = await waitForProject(project.id, item => item.files.length === 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 1);
+
+  await new Promise(resolve => originalSetTimeout(resolve, 3300));
+  fresh = await getProject(project.id);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 1);
+});
+
+test('ps-poll provenance failure does not block ledger insertion', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'failure-ps-poll-logo.ai');
+  fs.writeFileSync(filePath, 'ps linked bytes');
+  let pollReady = false;
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (!pollReady) return { stdout: '' };
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+      return { stdout: '987 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
+      return { stdout: `${filePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('PS poll provenance failure');
+  const storedProject = await getProject(project.id);
+  storedProject.provenance.nodes = new Proxy({}, {
+    set() {
+      throw new Error('forced ps-poll provenance failure');
+    },
+  });
+  pollReady = true;
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 5000);
+  assert.equal(fresh.files[0].path, filePath);
+  assert.equal(fresh.files[0].source, 'ps-poll');
+});
+
 test('pre-package lsof package scan insertion records one deduped session observation', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Prepackage lsof provenance');
