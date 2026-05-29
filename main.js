@@ -1004,11 +1004,14 @@ function recordSessionObservedFile(project, fileEntry, observer = {}) {
 
     const sessionId = getProjectProvenanceSessionId(project, provenance);
     const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
-    const method = typeof observer.method === 'string' && observer.method.trim()
-      ? observer.method.trim()
+    const observerRecord = isRecord(observer) ? observer : {};
+    const observerPayload = isRecord(observerRecord.payload) ? observerRecord.payload : null;
+    const { payload: _ignoredObserverPayload, ...observerFields } = observerRecord;
+    const method = typeof observerRecord.method === 'string' && observerRecord.method.trim()
+      ? observerRecord.method.trim()
       : 'unknown';
-    const observerKind = typeof observer.kind === 'string' && observer.kind.trim()
-      ? observer.kind.trim()
+    const observerKind = typeof observerRecord.kind === 'string' && observerRecord.kind.trim()
+      ? observerRecord.kind.trim()
       : 'unknown';
     const confidence = observerKind === OBSERVER_KINDS.MANUAL_USER_ACTION
       ? CONFIDENCE_BANDS.CONFIRMED
@@ -1039,7 +1042,7 @@ function recordSessionObservedFile(project, fileEntry, observer = {}) {
       sessionId,
       observedAt,
       observer: {
-        ...observer,
+        ...observerFields,
         kind: observerKind,
         method,
       },
@@ -1057,12 +1060,38 @@ function recordSessionObservedFile(project, fileEntry, observer = {}) {
       ),
       payload: {
         source: fileEntry.source || null,
+        ...(observerPayload || {}),
       },
     });
     appendObservation(provenance, observation);
   } catch (e) {
     console.warn('[crate][provenance] session_observed_file skipped:', e.message);
   }
+}
+
+const PRE_PACKAGE_RECOVERY_PROVENANCE_SOURCES = new Set([
+  'lsof-package-scan',
+  'ai-linked',
+  'psd-linked',
+  'psd-embedded',
+  'indd-linked',
+  'linked-asset',
+  'pre-package-doublecheck',
+]);
+
+function recordPrePackageRecoverySessionObservation(project, fileEntry) {
+  const source = fileEntry && fileEntry.source;
+  if (!PRE_PACKAGE_RECOVERY_PROVENANCE_SOURCES.has(source)) return;
+
+  recordSessionObservedFile(project, fileEntry, {
+    kind: OBSERVER_KINDS.PACKAGE_RECOVERY,
+    method: source,
+    payload: {
+      method: source,
+      channel: 'pre-package-scan',
+      recoveryType: 'package-time-recovery',
+    },
+  });
 }
 
 function recordPendingFileDecision(project, fileEntry, decision) {
@@ -4978,6 +5007,7 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
     path.join(homedir, 'Library', 'Application Support', 'Figma'),
   ];
   const watchStart = project.watchStartedAt || project.createdAt;
+  const preScanExistingPaths = new Set(project.files.map(f => f.path));
   const existingPaths = new Set(project.files.map(f => f.path));
 
   await Promise.race([
@@ -5448,10 +5478,20 @@ end tell`;
     const scanPending = project.pendingFiles || [];
     const merged = mutateProject(projectId, (proj) => {
       const existingPaths = new Set(proj.files.map(f => f.path));
+      const recoveredFilesForProvenance = [];
       for (const f of scanFiles) {
+        if (preScanExistingPaths.has(f.path)) continue;
+
         if (!existingPaths.has(f.path)) {
           proj.files.push(f);
           existingPaths.add(f.path);
+          recoveredFilesForProvenance.push(f);
+          continue;
+        }
+
+        const storedFile = proj.files.find(file => file.path === f.path && file.source === f.source);
+        if (storedFile) {
+          recoveredFilesForProvenance.push(storedFile);
         }
       }
       if (scanPending.length > 0) {
@@ -5464,6 +5504,11 @@ end tell`;
         }
       }
       proj.files = deduplicateFiles(proj.files);
+      for (const file of recoveredFilesForProvenance) {
+        const storedFile = proj.files.find(f => f.path === file.path && f.source === file.source);
+        if (!storedFile) continue;
+        recordPrePackageRecoverySessionObservation(proj, storedFile);
+      }
       return { files: proj.files };
     });
     if (merged) project.files = merged.files;
