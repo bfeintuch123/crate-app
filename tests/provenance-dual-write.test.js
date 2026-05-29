@@ -372,6 +372,19 @@ function getSessionObservedByMethod(project, method) {
     .filter(observation => observation.observer && observation.observer.method === method);
 }
 
+function assertNoRelationshipEdges(project) {
+  assert.equal(getProvenanceEdges(project, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+  assert.equal(getProvenanceEdges(project, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+  assert.equal(getProvenanceEdges(project, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+}
+
+function assertProvenanceTextExcludes(project, forbiddenValues) {
+  const provenanceText = JSON.stringify(project.provenance);
+  for (const value of forbiddenValues) {
+    assert.equal(provenanceText.includes(value), false, `provenance should not include ${value}`);
+  }
+}
+
 function packageFolder(outputDir, projectName) {
   const dateStr = new Date().toISOString().split('T')[0];
   return path.join(outputDir, `${projectName}_${dateStr}`);
@@ -1518,6 +1531,315 @@ test('ps-poll provenance failure does not block ledger insertion', async () => {
   const fresh = await waitForProject(project.id, item => item.files.length === 1, 5000);
   assert.equal(fresh.files[0].path, filePath);
   assert.equal(fresh.files[0].source, 'ps-poll');
+});
+
+test('lastused-poll accepted insertion records one deduped candidate session observation', async () => {
+  resetTestHomeWorkspace();
+  const filePath = path.join(TEST_HOME, 'Desktop', 'lastused-logo.png');
+  fs.writeFileSync(filePath, 'lastused bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return { stdout: '111 /Applications/Figma.app/Contents/MacOS/Figma --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return { stdout: '' };
+    }
+    if (kind === 'execFile' && command === '/usr/bin/mdfind') {
+      return { stdout: `${filePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Lastused poll provenance');
+  let fresh = await waitForProject(
+    project.id,
+    item => item.files.some(file => file.source === 'lastused-poll'),
+    12000
+  );
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+
+  let observations = getSessionObservedByMethod(fresh, 'lastused-poll');
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.SPOTLIGHT_LAST_USED);
+  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.deepEqual(observations[0].payload, {
+    source: 'lastused-poll',
+    method: 'lastused-poll',
+    channel: 'live-lastused-poll',
+  });
+  assertNoRelationshipEdges(fresh);
+  assertProvenanceTextExcludes(fresh, [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/usr/bin/mdfind',
+    'stdout',
+  ]);
+
+  await new Promise(resolve => originalSetTimeout(resolve, 10500));
+  fresh = await getProject(project.id);
+  observations = getSessionObservedByMethod(fresh, 'lastused-poll');
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.equal(observations.length, 1);
+});
+
+test('scan-on-open linked accepted insertion records one deduped candidate session observation', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const sourcePath = path.join(repoTempRoot, 'layout.ai');
+    const linkedPath = path.join(repoTempRoot, 'linked-logo.png');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    fs.writeFileSync(sourcePath, `RAW_REGEX_CONTENT_SHOULD_NOT_APPEAR ${linkedPath}`);
+
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+        return { stdout: '222 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+        return { stdout: `p222\nf12\ntREG\nn${sourcePath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Scan open linked provenance');
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      5000
+    );
+
+    let observations = getSessionObservedByMethod(fresh, 'scan-on-open');
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PARSER);
+    assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+    assert.deepEqual(observations[0].payload, {
+      source: 'scan-on-open',
+      method: 'scan-on-open',
+      channel: 'live-scan-on-open',
+    });
+    assertNoRelationshipEdges(fresh);
+    assertProvenanceTextExcludes(fresh, [
+      'RAW_REGEX_CONTENT_SHOULD_NOT_APPEAR',
+      'SHOULD_NOT_APPEAR_PROCESS_ARG',
+      '/usr/sbin/lsof',
+      'stdout',
+    ]);
+
+    await emitWatcher('change', sourcePath);
+    await new Promise(resolve => originalSetTimeout(resolve, 800));
+    fresh = await getProject(project.id);
+    observations = getSessionObservedByMethod(fresh, 'scan-on-open');
+    assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
+    assert.equal(observations.length, 1);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
+test('scan-on-open PSD parser accepted linked and embedded insertions record candidate session observations only', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-psd-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const psdPath = path.join(repoTempRoot, 'source.psd');
+    const triggerPath = path.join(repoTempRoot, 'trigger-logo.png');
+    const linkedPath = path.join(repoTempRoot, 'linked-logo.ai');
+    fs.writeFileSync(triggerPath, 'trigger bytes');
+    fs.writeFileSync(psdPath, `PSD_RAW_CONTENT_SHOULD_NOT_APPEAR ${triggerPath}`);
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: linkedPath } }],
+      linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('EMBEDDED_RAW_CONTENT_SHOULD_NOT_APPEAR') }],
+    };
+
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+        return { stdout: '333 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+        return { stdout: `p333\nf13\ntREG\nn${psdPath}\n` };
+      }
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return { stdout: '' };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Scan open PSD provenance');
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'psd-linked') &&
+        item.files.some(file => file.source === 'psd-embedded'),
+      5000
+    );
+
+    const observations = getSessionObservedByMethod(fresh, 'scan-on-open-psd-parser');
+    assert.equal(observations.length, 2);
+    assert.deepEqual(observations.map(observation => observation.payload.source).sort(), ['psd-embedded', 'psd-linked']);
+    for (const observation of observations) {
+      assert.equal(observation.observer.kind, OBSERVER_KINDS.PARSER);
+      assert.equal(observation.confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+      assert.equal(observation.payload.method, 'scan-on-open-psd-parser');
+      assert.equal(observation.payload.channel, 'live-scan-on-open');
+      assert.equal(observation.payload.parser, 'ag-psd');
+    }
+    assertNoRelationshipEdges(fresh);
+    assertProvenanceTextExcludes(fresh, [
+      'PSD_RAW_CONTENT_SHOULD_NOT_APPEAR',
+      'EMBEDDED_RAW_CONTENT_SHOULD_NOT_APPEAR',
+      'SHOULD_NOT_APPEAR_PROCESS_ARG',
+      '/usr/sbin/lsof',
+      'stdout',
+    ]);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.rmSync(path.join(os.tmpdir(), `crate-psd-extract-dual-write-project-${watcherRecords.length}`), { recursive: true, force: true });
+  }
+});
+
+test('scan-on-open deduped-away linked candidate does not record session observation', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-dedupe-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const project = await createProject('Scan open dedupe provenance');
+    const sourcePath = path.join(repoTempRoot, 'layout.ai');
+    const targetPath = path.join(repoTempRoot, 'canonical-logo.png');
+    const aliasPath = path.join(repoTempRoot, 'alias-logo.png');
+    fs.writeFileSync(sourcePath, `raw content ${aliasPath}`);
+    fs.writeFileSync(targetPath, 'canonical bytes');
+    fs.symlinkSync(targetPath, aliasPath);
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: sourcePath,
+          name: 'layout.ai',
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: targetPath,
+          name: 'canonical-logo.png',
+          ext: '.png',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+      ],
+    });
+
+    await emitWatcher('change', sourcePath);
+    await new Promise(resolve => originalSetTimeout(resolve, 800));
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === aliasPath), false);
+    assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 0);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
+test('scan-on-open provenance failure does not block accepted ledger insertion', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-failure-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const project = await createProject('Scan open provenance failure');
+    const sourcePath = path.join(repoTempRoot, 'layout.ai');
+    const linkedPath = path.join(repoTempRoot, 'linked-logo.png');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    fs.writeFileSync(sourcePath, `raw content ${linkedPath}`);
+    const storedProject = await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'layout.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    storedProject.provenance.nodes = new Proxy({}, {
+      set() {
+        throw new Error('forced scan-on-open provenance failure');
+      },
+    });
+
+    await emitWatcher('change', sourcePath);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      3000
+    );
+    assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 0);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
+test('initial snapshot linked-asset regex accepted insertion records candidate session observation only', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-initial-snapshot-regex-provenance');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const sourcePath = path.join(TEST_HOME, 'Desktop', 'snapshot-layout.ai');
+    const linkedPath = path.join(repoTempRoot, 'snapshot-linked.png');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    fs.writeFileSync(sourcePath, `SNAPSHOT_REGEX_CONTENT_SHOULD_NOT_APPEAR ${linkedPath}`);
+
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'execFile' && command === '/bin/ps') {
+        return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+      }
+      if (kind === 'execFile' && command === '/usr/sbin/lsof') {
+        return { stdout: `p444\nf14\ntREG\nn${sourcePath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Initial snapshot regex provenance');
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'linked-asset'),
+      5000
+    );
+
+    const observations = getSessionObservedByMethod(fresh, 'initial-snapshot-linked-regex');
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PARSER);
+    assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+    assert.deepEqual(observations[0].payload, {
+      source: 'linked-asset',
+      method: 'initial-snapshot-linked-regex',
+      channel: 'initial-lsof-snapshot',
+    });
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+    assertProvenanceTextExcludes(fresh, [
+      'SNAPSHOT_REGEX_CONTENT_SHOULD_NOT_APPEAR',
+      'SHOULD_NOT_APPEAR_PROCESS_ARG',
+      '/usr/sbin/lsof',
+      'stdout',
+    ]);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
 });
 
 test('pre-package lsof package scan insertion records one deduped session observation', async () => {
