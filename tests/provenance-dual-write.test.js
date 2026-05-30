@@ -224,6 +224,24 @@ function getChildProcessResult(kind, command, args = []) {
   }) || { stdout: '', stderr: '' };
 }
 
+function isOsascriptInvocation({ kind, command, args }, scriptName) {
+  return kind === 'execFile' &&
+    command === '/usr/bin/osascript' &&
+    Array.isArray(args) &&
+    args.length === 1 &&
+    path.basename(args[0]) === scriptName;
+}
+
+function assertPrivateTempScriptPath(scriptPath) {
+  const scriptDir = path.dirname(scriptPath);
+  assert.equal(path.resolve(path.dirname(scriptDir)), path.resolve(os.tmpdir()));
+  assert.equal(path.basename(scriptDir).startsWith('crate-script-'), true);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(scriptDir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(scriptPath).mode & 0o777, 0o600);
+  }
+}
+
 function createChildProcessStub() {
   return {
     on: () => {},
@@ -1403,57 +1421,97 @@ test('lsof provenance failure does not block ledger capture', async () => {
 test('ps-poll accepted insertion records one session observation', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'ps-poll-logo.ai');
   const unrelatedPath = path.join(TEST_HOME, 'Desktop', 'UNRELATED_FILE_LIST.ai');
+  const originalWriteFile = fs.promises.writeFile;
+  const privateScriptDirs = new Set();
+  const scriptWrites = [];
+  const osascriptInvocations = [];
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-script-sentinel-'));
   fs.writeFileSync(filePath, 'ps linked bytes');
 
-  setChildProcessHandler(({ kind, command }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
-      return {
-        stdout: '123 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n',
-      };
+  fs.promises.writeFile = async function trackedWriteFile(target, data, options) {
+    if (typeof target === 'string' && path.basename(path.dirname(target)).startsWith('crate-script-')) {
+      privateScriptDirs.add(path.dirname(target));
+      scriptWrites.push({ target, options });
     }
-    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
-      return { stdout: `${filePath}\n${unrelatedPath}\n` };
+    return originalWriteFile.call(fs.promises, target, data, options);
+  };
+
+  try {
+    setChildProcessHandler(({ kind, command, args, commandText }) => {
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return {
+          stdout: '123 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n',
+        };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-poll.applescript')) {
+        osascriptInvocations.push({ command, args, commandText });
+        privateScriptDirs.add(path.dirname(args[0]));
+        assertPrivateTempScriptPath(args[0]);
+        assertPrivateTempScriptPath(path.join(path.dirname(args[0]), 'crate-ps-poll.js'));
+        assert.equal(commandText.includes('tell application'), false);
+        assert.equal(commandText.includes('LayerKind.SMARTOBJECT'), false);
+        return { stdout: `${filePath}\n${unrelatedPath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('PS poll provenance');
+    const fresh = await waitForProject(project.id, item => item.files.length === 1);
+    assert.equal(fresh.files[0].path, filePath);
+    assert.equal(fresh.files[0].source, 'ps-poll');
+
+    const observations = getSessionObservedByMethod(fresh, 'ps-poll');
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
+    assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
+    assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+    assert.deepEqual(observations[0].payload, {
+      source: 'ps-poll',
+      method: 'ps-poll',
+      channel: 'live-app-poll',
+    });
+    assert.deepEqual(fresh.provenance.edges, {});
+    assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
+
+    const writtenNames = new Set(scriptWrites.map(write => path.basename(write.target)));
+    assert.equal(writtenNames.has('crate-ps-poll.js'), true);
+    assert.equal(writtenNames.has('crate-ps-poll.applescript'), true);
+    for (const write of scriptWrites) {
+      assert.equal(write.options.flag, 'wx');
+      assert.equal(write.options.mode, 0o600);
     }
-    return { stdout: '' };
-  });
+    assert.ok(osascriptInvocations.length >= 1);
+    for (const dir of privateScriptDirs) {
+      assert.equal(fs.existsSync(dir), false);
+    }
+    assert.equal(fs.existsSync(sentinelDir), true);
 
-  const project = await createProject('PS poll provenance');
-  const fresh = await waitForProject(project.id, item => item.files.length === 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'ps-poll');
-
-  const observations = getSessionObservedByMethod(fresh, 'ps-poll');
-  assert.equal(observations.length, 1);
-  assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
-  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
-  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-  assert.deepEqual(observations[0].payload, {
-    source: 'ps-poll',
-    method: 'ps-poll',
-    channel: 'live-app-poll',
-  });
-  assert.deepEqual(fresh.provenance.edges, {});
-  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
-
-  const provenanceText = JSON.stringify(fresh.provenance);
-  assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
-  assert.equal(provenanceText.includes('/Applications/Adobe Photoshop.app'), false);
-  assert.equal(provenanceText.includes(unrelatedPath), false);
-  assert.equal(provenanceText.includes('raw'), false);
-  assert.equal(provenanceText.includes('stdout'), false);
+    const provenanceText = JSON.stringify(fresh.provenance);
+    assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+    assert.equal(provenanceText.includes('/Applications/Adobe Photoshop.app'), false);
+    assert.equal(provenanceText.includes(unrelatedPath), false);
+    assert.equal(provenanceText.includes('raw'), false);
+    assert.equal(provenanceText.includes('stdout'), false);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    fs.rmSync(sentinelDir, { recursive: true, force: true });
+  }
 });
 
 test('indd-poll accepted insertion records one session observation', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'indd-poll-image.png');
   fs.writeFileSync(filePath, 'indd linked bytes');
 
-  setChildProcessHandler(({ kind, command }) => {
+  const osascriptDirs = new Set();
+  setChildProcessHandler(({ kind, command, args }) => {
     if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
       return {
         stdout: '456 /Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n',
       };
     }
-    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-indd-poll')) {
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      osascriptDirs.add(path.dirname(args[0]));
+      assertPrivateTempScriptPath(args[0]);
       return { stdout: `${filePath}\n` };
     }
     return { stdout: '' };
@@ -1477,17 +1535,20 @@ test('indd-poll accepted insertion records one session observation', async () =>
   assert.deepEqual(fresh.provenance.edges, {});
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+  for (const dir of osascriptDirs) {
+    assert.equal(fs.existsSync(dir), false);
+  }
 });
 
 test('repeated ps-poll insertion does not duplicate session observations', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'dedupe-ps-poll-logo.ai');
   fs.writeFileSync(filePath, 'ps linked bytes');
 
-  setChildProcessHandler(({ kind, command }) => {
+  setChildProcessHandler(({ kind, command, args }) => {
     if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
       return { stdout: '789 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop\n' };
     }
-    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-poll.applescript')) {
       return { stdout: `${filePath}\n` };
     }
     return { stdout: '' };
@@ -1508,12 +1569,12 @@ test('ps-poll provenance failure does not block ledger insertion', async () => {
   fs.writeFileSync(filePath, 'ps linked bytes');
   let pollReady = false;
 
-  setChildProcessHandler(({ kind, command }) => {
+  setChildProcessHandler(({ kind, command, args }) => {
     if (!pollReady) return { stdout: '' };
     if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
       return { stdout: '987 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop\n' };
     }
-    if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ps-poll')) {
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-poll.applescript')) {
       return { stdout: `${filePath}\n` };
     }
     return { stdout: '' };
@@ -1967,11 +2028,13 @@ test('pre-package app-script parser and regex recovered additions record session
       ],
     });
 
-    setChildProcessHandler(({ kind, command }) => {
+    setChildProcessHandler(({ kind, command, args, commandText }) => {
       if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
         return { stdout: '/Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
       }
-      if (kind === 'exec' && command.startsWith('/usr/bin/osascript') && command.includes('crate-ai-scan')) {
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-scan.applescript')) {
+        assertPrivateTempScriptPath(args[0]);
+        assert.equal(commandText.includes('tell application'), false);
         return { stdout: `${scriptLinkedPath}\n` };
       }
       return { stdout: '' };

@@ -38,6 +38,45 @@ const {
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
+const TEMP_SCRIPT_DIR_PREFIX = 'crate-script-';
+const TEMP_SCRIPT_DIR_MODE = 0o700;
+const TEMP_SCRIPT_FILE_MODE = 0o600;
+
+function safeTempScriptName(name) {
+  if (typeof name !== 'string' || name.trim() === '' || name !== path.basename(name)) {
+    throw new Error('Invalid temporary script name');
+  }
+  return name;
+}
+
+async function runOsascriptInPrivateTemp(buildScripts, entryScriptName, options = {}) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), TEMP_SCRIPT_DIR_PREFIX));
+  const resolveScriptPath = (name) => path.join(tempDir, safeTempScriptName(name));
+
+  try {
+    try { fs.chmodSync(tempDir, TEMP_SCRIPT_DIR_MODE); } catch (_) {}
+
+    const scripts = buildScripts({ tempDir, resolveScriptPath }) || {};
+    for (const [name, contents] of Object.entries(scripts)) {
+      const scriptPath = resolveScriptPath(name);
+      await fs.promises.writeFile(scriptPath, contents, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: TEMP_SCRIPT_FILE_MODE,
+      });
+      try { fs.chmodSync(scriptPath, TEMP_SCRIPT_FILE_MODE); } catch (_) {}
+    }
+
+    const entryScriptPath = resolveScriptPath(entryScriptName);
+    if (!Object.prototype.hasOwnProperty.call(scripts, safeTempScriptName(entryScriptName))) {
+      throw new Error('Missing temporary entry script');
+    }
+
+    return await execFileAsync('/usr/bin/osascript', [entryScriptPath], options);
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 async function getXattrLastUsedMs(filePath) {
   try {
@@ -3070,13 +3109,13 @@ async function pollPsForProject(projectId) {
     ).catch(() => ({ stdout: '' }));
 
     if (psCheck.trim()) {
-      const jsPath = path.join(os.tmpdir(), `crate-ps-poll-${projectId}.js`);
-      const asPath = path.join(os.tmpdir(), `crate-ps-poll-${projectId}.applescript`);
       try {
-        await fs.promises.writeFile(jsPath, PS_DOJAVASCRIPT, 'utf8');
-        await fs.promises.writeFile(asPath, psDoJavascriptAS(jsPath), 'utf8');
-        const { stdout: psOut } = await execAsync(
-          `/usr/bin/osascript "${asPath}"`,
+        const { stdout: psOut } = await runOsascriptInPrivateTemp(
+          ({ resolveScriptPath }) => ({
+            'crate-ps-poll.js': PS_DOJAVASCRIPT,
+            'crate-ps-poll.applescript': psDoJavascriptAS(resolveScriptPath('crate-ps-poll.js')),
+          }),
+          'crate-ps-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
         for (const p of psOut.split('\n').filter(Boolean)) {
@@ -3084,9 +3123,6 @@ async function pollPsForProject(projectId) {
         }
       } catch (e) {
         // Photoshop may be busy or script timed out — skip silently
-      } finally {
-        try { fs.unlinkSync(jsPath); } catch (_) {}
-        try { fs.unlinkSync(asPath); } catch (_) {}
       }
     }
 
@@ -3097,11 +3133,10 @@ async function pollPsForProject(projectId) {
     ).catch(() => ({ stdout: '' }));
 
     if (inddCheck.trim()) {
-      const scriptPath = path.join(os.tmpdir(), `crate-indd-poll-${projectId}.applescript`);
       try {
-        await fs.promises.writeFile(scriptPath, INDD_APPLESCRIPT, 'utf8');
-        const { stdout: inddOut } = await execAsync(
-          `/usr/bin/osascript "${scriptPath}"`,
+        const { stdout: inddOut } = await runOsascriptInPrivateTemp(
+          () => ({ 'crate-indd-poll.applescript': INDD_APPLESCRIPT }),
+          'crate-indd-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
         for (const line of inddOut.split('\n')) {
@@ -3110,8 +3145,6 @@ async function pollPsForProject(projectId) {
         }
       } catch (e) {
         // InDesign may be busy or script timed out — skip silently
-      } finally {
-        try { fs.unlinkSync(scriptPath); } catch (_) {}
       }
     }
 
@@ -3443,32 +3476,24 @@ async function extractLinkedAssetsPhotoshop(filePath) {
 
     if (psCheck.trim()) {
       // v2.3.4: do javascript — exposes embedded smart object paths
-      const jsPath = path.join(os.tmpdir(), 'crate-ps-scan.js');
-      const asPath = path.join(os.tmpdir(), 'crate-ps-scan.applescript');
+      const { stdout: psPaths } = await runOsascriptInPrivateTemp(
+        ({ resolveScriptPath }) => ({
+          'crate-ps-scan.js': PS_DOJAVASCRIPT,
+          'crate-ps-scan.applescript': psDoJavascriptAS(resolveScriptPath('crate-ps-scan.js')),
+        }),
+        'crate-ps-scan.applescript',
+        { timeout: 10000, encoding: 'utf8' }
+      ).catch(() => ({ stdout: '' }));
 
-      await fs.promises.writeFile(jsPath, PS_DOJAVASCRIPT, 'utf8');
-      await fs.promises.writeFile(asPath, psDoJavascriptAS(jsPath), 'utf8');
-      try {
-        const { stdout: psPaths } = await execAsync(
-          `/usr/bin/osascript "${asPath}"`,
-          { timeout: 10000, encoding: 'utf8' }
-        ).catch(() => ({ stdout: '' }));
-
-        if (psPaths.trim()) {
-          const results = [];
-          for (const p of psPaths.split('\n').filter(Boolean)) {
-            if (p === filePath) continue;
-            if (fs.existsSync(p)) results.push(p);
-          }
-          if (results.length > 0) {
-            await fs.promises.unlink(jsPath).catch(() => {});
-            await fs.promises.unlink(asPath).catch(() => {});
-            return results;
-          }
+      if (psPaths.trim()) {
+        const results = [];
+        for (const p of psPaths.split('\n').filter(Boolean)) {
+          if (p === filePath) continue;
+          if (fs.existsSync(p)) results.push(p);
         }
-      } finally {
-        await fs.promises.unlink(jsPath).catch(() => {});
-        await fs.promises.unlink(asPath).catch(() => {});
+        if (results.length > 0) {
+          return results;
+        }
       }
     }
   } catch (e) {
@@ -3552,7 +3577,6 @@ async function extractLinkedAssetsInDesign(filePath) {
     ).catch(() => ({ stdout: '' }));
 
     if (psCheck.trim()) {
-      const scriptPath = path.join(os.tmpdir(), 'crate-indd-query.applescript');
       const appleScript = `tell application "Adobe InDesign"
   try
     set pathList to {}
@@ -3571,28 +3595,23 @@ async function extractLinkedAssetsInDesign(filePath) {
   end try
 end tell`;
 
-      await fs.promises.writeFile(scriptPath, appleScript, 'utf8');
-      try {
-        const { stdout: inddPaths } = await execAsync(
-          `/usr/bin/osascript "${scriptPath}"`,
-          { timeout: 10000, encoding: 'utf8' }
-        ).catch(() => ({ stdout: '' }));
+      const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
+        () => ({ 'crate-indd-query.applescript': appleScript }),
+        'crate-indd-query.applescript',
+        { timeout: 10000, encoding: 'utf8' }
+      ).catch(() => ({ stdout: '' }));
 
-        if (inddPaths.trim()) {
-          const results = [];
-          for (const line of inddPaths.trim().split('\n')) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            if (trimmed === filePath) continue;
-            if (fs.existsSync(trimmed)) results.push(trimmed);
-          }
-          if (results.length > 0) {
-            await fs.promises.unlink(scriptPath).catch(() => {});
-            return results;
-          }
+      if (inddPaths.trim()) {
+        const results = [];
+        for (const line of inddPaths.trim().split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (trimmed === filePath) continue;
+          if (fs.existsSync(trimmed)) results.push(trimmed);
         }
-      } finally {
-        await fs.promises.unlink(scriptPath).catch(() => {});
+        if (results.length > 0) {
+          return results;
+        }
       }
     }
   } catch (e) {
@@ -5265,7 +5284,6 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
     ).catch(() => ({ stdout: '' }));
 
     if (aiPsCheck.trim()) {
-      const aiScriptPath = path.join(os.tmpdir(), `crate-ai-scan-${projectId}.applescript`);
       const aiAppleScript = `tell application "Adobe Illustrator"
   try
     set pathList to {}
@@ -5286,36 +5304,32 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
   end try
 end tell`;
 
-      await fs.promises.writeFile(aiScriptPath, aiAppleScript, 'utf8');
-      try {
-        const { stdout: aiPaths } = await execAsync(
-          `/usr/bin/osascript "${aiScriptPath}"`,
-          { timeout: 10000, encoding: 'utf8' }
-        ).catch(() => ({ stdout: '' }));
+      const { stdout: aiPaths } = await runOsascriptInPrivateTemp(
+        () => ({ 'crate-ai-scan.applescript': aiAppleScript }),
+        'crate-ai-scan.applescript',
+        { timeout: 10000, encoding: 'utf8' }
+      ).catch(() => ({ stdout: '' }));
 
-        if (aiPaths.trim()) {
-          const existingPaths = new Set(project.files.map(f => f.path));
-          for (const linkedPath of aiPaths.trim().split('\n')) {
-            const trimmed = linkedPath.trim();
-            if (!trimmed) continue;
-            if (existingPaths.has(trimmed)) continue;
-            if (!fs.existsSync(trimmed)) continue;
-            const ext = path.extname(trimmed).toLowerCase();
-            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      if (aiPaths.trim()) {
+        const existingPaths = new Set(project.files.map(f => f.path));
+        for (const linkedPath of aiPaths.trim().split('\n')) {
+          const trimmed = linkedPath.trim();
+          if (!trimmed) continue;
+          if (existingPaths.has(trimmed)) continue;
+          if (!fs.existsSync(trimmed)) continue;
+          const ext = path.extname(trimmed).toLowerCase();
+          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-            project.files.push({
-              path: trimmed,
-              name: path.basename(trimmed),
-              ext,
-              addedAt: Date.now(),
-              source: 'ai-linked',
-            });
-            existingPaths.add(trimmed);
-            newCount++;
-          }
+          project.files.push({
+            path: trimmed,
+            name: path.basename(trimmed),
+            ext,
+            addedAt: Date.now(),
+            source: 'ai-linked',
+          });
+          existingPaths.add(trimmed);
+          newCount++;
         }
-      } finally {
-        await fs.promises.unlink(aiScriptPath).catch(() => {});
       }
     }
   } catch (e) {
@@ -5333,39 +5347,33 @@ end tell`;
     ).catch(() => ({ stdout: '' }));
 
     if (psPsCheck.trim()) {
-      const psJsPath = path.join(os.tmpdir(), `crate-ps-scan-${projectId}.js`);
-      const psAsPath = path.join(os.tmpdir(), `crate-ps-scan-${projectId}.applescript`);
+      const { stdout: psPaths } = await runOsascriptInPrivateTemp(
+        ({ resolveScriptPath }) => ({
+          'crate-ps-scan.js': PS_DOJAVASCRIPT,
+          'crate-ps-scan.applescript': psDoJavascriptAS(resolveScriptPath('crate-ps-scan.js')),
+        }),
+        'crate-ps-scan.applescript',
+        { timeout: 10000, encoding: 'utf8' }
+      ).catch(() => ({ stdout: '' }));
 
-      await fs.promises.writeFile(psJsPath, PS_DOJAVASCRIPT, 'utf8');
-      await fs.promises.writeFile(psAsPath, psDoJavascriptAS(psJsPath), 'utf8');
-      try {
-        const { stdout: psPaths } = await execAsync(
-          `/usr/bin/osascript "${psAsPath}"`,
-          { timeout: 10000, encoding: 'utf8' }
-        ).catch(() => ({ stdout: '' }));
+      if (psPaths.trim()) {
+        const existingPaths = new Set(project.files.map(f => f.path));
+        for (const trimmed of psPaths.split('\n').filter(Boolean)) {
+          if (existingPaths.has(trimmed)) continue;
+          if (!fs.existsSync(trimmed)) continue;
+          const ext = path.extname(trimmed).toLowerCase();
+          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-        if (psPaths.trim()) {
-          const existingPaths = new Set(project.files.map(f => f.path));
-          for (const trimmed of psPaths.split('\n').filter(Boolean)) {
-            if (existingPaths.has(trimmed)) continue;
-            if (!fs.existsSync(trimmed)) continue;
-            const ext = path.extname(trimmed).toLowerCase();
-            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-
-            project.files.push({
-              path: trimmed,
-              name: path.basename(trimmed),
-              ext,
-              addedAt: Date.now(),
-              source: 'psd-linked',
-            });
-            existingPaths.add(trimmed);
-            newCount++;
-          }
+          project.files.push({
+            path: trimmed,
+            name: path.basename(trimmed),
+            ext,
+            addedAt: Date.now(),
+            source: 'psd-linked',
+          });
+          existingPaths.add(trimmed);
+          newCount++;
         }
-      } finally {
-        await fs.promises.unlink(psJsPath).catch(() => {});
-        await fs.promises.unlink(psAsPath).catch(() => {});
       }
     }
   } catch (e) {
@@ -5405,7 +5413,6 @@ end tell`;
     ).catch(() => ({ stdout: '' }));
 
     if (inddPsCheck.trim()) {
-      const inddScriptPath = path.join(os.tmpdir(), `crate-indd-scan-${projectId}.applescript`);
       const inddAppleScript = `tell application "Adobe InDesign"
   try
     set pathList to {}
@@ -5424,36 +5431,32 @@ end tell`;
   end try
 end tell`;
 
-      await fs.promises.writeFile(inddScriptPath, inddAppleScript, 'utf8');
-      try {
-        const { stdout: inddPaths } = await execAsync(
-          `/usr/bin/osascript "${inddScriptPath}"`,
-          { timeout: 10000, encoding: 'utf8' }
-        ).catch(() => ({ stdout: '' }));
+      const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
+        () => ({ 'crate-indd-scan.applescript': inddAppleScript }),
+        'crate-indd-scan.applescript',
+        { timeout: 10000, encoding: 'utf8' }
+      ).catch(() => ({ stdout: '' }));
 
-        if (inddPaths.trim()) {
-          const existingPaths = new Set(project.files.map(f => f.path));
-          for (const linkedPath of inddPaths.trim().split('\n')) {
-            const trimmed = linkedPath.trim();
-            if (!trimmed) continue;
-            if (existingPaths.has(trimmed)) continue;
-            if (!fs.existsSync(trimmed)) continue;
-            const ext = path.extname(trimmed).toLowerCase();
-            if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      if (inddPaths.trim()) {
+        const existingPaths = new Set(project.files.map(f => f.path));
+        for (const linkedPath of inddPaths.trim().split('\n')) {
+          const trimmed = linkedPath.trim();
+          if (!trimmed) continue;
+          if (existingPaths.has(trimmed)) continue;
+          if (!fs.existsSync(trimmed)) continue;
+          const ext = path.extname(trimmed).toLowerCase();
+          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-            project.files.push({
-              path: trimmed,
-              name: path.basename(trimmed),
-              ext,
-              addedAt: Date.now(),
-              source: 'indd-linked',
-            });
-            existingPaths.add(trimmed);
-            newCount++;
-          }
+          project.files.push({
+            path: trimmed,
+            name: path.basename(trimmed),
+            ext,
+            addedAt: Date.now(),
+            source: 'indd-linked',
+          });
+          existingPaths.add(trimmed);
+          newCount++;
         }
-      } finally {
-        await fs.promises.unlink(inddScriptPath).catch(() => {});
       }
     }
   } catch (e) {
