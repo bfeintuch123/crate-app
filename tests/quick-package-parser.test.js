@@ -30,6 +30,13 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 
 let unzipFixture = new Map();
 
+function unzipFixtureData(value) {
+  if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'data')) {
+    return value.data;
+  }
+  return value;
+}
+
 function createChildProcessStub() {
   return {
     on: () => {},
@@ -43,7 +50,7 @@ function unzipListing() {
   return [
     'Archive: deck.pptx',
     ...[...unzipFixture.entries()].map(([zipPath, data]) => {
-      const size = Buffer.byteLength(data);
+      const size = Buffer.byteLength(unzipFixtureData(data));
       return `${String(size).padStart(9)}  01-01-2026 12:00  ${zipPath}`;
     }),
     '',
@@ -74,7 +81,9 @@ execFileStub[nodePromisify.custom] = async (command, args = []) => {
     if (!unzipFixture.has(zipPath)) {
       throw new Error(`Missing fixture for ${zipPath}`);
     }
-    return { stdout: Buffer.from(unzipFixture.get(zipPath)), stderr: '' };
+    const value = unzipFixture.get(zipPath);
+    if (value && typeof value === 'object' && value.error) throw value.error;
+    return { stdout: Buffer.from(unzipFixtureData(value)), stderr: '' };
   }
 
   throw new Error(`Unexpected unzip args: ${args.join(' ')}`);
@@ -136,6 +145,58 @@ test('Quick Package extracts PowerPoint embedded media without reporting them mi
   }
 });
 
+test('Quick Package reports only failed PowerPoint embedded media as missing', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Presentation1.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('pptx container bytes'));
+
+    unzipFixture = new Map([
+      ['ppt/media/image1.jpeg', 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['ppt/media/image2.png', {
+        data: 'PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+        error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
+      }],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['assetsCopied', 'assetsFound', 'assetsMissing', 'files', 'masterFile', 'outputDir'].sort()
+    );
+    assert.equal(result.assetsFound, 2);
+    assert.equal(result.assetsCopied, 1);
+    assert.deepEqual(result.assetsMissing, [{
+      path: 'Could not extract embedded media image2.png from Presentation1.pptx.',
+      source: 'pptx-embedded',
+    }]);
+
+    const missingText = JSON.stringify(result.assetsMissing);
+    assert.equal(missingText.includes('image1.jpeg'), false);
+    assert.equal(missingText.includes('RAW_STDERR'), false);
+    assert.equal(missingText.includes('unzip'), false);
+    assert.equal(missingText.includes('/private/tmp'), false);
+    assert.equal(missingText.includes(tmpRoot), false);
+
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Presentation1 — image1.jpeg'), 'utf8'),
+      'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(fs.existsSync(path.join(outputDir, 'Presentation1 — image2.png')), false);
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Presentation1.pptx', source: 'master' },
+        { copied: 'Presentation1 — image1.jpeg', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Quick Package extracts Keynote Data media and ignores Keynote archive junk', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -186,6 +247,58 @@ test('Quick Package extracts Keynote Data media and ignores Keynote archive junk
         { copied: 'Keynote Deck.key', source: 'master' },
         { copied: 'Keynote Deck — photo.jpeg', source: 'embedded' },
         { copied: 'Keynote Deck — logo.png', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package reports only failed Keynote embedded media as missing', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Presentation1.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
+
+    unzipFixture = new Map([
+      ['Data/photo-1234.jpeg', 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/clip-5678.mov', {
+        data: 'KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+        error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
+      }],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['assetsCopied', 'assetsFound', 'assetsMissing', 'files', 'masterFile', 'outputDir'].sort()
+    );
+    assert.equal(result.assetsFound, 2);
+    assert.equal(result.assetsCopied, 1);
+    assert.deepEqual(result.assetsMissing, [{
+      path: 'Could not extract embedded media clip-5678.mov from Presentation1.key.',
+      source: 'keynote-embedded',
+    }]);
+
+    const missingText = JSON.stringify(result.assetsMissing);
+    assert.equal(missingText.includes('photo-1234.jpeg'), false);
+    assert.equal(missingText.includes('RAW_STDERR'), false);
+    assert.equal(missingText.includes('unzip'), false);
+    assert.equal(missingText.includes('/private/tmp'), false);
+    assert.equal(missingText.includes(tmpRoot), false);
+
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Presentation1 — photo.jpeg'), 'utf8'),
+      'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(fs.existsSync(path.join(outputDir, 'Presentation1 — clip.mov')), false);
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Presentation1.key', source: 'master' },
+        { copied: 'Presentation1 — photo.jpeg', source: 'embedded' },
       ]
     );
   } finally {

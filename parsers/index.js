@@ -288,7 +288,14 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   if (includeEmbedded && parser.extractToDirectory) {
     try {
       const embeddedAssets = await parser.extractAssets(filePath);
-      const extracted = await parser.extractToDirectory(filePath, outputRoot, embeddedAssets);
+      const extracted = await parser.extractToDirectory(filePath, outputRoot, embeddedAssets, {
+        onExtractionError: (failure) => {
+          result.assetsMissing.push({
+            path: failure && failure.message ? failure.message : `Could not extract embedded media from ${path.basename(filePath)}.`,
+            source: failure && failure.asset && failure.asset.source ? failure.asset.source : 'embedded'
+          });
+        }
+      });
 
       for (const item of extracted) {
         result.assetsCopied++;
@@ -299,7 +306,7 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
         });
       }
     } catch (e) {
-      console.warn(`[packageMasterFile] Failed to extract embedded media: ${e.message}`);
+      console.warn(`[packageMasterFile] Could not extract embedded media from ${path.basename(filePath)}.`);
     }
   }
 
