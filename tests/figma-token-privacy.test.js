@@ -45,6 +45,16 @@ async function captureConsole(fn) {
   }
 }
 
+test('renderer Figma token privacy hint accurately describes local storage and API usage', () => {
+  const rendererHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const normalizedHtml = rendererHtml.replace(/\s+/g, ' ');
+  const expectedHint = 'Stored locally on this Mac, using Keychain when available or ~/.crate/figma-token with owner-only permissions. Crate uses it only to request your Figma files and assets from Figma.';
+  const staleClaim = /never leaves\s+your computer/i;
+
+  assert.equal(normalizedHtml.includes(expectedHint), true);
+  assert.equal(staleClaim.test(rendererHtml), false);
+});
+
 test('storeToken hardens existing fallback token file permissions without logging token contents', async () => {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-token-privacy-'));
   const crateDir = path.join(tempHome, '.crate');
