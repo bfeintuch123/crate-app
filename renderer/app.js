@@ -730,6 +730,10 @@ function formatFileCount(count, singular = 'file', plural = 'files') {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function getPackageIssueMessage(error) {
+  return typeof error === 'string' ? error.trim() : '';
+}
+
 function renderPackageDetails(result) {
   const details = $('#package-details');
   if (!details) return;
@@ -754,6 +758,18 @@ function renderPackageDetails(result) {
   $('#package-details-review').textContent = errors.length === 0
     ? 'No issues found'
     : `${formatFileCount(errors.length, 'issue', 'issues')} need review`;
+
+  const issuesEl = $('#package-details-issues');
+  if (issuesEl) {
+    issuesEl.innerHTML = '';
+    const issueMessages = errors.map(getPackageIssueMessage).filter(Boolean);
+    for (const message of issueMessages) {
+      const item = document.createElement('li');
+      item.textContent = message;
+      issuesEl.appendChild(item);
+    }
+    issuesEl.classList.toggle('hidden', issueMessages.length === 0);
+  }
 
   details.classList.remove('hidden');
 }

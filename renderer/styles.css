@@ -1154,6 +1154,24 @@ body {
   line-height: 1.4;
 }
 
+.package-details-review-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.package-details-issues {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--gray-600);
+  line-height: 1.35;
+  text-align: left;
+}
+
+.package-details-issues li {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
 /* Inactivity / Confirm Modals */
 .inactivity-title,
 .confirm-title {
