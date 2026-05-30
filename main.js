@@ -2281,6 +2281,12 @@ const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
 const FIGMA_INCREMENTAL_OVERLAP_MS = FIGMA_POLL_INTERVAL_MS * 2; // 2 minutes
 const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
+const FIGMA_ASSET_DIR_MODE = 0o700;
+const FIGMA_ASSET_FILE_MODE = 0o600;
+const SAFE_FIGMA_ASSET_FORMATS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'tif', 'tiff', 'heic',
+  'svg', 'pdf', 'bmp', 'avif',
+]);
 
 // --- Photoshop + InDesign Polling (v2.3.0) ---
 const psPollers = new Map();          // projectId -> setInterval id
@@ -2632,11 +2638,37 @@ function stopLsofPolling(projectId) {
 /**
  * Ensure Figma assets directory exists.
  */
-function ensureFigmaAssetsDir() {
-  if (!fs.existsSync(FIGMA_ASSETS_DIR)) {
-    fs.mkdirSync(FIGMA_ASSETS_DIR, { recursive: true });
+function hardenOwnerOnlyPermissions(targetPath, mode) {
+  if (process.platform === 'win32') return;
+  try {
+    fs.chmodSync(targetPath, mode);
+  } catch (_) {
+    // Best effort: chmod can be unsupported on unusual filesystems.
   }
+}
+
+function ensureOwnerOnlyDirectory(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true, mode: FIGMA_ASSET_DIR_MODE });
+  }
+  hardenOwnerOnlyPermissions(dirPath, FIGMA_ASSET_DIR_MODE);
+  return dirPath;
+}
+
+function ensureFigmaAssetsDir() {
+  ensureOwnerOnlyDirectory(path.dirname(FIGMA_ASSETS_DIR));
+  ensureOwnerOnlyDirectory(FIGMA_ASSETS_DIR);
   return FIGMA_ASSETS_DIR;
+}
+
+function sanitizeFigmaAssetFormat(format) {
+  if (typeof format !== 'string') return 'png';
+  const trimmed = format.trim().toLowerCase();
+  if (!trimmed || trimmed.includes('\0')) return 'png';
+  if (!/^\.?[a-z0-9]+$/.test(trimmed)) return 'png';
+
+  const extension = trimmed.replace(/^\./, '');
+  return SAFE_FIGMA_ASSET_FORMATS.has(extension) ? extension : 'png';
 }
 
 /**
@@ -2651,24 +2683,28 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
     const buffer = await response.buffer();
     if (buffer.length === 0) return null;
 
+    ensureFigmaAssetsDir();
+
     // Create project-specific subdir
     const projectDir = path.join(FIGMA_ASSETS_DIR, projectId);
-    if (!fs.existsSync(projectDir)) {
-      fs.mkdirSync(projectDir, { recursive: true });
-    }
+    ensureOwnerOnlyDirectory(projectDir);
 
     // v2.4.2: Use actual format from Figma API if available, fall back to png
-    const ext = format || 'png';
+    const ext = sanitizeFigmaAssetFormat(format);
     const safeName = fileName.replace(/[^a-zA-Z0-9_\-.]/g, '_').substring(0, 100);
     const localPath = path.join(projectDir, `${safeName}.${ext}`);
 
     // Skip if already exists with same size
     if (fs.existsSync(localPath)) {
       const existingSize = fs.statSync(localPath).size;
-      if (existingSize === buffer.length) return localPath;
+      if (existingSize === buffer.length) {
+        hardenOwnerOnlyPermissions(localPath, FIGMA_ASSET_FILE_MODE);
+        return localPath;
+      }
     }
 
-    fs.writeFileSync(localPath, buffer);
+    fs.writeFileSync(localPath, buffer, { mode: FIGMA_ASSET_FILE_MODE });
+    hardenOwnerOnlyPermissions(localPath, FIGMA_ASSET_FILE_MODE);
     console.log(`[crate][figma] downloaded asset: ${formatFigmaLocalNameForLog(localPath)}`);
     return localPath;
   } catch (e) {
@@ -2706,7 +2742,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     }
 
     const fileName = `${asset.figmaFileName}_${asset.name}`;
-    const assetFormat = asset.format || 'png';
+    const assetFormat = sanitizeFigmaAssetFormat(asset.format);
     const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
 
     if (!localPath) {
