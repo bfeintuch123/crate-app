@@ -50,6 +50,11 @@ function formatEmbeddedMediaExtractionFailure(archivePath, zipPath) {
   return `Could not extract embedded media ${mediaName} from ${archiveName}.`;
 }
 
+function formatEmbeddedMediaInspectionFailure(archivePath) {
+  const archiveName = safeDisplayName(archivePath, 'presentation');
+  return `Could not inspect embedded media in ${archiveName}.`;
+}
+
 // Media file extensions to extract
 const EMBEDDED_MEDIA_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
@@ -67,7 +72,7 @@ class PowerPointParser extends BaseParser {
    * @param {string} filePath - Absolute path to the .pptx or .key file
    * @returns {Promise<Array<{path: string, source: string, exists: boolean, zipPath: string, size: number}>>}
    */
-  async extractAssets(filePath) {
+  async extractAssets(filePath, options = {}) {
     const ext = path.extname(filePath).toLowerCase();
     const assets = [];
 
@@ -130,7 +135,19 @@ class PowerPointParser extends BaseParser {
         });
       }
     } catch (e) {
-      console.error(`[PowerPointParser] Could not inspect embedded media in ${safeDisplayName(filePath, 'presentation')}.`);
+      const message = formatEmbeddedMediaInspectionFailure(filePath);
+      console.error(`[PowerPointParser] ${message}`);
+      if (typeof options.onInspectionError === 'function') {
+        try {
+          options.onInspectionError({
+            archivePath: filePath,
+            message,
+            source: sourceType
+          });
+        } catch (callbackError) {
+          console.warn('[PowerPointParser] Embedded inspection error callback skipped');
+        }
+      }
     }
 
     return this.deduplicateAssets(assets);

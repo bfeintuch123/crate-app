@@ -515,6 +515,14 @@ function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
   });
 }
 
+function setPresentationUnzipListingFailure(error) {
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind !== 'execFile' || command !== '/usr/bin/unzip') return { stdout: '', stderr: '' };
+    if (args[0] === '-l') throw error;
+    return { stdout: '', stderr: '' };
+  });
+}
+
 function setPowerPointUnzipFixture(mediaEntries) {
   setPresentationUnzipFixture(mediaEntries, 'deck.pptx');
 }
@@ -888,6 +896,70 @@ test('PowerPoint package extraction surfaces per-entry media failures without bl
   }
 });
 
+test('PowerPoint package extraction surfaces archive inspection failures without blocking deck copy', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Inspection Failure');
+    const pptxPath = path.join(tmpRoot, 'Presentation1.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptxPath, Buffer.from('not a zip archive'));
+    setPresentationUnzipListingFailure(new Error(`unzip RAW_STDERR RAW_STDOUT /private/tmp/crate-secret ${tmpRoot}`));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Presentation1.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, [
+      'Could not inspect embedded media in Presentation1.pptx.'
+    ]);
+
+    const errorText = JSON.stringify(result.errors);
+    assert.equal(errorText.includes('RAW_STDERR'), false);
+    assert.equal(errorText.includes('RAW_STDOUT'), false);
+    assert.equal(errorText.includes('unzip'), false);
+    assert.equal(errorText.includes('/private/tmp'), false);
+    assert.equal(errorText.includes(tmpRoot), false);
+
+    const destFolder = packageFolder(outputDir, 'PowerPoint Inspection Failure');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.pptx'), 'utf8'), 'not a zip archive');
+    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — image1.jpeg')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+
+    const manifest = readManifest(outputDir, 'PowerPoint Inspection Failure');
+    assert.equal(manifest.package.copiedCount, 1);
+    assert.equal(manifest.package.embeddedCount, 0);
+    assert.equal(manifest.package.totalFiles, 1);
+    assert.deepEqual(manifest.package.errors, [
+      'Could not inspect embedded media in Presentation1.pptx.'
+    ]);
+    const manifestErrorText = JSON.stringify(manifest.package.errors);
+    assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
+    assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
+    assert.equal(manifestErrorText.includes('/private/tmp'), false);
+    assert.equal(manifestErrorText.includes(tmpRoot), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('PowerPoint provenance stays internal when diagnostic report is disabled', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -1225,6 +1297,70 @@ test('Keynote package extraction surfaces per-entry media failures without block
       'Could not extract embedded media clip-5678.mov from Presentation1.key.'
     ]);
     assert.equal(JSON.stringify(manifest).includes('Data/clip-5678.mov'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction surfaces archive inspection failures without blocking deck copy', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Inspection Failure');
+    const keynotePath = path.join(tmpRoot, 'Presentation1.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('not a zip archive'));
+    setPresentationUnzipListingFailure(new Error(`unzip RAW_STDERR RAW_STDOUT /private/tmp/crate-secret ${tmpRoot}`));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Presentation1.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, [
+      'Could not inspect embedded media in Presentation1.key.'
+    ]);
+
+    const errorText = JSON.stringify(result.errors);
+    assert.equal(errorText.includes('RAW_STDERR'), false);
+    assert.equal(errorText.includes('RAW_STDOUT'), false);
+    assert.equal(errorText.includes('unzip'), false);
+    assert.equal(errorText.includes('/private/tmp'), false);
+    assert.equal(errorText.includes(tmpRoot), false);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Inspection Failure');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.key'), 'utf8'), 'not a zip archive');
+    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — photo.jpeg')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+
+    const manifest = readManifest(outputDir, 'Keynote Inspection Failure');
+    assert.equal(manifest.package.copiedCount, 1);
+    assert.equal(manifest.package.embeddedCount, 0);
+    assert.equal(manifest.package.totalFiles, 1);
+    assert.deepEqual(manifest.package.errors, [
+      'Could not inspect embedded media in Presentation1.key.'
+    ]);
+    const manifestErrorText = JSON.stringify(manifest.package.errors);
+    assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
+    assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
+    assert.equal(manifestErrorText.includes('/private/tmp'), false);
+    assert.equal(manifestErrorText.includes(tmpRoot), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

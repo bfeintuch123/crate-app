@@ -195,8 +195,17 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
 
   // Extract assets
   let assets;
+  let archiveInspectionFailed = false;
   try {
-    assets = await parser.extractAssets(filePath);
+    assets = await parser.extractAssets(filePath, {
+      onInspectionError: (failure) => {
+        archiveInspectionFailed = true;
+        result.assetsMissing.push({
+          path: failure && failure.message ? failure.message : `Could not inspect embedded media in ${path.basename(filePath)}.`,
+          source: failure && failure.source ? failure.source : 'embedded'
+        });
+      }
+    });
   } catch (e) {
     // Parser threw an error (likely a stub)
     throw new Error(`Parser error for ${path.basename(filePath)}: ${e.message}`);
@@ -285,7 +294,7 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   }
 
   // For PowerPoint/Keynote, also extract embedded media if requested
-  if (includeEmbedded && parser.extractToDirectory) {
+  if (includeEmbedded && parser.extractToDirectory && !archiveInspectionFailed) {
     try {
       const embeddedAssets = await parser.extractAssets(filePath);
       const extracted = await parser.extractToDirectory(filePath, outputRoot, embeddedAssets, {

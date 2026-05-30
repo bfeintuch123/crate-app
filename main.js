@@ -5827,6 +5827,11 @@ function formatEmbeddedMediaExtractionFailure(presentationPath, internalPath) {
   return `Could not extract embedded media ${mediaName} from ${presentationName}.`;
 }
 
+function formatEmbeddedMediaInspectionFailure(presentationPath) {
+  const presentationName = safeEmbeddedMediaDisplayName(presentationPath, 'presentation');
+  return `Could not inspect embedded media in ${presentationName}.`;
+}
+
 // Parse a zip entry date from `unzip -l` output (macOS format: MM-DD-YYYY HH:MM)
 // Returns a Date object or null if parsing fails.
 function parseZipEntryDate(dateStr, timeStr) {
@@ -6051,7 +6056,18 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       }
     }
   } catch (e) {
-    console.error(`[crate] Could not inspect embedded media in ${safeEmbeddedMediaDisplayName(presentationPath, 'presentation')}.`);
+    const message = formatEmbeddedMediaInspectionFailure(presentationPath);
+    console.error(`[crate] ${message}`);
+    if (typeof options.onInspectionError === 'function') {
+      try {
+        options.onInspectionError({
+          presentationPath,
+          message,
+        });
+      } catch (callbackErr) {
+        console.warn('[crate] embedded media inspection error callback skipped');
+      }
+    }
   }
 
   return extracted;
@@ -6266,6 +6282,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
             });
           },
           onExtractionError: (failure) => {
+            if (failure && failure.message) errors.push(failure.message);
+          },
+          onInspectionError: (failure) => {
             if (failure && failure.message) errors.push(failure.message);
           },
         });

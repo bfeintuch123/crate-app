@@ -29,6 +29,7 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 };
 
 let unzipFixture = new Map();
+let unzipListingError = null;
 
 function unzipFixtureData(value) {
   if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'data')) {
@@ -73,6 +74,7 @@ execFileStub[nodePromisify.custom] = async (command, args = []) => {
   }
 
   if (args[0] === '-l') {
+    if (unzipListingError) throw unzipListingError;
     return { stdout: unzipListing(), stderr: '' };
   }
 
@@ -442,6 +444,76 @@ test('Quick Package still reports real missing linked filesystem assets', async 
     assert.deepEqual(result.assetsMissing, [{ path: missingPath, source: 'ai-regex' }]);
     assert.equal(fs.readFileSync(path.join(outputDir, 'MissingLinked.ai'), 'utf8'), `%PDF linked asset ${missingPath}`);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package surfaces PowerPoint archive inspection failures without changing result shape', async () => {
+  const tmpRoot = makeTempDir();
+  unzipListingError = new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`);
+  try {
+    const deckPath = path.join(tmpRoot, 'Presentation1.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('not a zip archive'));
+    unzipFixture = new Map();
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['assetsCopied', 'assetsFound', 'assetsMissing', 'files', 'masterFile', 'outputDir'].sort()
+    );
+    assert.equal(result.masterFile, deckPath);
+    assert.equal(result.assetsFound, 0);
+    assert.equal(result.assetsCopied, 0);
+    assert.deepEqual(result.assetsMissing, [{
+      path: 'Could not inspect embedded media in Presentation1.pptx.',
+      source: 'pptx-embedded',
+    }]);
+    assert.equal(fs.readFileSync(path.join(outputDir, 'Presentation1.pptx'), 'utf8'), 'not a zip archive');
+
+    const missingText = JSON.stringify(result.assetsMissing);
+    assert.equal(missingText.includes('RAW_STDERR'), false);
+    assert.equal(missingText.includes('unzip'), false);
+    assert.equal(missingText.includes('/private/tmp'), false);
+    assert.equal(missingText.includes(tmpRoot), false);
+  } finally {
+    unzipListingError = null;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package surfaces Keynote archive inspection failures without changing result shape', async () => {
+  const tmpRoot = makeTempDir();
+  unzipListingError = new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`);
+  try {
+    const deckPath = path.join(tmpRoot, 'Presentation1.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('not a zip archive'));
+    unzipFixture = new Map();
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['assetsCopied', 'assetsFound', 'assetsMissing', 'files', 'masterFile', 'outputDir'].sort()
+    );
+    assert.equal(result.masterFile, deckPath);
+    assert.equal(result.assetsFound, 0);
+    assert.equal(result.assetsCopied, 0);
+    assert.deepEqual(result.assetsMissing, [{
+      path: 'Could not inspect embedded media in Presentation1.key.',
+      source: 'keynote-embedded',
+    }]);
+    assert.equal(fs.readFileSync(path.join(outputDir, 'Presentation1.key'), 'utf8'), 'not a zip archive');
+
+    const missingText = JSON.stringify(result.assetsMissing);
+    assert.equal(missingText.includes('RAW_STDERR'), false);
+    assert.equal(missingText.includes('unzip'), false);
+    assert.equal(missingText.includes('/private/tmp'), false);
+    assert.equal(missingText.includes(tmpRoot), false);
+  } finally {
+    unzipListingError = null;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
