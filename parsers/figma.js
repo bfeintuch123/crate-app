@@ -45,6 +45,79 @@ try {
 const FIGMA_API_BASE = 'https://api.figma.com/v1';
 const TOKEN_FILE_PATH = path.join(os.homedir(), '.crate', 'figma-token');
 
+function figmaParserText(value) {
+  if (value instanceof Error) return value.message || '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch (e) {
+    return String(value);
+  }
+}
+
+function redactFigmaParserText(value) {
+  return figmaParserText(value)
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    .replace(/\b(?:Authorization|X-Figma-Token)\b\s*[:=]?\s*(?:Bearer\s+)?[^\s,;)]+/gi, '[redacted-credential]')
+    .replace(/\b(?:Cookie|Set-Cookie)\b\s*[:=]?\s*[^\s,;)]+/gi, '[redacted-credential]')
+    .replace(/\bBearer\s+[^\s,;)]+/gi, '[redacted-credential]')
+    .replace(/\b(?:token|access_token|auth|sig|signature|client_secret|secret|key|cookie)\b\s*[:=]\s*[^\s,;)]+/gi, '[redacted-credential]')
+    .replace(/[A-Za-z0-9._-]*(?:token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var|\/tmp)\/[^\s"'<>),]+/g, '[redacted-path]');
+}
+
+function formatFigmaParserScalar(value, fallback = 'unknown') {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  const redacted = redactFigmaParserText(value.trim());
+  if (redacted.includes('[redacted')) return fallback;
+  const safe = redacted.replace(/[^\w:.-]/g, '_').slice(0, 120);
+  return safe || fallback;
+}
+
+function redactFigmaParserIssue(value) {
+  if (value && typeof value === 'object' && !(value instanceof Error)) {
+    return {
+      ...value,
+      ...(value.message != null ? { message: redactFigmaParserText(value.message) } : {}),
+      ...(value.error != null ? { error: redactFigmaParserText(value.error) } : {}),
+      ...(value.warning != null ? { warning: redactFigmaParserText(value.warning) } : {})
+    };
+  }
+  return redactFigmaParserText(value);
+}
+
+function redactFigmaParserIssues(values) {
+  return (Array.isArray(values) ? values : [values])
+    .filter(value => value !== undefined && value !== null)
+    .map(redactFigmaParserIssue);
+}
+
+function figmaEndpointCategory(endpoint) {
+  const pathOnly = String(endpoint || '').split('?')[0];
+  if (pathOnly === '/me') return 'user profile';
+  if (/^\/files\/[^/]+\/metadata$/.test(pathOnly)) return 'file metadata';
+  if (/^\/files\/[^/]+\/images$/.test(pathOnly)) return 'file images';
+  if (/^\/files\/[^/]+$/.test(pathOnly)) return 'file';
+  if (/^\/images\/[^/]+$/.test(pathOnly)) return 'rendered images';
+  if (/^\/teams\/[^/]+\/projects$/.test(pathOnly)) return 'team projects';
+  if (/^\/teams\/[^/]+$/.test(pathOnly)) return 'team';
+  if (/^\/projects\/[^/]+\/files$/.test(pathOnly)) return 'project files';
+  return 'request';
+}
+
+function figmaApiFailureMessage(endpoint, status = null, detail = null) {
+  const parts = [figmaEndpointCategory(endpoint)];
+  if (Number.isInteger(status)) parts.push(`status ${status}`);
+  if (detail) parts.push(redactFigmaParserText(detail));
+  return `Figma API request failed (${parts.join(', ')})`;
+}
+
+function safeFigmaParserError(message) {
+  const error = new Error(message);
+  error._crateFigmaParserSafe = true;
+  return error;
+}
+
 class FigmaParser extends BaseParser {
   /**
    * Figma-specific dedupe.
@@ -146,13 +219,13 @@ class FigmaParser extends BaseParser {
       try {
         fs.chmodSync(dir, 0o700);
       } catch (chmodDirError) {
-        console.warn(`[crate][figma] could not harden token directory permissions: ${chmodDirError.message}`);
+        console.warn(`[crate][figma] could not harden token directory permissions: ${redactFigmaParserText(chmodDirError.message)}`);
       }
       fs.writeFileSync(TOKEN_FILE_PATH, token, { mode: 0o600 });
       fs.chmodSync(TOKEN_FILE_PATH, 0o600);
       return true;
     } catch (e) {
-      console.warn(`[crate][figma] could not store token securely: ${e.message}`);
+      console.warn(`[crate][figma] could not store token securely: ${redactFigmaParserText(e.message)}`);
       return false;
     }
   }
@@ -351,23 +424,30 @@ class FigmaParser extends BaseParser {
       if (!response.ok) {
         const status = response.status;
         if (status === 401) {
-          throw new Error('Invalid Figma API token. Please check your Personal Access Token.');
+          throw safeFigmaParserError('Invalid Figma API token. Please check your Personal Access Token.');
         } else if (status === 403) {
-          throw new Error('Access denied. You may not have permission to view this Figma file.');
+          throw safeFigmaParserError('Access denied. You may not have permission to view this Figma file.');
         } else if (status === 404) {
-          throw new Error('Figma file not found. Check that the file URL is correct and the file still exists.');
+          throw safeFigmaParserError('Figma file not found. Check that the file URL is correct and the file still exists.');
         } else if (status === 429) {
-          throw new Error('Rate limit exceeded. Please wait a moment and try again.');
+          throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.');
         } else {
-          throw new Error(`Figma API error: ${status} ${response.statusText}`);
+          throw safeFigmaParserError(figmaApiFailureMessage(endpoint, status));
         }
       }
 
-      return response.json();
+      try {
+        return await response.json();
+      } catch (e) {
+        throw safeFigmaParserError(figmaApiFailureMessage(endpoint));
+      }
     } catch (e) {
       clearTimeout(timeoutId);
-      if (e.name === 'AbortError') throw new Error('Figma API request timed out after 30s');
-      throw e;
+      if (e && e.name === 'AbortError') {
+        throw safeFigmaParserError(figmaApiFailureMessage(endpoint, null, 'timed out after 30s'));
+      }
+      if (e && e._crateFigmaParserSafe) throw e;
+      throw safeFigmaParserError(figmaApiFailureMessage(endpoint));
     }
   }
 
@@ -540,6 +620,20 @@ class FigmaParser extends BaseParser {
     return chunks;
   }
 
+  _figmaExtractionResult({ assets = [], errors = [], warnings = [], scope }) {
+    const safeScope = scope ? {
+      ...scope,
+      warning: scope.warning ? redactFigmaParserText(scope.warning) : scope.warning
+    } : scope;
+
+    return {
+      assets,
+      errors: redactFigmaParserIssues(errors),
+      warnings: redactFigmaParserIssues(warnings),
+      scope: safeScope
+    };
+  }
+
   /**
    * Extract the file key from a Figma URL.
    *
@@ -707,7 +801,7 @@ class FigmaParser extends BaseParser {
         }
       };
     } catch (e) {
-      return { valid: false, error: e.message };
+      return { valid: false, error: redactFigmaParserText(e.message) };
     }
   }
 
@@ -810,7 +904,10 @@ class FigmaParser extends BaseParser {
           teamName: 'Manual'
         };
       } catch (e) {
-        console.error(`[crate][figma] getFileMetadata error for ${fileKey}:`, e.message);
+        console.error(
+          `[crate][figma] getFileMetadata error for ${formatFigmaParserScalar(fileKey)}:`,
+          redactFigmaParserText(e.message)
+        );
         return null;
       }
     }
@@ -895,10 +992,11 @@ class FigmaParser extends BaseParser {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
           teamName = teamData.name || teamName;
         } catch (e) {
-          const hint = e.message.toLowerCase().includes('not found')
+          const safeMessage = redactFigmaParserText(e.message);
+          const hint = figmaParserText(e).toLowerCase().includes('not found')
             ? 'Team not found or not accessible via API. If this is a personal workspace, paste a direct Figma file URL instead.'
-            : e.message;
-          const msg = `Cannot access team ${teamId}: ${hint}`;
+            : safeMessage;
+          const msg = `Cannot access team ${formatFigmaParserScalar(teamId)}: ${hint}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
           continue;
@@ -909,7 +1007,7 @@ class FigmaParser extends BaseParser {
           const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
           projects = projectsData.projects || [];
         } catch (e) {
-          const msg = `Cannot list projects for team ${teamId} (${teamName}): ${e.message}`;
+          const msg = `Cannot list projects for team ${formatFigmaParserScalar(teamId)} (${redactFigmaParserText(teamName)}): ${redactFigmaParserText(e.message)}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
           continue;
@@ -941,7 +1039,7 @@ class FigmaParser extends BaseParser {
               }
             }
           } catch (e) {
-            errors.push(`Error listing files in project ${project.name}: ${e.message}`);
+            errors.push(`Error listing files in project ${redactFigmaParserText(project.name)}: ${redactFigmaParserText(e.message)}`);
           }
         }
       }
@@ -958,7 +1056,7 @@ class FigmaParser extends BaseParser {
             discoverySource: 'tracked'
           });
           console.log(
-            `[crate][figma] tracked file ${fileKey}: lastModifiedMs=${meta.lastModifiedMs} included=yes reason=direct-tracked authoritative`
+            `[crate][figma] tracked file ${formatFigmaParserScalar(fileKey)}: lastModifiedMs=${meta.lastModifiedMs} included=yes reason=direct-tracked authoritative`
           );
           continue;
         }
@@ -976,9 +1074,9 @@ class FigmaParser extends BaseParser {
           isTracked: true,
           discoverySource: 'tracked'
         });
-        errors.push(`Metadata fetch failed for tracked file ${fileKey}; proceeding to extraction anyway.`);
+        errors.push(`Metadata fetch failed for tracked file ${formatFigmaParserScalar(fileKey)}; proceeding to extraction anyway.`);
         console.log(
-          `[crate][figma] tracked file ${fileKey}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
+          `[crate][figma] tracked file ${formatFigmaParserScalar(fileKey)}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
         );
       }
 
@@ -993,11 +1091,11 @@ class FigmaParser extends BaseParser {
         return bLastModified - aLastModified;
       });
 
-      return { recentFiles, errors };
+      return { recentFiles, errors: redactFigmaParserIssues(errors) };
     } catch (e) {
-      console.error('[crate][figma] discoverRecentFiles error:', e.message);
-      errors.push(`discoverRecentFiles failed: ${e.message}`);
-      return { recentFiles, errors };
+      console.error('[crate][figma] discoverRecentFiles error:', redactFigmaParserText(e.message));
+      errors.push(`discoverRecentFiles failed: ${redactFigmaParserText(e.message)}`);
+      return { recentFiles, errors: redactFigmaParserIssues(errors) };
     }
   }
 
@@ -1011,7 +1109,7 @@ class FigmaParser extends BaseParser {
   async extractAssetsFromFileKey(fileKey, scopeEntry = null) {
     const token = await this.getStoredToken();
     if (!token || !fetch) {
-      return {
+      return this._figmaExtractionResult({
         assets: [],
         errors: ["No token or fetch available"],
         warnings: [],
@@ -1022,7 +1120,7 @@ class FigmaParser extends BaseParser {
           lockedPageName: null,
           warning: null
         }
-      };
+      });
     }
 
     try {
@@ -1036,10 +1134,10 @@ class FigmaParser extends BaseParser {
       const scopedRoot = scope.rootNode || fileData.document;
 
       if (scope.warning) {
-        warnings.push(scope.warning);
+        warnings.push(redactFigmaParserText(scope.warning));
       }
       if (scope.scopeMode === 'current-page' && scope.lockStatus !== 'locked') {
-        return {
+        return this._figmaExtractionResult({
           assets: [],
           errors,
           warnings,
@@ -1050,7 +1148,7 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             warning: scope.warning
           }
-        };
+        });
       }
 
       // Primary path: recover original placed image-fill assets via imageRef mapping
@@ -1063,8 +1161,8 @@ class FigmaParser extends BaseParser {
       }
       const imageRefList = Array.from(imageRefs);
       console.log(
-        `[crate][figma] extractAssetsFromFileKey ${fileKey}: imageRefs found (${imageRefList.length})` +
-        `${imageRefList.length > 0 ? `: ${imageRefList.join(', ')}` : ''}`
+        `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: imageRefs found (${imageRefList.length})` +
+        `${imageRefList.length > 0 ? `: ${imageRefList.map(ref => formatFigmaParserScalar(ref)).join(', ')}` : ''}`
       );
 
       if (imageRefs.size > 0) {
@@ -1102,22 +1200,22 @@ class FigmaParser extends BaseParser {
             });
           }
           console.log(
-            `[crate][figma] extractAssetsFromFileKey ${fileKey}: image URLs resolved (${resolvedImageRefs.length})` +
-            `${resolvedImageRefs.length > 0 ? ` for imageRefs: ${resolvedImageRefs.join(', ')}` : ''}`
+            `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: image URLs resolved (${resolvedImageRefs.length})` +
+            `${resolvedImageRefs.length > 0 ? ` for imageRefs: ${resolvedImageRefs.map(ref => formatFigmaParserScalar(ref)).join(', ')}` : ''}`
           );
         } catch (err) {
-          errors.push(`Image-fill recovery failed for ${fileKey}: ${err.message}`);
+          errors.push(`Image-fill recovery failed for ${formatFigmaParserScalar(fileKey)}: ${redactFigmaParserText(err.message)}`);
         }
       }
 
       if (assets.length > 0) {
         const dedupedAssets = this.deduplicateFigmaAssets(assets);
         console.log(
-          `[crate][figma] extractAssetsFromFileKey ${fileKey}: image-fill pipeline counts ` +
+          `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: image-fill pipeline counts ` +
           `resolved=${assets.length} deduped=${dedupedAssets.length} passed_to_ingestion=${dedupedAssets.length}`
         );
-        console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=no`);
-        return {
+        console.log(`[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback rendered-node path used=no`);
+        return this._figmaExtractionResult({
           assets: dedupedAssets,
           errors,
           warnings,
@@ -1128,7 +1226,7 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             warning: scope.warning
           }
-        };
+        });
       }
 
       // Fallback path: node render exports (legacy behavior)
@@ -1136,7 +1234,7 @@ class FigmaParser extends BaseParser {
       const nodeNames = {};
       this._findImageNodes(scopedRoot, imageNodeIds, nodeNames);
       if (imageNodeIds.length === 0) {
-        return {
+        return this._figmaExtractionResult({
           assets: [],
           errors,
           warnings,
@@ -1147,10 +1245,10 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             warning: scope.warning
           }
-        };
+        });
       }
 
-      console.log(`[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback rendered-node path used=yes`);
+      console.log(`[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback rendered-node path used=yes`);
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -1179,16 +1277,16 @@ class FigmaParser extends BaseParser {
             }
           }
         } catch (err) {
-          errors.push("Batch image export failed for " + fileKey + ": " + err.message);
+          errors.push(`Batch image export failed for ${formatFigmaParserScalar(fileKey)}: ${redactFigmaParserText(err.message)}`);
         }
       }
 
       const dedupedFallbackAssets = this.deduplicateFigmaAssets(assets);
       console.log(
-        `[crate][figma] extractAssetsFromFileKey ${fileKey}: fallback pipeline counts ` +
+        `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback pipeline counts ` +
         `resolved=${assets.length} deduped=${dedupedFallbackAssets.length} passed_to_ingestion=${dedupedFallbackAssets.length}`
       );
-      return {
+      return this._figmaExtractionResult({
         assets: dedupedFallbackAssets,
         errors,
         warnings,
@@ -1199,12 +1297,12 @@ class FigmaParser extends BaseParser {
           lockedPageName: scope.lockedPageName,
           warning: scope.warning
         }
-      };
+      });
     } catch (e) {
-      console.error('[crate][figma] extractAssetsFromFileKey error:', e.message);
-      return {
+      console.error('[crate][figma] extractAssetsFromFileKey error:', redactFigmaParserText(e.message));
+      return this._figmaExtractionResult({
         assets: [],
-        errors: [e.message],
+        errors: [redactFigmaParserText(e.message)],
         warnings: [],
         scope: {
           scopeMode: scopeEntry && scopeEntry.scopeMode === 'current-page' ? 'current-page' : 'entire-file',
@@ -1213,7 +1311,7 @@ class FigmaParser extends BaseParser {
           lockedPageName: null,
           warning: null
         }
-      };
+      });
     }
   }
 
@@ -1264,7 +1362,7 @@ class FigmaParser extends BaseParser {
     // Handle both old array format and new {recentFiles, errors} format
     const files = Array.isArray(discovery) ? discovery : (discovery.recentFiles || []);
     if (discovery.errors && discovery.errors.length > 0) {
-      result.errors.push(...discovery.errors);
+      result.errors.push(...redactFigmaParserIssues(discovery.errors));
     }
 
     const trackedFiles = files.filter(file => file.isTracked);
@@ -1273,15 +1371,15 @@ class FigmaParser extends BaseParser {
     result.files = [...trackedFiles, ...cappedNonTrackedFiles];
     console.log(
       `[crate][figma] autoTrackScan final file keys scanned (${result.files.length}): ` +
-      `${result.files.map(file => file.key).join(', ')}`
+      `${result.files.map(file => formatFigmaParserScalar(file.key)).join(', ')}`
     );
 
     // Extract assets from each file
     for (const file of result.files) {
       try {
         const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntriesByKey.get(file.key) || null);
-        if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...extractResult.errors); }
-        if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...extractResult.warnings); }
+        if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...redactFigmaParserIssues(extractResult.errors)); }
+        if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...redactFigmaParserIssues(extractResult.warnings)); }
         if (extractResult.scope) {
           result.scopeEntries.push({
             fileKey: file.key,
@@ -1290,7 +1388,7 @@ class FigmaParser extends BaseParser {
             lockStatus: extractResult.scope.lockStatus,
             lockedPageId: extractResult.scope.lockedPageId,
             lockedPageName: extractResult.scope.lockedPageName,
-            warning: extractResult.scope.warning || null
+            warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null
           });
         }
         for (const asset of extractResult.assets) {
@@ -1299,10 +1397,12 @@ class FigmaParser extends BaseParser {
           result.assets.push(asset);
         }
       } catch (e) {
-        result.errors.push(`Error extracting from ${file.name}: ${e.message}`);
+        result.errors.push(`Error extracting from ${redactFigmaParserText(file.name)}: ${redactFigmaParserText(e.message)}`);
       }
     }
 
+    result.errors = redactFigmaParserIssues(result.errors);
+    result.warnings = redactFigmaParserIssues(result.warnings);
     return result;
   }
 }
