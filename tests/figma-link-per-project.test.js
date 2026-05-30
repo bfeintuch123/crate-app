@@ -856,6 +856,109 @@ test('Figma asset cache directories and downloaded files are owner-only where su
   }
 });
 
+test('Figma asset cache rejects symlinked cache root without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_FIGMA_ROOT_TARGET');
+  fs.mkdirSync(symlinkTarget, { recursive: true });
+  fs.symlinkSync(symlinkTarget, crateDir, 'dir');
+
+  const project = await createLinkedFigmaProject('Figma Symlink Root Cache');
+  setFigmaDownloadResponse('figma symlink root bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/symlink-root.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-symlink-root',
+    imageRef: 'img-symlink-root',
+    name: 'Symlink Root',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const { output } = await captureConsole(async () => {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
+  assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+  assert.equal(output.includes(symlinkTarget), false);
+  assert.equal(output.includes('SHOULD_NOT_APPEAR_FIGMA_ROOT_TARGET'), false);
+});
+
+test('Figma asset cache rejects symlinked category directory without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const assetsDir = path.join(crateDir, 'figma-assets');
+  const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_FIGMA_CATEGORY_TARGET');
+  fs.mkdirSync(crateDir, { recursive: true });
+  fs.mkdirSync(symlinkTarget, { recursive: true });
+  fs.symlinkSync(symlinkTarget, assetsDir, 'dir');
+
+  const project = await createLinkedFigmaProject('Figma Symlink Category Cache');
+  setFigmaDownloadResponse('figma symlink category bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/symlink-category.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-symlink-category',
+    imageRef: 'img-symlink-category',
+    name: 'Symlink Category',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const { output } = await captureConsole(async () => {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
+  assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+  assert.equal(output.includes(symlinkTarget), false);
+  assert.equal(output.includes('SHOULD_NOT_APPEAR_FIGMA_CATEGORY_TARGET'), false);
+});
+
+test('Figma asset cache rejects symlinked project directory without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const project = await createLinkedFigmaProject('Figma Symlink Project Cache');
+  const assetsDir = path.join(TEST_HOME, '.crate', 'figma-assets');
+  const projectDir = path.join(assetsDir, project.id);
+  const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_FIGMA_PROJECT_TARGET');
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.mkdirSync(symlinkTarget, { recursive: true });
+  fs.symlinkSync(symlinkTarget, projectDir, 'dir');
+
+  setFigmaDownloadResponse('figma symlink project bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/symlink-project.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-symlink-project',
+    imageRef: 'img-symlink-project',
+    name: 'Symlink Project',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const { output } = await captureConsole(async () => {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
+  assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+  assert.equal(output.includes(symlinkTarget), false);
+  assert.equal(output.includes('SHOULD_NOT_APPEAR_FIGMA_PROJECT_TARGET'), false);
+});
+
 test('Figma asset format extensions are allowlisted and stay inside the cache directory', async () => {
   const project = await createLinkedFigmaProject('Figma Format Sanitization');
   setFigmaDownloadResponse('format asset bytes');

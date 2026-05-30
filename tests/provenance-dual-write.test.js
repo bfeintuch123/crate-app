@@ -717,6 +717,140 @@ test('presentation scan-on-save hardens existing permissive cache directories an
   }
 });
 
+test('presentation scan-on-save rejects symlinked cache root without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Symlink Root Cache');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = presentationCachePaths(project.id);
+    const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET');
+    fs.mkdirSync(symlinkTarget, { recursive: true });
+    fs.symlinkSync(symlinkTarget, paths.crateDir, 'dir');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('PRESENTATION_SYMLINK_ROOT_BYTES'.repeat(40)),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      await new Promise(resolve => originalSetTimeout(resolve, 2600));
+      return getProject(project.id);
+    });
+
+    const fresh = captured.result;
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+    assert.equal(captured.output.includes(symlinkTarget), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    resetPresentationCacheRoot();
+  }
+});
+
+test('presentation scan-on-save rejects symlinked category cache directory without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Symlink Category Cache');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = presentationCachePaths(project.id);
+    const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET');
+    fs.mkdirSync(paths.crateDir, { recursive: true });
+    fs.mkdirSync(symlinkTarget, { recursive: true });
+    fs.symlinkSync(symlinkTarget, paths.assetsDir, 'dir');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('PRESENTATION_SYMLINK_CATEGORY_BYTES'.repeat(40)),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      await new Promise(resolve => originalSetTimeout(resolve, 2600));
+      return getProject(project.id);
+    });
+
+    const fresh = captured.result;
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+    assert.equal(captured.output.includes(symlinkTarget), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    resetPresentationCacheRoot();
+  }
+});
+
+test('presentation scan-on-save rejects symlinked project cache directory without leaking target path', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Symlink Project Cache');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = presentationCachePaths(project.id);
+    const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET');
+    fs.mkdirSync(paths.assetsDir, { recursive: true });
+    fs.mkdirSync(symlinkTarget, { recursive: true });
+    fs.symlinkSync(symlinkTarget, paths.projectDir, 'dir');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('PRESENTATION_SYMLINK_PROJECT_BYTES'.repeat(40)),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      await new Promise(resolve => originalSetTimeout(resolve, 2600));
+      return getProject(project.id);
+    });
+
+    const fresh = captured.result;
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.deepEqual(fs.readdirSync(symlinkTarget), []);
+    assert.equal(captured.output.includes(symlinkTarget), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    resetPresentationCacheRoot();
+  }
+});
+
 test('PowerPoint package extraction records deterministic media provenance and diagnostics graph', async () => {
   const tmpRoot = makeTempDir();
   try {
