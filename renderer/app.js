@@ -2,6 +2,10 @@
 const MAX_PROJECTS = 7;
 const MAX_VISIBLE_FILES = 4;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
+const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
+const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
+const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
+const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
 
 // ===== State =====
 let state = {
@@ -43,6 +47,30 @@ function isPresentationWorkflow(project) {
   if (!project) return false;
   if (project.type === 'presentation') return true;
   return (project.files || []).some(file => PRESENTATION_FILE_EXTS.has(getFileExtension(file)));
+}
+
+function sanitizePackageFolderName(rawName, fallbackName = DEFAULT_PACKAGE_FOLDER_NAME) {
+  let fallback = `${fallbackName || DEFAULT_PACKAGE_FOLDER_NAME}`
+    .replace(UNSAFE_PACKAGE_FOLDER_CHARS, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!fallback || fallback === '.' || fallback === '..') fallback = DEFAULT_PACKAGE_FOLDER_NAME;
+
+  let name = `${rawName || ''}`
+    .replace(UNSAFE_PACKAGE_FOLDER_CHARS, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (name.startsWith('..')) name = name.replace(/^\.+/, '').trim();
+  if (!name || name === '.' || name === '..') name = fallback;
+  if (name.length > MAX_PACKAGE_FOLDER_NAME_LENGTH) {
+    name = name.slice(0, MAX_PACKAGE_FOLDER_NAME_LENGTH).trim();
+  }
+  return name || fallback;
+}
+
+function sanitizeNamingTemplate(rawTemplate) {
+  return sanitizePackageFolderName(rawTemplate, DEFAULT_NAMING_TEMPLATE);
 }
 
 // ===== DOM Helpers =====
@@ -228,7 +256,7 @@ function showNewProjectForm() {
   // Update template display from current settings
   const templateDisplay = $('#naming-template-display');
   if (templateDisplay) {
-    templateDisplay.textContent = state.settings.namingTemplate || '{Project}_{Date}';
+    templateDisplay.textContent = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   }
 
   updateNamingPreview();
@@ -301,16 +329,18 @@ function setFigmaSectionExpanded(expanded) {
 
 // ===== Naming Preview =====
 function cleanName(s) {
-  const cleaned = s.replace(/[^a-zA-Z0-9 ._\-()]/g, '').replace(/\s+/g, ' ').trim();
-  return cleaned || 'Untitled';
+  const cleaned = `${s || ''}`.replace(/[^a-zA-Z0-9 ._\-()]/g, '').replace(/\s+/g, ' ').trim();
+  if (cleaned === '.' || cleaned === '..') return DEFAULT_PACKAGE_FOLDER_NAME;
+  return cleaned || DEFAULT_PACKAGE_FOLDER_NAME;
 }
 
 function resolveNamingTemplate(template, name) {
   const dateStr = new Date().toISOString().split('T')[0];
   // Use the full project name — no client/project splitting.
-  return template
+  const folderName = sanitizeNamingTemplate(template)
     .replace('{Project}', cleanName(name || 'Project'))
     .replace('{Date}', dateStr);
+  return sanitizePackageFolderName(folderName);
 }
 
 function getProjectFigmaScopeMode(project) {
@@ -346,7 +376,7 @@ function getProjectFigmaWarning(project) {
 }
 
 function updateNamingPreview() {
-  const template = state.settings.namingTemplate || '{Project}_{Date}';
+  const template = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   const input = $('#input-project-name');
   const name = input ? input.value.trim() : '';
   const preview = resolveNamingTemplate(template, name);
@@ -594,7 +624,7 @@ async function renderSettings() {
   state.settings = await window.crate.getSettings();
   state.usage = await window.crate.getUsage();
 
-  $('#input-naming-template').value = state.settings.namingTemplate;
+  $('#input-naming-template').value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   $('#toggle-notifications').checked = state.settings.notifications || false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
@@ -920,10 +950,13 @@ function setupEventListeners() {
   // Settings
   $('#input-naming-template').addEventListener('input', updateSettingsNamingPreview);
 
-  $('#input-naming-template').addEventListener('change', () => {
-    const template = $('#input-naming-template').value;
-    window.crate.updateSetting('namingTemplate', template);
-    state.settings.namingTemplate = template;
+  $('#input-naming-template').addEventListener('change', async () => {
+    const input = $('#input-naming-template');
+    const template = input.value;
+    const updatedSettings = await window.crate.updateSetting('namingTemplate', template);
+    state.settings = updatedSettings || state.settings;
+    input.value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
+    updateSettingsNamingPreview();
   });
 
   $('#toggle-notifications').addEventListener('change', () => {
