@@ -2726,12 +2726,19 @@ function ensureOwnerOnlyDirectory(dirPath, mode = OWNER_ONLY_DIR_MODE) {
 
 function hardenOwnerOnlyFile(filePath, mode = OWNER_ONLY_FILE_MODE) {
   if (process.platform === 'win32') return;
+  let fd = null;
   try {
-    if (!fs.lstatSync(filePath).isFile()) return;
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(filePath, flags);
+    if (!fs.fstatSync(fd).isFile()) return;
+    fs.fchmodSync(fd, mode);
   } catch (_) {
-    return;
+    // Best effort: the file may have disappeared or the filesystem may not support fchmod.
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
   }
-  hardenOwnerOnlyPermissions(filePath, mode);
 }
 
 function writeOwnerOnlyFileSync(filePath, data, options = {}, mode = OWNER_ONLY_FILE_MODE) {
@@ -2739,16 +2746,91 @@ function writeOwnerOnlyFileSync(filePath, data, options = {}, mode = OWNER_ONLY_
   hardenOwnerOnlyFile(filePath, mode);
 }
 
+function cacheSafetyError(label, detail) {
+  const safeLabel = String(label || 'cache').replace(/[^a-z0-9_.:-]/gi, '_');
+  const safeDetail = String(detail || 'unsafe').replace(/[^a-z0-9_.:-]/gi, '_');
+  return new Error(`Unsafe cache path: ${safeLabel} ${safeDetail}`);
+}
+
+function safeRealpath(cachePath, label) {
+  try {
+    return fs.realpathSync.native(cachePath);
+  } catch (_) {
+    throw cacheSafetyError(label, 'unavailable');
+  }
+}
+
+function ensureSafeCacheSegment(segment, label) {
+  if (typeof segment !== 'string' || !segment || segment.includes('\0')) {
+    throw cacheSafetyError(label, 'invalid');
+  }
+  if (segment === '.' || segment === '..' || path.basename(segment) !== segment) {
+    throw cacheSafetyError(label, 'invalid');
+  }
+  return segment;
+}
+
+function ensureSafeCacheDirectory(dirPath, label, mode = OWNER_ONLY_DIR_MODE, parentRealPath = null) {
+  let stat = null;
+  try {
+    stat = fs.lstatSync(dirPath);
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') throw cacheSafetyError(label, 'unavailable');
+  }
+
+  if (stat) {
+    if (stat.isSymbolicLink()) throw cacheSafetyError(label, 'symlink');
+    if (!stat.isDirectory()) throw cacheSafetyError(label, 'not_directory');
+  } else {
+    try {
+      fs.mkdirSync(dirPath, { mode });
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') throw cacheSafetyError(label, 'unavailable');
+    }
+    try {
+      stat = fs.lstatSync(dirPath);
+    } catch (_) {
+      throw cacheSafetyError(label, 'unavailable');
+    }
+    if (stat.isSymbolicLink()) throw cacheSafetyError(label, 'symlink');
+    if (!stat.isDirectory()) throw cacheSafetyError(label, 'not_directory');
+  }
+
+  hardenOwnerOnlyPermissions(dirPath, mode);
+  const realPath = safeRealpath(dirPath, label);
+  if (parentRealPath && !isPathInsideDirectory(parentRealPath, realPath)) {
+    throw cacheSafetyError(label, 'outside_root');
+  }
+  return realPath;
+}
+
+function ensureSafeLocalCacheDir(category, projectId = null, mode = OWNER_ONLY_DIR_MODE) {
+  const safeCategory = ensureSafeCacheSegment(category, 'cache-category');
+  const crateDir = path.join(os.homedir(), '.crate');
+  const crateRealPath = ensureSafeCacheDirectory(crateDir, 'cache-root', mode);
+  const categoryDir = path.join(crateDir, safeCategory);
+  const categoryRealPath = ensureSafeCacheDirectory(categoryDir, safeCategory, mode, crateRealPath);
+  if (projectId == null) return { crateDir, categoryDir, projectDir: null };
+
+  const safeProjectId = ensureSafeCacheSegment(projectId, 'cache-project');
+  const projectDir = path.join(categoryDir, safeProjectId);
+  ensureSafeCacheDirectory(projectDir, `${safeCategory}-project`, mode, categoryRealPath);
+  return { crateDir, categoryDir, projectDir };
+}
+
 function ensureFigmaAssetsDir() {
-  ensureOwnerOnlyDirectory(path.dirname(FIGMA_ASSETS_DIR));
-  ensureOwnerOnlyDirectory(FIGMA_ASSETS_DIR);
+  ensureSafeLocalCacheDir('figma-assets', null, FIGMA_ASSET_DIR_MODE);
   return FIGMA_ASSETS_DIR;
 }
 
+function ensureFigmaProjectAssetsDir(projectId) {
+  const paths = ensureSafeLocalCacheDir('figma-assets', projectId, FIGMA_ASSET_DIR_MODE);
+  return paths.projectDir;
+}
+
 function ensurePresentationAssetsDir(projectId) {
-  ensureOwnerOnlyDirectory(path.dirname(PRESENTATION_ASSETS_DIR), PRESENTATION_ASSET_DIR_MODE);
-  ensureOwnerOnlyDirectory(PRESENTATION_ASSETS_DIR, PRESENTATION_ASSET_DIR_MODE);
-  return ensureOwnerOnlyDirectory(path.join(PRESENTATION_ASSETS_DIR, projectId), PRESENTATION_ASSET_DIR_MODE);
+  const paths = ensureSafeLocalCacheDir('presentation-assets', projectId, PRESENTATION_ASSET_DIR_MODE);
+  return paths.projectDir;
 }
 
 function isPathInsideDirectory(parentDir, filePath) {
@@ -2757,8 +2839,56 @@ function isPathInsideDirectory(parentDir, filePath) {
   return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
+function ensureRegularCacheFile(filePath, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return null;
+    throw cacheSafetyError(label, 'unavailable');
+  }
+  if (stat.isSymbolicLink()) throw cacheSafetyError(label, 'symlink');
+  if (!stat.isFile()) throw cacheSafetyError(label, 'not_file');
+  return stat;
+}
+
+function safeCacheTempPath(filePath) {
+  const dir = path.dirname(filePath);
+  const ext = path.extname(filePath);
+  const base = path.basename(filePath, ext);
+  return path.join(dir, `.${base}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp${ext}`);
+}
+
+function writeOwnerOnlyCacheFileSync(filePath, data, cacheDir, mode = OWNER_ONLY_FILE_MODE, options = {}) {
+  if (!isPathInsideDirectory(cacheDir, filePath)) throw cacheSafetyError('cache-file', 'outside_root');
+  const existing = ensureRegularCacheFile(filePath, 'cache-file');
+  if (existing && !options.replace) throw cacheSafetyError('cache-file', 'exists');
+
+  const tempPath = options.replace ? safeCacheTempPath(filePath) : filePath;
+  try {
+    fs.writeFileSync(tempPath, data, { flag: 'wx', mode });
+    hardenOwnerOnlyFile(tempPath, mode);
+    if (options.replace) {
+      ensureRegularCacheFile(filePath, 'cache-file');
+      fs.renameSync(tempPath, filePath);
+      hardenOwnerOnlyFile(filePath, mode);
+    }
+  } catch (e) {
+    if (tempPath !== filePath) {
+      try { fs.unlinkSync(tempPath); } catch (_) {}
+    }
+    if (e && e.message && e.message.startsWith('Unsafe cache path:')) throw e;
+    throw cacheSafetyError('cache-file', 'write_failed');
+  }
+}
+
 function hardenPresentationCacheFileIfPresent(filePath, cacheDir) {
   if (!isPathInsideDirectory(cacheDir, filePath)) return;
+  try {
+    ensureRegularCacheFile(filePath, 'presentation-cache-file');
+  } catch (_) {
+    return;
+  }
   hardenOwnerOnlyFile(filePath, PRESENTATION_ASSET_FILE_MODE);
 }
 
@@ -2784,11 +2914,7 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
     const buffer = await response.buffer();
     if (buffer.length === 0) return null;
 
-    ensureFigmaAssetsDir();
-
-    // Create project-specific subdir
-    const projectDir = path.join(FIGMA_ASSETS_DIR, projectId);
-    ensureOwnerOnlyDirectory(projectDir);
+    const projectDir = ensureFigmaProjectAssetsDir(projectId);
 
     // v2.4.2: Use actual format from Figma API if available, fall back to png
     const ext = sanitizeFigmaAssetFormat(format);
@@ -2796,16 +2922,16 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
     const localPath = path.join(projectDir, `${safeName}.${ext}`);
 
     // Skip if already exists with same size
-    if (fs.existsSync(localPath)) {
-      const existingSize = fs.statSync(localPath).size;
+    const existingStat = ensureRegularCacheFile(localPath, 'figma-cache-file');
+    if (existingStat) {
+      const existingSize = existingStat.size;
       if (existingSize === buffer.length) {
-        hardenOwnerOnlyPermissions(localPath, FIGMA_ASSET_FILE_MODE);
+        hardenOwnerOnlyFile(localPath, FIGMA_ASSET_FILE_MODE);
         return localPath;
       }
     }
 
-    fs.writeFileSync(localPath, buffer, { mode: FIGMA_ASSET_FILE_MODE });
-    hardenOwnerOnlyPermissions(localPath, FIGMA_ASSET_FILE_MODE);
+    writeOwnerOnlyCacheFileSync(localPath, buffer, projectDir, FIGMA_ASSET_FILE_MODE, { replace: !!existingStat });
     console.log(`[crate][figma] downloaded asset: ${formatFigmaLocalNameForLog(localPath)}`);
     return localPath;
   } catch (e) {
@@ -2821,7 +2947,6 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
 async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextLabel = 'scan') {
   if (!assets || assets.length === 0) return 0;
 
-  ensureFigmaAssetsDir();
   const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
   const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
   let addedCount = 0;
@@ -4362,7 +4487,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
           counter++;
         }
 
-        writeOwnerOnlyFileSync(destPath, data, { flag: 'wx' }, PRESENTATION_ASSET_FILE_MODE);
+        writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
         newEntries.push({
