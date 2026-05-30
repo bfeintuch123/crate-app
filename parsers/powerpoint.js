@@ -34,10 +34,21 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   ensureSafePackageDirectory,
+  sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
 
 const execFileAsync = promisify(execFile);
+
+function safeDisplayName(rawName, fallbackName) {
+  return sanitizePackageFileName(path.basename(String(rawName || fallbackName || 'file')), fallbackName || 'file');
+}
+
+function formatEmbeddedMediaExtractionFailure(archivePath, zipPath) {
+  const mediaName = safeDisplayName(zipPath, 'embedded media');
+  const archiveName = safeDisplayName(archivePath, 'presentation');
+  return `Could not extract embedded media ${mediaName} from ${archiveName}.`;
+}
 
 // Media file extensions to extract
 const EMBEDDED_MEDIA_EXTENSIONS = new Set([
@@ -119,7 +130,7 @@ class PowerPointParser extends BaseParser {
         });
       }
     } catch (e) {
-      console.error(`[PowerPointParser] Failed to list archive: ${e.message}`);
+      console.error(`[PowerPointParser] Could not inspect embedded media in ${safeDisplayName(filePath, 'presentation')}.`);
     }
 
     return this.deduplicateAssets(assets);
@@ -136,7 +147,7 @@ class PowerPointParser extends BaseParser {
    * @param {Array<{zipPath: string}>} assets - Assets from extractAssets()
    * @returns {Promise<Array<{originalZipPath: string, extractedPath: string}>>}
    */
-  async extractToDirectory(archivePath, destDir, assets) {
+  async extractToDirectory(archivePath, destDir, assets, options = {}) {
     const ext = path.extname(archivePath).toLowerCase();
     const baseName = path.basename(archivePath, ext);
     const extracted = [];
@@ -173,7 +184,20 @@ class PowerPointParser extends BaseParser {
           extractedPath: destPath
         });
       } catch (e) {
-        console.error(`[PowerPointParser] Failed to extract ${asset.zipPath}: ${e.message}`);
+        const message = formatEmbeddedMediaExtractionFailure(archivePath, asset.zipPath);
+        console.error(`[PowerPointParser] ${message}`);
+        if (typeof options.onExtractionError === 'function') {
+          try {
+            options.onExtractionError({
+              archivePath,
+              zipPath: asset.zipPath,
+              asset,
+              message
+            });
+          } catch (callbackError) {
+            console.warn('[PowerPointParser] Embedded extraction error callback skipped');
+          }
+        }
       }
     }
 

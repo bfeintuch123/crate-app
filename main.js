@@ -5817,6 +5817,16 @@ const EMBEDDED_MEDIA_EXTENSIONS = new Set([
   '.svg', '.pdf', '.eps', '.mp4', '.mov',
 ]);
 
+function safeEmbeddedMediaDisplayName(rawName, fallbackName) {
+  return sanitizePackageFileName(path.basename(String(rawName || fallbackName || 'file')), fallbackName || 'file');
+}
+
+function formatEmbeddedMediaExtractionFailure(presentationPath, internalPath) {
+  const mediaName = safeEmbeddedMediaDisplayName(internalPath, 'embedded media');
+  const presentationName = safeEmbeddedMediaDisplayName(presentationPath, 'presentation');
+  return `Could not extract embedded media ${mediaName} from ${presentationName}.`;
+}
+
 // Parse a zip entry date from `unzip -l` output (macOS format: MM-DD-YYYY HH:MM)
 // Returns a Date object or null if parsing fails.
 function parseZipEntryDate(dateStr, timeStr) {
@@ -6025,11 +6035,23 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         }
         console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
       } catch (e) {
-        console.error(`[crate] failed to read ${zipPath}:`, e.message);
+        const message = formatEmbeddedMediaExtractionFailure(presentationPath, zipPath);
+        console.error(`[crate] ${message}`);
+        if (typeof options.onExtractionError === 'function') {
+          try {
+            options.onExtractionError({
+              presentationPath,
+              internalPath: zipPath,
+              message,
+            });
+          } catch (callbackErr) {
+            console.warn('[crate] embedded media extraction error callback skipped');
+          }
+        }
       }
     }
   } catch (e) {
-    console.error('[crate] extractEmbeddedMedia error for', presentationPath, ':', e.message);
+    console.error(`[crate] Could not inspect embedded media in ${safeEmbeddedMediaDisplayName(presentationPath, 'presentation')}.`);
   }
 
   return extracted;
@@ -6243,11 +6265,14 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
               outputPath: extraction.materializedPath,
             });
           },
+          onExtractionError: (failure) => {
+            if (failure && failure.message) errors.push(failure.message);
+          },
         });
         embeddedCount += embeddedFiles.length;
       } catch (embedErr) {
         // M7: Report embedded extraction errors so user sees 'X files packaged, Y errors'
-        errors.push(`Embedded media extraction failed for ${file.name}: ${embedErr.message}`);
+        errors.push(`Could not inspect embedded media in ${getPackageFileDisplayName(file)}.`);
       }
     }
 

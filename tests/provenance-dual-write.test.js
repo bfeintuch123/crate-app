@@ -508,6 +508,7 @@ function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
     }
     if (args[0] === '-p') {
       const entry = byInternalPath.get(args[2]);
+      if (entry && entry.error) throw entry.error;
       return { stdout: entry ? entry.data : Buffer.alloc(0), stderr: '' };
     }
     return { stdout: '', stderr: '' };
@@ -580,6 +581,7 @@ test.afterEach(async () => {
   currentPsdFixture = { children: [], linkedFiles: [] };
   if (storeInstance) storeInstance.set('projects', []);
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
+  if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   watcherRecords.length = 0;
   clearTrackedTimers();
 });
@@ -804,6 +806,83 @@ test('PowerPoint package extraction records deterministic media provenance and d
     assert.equal(duplicateResult.totalFiles, 1);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PowerPoint package extraction surfaces per-entry media failures without blocking successes', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Partial Failure');
+    const pptxPath = path.join(tmpRoot, 'Presentation1.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.jpeg',
+        data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+        error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Presentation1.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, [
+      'Could not extract embedded media image2.png from Presentation1.pptx.'
+    ]);
+
+    const errorText = JSON.stringify(result.errors);
+    assert.equal(errorText.includes('RAW_STDERR'), false);
+    assert.equal(errorText.includes('unzip'), false);
+    assert.equal(errorText.includes('/private/tmp'), false);
+    assert.equal(errorText.includes(tmpRoot), false);
+
+    const destFolder = packageFolder(outputDir, 'PowerPoint Partial Failure');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.pptx'), 'utf8'), 'pptx container bytes');
+    assert.equal(
+      fs.readFileSync(path.join(destFolder, 'Presentation1 — image1.jpeg'), 'utf8'),
+      'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — image2.png')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('ppt/media/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath),
+      ['ppt/media/image1.jpeg']
+    );
+    const manifest = readManifest(outputDir, 'PowerPoint Partial Failure');
+    assert.equal(manifest.package.embeddedCount, 1);
+    assert.deepEqual(manifest.package.errors, [
+      'Could not extract embedded media image2.png from Presentation1.pptx.'
+    ]);
+    assert.equal(JSON.stringify(manifest).includes('ppt/media/image2.png'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1069,6 +1148,83 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(duplicateResult.totalFiles, 1);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction surfaces per-entry media failures without blocking successes', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Partial Failure');
+    const keynotePath = path.join(tmpRoot, 'Presentation1.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([
+      {
+        internalPath: 'Data/photo-1234.jpeg',
+        data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'Data/clip-5678.mov',
+        data: Buffer.from('KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+        error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Presentation1.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, [
+      'Could not extract embedded media clip-5678.mov from Presentation1.key.'
+    ]);
+
+    const errorText = JSON.stringify(result.errors);
+    assert.equal(errorText.includes('RAW_STDERR'), false);
+    assert.equal(errorText.includes('unzip'), false);
+    assert.equal(errorText.includes('/private/tmp'), false);
+    assert.equal(errorText.includes(tmpRoot), false);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Partial Failure');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.key'), 'utf8'), 'keynote container bytes');
+    assert.equal(
+      fs.readFileSync(path.join(destFolder, 'Presentation1 — photo.jpeg'), 'utf8'),
+      'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — clip.mov')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath),
+      ['Data/photo-1234.jpeg']
+    );
+    const manifest = readManifest(outputDir, 'Keynote Partial Failure');
+    assert.equal(manifest.package.embeddedCount, 1);
+    assert.deepEqual(manifest.package.errors, [
+      'Could not extract embedded media clip-5678.mov from Presentation1.key.'
+    ]);
+    assert.equal(JSON.stringify(manifest).includes('Data/clip-5678.mov'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
