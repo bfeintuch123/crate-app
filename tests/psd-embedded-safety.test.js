@@ -276,10 +276,81 @@ function assertPackageResultShape(result) {
   ]);
 }
 
+function isPathInsideDirectory(rootDir, candidatePath) {
+  const root = path.resolve(rootDir);
+  const candidate = path.resolve(candidatePath);
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function listPathsRecursive(rootDir) {
+  if (!fs.existsSync(rootDir)) return [];
+  const entries = [];
+  for (const entry of fs.readdirSync(rootDir)) {
+    const entryPath = path.join(rootDir, entry);
+    entries.push(entryPath);
+    if (fs.lstatSync(entryPath).isDirectory()) {
+      entries.push(...listPathsRecursive(entryPath));
+    }
+  }
+  return entries;
+}
+
+function assertPackageFolderContained(outputDir, folderPath) {
+  assert.ok(isPathInsideDirectory(outputDir, folderPath), `${folderPath} escaped ${outputDir}`);
+  assert.notEqual(path.resolve(folderPath), path.resolve(outputDir));
+}
+
+function assertNoPackageWritesOutsideOutput(tmpRoot, outputDir, allowedOutsideRoots) {
+  for (const entryPath of listPathsRecursive(tmpRoot)) {
+    if (isPathInsideDirectory(outputDir, entryPath)) continue;
+    if (allowedOutsideRoots.some(root => isPathInsideDirectory(root, entryPath))) continue;
+    assert.fail(`Unexpected package write outside outputPath: ${path.relative(tmpRoot, entryPath)}`);
+  }
+}
+
+async function packageSingleFileFixture({ id, projectName, namingTemplate, sourceName = 'logo.ai' }) {
+  const tmpRoot = makeTempDir();
+  const sourceDir = path.join(tmpRoot, 'source');
+  const outputDir = path.join(tmpRoot, 'out');
+  const sourcePath = path.join(sourceDir, sourceName);
+  try {
+    fs.mkdirSync(sourceDir);
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    setProjects([makeProject(id, projectName, [{
+      path: sourcePath,
+      name: sourceName,
+      ext: path.extname(sourceName),
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+    await callIpc('settings:update', 'namingTemplate', namingTemplate === undefined ? '{Project}_{Date}' : namingTemplate);
+
+    const result = await callIpc('projects:package', id, outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assertPackageFolderContained(outputDir, result.folderPath);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, sourceName), 'utf8'), 'logo bytes');
+    assertNoPackageWritesOutsideOutput(tmpRoot, outputDir, [sourceDir]);
+    return { result, tmpRoot, sourceDir, outputDir };
+  } catch (error) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 test.afterEach(() => {
   currentPsdFixture = { children: [], linkedFiles: [] };
   if (storeInstance) storeInstance.set('projects', []);
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
+  if (storeInstance) storeInstance.set('settings.namingTemplate', '{Project}_{Date}');
+  if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   clearTrackedTimeouts();
 });
 
@@ -644,6 +715,113 @@ test('package copy sanitizes corrupt destination names and stays inside package 
     assert.equal(fs.existsSync(path.join(destFolder, 'nested')), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('normal naming template still creates the expected package folder', async () => {
+  const fixture = await packageSingleFileFixture({
+    id: 'package-folder-normal-template',
+    projectName: 'Normal Project',
+    namingTemplate: '{Project}_{Date}',
+  });
+  try {
+    const expectedFolder = packageFolder(fixture.outputDir, 'Normal Project');
+    assert.equal(fixture.result.folderPath, expectedFolder);
+    assert.equal(path.basename(fixture.result.folderPath), `Normal Project_${new Date().toISOString().split('T')[0]}`);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('naming template path traversal cannot escape selected output folder', async () => {
+  const fixture = await packageSingleFileFixture({
+    id: 'package-folder-template-traversal',
+    projectName: 'QA',
+    namingTemplate: '../evil',
+  });
+  try {
+    assert.equal(fs.existsSync(path.join(fixture.tmpRoot, 'evil')), false);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('project name path traversal cannot escape selected output folder', async () => {
+  const fixture = await packageSingleFileFixture({
+    id: 'package-folder-project-traversal',
+    projectName: '..',
+    namingTemplate: '{Project}_{Date}',
+  });
+  try {
+    assert.notEqual(path.basename(fixture.result.folderPath), '..');
+    assert.equal(fs.existsSync(path.join(fixture.tmpRoot, 'logo.ai')), false);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('slash-containing naming template remains inside selected output folder', async () => {
+  const fixture = await packageSingleFileFixture({
+    id: 'package-folder-slash-template',
+    projectName: 'QA',
+    namingTemplate: 'nested/folder_{Project}',
+  });
+  try {
+    assert.equal(path.basename(fixture.result.folderPath).includes('/'), false);
+    assert.equal(path.basename(fixture.result.folderPath).includes('\\'), false);
+    assert.equal(fs.existsSync(path.join(fixture.outputDir, 'nested')), false);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('absolute-path-like naming template remains inside selected output folder', async () => {
+  const tmpRoot = makeTempDir();
+  const sourceDir = path.join(tmpRoot, 'source');
+  const outputDir = path.join(tmpRoot, 'out');
+  const outsideTarget = path.join(tmpRoot, 'outside-absolute');
+  const sourcePath = path.join(sourceDir, 'logo.ai');
+  try {
+    fs.mkdirSync(sourceDir);
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    setProjects([makeProject('package-folder-absolute-template', 'QA', [{
+      path: sourcePath,
+      name: 'logo.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }])]);
+    await callIpc('settings:update', 'namingTemplate', outsideTarget);
+
+    const result = await callIpc('projects:package', 'package-folder-absolute-template', outputDir);
+
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+    assertPackageFolderContained(outputDir, result.folderPath);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.equal(fs.existsSync(outsideTarget), false);
+    assertNoPackageWritesOutsideOutput(tmpRoot, outputDir, [sourceDir]);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('null-byte naming template and project name are handled safely', async () => {
+  const fixture = await packageSingleFileFixture({
+    id: 'package-folder-null-byte',
+    projectName: 'Null\0Project',
+    namingTemplate: 'bad\0template_{Project}',
+  });
+  try {
+    assert.equal(fixture.result.folderPath.includes('\0'), false);
+    assert.equal(path.basename(fixture.result.folderPath).includes('\0'), false);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
   }
 });
 

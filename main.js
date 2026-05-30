@@ -43,6 +43,63 @@ const TEMP_SCRIPT_DIR_MODE = 0o700;
 const TEMP_SCRIPT_FILE_MODE = 0o600;
 const OWNER_ONLY_DIR_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
+const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
+const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
+const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
+const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
+
+function realpathSync(targetPath) {
+  return (fs.realpathSync.native || fs.realpathSync)(targetPath);
+}
+
+function sanitizePackageFolderName(rawName, fallbackName = DEFAULT_PACKAGE_FOLDER_NAME) {
+  let fallback = `${fallbackName || DEFAULT_PACKAGE_FOLDER_NAME}`
+    .replace(UNSAFE_PACKAGE_FOLDER_CHARS, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!fallback || fallback === '.' || fallback === '..') fallback = DEFAULT_PACKAGE_FOLDER_NAME;
+
+  let name = `${rawName || ''}`
+    .replace(UNSAFE_PACKAGE_FOLDER_CHARS, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (name.startsWith('..')) name = name.replace(/^\.+/, '').trim();
+  if (!name || name === '.' || name === '..') name = fallback;
+  if (name.length > MAX_PACKAGE_FOLDER_NAME_LENGTH) {
+    name = name.slice(0, MAX_PACKAGE_FOLDER_NAME_LENGTH).trim();
+  }
+  return name || fallback;
+}
+
+function sanitizeNamingTemplate(rawTemplate) {
+  return sanitizePackageFolderName(rawTemplate, DEFAULT_NAMING_TEMPLATE);
+}
+
+function resolvePackageFolderInsideOutput(outputPath, rawFolderName) {
+  if (!outputPath || typeof outputPath !== 'string' || outputPath.includes('\0')) {
+    throw new Error('Invalid package output folder');
+  }
+
+  const outputRoot = path.resolve(outputPath);
+  const safeFolderName = sanitizePackageFolderName(rawFolderName);
+  const destFolder = path.resolve(outputRoot, safeFolderName);
+  if (!isPathInsideDirectory(outputRoot, destFolder) || path.relative(outputRoot, destFolder) === '') {
+    throw new Error('Package output folder escapes selected output folder');
+  }
+
+  const ensuredFolder = ensureSafePackageDirectory(destFolder);
+  if (!isPathInsideDirectory(outputRoot, ensuredFolder)) {
+    throw new Error('Package output folder escapes selected output folder');
+  }
+
+  const realOutputRoot = realpathSync(outputRoot);
+  const realDestFolder = realpathSync(ensuredFolder);
+  if (!isPathInsideDirectory(realOutputRoot, realDestFolder)) {
+    throw new Error('Package output folder escapes selected output folder');
+  }
+  return ensuredFolder;
+}
 
 function safeTempScriptName(name) {
   if (typeof name !== 'string' || name.trim() === '' || name !== path.basename(name)) {
@@ -798,7 +855,7 @@ const store = new Store({
   defaults: {
     projects: [],
     settings: {
-      namingTemplate: '{Project}_{Date}',
+      namingTemplate: DEFAULT_NAMING_TEMPLATE,
       notifications: true,
       includeDiagnosticReport: false,
       showPackageDetails: true
@@ -813,8 +870,14 @@ const store = new Store({
 // One-time migration: update old naming template format to new one
 function migrateSettings() {
   const settings = store.get('settings');
+  let namingTemplate = settings.namingTemplate;
   if (settings.namingTemplate && settings.namingTemplate.includes('{Client}')) {
-    store.set('settings.namingTemplate', '{Project}_{Date}');
+    namingTemplate = DEFAULT_NAMING_TEMPLATE;
+    store.set('settings.namingTemplate', namingTemplate);
+  }
+  const safeNamingTemplate = sanitizeNamingTemplate(namingTemplate);
+  if (safeNamingTemplate !== namingTemplate) {
+    store.set('settings.namingTemplate', safeNamingTemplate);
   }
   if (settings.includeDiagnosticReport === undefined) {
     store.set('settings.includeDiagnosticReport', false);
@@ -2217,8 +2280,9 @@ function sendToRenderer(channel, data) {
 }
 
 function cleanName(s) {
-  const cleaned = s.replace(/[^a-zA-Z0-9 ._\-()]/g, '').replace(/\s+/g, ' ').trim();
-  return cleaned || 'Untitled';
+  const cleaned = `${s || ''}`.replace(/[^a-zA-Z0-9 ._\-()]/g, '').replace(/\s+/g, ' ').trim();
+  if (cleaned === '.' || cleaned === '..') return DEFAULT_PACKAGE_FOLDER_NAME;
+  return cleaned || DEFAULT_PACKAGE_FOLDER_NAME;
 }
 
 function sanitizeEmbeddedPsdAssetName(rawName, fallbackName = 'embedded-asset') {
@@ -6076,7 +6140,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
   // Build folder name from naming template
   const settings = store.get('settings');
-  const template = settings.namingTemplate;
+  const template = sanitizeNamingTemplate(settings.namingTemplate);
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
 
@@ -6086,7 +6150,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     .replace('{Project}', cleanName(project.name))
     .replace('{Date}', dateStr);
 
-  const destFolder = ensureSafePackageDirectory(path.join(outputPath, folderName));
+  const destFolder = resolvePackageFolderInsideOutput(outputPath, folderName);
 
   try {
     let copiedCount = 0;
@@ -6514,6 +6578,10 @@ ipcMain.handle('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
   const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
+  if (key === 'namingTemplate') {
+    store.set(`settings.${key}`, sanitizeNamingTemplate(value));
+    return store.get('settings');
+  }
   store.set(`settings.${key}`, value);
   return store.get('settings');
 });
