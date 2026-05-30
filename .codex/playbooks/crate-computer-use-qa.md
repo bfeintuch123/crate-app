@@ -81,7 +81,7 @@ Tier 4 - Other supported creative workflows:
 - `docs/*.md`.
 - approved fixture instructions and synthetic assets.
 - approved package outputs under `/private/tmp` or another Bryant-approved QA path.
-- `crate-provenance.json` from approved QA package outputs.
+- optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests from approved QA package outputs when diagnostic reports were enabled.
 - `package.json` read-only for version and script context.
 
 ## Files Codex May Modify
@@ -117,10 +117,13 @@ Inspect approved package output after a GUI run:
 
 ```sh
 find <approved-package-output> -maxdepth 4 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length}, null, 2));" <approved-package-output>/crate-provenance.json
-rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length}, null, 2));" "$diagnostic_manifest"
+rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
+
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 Run docs-only checks only if process docs are edited:
 
@@ -177,7 +180,7 @@ Fail:
 Steps:
 - Open the Package Details dropdown from Package Complete.
 - Confirm included files, file sources, extracted or linked information, warnings, and needs-review items match the approved fixture.
-- Compare visible Package Details to `crate-provenance.json` when a manifest is present.
+- Compare visible Package Details to `Crate Diagnostics/crate-provenance.json` only when the diagnostic report setting was enabled and a manifest is present.
 - Screenshot collapsed and expanded states.
 
 Pass:
@@ -206,7 +209,7 @@ Steps:
 - Screenshot the top-level package folder.
 - Inspect expected subfolders and files.
 - Confirm unrelated files are absent.
-- Confirm `crate-provenance.json` exists only when expected.
+- Confirm `Crate Diagnostics/crate-provenance.json` exists only when diagnostic reports were enabled.
 
 Pass:
 - Finder output matches the expected file inventory and remains inside the intended package folder.
@@ -296,7 +299,7 @@ Collect only approved and privacy-safe artifacts:
 - Package Details collapsed and expanded screenshots
 - Finder output screenshot
 - redacted package inventory
-- redacted `crate-provenance.json` summary
+- redacted `Crate Diagnostics/crate-provenance.json` summary when diagnostics were enabled
 - screen recording path when one was approved
 
 Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only after Bryant approves artifact writing. Do not store private client or tester assets in the report.

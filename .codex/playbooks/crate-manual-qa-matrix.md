@@ -26,7 +26,7 @@ Use .codex/playbooks/crate-manual-qa-matrix.md to run or prepare Crate manual QA
 - Manual QA is used to validate real designer behavior.
 - Use synthetic, minimal, or explicitly cleared project files whenever artifacts will be shared.
 - Use real designer workflows where possible, but do not upload private or confidential client work unless cleared.
-- Preserve package outputs and `crate-provenance.json` for review.
+- Preserve package outputs and optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests for review when diagnostic reports were enabled.
 - Record what Crate did, not what the tester hoped it did.
 - Provenance may be partial and should not overclaim certainty.
 - Expected exclusions matter as much as expected inclusions.
@@ -52,7 +52,7 @@ Before running workflows:
 - `docs/*.md`
 - approved fixture docs and synthetic fixture assets
 - approved package outputs under `/private/tmp` or another Bryant-approved path
-- `crate-provenance.json` files from manual QA packages
+- optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests from manual QA packages when diagnostic reports were enabled
 - `package.json` read-only for version/script context
 - changed files and tests read-only when needed to map QA risk
 
@@ -90,15 +90,18 @@ Inspect approved package outputs:
 
 ```sh
 find <approved-package-output> -maxdepth 4 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" <approved-package-output>/crate-provenance.json
-rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
+
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 Review multiple package outputs when a manual run creates them:
 
 ```sh
-find <manual-qa-output-root> -name crate-provenance.json -type f | sort
+find <manual-qa-output-root> -path "*/Crate Diagnostics/crate-provenance.json" -type f | sort
 find <manual-qa-output-root> -type f | sort
 ```
 
@@ -116,7 +119,7 @@ For every workflow, collect:
 - setup screenshot
 - action recording
 - package output screenshot
-- `crate-provenance.json` screenshot or redacted summary
+- optional `Crate Diagnostics/crate-provenance.json` screenshot or redacted summary when diagnostic reports were enabled
 - pass/fail result
 - notes about expected exclusions and known limitations
 
@@ -131,7 +134,7 @@ Action:
 
 Expected package contents:
 - Current-page materialized image assets.
-- Package metadata and `crate-provenance.json` when manifest writing is enabled.
+- Package metadata and `Crate Diagnostics/crate-provenance.json` when diagnostic reports are enabled.
 
 Expected provenance signals:
 - Figma file or page context.
@@ -617,7 +620,7 @@ Action:
 
 Expected package contents:
 - Expected files for the specific workflow.
-- `crate-provenance.json` when enabled.
+- `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled.
 
 Expected provenance signals:
 - Package copy and extraction edges for files Crate actually wrote.
@@ -639,16 +642,16 @@ Pass/fail:
 Known limitations:
 - File tree review does not prove source provenance by itself.
 
-### crate-provenance.json Review
+### Crate Diagnostics/crate-provenance.json Review
 Setup:
-- Use the manifest from any manual QA package.
+- Use the diagnostic manifest from any manual QA package where `Include diagnostic report in packages` was enabled.
 - Work from a redacted copy if privacy requires it.
 
 Action:
 - Parse the JSON and review counts, nodes, edges, evidence, warnings, confidence bands, and privacy-sensitive strings.
 
 Expected package contents:
-- Manifest exists and parses.
+- Diagnostic manifest exists and parses when diagnostics were enabled.
 
 Expected provenance signals:
 - `package_includes_file` for copied files.
@@ -677,7 +680,7 @@ Known limitations:
 ## Required Checks
 - Each selected workflow has setup, action, expected package contents, expected provenance signals, expected exclusions, screenshots/recordings, pass/fail criteria, and known limitations.
 - Package output is preserved for each run.
-- `crate-provenance.json` is inspected or marked unavailable.
+- Optional `Crate Diagnostics/crate-provenance.json` is inspected or marked unavailable.
 - Expected inclusions and exclusions are both reviewed.
 - Privacy checks are run before any artifact is shared.
 - Partial provenance is described accurately.
@@ -736,7 +739,7 @@ npx wrangler pages deploy <directory>
 - QA environment.
 - Workflow matrix with pass, fail, unclear, or not run.
 - Package output paths.
-- `crate-provenance.json` findings.
+- `Crate Diagnostics/crate-provenance.json` findings when diagnostics were enabled.
 - Expected inclusions and exclusions.
 - Privacy check results.
 - Screenshots and recordings collected.

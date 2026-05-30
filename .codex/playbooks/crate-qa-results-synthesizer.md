@@ -3,7 +3,7 @@
 ## Purpose
 Turn Jenna and tester QA results into structured next actions.
 
-QA synthesis is not bug fixing. It organizes observed evidence, package output, `crate-provenance.json`, screen recordings, expected versus actual behavior, and privacy constraints so Bryant can decide whether to pass, triage, reproduce, hold release, or proceed toward final `v2.8.0`.
+QA synthesis is not bug fixing. It organizes observed evidence, package output, optional `Crate Diagnostics/crate-provenance.json` diagnostic output, screen recordings, expected versus actual behavior, and privacy constraints so Bryant can decide whether to pass, triage, reproduce, hold release, or proceed toward final `v2.8.0`.
 
 ## When To Use
 - After Jenna QA produces notes, recordings, package folders, screenshots, or manifest output.
@@ -16,7 +16,7 @@ QA synthesis is not bug fixing. It organizes observed evidence, package output, 
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-qa-results-synthesizer.md to synthesize these Jenna or tester QA results. Ingest notes, recordings, package folder inventory, crate-provenance.json, expected versus actual package contents, scope behavior, missing and wrong assets, provenance confusion, install warnings, classify each result, map to next playbook, and do not modify app code or approve release.
+Use .codex/playbooks/crate-qa-results-synthesizer.md to synthesize these Jenna or tester QA results. Ingest notes, recordings, package folder inventory, optional Crate Diagnostics/crate-provenance.json if diagnostic reports were enabled, expected versus actual package contents, scope behavior, missing and wrong assets, provenance confusion, install warnings, classify each result, map to next playbook, and do not modify app code or approve release.
 ```
 
 ## Inputs To Collect
@@ -35,11 +35,11 @@ Use .codex/playbooks/crate-qa-results-synthesizer.md to synthesize these Jenna o
 - expected package contents
 - expected exclusions
 - Figma scope setting:
-  - Current Page Only
-  - Entire File
-  - unknown
+- Current Page Only
+- Entire File
+- unknown
 - package output folder path or redacted inventory
-- `crate-provenance.json` path or redacted summary
+- optional `Crate Diagnostics/crate-provenance.json` path or redacted summary when diagnostic reports were enabled
 - screen recording path or approved link
 - screenshots
 - missing asset reports
@@ -56,7 +56,7 @@ Use .codex/playbooks/crate-qa-results-synthesizer.md to synthesize these Jenna o
 - approved QA notes
 - approved screen-recording metadata and screenshots
 - approved package output folders
-- approved `crate-provenance.json` files
+- approved optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests
 - redacted package inventories
 - redacted manifest summaries
 - GitHub issues and PR metadata through `gh`
@@ -99,20 +99,23 @@ Inspect approved package output inventory:
 
 ```sh
 find <approved-package-output> -maxdepth 5 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
 du -sh <approved-package-output>
 ```
 
-Summarize `crate-provenance.json` when approved:
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
+
+Summarize the diagnostic manifest when approved:
 
 ```sh
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" <approved-package-output>/crate-provenance.json
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
 ```
 
 Check manifest privacy before sharing:
 
 ```sh
-rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof|notary" <approved-package-output>/crate-provenance.json
+rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof|notary" "$diagnostic_manifest"
 ```
 
 Compare expected and actual package inventories when Bryant provides an expected list:
@@ -206,7 +209,7 @@ Secondary tags may include:
 
 ## Package And Provenance Review Checklist
 - Does the package folder exist?
-- Does it contain `crate-provenance.json` when expected?
+- Does it contain `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled?
 - Does the manifest parse as JSON?
 - Do `copiedCount`, `embeddedCount`, `totalFiles`, and `errors` align with the package contents?
 - Are expected assets present?
@@ -258,7 +261,7 @@ Recommend holding final release when:
 - any P1 affects a core promised workflow for the target release
 - package output includes wrong, private, unrelated, or out-of-scope assets
 - Current Page Only silently widens scope
-- `crate-provenance.json` exposes secrets or materially overclaims certainty
+- `Crate Diagnostics/crate-provenance.json` exposes secrets or materially overclaims certainty
 - install or security warnings block internal QA
 - Jenna QA is incomplete and Bryant has not waived it
 - `.codex/playbooks/crate-release-gate.md` has not validated readiness
@@ -269,7 +272,7 @@ Recommend proceeding toward final `v2.8.0` only when:
 - Jenna QA has either passed or Bryant explicitly accepts remaining limitations
 - no unresolved P0 or release-blocking P1 remains
 - expected limitations are documented and not privacy or data-loss risks
-- package output and `crate-provenance.json` evidence match the release's evidence-aware promise
+- package output and optional `Crate Diagnostics/crate-provenance.json` evidence match the release's evidence-aware promise
 - `get-crate.com` is still held until final release approval
 - next step is `.codex/playbooks/crate-release-gate.md`, not direct build, tag, release, or deploy
 
@@ -322,7 +325,7 @@ npx wrangler pages deploy <directory>
 
 ## Definition Of Done
 - QA source, version, workflow, expected behavior, actual behavior, and privacy constraints are captured.
-- Package output and `crate-provenance.json` are reviewed when approved and available.
+- Package output and optional `Crate Diagnostics/crate-provenance.json` are reviewed when approved and available.
 - Missing, wrong, extra, and expected-exclusion findings are classified.
 - Current Page Only versus Entire File behavior is assessed when Figma is involved.
 - Install/security warnings are classified and routed.
@@ -338,7 +341,7 @@ npx wrangler pages deploy <directory>
   - Privacy constraints:
 - Current state:
   - Package output:
-  - `crate-provenance.json`:
+  - `Crate Diagnostics/crate-provenance.json`:
   - Figma scope:
   - Install/security state:
 - Findings:

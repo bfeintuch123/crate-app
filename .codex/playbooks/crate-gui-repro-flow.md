@@ -3,14 +3,14 @@
 ## Purpose
 Reproduce GUI-only Crate bugs across Crate-supported creative apps and workflows that cannot be fully diagnosed from tests alone.
 
-This playbook turns a user-facing report into a controlled GUI reproduction record: exact steps, source-app state, screenshots, package output, Package Details, `crate-provenance.json`, and a classification that determines whether the next step is a code fix, product clarification, manual QA, package diff, or CLI artifact triage.
+This playbook turns a user-facing report into a controlled GUI reproduction record: exact steps, source-app state, screenshots, package output, Package Details, optional `Crate Diagnostics/crate-provenance.json` diagnostic output, and a classification that determines whether the next step is a code fix, product clarification, manual QA, package diff, or CLI artifact triage.
 
 Start narrow, then expand by scoped app lane. Figma, PowerPoint, and Keynote are initial priority workflows, not the full long-term GUI repro scope.
 
 ## When To Use
 - A bug appears only through Crate, Finder, a Crate-supported creative app, or browser-assisted GUI state.
 - Automated tests pass but the user-facing workflow still looks wrong.
-- Package Complete, Package Details, Finder output, or `crate-provenance.json` contradict each other.
+- Package Complete, Package Details, Finder output, or optional `Crate Diagnostics/crate-provenance.json` diagnostic output contradict each other.
 - A report mentions unexpected assets, missing assets, Figma page-scope mismatch, or save-before-package behavior.
 - Bryant needs evidence before deciding whether a CLI fix branch is warranted.
 
@@ -82,7 +82,7 @@ Tier 4 - Other supported creative workflows:
 - approved bug reports, tester notes, or QA summaries.
 - approved fixture instructions and synthetic assets.
 - approved package output folders under `/private/tmp` or another Bryant-approved path.
-- approved `crate-provenance.json` files from repro packages.
+- approved optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests from repro packages when diagnostic reports were enabled.
 - `package.json` read-only for version and script context.
 - changed files and tests read-only only after GUI artifacts show that CLI triage is needed.
 
@@ -119,10 +119,13 @@ Inspect package output after Bryant approves the package path:
 
 ```sh
 find <approved-package-output> -maxdepth 5 -type f | sort
-test -f <approved-package-output>/crate-provenance.json
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const by=(items,key)=>(items||[]).reduce((a,x)=>{const k=(x&&x[key])||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodesByType:by(m.nodes,'type'),edgesByType:by(m.edges,'relationType')}, null, 2));" <approved-package-output>/crate-provenance.json
-rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" <approved-package-output>/crate-provenance.json
+diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
+test -f "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const by=(items,key)=>(items||[]).reduce((a,x)=>{const k=(x&&x[key])||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodesByType:by(m.nodes,'type'),edgesByType:by(m.edges,'relationType')}, null, 2));" "$diagnostic_manifest"
+rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
+
+Diagnostic reports are optional and off by default. Enable `Include diagnostic report in packages` before expecting `Crate Diagnostics/crate-provenance.json`; do not expect a package-root manifest in default package output.
 
 Prepare CLI artifact triage only after GUI repro evidence exists:
 
@@ -145,7 +148,7 @@ rg -n "[^[:ascii:]]" AGENTS.md .codex/playbooks docs
 - Confirm the approved app tier and exact app lane before opening source apps.
 - Keep the first repro as close as possible to the user's report.
 - Change one variable at a time after the first repro.
-- Compare Package Details against Finder output and `crate-provenance.json`.
+- Compare Package Details against Finder output and `Crate Diagnostics/crate-provenance.json` only when the diagnostic report setting was enabled and a manifest is present.
 - Treat screenshots and package folders as evidence, not guesses.
 - Do not modify app code during repro.
 - Do not claim root cause without artifacts.
@@ -165,7 +168,7 @@ For every attempted repro, record:
 - Package Complete state
 - Package Details state
 - Finder package output path
-- `crate-provenance.json` summary when present
+- `Crate Diagnostics/crate-provenance.json` summary when diagnostics were enabled and a manifest is present
 - screenshots or recording paths when approved
 - whether the issue reproduced
 - whether private assets were avoided or approved
@@ -182,7 +185,7 @@ Steps:
 - Package once before saving if Bryant approved that scenario.
 - Save the deck.
 - Package again after saving.
-- Compare Package Complete, Package Details, Finder output, and `crate-provenance.json` between runs.
+- Compare Package Complete, Package Details, Finder output, and `Crate Diagnostics/crate-provenance.json` between runs when diagnostics were enabled.
 
 Classify:
 - Real bug if Crate claims it packaged unsaved content but output does not match, or if saved content is missed without warning.
@@ -198,7 +201,7 @@ Steps:
 - Close unrelated apps only if the original report did not include them; otherwise preserve the reported state.
 - Package the approved workflow.
 - Inspect Finder output for extra files.
-- Compare extra files with Package Details and `crate-provenance.json`.
+- Compare extra files with Package Details and `Crate Diagnostics/crate-provenance.json` when diagnostics were enabled.
 - Check whether extras came from the same folder, another open app, prior activity, embedded extraction, or Figma scope.
 
 Classify:
@@ -215,7 +218,7 @@ Steps:
 - Confirm whether the source document was saved.
 - Confirm whether the asset is embedded, linked, cloud-backed, or generated.
 - Package the approved workflow.
-- Inspect Package Details, Finder output, and `crate-provenance.json`.
+- Inspect Package Details, Finder output, and `Crate Diagnostics/crate-provenance.json` when diagnostics were enabled.
 - Record warnings, errors, needs-review entries, and missing-file messaging.
 
 Classify:
@@ -232,7 +235,7 @@ Steps:
 - Record the current Figma page before packaging.
 - Confirm Crate is set to Current Page Only.
 - Package the workflow.
-- Inspect Package Complete, Package Details, Finder output, and `crate-provenance.json`.
+- Inspect Package Complete, Package Details, Finder output, and `Crate Diagnostics/crate-provenance.json` when diagnostics were enabled.
 - Repeat only if Bryant approves changing page, scope, or file.
 
 Classify:
@@ -258,11 +261,11 @@ Fail:
 - Files are missing, extra, outside the root, duplicated unexpectedly, or named in a way that hides source identity.
 
 ### Package Details And Manifest Comparison
-Use this comparison whenever `crate-provenance.json` exists.
+Use this comparison whenever diagnostic reports were enabled and `Crate Diagnostics/crate-provenance.json` exists.
 
 Steps:
 - Screenshot Package Details collapsed and expanded states.
-- Summarize `crate-provenance.json` counts and warnings with the approved command.
+- Summarize `Crate Diagnostics/crate-provenance.json` counts and warnings with the approved command.
 - Compare Package Details labels to manifest evidence.
 - Flag overclaims, missing warnings, unexplained included files, and manifest/package count mismatches.
 

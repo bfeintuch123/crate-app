@@ -31,7 +31,7 @@ Use .codex/playbooks/crate-package-diff.md to compare package outputs before and
 - Missing and extra files.
 - Path normalization and case differences.
 - File hashes when safe and practical.
-- `crate-provenance.json` contents, warnings, graph shape, and privacy redaction.
+- Optional `Crate Diagnostics/crate-provenance.json` contents, warnings, graph shape, and privacy redaction when diagnostic reports were enabled.
 - Package output containment: all package files remain inside the intended output folder.
 
 ## Files Codex May Read
@@ -40,7 +40,7 @@ Use .codex/playbooks/crate-package-diff.md to compare package outputs before and
 - `docs/*.md`
 - approved fixture docs and synthetic fixture assets
 - package output directories under `/private/tmp/crate-package-diff-*`
-- `crate-provenance.json` files from before and after package outputs
+- optional `Crate Diagnostics/crate-provenance.json` files from before and after package outputs when diagnostic reports were enabled
 - `package.json` read-only, for version/script context
 - changed files and tests read-only when needed for package risk context
 
@@ -105,6 +105,8 @@ Summarize package manifests:
 node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({file:p,copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
 ```
 
+Use explicit manifest paths, typically `<package-output>/Crate Diagnostics/crate-provenance.json`, only when `Include diagnostic report in packages` was enabled for both package runs. Diagnostics are optional and off by default; do not expect a package-root manifest.
+
 Check manifest privacy and containment:
 
 ```sh
@@ -117,7 +119,7 @@ node -e "const path=require('path'); const root=path.resolve(process.argv[1]); f
 - Copied file list comparison.
 - Embedded extracted asset comparison.
 - Missing and extra file detection.
-- `crate-provenance.json` comparison.
+- Optional `Crate Diagnostics/crate-provenance.json` comparison when diagnostic reports were enabled for both package runs.
 - Package count comparison:
   - `copiedCount`
   - `embeddedCount`
@@ -165,7 +167,7 @@ rm -rf /private/tmp/crate-package-diff-<id>
 ## Quality Impact
 - Catches missing, extra, duplicated, and out-of-scope package files before merge.
 - Makes package count changes visible instead of relying on visual folder inspection.
-- Validates `crate-provenance.json` graph and privacy behavior alongside package content.
+- Validates optional `Crate Diagnostics/crate-provenance.json` graph and privacy behavior alongside package content when diagnostics were enabled.
 - Speeds review by producing a before/after artifact Bryant can rerun or inspect.
 - Reduces false alarms by classifying expected and unexpected diffs explicitly.
 

@@ -16,7 +16,7 @@ Benchmark fixtures are process infrastructure, not product UI. They exist to mak
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-benchmark-fixtures.md to define repeatable Crate benchmark fixtures for this workflow. Prefer synthetic/minimal files, document expected package contents and crate-provenance.json graph shape, and do not touch app code.
+Use .codex/playbooks/crate-benchmark-fixtures.md to define repeatable Crate benchmark fixtures for this workflow. Prefer synthetic/minimal files, document expected package contents and optional Crate Diagnostics/crate-provenance.json graph shape when diagnostics were enabled, and do not touch app code.
 ```
 
 ## Fixture Set
@@ -48,7 +48,7 @@ Required fixture categories:
   - expected extracted media files
   - expected package counts and manifest behavior
 - Package manifest fixture:
-  - package output with `crate-provenance.json`
+  - package output with `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled
   - expected package node, package copy/extract edges, warnings, and redacted paths
 - Cross-app workflow fixture candidates:
   - Figma asset plus Photoshop or PowerPoint usage
@@ -69,8 +69,8 @@ Each fixture definition should document:
 - expected `embeddedCount`
 - expected `totalFiles`
 - expected `errors`
-- expected `crate-provenance.json` node types
-- expected `crate-provenance.json` edge types
+- expected `Crate Diagnostics/crate-provenance.json` node types when diagnostics were enabled
+- expected `Crate Diagnostics/crate-provenance.json` edge types when diagnostics were enabled
 - expected warnings
 - expected omitted data
 - expected confirmed, likely, candidate, and weak evidence
@@ -79,7 +79,7 @@ Each fixture definition should document:
 - Confirmed evidence:
   - Crate copied a file into a package
   - Crate extracted an embedded resource
-  - Crate wrote `crate-provenance.json`
+  - Crate wrote `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled
   - Figma asset download succeeded and the file ledger was updated
   - parser returned structured linked or embedded metadata
 - Likely evidence:
@@ -94,6 +94,8 @@ Each fixture definition should document:
   - basename-only or out-of-scope hints
 
 Do not overclaim fixture certainty. If the fixture cannot prove a relationship, write the expected confidence band lower.
+
+Diagnostic manifest existence is an artifact check, not a required `package_writes_manifest` graph edge for v2.8.0 fixtures.
 
 ## Files Codex May Read
 - `AGENTS.md`
@@ -205,7 +207,7 @@ npx wrangler pages deploy <directory>
 - Branch and dirty state.
 - Fixture definitions added or reviewed.
 - Expected package contents.
-- Expected `crate-provenance.json` contents.
+- Expected `Crate Diagnostics/crate-provenance.json` contents when diagnostics were enabled.
 - Evidence bands: confirmed, likely, candidate, weak.
 - Commands run and results.
 - Files changed.
