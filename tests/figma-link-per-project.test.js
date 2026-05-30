@@ -327,6 +327,10 @@ function setFigmaDownloadResponse(body = 'figma asset bytes') {
   });
 }
 
+function modeOf(filePath) {
+  return fs.statSync(filePath).mode & 0o777;
+}
+
 function figmaScanResult(assets, scopeEntries = []) {
   return {
     files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
@@ -806,6 +810,97 @@ test('Figma asset scan records cloud resource materialization provenance after l
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
 });
 
+test('Figma asset cache directories and downloaded files are owner-only where supported', async () => {
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const assetsDir = path.join(crateDir, 'figma-assets');
+  fs.mkdirSync(assetsDir, { recursive: true, mode: 0o755 });
+  if (process.platform !== 'win32') {
+    fs.chmodSync(crateDir, 0o755);
+    fs.chmodSync(assetsDir, 0o755);
+  }
+
+  const project = await createLinkedFigmaProject('Figma Private Asset Cache');
+  const assetBytes = 'private figma cache bytes';
+  setFigmaDownloadResponse(assetBytes);
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/private-cache.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-private-cache',
+    imageRef: 'img-private-cache',
+    name: 'Private Cache',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const { output } = await captureConsole(async () => {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+    await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should be cached');
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const file = fresh.files[0];
+  const projectDir = path.dirname(file.path);
+
+  assert.equal(fs.readFileSync(file.path, 'utf8'), assetBytes);
+  if (process.platform !== 'win32') {
+    assert.equal(modeOf(crateDir), 0o700);
+    assert.equal(modeOf(assetsDir), 0o700);
+    assert.equal(modeOf(projectDir), 0o700);
+    assert.equal(modeOf(file.path), 0o600);
+  }
+
+  for (const forbidden of [assetBytes, file.path, projectDir, assetsDir, crateDir]) {
+    assert.equal(output.includes(forbidden), false, `log output should not include ${forbidden}`);
+  }
+});
+
+test('Figma asset format extensions are allowlisted and stay inside the cache directory', async () => {
+  const project = await createLinkedFigmaProject('Figma Format Sanitization');
+  setFigmaDownloadResponse('format asset bytes');
+  nextFigmaScanResult = figmaScanResult([
+    {
+      url: 'https://cdn.figma.example/safe.webp',
+      nodeId: 'node-safe-format',
+      imageRef: 'img-safe-format',
+      name: 'Safe Format',
+      format: 'webp',
+      figmaFileKey: 'FIG22',
+      figmaFileName: 'Brand Cloud',
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    },
+    {
+      url: 'https://cdn.figma.example/unsafe.png',
+      nodeId: 'node-unsafe-format',
+      imageRef: 'img-unsafe-format',
+      name: 'Unsafe Format',
+      format: '../../outside',
+      figmaFileKey: 'FIG22',
+      figmaFileName: 'Brand Cloud',
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    },
+  ]);
+
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  const fresh = await waitForProject(project.id, item => item.files.length === 2, 'Both Figma assets should be cached');
+  const projectDir = path.join(TEST_HOME, '.crate', 'figma-assets', project.id);
+  const safeFile = fresh.files.find(file => file.name === 'Brand_Cloud_Safe_Format.webp');
+  const unsafeFile = fresh.files.find(file => file.name === 'Brand_Cloud_Unsafe_Format.png');
+
+  assert.ok(safeFile, 'safe webp asset should keep its extension');
+  assert.equal(safeFile.ext, '.webp');
+  assert.ok(unsafeFile, 'unsafe extension should fall back to png');
+  assert.equal(unsafeFile.ext, '.png');
+  assert.equal(path.dirname(unsafeFile.path), projectDir);
+  const relativeUnsafePath = path.relative(projectDir, unsafeFile.path);
+  assert.equal(relativeUnsafePath.startsWith('..'), false);
+  assert.equal(path.isAbsolute(relativeUnsafePath), false);
+  assert.equal(fs.existsSync(path.join(TEST_HOME, '.crate', 'outside')), false);
+});
+
 test('main-process Figma logs redact tracked URLs, signed URLs, and local asset paths', async () => {
   const sensitiveFigmaUrl = 'https://www.figma.com/file/FIGLOG/Secret-File?page-id=1%3A1&token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
   const sensitiveCdnUrl = 'https://cdn.figma.example/signed/SHOULD_NOT_APPEAR_URL?token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
@@ -817,7 +912,8 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
     sensitiveFigmaUrl
   );
   storedFigmaToken = 'test-token';
-  setFigmaDownloadResponse('log privacy asset bytes');
+  const assetBytes = 'log privacy asset bytes';
+  setFigmaDownloadResponse(assetBytes);
   nextFigmaScanResult = figmaScanResult([{
     url: sensitiveCdnUrl,
     nodeId: 'node-log-privacy',
@@ -879,6 +975,8 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
     'Authorization',
     'Bearer',
     'cookie',
+    storedFigmaToken,
+    assetBytes,
     localAssetPath,
     path.dirname(localAssetPath),
     TEST_HOME,
