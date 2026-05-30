@@ -362,6 +362,70 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-parser-'));
 }
 
+function presentationCachePaths(projectId) {
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const assetsDir = path.join(crateDir, 'presentation-assets');
+  const projectDir = path.join(assetsDir, projectId);
+  return { crateDir, assetsDir, projectDir };
+}
+
+function resetPresentationCacheRoot() {
+  fs.rmSync(path.join(TEST_HOME, '.crate'), { recursive: true, force: true });
+}
+
+function chmodIfSupported(filePath, mode) {
+  if (process.platform !== 'win32') fs.chmodSync(filePath, mode);
+}
+
+function makePermissivePresentationCacheDirectories(projectId) {
+  const paths = presentationCachePaths(projectId);
+  for (const dirPath of [paths.crateDir, paths.assetsDir, paths.projectDir]) {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o755 });
+    chmodIfSupported(dirPath, 0o755);
+  }
+  return paths;
+}
+
+function assertOwnerOnlyMode(filePath, expectedMode) {
+  if (process.platform === 'win32') return;
+  assert.equal(fs.statSync(filePath).mode & 0o777, expectedMode);
+}
+
+function assertPresentationCacheDirectoryModes(projectId) {
+  const paths = presentationCachePaths(projectId);
+  assertOwnerOnlyMode(paths.crateDir, 0o700);
+  assertOwnerOnlyMode(paths.assetsDir, 0o700);
+  assertOwnerOnlyMode(paths.projectDir, 0o700);
+}
+
+function assertTextExcludes(text, forbiddenValues, label) {
+  forbiddenValues.forEach((value, index) => {
+    assert.equal(text.includes(value), false, `${label} should exclude forbidden value ${index}`);
+  });
+}
+
+async function captureConsoleDuring(fn) {
+  const originals = {
+    log: console.log,
+    warn: console.warn,
+    error: console.error,
+  };
+  const output = [];
+  for (const method of Object.keys(originals)) {
+    console[method] = (...args) => {
+      output.push(args.map(arg => arg instanceof Error ? arg.message : String(arg)).join(' '));
+    };
+  }
+  try {
+    const result = await fn();
+    return { result, output: output.join('\n') };
+  } finally {
+    console.log = originals.log;
+    console.warn = originals.warn;
+    console.error = originals.error;
+  }
+}
+
 function resetTestHomeWorkspace() {
   for (const folder of ['Desktop', 'Documents', 'Downloads']) {
     const folderPath = path.join(TEST_HOME, folder);
@@ -533,8 +597,16 @@ test.after(() => {
 test('PowerPoint scan-on-save extraction records media provenance without ledger metadata leak', async () => {
   const tmpRoot = makeTempDir();
   try {
+    resetPresentationCacheRoot();
     const project = await createProject('PowerPoint Scan Save Provenance');
     const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const mediaBytes = 'JPEG_BINARY_SHOULD_NOT_LEAK token=SHOULD_NOT_LEAK https://signed.example.test/private?sig=1 RAW_SCRIPT_OUTPUT '.repeat(10);
+    const forbiddenValues = [
+      'JPEG_BINARY_SHOULD_NOT_LEAK',
+      'token=SHOULD_NOT_LEAK',
+      'https://signed.example.test/private?sig=1',
+      'RAW_SCRIPT_OUTPUT',
+    ];
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -547,20 +619,27 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     });
     setPowerPointUnzipFixture([{
       internalPath: 'ppt/media/image1.jpeg',
-      data: Buffer.from('JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      data: Buffer.from(mediaBytes),
     }]);
 
-    await emitWatcher('change', pptxPath);
-    let fresh = await waitForProject(
-      project.id,
-      item => item.files.some(file => file.source === 'scan-on-save-presentation'),
-      5000
-    );
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation'),
+        5000
+      );
+    });
+    let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
     assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
     assert.equal(extracted.name, 'Deck — image1.jpeg');
-    assert.equal(fs.readFileSync(extracted.path, 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assertPresentationCacheDirectoryModes(project.id);
+    assertOwnerOnlyMode(extracted.path, 0o600);
+    assertTextExcludes(JSON.stringify(fresh), forbiddenValues, 'PowerPoint project state');
+    assertTextExcludes(captured.output, forbiddenValues, 'PowerPoint scan-on-save logs');
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
 
@@ -569,6 +648,60 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     fresh = await getProject(project.id);
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation scan-on-save hardens existing permissive cache directories and media files', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Cache Hardening');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = makePermissivePresentationCacheDirectories(project.id);
+    const stalePath = path.join(paths.projectDir, 'Deck — existing.jpeg');
+    fs.writeFileSync(stalePath, 'existing permissive media bytes', { mode: 0o644 });
+    chmodIfSupported(stalePath, 0o644);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: stalePath,
+          name: 'Deck — existing.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('PERMISSIVE_CACHE_NEW_BYTES'.repeat(40)),
+    }]);
+
+    await emitWatcher('change', pptxPath);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.name === 'Deck — image1.jpeg'),
+      5000
+    );
+    const extracted = fresh.files.find(file => file.name === 'Deck — image1.jpeg');
+    assert.ok(extracted);
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), 'PERMISSIVE_CACHE_NEW_BYTES'.repeat(40));
+    assertPresentationCacheDirectoryModes(project.id);
+    assertOwnerOnlyMode(stalePath, 0o600);
+    assertOwnerOnlyMode(extracted.path, 0o600);
+    assert.equal(fresh.files.some(file => file.path === stalePath), true);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -766,8 +899,17 @@ test('PowerPoint provenance failure does not block package extraction success', 
 test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async () => {
   const tmpRoot = makeTempDir();
   try {
+    resetPresentationCacheRoot();
     const project = await createProject('Keynote Scan Save Provenance');
     const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const mediaBytes = 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK token=SHOULD_NOT_LEAK https://signed.example.test/keynote?sig=1 RAW_SCRIPT_OUTPUT '.repeat(10);
+    const forbiddenValues = [
+      'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK',
+      'token=SHOULD_NOT_LEAK',
+      'https://signed.example.test/keynote?sig=1',
+      'RAW_SCRIPT_OUTPUT',
+    ];
+    makePermissivePresentationCacheDirectories(project.id);
     fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -780,20 +922,27 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
     });
     setKeynoteUnzipFixture([{
       internalPath: 'Data/photo-1234.jpeg',
-      data: Buffer.from('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      data: Buffer.from(mediaBytes),
     }]);
 
-    await emitWatcher('change', keynotePath);
-    let fresh = await waitForProject(
-      project.id,
-      item => item.files.some(file => file.source === 'scan-on-save-presentation'),
-      5000
-    );
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', keynotePath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation'),
+        5000
+      );
+    });
+    let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
     assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
     assert.equal(extracted.name, 'Deck — photo.jpeg');
-    assert.equal(fs.readFileSync(extracted.path, 'utf8'), 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assertPresentationCacheDirectoryModes(project.id);
+    assertOwnerOnlyMode(extracted.path, 0o600);
+    assertTextExcludes(JSON.stringify(fresh), forbiddenValues, 'Keynote project state');
+    assertTextExcludes(captured.output, forbiddenValues, 'Keynote scan-on-save logs');
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
 

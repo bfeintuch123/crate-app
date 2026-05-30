@@ -41,6 +41,8 @@ const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
 const TEMP_SCRIPT_DIR_PREFIX = 'crate-script-';
 const TEMP_SCRIPT_DIR_MODE = 0o700;
 const TEMP_SCRIPT_FILE_MODE = 0o600;
+const OWNER_ONLY_DIR_MODE = 0o700;
+const OWNER_ONLY_FILE_MODE = 0o600;
 
 function safeTempScriptName(name) {
   if (typeof name !== 'string' || name.trim() === '' || name !== path.basename(name)) {
@@ -2281,8 +2283,11 @@ const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
 const FIGMA_INCREMENTAL_OVERLAP_MS = FIGMA_POLL_INTERVAL_MS * 2; // 2 minutes
 const FIGMA_ASSETS_DIR = path.join(os.homedir(), '.crate', 'figma-assets');
-const FIGMA_ASSET_DIR_MODE = 0o700;
-const FIGMA_ASSET_FILE_MODE = 0o600;
+const FIGMA_ASSET_DIR_MODE = OWNER_ONLY_DIR_MODE;
+const FIGMA_ASSET_FILE_MODE = OWNER_ONLY_FILE_MODE;
+const PRESENTATION_ASSETS_DIR = path.join(os.homedir(), '.crate', 'presentation-assets');
+const PRESENTATION_ASSET_DIR_MODE = OWNER_ONLY_DIR_MODE;
+const PRESENTATION_ASSET_FILE_MODE = OWNER_ONLY_FILE_MODE;
 const SAFE_FIGMA_ASSET_FORMATS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'tif', 'tiff', 'heic',
   'svg', 'pdf', 'bmp', 'avif',
@@ -2647,18 +2652,50 @@ function hardenOwnerOnlyPermissions(targetPath, mode) {
   }
 }
 
-function ensureOwnerOnlyDirectory(dirPath) {
+function ensureOwnerOnlyDirectory(dirPath, mode = OWNER_ONLY_DIR_MODE) {
   if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true, mode: FIGMA_ASSET_DIR_MODE });
+    fs.mkdirSync(dirPath, { recursive: true, mode });
   }
-  hardenOwnerOnlyPermissions(dirPath, FIGMA_ASSET_DIR_MODE);
+  hardenOwnerOnlyPermissions(dirPath, mode);
   return dirPath;
+}
+
+function hardenOwnerOnlyFile(filePath, mode = OWNER_ONLY_FILE_MODE) {
+  if (process.platform === 'win32') return;
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return;
+  } catch (_) {
+    return;
+  }
+  hardenOwnerOnlyPermissions(filePath, mode);
+}
+
+function writeOwnerOnlyFileSync(filePath, data, options = {}, mode = OWNER_ONLY_FILE_MODE) {
+  fs.writeFileSync(filePath, data, { ...options, mode });
+  hardenOwnerOnlyFile(filePath, mode);
 }
 
 function ensureFigmaAssetsDir() {
   ensureOwnerOnlyDirectory(path.dirname(FIGMA_ASSETS_DIR));
   ensureOwnerOnlyDirectory(FIGMA_ASSETS_DIR);
   return FIGMA_ASSETS_DIR;
+}
+
+function ensurePresentationAssetsDir(projectId) {
+  ensureOwnerOnlyDirectory(path.dirname(PRESENTATION_ASSETS_DIR), PRESENTATION_ASSET_DIR_MODE);
+  ensureOwnerOnlyDirectory(PRESENTATION_ASSETS_DIR, PRESENTATION_ASSET_DIR_MODE);
+  return ensureOwnerOnlyDirectory(path.join(PRESENTATION_ASSETS_DIR, projectId), PRESENTATION_ASSET_DIR_MODE);
+}
+
+function isPathInsideDirectory(parentDir, filePath) {
+  if (typeof parentDir !== 'string' || typeof filePath !== 'string') return false;
+  const relativePath = path.relative(path.resolve(parentDir), path.resolve(filePath));
+  return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function hardenPresentationCacheFileIfPresent(filePath, cacheDir) {
+  if (!isPathInsideDirectory(cacheDir, filePath)) return;
+  hardenOwnerOnlyFile(filePath, PRESENTATION_ASSET_FILE_MODE);
 }
 
 function sanitizeFigmaAssetFormat(format) {
@@ -4140,8 +4177,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     const base = path.basename(presentationPath, ext);
 
     // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
-    const tempDir = path.join(os.homedir(), '.crate', 'presentation-assets', projectId);
-    await fs.promises.mkdir(tempDir, { recursive: true });
+    const tempDir = ensurePresentationAssetsDir(projectId);
 
     // Build dedup sets from existing project files
     const currentProjects = getProjects();
@@ -4152,6 +4188,9 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     // Name-based dedup for .key files
     const alreadyCapturedBases = new Set();
     for (const f of projectFiles) {
+      if (f && f.source === 'scan-on-save-presentation') {
+        hardenPresentationCacheFileIfPresent(f.path, tempDir);
+      }
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
       // v2.6.1: scan-on-save prefixes filenames with "{PresentationName} — ".
@@ -4252,13 +4291,14 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         let destPath = path.join(tempDir, outputName);
         let counter = 1;
         while (fs.existsSync(destPath)) {
+          hardenPresentationCacheFileIfPresent(destPath, tempDir);
           const e = path.extname(outputName);
           const b = path.basename(outputName, e);
           destPath = path.join(tempDir, `${b}_${counter}${e}`);
           counter++;
         }
 
-        fs.writeFileSync(destPath, data, { flag: 'wx' });
+        writeOwnerOnlyFileSync(destPath, data, { flag: 'wx' }, PRESENTATION_ASSET_FILE_MODE);
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
         newEntries.push({
@@ -4271,7 +4311,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
           presentationPath,
         });
       } catch (e) {
-        console.error(`[crate] scan-on-save-presentation: failed to extract ${zipPath}:`, e.message);
+        console.error(`[crate] scan-on-save-presentation: failed to extract ${zipPath}:`, redactFigmaLogText(e.message));
       }
     }
 
@@ -4308,7 +4348,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
       sendToRenderer('files:updated', { projectId, files: result.files });
     }
   } catch (e) {
-    console.log('[scan-on-save-presentation] extraction failed:', e.message);
+    console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
   }
 }
 
