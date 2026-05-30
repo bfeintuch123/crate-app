@@ -136,6 +136,63 @@ test('Quick Package extracts PowerPoint embedded media without reporting them mi
   }
 });
 
+test('Quick Package extracts Keynote Data media and ignores Keynote archive junk', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
+
+    unzipFixture = new Map([
+      ['Data/photo-1234.jpeg', 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/logo.png', 'KEYNOTE_PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/.hidden.png', 'KEYNOTE_HIDDEN_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['__MACOSX/Data/logo.png', 'KEYNOTE_MACOSX_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/st-1234abcd-5678.jpeg', 'KEYNOTE_SLIDE_THUMB_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/mt-1234.jpeg', 'KEYNOTE_THEME_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/bg-abcdef.jpeg', 'KEYNOTE_BACKGROUND_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/tx-abcdef.jpg', 'KEYNOTE_TEXT_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/photo-1234-small.jpeg', 'KEYNOTE_SMALL_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['assetsCopied', 'assetsFound', 'assetsMissing', 'files', 'masterFile', 'outputDir'].sort()
+    );
+    assert.equal(result.masterFile, deckPath);
+    assert.equal(result.assetsFound, 2);
+    assert.equal(result.assetsCopied, 2);
+    assert.deepEqual(result.assetsMissing, []);
+
+    assert.deepEqual(fs.readdirSync(outputDir).sort(), [
+      'Keynote Deck — logo.png',
+      'Keynote Deck — photo.jpeg',
+      'Keynote Deck.key',
+    ]);
+    assert.equal(fs.readFileSync(path.join(outputDir, 'Keynote Deck.key'), 'utf8'), 'keynote container bytes');
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Keynote Deck — photo.jpeg'), 'utf8'),
+      'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Keynote Deck — logo.png'), 'utf8'),
+      'KEYNOTE_PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Keynote Deck.key', source: 'master' },
+        { copied: 'Keynote Deck — photo.jpeg', source: 'embedded' },
+        { copied: 'Keynote Deck — logo.png', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Quick Package contains parser-controlled embedded filenames', async () => {
   const tmpRoot = makeTempDir();
   try {
