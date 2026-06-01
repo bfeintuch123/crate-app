@@ -2268,6 +2268,7 @@ const scanInFlight = new Set();
 let packageInFlight = false;
 
 let tray = null;
+// Historical name retained for existing renderer send paths; this is now the main app window.
 let trayWindow = null;
 const watchers = new Map(); // projectId -> chokidar watcher
 const lastFileActivity = new Map(); // projectId -> timestamp
@@ -4541,22 +4542,26 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
   }
 }
 
-function createTrayWindow() {
+function createMainWindow() {
+  if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
+
   trayWindow = new BrowserWindow({
-    width: 360,
-    height: 620,
-    show: false,
-    frame: false,
-    resizable: false,
-    movable: false,
-    minimizable: false,
-    maximizable: false,
-    closable: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    transparent: true,
-    vibrancy: 'sidebar',
-    visualEffectState: 'active',
+    width: 960,
+    height: 760,
+    minWidth: 720,
+    minHeight: 560,
+    show: true,
+    title: 'Crate',
+    frame: true,
+    resizable: true,
+    movable: true,
+    minimizable: true,
+    maximizable: true,
+    closable: true,
+    alwaysOnTop: false,
+    skipTaskbar: false,
+    transparent: false,
+    backgroundColor: '#ffffff',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -4566,46 +4571,35 @@ function createTrayWindow() {
 
   trayWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  trayWindow.on('blur', () => {
-    if (trayWindow && trayWindow.isVisible()) {
-      trayWindow.hide();
-    }
+  trayWindow.on('closed', () => {
+    trayWindow = null;
   });
+
+  return trayWindow;
 }
 
 function toggleTrayWindow() {
-  if (!trayWindow) return;
+  showMainWindow();
+}
 
-  if (trayWindow.isVisible()) {
-    trayWindow.hide();
-    return;
+function showMainWindow() {
+  if (typeof app.isReady === 'function' && !app.isReady()) return;
+
+  if (!trayWindow || trayWindow.isDestroyed()) {
+    createMainWindow();
   }
+  if (!trayWindow || trayWindow.isDestroyed()) return;
 
-  const trayBounds = tray.getBounds();
-  const windowBounds = trayWindow.getBounds();
-
-  const x = Math.round(trayBounds.x + trayBounds.width / 2 - windowBounds.width / 2);
-  const y = Math.round(trayBounds.y + trayBounds.height);
-
-  trayWindow.setPosition(x, y, false);
+  if (typeof trayWindow.isMinimized === 'function' && trayWindow.isMinimized()) {
+    trayWindow.restore();
+  }
   trayWindow.show();
   trayWindow.focus();
 }
 
-// Re-show the tray window (e.g. after a native dialog steals focus and triggers blur→hide)
+// Backward-compatible name for package/dialog flows that reveal the app UI.
 function showTrayWindow() {
-  if (!trayWindow || trayWindow.isDestroyed()) return;
-  if (!trayWindow.isVisible()) {
-    if (tray) {
-      const trayBounds = tray.getBounds();
-      const windowBounds = trayWindow.getBounds();
-      const x = Math.round(trayBounds.x + trayBounds.width / 2 - windowBounds.width / 2);
-      const y = Math.round(trayBounds.y + trayBounds.height);
-      trayWindow.setPosition(x, y, false);
-    }
-    trayWindow.show();
-    trayWindow.focus();
-  }
+  showMainWindow();
 }
 
 function createTray() {
@@ -5044,7 +5038,7 @@ function startInactivityChecker() {
           continue;
         }
 
-        // v2.4.2: Fallback — if tray window not visible, show native Notification
+        // v2.4.2: Fallback — if the app window is not visible, show native Notification
         if (!trayWindow || trayWindow.isDestroyed() || !trayWindow.isVisible()) {
           inactivityNotified.add(project.id);
           if (Notification.isSupported()) {
@@ -5056,9 +5050,7 @@ function startInactivityChecker() {
             notif.on('click', () => {
               lastFileActivity.set(project.id, Date.now());
               inactivityNotified.delete(project.id);
-              if (trayWindow && !trayWindow.isDestroyed()) {
-                trayWindow.show();
-              }
+              showMainWindow();
             });
             notif.show();
           }
@@ -5295,7 +5287,7 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
       { name: 'All Files', extensions: ['*'] },
     ],
   });
-  // Re-show tray window after native dialog closes (window hides on blur)
+  // Show the app window after native dialog closes.
   showTrayWindow();
 
   if (dialogResult.canceled) return null;
@@ -6453,7 +6445,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
       }).show();
     }
 
-    // Re-show tray window so user sees the success confirmation
+    // Show the app window so user sees the success confirmation.
     showTrayWindow();
 
     return {
@@ -6479,7 +6471,7 @@ ipcMain.handle('projects:select-output', async () => {
     title: 'Choose Package Destination',
     defaultPath: path.join(os.homedir(), 'Desktop')
   });
-  // Re-show tray window after native dialog closes (window hides on blur)
+  // Show the app window after native dialog closes.
   showTrayWindow();
   if (result.canceled) return null;
   return result.filePaths[0];
@@ -6796,8 +6788,9 @@ app.whenReady().then(async () => {
     ]));
   }
 
-  createTrayWindow();
+  createMainWindow();
   createTray();
+  showMainWindow();
 
   // Resume watching for any active projects (FIX 4: await async startWatching)
   const projects = getProjects();
@@ -6811,12 +6804,20 @@ app.whenReady().then(async () => {
   startInactivityChecker();
 });
 
+app.on('activate', () => {
+  showMainWindow();
+});
+
+app.on('second-instance', () => {
+  showMainWindow();
+});
+
 // Track intentional quit so we don't block Dock right-click → Quit
 let isQuitting = false;
 
 app.on('window-all-closed', (e) => {
   // Only prevent quit if it wasn't deliberately triggered (e.g. user closed
-  // the tray window by accident). Dock "Quit" and app.quit() set isQuitting=true
+  // the app window). Dock "Quit" and app.quit() set isQuitting=true
   // via before-quit, so those flow through cleanly.
   if (!isQuitting) {
     e.preventDefault();
@@ -6872,7 +6873,7 @@ app.on('before-quit', () => {
     clearTimeout(timerId);
   }
   scanOnSavePresentationTimers.clear();
-  // Explicitly destroy tray + window so quit isn't blocked by hidden windows
+  // Explicitly destroy tray + window so quit isn't blocked by live windows.
   if (tray && !tray.isDestroyed()) {
     tray.destroy();
     tray = null;
