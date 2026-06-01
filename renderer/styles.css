@@ -27,7 +27,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
   font-size: 13px;
   color: var(--black);
-  background: transparent;
+  background: var(--white);
   -webkit-font-smoothing: antialiased;
   user-select: none;
   overflow: hidden;
@@ -35,18 +35,11 @@ body {
 
 /* ===== App Container ===== */
 #app {
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(20px);
-  border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.6);
-  box-shadow:
-    0 32px 100px rgba(0, 0, 0, 0.22),
-    0 8px 28px rgba(0, 0, 0, 0.12),
-    0 1px 4px rgba(0, 0, 0, 0.06);
+  background: var(--white);
   display: flex;
   flex-direction: column;
   height: 100vh;
-  max-height: 620px;
+  width: 100vw;
   overflow: hidden;
 }
 
