@@ -497,19 +497,39 @@ function assertPackageResultShape(result) {
 
 function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
   const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
+  const entryData = (entry) => Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data || '');
+  const listedPath = (entry) => typeof entry.listedPath === 'string' ? entry.listedPath : entry.internalPath;
+  const matchesZipPattern = (pattern, candidate) => {
+    const wildcardIndex = pattern.indexOf('*');
+    if (wildcardIndex === -1) return pattern === candidate;
+    const prefix = pattern.slice(0, wildcardIndex);
+    const suffix = pattern.slice(wildcardIndex + 1);
+    return candidate.startsWith(prefix) && candidate.endsWith(suffix);
+  };
+  const entryMatches = (entryPath) => {
+    if (byInternalPath.has(entryPath)) return [entryPath];
+    if (!entryPath.includes('*')) return [];
+    return [...byInternalPath.keys()].filter(candidate => matchesZipPattern(entryPath, candidate));
+  };
+
   setChildProcessHandler(({ kind, command, args }) => {
     if (kind !== 'execFile' || command !== '/usr/bin/unzip') return { stdout: '', stderr: '' };
     if (args[0] === '-l') {
       const lines = mediaEntries.map(entry => {
-        const size = entry.data.length;
-        return `      ${size}  05-26-2026 12:34   ${entry.internalPath}`;
+        const size = entryData(entry).length;
+        return `      ${size}  05-26-2026 12:34   ${listedPath(entry)}`;
       });
       return { stdout: [`Archive: ${archiveName}`, ...lines, ''].join('\n'), stderr: '' };
     }
     if (args[0] === '-p') {
-      const entry = byInternalPath.get(args[2]);
-      if (entry && entry.error) throw entry.error;
-      return { stdout: entry ? entry.data : Buffer.alloc(0), stderr: '' };
+      const matches = entryMatches(args[2]);
+      if (matches.length === 0) throw new Error(`Missing fixture for ${args[2]}`);
+      const buffers = matches.map(match => {
+        const entry = byInternalPath.get(match);
+        if (entry && entry.error) throw entry.error;
+        return entryData(entry);
+      });
+      return { stdout: Buffer.concat(buffers), stderr: '' };
     }
     return { stdout: '', stderr: '' };
   });
@@ -1354,6 +1374,144 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(duplicateResult.totalFiles, 1);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction falls back to a unique safe tail for mojibake-listed Data media', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Mojibake Media');
+    const keynotePath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    const listedPath = 'Data/Presentation1-QA3-QuickPackage-Smoke \uFFFD\uFFFD\uFFFD image2-9089.png';
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/Presentation1-QA3-QuickPackage-Smoke raw-bytes image2-9089.png',
+      listedPath,
+      data: Buffer.from('KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+    }]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Keynote Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Mojibake Media');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Keynote Deck.key'), 'utf8'), 'keynote container bytes');
+    assert.equal(
+      fs.readFileSync(path.join(destFolder, 'Keynote Deck — image2.png'), 'utf8'),
+      'KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
+
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'));
+    assert.deepEqual(
+      embeddedResources.map(node => node.sourceMetadata.internalPath),
+      [listedPath]
+    );
+    assert.equal(String(embeddedResources[0].resourceKey || '').startsWith('keynote-media:'), true);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE)[0].payload.internalPath, listedPath);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE)[0].payload.internalPath, listedPath);
+
+    const manifest = readManifest(outputDir, 'Keynote Mojibake Media');
+    assert.equal(manifest.package.embeddedCount, 1);
+    assert.deepEqual(manifest.package.errors, []);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('Keynote Deck — image2.png'), true);
+    assert.equal(manifestText.includes('KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction fails closed for ambiguous mojibake wildcard tails', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Ambiguous Mojibake');
+    const keynotePath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([
+      {
+        internalPath: 'Data/raw-entry-a image2-9089.png',
+        listedPath: 'Data/Slide A \uFFFD\uFFFD\uFFFD image2-9089.png',
+        data: Buffer.from('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'Data/raw-entry-b image2-9089.png',
+        listedPath: 'Data/Slide B \uFFFD\uFFFD\uFFFD image2-9089.png',
+        data: Buffer.from('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Keynote Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, [
+      'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+      'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+    ]);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Ambiguous Mojibake');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Keynote Deck.key'), 'utf8'), 'keynote container bytes');
+    assert.equal(fs.existsSync(path.join(destFolder, 'Keynote Deck — image2.png')), false);
+
+    const errorText = JSON.stringify(result.errors);
+    assert.equal(errorText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(errorText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(errorText.includes('unzip'), false);
+    assert.equal(errorText.includes('/private/tmp'), false);
+    assert.equal(errorText.includes(tmpRoot), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+
+    const manifest = readManifest(outputDir, 'Keynote Ambiguous Mojibake');
+    assert.equal(manifest.package.embeddedCount, 0);
+    assert.deepEqual(manifest.package.errors, result.errors);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(manifestText.includes('/private/tmp'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

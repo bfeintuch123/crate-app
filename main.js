@@ -5939,7 +5939,7 @@ function safeEmbeddedMediaDisplayName(rawName, fallbackName) {
 }
 
 function formatEmbeddedMediaExtractionFailure(presentationPath, internalPath) {
-  const mediaName = safeEmbeddedMediaDisplayName(internalPath, 'embedded media');
+  const mediaName = safeEmbeddedMediaDisplayName(getKeynoteArchiveEntryTail(internalPath) || internalPath, 'embedded media');
   const presentationName = safeEmbeddedMediaDisplayName(presentationPath, 'presentation');
   return `Could not extract embedded media ${mediaName} from ${presentationName}.`;
 }
@@ -5947,6 +5947,67 @@ function formatEmbeddedMediaExtractionFailure(presentationPath, internalPath) {
 function formatEmbeddedMediaInspectionFailure(presentationPath) {
   const presentationName = safeEmbeddedMediaDisplayName(presentationPath, 'presentation');
   return `Could not inspect embedded media in ${presentationName}.`;
+}
+
+const KEYNOTE_SAFE_WILDCARD_TAIL = /^[A-Za-z0-9][A-Za-z0-9._ ()-]*\.[A-Za-z0-9]{2,5}$/;
+
+function getKeynoteArchiveEntryTail(zipPath) {
+  if (typeof zipPath !== 'string' || !zipPath.startsWith('Data/')) return null;
+
+  const entryName = path.basename(zipPath).trim();
+  if (!entryName) return null;
+
+  const mojibakeSegments = entryName
+    .split(/\uFFFD+/)
+    .map(part => part.trim())
+    .filter(Boolean);
+  const candidate = mojibakeSegments.length > 1
+    ? mojibakeSegments[mojibakeSegments.length - 1]
+    : entryName;
+
+  if (!candidate || candidate.includes('/') || candidate.includes('\\')) return null;
+  if (/[\x00-\x1f\x7f*?\[\]{}]/.test(candidate)) return null;
+  if (!KEYNOTE_SAFE_WILDCARD_TAIL.test(candidate)) return null;
+  if (!EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(candidate).toLowerCase())) return null;
+  return candidate;
+}
+
+function getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths) {
+  const tail = getKeynoteArchiveEntryTail(zipPath);
+  if (!tail) return null;
+
+  const matches = (listedZipPaths || [])
+    .filter(listedPath => typeof listedPath === 'string')
+    .filter(listedPath => listedPath.startsWith('Data/'))
+    .filter(listedPath => EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(listedPath).toLowerCase()))
+    .filter(listedPath => getKeynoteArchiveEntryTail(listedPath) === tail);
+  if (matches.length !== 1) return null;
+
+  return {
+    tail,
+    wildcardPath: `Data/*${tail}`,
+  };
+}
+
+async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths) {
+  try {
+    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
+      timeout: 10000, maxBuffer: 50 * 1024 * 1024,
+      encoding: 'buffer'
+    });
+    return { data, outputTail: getKeynoteArchiveEntryTail(zipPath) };
+  } catch (exactError) {
+    if (ext !== '.key') throw exactError;
+
+    const fallback = getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths);
+    if (!fallback) throw exactError;
+
+    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, fallback.wildcardPath], {
+      timeout: 10000, maxBuffer: 50 * 1024 * 1024,
+      encoding: 'buffer'
+    });
+    return { data, outputTail: fallback.tail };
+  }
 }
 
 // Parse a zip entry date from `unzip -l` output (macOS format: MM-DD-YYYY HH:MM)
@@ -6022,7 +6083,15 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       timeout: 10000, encoding: 'utf8'
     });
 
-    for (const line of listing.split('\n')) {
+    const listingLines = listing.split('\n');
+    const listedZipPaths = listingLines
+      .map(line => {
+        const m = line.match(/^\s+(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\s+(.+)$/);
+        return m ? m[4].trim() : null;
+      })
+      .filter(Boolean);
+
+    for (const line of listingLines) {
       // Match: length, date (MM-DD-YYYY), time (HH:MM), filename
       const m = line.match(/^\s+(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\s+(.+)$/);
       if (!m) continue;
@@ -6111,11 +6180,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       }
 
       try {
-        // unzip -p pipes file contents to stdout
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
-          timeout: 10000, maxBuffer: 50 * 1024 * 1024, // 50MB per file
-          encoding: 'buffer'
-        });
+        const { data, outputTail } = await extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths);
 
         // v1.3.18: Content-based dedup for .pptx — skip if identical to a captured file.
         if ((ext === '.pptx' || ext === '.ppt') && contentFingerprints.size > 0) {
@@ -6131,7 +6196,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
         // Recover the original filename: strip Keynote's trailing "-NNNN" suffix
         // e.g. "shopping (5)-9073.jpeg" → "shopping (5).jpeg"
-        let outputName = path.basename(zipPath);
+        let outputName = outputTail || path.basename(zipPath);
         if (ext === '.key') {
           outputName = outputName.replace(/-\d{3,6}(\.[a-z]+)$/i, '$1');
         }
