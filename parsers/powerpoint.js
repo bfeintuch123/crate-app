@@ -45,7 +45,7 @@ function safeDisplayName(rawName, fallbackName) {
 }
 
 function formatEmbeddedMediaExtractionFailure(archivePath, zipPath) {
-  const mediaName = safeDisplayName(zipPath, 'embedded media');
+  const mediaName = safeDisplayName(getKeynoteArchiveEntryTail(zipPath) || zipPath, 'embedded media');
   const archiveName = safeDisplayName(archivePath, 'presentation');
   return `Could not extract embedded media ${mediaName} from ${archiveName}.`;
 }
@@ -60,6 +60,67 @@ const EMBEDDED_MEDIA_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
   '.svg', '.pdf', '.eps', '.mp4', '.mov', '.m4v', '.avi', '.wmv'
 ]);
+
+const KEYNOTE_SAFE_WILDCARD_TAIL = /^[A-Za-z0-9][A-Za-z0-9._ ()-]*\.[A-Za-z0-9]{2,5}$/;
+
+function getKeynoteArchiveEntryTail(zipPath) {
+  if (typeof zipPath !== 'string' || !zipPath.startsWith('Data/')) return null;
+
+  const entryName = path.basename(zipPath).trim();
+  if (!entryName) return null;
+
+  const mojibakeSegments = entryName
+    .split(/\uFFFD+/)
+    .map(part => part.trim())
+    .filter(Boolean);
+  const candidate = mojibakeSegments.length > 1
+    ? mojibakeSegments[mojibakeSegments.length - 1]
+    : entryName;
+
+  if (!candidate || candidate.includes('/') || candidate.includes('\\')) return null;
+  if (/[\x00-\x1f\x7f*?\[\]{}]/.test(candidate)) return null;
+  if (!KEYNOTE_SAFE_WILDCARD_TAIL.test(candidate)) return null;
+  if (!EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(candidate).toLowerCase())) return null;
+  return candidate;
+}
+
+function getUniqueKeynoteWildcardFallback(zipPath, assets) {
+  const tail = getKeynoteArchiveEntryTail(zipPath);
+  if (!tail) return null;
+
+  const matches = (assets || [])
+    .filter(asset => asset && typeof asset.zipPath === 'string')
+    .filter(asset => getKeynoteArchiveEntryTail(asset.zipPath) === tail);
+  if (matches.length !== 1) return null;
+
+  return {
+    tail,
+    wildcardPath: `Data/*${tail}`,
+  };
+}
+
+async function extractArchiveEntryData(archivePath, zipPath, ext, assets) {
+  try {
+    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, zipPath], {
+      timeout: 30000,
+      maxBuffer: 100 * 1024 * 1024,
+      encoding: 'buffer'
+    });
+    return { data, outputTail: getKeynoteArchiveEntryTail(zipPath) };
+  } catch (exactError) {
+    if (ext !== '.key') throw exactError;
+
+    const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
+    if (!fallback) throw exactError;
+
+    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, fallback.wildcardPath], {
+      timeout: 30000,
+      maxBuffer: 100 * 1024 * 1024,
+      encoding: 'buffer'
+    });
+    return { data, outputTail: fallback.tail };
+  }
+}
 
 class PowerPointParser extends BaseParser {
   /**
@@ -175,15 +236,10 @@ class PowerPointParser extends BaseParser {
       if (!asset.zipPath) continue;
 
       try {
-        // Extract file content using unzip -p (pipe to stdout)
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, asset.zipPath], {
-          timeout: 30000,
-          maxBuffer: 100 * 1024 * 1024,  // 100MB per file
-          encoding: 'buffer'
-        });
+        const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
 
         // Generate output filename
-        let outputName = path.basename(asset.zipPath);
+        let outputName = outputTail || path.basename(asset.zipPath);
 
         // Strip Keynote's numeric suffix (e.g., "image-9073.jpg" → "image.jpg")
         if (ext === '.key') {

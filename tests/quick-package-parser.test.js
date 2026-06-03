@@ -38,6 +38,27 @@ function unzipFixtureData(value) {
   return value;
 }
 
+function unzipFixtureListedPath(zipPath, value) {
+  if (value && typeof value === 'object' && typeof value.listedPath === 'string') {
+    return value.listedPath;
+  }
+  return zipPath;
+}
+
+function matchesZipPattern(pattern, candidate) {
+  const wildcardIndex = pattern.indexOf('*');
+  if (wildcardIndex === -1) return pattern === candidate;
+  const prefix = pattern.slice(0, wildcardIndex);
+  const suffix = pattern.slice(wildcardIndex + 1);
+  return candidate.startsWith(prefix) && candidate.endsWith(suffix);
+}
+
+function unzipFixtureMatches(zipPath) {
+  if (unzipFixture.has(zipPath)) return [zipPath];
+  if (!zipPath.includes('*')) return [];
+  return [...unzipFixture.keys()].filter(candidate => matchesZipPattern(zipPath, candidate));
+}
+
 function createChildProcessStub() {
   return {
     on: () => {},
@@ -52,7 +73,7 @@ function unzipListing() {
     'Archive: deck.pptx',
     ...[...unzipFixture.entries()].map(([zipPath, data]) => {
       const size = Buffer.byteLength(unzipFixtureData(data));
-      return `${String(size).padStart(9)}  01-01-2026 12:00  ${zipPath}`;
+      return `${String(size).padStart(9)}  01-01-2026 12:00  ${unzipFixtureListedPath(zipPath, data)}`;
     }),
     '',
   ].join('\n');
@@ -80,12 +101,16 @@ execFileStub[nodePromisify.custom] = async (command, args = []) => {
 
   if (args[0] === '-p') {
     const zipPath = args[2];
-    if (!unzipFixture.has(zipPath)) {
+    const matches = unzipFixtureMatches(zipPath);
+    if (matches.length === 0) {
       throw new Error(`Missing fixture for ${zipPath}`);
     }
-    const value = unzipFixture.get(zipPath);
-    if (value && typeof value === 'object' && value.error) throw value.error;
-    return { stdout: Buffer.from(unzipFixtureData(value)), stderr: '' };
+    const buffers = matches.map(match => {
+      const value = unzipFixture.get(match);
+      if (value && typeof value === 'object' && value.error) throw value.error;
+      return Buffer.from(unzipFixtureData(value));
+    });
+    return { stdout: Buffer.concat(buffers), stderr: '' };
   }
 
   throw new Error(`Unexpected unzip args: ${args.join(' ')}`);
@@ -251,6 +276,90 @@ test('Quick Package extracts Keynote Data media and ignores Keynote archive junk
         { copied: 'Keynote Deck — logo.png', source: 'embedded' },
       ]
     );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package extracts Keynote media with mojibake-listed archive names through a unique safe tail', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
+
+    unzipFixture = new Map([
+      ['Data/Presentation1-QA3-QuickPackage-Smoke raw-bytes image2-9089.png', {
+        listedPath: 'Data/Presentation1-QA3-QuickPackage-Smoke \uFFFD\uFFFD\uFFFD image2-9089.png',
+        data: 'KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+      }],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.equal(result.assetsFound, 1);
+    assert.equal(result.assetsCopied, 1);
+    assert.deepEqual(result.assetsMissing, []);
+    assert.deepEqual(fs.readdirSync(outputDir).sort(), [
+      'Keynote Deck — image2.png',
+      'Keynote Deck.key',
+    ]);
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Keynote Deck — image2.png'), 'utf8'),
+      'KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Keynote Deck.key', source: 'master' },
+        { copied: 'Keynote Deck — image2.png', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package fails closed for ambiguous Keynote mojibake wildcard tails', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
+
+    unzipFixture = new Map([
+      ['Data/raw-entry-a image2-9089.png', {
+        listedPath: 'Data/Slide A \uFFFD\uFFFD\uFFFD image2-9089.png',
+        data: 'KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+      }],
+      ['Data/raw-entry-b image2-9089.png', {
+        listedPath: 'Data/Slide B \uFFFD\uFFFD\uFFFD image2-9089.png',
+        data: 'KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+      }],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.equal(result.assetsFound, 2);
+    assert.equal(result.assetsCopied, 0);
+    assert.deepEqual(result.assetsMissing, [
+      {
+        path: 'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+        source: 'keynote-embedded',
+      },
+      {
+        path: 'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+        source: 'keynote-embedded',
+      },
+    ]);
+    assert.deepEqual(fs.readdirSync(outputDir).sort(), ['Keynote Deck.key']);
+
+    const missingText = JSON.stringify(result.assetsMissing);
+    assert.equal(missingText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(missingText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(missingText.includes('unzip'), false);
+    assert.equal(missingText.includes('/private/tmp'), false);
+    assert.equal(missingText.includes(tmpRoot), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
