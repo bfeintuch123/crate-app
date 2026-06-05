@@ -1446,6 +1446,85 @@ test('Keynote package extraction falls back to a unique safe tail for mojibake-l
   }
 });
 
+test('Keynote package extraction recovers mixed mojibake tails without collapsing output names', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Mixed Mojibake Media');
+    const keynotePath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    const exactPath = 'Data/Screenshot 2026-03-10 at 9.07-9090.png';
+    const mixedListedPath = 'Data/Screenshot 2026-03-10 at 9.07.43\uFFFD\u01FBPM-9089.png';
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    setKeynoteUnzipFixture([
+      {
+        internalPath: exactPath,
+        data: Buffer.from('KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+      {
+        internalPath: 'Data/Screenshot 2026-03-10 at 9.07.43 raw-bytes PM-9089.png',
+        listedPath: mixedListedPath,
+        data: Buffer.from('KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
+      },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: keynotePath,
+        name: 'Keynote Deck.key',
+        ext: '.key',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 2);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Mixed Mojibake Media');
+    const packageEntries = fs.readdirSync(destFolder).sort();
+    assert.equal(packageEntries.includes('Keynote Deck.key'), true);
+    assert.equal(packageEntries.includes('Keynote Deck — Screenshot 2026-03-10 at 9.07.png'), true);
+    assert.equal(packageEntries.includes('Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), true);
+    assert.equal(packageEntries.includes('Keynote Deck — PM.png'), false);
+    assert.equal(packageEntries.some(name => name.includes('\uFFFD') || name.includes('\u01FB')), false);
+    assert.equal(
+      fs.readFileSync(path.join(destFolder, 'Keynote Deck — Screenshot 2026-03-10 at 9.07.png'), 'utf8'),
+      'KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(
+      fs.readFileSync(path.join(destFolder, 'Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), 'utf8'),
+      'KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
+    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
+      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'))
+      .map(node => node.sourceMetadata.internalPath)
+      .sort();
+    assert.deepEqual(embeddedResources, [exactPath, mixedListedPath].sort());
+
+    const manifest = readManifest(outputDir, 'Keynote Mixed Mojibake Media');
+    assert.equal(manifest.package.embeddedCount, 2);
+    assert.deepEqual(manifest.package.errors, []);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), true);
+    assert.equal(manifestText.includes('KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'), false);
+    assert.equal(manifestText.includes('KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Keynote package extraction fails closed for ambiguous mojibake wildcard tails', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -1456,13 +1535,13 @@ test('Keynote package extraction fails closed for ambiguous mojibake wildcard ta
     fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
     setKeynoteUnzipFixture([
       {
-        internalPath: 'Data/raw-entry-a image2-9089.png',
-        listedPath: 'Data/Slide A \uFFFD\uFFFD\uFFFD image2-9089.png',
+        internalPath: 'Data/raw-entry-a PM-9089.png',
+        listedPath: 'Data/Slide A \uFFFD\u01FBPM-9089.png',
         data: Buffer.from('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
       },
       {
-        internalPath: 'Data/raw-entry-b image2-9089.png',
-        listedPath: 'Data/Slide B \uFFFD\uFFFD\uFFFD image2-9089.png',
+        internalPath: 'Data/raw-entry-b PM-9089.png',
+        listedPath: 'Data/Slide B \uFFFD\u01FBPM-9089.png',
         data: Buffer.from('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
       },
     ]);
@@ -1484,13 +1563,13 @@ test('Keynote package extraction fails closed for ambiguous mojibake wildcard ta
     assert.equal(result.embeddedCount, 0);
     assert.equal(result.totalFiles, 1);
     assert.deepEqual(result.errors, [
-      'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
-      'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+      'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
+      'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
     ]);
 
     const destFolder = packageFolder(outputDir, 'Keynote Ambiguous Mojibake');
     assert.equal(fs.readFileSync(path.join(destFolder, 'Keynote Deck.key'), 'utf8'), 'keynote container bytes');
-    assert.equal(fs.existsSync(path.join(destFolder, 'Keynote Deck — image2.png')), false);
+    assert.equal(fs.existsSync(path.join(destFolder, 'Keynote Deck — PM.png')), false);
 
     const errorText = JSON.stringify(result.errors);
     assert.equal(errorText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);

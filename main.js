@@ -5950,26 +5950,62 @@ function formatEmbeddedMediaInspectionFailure(presentationPath) {
 }
 
 const KEYNOTE_SAFE_WILDCARD_TAIL = /^[A-Za-z0-9][A-Za-z0-9._ ()-]*\.[A-Za-z0-9]{2,5}$/;
+const KEYNOTE_SAFE_WILDCARD_CHAR = /^[A-Za-z0-9._ ()-]$/;
+
+function stripKeynoteNumericSuffix(name) {
+  return String(name || '').replace(/-\d{3,6}(\.[a-z0-9]{2,5})$/i, '$1');
+}
+
+function hasEmbeddedMediaExtension(name) {
+  return EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(String(name || '')).toLowerCase());
+}
+
+function isSafeKeynoteWildcardTail(candidate) {
+  if (!candidate || candidate.includes('/') || candidate.includes('\\')) return false;
+  if (/[\x00-\x1f\x7f*?\[\]{}]/.test(candidate)) return false;
+  if (!KEYNOTE_SAFE_WILDCARD_TAIL.test(candidate)) return false;
+  return hasEmbeddedMediaExtension(candidate);
+}
+
+function isUsefulKeynoteOutputTail(tail) {
+  const stripped = stripKeynoteNumericSuffix(tail);
+  const stem = path.basename(stripped, path.extname(stripped)).trim();
+  return stem.length >= 3;
+}
 
 function getKeynoteArchiveEntryTail(zipPath) {
   if (typeof zipPath !== 'string' || !zipPath.startsWith('Data/')) return null;
 
   const entryName = path.basename(zipPath).trim();
   if (!entryName) return null;
+  if (!hasEmbeddedMediaExtension(entryName)) return null;
 
-  const mojibakeSegments = entryName
-    .split(/\uFFFD+/)
-    .map(part => part.trim())
-    .filter(Boolean);
-  const candidate = mojibakeSegments.length > 1
-    ? mojibakeSegments[mojibakeSegments.length - 1]
-    : entryName;
+  let suffixStart = entryName.length;
+  while (suffixStart > 0 && KEYNOTE_SAFE_WILDCARD_CHAR.test(entryName[suffixStart - 1])) {
+    suffixStart -= 1;
+  }
 
-  if (!candidate || candidate.includes('/') || candidate.includes('\\')) return null;
-  if (/[\x00-\x1f\x7f*?\[\]{}]/.test(candidate)) return null;
-  if (!KEYNOTE_SAFE_WILDCARD_TAIL.test(candidate)) return null;
-  if (!EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(candidate).toLowerCase())) return null;
-  return candidate;
+  const candidate = entryName.slice(suffixStart).trim();
+  return isSafeKeynoteWildcardTail(candidate) ? candidate : null;
+}
+
+function getKeynoteArchiveEntryOutputTail(zipPath, wildcardTail = null) {
+  if (typeof zipPath !== 'string' || !zipPath.startsWith('Data/')) return null;
+
+  const entryName = path.basename(zipPath).trim();
+  if (!entryName) return wildcardTail;
+
+  const tail = wildcardTail || getKeynoteArchiveEntryTail(zipPath);
+  if (tail && isUsefulKeynoteOutputTail(tail)) return tail;
+
+  const displayName = entryName
+    .replace(/[^\x20-\x7e]+/g, ' ')
+    .replace(/[\x00-\x1f\x7f*?\[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const safeDisplayName = safeEmbeddedMediaDisplayName(displayName, tail || 'embedded media');
+  if (hasEmbeddedMediaExtension(safeDisplayName)) return safeDisplayName;
+  return tail;
 }
 
 function getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths) {
@@ -5980,7 +6016,7 @@ function getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths) {
     .filter(listedPath => typeof listedPath === 'string')
     .filter(listedPath => listedPath.startsWith('Data/'))
     .filter(listedPath => EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(listedPath).toLowerCase()))
-    .filter(listedPath => getKeynoteArchiveEntryTail(listedPath) === tail);
+    .filter(listedPath => path.basename(listedPath).trim().endsWith(tail));
   if (matches.length !== 1) return null;
 
   return {
@@ -5995,7 +6031,7 @@ async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, l
       timeout: 10000, maxBuffer: 50 * 1024 * 1024,
       encoding: 'buffer'
     });
-    return { data, outputTail: getKeynoteArchiveEntryTail(zipPath) };
+    return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
   } catch (exactError) {
     if (ext !== '.key') throw exactError;
 
@@ -6006,7 +6042,7 @@ async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, l
       timeout: 10000, maxBuffer: 50 * 1024 * 1024,
       encoding: 'buffer'
     });
-    return { data, outputTail: fallback.tail };
+    return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
 }
 
