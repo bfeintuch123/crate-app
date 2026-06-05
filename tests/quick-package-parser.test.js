@@ -320,6 +320,53 @@ test('Quick Package extracts Keynote media with mojibake-listed archive names th
   }
 });
 
+test('Quick Package extracts Keynote media with mixed mojibake tails without false missing assets', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Keynote Deck.key');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
+
+    unzipFixture = new Map([
+      ['Data/Screenshot 2026-03-10 at 9.07-9090.png', 'KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'.repeat(40)],
+      ['Data/Screenshot 2026-03-10 at 9.07.43 raw-bytes PM-9089.png', {
+        listedPath: 'Data/Screenshot 2026-03-10 at 9.07.43\uFFFD\u01FBPM-9089.png',
+        data: 'KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40),
+      }],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.equal(result.assetsFound, 2);
+    assert.equal(result.assetsCopied, 2);
+    assert.deepEqual(result.assetsMissing, []);
+    assert.deepEqual(fs.readdirSync(outputDir).sort(), [
+      'Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png',
+      'Keynote Deck — Screenshot 2026-03-10 at 9.07.png',
+      'Keynote Deck.key',
+    ]);
+    assert.equal(fs.existsSync(path.join(outputDir, 'Keynote Deck — PM.png')), false);
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Keynote Deck — Screenshot 2026-03-10 at 9.07.png'), 'utf8'),
+      'KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), 'utf8'),
+      'KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Keynote Deck.key', source: 'master' },
+        { copied: 'Keynote Deck — Screenshot 2026-03-10 at 9.07.png', source: 'embedded' },
+        { copied: 'Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Quick Package fails closed for ambiguous Keynote mojibake wildcard tails', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -328,12 +375,12 @@ test('Quick Package fails closed for ambiguous Keynote mojibake wildcard tails',
     fs.writeFileSync(deckPath, Buffer.from('keynote container bytes'));
 
     unzipFixture = new Map([
-      ['Data/raw-entry-a image2-9089.png', {
-        listedPath: 'Data/Slide A \uFFFD\uFFFD\uFFFD image2-9089.png',
+      ['Data/raw-entry-a PM-9089.png', {
+        listedPath: 'Data/Slide A \uFFFD\u01FBPM-9089.png',
         data: 'KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'.repeat(40),
       }],
-      ['Data/raw-entry-b image2-9089.png', {
-        listedPath: 'Data/Slide B \uFFFD\uFFFD\uFFFD image2-9089.png',
+      ['Data/raw-entry-b PM-9089.png', {
+        listedPath: 'Data/Slide B \uFFFD\u01FBPM-9089.png',
         data: 'KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'.repeat(40),
       }],
     ]);
@@ -344,11 +391,11 @@ test('Quick Package fails closed for ambiguous Keynote mojibake wildcard tails',
     assert.equal(result.assetsCopied, 0);
     assert.deepEqual(result.assetsMissing, [
       {
-        path: 'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+        path: 'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
         source: 'keynote-embedded',
       },
       {
-        path: 'Could not extract embedded media image2-9089.png from Keynote Deck.key.',
+        path: 'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
         source: 'keynote-embedded',
       },
     ]);
