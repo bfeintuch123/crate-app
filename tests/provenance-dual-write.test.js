@@ -2064,7 +2064,74 @@ test('chokidar ignored, non-primary, and temp files do not record provenance', a
   assert.deepEqual(fresh.provenance.observations, []);
 });
 
-test('initial lsof snapshot records sanitized app process provenance for accepted lsof file', async () => {
+test('automatic live capture ignores old package output and diagnostics folders', async () => {
+  const project = await createProject('Package output exclusion');
+  const packageRootFile = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Crate-QA',
+    'v2.8.0-qa.5-jenna',
+    'package-outputs',
+    'Jenna Baseline Existing Files QA_2026-06-07',
+    'Pricing Tobias Joseph copy.indd'
+  );
+  const diagnosticsFile = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Jenna Baseline Existing Files QA_2026-06-07',
+    'Crate Diagnostics',
+    'diagnostics-source.ai'
+  );
+  const quickPackageFile = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Presentation1_2026-06-07',
+    'Presentation1.ai'
+  );
+
+  for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, 'excluded auto capture bytes');
+    await emitWatcher('add', filePath);
+    await emitWatcher('change', filePath);
+  }
+
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.deepEqual(fresh.provenance.observations, []);
+});
+
+test('manual add remains allowed for excluded-looking package output paths', async () => {
+  const project = await createProject('Manual package output add');
+  const filePath = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Crate-QA',
+    'package-outputs',
+    'Manual Existing Files QA_2026-06-07',
+    'explicit-source.ai'
+  );
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, 'manual add bytes');
+
+  manualDialogFor([filePath]);
+  const files = await callIpc('projects:add-files', project.id);
+
+  assert.equal(files.length, 1);
+  assert.equal(files[0].path, filePath);
+  assert.equal(files[0].source, 'manual-browse');
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assertSessionObservedFile(
+    fresh,
+    OBSERVER_KINDS.MANUAL_USER_ACTION,
+    'projects:add-files',
+    CONFIDENCE_BANDS.CONFIRMED
+  );
+});
+
+test('initial lsof snapshot stages stale open files as pending without captured-file provenance', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'initial-logo.ai');
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
@@ -2081,31 +2148,20 @@ test('initial lsof snapshot records sanitized app process provenance for accepte
   const project = await createProject('Initial lsof provenance');
   const fresh = await getProject(project.id);
 
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'lsof');
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof');
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
   const sessionObservations = getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE);
   const appOpenedObservations = getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE);
 
-  assert.equal(appNodes.length, 1);
-  assert.equal(appNodes[0].name, 'Adobe Photoshop');
-  assert.equal(appNodes[0].appFamily, 'photoshop');
-  assert.equal(processNodes.length, 1);
-  assert.equal(processNodes[0].pid, 123);
-  assert.equal(processNodes[0].appName, 'Adobe Photoshop');
-  assert.equal(processNodes[0].appFamily, 'photoshop');
-  assert.equal(processNodes[0].method, 'initial-snapshot');
-  assert.equal(sessionObservations.length, 1);
-  assert.equal(sessionObservations[0].observer.kind, OBSERVER_KINDS.LSOF);
-  assert.equal(sessionObservations[0].observer.method, 'initial-snapshot');
-  assert.equal(appOpenedObservations.length, 1);
-  assert.equal(appOpenedObservations[0].subjectNodeId, processNodes[0].id);
-  assert.equal(appOpenedObservations[0].observer.kind, OBSERVER_KINDS.LSOF);
-  assert.equal(appOpenedObservations[0].observer.method, 'initial-snapshot');
-  assert.equal(appOpenedObservations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.equal(appNodes.length, 0);
+  assert.equal(processNodes.length, 0);
+  assert.equal(sessionObservations.length, 0);
+  assert.equal(appOpenedObservations.length, 0);
 
   const provenanceText = JSON.stringify(fresh.provenance);
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
@@ -2114,7 +2170,7 @@ test('initial lsof snapshot records sanitized app process provenance for accepte
   assert.equal(provenanceText.includes('stdout'), false);
 });
 
-test('ongoing lsof poll records sanitized app process provenance for newly accepted lsof file', async () => {
+test('ongoing lsof poll stages broad observations as pending without captured-file provenance', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'poll-logo.ai');
   let pollReady = false;
   setChildProcessHandler(({ kind, command }) => {
@@ -2133,27 +2189,22 @@ test('ongoing lsof poll records sanitized app process provenance for newly accep
   const project = await createProject('Poll lsof provenance');
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.files.length === 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'lsof');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof');
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
   const appOpenedObservations = getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE);
 
-  assert.equal(appNodes.length, 1);
-  assert.equal(appNodes[0].name, 'Figma');
-  assert.equal(appNodes[0].appFamily, 'figma');
-  assert.equal(processNodes.length, 1);
-  assert.equal(processNodes[0].pid, 456);
-  assert.equal(processNodes[0].method, 'poll');
-  assert.equal(appOpenedObservations.length, 1);
-  assert.equal(appOpenedObservations[0].observer.method, 'poll');
-  assert.equal(appOpenedObservations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
+  assert.equal(appNodes.length, 0);
+  assert.equal(processNodes.length, 0);
+  assert.equal(appOpenedObservations.length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
 });
 
-test('repeated lsof observations for the same accepted file are deduped', async () => {
+test('repeated lsof observations for the same pending file are deduped', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'dedupe-logo.ai');
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
@@ -2175,10 +2226,12 @@ test('repeated lsof observations for the same accepted file are deduped', async 
   await new Promise(resolve => originalSetTimeout(resolve, 800));
   const fresh = await getProject(project.id);
 
-  assert.equal(fresh.files.length, 1);
-  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 1);
-  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 1);
-  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 0);
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
 });
 
 test('rejected lsof candidates do not record provenance', async () => {
@@ -2202,7 +2255,7 @@ test('rejected lsof candidates do not record provenance', async () => {
   assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
 });
 
-test('lsof provenance failure does not block ledger capture', async () => {
+test('lsof provenance failure does not block pending candidate staging', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'failure-logo.ai');
   let pollReady = false;
   setChildProcessHandler(({ kind, command }) => {
@@ -2225,12 +2278,13 @@ test('lsof provenance failure does not block ledger capture', async () => {
   });
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.files.length === 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'lsof');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof');
 });
 
-test('ps-poll accepted insertion records one session observation', async () => {
+test('ps-poll broad discovery stages pending candidate without captured-file provenance', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'ps-poll-logo.ai');
   const unrelatedPath = path.join(TEST_HOME, 'Desktop', 'UNRELATED_FILE_LIST.ai');
   const originalWriteFile = fs.promises.writeFile;
@@ -2268,20 +2322,13 @@ test('ps-poll accepted insertion records one session observation', async () => {
     });
 
     const project = await createProject('PS poll provenance');
-    const fresh = await waitForProject(project.id, item => item.files.length === 1);
-    assert.equal(fresh.files[0].path, filePath);
-    assert.equal(fresh.files[0].source, 'ps-poll');
+    const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+    assert.deepEqual(fresh.files, []);
+    assert.equal(fresh.pendingFiles[0].path, filePath);
+    assert.equal(fresh.pendingFiles[0].source, 'ps-poll');
 
     const observations = getSessionObservedByMethod(fresh, 'ps-poll');
-    assert.equal(observations.length, 1);
-    assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
-    assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
-    assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-    assert.deepEqual(observations[0].payload, {
-      source: 'ps-poll',
-      method: 'ps-poll',
-      channel: 'live-app-poll',
-    });
+    assert.equal(observations.length, 0);
     assert.deepEqual(fresh.provenance.edges, {});
     assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
 
@@ -2310,7 +2357,7 @@ test('ps-poll accepted insertion records one session observation', async () => {
   }
 });
 
-test('indd-poll accepted insertion records one session observation', async () => {
+test('indd-poll broad discovery stages pending candidate without captured-file provenance', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'indd-poll-image.png');
   fs.writeFileSync(filePath, 'indd linked bytes');
 
@@ -2330,20 +2377,13 @@ test('indd-poll accepted insertion records one session observation', async () =>
   });
 
   const project = await createProject('INDD poll provenance');
-  const fresh = await waitForProject(project.id, item => item.files.length === 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'indd-poll');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'indd-poll');
 
   const observations = getSessionObservedByMethod(fresh, 'indd-poll');
-  assert.equal(observations.length, 1);
-  assert.equal(observations[0].kind, EDGE_TYPES.SESSION_OBSERVED_FILE);
-  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.APP_SCRIPT);
-  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-  assert.deepEqual(observations[0].payload, {
-    source: 'indd-poll',
-    method: 'indd-poll',
-    channel: 'live-app-poll',
-  });
+  assert.equal(observations.length, 0);
   assert.deepEqual(fresh.provenance.edges, {});
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
@@ -2352,7 +2392,7 @@ test('indd-poll accepted insertion records one session observation', async () =>
   }
 });
 
-test('repeated ps-poll insertion does not duplicate session observations', async () => {
+test('repeated ps-poll pending insertion does not duplicate candidates or observations', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'dedupe-ps-poll-logo.ai');
   fs.writeFileSync(filePath, 'ps linked bytes');
 
@@ -2367,16 +2407,17 @@ test('repeated ps-poll insertion does not duplicate session observations', async
   });
 
   const project = await createProject('PS poll dedupe provenance');
-  let fresh = await waitForProject(project.id, item => item.files.length === 1);
-  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 1);
+  let fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 0);
 
   await new Promise(resolve => originalSetTimeout(resolve, 3300));
   fresh = await getProject(project.id);
-  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
-  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 1);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 0);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'ps-poll').length, 0);
 });
 
-test('ps-poll provenance failure does not block ledger insertion', async () => {
+test('ps-poll provenance failure does not block pending candidate staging', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'failure-ps-poll-logo.ai');
   fs.writeFileSync(filePath, 'ps linked bytes');
   let pollReady = false;
@@ -2401,12 +2442,13 @@ test('ps-poll provenance failure does not block ledger insertion', async () => {
   });
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.files.length === 1, 5000);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].source, 'ps-poll');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1, 5000);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'ps-poll');
 });
 
-test('lastused-poll accepted insertion records one deduped candidate session observation', async () => {
+test('lastused-poll broad discovery stages pending candidate without captured-file provenance', async () => {
   resetTestHomeWorkspace();
   const filePath = path.join(TEST_HOME, 'Desktop', 'lastused-logo.png');
   fs.writeFileSync(filePath, 'lastused bytes');
@@ -2427,20 +2469,14 @@ test('lastused-poll accepted insertion records one deduped candidate session obs
   const project = await createProject('Lastused poll provenance');
   let fresh = await waitForProject(
     project.id,
-    item => item.files.some(file => file.source === 'lastused-poll'),
+    item => item.pendingFiles.some(file => file.source === 'lastused-poll'),
     12000
   );
-  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 0);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
 
   let observations = getSessionObservedByMethod(fresh, 'lastused-poll');
-  assert.equal(observations.length, 1);
-  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.SPOTLIGHT_LAST_USED);
-  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-  assert.deepEqual(observations[0].payload, {
-    source: 'lastused-poll',
-    method: 'lastused-poll',
-    channel: 'live-lastused-poll',
-  });
+  assert.equal(observations.length, 0);
   assertNoRelationshipEdges(fresh);
   assertProvenanceTextExcludes(fresh, [
     'SHOULD_NOT_APPEAR_PROCESS_ARG',
@@ -2451,8 +2487,9 @@ test('lastused-poll accepted insertion records one deduped candidate session obs
   await new Promise(resolve => originalSetTimeout(resolve, 10500));
   fresh = await getProject(project.id);
   observations = getSessionObservedByMethod(fresh, 'lastused-poll');
-  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
-  assert.equal(observations.length, 1);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 0);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  assert.equal(observations.length, 0);
 });
 
 test('scan-on-open linked accepted insertion records one deduped candidate session observation', async () => {
@@ -2468,17 +2505,17 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
     fs.writeFileSync(linkedPath, 'linked bytes');
     fs.writeFileSync(sourcePath, `RAW_REGEX_CONTENT_SHOULD_NOT_APPEAR ${linkedPath}`);
 
-    setChildProcessHandler(({ kind, command }) => {
-      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
-        return { stdout: '222 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
-      }
-      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
-        return { stdout: `p222\nf12\ntREG\nn${sourcePath}\n` };
-      }
-      return { stdout: '' };
-    });
-
     const project = await createProject('Scan open linked provenance');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'layout.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await emitWatcher('change', sourcePath);
     let fresh = await waitForProject(
       project.id,
       item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
@@ -2497,7 +2534,6 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
     assertNoRelationshipEdges(fresh);
     assertProvenanceTextExcludes(fresh, [
       'RAW_REGEX_CONTENT_SHOULD_NOT_APPEAR',
-      'SHOULD_NOT_APPEAR_PROCESS_ARG',
       '/usr/sbin/lsof',
       'stdout',
     ]);
@@ -2532,7 +2568,9 @@ test('scan-on-open PSD parser accepted linked and embedded insertions record can
       linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('EMBEDDED_RAW_CONTENT_SHOULD_NOT_APPEAR') }],
     };
 
+    let pollReady = false;
     setChildProcessHandler(({ kind, command }) => {
+      if (!pollReady) return { stdout: '' };
       if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
         return { stdout: '333 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
       }
@@ -2546,6 +2584,16 @@ test('scan-on-open PSD parser accepted linked and embedded insertions record can
     });
 
     const project = await createProject('Scan open PSD provenance');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: 'source.psd',
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    pollReady = true;
     const fresh = await waitForProject(
       project.id,
       item => item.files.some(file => file.source === 'psd-linked') &&
@@ -2662,7 +2710,7 @@ test('scan-on-open provenance failure does not block accepted ledger insertion',
   }
 });
 
-test('initial snapshot linked-asset regex accepted insertion records candidate session observation only', async () => {
+test('initial snapshot does not parse linked assets from stale pending source files', async () => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-initial-snapshot-regex-provenance');
   if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
@@ -2686,21 +2734,14 @@ test('initial snapshot linked-asset regex accepted insertion records candidate s
     });
 
     const project = await createProject('Initial snapshot regex provenance');
-    const fresh = await waitForProject(
-      project.id,
-      item => item.files.some(file => file.path === linkedPath && file.source === 'linked-asset'),
-      5000
-    );
+    const fresh = await getProject(project.id);
 
     const observations = getSessionObservedByMethod(fresh, 'initial-snapshot-linked-regex');
-    assert.equal(observations.length, 1);
-    assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PARSER);
-    assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-    assert.deepEqual(observations[0].payload, {
-      source: 'linked-asset',
-      method: 'initial-snapshot-linked-regex',
-      channel: 'initial-lsof-snapshot',
-    });
+    assert.deepEqual(fresh.files, []);
+    assert.equal(fresh.pendingFiles.length, 1);
+    assert.equal(fresh.pendingFiles[0].path, sourcePath);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(observations.length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
@@ -2715,7 +2756,7 @@ test('initial snapshot linked-asset regex accepted insertion records candidate s
   }
 });
 
-test('pre-package lsof package scan insertion records one deduped session observation', async () => {
+test('pre-package lsof package scan stages pending candidate without captured-file provenance', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Prepackage lsof provenance');
   const figPath = path.join(TEST_HOME, 'Desktop', 'package-open.fig');
@@ -2735,27 +2776,20 @@ test('pre-package lsof package scan insertion records one deduped session observ
   assert.equal(scan.newCount, 1);
 
   let fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].source, 'lsof-package-scan');
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof-package-scan');
 
   const observations = getSessionObservedByMethod(fresh, 'lsof-package-scan');
-  assert.equal(observations.length, 1);
-  assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PACKAGE_RECOVERY);
-  assert.equal(Object.prototype.hasOwnProperty.call(observations[0].observer, 'payload'), false);
-  assert.equal(observations[0].confidence.band, CONFIDENCE_BANDS.CANDIDATE);
-  assert.deepEqual(observations[0].payload, {
-    source: 'lsof-package-scan',
-    method: 'lsof-package-scan',
-    channel: 'pre-package-scan',
-    recoveryType: 'package-time-recovery',
-  });
+  assert.equal(observations.length, 0);
   assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
   assert.deepEqual(fresh.provenance.edges, {});
 
   await callIpc('projects:pre-package-scan', project.id);
   fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.filter(file => file.source === 'lsof-package-scan').length, 1);
+  assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 0);
 });
 
 test('pre-package deduped-away recovery candidate does not record session observation', async () => {
@@ -2786,11 +2820,12 @@ test('pre-package deduped-away recovery candidate does not record session observ
   });
 
   const scan = await callIpc('projects:pre-package-scan', project.id);
-  assert.equal(scan.newCount, 1);
+  assert.equal(scan.newCount, 0);
 
   const fresh = await getProject(project.id);
   assert.equal(fresh.files.length, 1);
   assert.equal(fresh.files[0].path, targetPath);
+  assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 0);
 });
 
@@ -2856,11 +2891,12 @@ test('pre-package app-script parser and regex recovered additions record session
     assert.equal(scan.newCount, 3);
 
     let fresh = await getProject(project.id);
-    assert.equal(fresh.files.some(file => file.source === 'ai-linked'), true);
+    assert.equal(fresh.files.some(file => file.source === 'ai-linked'), false);
+    assert.equal(fresh.pendingFiles.some(file => file.source === 'ai-linked'), true);
     assert.equal(fresh.files.some(file => file.source === 'psd-embedded'), true);
     assert.equal(fresh.files.some(file => file.source === 'linked-asset'), true);
 
-    for (const method of ['ai-linked', 'psd-embedded', 'linked-asset']) {
+    for (const method of ['psd-embedded', 'linked-asset']) {
       const observations = getSessionObservedByMethod(fresh, method);
       assert.equal(observations.length, 1);
       assert.equal(observations[0].observer.kind, OBSERVER_KINDS.PACKAGE_RECOVERY);
@@ -2869,6 +2905,7 @@ test('pre-package app-script parser and regex recovered additions record session
       assert.equal(observations[0].payload.method, method);
       assert.equal(observations[0].payload.channel, 'pre-package-scan');
     }
+    assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
 
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
@@ -2879,9 +2916,10 @@ test('pre-package app-script parser and regex recovered additions record session
     assert.deepEqual(packageResult.errors, []);
 
     fresh = await getProject(project.id);
-    for (const method of ['ai-linked', 'psd-embedded', 'linked-asset']) {
+    for (const method of ['psd-embedded', 'linked-asset']) {
       assert.equal(getSessionObservedByMethod(fresh, method).length, 1);
     }
+    assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
   } finally {
     fs.rmSync(path.join(os.tmpdir(), `crate-psd-extract-${project ? project.id : ''}`), { recursive: true, force: true });
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
@@ -2889,7 +2927,7 @@ test('pre-package app-script parser and regex recovered additions record session
   }
 });
 
-test('pre-package recovery provenance failure does not block recovered file insertion', async () => {
+test('pre-package recovery provenance failure does not block pending candidate staging', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Prepackage provenance failure');
   const figPath = path.join(TEST_HOME, 'Desktop', 'failure-open.fig');
@@ -2915,8 +2953,9 @@ test('pre-package recovery provenance failure does not block recovered file inse
   assert.equal(scan.newCount, 1);
 
   const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].source, 'lsof-package-scan');
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof-package-scan');
 });
 
 test('pre-package pending candidates do not create captured-file observations until accepted', async () => {
