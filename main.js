@@ -264,6 +264,210 @@ function deduplicateFiles(files) {
   });
 }
 
+const LIVE_CAPTURE_DECISIONS = Object.freeze({
+  DIRECT_ADD: 'direct_add',
+  PENDING_CANDIDATE: 'pending_candidate',
+  IGNORE_EXCLUDED: 'ignore_excluded',
+  IGNORE_DUPLICATE: 'ignore_duplicate',
+});
+
+const AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES = new Set([
+  'crate diagnostics',
+  'package-outputs',
+  'package output',
+  'package outputs',
+]);
+
+const BROAD_LIVE_CAPTURE_SOURCES = new Set([
+  'lsof',
+  'ps-poll',
+  'indd-poll',
+  'lastused-poll',
+  'lsof-package-scan',
+  'ai-linked',
+  'indd-linked',
+]);
+
+function getNormalizedPathSet(files) {
+  return new Set((Array.isArray(files) ? files : [])
+    .map(file => normalizeTrackedFilePath(file && file.path))
+    .filter(Boolean));
+}
+
+function getTrackedFileKeySet(files) {
+  return new Set((Array.isArray(files) ? files : [])
+    .map(file => getTrackedFileDedupKey(file))
+    .filter(Boolean));
+}
+
+function getAutoCapturePathSegments(filePath) {
+  if (typeof filePath !== 'string' || !filePath.trim()) return [];
+  return path.resolve(filePath.trim())
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean);
+}
+
+function isLikelyDatedPackageFolderName(folderName) {
+  return /^[^/\\]+_\d{4}-\d{2}-\d{2}$/.test(String(folderName || ''));
+}
+
+function isPathInsideOrEqual(parentDir, filePath) {
+  if (typeof parentDir !== 'string' || !parentDir.trim()) return false;
+  if (typeof filePath !== 'string' || !filePath.trim()) return false;
+  const parent = path.resolve(parentDir);
+  const candidate = path.resolve(filePath);
+  const relativePath = path.relative(parent, candidate);
+  return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function getKnownPackageOutputPaths(projects = getProjects()) {
+  const paths = [];
+  for (const project of Array.isArray(projects) ? projects : []) {
+    if (project && typeof project.outputPath === 'string' && project.outputPath.trim()) {
+      paths.push(project.outputPath);
+    }
+  }
+  const quickPackageOutputs = store && typeof store.get === 'function'
+    ? store.get('quickPackageOutputPaths', [])
+    : [];
+  if (Array.isArray(quickPackageOutputs)) {
+    for (const outputPath of quickPackageOutputs) {
+      if (typeof outputPath === 'string' && outputPath.trim()) paths.push(outputPath);
+    }
+  }
+  return Array.from(new Set(paths.map(outputPath => path.resolve(outputPath))));
+}
+
+function rememberGeneratedPackageOutputPath(outputPath) {
+  if (typeof outputPath !== 'string' || !outputPath.trim()) return;
+  try {
+    const resolvedOutput = path.resolve(outputPath);
+    const current = store.get('quickPackageOutputPaths', []);
+    const next = Array.isArray(current) ? current.slice() : [];
+    if (!next.some(existing => path.resolve(existing) === resolvedOutput)) {
+      next.push(resolvedOutput);
+      store.set('quickPackageOutputPaths', next.slice(-50));
+    }
+  } catch (_) {
+    // Best effort. This only improves future auto-capture exclusions.
+  }
+}
+
+function isAutoCaptureExcludedPath(filePath, projects = getProjects()) {
+  if (typeof filePath !== 'string' || !filePath.trim()) return true;
+
+  const segments = getAutoCapturePathSegments(filePath);
+  const lowerSegments = segments.map(segment => segment.toLowerCase());
+  const lowerBase = (segments[segments.length - 1] || '').toLowerCase();
+
+  if (lowerBase === PROVENANCE_MANIFEST_FILENAME.toLowerCase()) return true;
+  if (lowerSegments.some(segment => AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES.has(segment))) return true;
+
+  for (const outputPath of getKnownPackageOutputPaths(projects)) {
+    if (isPathInsideOrEqual(outputPath, filePath)) return true;
+  }
+
+  // Automatic capture only: Crate's package folder format is "{Project}_{YYYY-MM-DD}".
+  // Manual explicit add remains allowed even when a folder happens to match this shape.
+  for (let i = 0; i < segments.length - 1; i++) {
+    if (isLikelyDatedPackageFolderName(segments[i])) return true;
+  }
+
+  return false;
+}
+
+function isAcceptedProjectFilePath(project, filePath) {
+  const normalizedPath = normalizeTrackedFilePath(filePath);
+  if (!normalizedPath) return false;
+  return getNormalizedPathSet(project && project.files).has(normalizedPath);
+}
+
+function buildAutoCaptureFileEntry(filePath, source, extra = {}) {
+  return {
+    path: filePath,
+    name: path.basename(filePath),
+    ext: path.extname(filePath).toLowerCase(),
+    addedAt: Date.now(),
+    source,
+    ...extra,
+  };
+}
+
+function classifyLiveObservedFile(project, fileEntry, observation = {}) {
+  const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
+  if (!project || !fileEntry || !normalizedPath) {
+    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, reason: 'invalid-path', normalizedPath };
+  }
+
+  if (isAutoCaptureExcludedPath(fileEntry.path)) {
+    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, reason: 'crate-output-path', normalizedPath };
+  }
+
+  const candidateKey = getTrackedFileDedupKey(fileEntry);
+  const acceptedKeys = getTrackedFileKeySet(project.files);
+  if (acceptedKeys.has(candidateKey)) {
+    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_DUPLICATE, reason: 'already-accepted', normalizedPath };
+  }
+
+  const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
+  if (pendingKeys.has(candidateKey)) {
+    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_DUPLICATE, reason: 'already-pending', normalizedPath };
+  }
+
+  if (observation.forcePending === true || BROAD_LIVE_CAPTURE_SOURCES.has(fileEntry.source)) {
+    return { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'broad-observer', normalizedPath };
+  }
+
+  if (observation.allowDirect === true) {
+    return { decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD, reason: observation.reason || 'strong-session-observation', normalizedPath };
+  }
+
+  if (observation.relationshipSourcePath) {
+    return isAcceptedProjectFilePath(project, observation.relationshipSourcePath)
+      ? { decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD, reason: observation.reason || 'accepted-source-relationship', normalizedPath }
+      : { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'unaccepted-source-relationship', normalizedPath };
+  }
+
+  return { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'unclassified-auto-observer', normalizedPath };
+}
+
+function stageLiveObservedFile(project, fileEntry, observation = {}) {
+  const classification = classifyLiveObservedFile(project, fileEntry, observation);
+  const normalizedPath = classification.normalizedPath;
+
+  if (classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+    if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
+    const candidateKey = getTrackedFileDedupKey(fileEntry);
+    project.pendingFiles = project.pendingFiles.filter(file => (
+      getTrackedFileDedupKey(file) !== candidateKey &&
+      normalizeTrackedFilePath(file && file.path) !== normalizedPath
+    ));
+    project.files.push(fileEntry);
+    project.files = deduplicateFiles(project.files);
+    return { ...classification, changed: true, file: fileEntry };
+  }
+
+  if (classification.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+    if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
+    project.pendingFiles.push(fileEntry);
+    return { ...classification, changed: true, file: fileEntry };
+  }
+
+  return { ...classification, changed: false, file: fileEntry };
+}
+
+function pruneExcludedAutoCapturedFiles(project) {
+  if (!project || !Array.isArray(project.files)) return false;
+
+  const before = project.files.length;
+  project.files = project.files.filter(file => {
+    if (!file || file.source === 'manual-browse' || file.source === 'manual') return true;
+    return !isAutoCaptureExcludedPath(file.path);
+  });
+  return project.files.length !== before;
+}
+
 const FIGMA_SCOPE_CURRENT_PAGE = 'current-page';
 const FIGMA_SCOPE_ENTIRE_FILE = 'entire-file';
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
@@ -2254,7 +2458,21 @@ function mutateProject(projectId, fn) {
   if (!Array.isArray(project.files)) {
     project.files = [];
   } else {
+    pruneExcludedAutoCapturedFiles(project);
     project.files = deduplicateFiles(project.files);
+  }
+  if (!Array.isArray(project.pendingFiles)) {
+    project.pendingFiles = [];
+  } else {
+    const acceptedKeys = getTrackedFileKeySet(project.files);
+    const seenPendingKeys = new Set();
+    project.pendingFiles = project.pendingFiles.filter(file => {
+      const key = getTrackedFileDedupKey(file);
+      if (!key || acceptedKeys.has(key) || seenPendingKeys.has(key)) return false;
+      if (isAutoCaptureExcludedPath(file && file.path)) return false;
+      seenPendingKeys.add(key);
+      return true;
+    });
   }
   safelyEnsureProjectProvenance(project);
   store.set('projects', projects);
@@ -2521,8 +2739,8 @@ function pollLsofForProject(projectId) {
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return { changed: false };
 
-        const existingPaths = new Set(proj.files.map(f => f.path));
-        const pendingPaths = new Set((proj.pendingFiles || []).map(f => f.path));
+        const existingPaths = getNormalizedPathSet(proj.files);
+        const pendingPaths = getNormalizedPathSet(proj.pendingFiles);
 
         // v2.5.3: Directory scoping — derive project root from existing files to prevent
         // cross-project contamination when multiple projects are open in the same design app
@@ -2612,8 +2830,9 @@ function pollLsofForProject(projectId) {
                                           filePath.startsWith(home + '/Downloads/');
           if (projectRoot !== null && !isInAllowedDirForScope && !filePath.startsWith(projectRoot + '/')) continue;
 
-          if (existingPaths.has(filePath)) continue;
-          if (pendingPaths.has(filePath)) continue;
+          const normalizedFilePath = normalizeTrackedFilePath(filePath);
+          if (existingPaths.has(normalizedFilePath)) continue;
+          if (pendingPaths.has(normalizedFilePath)) continue;
 
           if (path.basename(filePath).startsWith('~$')) continue;
 
@@ -2651,21 +2870,22 @@ function pollLsofForProject(projectId) {
           // v2.2.2: Removed presentation mtime filter — old files on disk placed
           // mid-session should be captured when opened by a design app.
 
-          const fileEntry = {
-            path: filePath,
-            name: path.basename(filePath),
-            ext,
-            addedAt: Date.now(),
-            source: 'lsof',
-          };
-
-          proj.files.push(fileEntry);
-          recordLsofAcceptedFileProvenance(proj, fileEntry, {
-            method: 'poll',
-            pid: currentPid,
-            command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+          const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
+          const staged = stageLiveObservedFile(proj, fileEntry, {
+            forcePending: true,
+            reason: 'lsof-broad-observer',
           });
-          existingPaths.add(filePath);
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            recordLsofAcceptedFileProvenance(proj, fileEntry, {
+              method: 'poll',
+              pid: currentPid,
+              command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+            });
+            existingPaths.add(normalizedFilePath);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedFilePath);
+          }
           lastFileActivity.set(projectId, Date.now());
           inactivityNotified.delete(projectId);
           changed = true;
@@ -2674,11 +2894,12 @@ function pollLsofForProject(projectId) {
         if (changed) {
           proj.files = deduplicateFiles(proj.files);
         }
-        return { changed, files: proj.files };
+        return { changed, files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
       if (result && result.changed && trayWindow && !trayWindow.isDestroyed()) {
         trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+        trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
       }
     });
   });
@@ -3413,12 +3634,14 @@ async function pollPsForProject(projectId) {
 
     if (discoveredPaths.length === 0) return;
 
-    // Deduplicate against existing project files
-    const existingPaths = new Set(project.files.map(f => f.path));
+    // Deduplicate against accepted and pending project ledgers.
+    const existingPaths = getNormalizedPathSet(project.files);
+    const pendingPaths = getNormalizedPathSet(project.pendingFiles);
     const newFiles = [];
 
     for (const { filePath, source } of discoveredPaths) {
-      if (existingPaths.has(filePath)) continue;
+      const normalizedFilePath = normalizeTrackedFilePath(filePath);
+      if (existingPaths.has(normalizedFilePath) || pendingPaths.has(normalizedFilePath)) continue;
       const ext = path.extname(filePath).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       try {
@@ -3427,7 +3650,7 @@ async function pollPsForProject(projectId) {
         continue; // File doesn't exist or not readable
       }
       newFiles.push({ filePath, source, ext });
-      existingPaths.add(filePath); // prevent dupes within this batch
+      pendingPaths.add(normalizedFilePath); // prevent dupes within this batch
     }
 
     if (newFiles.length === 0) return;
@@ -3435,28 +3658,27 @@ async function pollPsForProject(projectId) {
     let addedCount = 0;
     for (const { filePath, source, ext } of newFiles) {
       const result = mutateProject(projectId, (proj) => {
-        if (proj.files.some(f => f.path === filePath)) return null;
-        const fileEntry = {
-          path: filePath,
-          name: path.basename(filePath),
-          ext,
-          addedAt: Date.now(),
-          source,
-        };
-        proj.files.push(fileEntry);
-        proj.files = deduplicateFiles(proj.files);
-        const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
-        if (storedFile) {
-          recordSessionObservedFile(proj, storedFile, {
-            kind: OBSERVER_KINDS.APP_SCRIPT,
-            method: source,
-            payload: {
+        if (proj.status !== 'watching') return null;
+        const fileEntry = buildAutoCaptureFileEntry(filePath, source, { ext });
+        const staged = stageLiveObservedFile(proj, fileEntry, {
+          forcePending: true,
+          reason: 'app-script-broad-observer',
+        });
+        if (!staged.changed) return null;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
+          if (storedFile) {
+            recordSessionObservedFile(proj, storedFile, {
+              kind: OBSERVER_KINDS.APP_SCRIPT,
               method: source,
-              channel: 'live-app-poll',
-            },
-          });
+              payload: {
+                method: source,
+                channel: 'live-app-poll',
+              },
+            });
+          }
         }
-        return { files: proj.files };
+        return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
       if (result) addedCount++;
     }
@@ -3468,8 +3690,9 @@ async function pollPsForProject(projectId) {
       const updatedProject = getProjects().find(p => p.id === projectId);
       if (updatedProject) {
         sendToRenderer('files:updated', { projectId, files: updatedProject.files });
+        sendToRenderer('files:pending', { projectId, pendingFiles: updatedProject.pendingFiles || [] });
       }
-      console.log(`[crate][ps-poll] Added ${addedCount} linked assets to project ${projectId}`);
+      console.log(`[crate][ps-poll] Staged ${addedCount} linked assets for project ${projectId}`);
     }
   } catch (e) {
     console.error('[crate][ps-poll] pollPsForProject error:', e.message);
@@ -3534,7 +3757,8 @@ async function pollLastUsedForProject(projectId) {
   // v2.4.8: never fall back to createdAt (days old) — if watchStartedAt missing, skip cycle
   const watchStart = project.watchStartedAt;
   if (!watchStart) return;
-  const existingPaths = new Set(project.files.map(f => f.path));
+  const existingPaths = getNormalizedPathSet(project.files);
+  const pendingPaths = getNormalizedPathSet(project.pendingFiles);
   const newFiles = [];
 
   // v2.4.2: Single mdfind query instead of per-file mdls spawning.
@@ -3572,9 +3796,11 @@ async function pollLastUsedForProject(projectId) {
       // but must still be excluded — their content is extracted via scan-on-save, not polling.
       const PRESENTATION_SOURCE_EXTS_LU = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
       if (PRESENTATION_SOURCE_EXTS_LU.has(ext)) continue;
-      if (existingPaths.has(fullPath)) continue;
+      if (isAutoCaptureExcludedPath(fullPath)) continue;
+      const normalizedFullPath = normalizeTrackedFilePath(fullPath);
+      if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
       newFiles.push({ path: fullPath, name, ext, addedAt: Date.now(), source: 'lastused-poll' });
-      existingPaths.add(fullPath);
+      pendingPaths.add(normalizedFullPath);
     }
   } catch (e) {
     // mdfind failed — skip this poll cycle
@@ -3584,14 +3810,17 @@ async function pollLastUsedForProject(projectId) {
 
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching') return null;
-    const existingSet = new Set(proj.files.map(f => f.path));
     const acceptedFiles = [];
     let added = 0;
     for (const f of newFiles) {
-      if (existingSet.has(f.path)) continue;
-      proj.files.push(f);
-      existingSet.add(f.path);
-      acceptedFiles.push(f);
+      const staged = stageLiveObservedFile(proj, f, {
+        forcePending: true,
+        reason: 'lastused-broad-observer',
+      });
+      if (!staged.changed) continue;
+      if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+        acceptedFiles.push(f);
+      }
       added++;
     }
     if (added === 0) return null;
@@ -3608,11 +3837,12 @@ async function pollLastUsedForProject(projectId) {
         },
       });
     }
-    return { files: proj.files };
+    return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
   });
 
   if (result && trayWindow && !trayWindow.isDestroyed()) {
     trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+    trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
   }
   } catch (e) {
     console.error('[crate][lastused-poll] pollLastUsedForProject error:', e.message);
@@ -4107,6 +4337,8 @@ async function extractLinkedAssetsPxd(filePath) {
 async function runScanOnOpen(projectId, filePath) {
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
+  const currentProject = getProjects().find(p => p.id === projectId);
+  if (!currentProject || !isAcceptedProjectFilePath(currentProject, filePath)) return;
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const linkedPaths = await extractLinkedAssets(filePath);
@@ -4135,23 +4367,19 @@ async function runScanOnOpen(projectId, filePath) {
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching') return null;
     // v2.4.0: normalize paths before comparing to prevent duplicates
-    const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
     const acceptedFiles = [];
     let changed = false;
 
     for (const linkedPath of validPaths) {
-      if (existingPaths.has(path.resolve(linkedPath).toLowerCase())) continue;
-
-      const fileEntry = {
-        path: linkedPath,
-        name: path.basename(linkedPath),
-        ext: path.extname(linkedPath).toLowerCase(),
-        addedAt: Date.now(),
-        source: 'scan-on-open',
-      };
-      proj.files.push(fileEntry);
-      acceptedFiles.push(fileEntry);
-      existingPaths.add(path.resolve(linkedPath).toLowerCase());
+      const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'scan-on-open');
+      const staged = stageLiveObservedFile(proj, fileEntry, {
+        relationshipSourcePath: filePath,
+        reason: 'scan-on-open-source-relationship',
+      });
+      if (!staged.changed) continue;
+      if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+        acceptedFiles.push(fileEntry);
+      }
       changed = true;
     }
 
@@ -4170,13 +4398,14 @@ async function runScanOnOpen(projectId, filePath) {
         });
       }
     }
-    return changed ? { files: proj.files } : null;
+    return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
   });
 
   if (result) {
     lastFileActivity.set(projectId, Date.now());
     inactivityNotified.delete(projectId);
     sendToRenderer('files:updated', { projectId, files: result.files });
+    sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
   }
 
   // v2.3.6: PSD binary parse — extract embedded smart object assets via ag-psd.
@@ -4191,21 +4420,18 @@ async function runScanOnOpen(projectId, filePath) {
       const psdResult = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
         // v2.4.0: normalize paths before comparing to prevent duplicates
-        const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
         const acceptedFiles = [];
         let changed = false;
         for (const asset of psdAssets) {
-          if (existingPaths.has(path.resolve(asset.filePath).toLowerCase())) continue;
-          const fileEntry = {
-            path: asset.filePath,
-            name: path.basename(asset.filePath),
-            ext: path.extname(asset.filePath).toLowerCase(),
-            addedAt: Date.now(),
-            source: asset.source,
-          };
-          proj.files.push(fileEntry);
-          acceptedFiles.push(fileEntry);
-          existingPaths.add(path.resolve(asset.filePath).toLowerCase());
+          const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+          const staged = stageLiveObservedFile(proj, fileEntry, {
+            relationshipSourcePath: filePath,
+            reason: 'scan-on-open-psd-parser',
+          });
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            acceptedFiles.push(fileEntry);
+          }
           changed = true;
         }
         if (changed) {
@@ -4224,12 +4450,13 @@ async function runScanOnOpen(projectId, filePath) {
             });
           }
         }
-        return changed ? { files: proj.files } : null;
+        return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
       });
       if (psdResult) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
         sendToRenderer('files:updated', { projectId, files: psdResult.files });
+        sendToRenderer('files:pending', { projectId, pendingFiles: psdResult.pendingFiles || [] });
       }
     }
   }
@@ -4256,6 +4483,9 @@ function scheduleScanOnSave(projectId, psdFilePath) {
 
 async function runScanOnSave(projectId, psdFilePath) {
   try {
+    const currentProject = getProjects().find(p => p.id === projectId);
+    if (!currentProject || !isAcceptedProjectFilePath(currentProject, psdFilePath)) return;
+
     const stat = await fs.promises.stat(psdFilePath);
     if (stat.size > MAX_PARSE_FILE_SIZE) return;
 
@@ -4310,34 +4540,31 @@ async function runScanOnSave(projectId, psdFilePath) {
 
     const result = mutateProject(projectId, (proj) => {
       if (proj.status !== 'watching') return null;
-      const existingPaths = new Set(proj.files.map(f =>
-        f.embedded && f.source === 'scan-on-save-embedded'
-          ? getEmbeddedPsdDedupKey(f)
-          : path.resolve(f.path).toLowerCase()
-      ));
       let changed = false;
 
       for (const entry of newEntries) {
-        const key = entry.embedded
-          ? getEmbeddedPsdDedupKey(entry)
-          : path.resolve(entry.path).toLowerCase();
-        if (existingPaths.has(key)) continue;
-        proj.files.push(entry);
-        recordPsdParserRelationship(proj, psdFilePath, entry);
-        existingPaths.add(key);
+        const staged = stageLiveObservedFile(proj, entry, {
+          relationshipSourcePath: psdFilePath,
+          reason: 'scan-on-save-psd',
+        });
+        if (!staged.changed) continue;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          recordPsdParserRelationship(proj, psdFilePath, entry);
+        }
         changed = true;
       }
 
       if (changed) {
         proj.files = deduplicateFiles(proj.files);
       }
-      return changed ? { files: proj.files } : null;
+      return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
     });
 
     if (result) {
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendToRenderer('files:updated', { projectId, files: result.files });
+      sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
     }
   } catch (e) {
     // L2: Log so failures are debuggable — never break the session
@@ -4365,6 +4592,8 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
   try {
     const ext = path.extname(presentationPath).toLowerCase();
     const base = path.basename(presentationPath, ext);
+    const currentProject = getProjects().find(p => p.id === projectId);
+    if (!currentProject || !isAcceptedProjectFilePath(currentProject, presentationPath)) return;
 
     // Ensure temp dir exists: ~/.crate/presentation-assets/{projectId}/
     const tempDir = ensurePresentationAssetsDir(projectId);
@@ -4509,33 +4738,36 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
 
     const result = mutateProject(projectId, (proj) => {
       if (proj.status !== 'watching') return null;
-      const existingPaths = new Set(proj.files.map(f => path.resolve(f.path).toLowerCase()));
       let changed = false;
 
       for (const entry of newEntries) {
-        const normPath = path.resolve(entry.path).toLowerCase();
-        if (existingPaths.has(normPath)) continue;
         const { internalPath, presentationPath: sourcePresentationPath, ...fileEntry } = entry;
-        proj.files.push(fileEntry);
-        recordPowerPointMediaExtractionProvenanceForProject(proj, [{
-          presentationPath: sourcePresentationPath,
-          internalPath,
-          materializedPath: fileEntry.path,
-          source: fileEntry.source,
-          observedAt: fileEntry.addedAt,
-        }]);
-        existingPaths.add(normPath);
+        const staged = stageLiveObservedFile(proj, fileEntry, {
+          relationshipSourcePath: sourcePresentationPath,
+          reason: 'scan-on-save-presentation',
+        });
+        if (!staged.changed) continue;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          recordPowerPointMediaExtractionProvenanceForProject(proj, [{
+            presentationPath: sourcePresentationPath,
+            internalPath,
+            materializedPath: fileEntry.path,
+            source: fileEntry.source,
+            observedAt: fileEntry.addedAt,
+          }]);
+        }
         changed = true;
       }
 
       if (changed) proj.files = deduplicateFiles(proj.files);
-      return changed ? { files: proj.files } : null;
+      return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
     });
 
     if (result) {
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendToRenderer('files:updated', { projectId, files: result.files });
+      sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
     }
   } catch (e) {
     console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
@@ -4671,8 +4903,9 @@ async function startWatching(projectId) {
         // v2.2.2: Collect design files for scan-on-open
         const snapshotDesignFiles = [];
 
-        mutateProject(projectId, (project) => {
-          const existingPaths = new Set(project.files.map(f => f.path));
+        const snapshotResult = mutateProject(projectId, (project) => {
+          const existingPaths = getNormalizedPathSet(project.files);
+          const pendingPaths = getNormalizedPathSet(project.pendingFiles);
           let snapshotChanged = false;
           let currentPid = null;
           let currentType = null;
@@ -4727,34 +4960,51 @@ async function startWatching(projectId) {
             // image/font/pdf handles that an app may still have open.
             if (project.files.length === 0 && !PRIMARY_DESIGN_EXTENSIONS.has(ext)) continue;
 
+            const normalizedFilePath = normalizeTrackedFilePath(filePath);
+            const sourceAcceptedBefore = existingPaths.has(normalizedFilePath);
+
             // v2.3.9: Mark for scan-on-open BEFORE existingPaths check —
             // pre-session files already in project still need asset extraction.
-            if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
+            if (sourceAcceptedBefore && SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
               snapshotDesignFiles.push(filePath);
             }
 
-            if (existingPaths.has(filePath)) continue;
-
-            const fileEntry = {
-              path: filePath,
-              name: path.basename(filePath),
-              ext,
-              addedAt: Date.now(),
-              source: 'lsof',
-            };
-
-            project.files.push(fileEntry);
-            recordLsofAcceptedFileProvenance(project, fileEntry, {
-              method: 'initial-snapshot',
-              pid: currentPid,
-              command: currentPid ? pidToCmd.get(currentPid) || '' : '',
-            });
-            existingPaths.add(filePath);
-            snapshotChanged = true;
-
-            if (LINKABLE_EXTS_SNAPSHOT.has(ext)) {
-              linkableForParse.push(fileEntry);
+            if (sourceAcceptedBefore) {
+              if (LINKABLE_EXTS_SNAPSHOT.has(ext)) {
+                linkableForParse.push({
+                  path: filePath,
+                  name: path.basename(filePath),
+                  ext,
+                  source: 'lsof',
+                });
+              }
+              continue;
             }
+            if (pendingPaths.has(normalizedFilePath)) continue;
+
+            const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
+            const staged = stageLiveObservedFile(project, fileEntry, {
+              forcePending: true,
+              reason: 'initial-lsof-snapshot',
+            });
+            if (!staged.changed) continue;
+            if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+              recordLsofAcceptedFileProvenance(project, fileEntry, {
+                method: 'initial-snapshot',
+                pid: currentPid,
+                command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+              });
+              existingPaths.add(normalizedFilePath);
+              if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
+                snapshotDesignFiles.push(filePath);
+              }
+              if (LINKABLE_EXTS_SNAPSHOT.has(ext)) {
+                linkableForParse.push(fileEntry);
+              }
+            } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+              pendingPaths.add(normalizedFilePath);
+            }
+            snapshotChanged = true;
           }
 
           // Parse linked assets from any linkable design files found in the snapshot
@@ -4770,19 +5020,22 @@ async function startWatching(projectId) {
                 LINKED_ASSET_REGEX_SNAPSHOT.lastIndex = 0;
                 while ((match = LINKED_ASSET_REGEX_SNAPSHOT.exec(content)) !== null) {
                   const linkedPath = match[0];
-                  if (existingPaths.has(linkedPath)) continue;
+                  const normalizedLinkedPath = normalizeTrackedFilePath(linkedPath);
+                  if (existingPaths.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
                   if (!fs.existsSync(linkedPath)) continue;
 
-                  const fileEntry = {
-                    path: linkedPath,
-                    name: path.basename(linkedPath),
-                    ext: path.extname(linkedPath).toLowerCase(),
-                    addedAt: Date.now(),
-                    source: 'linked-asset',
-                  };
-                  project.files.push(fileEntry);
-                  linkedRegexFiles.push(fileEntry);
-                  existingPaths.add(linkedPath);
+                  const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
+                  const staged = stageLiveObservedFile(project, fileEntry, {
+                    relationshipSourcePath: designFile.path,
+                    reason: 'initial-snapshot-linked-regex',
+                  });
+                  if (!staged.changed) continue;
+                  if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+                    linkedRegexFiles.push(fileEntry);
+                    existingPaths.add(normalizedLinkedPath);
+                  } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+                    pendingPaths.add(normalizedLinkedPath);
+                  }
                   snapshotChanged = true;
                 }
               } catch (e) {
@@ -4809,7 +5062,12 @@ async function startWatching(projectId) {
           if (snapshotChanged) {
             project.files = deduplicateFiles(project.files);
           }
+          return snapshotChanged ? { files: project.files, pendingFiles: project.pendingFiles || [] } : null;
         });
+        if (snapshotResult) {
+          sendToRenderer('files:updated', { projectId, files: snapshotResult.files });
+          sendToRenderer('files:pending', { projectId, pendingFiles: snapshotResult.pendingFiles || [] });
+        }
 
         // v2.2.2: Fire-and-forget scan-on-open for design files found in initial snapshot.
         // Initialize scannedDesignFiles for this project and mark these as scanned.
@@ -4888,18 +5146,20 @@ async function startWatching(projectId) {
     // lsof polling is the reliable mechanism for capturing those files.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        proj.files.push(fileEntry);
-        recordSessionObservedFile(proj, fileEntry, {
-          kind: OBSERVER_KINDS.CHOKIDAR,
-          method: 'add',
+        const staged = stageLiveObservedFile(proj, fileEntry, {
+          allowDirect: true,
+          reason: 'chokidar-add',
         });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
+        if (!staged.changed) return null;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          recordSessionObservedFile(proj, fileEntry, {
+            kind: OBSERVER_KINDS.CHOKIDAR,
+            method: 'add',
+          });
+        }
+        return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
       if (result) {
@@ -4907,6 +5167,7 @@ async function startWatching(projectId) {
         inactivityNotified.delete(projectId);
         if (trayWindow && !trayWindow.isDestroyed()) {
           trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+          trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
         }
       }
     }
@@ -4931,18 +5192,20 @@ async function startWatching(projectId) {
     // Same rationale as the 'add' handler — image/media changes are noise here.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
-      // v2.4.0: normalize path comparison to prevent duplicates
-      const normFilePath = path.resolve(filePath).toLowerCase();
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
-        if (proj.files.some(f => path.resolve(f.path).toLowerCase() === normFilePath)) return null;
-        proj.files.push(fileEntry);
-        recordSessionObservedFile(proj, fileEntry, {
-          kind: OBSERVER_KINDS.CHOKIDAR,
-          method: 'change',
+        const staged = stageLiveObservedFile(proj, fileEntry, {
+          allowDirect: true,
+          reason: 'chokidar-change',
         });
-        proj.files = deduplicateFiles(proj.files);
-        return { files: proj.files };
+        if (!staged.changed) return null;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          recordSessionObservedFile(proj, fileEntry, {
+            kind: OBSERVER_KINDS.CHOKIDAR,
+            method: 'change',
+          });
+        }
+        return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
       if (result) {
@@ -4950,24 +5213,28 @@ async function startWatching(projectId) {
         inactivityNotified.delete(projectId);
         if (trayWindow && !trayWindow.isDestroyed()) {
           trayWindow.webContents.send('files:updated', { projectId, files: result.files });
+          trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
         }
       }
+
+      const updatedProject = getProjects().find(p => p.id === projectId);
+      const sourceIsAccepted = isAcceptedProjectFilePath(updatedProject, filePath);
 
       // v2.2.2: When a design file changes, re-scan for linked assets
       // (designer may have added new links). Fire-and-forget.
       // C3: Skip runScanOnOpen for .psd — scheduleScanOnSave handles it with debounce
       // to avoid double ag-psd parse on every .psd save event.
-      if (SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
+      if (sourceIsAccepted && SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
         runScanOnOpen(projectId, filePath).catch(() => {});
       }
 
       // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
-      if (ext === '.psd') {
+      if (sourceIsAccepted && ext === '.psd') {
         scheduleScanOnSave(projectId, filePath);
       }
 
       // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
-      if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
+      if (sourceIsAccepted && (ext === '.pptx' || ext === '.ppt' || ext === '.key')) {
         scheduleScanOnSavePresentation(projectId, filePath);
       }
     }
@@ -5234,8 +5501,10 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
     if (idx === -1) return null;
 
     const [file] = project.pendingFiles.splice(idx, 1);
+    const acceptedKey = getTrackedFileDedupKey(file);
+    const acceptedPaths = getTrackedFileKeySet(project.files);
 
-    if (!project.files.some(f => f.path === filePath)) {
+    if (!acceptedPaths.has(acceptedKey)) {
       project.files.push(file);
       recordPendingFileDecision(project, file, 'accepted');
       project.files = deduplicateFiles(project.files);
@@ -5294,21 +5563,23 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
 
   const filePaths = dialogResult.filePaths;
   const result = mutateProject(projectId, (project) => {
+    const acceptedKeys = getTrackedFileKeySet(project.files);
     for (const filePath of filePaths) {
-      if (!project.files.some(f => f.path === filePath)) {
-        const fileEntry = {
-          path: filePath,
-          name: path.basename(filePath),
-          ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now(),
-          source: 'manual-browse', // M1
-        };
-        project.files.push(fileEntry);
-        recordSessionObservedFile(project, fileEntry, {
-          kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
-          method: 'projects:add-files',
-        });
-      }
+      const fileEntry = {
+        path: filePath,
+        name: path.basename(filePath),
+        ext: path.extname(filePath).toLowerCase(),
+        addedAt: Date.now(),
+        source: 'manual-browse', // M1
+      };
+      const key = getTrackedFileDedupKey(fileEntry);
+      if (acceptedKeys.has(key)) continue;
+      project.files.push(fileEntry);
+      acceptedKeys.add(key);
+      recordSessionObservedFile(project, fileEntry, {
+        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+        method: 'projects:add-files',
+      });
     }
     project.files = deduplicateFiles(project.files);
     return project.files;
@@ -5360,8 +5631,9 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
     path.join(homedir, 'Library', 'Application Support', 'Figma'),
   ];
   const watchStart = project.watchStartedAt || project.createdAt;
-  const preScanExistingPaths = new Set(project.files.map(f => f.path));
-  const existingPaths = new Set(project.files.map(f => f.path));
+  const preScanExistingKeys = getTrackedFileKeySet(project.files);
+  const existingPaths = getNormalizedPathSet(project.files);
+  const pendingPaths = getNormalizedPathSet(project.pendingFiles);
 
   await Promise.race([
     (async () => {
@@ -5386,16 +5658,23 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
         // Only capture .fig files within known scan dirs — prevents false positives
         // if Figma has unrelated project files open simultaneously.
         if (!scanDirs.some(dir => filePath.startsWith(dir + "/"))) continue;
-        if (existingPaths.has(filePath)) continue;
+        if (isAutoCaptureExcludedPath(filePath)) continue;
+        const normalizedFilePath = normalizeTrackedFilePath(filePath);
+        if (existingPaths.has(normalizedFilePath) || pendingPaths.has(normalizedFilePath)) continue;
         if (!fs.existsSync(filePath)) continue;
-        project.files.push({
-          path: filePath,
-          name: path.basename(filePath),
-          ext: ".fig",
-          addedAt: Date.now(),
-          source: "lsof-package-scan",
+        const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof-package-scan', {
+          ext: '.fig',
         });
-        existingPaths.add(filePath);
+        const staged = stageLiveObservedFile(project, fileEntry, {
+          forcePending: true,
+          reason: 'pre-package-lsof-scan',
+        });
+        if (!staged.changed) continue;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          existingPaths.add(normalizedFilePath);
+        } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+          pendingPaths.add(normalizedFilePath);
+        }
         newCount++;
       }
     }
@@ -5423,7 +5702,9 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
 
           if (!entry.isFile()) continue;
           if (path.extname(entry.name).toLowerCase() !== '.fig') continue;
-          if (existingPaths.has(fullPath)) continue;
+          if (isAutoCaptureExcludedPath(fullPath)) continue;
+          const normalizedFullPath = normalizeTrackedFilePath(fullPath);
+          if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
 
           // Only include .fig files created or modified during this watch session.
           // v1.3.26: Also check birthtimeMs — Figma Desktop is cloud-first and
@@ -5438,15 +5719,20 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
             continue;
           }
 
-          if (!project.pendingFiles) project.pendingFiles = [];
-          project.pendingFiles.push({
-            path: fullPath,
+          const fileEntry = buildAutoCaptureFileEntry(fullPath, 'fig-scan', {
             name: entry.name,
             ext: '.fig',
-            addedAt: Date.now(),
-            source: 'fig-scan',
           });
-          existingPaths.add(fullPath);
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            forcePending: true,
+            reason: 'pre-package-fig-scan',
+          });
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPaths.add(normalizedFullPath);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedFullPath);
+          }
           newCount++;
         }
       };
@@ -5486,7 +5772,9 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
           if (!entry.isFile()) continue;
           const ext = path.extname(entry.name).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-          if (existingPaths.has(fullPath)) continue;
+          if (isAutoCaptureExcludedPath(fullPath)) continue;
+          const normalizedFullPath = normalizeTrackedFilePath(fullPath);
+          if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
 
           try {
             const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
@@ -5505,15 +5793,20 @@ ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
             continue;
           }
 
-          if (!project.pendingFiles) project.pendingFiles = [];
-          project.pendingFiles.push({
-            path: fullPath,
+          const fileEntry = buildAutoCaptureFileEntry(fullPath, 'lastused-scan', {
             name: entry.name,
             ext,
-            addedAt: Date.now(),
-            source: 'lastused-scan',
           });
-          existingPaths.add(fullPath);
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            forcePending: true,
+            reason: 'pre-package-lastused-scan',
+          });
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPaths.add(normalizedFullPath);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedFullPath);
+          }
           newCount++;
         }
       };
@@ -5568,23 +5861,27 @@ end tell`;
       ).catch(() => ({ stdout: '' }));
 
       if (aiPaths.trim()) {
-        const existingPaths = new Set(project.files.map(f => f.path));
         for (const linkedPath of aiPaths.trim().split('\n')) {
           const trimmed = linkedPath.trim();
           if (!trimmed) continue;
-          if (existingPaths.has(trimmed)) continue;
+          if (isAutoCaptureExcludedPath(trimmed)) continue;
+          const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
+          if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
           if (!fs.existsSync(trimmed)) continue;
           const ext = path.extname(trimmed).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-          project.files.push({
-            path: trimmed,
-            name: path.basename(trimmed),
-            ext,
-            addedAt: Date.now(),
-            source: 'ai-linked',
+          const fileEntry = buildAutoCaptureFileEntry(trimmed, 'ai-linked', { ext });
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            forcePending: true,
+            reason: 'pre-package-app-script-broad-observer',
           });
-          existingPaths.add(trimmed);
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPaths.add(normalizedTrimmed);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedTrimmed);
+          }
           newCount++;
         }
       }
@@ -5614,21 +5911,25 @@ end tell`;
       ).catch(() => ({ stdout: '' }));
 
       if (psPaths.trim()) {
-        const existingPaths = new Set(project.files.map(f => f.path));
         for (const trimmed of psPaths.split('\n').filter(Boolean)) {
-          if (existingPaths.has(trimmed)) continue;
+          if (isAutoCaptureExcludedPath(trimmed)) continue;
+          const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
+          if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
           if (!fs.existsSync(trimmed)) continue;
           const ext = path.extname(trimmed).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-          project.files.push({
-            path: trimmed,
-            name: path.basename(trimmed),
-            ext,
-            addedAt: Date.now(),
-            source: 'psd-linked',
+          const fileEntry = buildAutoCaptureFileEntry(trimmed, 'psd-linked', { ext });
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            forcePending: true,
+            reason: 'pre-package-app-script-broad-observer',
           });
-          existingPaths.add(trimmed);
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPaths.add(normalizedTrimmed);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedTrimmed);
+          }
           newCount++;
         }
       }
@@ -5645,15 +5946,19 @@ end tell`;
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId);
       for (const asset of psdAssets) {
-        if (existingPaths.has(asset.filePath)) continue;
-        project.files.push({
-          path: asset.filePath,
-          name: path.basename(asset.filePath),
-          ext: path.extname(asset.filePath).toLowerCase(),
-          addedAt: Date.now(),
-          source: asset.source,
+        const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
+        if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
+        const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+        const staged = stageLiveObservedFile(project, fileEntry, {
+          relationshipSourcePath: psdFile.path,
+          reason: 'pre-package-psd-parser',
         });
-        existingPaths.add(asset.filePath);
+        if (!staged.changed) continue;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+          existingPaths.add(normalizedAssetPath);
+        } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+          pendingPaths.add(normalizedAssetPath);
+        }
         newCount++;
       }
     }
@@ -5695,23 +6000,27 @@ end tell`;
       ).catch(() => ({ stdout: '' }));
 
       if (inddPaths.trim()) {
-        const existingPaths = new Set(project.files.map(f => f.path));
         for (const linkedPath of inddPaths.trim().split('\n')) {
           const trimmed = linkedPath.trim();
           if (!trimmed) continue;
-          if (existingPaths.has(trimmed)) continue;
+          if (isAutoCaptureExcludedPath(trimmed)) continue;
+          const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
+          if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
           if (!fs.existsSync(trimmed)) continue;
           const ext = path.extname(trimmed).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
-          project.files.push({
-            path: trimmed,
-            name: path.basename(trimmed),
-            ext,
-            addedAt: Date.now(),
-            source: 'indd-linked',
+          const fileEntry = buildAutoCaptureFileEntry(trimmed, 'indd-linked', { ext });
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            forcePending: true,
+            reason: 'pre-package-app-script-broad-observer',
           });
-          existingPaths.add(trimmed);
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPaths.add(normalizedTrimmed);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedTrimmed);
+          }
           newCount++;
         }
       }
@@ -5734,7 +6043,7 @@ end tell`;
   const LINKABLE_EXTENSIONS = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
   if (linkableFiles.length > 0) {
-    const linkExisting = new Set(project.files.map(f => f.path));
+    const linkExisting = getNormalizedPathSet(project.files);
 
     for (const designFile of linkableFiles) {
       try {
@@ -5745,17 +6054,23 @@ end tell`;
         LINKED_ASSET_REGEX.lastIndex = 0;
         while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
           const linkedPath = match[0];
-          if (linkExisting.has(linkedPath)) continue;
+          if (isAutoCaptureExcludedPath(linkedPath)) continue;
+          const normalizedLinkedPath = normalizeTrackedFilePath(linkedPath);
+          if (linkExisting.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
           if (!fs.existsSync(linkedPath)) continue;
 
-          project.files.push({
-            path: linkedPath,
-            name: path.basename(linkedPath),
-            ext: path.extname(linkedPath).toLowerCase(),
-            addedAt: Date.now(),
-            source: 'linked-asset',
+          const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            relationshipSourcePath: designFile.path,
+            reason: 'pre-package-linked-regex',
           });
-          linkExisting.add(linkedPath);
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            linkExisting.add(normalizedLinkedPath);
+            existingPaths.add(normalizedLinkedPath);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedLinkedPath);
+          }
           newCount++;
         }
       } catch (e) {
@@ -5771,7 +6086,7 @@ end tell`;
   // v2.2.3: Pre-package double-check — re-extract linked assets from all scannable
   // design files in the project to catch anything missed during the session.
   try {
-    const existingPathsCheck = new Set(project.files.map(f => f.path));
+    const existingPathsCheck = getNormalizedPathSet(project.files);
     let doubleCheckCount = 0;
     for (const file of project.files.slice()) {
       if (!SCAN_ON_OPEN_EXTENSIONS.has(file.ext)) continue;
@@ -5779,19 +6094,27 @@ end tell`;
         if (!fs.existsSync(file.path)) continue;
         const linkedPaths = await extractLinkedAssets(file.path);
         for (const lp of linkedPaths) {
-          if (existingPathsCheck.has(lp)) continue;
+          if (isAutoCaptureExcludedPath(lp)) continue;
+          const normalizedLinkedPath = normalizeTrackedFilePath(lp);
+          if (existingPathsCheck.has(normalizedLinkedPath) || pendingPaths.has(normalizedLinkedPath)) continue;
           if (!lp.startsWith('/Users/')) continue;
           const lpExt = path.extname(lp).toLowerCase();
           if (!DESIGN_FILE_EXTENSIONS.has(lpExt)) continue;
           if (!fs.existsSync(lp)) continue;
-          project.files.push({
-            path: lp,
-            name: path.basename(lp),
+          const fileEntry = buildAutoCaptureFileEntry(lp, 'pre-package-doublecheck', {
             ext: lpExt,
-            addedAt: Date.now(),
-            source: 'pre-package-doublecheck',
           });
-          existingPathsCheck.add(lp);
+          const staged = stageLiveObservedFile(project, fileEntry, {
+            relationshipSourcePath: file.path,
+            reason: 'pre-package-doublecheck',
+          });
+          if (!staged.changed) continue;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            existingPathsCheck.add(normalizedLinkedPath);
+            existingPaths.add(normalizedLinkedPath);
+          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+            pendingPaths.add(normalizedLinkedPath);
+          }
           doubleCheckCount++;
         }
       } catch (e) {
@@ -5814,14 +6137,15 @@ end tell`;
     const scanFiles = project.files;
     const scanPending = project.pendingFiles || [];
     const merged = mutateProject(projectId, (proj) => {
-      const existingPaths = new Set(proj.files.map(f => f.path));
+      const existingKeys = getTrackedFileKeySet(proj.files);
       const recoveredFilesForProvenance = [];
       for (const f of scanFiles) {
-        if (preScanExistingPaths.has(f.path)) continue;
+        const key = getTrackedFileDedupKey(f);
+        if (preScanExistingKeys.has(key)) continue;
 
-        if (!existingPaths.has(f.path)) {
+        if (!existingKeys.has(key)) {
           proj.files.push(f);
-          existingPaths.add(f.path);
+          existingKeys.add(key);
           recoveredFilesForProvenance.push(f);
           continue;
         }
@@ -5833,10 +6157,12 @@ end tell`;
       }
       if (scanPending.length > 0) {
         if (!proj.pendingFiles) proj.pendingFiles = [];
-        const existPendingPaths = new Set(proj.pendingFiles.map(f => f.path));
+        const existPendingKeys = getTrackedFileKeySet(proj.pendingFiles);
         for (const f of scanPending) {
-          if (!existPendingPaths.has(f.path) && !existingPaths.has(f.path)) {
+          const key = getTrackedFileDedupKey(f);
+          if (!existPendingKeys.has(key) && !existingKeys.has(key)) {
             proj.pendingFiles.push(f);
+            existPendingKeys.add(key);
           }
         }
       }
@@ -6533,6 +6859,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
       proj.packagedAt = Date.now();
       proj.outputPath = destFolder;
     });
+    rememberGeneratedPackageOutputPath(destFolder);
 
     // Increment usage
     usage.packagesThisMonth++;
@@ -6663,6 +6990,7 @@ ipcMain.handle('v2:package-file', async (event, filePath) => {
 
   try {
     const result = await packageMasterFile(filePath, destFolder);
+    rememberGeneratedPackageOutputPath(destFolder);
     return {
       success: true,
       masterFile: result.masterFile,
