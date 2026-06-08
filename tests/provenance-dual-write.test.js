@@ -2102,6 +2102,52 @@ test('automatic live capture ignores old package output and diagnostics folders'
   assert.deepEqual(fresh.provenance.observations, []);
 });
 
+test('lsof package-output image observations are ignored, not accepted or pending', async () => {
+  const currentSourcePath = path.join(TEST_HOME, 'Desktop', 'current-project.ai');
+  const stalePackageImagePath = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Crate-QA',
+    'package-outputs',
+    'Jenna Baseline Existing Files QA_2026-06-07',
+    'Presentation1 — image1_1.jpeg'
+  );
+  fs.mkdirSync(path.dirname(currentSourcePath), { recursive: true });
+  fs.mkdirSync(path.dirname(stalePackageImagePath), { recursive: true });
+  fs.writeFileSync(currentSourcePath, 'current source bytes');
+  fs.writeFileSync(stalePackageImagePath, 'stale package image bytes');
+
+  let pollReady = false;
+  setChildProcessHandler(({ kind, command }) => {
+    if (!pollReady) return { stdout: '' };
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return { stdout: '222 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return { stdout: `p222\nf20\ntREG\nn${stalePackageImagePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Lsof package output exclusion');
+  await setProjectFiles(project.id, {
+    files: [{
+      path: currentSourcePath,
+      name: 'current-project.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }],
+  });
+  pollReady = true;
+  await new Promise(resolve => originalSetTimeout(resolve, 800));
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === stalePackageImagePath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === stalePackageImagePath), false);
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 0);
+});
+
 test('manual add remains allowed for excluded-looking package output paths', async () => {
   const project = await createProject('Manual package output add');
   const filePath = path.join(
@@ -2971,6 +3017,28 @@ test('pre-package pending candidates do not create captured-file observations un
   assert.deepEqual(fresh.files, []);
   assert.equal(fresh.pendingFiles.length, 1);
   assert.equal(fresh.pendingFiles[0].source, 'fig-scan');
+  assert.deepEqual(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE), []);
+});
+
+test('pre-package local Figma recovery ignores generated package folders', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Prepackage Figma package output exclusion');
+  const figPath = path.join(
+    TEST_HOME,
+    'Desktop',
+    'Presentation1_2026-06-07',
+    'old-export.fig'
+  );
+  fs.mkdirSync(path.dirname(figPath), { recursive: true });
+  fs.writeFileSync(figPath, 'old fig package output bytes');
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(scan.newCount, 0);
+
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
   assert.deepEqual(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE), []);
 });
 
