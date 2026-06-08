@@ -271,6 +271,14 @@ const LIVE_CAPTURE_DECISIONS = Object.freeze({
   IGNORE_DUPLICATE: 'ignore_duplicate',
 });
 
+const LIVE_CAPTURE_STATES = Object.freeze({
+  OBSERVED: 'observed',
+  PENDING: 'pending',
+  NEEDS_SAVE: 'needs-save',
+  PACKAGE_READY: 'package-ready',
+  IGNORED: 'ignored',
+});
+
 const AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES = new Set([
   'crate diagnostics',
   'package-outputs',
@@ -286,6 +294,7 @@ const BROAD_LIVE_CAPTURE_SOURCES = new Set([
   'lsof-package-scan',
   'ai-linked',
   'indd-linked',
+  'app-opened',
 ]);
 
 const STRONG_SESSION_LIVE_CAPTURE_REASONS = new Set([
@@ -400,6 +409,92 @@ function buildAutoCaptureFileEntry(filePath, source, extra = {}) {
   };
 }
 
+function normalizeLiveCaptureReason(reason, fallback = 'observed-during-session') {
+  const safe = String(reason || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return safe || fallback;
+}
+
+function getLiveCaptureAppFamily(fileEntry, observation = {}) {
+  if (typeof observation.appFamily === 'string' && observation.appFamily.trim()) {
+    return normalizeLiveCaptureReason(observation.appFamily, 'app');
+  }
+
+  const ext = (fileEntry && (fileEntry.ext || path.extname(fileEntry.path || '')) || '').toLowerCase();
+  const source = fileEntry && fileEntry.source;
+  if (source === 'ai-linked') return 'illustrator';
+  if (source === 'ps-poll' || source === 'psd-linked' || source === 'psd-embedded') return 'photoshop';
+  if (source === 'indd-poll' || source === 'indd-linked') return 'indesign';
+  if (source === 'figma-auto' || source === 'fig-scan' || (ext === '.fig' && source === 'lsof-package-scan')) return 'figma';
+  if (ext === '.pptx' || ext === '.ppt' || ext === '.pptm') return 'powerpoint';
+  if (ext === '.key' || ext === '.keynote') return 'keynote';
+  return null;
+}
+
+function getLiveCaptureState(fileEntry, classification, observation = {}) {
+  if (classification && classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+    return LIVE_CAPTURE_STATES.PACKAGE_READY;
+  }
+
+  if (typeof observation.captureState === 'string' && Object.values(LIVE_CAPTURE_STATES).includes(observation.captureState)) {
+    return observation.captureState;
+  }
+
+  if (observation.requiresSave === true) return LIVE_CAPTURE_STATES.NEEDS_SAVE;
+
+  const ext = (fileEntry && (fileEntry.ext || path.extname(fileEntry.path || '')) || '').toLowerCase();
+  const reason = normalizeLiveCaptureReason(observation.reason || (classification && classification.reason));
+  if (reason === 'initial-lsof-snapshot') return LIVE_CAPTURE_STATES.PENDING;
+  if ((fileEntry && fileEntry.source === 'lsof') && PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
+    return LIVE_CAPTURE_STATES.OBSERVED;
+  }
+  if (fileEntry && ['ai-linked', 'ps-poll', 'indd-poll'].includes(fileEntry.source)) {
+    return LIVE_CAPTURE_STATES.NEEDS_SAVE;
+  }
+
+  return LIVE_CAPTURE_STATES.PENDING;
+}
+
+function decorateLiveObservedFile(fileEntry, classification, observation = {}) {
+  const captureState = getLiveCaptureState(fileEntry, classification, observation);
+  const reason = normalizeLiveCaptureReason(observation.captureReason || observation.reason || classification.reason);
+  const appFamily = getLiveCaptureAppFamily(fileEntry, observation);
+  const sourceName = typeof observation.relationshipSourcePath === 'string' && observation.relationshipSourcePath.trim()
+    ? path.basename(observation.relationshipSourcePath)
+    : null;
+
+  const captureEvidence = {
+    reason,
+    state: captureState,
+    source: fileEntry.source || null,
+    needsSave: captureState === LIVE_CAPTURE_STATES.NEEDS_SAVE,
+  };
+  if (appFamily) captureEvidence.appFamily = appFamily;
+  if (sourceName) captureEvidence.sourceName = sourceName;
+  if (observation.relationshipSourcePath) captureEvidence.relationship = 'source-linked';
+
+  return {
+    ...fileEntry,
+    captureState,
+    captureReason: reason,
+    captureEvidence,
+  };
+}
+
+function stripLiveCaptureMetadata(fileEntry) {
+  if (!fileEntry || typeof fileEntry !== 'object') return fileEntry;
+  const {
+    captureState,
+    captureReason,
+    captureEvidence,
+    ...cleanFileEntry
+  } = fileEntry;
+  return cleanFileEntry;
+}
+
 function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
   if (!project || !fileEntry || !normalizedPath) {
@@ -446,21 +541,23 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
   const normalizedPath = classification.normalizedPath;
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+    const stagedFile = stripLiveCaptureMetadata(fileEntry);
     if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
-    const candidateKey = getTrackedFileDedupKey(fileEntry);
+    const candidateKey = getTrackedFileDedupKey(stagedFile);
     project.pendingFiles = project.pendingFiles.filter(file => (
       getTrackedFileDedupKey(file) !== candidateKey &&
       normalizeTrackedFilePath(file && file.path) !== normalizedPath
     ));
-    project.files.push(fileEntry);
+    project.files.push(stagedFile);
     project.files = deduplicateFiles(project.files);
-    return { ...classification, changed: true, file: fileEntry };
+    return { ...classification, changed: true, file: stagedFile };
   }
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+    const stagedFile = decorateLiveObservedFile(fileEntry, classification, observation);
     if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
-    project.pendingFiles.push(fileEntry);
-    return { ...classification, changed: true, file: fileEntry };
+    project.pendingFiles.push(stagedFile);
+    return { ...classification, changed: true, file: stagedFile };
   }
 
   return { ...classification, changed: false, file: fileEntry };
@@ -2822,12 +2919,9 @@ function pollLsofForProject(projectId) {
             if (!isInWatchedDir) continue;
           }
 
-          // v2.5.5: Never capture presentation source files (.pptx, .key, etc.) via lsof.
-          // When PowerPoint or Keynote has multiple presentations open, lsof sees all of them.
-          // These source files are not linked assets — their embedded content is extracted via
-          // scan-on-save instead. Capturing a second open presentation is always a false positive.
-          const PRESENTATION_SOURCE_EXTS = new Set(['.pptx', '.pptm', '.ppt', '.key', '.keynote']);
-          if (PRESENTATION_SOURCE_EXTS.has(path.extname(filePath).toLowerCase())) continue;
+          // Presentation source files are broad lsof evidence, not package-ready proof.
+          // Let them reach the central policy as pending/observed candidates so an
+          // after-watch open can be visible without reintroducing direct-add contamination.
 
           // v2.5.3: Directory scoping — reject lsof hits outside project root.
           // v2.6.4: Also exempt files in Desktop/Documents/Downloads — these are the user's
@@ -2879,10 +2973,17 @@ function pollLsofForProject(projectId) {
           // v2.2.2: Removed presentation mtime filter — old files on disk placed
           // mid-session should be captured when opened by a design app.
 
+          const processIdentity = currentPid
+            ? getDesignAppProcessIdentity(pidToCmd.get(currentPid) || '')
+            : null;
+          const isPrimarySource = PRIMARY_DESIGN_EXTENSIONS.has(ext);
           const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
           const staged = stageLiveObservedFile(proj, fileEntry, {
             forcePending: true,
-            reason: 'lsof-broad-observer',
+            reason: isPrimarySource ? 'opened-after-watch' : 'app-file-observed',
+            captureReason: isPrimarySource ? 'opened-after-watch' : 'app-file-observed',
+            captureState: isPrimarySource ? LIVE_CAPTURE_STATES.OBSERVED : LIVE_CAPTURE_STATES.PENDING,
+            appFamily: processIdentity && processIdentity.appFamily,
           });
           if (!staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -3550,6 +3651,43 @@ const PS_DOJAVASCRIPT = `(function() {
   return paths.join('\\n');
 })();`;
 
+const AI_ACTIVE_SESSION_APPLESCRIPT = `tell application "Adobe Illustrator"
+  try
+    set outputLines to {}
+    repeat with aDoc in documents
+      set docPath to ""
+      set docModified to "unknown"
+      try
+        set docPath to POSIX path of (full name of aDoc as alias)
+      end try
+      try
+        if modified of aDoc is true then
+          set docModified to "true"
+        else
+          set docModified to "false"
+        end if
+      end try
+      if docPath is not "" then
+        set end of outputLines to "DOC" & tab & docPath & tab & docModified
+      end if
+      repeat with pItem in every placed item of aDoc
+        try
+          if linked of pItem is true then
+            set linkedPath to POSIX path of (file of pItem as alias)
+            if linkedPath is not "" then
+              set end of outputLines to "LINK" & tab & docPath & tab & linkedPath & tab & docModified
+            end if
+          end if
+        end try
+      end repeat
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return outputLines as text
+  on error
+    return ""
+  end try
+end tell`;
+
 function psDoJavascriptAS(jsFilePath) {
   return `tell application "Adobe Photoshop"
   try
@@ -3560,6 +3698,37 @@ function psDoJavascriptAS(jsFilePath) {
     return ""
   end try
 end tell`;
+}
+
+function parseIllustratorActiveSessionOutput(output) {
+  const documents = [];
+  const links = [];
+  for (const rawLine of String(output || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split('\t');
+    const kind = parts[0];
+    if (kind === 'DOC' && parts.length >= 3) {
+      const documentPath = parts[1];
+      if (!documentPath || !path.isAbsolute(documentPath)) continue;
+      documents.push({
+        documentPath,
+        modified: parts[2] === 'true',
+      });
+      continue;
+    }
+    if (kind === 'LINK' && parts.length >= 4) {
+      const documentPath = parts[1];
+      const linkedPath = parts[2];
+      if (!linkedPath || !path.isAbsolute(linkedPath)) continue;
+      links.push({
+        documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
+        linkedPath,
+        modified: parts[3] === 'true',
+      });
+    }
+  }
+  return { documents, links };
 }
 
 const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
@@ -3598,6 +3767,46 @@ async function pollPsForProject(projectId) {
   try {
     const discoveredPaths = [];
 
+    // --- Illustrator ---
+    const { stdout: aiCheck } = await execAsync(
+      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
+      { timeout: 3000, encoding: 'utf8' }
+    ).catch(() => ({ stdout: '' }));
+
+    if (aiCheck.trim()) {
+      try {
+        const { stdout: aiOut } = await runOsascriptInPrivateTemp(
+          () => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }),
+          'crate-ai-active-session.applescript',
+          { timeout: 10000, encoding: 'utf8' }
+        );
+        const activeState = parseIllustratorActiveSessionOutput(aiOut);
+        for (const doc of activeState.documents) {
+          discoveredPaths.push({
+            filePath: doc.documentPath,
+            source: 'app-opened',
+            appFamily: 'illustrator',
+            captureReason: doc.modified ? 'unsaved-source-needs-save' : 'opened-after-watch',
+            captureState: doc.modified ? LIVE_CAPTURE_STATES.NEEDS_SAVE : LIVE_CAPTURE_STATES.OBSERVED,
+            requiresSave: doc.modified,
+          });
+        }
+        for (const link of activeState.links) {
+          discoveredPaths.push({
+            filePath: link.linkedPath,
+            source: 'ai-linked',
+            appFamily: 'illustrator',
+            captureReason: 'linked-asset-observed',
+            captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
+            relationshipSourcePath: link.documentPath,
+            requiresSave: true,
+          });
+        }
+      } catch (e) {
+        // Illustrator may be busy or script timed out — skip silently
+      }
+    }
+
     // --- Photoshop ---
     const { stdout: psCheck } = await execAsync(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
@@ -3615,7 +3824,14 @@ async function pollPsForProject(projectId) {
           { timeout: 10000, encoding: 'utf8' }
         );
         for (const p of psOut.split('\n').filter(Boolean)) {
-          discoveredPaths.push({ filePath: p, source: 'ps-poll' });
+          discoveredPaths.push({
+            filePath: p,
+            source: 'ps-poll',
+            appFamily: 'photoshop',
+            captureReason: 'linked-asset-observed',
+            captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
+            requiresSave: true,
+          });
         }
       } catch (e) {
         // Photoshop may be busy or script timed out — skip silently
@@ -3637,7 +3853,16 @@ async function pollPsForProject(projectId) {
         );
         for (const line of inddOut.split('\n')) {
           const p = line.trim();
-          if (p) discoveredPaths.push({ filePath: p, source: 'indd-poll' });
+          if (p) {
+            discoveredPaths.push({
+              filePath: p,
+              source: 'indd-poll',
+              appFamily: 'indesign',
+              captureReason: 'linked-asset-observed',
+              captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
+              requiresSave: true,
+            });
+          }
         }
       } catch (e) {
         // InDesign may be busy or script timed out — skip silently
@@ -3651,7 +3876,8 @@ async function pollPsForProject(projectId) {
     const pendingPaths = getNormalizedPathSet(project.pendingFiles);
     const newFiles = [];
 
-    for (const { filePath, source } of discoveredPaths) {
+    for (const discovery of discoveredPaths) {
+      const { filePath, source } = discovery;
       const normalizedFilePath = normalizeTrackedFilePath(filePath);
       if (existingPaths.has(normalizedFilePath) || pendingPaths.has(normalizedFilePath)) continue;
       const ext = path.extname(filePath).toLowerCase();
@@ -3661,20 +3887,26 @@ async function pollPsForProject(projectId) {
       } catch (_) {
         continue; // File doesn't exist or not readable
       }
-      newFiles.push({ filePath, source, ext });
+      newFiles.push({ ...discovery, ext });
       pendingPaths.add(normalizedFilePath); // prevent dupes within this batch
     }
 
     if (newFiles.length === 0) return;
 
     let addedCount = 0;
-    for (const { filePath, source, ext } of newFiles) {
+    for (const discovery of newFiles) {
+      const { filePath, source, ext } = discovery;
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
         const fileEntry = buildAutoCaptureFileEntry(filePath, source, { ext });
         const staged = stageLiveObservedFile(proj, fileEntry, {
           forcePending: true,
-          reason: 'app-script-broad-observer',
+          reason: discovery.captureReason || 'app-script-broad-observer',
+          captureReason: discovery.captureReason || 'app-script-broad-observer',
+          captureState: discovery.captureState,
+          requiresSave: discovery.requiresSave === true,
+          appFamily: discovery.appFamily,
+          relationshipSourcePath: discovery.relationshipSourcePath,
         });
         if (!staged.changed) return null;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -4994,10 +5226,16 @@ async function startWatching(projectId) {
             }
             if (pendingPaths.has(normalizedFilePath)) continue;
 
+            const processIdentity = currentPid
+              ? getDesignAppProcessIdentity(pidToCmd.get(currentPid) || '')
+              : null;
             const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
             const staged = stageLiveObservedFile(project, fileEntry, {
               forcePending: true,
               reason: 'initial-lsof-snapshot',
+              captureReason: 'stale-prewatch-opened',
+              captureState: LIVE_CAPTURE_STATES.PENDING,
+              appFamily: processIdentity && processIdentity.appFamily,
             });
             if (!staged.changed) continue;
             if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -5508,6 +5746,7 @@ ipcMain.handle('projects:remove-file', (event, projectId, fileIdOrPath) => {
 // --- Tier 2: Accept / reject pending files ---
 
 ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
+  let acceptedSourceForScan = null;
   const result = mutateProject(projectId, (project) => {
     const idx = (project.pendingFiles || []).findIndex(f => f.path === filePath);
     if (idx === -1) return null;
@@ -5517,11 +5756,13 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
     const acceptedPaths = getTrackedFileKeySet(project.files);
 
     if (!acceptedPaths.has(acceptedKey)) {
-      project.files.push(file);
-      recordPendingFileDecision(project, file, 'accepted');
+      const acceptedFile = stripLiveCaptureMetadata(file);
+      project.files.push(acceptedFile);
+      recordPendingFileDecision(project, acceptedFile, 'accepted');
       project.files = deduplicateFiles(project.files);
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
+      acceptedSourceForScan = acceptedFile;
     }
 
     return { files: project.files, pendingFiles: project.pendingFiles };
@@ -5532,6 +5773,13 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
   if (trayWindow && !trayWindow.isDestroyed()) {
     trayWindow.webContents.send('files:updated', { projectId, files: result.files });
     trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles });
+  }
+
+  if (
+    acceptedSourceForScan &&
+    SCAN_ON_OPEN_EXTENSIONS.has((acceptedSourceForScan.ext || path.extname(acceptedSourceForScan.path || '')).toLowerCase())
+  ) {
+    runScanOnOpen(projectId, acceptedSourceForScan.path).catch(() => {});
   }
 
   return result;

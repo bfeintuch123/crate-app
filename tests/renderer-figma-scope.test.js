@@ -8,7 +8,6 @@ function createElementStub(tagName = 'div') {
   const classes = new Set();
   const element = {
     tagName: tagName.toUpperCase(),
-    textContent: '',
     style: {},
     children: [],
     open: false,
@@ -24,13 +23,35 @@ function createElementStub(tagName = 'div') {
       contains: (name) => classes.has(name),
     },
     appendChild: child => element.children.push(child),
+    addEventListener: () => {},
+    querySelector: selector => {
+      if (selector === '.btn-accept-pending' || selector === '.btn-reject-pending') {
+        return { addEventListener: () => {} };
+      }
+      return null;
+    },
   };
 
   let html = '';
+  let text = '';
+  const htmlEscape = value => String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+  Object.defineProperty(element, 'textContent', {
+    get: () => text,
+    set: value => {
+      text = String(value ?? '');
+      html = htmlEscape(text);
+    },
+  });
   Object.defineProperty(element, 'innerHTML', {
     get: () => html,
     set: value => {
-      html = value;
+      html = String(value ?? '');
+      text = html;
       element.children = [];
     },
   });
@@ -185,4 +206,45 @@ test('Package Details stays hidden when disabled in settings', () => {
 
   assert.equal(elements['package-details'].classList.contains('hidden'), true);
   assert.equal(elements['package-details-issues'].children.length, 0);
+});
+
+test('Pending-only live session renders active review state instead of empty tracking copy', () => {
+  const elements = {
+    'pending-section': createElementStub(),
+    'pending-file-list': createElementStub(),
+    'file-list': createElementStub(),
+  };
+  const renderer = loadRendererHelpers(createDocumentStub(elements));
+  const project = {
+    id: 'project-pending-only',
+    files: [],
+    pendingFiles: [{
+      path: '/Users/example/Desktop/IMG_5331.JPG',
+      name: 'IMG_5331.JPG',
+      ext: '.jpg',
+      source: 'ai-linked',
+      captureState: 'needs-save',
+      captureReason: 'linked-asset-observed',
+      captureEvidence: {
+        state: 'needs-save',
+        reason: 'linked-asset-observed',
+        source: 'ai-linked',
+        needsSave: true,
+        appFamily: 'illustrator',
+        sourceName: 'layout.ai',
+        relationship: 'source-linked',
+      },
+    }],
+  };
+
+  renderer.renderPendingFiles(project);
+  renderer.renderFileList(project.files, { hasActiveCandidates: true });
+
+  assert.equal(elements['pending-section'].classList.contains('hidden'), false);
+  assert.equal(elements['pending-file-list'].children.length, 1);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('Save to make package-ready'), true);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('provenance'), false);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
+  assert.equal(elements['file-list'].innerHTML.includes('No package-ready files yet'), true);
+  assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
 });

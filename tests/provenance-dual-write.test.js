@@ -1884,6 +1884,48 @@ test('accept pending preserves file ledger entry and records one confirmed sessi
   );
 });
 
+test('accept pending source triggers persisted scan-on-open linked asset discovery', async () => {
+  resetTestHomeWorkspace();
+  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-accept-pending-scan');
+  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+
+  try {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+    fs.mkdirSync(repoTempRoot, { recursive: true });
+    const sourcePath = path.join(repoTempRoot, 'accepted-source.ai');
+    const linkedPath = path.join(repoTempRoot, 'accepted-linked.png');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    fs.writeFileSync(sourcePath, `ai persisted link ${linkedPath}`);
+
+    const project = await createProject('Accept pending scan provenance');
+    await setProjectFiles(project.id, {
+      pendingFiles: [makePendingFile(sourcePath, 'lsof')],
+    });
+
+    const result = await callIpc('projects:accept-pending', project.id, sourcePath);
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].path, sourcePath);
+    assert.equal(Object.prototype.hasOwnProperty.call(result.files[0], 'captureState'), false);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      5000
+    );
+    assert.equal(fresh.pendingFiles.length, 0);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.equal(Object.prototype.hasOwnProperty.call(linkedFile, 'captureState'), false);
+    const acceptObservations = getSessionObservedByMethod(fresh, 'projects:accept-pending');
+    assert.equal(acceptObservations.length, 1);
+    assert.equal(acceptObservations[0].observer.kind, OBSERVER_KINDS.MANUAL_USER_ACTION);
+    assert.equal(acceptObservations[0].confidence.band, CONFIDENCE_BANDS.CONFIRMED);
+    assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 1);
+  } finally {
+    fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
 test('duplicate or already-present pending accept does not duplicate observations', async () => {
   const project = await createProject('Duplicate pending accept provenance');
   const filePath = path.join(os.tmpdir(), 'duplicate-pending.ai');
@@ -2239,6 +2281,15 @@ test('ongoing lsof poll stages broad observations as pending without captured-fi
   assert.deepEqual(fresh.files, []);
   assert.equal(fresh.pendingFiles[0].path, filePath);
   assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.equal(fresh.pendingFiles[0].captureState, 'observed');
+  assert.equal(fresh.pendingFiles[0].captureReason, 'opened-after-watch');
+  assert.deepEqual(fresh.pendingFiles[0].captureEvidence, {
+    reason: 'opened-after-watch',
+    state: 'observed',
+    source: 'lsof',
+    needsSave: false,
+    appFamily: 'figma',
+  });
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
@@ -2248,6 +2299,39 @@ test('ongoing lsof poll stages broad observations as pending without captured-fi
   assert.equal(processNodes.length, 0);
   assert.equal(appOpenedObservations.length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+});
+
+test('PowerPoint open-after-watch source is visible as pending without direct-add', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'open-after-watch.pptx');
+  fs.writeFileSync(filePath, 'pptx bytes');
+  let pollReady = false;
+  setChildProcessHandler(({ kind, command }) => {
+    if (!pollReady) return { stdout: '' };
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return { stdout: '789 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return { stdout: `p789\nf12\ntREG\nn${filePath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await callIpc('projects:create', 'Presentation open provenance', 'presentation', 'current-page', null);
+  pollReady = true;
+
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles[0].path, filePath);
+  assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.equal(fresh.pendingFiles[0].captureState, 'observed');
+  assert.equal(fresh.pendingFiles[0].captureReason, 'opened-after-watch');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'powerpoint');
+  assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
+  assertProvenanceTextExcludes(fresh, [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Microsoft PowerPoint.app',
+    'stdout',
+  ]);
 });
 
 test('repeated lsof observations for the same pending file are deduped', async () => {
@@ -2372,6 +2456,9 @@ test('ps-poll broad discovery stages pending candidate without captured-file pro
     assert.deepEqual(fresh.files, []);
     assert.equal(fresh.pendingFiles[0].path, filePath);
     assert.equal(fresh.pendingFiles[0].source, 'ps-poll');
+    assert.equal(fresh.pendingFiles[0].captureState, 'needs-save');
+    assert.equal(fresh.pendingFiles[0].captureReason, 'linked-asset-observed');
+    assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'photoshop');
 
     const observations = getSessionObservedByMethod(fresh, 'ps-poll');
     assert.equal(observations.length, 0);
@@ -2427,6 +2514,9 @@ test('indd-poll broad discovery stages pending candidate without captured-file p
   assert.deepEqual(fresh.files, []);
   assert.equal(fresh.pendingFiles[0].path, filePath);
   assert.equal(fresh.pendingFiles[0].source, 'indd-poll');
+  assert.equal(fresh.pendingFiles[0].captureState, 'needs-save');
+  assert.equal(fresh.pendingFiles[0].captureReason, 'linked-asset-observed');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'indesign');
 
   const observations = getSessionObservedByMethod(fresh, 'indd-poll');
   assert.equal(observations.length, 0);
@@ -2436,6 +2526,51 @@ test('indd-poll broad discovery stages pending candidate without captured-file p
   for (const dir of osascriptDirs) {
     assert.equal(fs.existsSync(dir), false);
   }
+});
+
+test('Illustrator live app evidence stages open source and linked asset as needs-save candidates', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'jpg bytes');
+  setChildProcessHandler(({ kind, command, args, commandText }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      assertPrivateTempScriptPath(args[0]);
+      assert.equal(commandText.includes('tell application'), false);
+      return { stdout: `DOC\t${sourcePath}\ttrue\nLINK\t${sourcePath}\t${linkedPath}\ttrue\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator active session provenance');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const sourceCandidate = fresh.pendingFiles.find(file => file.path === sourcePath);
+  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+
+  assert.ok(sourceCandidate);
+  assert.ok(linkedCandidate);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(sourceCandidate.source, 'app-opened');
+  assert.equal(sourceCandidate.captureState, 'needs-save');
+  assert.equal(sourceCandidate.captureReason, 'unsaved-source-needs-save');
+  assert.equal(sourceCandidate.captureEvidence.appFamily, 'illustrator');
+  assert.equal(linkedCandidate.source, 'ai-linked');
+  assert.equal(linkedCandidate.captureState, 'needs-save');
+  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.sourceName, 'live-illustrator.ai');
+  assert.equal(linkedCandidate.captureEvidence.relationship, 'source-linked');
+  assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
+  assertProvenanceTextExcludes(fresh, [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'tell application',
+    sourcePath,
+    linkedPath,
+    'stdout',
+  ]);
 });
 
 test('repeated ps-poll pending insertion does not duplicate candidates or observations', async () => {
