@@ -288,6 +288,12 @@ const BROAD_LIVE_CAPTURE_SOURCES = new Set([
   'indd-linked',
 ]);
 
+const STRONG_SESSION_LIVE_CAPTURE_REASONS = new Set([
+  'chokidar-add',
+  'chokidar-change',
+  'figma-project-tracked-cloud',
+]);
+
 function getNormalizedPathSet(files) {
   return new Set((Array.isArray(files) ? files : [])
     .map(file => normalizeTrackedFilePath(file && file.path))
@@ -419,7 +425,10 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
     return { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'broad-observer', normalizedPath };
   }
 
-  if (observation.allowDirect === true) {
+  if (
+    observation.allowDirect === true &&
+    STRONG_SESSION_LIVE_CAPTURE_REASONS.has(observation.reason)
+  ) {
     return { decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD, reason: observation.reason || 'strong-session-observation', normalizedPath };
   }
 
@@ -3229,8 +3238,11 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         figmaScopeMode: asset.figmaScopeMode || null,
         figmaAssetKey
       };
-      proj.files.push(fileRecord);
-      proj.files = deduplicateFiles(proj.files);
+      const staged = stageLiveObservedFile(proj, fileRecord, {
+        allowDirect: true,
+        reason: 'figma-project-tracked-cloud',
+      });
+      if (!staged.changed || staged.decision !== LIVE_CAPTURE_DECISIONS.DIRECT_ADD) return null;
       console.log(
         `[crate][figma] asset inserted (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
         `name=${formatFigmaLocalNameForLog(fileRecord.name)} localName=${formatFigmaLocalNameForLog(localPath)}`
