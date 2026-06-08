@@ -7,11 +7,14 @@ This playbook is for observing and recording Crate behavior in real GUI workflow
 
 Start narrow, then expand by scoped app lane. Figma, PowerPoint, and Keynote are initial priority workflows, not the full long-term GUI QA scope.
 
+Jenna-machine real-file installed-app QA is an internal-validation lane within this playbook. Use it only when Bryant explicitly scopes QA to Jenna's machine, Jenna-approved real files, the installed Crate app, and installed creative apps. Treat it as privacy-sensitive evidence collection, not broad tester rollout and not release approval.
+
 ## When To Use
 - Before tester rollout when Bryant wants GUI evidence for Crate workflows.
 - Before release readiness when recent changes affect packaging, Package Complete, Package Details, Settings, Figma scope, PowerPoint, Keynote, Finder output, or provenance display.
 - After a GUI-only bug report where tests do not show the user-facing failure.
 - When Bryant wants screenshots, recordings, and a repeatable QA transcript instead of a code change.
+- When Bryant approves Jenna-machine internal QA using real files and already-installed apps.
 - With `.codex/playbooks/crate-manual-qa-matrix.md` for a broader manual QA run.
 
 ## Start Prompt
@@ -81,12 +84,14 @@ Tier 4 - Other supported creative workflows:
 - `docs/*.md`.
 - approved fixture instructions and synthetic assets.
 - approved package outputs under `/private/tmp` or another Bryant-approved QA path.
+- approved Jenna-machine real-file QA source paths, package outputs, screenshots, recordings, notes, and redacted inventories, only when Bryant explicitly approved that exact artifact for inspection and Jenna approved access when relevant.
 - optional `Crate Diagnostics/crate-provenance.json` diagnostic manifests from approved QA package outputs when diagnostic reports were enabled.
 - `package.json` read-only for version and script context.
 
 ## Files Codex May Modify
 - None by default.
 - With Bryant's explicit approval, Codex may write screenshots, screen recordings, notes, and redacted QA reports under `/private/tmp/crate-computer-use-qa-*`.
+- With Bryant's explicit approval for Jenna-machine real-file installed-app QA, Codex may duplicate approved local originals into an approved `source-copies/` folder and operate only on those copies.
 - With Bryant's explicit approval for process-doc updates, Codex may modify `.codex/playbooks/*.md`, `docs/*.md`, or `AGENTS.md` playbook references.
 
 ## Files Codex Must Not Modify
@@ -136,6 +141,7 @@ rg -n "[^[:ascii:]]" AGENTS.md .codex/playbooks docs
 ## GUI QA Setup
 - Confirm the branch, build, or installed app version under test.
 - Confirm whether the app under test is a local dev run, installed QA build, or released build.
+- For Jenna-machine real-file installed-app QA, confirm the installed Crate app path, installed Crate version, approved Jenna-machine source files, approved output folder, approved app lane, and whether diagnostic reports should be enabled before opening files.
 - Confirm macOS version and source-app versions when relevant.
 - Confirm the approved app tier and exact app lane before opening source apps.
 - Confirm the package output folder before starting.
@@ -288,6 +294,72 @@ Pass:
 Fail:
 - Crate packages unrelated app files, misses expected eligible files without warning, silently widens scope, or overclaims source evidence.
 
+### Jenna-Machine Real-File Installed-App QA
+Use this flow only when Bryant explicitly approves internal QA on Jenna's machine using Jenna-approved real files, the installed Crate app, and already-installed source apps. Do not use this flow as approval to install apps, update apps, grant permissions, inspect unrelated files, or make a release decision.
+
+Preflight:
+- Confirm this is Jenna-machine internal validation, not external tester rollout.
+- Confirm the installed DMG-derived Crate app path on Jenna's Mac and visible version/build under test.
+- Confirm each installed source app and version when visible.
+- Confirm the exact approved real file, folder, or cloud document for the lane.
+- Confirm whether the approved real file can be opened, screenshotted, recorded, inventoried, or summarized.
+- Confirm the approved package output folder and whether it may be inspected after packaging.
+- Confirm whether `Include diagnostic report in packages` should be enabled for this run.
+- Confirm any expected package contents and expected exclusions Bryant or Jenna already know.
+
+Real-file handling rules:
+- Use only Bryant-approved real files, folders, cloud documents, package outputs, screenshots, recordings, and manifests.
+- Duplicate approved local originals into an approved `source-copies/` folder before opening them in source apps; run QA from those copies and leave originals untouched.
+- If a source app forces a save, save only the approved file inside `source-copies/`.
+- Use approved `test-photos/` assets only for add-photo or place-photo tests; do not pull photos from Photos, Downloads, Desktop, recents, browser tabs, or unrelated folders.
+- Stop if the flow would inspect, mutate, rename, move, delete, upload, or package an original real file instead of the approved copy.
+
+Steps:
+- Open only the installed Crate app and the approved installed source app for the current lane.
+- Open only the approved real-file copy, folder, or cloud document; keep unrelated files, windows, tabs, and recent-document lists out of scope.
+- Record source-app state that affects package behavior, including save state, active document, linked or embedded media indicators, cloud/local state, and visible file identity.
+- Run the assigned Crate workflow from the installed app: explicit-add, live-watch, or both.
+- Capture Package Complete, Package Details collapsed and expanded, Finder output, and manifest summary when diagnostics were enabled and the manifest is approved for inspection.
+- Compare package output to expected real-file contents and expected exclusions, using redacted names when the file names or paths are private.
+- Record any blocked permissions, missing assets, wrong assets, extra assets, provenance confusion, install warnings, update prompts, crashes, or privacy concerns.
+
+Explicit-add workflow:
+- Add only the approved copied source file, approved copied source folder, approved cloud document, or approved `test-photos/` asset through Crate's explicit add action.
+- Record the exact visible control or menu used for the add.
+- Package to the approved output folder.
+- Pass only if the explicitly added item and expected eligible dependencies are included and unrelated watched files are absent.
+
+Live-watch workflow:
+- Start the approved project in Crate before opening or modifying the copied source file.
+- Open and save only the approved source copy in the installed source app.
+- For add-photo tests, place only approved `test-photos/` assets into the source copy.
+- Package to the approved output folder after Crate has had a fair chance to observe the workflow.
+- Pass only if expected live-watch files are captured and unrelated files opened outside the lane are absent.
+
+Lane coverage:
+- Adobe: run only the approved Photoshop, Illustrator, InDesign, Acrobat, or other approved Adobe lane; record linked, embedded, placed, exported, and save-state evidence visible in the app.
+- Figma: record Current Page Only or Entire File mode, file/page identity when approved, and whether the lane used the installed app or browser-based Figma.
+- PowerPoint: record saved state, linked media, embedded media, and any add-photo step using only approved `test-photos/` assets.
+- Keynote: record saved state, linked media, embedded media, and any add-photo step using only approved `test-photos/` assets; do not assume PowerPoint results cover Keynote.
+
+Audit:
+- Unexpected-file audit: compare Finder output and any approved manifest summary against the expected inclusion and exclusion list; fail if unrelated, private, original-source, Downloads, Desktop, recents, credential, token, or out-of-lane files appear.
+- Duplicate-file audit: record duplicate basenames, duplicate package entries, and repeated assets; pass only when duplicates are expected by the workflow or clearly explained by copied source plus package output, and fail when duplicates imply overcapture or confusing package output.
+
+Pass:
+- The installed Crate app packages the approved real-file workflow through the installed source app, includes expected eligible files, excludes unrelated/private files, and presents Package Complete and Package Details without misleading or sensitive output.
+
+Fail:
+- Crate misses expected real-file assets, includes unrelated/private files, packages from the wrong app or folder, silently widens scope, exposes sensitive paths or diagnostics, misstates provenance, crashes, hangs, or cannot complete the installed-app workflow.
+
+Stop and ask Bryant:
+- Jenna's real file, package output, screenshot, recording, or manifest was not explicitly approved for inspection.
+- The flow requires installing, updating, downloading, signing in, granting macOS permissions, changing cloud/account state, or changing system/app preferences.
+- The source app shows unrelated private files, recent documents, account information, client names, credentials, or private browser state.
+- The package output contains any private, unrelated, credential, token, or surprising file.
+- The installed Crate app or source app version differs from the version Bryant intended to validate.
+- The flow would require code edits, tests edits, package edits, app builds, release builds, signing, notarization, stapling, tags, deploys, or release-site changes.
+
 ## Screenshot And Result Collection
 Collect only approved and privacy-safe artifacts:
 
@@ -302,7 +374,7 @@ Collect only approved and privacy-safe artifacts:
 - redacted `Crate Diagnostics/crate-provenance.json` summary when diagnostics were enabled
 - screen recording path when one was approved
 
-Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only after Bryant approves artifact writing. Do not store private client or tester assets in the report.
+For Jenna-machine real-file installed-app QA, redact private file names, client names, local usernames, cloud URLs, and source paths unless Bryant explicitly approves preserving them. Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only after Bryant approves artifact writing. Do not store private client, tester, or Jenna-machine source assets in the report.
 
 ## When To Stop And Ask Bryant
 - A privacy, security, automation, file-access, keychain, signing, account, or update prompt appears.
@@ -313,6 +385,7 @@ Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only aft
 - A package appears to contain private, credential, or unrelated files.
 - Crate crashes, hangs, or appears to be using the wrong build.
 - A test requires changing app settings beyond the approved scope.
+- A Jenna-machine real-file QA flow would inspect, upload, rename, delete, or otherwise mutate original source files, or copy them anywhere except the approved `source-copies/` folder.
 - Any step would build, release, deploy, notarize, tag, merge, commit, push, or create a GitHub release.
 
 ## Approval Gates
@@ -326,6 +399,8 @@ Codex may run read-only repository checks and operate only the approved GUI apps
 - expanding app access beyond the current QA lane
 - using browser authentication
 - creating new package outputs from private files
+- opening Jenna-machine real files, source folders, package outputs, screenshots, recordings, or manifests
+- duplicating approved originals into `source-copies/`
 - installing, updating, or downloading apps
 - switching branches
 - running `npm start`
@@ -376,6 +451,15 @@ Codex may run read-only repository checks and operate only the approved GUI apps
   - Figma Current Page Only:
   - Figma Entire File:
   - Creative app lane:
+  - Jenna-machine real-file installed-app QA:
+    - Installed DMG app path/version:
+    - Source-copies folder:
+    - Test-photos used:
+    - Workflows run:
+    - Lanes run:
+    - Unexpected-file audit:
+    - Duplicate-file audit:
+    - Pass/fail decision:
 - Artifacts:
   - Screenshots:
   - Recordings:
