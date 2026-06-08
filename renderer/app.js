@@ -473,7 +473,9 @@ async function renderFiles() {
   renderPendingFiles(project);
 
   // File list
-  renderFileList(project.files);
+  renderFileList(project.files, {
+    hasActiveCandidates: (project.pendingFiles || []).length > 0,
+  });
 
   // Package button — always enabled; click handler shows toast if no files
   const packageBtn = $('#btn-package');
@@ -483,12 +485,15 @@ async function renderFiles() {
 // v2.5.0: Track expanded state for file list
 let fileListExpanded = false;
 
-function renderFileList(files) {
+function renderFileList(files, options = {}) {
   const container = $('#file-list');
   container.innerHTML = '';
 
   if (files.length === 0) {
-    container.innerHTML = '<div class="files-empty">No files tracked yet. Files will appear as you work.</div>';
+    const message = options.hasActiveCandidates
+      ? 'No package-ready files yet. Review the files Crate observed during this session.'
+      : 'No files tracked yet. Files will appear as you work.';
+    container.innerHTML = `<div class="files-empty">${escapeHtml(message)}</div>`;
     return;
   }
 
@@ -511,7 +516,9 @@ function renderFileList(files) {
       fileListExpanded = !fileListExpanded;
       // M2: Re-fetch current files from state instead of closing over stale `files` array
       const project = state.projects.find(p => p.id === state.selectedProjectId);
-      renderFileList(project ? project.files : files);
+      renderFileList(project ? project.files : files, {
+        hasActiveCandidates: !!(project && (project.pendingFiles || []).length > 0),
+      });
     });
     container.appendChild(toggle);
 
@@ -525,6 +532,45 @@ function renderFileList(files) {
       container.appendChild(drawer);
     }
   }
+}
+
+const PENDING_APP_LABELS = {
+  illustrator: 'Illustrator',
+  photoshop: 'Photoshop',
+  indesign: 'InDesign',
+  figma: 'Figma',
+  powerpoint: 'PowerPoint',
+  keynote: 'Keynote',
+};
+
+function getPendingCaptureState(file) {
+  const stateValue = file && typeof file.captureState === 'string' ? file.captureState : '';
+  if (stateValue === 'needs-save') return 'needs-save';
+  if (stateValue === 'observed') return 'observed';
+  return 'pending';
+}
+
+function getPendingAppLabel(file) {
+  const appFamily = file && file.captureEvidence && file.captureEvidence.appFamily;
+  return PENDING_APP_LABELS[appFamily] || null;
+}
+
+function getPendingFileReason(file) {
+  const stateValue = getPendingCaptureState(file);
+  const evidence = (file && file.captureEvidence) || {};
+  const appLabel = getPendingAppLabel(file);
+
+  if (stateValue === 'needs-save') {
+    if (evidence.sourceName) return `Linked asset observed from ${evidence.sourceName}. Save to make package-ready.`;
+    if (appLabel) return `Observed in ${appLabel}. Save to make package-ready.`;
+    return 'Save to make package-ready.';
+  }
+
+  if (stateValue === 'observed') {
+    return appLabel ? `Observed in ${appLabel}.` : 'Opened during this session.';
+  }
+
+  return appLabel ? `Needs review before packaging. Observed in ${appLabel}.` : 'Needs review before packaging.';
 }
 
 function createFileRow(file) {
@@ -574,10 +620,18 @@ function renderPendingFiles(project) {
   for (const file of pending) {
     const row = document.createElement('div');
     row.className = 'pending-file';
+    const reason = getPendingFileReason(file);
+    const stateLabel = getPendingCaptureState(file) === 'needs-save'
+      ? 'Needs save'
+      : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs review');
 
     row.innerHTML = `
       <span class="app-file-icon">${getFileEmoji(file.ext)}</span>
-      <span class="app-file-name pending-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
+      <span class="pending-file-copy">
+        <span class="app-file-name pending-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
+        <span class="pending-file-reason">${escapeHtml(reason)}</span>
+      </span>
+      <span class="pending-state-badge">${escapeHtml(stateLabel)}</span>
       <div class="pending-actions">
         <button class="btn-accept-pending" data-path="${escapeHtml(file.path)}" title="Add to project">+ Add</button>
         <button class="btn-reject-pending" data-path="${escapeHtml(file.path)}" title="Skip this file">Skip</button>
