@@ -64,6 +64,8 @@ test('main window uses normal macOS app lifecycle', async () => {
       this.showCount = 0;
       this.focusCount = 0;
       this.restoreCount = 0;
+      this.focusable = options.focusable !== false;
+      this.ignoreMouseEvents = false;
       windows.push(this);
     }
 
@@ -82,6 +84,8 @@ test('main window uses normal macOS app lifecycle', async () => {
     }
     show() { this.showCount += 1; }
     focus() { this.focusCount += 1; }
+    setFocusable(value) { this.focusable = value; }
+    setIgnoreMouseEvents(value) { this.ignoreMouseEvents = value; }
     destroy() { this.destroyed = true; }
   }
 
@@ -172,6 +176,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.options.minWidth, 720);
     assert.equal(win.options.minHeight, 560);
     assert.equal(win.options.show, true);
+    assert.equal(win.options.focusable, true);
     assert.equal(win.options.frame, true);
     assert.equal(win.options.resizable, true);
     assert.equal(win.options.movable, true);
@@ -189,6 +194,8 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
     assert.equal(win.showCount, 1);
     assert.equal(win.focusCount, 1);
+    assert.equal(win.focusable, true);
+    assert.equal(win.ignoreMouseEvents, false);
     assert.equal(appFocusCount, 1);
     assert.equal(trays.length, 1);
 
