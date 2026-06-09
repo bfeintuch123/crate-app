@@ -6,10 +6,18 @@ const vm = require('vm');
 
 function createElementStub(tagName = 'div') {
   const classes = new Set();
+  const listeners = {};
+  const attributes = {};
   const element = {
     tagName: tagName.toUpperCase(),
     style: {},
     children: [],
+    dataset: {},
+    listeners,
+    focused: false,
+    value: '',
+    checked: false,
+    disabled: false,
     open: false,
     classList: {
       add: (...names) => names.forEach(name => classes.add(name)),
@@ -23,7 +31,19 @@ function createElementStub(tagName = 'div') {
       contains: (name) => classes.has(name),
     },
     appendChild: child => element.children.push(child),
-    addEventListener: () => {},
+    addEventListener: (type, fn) => {
+      if (!listeners[type]) listeners[type] = [];
+      listeners[type].push(fn);
+    },
+    dispatchEvent: event => {
+      const normalizedEvent = typeof event === 'string' ? { type: event } : event;
+      for (const fn of listeners[normalizedEvent.type] || []) fn(normalizedEvent);
+    },
+    click: () => element.dispatchEvent({ type: 'click', preventDefault: () => {}, stopPropagation: () => {} }),
+    focus: () => { element.focused = true; },
+    setAttribute: (name, value) => { attributes[name] = String(value); },
+    getAttribute: name => attributes[name],
+    removeAttribute: name => { delete attributes[name]; },
     querySelector: selector => {
       if (selector === '.btn-accept-pending' || selector === '.btn-reject-pending') {
         return { addEventListener: () => {} };
@@ -59,17 +79,49 @@ function createElementStub(tagName = 'div') {
   return element;
 }
 
-function createDocumentStub(elements = {}) {
+function createDocumentStub(elements = {}, options = {}) {
+  const listeners = {};
+  const getElementById = id => {
+    if (!elements[id] && options.createMissingIds) elements[id] = createElementStub();
+    return elements[id] || null;
+  };
+
   return {
-    addEventListener: () => {},
+    listeners,
+    addEventListener: (type, fn) => { listeners[type] = fn; },
     querySelector: selector => {
-      if (selector.startsWith('#')) return elements[selector.slice(1)] || null;
+      if (selector.startsWith('#')) return getElementById(selector.slice(1));
+      if (selector === '.type-pill[data-type="branding"]') {
+        return (options.typePills || []).find(pill => pill.dataset.type === 'branding') || null;
+      }
       return null;
     },
-    querySelectorAll: () => [],
+    querySelectorAll: selector => {
+      if (selector === '.app-tab') return options.tabs || [];
+      if (selector === '.type-pill') return options.typePills || [];
+      return [];
+    },
     createElement: createElementStub,
     body: { appendChild: () => {} },
   };
+}
+
+function createInteractiveRendererDom() {
+  const elements = {};
+  const tabs = ['projects', 'files', 'settings'].map(tabName => {
+    const tab = createElementStub('button');
+    tab.dataset.tab = tabName;
+    if (tabName === 'projects') tab.classList.add('active');
+    return tab;
+  });
+  const typePills = ['branding', 'print', 'presentation', 'web'].map(type => {
+    const pill = createElementStub('button');
+    pill.dataset.type = type;
+    if (type === 'branding') pill.classList.add('active');
+    return pill;
+  });
+  const document = createDocumentStub(elements, { createMissingIds: true, tabs, typePills });
+  return { document, elements, tabs, typePills };
 }
 
 function createPackageDetailsDom() {
@@ -85,11 +137,11 @@ function createPackageDetailsDom() {
   return { document: createDocumentStub(elements), elements };
 }
 
-function loadRendererHelpers(document = createDocumentStub()) {
+function loadRendererHelpers(document = createDocumentStub(), windowOverrides = {}) {
   const context = {
     console,
     document,
-    window: {},
+    window: windowOverrides,
     setTimeout,
     clearTimeout,
     Date,
@@ -247,4 +299,43 @@ test('Pending-only live session renders active review state instead of empty tra
   assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
   assert.equal(elements['file-list'].innerHTML.includes('No package-ready files yet'), true);
   assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
+});
+
+test('renderer binds primary controls before startup IPC resolves', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const neverResolves = new Promise(() => {});
+  const crateBridge = {
+    getProjects: () => neverResolves,
+    getSettings: async () => ({ namingTemplate: '{Project}_{Date}' }),
+    getUsage: async () => ({ packagesThisMonth: 0 }),
+    onFilesUpdated: () => {},
+    onProjectUpdated: () => {},
+    onPackageTrigger: () => {},
+    onPendingFilesUpdated: () => {},
+    onFigmaAuthError: () => {},
+    onFigmaScanStarted: () => {},
+    onFigmaScanComplete: () => {},
+    onFigmaScanError: () => {},
+  };
+
+  loadRendererHelpers(document, { crate: crateBridge });
+  assert.equal(typeof document.listeners.DOMContentLoaded, 'function');
+
+  document.listeners.DOMContentLoaded();
+
+  assert.equal(elements['btn-start-project'].listeners.click.length, 1);
+  assert.equal(elements['btn-add-project'].listeners.click.length, 1);
+  assert.equal(elements['btn-v2-browse'].listeners.click.length, 1);
+
+  document.querySelector('#new-project-form');
+  document.querySelector('#projects-list');
+  document.querySelector('#projects-empty');
+  elements['new-project-form'].classList.add('hidden');
+  elements['projects-list'].classList.add('hidden');
+  elements['btn-start-project'].click();
+
+  assert.equal(elements['projects-empty'].classList.contains('hidden'), true);
+  assert.equal(elements['projects-list'].classList.contains('hidden'), true);
+  assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
+  assert.equal(elements['input-project-name'].focused, true);
 });

@@ -24,10 +24,41 @@ let state = {
   editFigmaProjectId: null
 };
 
+let rendererEventListenersBound = false;
+let mainProcessListenersBound = false;
+
 // Lightweight Figma URL validator — must match the patterns the main process accepts.
 const FIGMA_URL_PATTERN = /figma\.com\/(file|design|proto)\/([a-zA-Z0-9]+)/;
 function isValidFigmaUrl(url) {
   return typeof url === 'string' && FIGMA_URL_PATTERN.test(url.trim());
+}
+
+function sanitizeRendererLogText(value) {
+  let text = '';
+  if (value instanceof Error) {
+    text = value.message || '';
+  } else if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch (e) {
+      text = String(value);
+    }
+  }
+
+  return text
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    .replace(/\bAuthorization\b\s*[:=]\s*[^,\s)]+/gi, 'Authorization=[redacted]')
+    .replace(/\bBearer\s+[^\s,)]+/gi, 'Bearer [redacted]')
+    .replace(/\bcookie\b\s*[:=]\s*[^,\s)]+/gi, 'cookie=[redacted]')
+    .replace(/\btoken\b\s*[:=]\s*[^,\s)]+/gi, 'token=[redacted]')
+    .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var)\/[^\s"'<>]+/g, '[redacted-path]');
+}
+
+function logRendererError(scope, error) {
+  console.error(`[renderer] ${scope}:`, sanitizeRendererLogText(error));
 }
 
 function getFileExtension(file) {
@@ -79,15 +110,35 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 // ===== Init =====
 async function init() {
-  state.projects = await window.crate.getProjects();
-  state.settings = await window.crate.getSettings();
-  state.usage = await window.crate.getUsage();
+  setupEventListeners();
+
+  if (!window.crate) {
+    logRendererError('preload bridge unavailable during startup', 'window.crate missing');
+    renderProjects();
+    renderSettingsControls();
+    renderFooter();
+    return;
+  }
+
+  setupMainProcessListeners();
+
+  try {
+    const [projects, settings, usage] = await Promise.all([
+      window.crate.getProjects(),
+      window.crate.getSettings(),
+      window.crate.getUsage(),
+    ]);
+    state.projects = Array.isArray(projects) ? projects : [];
+    state.settings = settings && typeof settings === 'object' ? settings : {};
+    state.usage = usage && typeof usage === 'object' ? usage : {};
+  } catch (e) {
+    logRendererError('startup data load failed', e);
+  }
 
   renderProjects();
-  renderSettings();
+  renderSettingsControls();
   renderFooter();
-  setupEventListeners();
-  setupMainProcessListeners();
+  renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
 }
 
 // ===== Tab Switching =====
@@ -674,27 +725,45 @@ function getFileEmoji(ext) {
 }
 
 // ===== Render Settings =====
-async function renderSettings() {
-  state.settings = await window.crate.getSettings();
-  state.usage = await window.crate.getUsage();
-
+function renderSettingsControls() {
   $('#input-naming-template').value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   $('#toggle-notifications').checked = state.settings.notifications || false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
 
-  const used = state.usage.packagesThisMonth;
+  const used = Number(state.usage.packagesThisMonth) || 0;
   $('#plan-info').textContent = `Free Plan \u00B7 ${used}/10 packages`;
 
   updateSettingsNamingPreview();
-  renderFigmaSettings();
+}
+
+async function renderSettings() {
+  try {
+    const [settings, usage] = await Promise.all([
+      window.crate.getSettings(),
+      window.crate.getUsage(),
+    ]);
+    state.settings = settings && typeof settings === 'object' ? settings : {};
+    state.usage = usage && typeof usage === 'object' ? usage : {};
+  } catch (e) {
+    logRendererError('settings refresh failed', e);
+  }
+
+  renderSettingsControls();
+  renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
 }
 
 // ===== Figma Settings =====
 async function renderFigmaSettings() {
-  const status = await window.crate.getFigmaStatus();
   const connected = $('#figma-connected');
   const disconnected = $('#figma-disconnected');
+  let status = { connected: false };
+
+  try {
+    status = await window.crate.getFigmaStatus();
+  } catch (e) {
+    logRendererError('Figma status refresh failed', e);
+  }
 
   if (status.connected) {
     connected.classList.remove('hidden');
@@ -723,9 +792,8 @@ function updateSettingsNamingPreview() {
 }
 
 // ===== Render Footer =====
-async function renderFooter() {
-  state.usage = await window.crate.getUsage();
-  const used = state.usage.packagesThisMonth;
+function renderFooter() {
+  const used = Number(state.usage.packagesThisMonth) || 0;
   $('#footer-usage').textContent = `${used} of 10 packages used this month`;
 }
 
@@ -924,6 +992,9 @@ async function confirmClearAll() {
 
 // ===== Event Listeners =====
 function setupEventListeners() {
+  if (rendererEventListenersBound) return;
+  rendererEventListenersBound = true;
+
   // Tab switching
   $$('.app-tab').forEach(tab => {
     tab.addEventListener('click', () => switchTab(tab.dataset.tab));
@@ -1272,6 +1343,13 @@ function setFigmaScanButtonLoading(isLoading) {
 
 // ===== Main Process Listeners =====
 function setupMainProcessListeners() {
+  if (mainProcessListenersBound) return;
+  if (!window.crate) {
+    logRendererError('preload bridge unavailable for main-process listeners', 'window.crate missing');
+    return;
+  }
+  mainProcessListenersBound = true;
+
   // File updates from watcher
   window.crate.onFilesUpdated((data) => {
     window.crate.getProjects().then(projects => {

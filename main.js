@@ -5030,6 +5030,7 @@ function createMainWindow() {
     minWidth: 720,
     minHeight: 560,
     show: true,
+    focusable: true,
     title: 'Crate',
     frame: true,
     resizable: true,
@@ -5120,6 +5121,12 @@ function showMainWindow() {
 
   if (typeof trayWindow.isMinimized === 'function' && trayWindow.isMinimized()) {
     trayWindow.restore();
+  }
+  if (typeof trayWindow.setIgnoreMouseEvents === 'function') {
+    trayWindow.setIgnoreMouseEvents(false);
+  }
+  if (typeof trayWindow.setFocusable === 'function') {
+    trayWindow.setFocusable(true);
   }
   trayWindow.show();
   if (typeof app.focus === 'function') {
