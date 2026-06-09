@@ -2594,9 +2594,12 @@ let packageInFlight = false;
 let tray = null;
 // Historical name retained for existing renderer send paths; this is now the main app window.
 let trayWindow = null;
+let mainWindowShowFallback = null;
 const watchers = new Map(); // projectId -> chokidar watcher
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
+
+const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 
 function sendToRenderer(channel, data) {
   if (trayWindow && !trayWindow.isDestroyed()) {
@@ -5045,9 +5048,58 @@ function createMainWindow() {
     }
   });
 
-  trayWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  const rendererEntry = path.join(__dirname, 'renderer', 'index.html');
+
+  const clearMainWindowShowFallback = () => {
+    if (mainWindowShowFallback) {
+      clearTimeout(mainWindowShowFallback);
+      mainWindowShowFallback = null;
+    }
+  };
+
+  const revealLoadedMainWindow = () => {
+    clearMainWindowShowFallback();
+    showMainWindow();
+  };
+
+  if (typeof trayWindow.once === 'function') {
+    trayWindow.once('ready-to-show', revealLoadedMainWindow);
+  }
+
+  if (trayWindow.webContents && typeof trayWindow.webContents.once === 'function') {
+    trayWindow.webContents.once('did-finish-load', revealLoadedMainWindow);
+  }
+
+  if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
+    trayWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+      console.error('[main-window] renderer failed to load:', redactFigmaLogText(`${errorCode || ''} ${errorDescription || ''}`));
+      showMainWindow();
+    });
+    trayWindow.webContents.on('render-process-gone', (_event, details = {}) => {
+      console.error('[main-window] renderer process exited:', redactFigmaLogText(details.reason || 'unknown'));
+      showMainWindow();
+    });
+  }
+
+  const loadResult = trayWindow.loadFile(rendererEntry);
+  if (loadResult && typeof loadResult.catch === 'function') {
+    loadResult.catch((error) => {
+      console.error('[main-window] renderer load failed:', redactFigmaLogText(error && error.message));
+      showMainWindow();
+    });
+  }
+
+  clearMainWindowShowFallback();
+  mainWindowShowFallback = setTimeout(() => {
+    mainWindowShowFallback = null;
+    showMainWindow();
+  }, MAIN_WINDOW_SHOW_FALLBACK_MS);
+  if (mainWindowShowFallback && typeof mainWindowShowFallback.unref === 'function') {
+    mainWindowShowFallback.unref();
+  }
 
   trayWindow.on('closed', () => {
+    clearMainWindowShowFallback();
     trayWindow = null;
   });
 
@@ -5070,6 +5122,9 @@ function showMainWindow() {
     trayWindow.restore();
   }
   trayWindow.show();
+  if (typeof app.focus === 'function') {
+    app.focus({ steal: true });
+  }
   trayWindow.focus();
 }
 
@@ -7464,33 +7519,46 @@ ipcMain.handle('inactivity:pause', (event, projectId) => {
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {
-  // Show in Dock so users can right-click → Quit
-  // NOTE: Do NOT manually set dock icon — let Electron use the .icns from the packager
-  // which macOS renders with proper squircle mask (no white corners)
-  if (app.dock) {
-    // Add right-click Dock menu
-    app.dock.setMenu(require('electron').Menu.buildFromTemplate([
-      {
-        label: 'Quit Crate',
-        click: () => app.quit()
-      }
-    ]));
-  }
-
-  createMainWindow();
-  createTray();
-  showMainWindow();
-
-  // Resume watching for any active projects (FIX 4: await async startWatching)
-  const projects = getProjects();
-  for (const project of projects) {
-    if (project.status === 'watching') {
-      await startWatching(project.id);
+  try {
+    // Show in Dock so users can right-click → Quit
+    // NOTE: Do NOT manually set dock icon — let Electron use the .icns from the packager
+    // which macOS renders with proper squircle mask (no white corners)
+    if (app.dock) {
+      // Add right-click Dock menu
+      app.dock.setMenu(require('electron').Menu.buildFromTemplate([
+        {
+          label: 'Quit Crate',
+          click: () => app.quit()
+        }
+      ]));
     }
-  }
 
-  // Start inactivity checker
-  startInactivityChecker();
+    createMainWindow();
+    showMainWindow();
+    createTray();
+
+    // Resume watching for any active projects without letting watcher recovery block the UI.
+    const projects = getProjects();
+    for (const project of projects) {
+      if (project.status === 'watching') {
+        try {
+          await startWatching(project.id);
+        } catch (e) {
+          console.error('[startup] failed to resume project watch:', redactFigmaLogText(e && e.message));
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[startup] app initialization failed:', redactFigmaLogText(e && e.message));
+    try {
+      showMainWindow();
+    } catch (showError) {
+      console.error('[startup] failed to show main window:', redactFigmaLogText(showError && showError.message));
+    }
+  } finally {
+    // Start inactivity checker after the main UI has had a chance to show.
+    startInactivityChecker();
+  }
 });
 
 app.on('activate', () => {

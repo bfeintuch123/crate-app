@@ -9,14 +9,17 @@ test('main window uses normal macOS app lifecycle', async () => {
   const originalLoad = Module._load;
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
+  const originalConsoleError = console.error;
   const stubs = new Map();
   const appHandlers = new Map();
   const ipcHandlers = new Map();
   const windows = [];
   const trays = [];
   const intervals = new Set();
+  const errorLogs = [];
   let appReady = false;
   let readyCallback = null;
+  let appFocusCount = 0;
 
   function setStub(name, factory) {
     stubs.set(name, factory);
@@ -42,11 +45,20 @@ test('main window uses normal macOS app lifecycle', async () => {
     intervals.delete(interval);
   };
 
+  console.error = (...args) => {
+    errorLogs.push(args.join(' '));
+  };
+
   class TestBrowserWindow {
     constructor(options) {
       this.options = options;
       this.handlers = new Map();
-      this.webContents = { send: () => {} };
+      this.webContents = {
+        handlers: new Map(),
+        send: () => {},
+        on(channel, fn) { this.handlers.set(channel, fn); },
+        once(channel, fn) { this.handlers.set(channel, fn); },
+      };
       this.destroyed = false;
       this.minimized = false;
       this.showCount = 0;
@@ -55,8 +67,12 @@ test('main window uses normal macOS app lifecycle', async () => {
       windows.push(this);
     }
 
-    loadFile(filePath) { this.loadedFile = filePath; }
+    loadFile(filePath) {
+      this.loadedFile = filePath;
+      return Promise.resolve();
+    }
     on(channel, fn) { this.handlers.set(channel, fn); }
+    once(channel, fn) { this.handlers.set(channel, fn); }
     isDestroyed() { return this.destroyed; }
     isVisible() { return this.showCount > 0 && !this.destroyed; }
     isMinimized() { return this.minimized; }
@@ -119,6 +135,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       }),
       on(channel, fn) { appHandlers.set(channel, fn); },
       isReady: () => appReady,
+      focus: () => { appFocusCount += 1; },
       getPath: () => path.join(os.tmpdir(), 'crate-main-window-test-userdata'),
       dock: { setMenu: () => {} },
     },
@@ -165,18 +182,31 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.options.skipTaskbar, false);
     assert.equal(win.options.transparent, false);
     assert.equal(win.options.backgroundColor, '#ffffff');
+    assert.ok(win.loadedFile.endsWith(path.join('renderer', 'index.html')));
+    assert.equal(typeof win.handlers.get('ready-to-show'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('did-finish-load'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('did-fail-load'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
+    assert.equal(win.showCount, 1);
     assert.equal(win.focusCount, 1);
+    assert.equal(appFocusCount, 1);
     assert.equal(trays.length, 1);
 
-    trays[0].handlers.get('click')();
+    win.webContents.handlers.get('did-fail-load')({}, -6, 'ERR_FILE_NOT_FOUND');
     assert.equal(win.showCount, 2);
     assert.equal(win.focusCount, 2);
+    assert.equal(appFocusCount, 2);
+    assert.ok(errorLogs.some((line) => line.includes('[main-window] renderer failed to load')));
+
+    trays[0].handlers.get('click')();
+    assert.equal(win.showCount, 3);
+    assert.equal(win.focusCount, 3);
 
     win.minimized = true;
     appHandlers.get('activate')();
     assert.equal(win.restoreCount, 1);
-    assert.equal(win.showCount, 3);
-    assert.equal(win.focusCount, 3);
+    assert.equal(win.showCount, 4);
+    assert.equal(win.focusCount, 4);
 
     win.destroyed = true;
     win.handlers.get('closed')();
@@ -189,6 +219,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     Module._load = originalLoad;
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;
+    console.error = originalConsoleError;
     intervals.clear();
   }
 });
