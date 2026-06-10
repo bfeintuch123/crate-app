@@ -4217,14 +4217,38 @@ const PS_DOJAVASCRIPT = `(function() {
   return paths.join('\\n');
 })();`;
 
-const AI_ACTIVE_SESSION_APPLESCRIPT = `tell application "Adobe Illustrator"
+const AI_ACTIVE_SESSION_APPLESCRIPT = `on crateLiveEvidencePath(candidateValue)
+  try
+    if candidateValue is missing value then return ""
+  end try
+  try
+    return POSIX path of (candidateValue as alias)
+  end try
+  try
+    return POSIX path of candidateValue
+  end try
+  try
+    set candidateText to candidateValue as text
+    if candidateText starts with "/" then return candidateText
+  end try
+  return ""
+end crateLiveEvidencePath
+
+tell application "Adobe Illustrator"
   try
     set outputLines to {}
-    repeat with aDoc in documents
+    if (count of documents) is 0 then
+      set end of outputLines to "STATUS" & tab & "no-documents"
+    else
+      set aDoc to current document
       set docPath to ""
+      set docName to ""
       set docModified to "unknown"
       try
-        set docPath to POSIX path of (full name of aDoc as alias)
+        set docName to name of aDoc as text
+      end try
+      try
+        set docPath to my crateLiveEvidencePath(full name of aDoc)
       end try
       try
         if modified of aDoc is true then
@@ -4233,22 +4257,29 @@ const AI_ACTIVE_SESSION_APPLESCRIPT = `tell application "Adobe Illustrator"
           set docModified to "false"
         end if
       end try
-      if docPath is not "" then
-        set end of outputLines to "DOC" & tab & docPath & tab & docModified
-      end if
+      set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified
       repeat with pItem in every placed item of aDoc
+        set linkedPath to ""
         try
-          set linkedPath to POSIX path of (file of pItem as alias)
-          if linkedPath is not "" then
-            set end of outputLines to "LINK" & tab & docPath & tab & linkedPath & tab & docModified
-          end if
+          set linkedPath to my crateLiveEvidencePath(file of pItem)
         end try
+        if linkedPath is "" then
+          try
+            set linkedPath to my crateLiveEvidencePath(file path of pItem)
+          end try
+        end if
+        if linkedPath is not "" then
+          set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified
+        end if
       end repeat
-    end repeat
+    end if
     set AppleScript's text item delimiters to linefeed
     return outputLines as text
-  on error
-    return ""
+  on error errMsg number errNum
+    set safeReason to "illustrator-query-failed"
+    if errNum is -1743 then set safeReason to "automation-permission-denied"
+    if errNum is -1712 then set safeReason to "illustrator-query-timeout"
+    return "ERROR" & tab & safeReason
   end try
 end tell`;
 
@@ -4264,40 +4295,74 @@ function psDoJavascriptAS(jsFilePath) {
 end tell`;
 }
 
+const SAFE_LIVE_APP_STATUS_CODES = new Set([
+  'automation-permission-denied',
+  'automation-not-authorized',
+  'illustrator-query-failed',
+  'illustrator-query-timeout',
+  'no-documents',
+]);
+
+function normalizeLiveAppStatusCode(value, fallback = 'illustrator-query-failed') {
+  const code = sanitizeLiveEvidenceText(value);
+  if (!code) return fallback;
+  if (code === 'automation-not-authorized') return 'automation-permission-denied';
+  return SAFE_LIVE_APP_STATUS_CODES.has(code) ? code : fallback;
+}
+
 function parseIllustratorActiveSessionOutput(output) {
   const documents = [];
   const links = [];
+  const statuses = [];
+  const errors = [];
   for (const rawLine of String(output || '').split('\n')) {
     const line = rawLine.trim();
     if (!line) continue;
     const parts = line.split('\t');
     const kind = parts[0];
+    if (kind === 'STATUS' && parts.length >= 2) {
+      statuses.push(normalizeLiveAppStatusCode(parts[1], 'illustrator-query-failed'));
+      continue;
+    }
+    if (kind === 'ERROR' && parts.length >= 2) {
+      errors.push(normalizeLiveAppStatusCode(parts[1], 'illustrator-query-failed'));
+      continue;
+    }
     if (kind === 'DOC' && parts.length >= 3) {
+      const hasDocumentName = parts.length >= 4;
       const documentPath = parts[1];
-      if (!documentPath || !path.isAbsolute(documentPath)) continue;
+      const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
+      const modifiedValue = hasDocumentName ? parts[3] : parts[2];
+      if ((!documentPath || !path.isAbsolute(documentPath)) && !documentName) continue;
       documents.push({
-        documentPath,
-        modified: parts[2] === 'true',
+        documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
+        documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
+        modified: modifiedValue === 'true',
       });
       continue;
     }
     if (kind === 'LINK' && parts.length >= 4) {
+      const hasDocumentName = parts.length >= 5;
       const documentPath = parts[1];
-      const linkedPath = parts[2];
+      const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
+      const linkedPath = hasDocumentName ? parts[3] : parts[2];
+      const modifiedValue = hasDocumentName ? parts[4] : parts[3];
       if (!linkedPath || !path.isAbsolute(linkedPath)) continue;
       links.push({
         documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
+        documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
         linkedPath,
-        modified: parts[3] === 'true',
+        modified: modifiedValue === 'true',
       });
     }
   }
-  return { documents, links };
+  return { documents, links, statuses, errors };
 }
 
 function createIllustratorLiveEvidenceRecords(projectId, activeState) {
   const evidenceRecords = [];
   for (const doc of (activeState && activeState.documents) || []) {
+    if (!doc.documentPath) continue;
     evidenceRecords.push(createLiveAppEvidence({
       projectId,
       filePath: doc.documentPath,
@@ -4305,7 +4370,7 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState) {
       appFamily: 'illustrator',
       observerMethod: LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION,
       sourceDocumentPath: doc.documentPath,
-      sourceDocumentName: path.basename(doc.documentPath),
+      sourceDocumentName: doc.documentName || path.basename(doc.documentPath),
       documentModified: doc.modified,
       evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
       requiresSave: doc.modified,
@@ -4319,7 +4384,7 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState) {
       appFamily: 'illustrator',
       observerMethod: LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION,
       sourceDocumentPath: link.documentPath,
-      sourceDocumentName: link.documentPath ? path.basename(link.documentPath) : null,
+      sourceDocumentName: link.documentName || (link.documentPath ? path.basename(link.documentPath) : null),
       relationshipSourcePath: link.documentPath,
       documentModified: link.modified,
       evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
@@ -4327,6 +4392,20 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState) {
     }));
   }
   return evidenceRecords.filter(Boolean);
+}
+
+async function isIllustratorRunningForLiveEvidence() {
+  const primary = await execAsync(
+    "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
+    { timeout: 3000, encoding: 'utf8' }
+  ).catch(() => ({ stdout: '' }));
+  if (primary.stdout && primary.stdout.trim()) return true;
+
+  const fallback = await execAsync(
+    "/bin/ps ax -o command= 2>/dev/null | grep -Ei 'Illustrator\\.app/Contents/MacOS/(Adobe )?Illustrator' | grep -v grep",
+    { timeout: 3000, encoding: 'utf8' }
+  ).catch(() => ({ stdout: '' }));
+  return !!(fallback.stdout && fallback.stdout.trim());
 }
 
 function createLinkedAssetLiveEvidenceRecord({
@@ -4469,12 +4548,7 @@ async function pollPsForProject(projectId) {
     const polledApps = [];
 
     // --- Illustrator ---
-    const { stdout: aiCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
-
-    if (aiCheck.trim()) {
+    if (await isIllustratorRunningForLiveEvidence()) {
       polledApps.push('illustrator');
       try {
         const { stdout: aiOut } = await runOsascriptInPrivateTemp(
@@ -4483,6 +4557,9 @@ async function pollPsForProject(projectId) {
           { timeout: 10000, encoding: 'utf8' }
         );
         const activeState = parseIllustratorActiveSessionOutput(aiOut);
+        for (const safeReason of activeState.errors || []) {
+          logLiveAppEvidenceUnavailable('Illustrator', new Error(safeReason));
+        }
         liveEvidenceRecords.push(...createIllustratorLiveEvidenceRecords(projectId, activeState));
       } catch (e) {
         logLiveAppEvidenceUnavailable('Illustrator', e);
