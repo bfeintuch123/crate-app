@@ -2778,6 +2778,90 @@ test('indd-poll broad discovery stages pending candidate without captured-file p
   }
 });
 
+test('Photoshop and InDesign live evidence refresh newly linked assets conservatively', async () => {
+  resetTestHomeWorkspace();
+  const existingPsPath = path.join(TEST_HOME, 'Desktop', 'existing-ps-link.png');
+  const newPsPath = path.join(TEST_HOME, 'Desktop', 'new-ps-linked-smart-object.jpg');
+  const existingInddPath = path.join(TEST_HOME, 'Desktop', 'existing-indd-link.png');
+  const newInddPath = path.join(TEST_HOME, 'Desktop', 'new-indd-link.jpg');
+  for (const filePath of [existingPsPath, newPsPath, existingInddPath, newInddPath]) {
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+
+  let includeNewLinks = false;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+      return { stdout: '123 /Applications/Adobe Photoshop.app/Contents/MacOS/Adobe Photoshop --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return { stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-poll.applescript')) {
+      return { stdout: `${existingPsPath}\n${includeNewLinks ? `${newPsPath}\n` : ''}` };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      return { stdout: `${existingInddPath}\n${includeNewLinks ? `${newInddPath}\n` : ''}` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Adobe suite live refresh');
+  await setProjectFiles(project.id, {
+    files: [
+      {
+        path: existingPsPath,
+        name: path.basename(existingPsPath),
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+      {
+        path: existingInddPath,
+        name: path.basename(existingInddPath),
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+    ],
+  });
+
+  await new Promise(resolve => originalSetTimeout(resolve, 900));
+  let fresh = await getProject(project.id);
+  assert.deepEqual(fresh.pendingFiles, []);
+
+  includeNewLinks = true;
+  fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === newPsPath) &&
+      item.pendingFiles.some(file => file.path === newInddPath),
+    7000
+  );
+
+  const psCandidate = fresh.pendingFiles.find(file => file.path === newPsPath);
+  const inddCandidate = fresh.pendingFiles.find(file => file.path === newInddPath);
+  assert.ok(psCandidate);
+  assert.ok(inddCandidate);
+  assert.equal(psCandidate.source, 'ps-poll');
+  assert.equal(psCandidate.captureState, 'needs-save');
+  assert.equal(psCandidate.captureEvidence.appFamily, 'photoshop');
+  assert.equal(psCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(inddCandidate.source, 'indd-poll');
+  assert.equal(inddCandidate.captureState, 'needs-save');
+  assert.equal(inddCandidate.captureEvidence.appFamily, 'indesign');
+  assert.equal(inddCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(fresh.files.some(file => file.path === newPsPath), false);
+  assert.equal(fresh.files.some(file => file.path === newInddPath), false);
+  assert.deepEqual(getSessionObservedByMethod(fresh, 'ps-poll'), []);
+  assert.deepEqual(getSessionObservedByMethod(fresh, 'indd-poll'), []);
+  assertTextExcludes(JSON.stringify(fresh), [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Photoshop.app',
+    '/Applications/Adobe InDesign.app',
+    'stdout',
+    'raw',
+  ], 'Adobe suite live refresh state');
+});
+
 test('Illustrator live app evidence stages open source and linked asset as needs-save candidates', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
@@ -2860,6 +2944,93 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   ], 'Illustrator live evidence ledger');
   const ledgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {});
   assert.equal(ledgerEntries.filter(entry => entry.strongestState === 'needs-save').length, 2);
+});
+
+test('Illustrator live evidence refresh stages a newly placed linked asset with accepted files present', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'refresh-illustrator.ai');
+  const existingLinkedPath = path.join(TEST_HOME, 'Desktop', 'existing-linked.png');
+  const newLinkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'refresh-package-out');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(existingLinkedPath, 'existing linked bytes');
+  fs.writeFileSync(newLinkedPath, 'new linked bytes');
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  let includeNewLink = false;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      const lines = [
+        `DOC\t${sourcePath}\ttrue`,
+        `LINK\t${sourcePath}\t${existingLinkedPath}\ttrue`,
+      ];
+      if (includeNewLink) lines.push(`LINK\t${sourcePath}\t${newLinkedPath}\ttrue`);
+      return { stdout: `${lines.join('\n')}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator refresh active session');
+  await setProjectFiles(project.id, {
+    files: [
+      {
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+      {
+        path: existingLinkedPath,
+        name: path.basename(existingLinkedPath),
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'scan-on-open',
+      },
+    ],
+  });
+
+  await new Promise(resolve => originalSetTimeout(resolve, 900));
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === newLinkedPath), false);
+  assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+  assert.equal(fresh.files.some(file => file.path === existingLinkedPath), true);
+
+  includeNewLink = true;
+  fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === newLinkedPath),
+    7000
+  );
+
+  const imgCandidate = fresh.pendingFiles.find(file => file.path === newLinkedPath);
+  assert.ok(imgCandidate);
+  assert.equal(imgCandidate.source, 'ai-linked');
+  assert.equal(imgCandidate.captureState, 'needs-save');
+  assert.equal(imgCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(imgCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(imgCandidate.captureEvidence.documentModified, true);
+  assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'refresh-illustrator.ai');
+  assert.equal(imgCandidate.captureEvidence.relationship, 'source-linked');
+  assert.equal(fresh.files.some(file => file.path === newLinkedPath), false);
+
+  const sourceLedger = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .find(entry => entry.latest && entry.latest.candidateName === 'refresh-illustrator.ai');
+  assert.ok(sourceLedger);
+  assert.equal(sourceLedger.latest.captureRecommendation, 'needs-save');
+  assert.equal(sourceLedger.latest.reason, 'unsaved-source-needs-save');
+
+  const result = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(result);
+  assert.equal(result.success, true);
+  assert.equal(fs.existsSync(path.join(result.folderPath, path.basename(newLinkedPath))), false);
+  fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === newLinkedPath), true);
+  assert.equal(fresh.files.some(file => file.path === newLinkedPath), false);
 });
 
 test('strong Illustrator evidence updates an existing weak lsof pending candidate', async () => {

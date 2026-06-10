@@ -1022,14 +1022,20 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   const evidenceSummary = getPrivacySafeLiveEvidenceSummary(evidence, captureState, reason);
 
   if (acceptedKeys.has(candidateKey)) {
+    const acceptedCaptureState = captureState === LIVE_CAPTURE_STATES.NEEDS_SAVE
+      ? LIVE_CAPTURE_STATES.NEEDS_SAVE
+      : LIVE_CAPTURE_STATES.PACKAGE_READY;
+    const acceptedReason = acceptedCaptureState === LIVE_CAPTURE_STATES.NEEDS_SAVE
+      ? reason
+      : 'already-accepted';
     return {
       decision: LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
-      reason: 'already-accepted',
-      captureReason: 'already-accepted',
-      captureState: LIVE_CAPTURE_STATES.PACKAGE_READY,
+      reason: acceptedReason,
+      captureReason: acceptedReason,
+      captureState: acceptedCaptureState,
       normalizedPath,
       evidence,
-      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.PACKAGE_READY, 'already-accepted'),
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, acceptedCaptureState, acceptedReason),
     };
   }
 
@@ -3240,11 +3246,13 @@ const SAFE_FIGMA_ASSET_FORMATS = new Set([
   'svg', 'pdf', 'bmp', 'avif',
 ]);
 
-// --- Photoshop + InDesign Polling (v2.3.0) ---
+// --- Live app evidence refresh (Illustrator, Photoshop, InDesign) ---
 const psPollers = new Map();          // projectId -> setInterval id
 const psPollerStarting = new Set();   // guard: projectIds with initial poll in progress
 const psInProgress = new Set();       // projectIds currently mid-poll
-const PS_POLL_INTERVAL_MS = 3000;     // 3 seconds
+const LIVE_APP_REFRESH_INTERVAL_MS = 3000; // 3 seconds
+const LIVE_APP_INITIAL_REFRESH_DELAY_MS = 500;
+const PS_POLL_INTERVAL_MS = LIVE_APP_REFRESH_INTERVAL_MS; // historical alias
 
 // --- PSD binary parser debounce (v2.3.6) ---
 const psdParseDebounce = new Map();   // psdFilePath -> lastParsedTimestamp
@@ -4230,11 +4238,9 @@ const AI_ACTIVE_SESSION_APPLESCRIPT = `tell application "Adobe Illustrator"
       end if
       repeat with pItem in every placed item of aDoc
         try
-          if linked of pItem is true then
-            set linkedPath to POSIX path of (file of pItem as alias)
-            if linkedPath is not "" then
-              set end of outputLines to "LINK" & tab & docPath & tab & linkedPath & tab & docModified
-            end if
+          set linkedPath to POSIX path of (file of pItem as alias)
+          if linkedPath is not "" then
+            set end of outputLines to "LINK" & tab & docPath & tab & linkedPath & tab & docModified
           end if
         end try
       end repeat
@@ -4339,6 +4345,90 @@ function createLinkedAssetLiveEvidenceRecord({
     evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
     requiresSave: true,
   });
+}
+
+function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
+  const candidates = [];
+  const batchPaths = new Set();
+
+  for (const evidence of Array.isArray(liveEvidenceRecords) ? liveEvidenceRecords : []) {
+    if (!evidence || typeof evidence.filePath !== 'string' || !path.isAbsolute(evidence.filePath)) continue;
+    const normalizedFilePath = normalizeTrackedFilePath(evidence.filePath);
+    if (!normalizedFilePath || batchPaths.has(normalizedFilePath)) continue;
+    const ext = path.extname(evidence.filePath).toLowerCase();
+    if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+    try {
+      fs.accessSync(evidence.filePath, fs.constants.R_OK);
+    } catch (_) {
+      continue;
+    }
+    candidates.push({ evidence, ext, normalizedFilePath });
+    batchPaths.add(normalizedFilePath);
+  }
+
+  return candidates;
+}
+
+function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
+  const candidates = getLiveAppEvidenceCandidates(liveEvidenceRecords);
+  if (candidates.length === 0) return { changed: false, stagedCount: 0 };
+
+  const result = mutateProject(projectId, (proj) => {
+    if (proj.status !== 'watching') return null;
+    let changed = false;
+    let stagedCount = 0;
+    const stagedStates = new Map();
+
+    for (const { evidence, ext } of candidates) {
+      const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
+      const staged = stageLiveObservedFile(proj, fileEntry, {
+        forcePending: true,
+        reason: evidence.evidenceReason || 'app-script-broad-observer',
+        relationshipSourcePath: evidence.relationshipSourcePath,
+        liveEvidence: evidence,
+      });
+      if (!staged.changed) continue;
+      stagedCount++;
+      changed = true;
+      stagedStates.set(staged.captureState, (stagedStates.get(staged.captureState) || 0) + 1);
+      if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+        const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
+        if (storedFile) {
+          recordSessionObservedFile(proj, storedFile, {
+            kind: OBSERVER_KINDS.APP_SCRIPT,
+            method: evidence.source,
+            payload: {
+              method: evidence.source,
+              channel: 'live-app-refresh',
+            },
+          });
+        }
+      }
+    }
+
+    return {
+      changed,
+      stagedCount,
+      stagedStates: Array.from(stagedStates.entries()),
+      files: proj.files,
+      pendingFiles: proj.pendingFiles || [],
+    };
+  });
+
+  if (!result || result.stagedCount === 0) {
+    return { changed: false, stagedCount: 0 };
+  }
+
+  lastFileActivity.set(projectId, Date.now());
+  inactivityNotified.delete(projectId);
+
+  const updatedProject = getProjects().find(p => p.id === projectId);
+  if (updatedProject) {
+    sendToRenderer('files:updated', { projectId, files: updatedProject.files });
+    sendToRenderer('files:pending', { projectId, pendingFiles: updatedProject.pendingFiles || [] });
+  }
+
+  return result;
 }
 
 const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
@@ -4469,80 +4559,12 @@ async function pollPsForProject(projectId) {
 
     if (liveEvidenceRecords.length === 0) return;
 
-    // Skip accepted files, but let pending candidates reach the decision engine
-    // so stronger evidence can reconcile/promote them.
-    const existingPaths = getNormalizedPathSet(project.files);
-    const batchPaths = new Set();
-    const newFiles = [];
-
-    for (const evidence of liveEvidenceRecords) {
-      const { filePath, source } = evidence;
-      const normalizedFilePath = normalizeTrackedFilePath(filePath);
-      if (existingPaths.has(normalizedFilePath) || batchPaths.has(normalizedFilePath)) continue;
-      const ext = path.extname(filePath).toLowerCase();
-      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-      try {
-        fs.accessSync(filePath, fs.constants.R_OK);
-      } catch (_) {
-        continue; // File doesn't exist or not readable
-      }
-      newFiles.push({ evidence, ext });
-      batchPaths.add(normalizedFilePath); // prevent dupes within this batch
-    }
-
-    if (newFiles.length === 0) return;
-
-    let addedCount = 0;
-    const stagedStates = new Map();
-    for (const discovery of newFiles) {
-      const { evidence, ext } = discovery;
-      const { filePath, source } = evidence;
-      const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
-        const fileEntry = buildAutoCaptureFileEntry(filePath, source, { ext });
-        const staged = stageLiveObservedFile(proj, fileEntry, {
-          forcePending: true,
-          reason: evidence.evidenceReason || 'app-script-broad-observer',
-          relationshipSourcePath: evidence.relationshipSourcePath,
-          liveEvidence: evidence,
-        });
-        if (!staged.changed) return null;
-        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
-          const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
-          if (storedFile) {
-            recordSessionObservedFile(proj, storedFile, {
-              kind: OBSERVER_KINDS.APP_SCRIPT,
-              method: source,
-              payload: {
-                method: source,
-                channel: 'live-app-poll',
-              },
-            });
-          }
-        }
-        return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
-      });
-      if (result) {
-        addedCount++;
-        const state = result.pendingFiles.find(file => normalizeTrackedFilePath(file && file.path) === normalizeTrackedFilePath(filePath))?.captureState
-          || LIVE_CAPTURE_STATES.PENDING;
-        stagedStates.set(state, (stagedStates.get(state) || 0) + 1);
-      }
-    }
-
-    if (addedCount > 0) {
-      lastFileActivity.set(projectId, Date.now());
-      inactivityNotified.delete(projectId);
-
-      const updatedProject = getProjects().find(p => p.id === projectId);
-      if (updatedProject) {
-        sendToRenderer('files:updated', { projectId, files: updatedProject.files });
-        sendToRenderer('files:pending', { projectId, pendingFiles: updatedProject.pendingFiles || [] });
-      }
-      const stateSummary = Array.from(stagedStates.entries())
+    const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords);
+    if (refreshResult.stagedCount > 0) {
+      const stateSummary = Array.from(refreshResult.stagedStates || [])
         .map(([state, count]) => `${state}:${count}`)
         .join(',');
-      console.log(`[crate][live-app] Staged ${addedCount} active-session evidence candidates for project ${projectId}${stateSummary ? ` (${stateSummary})` : ''}`);
+      console.log(`[crate][live-app] Staged ${refreshResult.stagedCount} active-session evidence candidates for project ${projectId}${stateSummary ? ` (${stateSummary})` : ''}`);
     }
   } catch (e) {
     console.error('[crate][live-app] pollPsForProject error:', redactFigmaLogText(e && e.message));
@@ -4552,25 +4574,22 @@ async function pollPsForProject(projectId) {
 }
 
 /**
- * Start Photoshop + InDesign polling for a project.
+ * Start live app evidence refresh for a project.
  */
-async function startPsPolling(projectId) {
+function startPsPolling(projectId) {
   if (psPollers.has(projectId) || psPollerStarting.has(projectId)) return;
   psPollerStarting.add(projectId);
-
-  try {
-    await pollPsForProject(projectId);
-  } finally {
-    psPollerStarting.delete(projectId);
-  }
-
-  if (psPollers.has(projectId)) return;
 
   const intervalId = setInterval(() => {
     pollPsForProject(projectId);
   }, PS_POLL_INTERVAL_MS);
-
   psPollers.set(projectId, intervalId);
+
+  setTimeout(() => {
+    pollPsForProject(projectId).finally(() => {
+      psPollerStarting.delete(projectId);
+    });
+  }, LIVE_APP_INITIAL_REFRESH_DELAY_MS);
 }
 
 /**
@@ -6162,7 +6181,7 @@ async function startWatching(projectId) {
   if (projectHasFigmaTrackedFiles(projectSnapshot)) {
     startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
   }
-  startPsPolling(projectId);    // begin Photoshop + InDesign polling (v2.3.0)
+  startPsPolling(projectId);    // begin live app evidence refresh
   startLastUsedPolling(projectId); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
 }
 
