@@ -267,8 +267,10 @@ function deduplicateFiles(files) {
 const LIVE_CAPTURE_DECISIONS = Object.freeze({
   DIRECT_ADD: 'direct_add',
   PENDING_CANDIDATE: 'pending_candidate',
+  UPDATE_PENDING: 'update_pending',
   IGNORE_EXCLUDED: 'ignore_excluded',
   IGNORE_DUPLICATE: 'ignore_duplicate',
+  KEEP_EXISTING: 'keep_existing',
 });
 
 const LIVE_CAPTURE_STATES = Object.freeze({
@@ -278,6 +280,25 @@ const LIVE_CAPTURE_STATES = Object.freeze({
   PACKAGE_READY: 'package-ready',
   IGNORED: 'ignored',
 });
+
+const LIVE_APP_OBSERVER_METHODS = Object.freeze({
+  ILLUSTRATOR_ACTIVE_SESSION: 'illustrator-active-session',
+  PHOTOSHOP_LIVE_SCRIPT: 'photoshop-live-script',
+  INDESIGN_LIVE_APPLESCRIPT: 'indesign-live-applescript',
+});
+
+const LIVE_APP_EVIDENCE_STRENGTHS = Object.freeze({
+  STRUCTURED_APP_DOCUMENT: 'structured-app-document',
+  STRUCTURED_APP_LINK: 'structured-app-link',
+  OPEN_MASTER: 'open-master',
+  BROAD_APP_SIGNAL: 'broad-app-signal',
+  SAVED_FILE_EVENT: 'saved-file-event',
+  PARSER_CONFIRMED: 'parser-confirmed',
+  PROJECT_SCOPED_CLOUD: 'project-scoped-cloud',
+});
+
+const MAX_LIVE_EVIDENCE_CANDIDATES = 500;
+const MAX_LIVE_EVIDENCE_OBSERVATIONS_PER_CANDIDATE = 8;
 
 const AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES = new Set([
   'crate diagnostics',
@@ -302,6 +323,37 @@ const STRONG_SESSION_LIVE_CAPTURE_REASONS = new Set([
   'chokidar-change',
   'figma-project-tracked-cloud',
 ]);
+
+const SAVED_OR_CONFIRMED_CAPTURE_SOURCES = new Set([
+  'scan-on-open',
+  'psd-linked',
+  'psd-embedded',
+  'linked-asset',
+  'scan-on-save-linked',
+  'scan-on-save-embedded',
+  'scan-on-save-psd',
+  'scan-on-save-presentation',
+  'pre-package-doublecheck',
+  'figma-auto',
+]);
+
+const SAVED_OR_CONFIRMED_CAPTURE_REASONS = new Set([
+  'scan-on-open-source-relationship',
+  'scan-on-open-psd-parser',
+  'scan-on-save-psd-parser',
+  'scan-on-save-presentation',
+  'pre-package-parser-regex',
+  'pre-package-psd-parser',
+  'figma-project-tracked-cloud',
+]);
+
+const LIVE_CAPTURE_STATE_RANK = Object.freeze({
+  [LIVE_CAPTURE_STATES.IGNORED]: 0,
+  [LIVE_CAPTURE_STATES.PENDING]: 1,
+  [LIVE_CAPTURE_STATES.OBSERVED]: 2,
+  [LIVE_CAPTURE_STATES.NEEDS_SAVE]: 3,
+  [LIVE_CAPTURE_STATES.PACKAGE_READY]: 4,
+});
 
 function getNormalizedPathSet(files) {
   return new Set((Array.isArray(files) ? files : [])
@@ -418,6 +470,104 @@ function normalizeLiveCaptureReason(reason, fallback = 'observed-during-session'
   return safe || fallback;
 }
 
+function normalizeLiveCaptureState(captureState, fallback = LIVE_CAPTURE_STATES.PENDING) {
+  return Object.values(LIVE_CAPTURE_STATES).includes(captureState)
+    ? captureState
+    : fallback;
+}
+
+function getLiveCaptureStateRank(captureState) {
+  return LIVE_CAPTURE_STATE_RANK[captureState] || 0;
+}
+
+function getLiveEvidenceKeyHash(evidenceKey) {
+  if (typeof evidenceKey !== 'string' || !evidenceKey.trim()) return null;
+  return crypto.createHash('sha256').update(evidenceKey).digest('hex').slice(0, 24);
+}
+
+function sanitizeLiveEvidenceText(value) {
+  if (typeof value !== 'string') return null;
+  const safe = value.trim();
+  return safe ? safe.slice(0, 120) : null;
+}
+
+function getLiveAppDisplayName(appFamily) {
+  const normalized = normalizeLiveCaptureReason(appFamily, 'app');
+  const displayNames = {
+    illustrator: 'Illustrator',
+    photoshop: 'Photoshop',
+    indesign: 'InDesign',
+    figma: 'Figma',
+    powerpoint: 'PowerPoint',
+    keynote: 'Keynote',
+  };
+  return displayNames[normalized] || normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function getDesignerReasonForLiveEvidence({ appFamily, evidenceStrength, captureState } = {}) {
+  const appName = appFamily ? getLiveAppDisplayName(appFamily) : 'the active app';
+  if (captureState === LIVE_CAPTURE_STATES.NEEDS_SAVE) {
+    if (evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK) {
+      return `Linked asset observed in ${appName}. Save to make package-ready.`;
+    }
+    return `Observed in ${appName}. Save to make package-ready.`;
+  }
+  if (captureState === LIVE_CAPTURE_STATES.OBSERVED) {
+    return `Opened during this session in ${appName}.`;
+  }
+  if (captureState === LIVE_CAPTURE_STATES.PACKAGE_READY) {
+    return 'Ready to package after saved-file evidence.';
+  }
+  if (captureState === LIVE_CAPTURE_STATES.IGNORED) {
+    return 'Ignored because it is outside this package session.';
+  }
+  return 'Waiting for review.';
+}
+
+// Apps and filesystem watchers provide facts. This policy layer derives the
+// capture decision; future AI review can consume the compact summaries here
+// without ever seeing raw lsof/ps/mdls/AppleScript/JXA output.
+function createLiveAppEvidence(input = {}) {
+  const filePath = typeof input.filePath === 'string' ? input.filePath.trim() : '';
+  if (!filePath || !path.isAbsolute(filePath)) return null;
+
+  const appFamily = normalizeLiveCaptureReason(input.appFamily, 'app');
+  const sourceDocumentPath = typeof input.sourceDocumentPath === 'string' && path.isAbsolute(input.sourceDocumentPath)
+    ? input.sourceDocumentPath
+    : null;
+  const relationshipSourcePath = typeof input.relationshipSourcePath === 'string' && path.isAbsolute(input.relationshipSourcePath)
+    ? input.relationshipSourcePath
+    : sourceDocumentPath;
+  const sourceDocumentName = sanitizeLiveEvidenceText(input.sourceDocumentName)
+    || (relationshipSourcePath ? path.basename(relationshipSourcePath) : null);
+
+  const evidence = {
+    appFamily,
+    source: sanitizeLiveEvidenceText(input.source) || 'app-opened',
+    observerMethod: sanitizeLiveEvidenceText(input.observerMethod) || 'live-app',
+    observedAt: new Date().toISOString(),
+    projectId: sanitizeLiveEvidenceText(input.projectId) || null,
+    filePath,
+    sourceDocumentName,
+    sourceDocumentPath,
+    relationshipSourcePath,
+    documentModified: typeof input.documentModified === 'boolean' ? input.documentModified : null,
+    evidenceStrength: sanitizeLiveEvidenceText(input.evidenceStrength) || LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
+    evidenceReason: normalizeLiveCaptureReason(input.evidenceReason || input.captureReason, 'app-live-evidence'),
+    requiresSave: input.requiresSave === true || input.documentModified === true,
+  };
+
+  if (input.captureRecommendation || input.captureHint) {
+    evidence.captureHint = normalizeLiveCaptureState(input.captureHint || input.captureRecommendation, LIVE_CAPTURE_STATES.PENDING);
+  }
+  return evidence;
+}
+
+function logLiveAppEvidenceUnavailable(appLabel, error) {
+  const suffix = error && error.message ? ` ${redactFigmaLogText(error.message)}` : '';
+  console.warn(`[crate][live-app] ${appLabel} evidence unavailable. Check Automation permissions if this persists.${suffix}`);
+}
+
 function getLiveCaptureAppFamily(fileEntry, observation = {}) {
   if (typeof observation.appFamily === 'string' && observation.appFamily.trim()) {
     return normalizeLiveCaptureReason(observation.appFamily, 'app');
@@ -434,34 +584,370 @@ function getLiveCaptureAppFamily(fileEntry, observation = {}) {
   return null;
 }
 
-function getLiveCaptureState(fileEntry, classification, observation = {}) {
-  if (classification && classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
-    return LIVE_CAPTURE_STATES.PACKAGE_READY;
+function deriveLiveEvidenceStrength(fileEntry, evidence) {
+  if (evidence && typeof evidence.evidenceStrength === 'string' && evidence.evidenceStrength.trim()) {
+    return evidence.evidenceStrength;
   }
-
-  if (typeof observation.captureState === 'string' && Object.values(LIVE_CAPTURE_STATES).includes(observation.captureState)) {
-    return observation.captureState;
+  const source = fileEntry && fileEntry.source;
+  if (source === 'figma-auto') return LIVE_APP_EVIDENCE_STRENGTHS.PROJECT_SCOPED_CLOUD;
+  if (SAVED_OR_CONFIRMED_CAPTURE_SOURCES.has(source)) return LIVE_APP_EVIDENCE_STRENGTHS.PARSER_CONFIRMED;
+  if (source === 'app-opened') return LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT;
+  if (['ai-linked', 'ps-poll', 'indd-poll', 'indd-linked'].includes(source)) {
+    return LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK;
   }
-
-  if (observation.requiresSave === true) return LIVE_CAPTURE_STATES.NEEDS_SAVE;
-
-  const ext = (fileEntry && (fileEntry.ext || path.extname(fileEntry.path || '')) || '').toLowerCase();
-  const reason = normalizeLiveCaptureReason(observation.reason || (classification && classification.reason));
-  if (reason === 'initial-lsof-snapshot') return LIVE_CAPTURE_STATES.PENDING;
-  if ((fileEntry && fileEntry.source === 'lsof') && PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
-    return LIVE_CAPTURE_STATES.OBSERVED;
+  if (source === 'lsof' || source === 'lastused-poll' || source === 'lastused-scan' || source === 'lsof-package-scan') {
+    return LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL;
   }
-  if (fileEntry && ['ai-linked', 'ps-poll', 'indd-poll'].includes(fileEntry.source)) {
+  return LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL;
+}
+
+function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedPath = '') {
+  const liveEvidence = observation.liveEvidence && typeof observation.liveEvidence === 'object'
+    ? observation.liveEvidence
+    : {};
+  const source = sanitizeLiveEvidenceText(liveEvidence.source || fileEntry.source) || 'unknown';
+  const policyReason = normalizeLiveCaptureReason(
+    observation.reason || liveEvidence.evidenceReason || liveEvidence.captureReason || source,
+    'observed-during-session'
+  );
+  const displayReason = normalizeLiveCaptureReason(
+    observation.captureReason || liveEvidence.captureReason || policyReason,
+    policyReason
+  );
+  const relationshipSourcePath = typeof observation.relationshipSourcePath === 'string' && path.isAbsolute(observation.relationshipSourcePath)
+    ? observation.relationshipSourcePath
+    : (typeof liveEvidence.relationshipSourcePath === 'string' && path.isAbsolute(liveEvidence.relationshipSourcePath)
+      ? liveEvidence.relationshipSourcePath
+      : null);
+  const sourceDocumentPath = typeof liveEvidence.sourceDocumentPath === 'string' && path.isAbsolute(liveEvidence.sourceDocumentPath)
+    ? liveEvidence.sourceDocumentPath
+    : relationshipSourcePath;
+  const appFamily = sanitizeLiveEvidenceText(liveEvidence.appFamily)
+    || getLiveCaptureAppFamily(fileEntry, observation)
+    || null;
+  const evidence = {
+    schemaVersion: 1,
+    projectId: project && project.id ? String(project.id) : null,
+    watchStartedAt: project && (project.watchStartedAt || project.createdAt) || null,
+    observedAt: sanitizeLiveEvidenceText(liveEvidence.observedAt) || new Date().toISOString(),
+    candidateName: fileEntry && fileEntry.path ? path.basename(fileEntry.path) : null,
+    candidateExt: (fileEntry && (fileEntry.ext || path.extname(fileEntry.path || '')) || '').toLowerCase(),
+    source,
+    observerMethod: sanitizeLiveEvidenceText(liveEvidence.observerMethod || observation.observerMethod || source) || source,
+    appFamily,
+    sourceDocumentName: sanitizeLiveEvidenceText(liveEvidence.sourceDocumentName)
+      || (sourceDocumentPath ? path.basename(sourceDocumentPath) : null),
+    sourceDocumentPath,
+    relationshipSourcePath,
+    policyReason,
+    displayReason,
+    documentModified: typeof liveEvidence.documentModified === 'boolean'
+      ? liveEvidence.documentModified
+      : (typeof observation.documentModified === 'boolean' ? observation.documentModified : null),
+    forcePending: observation.forcePending === true,
+    allowDirect: observation.allowDirect === true,
+    explicitUserAdd: observation.explicitUserAdd === true,
+    acceptedPending: observation.acceptedPending === true,
+    captureHint: normalizeLiveCaptureState(liveEvidence.captureHint || observation.captureState, null),
+  };
+
+  evidence.evidenceStrength = deriveLiveEvidenceStrength(fileEntry, liveEvidence);
+  evidence.broadObserver = evidence.forcePending || BROAD_LIVE_CAPTURE_SOURCES.has(source);
+  evidence.parserConfirmed = observation.parserConfirmed === true
+    || SAVED_OR_CONFIRMED_CAPTURE_SOURCES.has(source)
+    || SAVED_OR_CONFIRMED_CAPTURE_REASONS.has(policyReason);
+  evidence.filesystemSaved = observation.filesystemSaved === true
+    || (evidence.allowDirect && STRONG_SESSION_LIVE_CAPTURE_REASONS.has(policyReason));
+  evidence.projectScopedCloud = source === 'figma-auto' && policyReason === 'figma-project-tracked-cloud';
+  evidence.savedEvidence = observation.savedEvidence === true
+    || evidence.parserConfirmed
+    || evidence.filesystemSaved
+    || evidence.projectScopedCloud;
+  evidence.relationshipAccepted = relationshipSourcePath
+    ? isAcceptedProjectFilePath(project, relationshipSourcePath)
+    : false;
+  evidence.requiresSave = liveEvidence.requiresSave === true
+    || observation.requiresSave === true
+    || evidence.documentModified === true
+    || (
+      !!relationshipSourcePath &&
+      !evidence.savedEvidence
+    );
+  evidence.evidenceKey = normalizedPath || normalizeTrackedFilePath(fileEntry && fileEntry.path);
+  evidence.evidenceKeyHash = getLiveEvidenceKeyHash(evidence.evidenceKey);
+  return evidence;
+}
+
+function isSavedOrConfirmedLiveEvidence(evidence) {
+  return !!(evidence && (
+    evidence.explicitUserAdd ||
+    evidence.acceptedPending ||
+    evidence.savedEvidence ||
+    evidence.parserConfirmed ||
+    evidence.filesystemSaved ||
+    evidence.projectScopedCloud
+  ));
+}
+
+function shouldDirectAddLiveEvidence(project, fileEntry, evidence) {
+  if (!evidence) return false;
+  if (evidence.explicitUserAdd || evidence.acceptedPending) return true;
+  if (evidence.forcePending || (evidence.broadObserver && !isSavedOrConfirmedLiveEvidence(evidence))) return false;
+  if (evidence.allowDirect && STRONG_SESSION_LIVE_CAPTURE_REASONS.has(evidence.policyReason)) return true;
+  if (evidence.relationshipSourcePath) {
+    return evidence.relationshipAccepted && isSavedOrConfirmedLiveEvidence(evidence) && evidence.documentModified !== true;
+  }
+  return false;
+}
+
+function decideLiveCaptureState(project, fileEntry, evidence, directEligible) {
+  if (directEligible) return LIVE_CAPTURE_STATES.PACKAGE_READY;
+  if (!evidence) return LIVE_CAPTURE_STATES.PENDING;
+  if (evidence.documentModified === true || evidence.requiresSave === true) {
     return LIVE_CAPTURE_STATES.NEEDS_SAVE;
   }
-
+  if (evidence.source === 'app-opened' || evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.OPEN_MASTER) {
+    return LIVE_CAPTURE_STATES.OBSERVED;
+  }
+  if (evidence.source === 'lsof' && PRIMARY_DESIGN_EXTENSIONS.has(evidence.candidateExt) && evidence.policyReason !== 'initial-lsof-snapshot') {
+    return LIVE_CAPTURE_STATES.OBSERVED;
+  }
+  if (isSavedOrConfirmedLiveEvidence(evidence) && !evidence.broadObserver) {
+    return LIVE_CAPTURE_STATES.PACKAGE_READY;
+  }
   return LIVE_CAPTURE_STATES.PENDING;
 }
 
+function getLiveCaptureReasonFromDecision(evidence, captureState) {
+  if (!evidence) return 'observed-during-session';
+  if (captureState === LIVE_CAPTURE_STATES.PACKAGE_READY) {
+    if (evidence.parserConfirmed) return evidence.policyReason || 'parser-confirmed-relationship';
+    if (evidence.filesystemSaved) return evidence.policyReason || 'saved-file-observed';
+    return evidence.policyReason || 'package-ready';
+  }
+  if (captureState === LIVE_CAPTURE_STATES.NEEDS_SAVE) {
+    if (evidence.documentModified === true && evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT) {
+      return 'unsaved-source-needs-save';
+    }
+    if (evidence.relationshipSourcePath || evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK) {
+      return 'linked-asset-observed';
+    }
+    return evidence.displayReason || 'needs-save';
+  }
+  if (captureState === LIVE_CAPTURE_STATES.OBSERVED) {
+    if (evidence.policyReason === 'opened-after-watch' || evidence.source === 'lsof' || evidence.source === 'app-opened') {
+      return 'opened-after-watch';
+    }
+    return evidence.displayReason || 'observed-during-session';
+  }
+  return evidence.displayReason || evidence.policyReason || 'observed-during-session';
+}
+
+function getPrivacySafeLiveEvidenceSummary(evidence, captureState, reason) {
+  if (!evidence || typeof evidence !== 'object') return null;
+  const keepCandidateIdentity = captureState !== LIVE_CAPTURE_STATES.IGNORED;
+  const summary = {
+    schemaVersion: 1,
+    evidenceKey: evidence.evidenceKeyHash || null,
+    candidateExt: evidence.candidateExt || null,
+    source: evidence.source || null,
+    observerMethod: evidence.observerMethod || null,
+    evidenceStrength: evidence.evidenceStrength || LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
+    captureRecommendation: captureState,
+    reason,
+    needsSave: captureState === LIVE_CAPTURE_STATES.NEEDS_SAVE,
+    designerReason: getDesignerReasonForLiveEvidence({
+      appFamily: evidence.appFamily,
+      evidenceStrength: evidence.evidenceStrength,
+      captureState,
+    }),
+    observedAt: evidence.observedAt || null,
+  };
+  if (keepCandidateIdentity && evidence.candidateName) summary.candidateName = evidence.candidateName;
+  if (evidence.appFamily) summary.appFamily = evidence.appFamily;
+  if (keepCandidateIdentity && evidence.sourceDocumentName) {
+    summary.sourceDocumentName = evidence.sourceDocumentName;
+    summary.sourceName = evidence.sourceDocumentName;
+  }
+  if (evidence.relationshipSourcePath) summary.relationship = 'source-linked';
+  if (typeof evidence.documentModified === 'boolean') summary.documentModified = evidence.documentModified;
+  if (evidence.savedEvidence) summary.savedEvidence = true;
+  if (evidence.parserConfirmed) summary.parserConfirmed = true;
+  if (evidence.filesystemSaved) summary.filesystemSaved = true;
+  if (evidence.projectScopedCloud) summary.projectScopedCloud = true;
+  if (evidence.captureHint && evidence.captureHint !== captureState) summary.ignoredCaptureHint = evidence.captureHint;
+  return summary;
+}
+
+function getLiveEvidenceProtectedKeys(project, extraKey = null) {
+  const keys = new Set();
+  if (typeof extraKey === 'string' && extraKey.trim()) keys.add(extraKey);
+  for (const file of [
+    ...((project && Array.isArray(project.files)) ? project.files : []),
+    ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
+  ]) {
+    const normalizedPath = normalizeTrackedFilePath(file && file.path);
+    const key = getLiveEvidenceKeyHash(normalizedPath);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+function getLiveEvidenceUpdatedAtMs(entry) {
+  const candidates = [
+    entry && entry.updatedAt,
+    entry && entry.latest && entry.latest.observedAt,
+    entry && entry.firstObservedAt,
+  ];
+  for (const value of candidates) {
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return 0;
+}
+
+function getLiveEvidencePrunePriority(entry, key, protectedKeys) {
+  const state = normalizeLiveCaptureState(
+    entry && (entry.strongestState || (entry.latest && entry.latest.captureRecommendation)),
+    LIVE_CAPTURE_STATES.IGNORED
+  );
+  if (protectedKeys.has(key) || (entry && protectedKeys.has(entry.evidenceKey))) {
+    return 100 + getLiveCaptureStateRank(state);
+  }
+  if (state === LIVE_CAPTURE_STATES.IGNORED) return 0;
+  if (
+    state === LIVE_CAPTURE_STATES.OBSERVED &&
+    entry &&
+    entry.latest &&
+    entry.latest.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL
+  ) {
+    return 1;
+  }
+  if (state === LIVE_CAPTURE_STATES.OBSERVED) return 2;
+  return 10 + getLiveCaptureStateRank(state);
+}
+
+function minimizeIgnoredLiveEvidenceLedgerEntry(entry) {
+  if (!entry || typeof entry !== 'object' || !entry.latest || typeof entry.latest !== 'object') return;
+  const state = normalizeLiveCaptureState(
+    entry.strongestState || entry.latest.captureRecommendation,
+    LIVE_CAPTURE_STATES.IGNORED
+  );
+  if (state !== LIVE_CAPTURE_STATES.IGNORED) return;
+  delete entry.latest.candidateName;
+  delete entry.latest.sourceDocumentName;
+  delete entry.latest.sourceName;
+}
+
+function pruneLiveEvidenceLedger(project, extraProtectedKey = null) {
+  if (!project || !project.liveEvidenceLedger || typeof project.liveEvidenceLedger !== 'object') return;
+  if (Array.isArray(project.liveEvidenceLedger)) return;
+  const ledger = project.liveEvidenceLedger;
+  if (!ledger.candidates || typeof ledger.candidates !== 'object' || Array.isArray(ledger.candidates)) {
+    ledger.candidates = {};
+    ledger.schemaVersion = 1;
+    return;
+  }
+
+  const entries = Object.entries(ledger.candidates);
+  for (const [, entry] of entries) {
+    minimizeIgnoredLiveEvidenceLedgerEntry(entry);
+  }
+  if (entries.length <= MAX_LIVE_EVIDENCE_CANDIDATES) {
+    ledger.candidateLimit = MAX_LIVE_EVIDENCE_CANDIDATES;
+    return;
+  }
+
+  const protectedKeys = getLiveEvidenceProtectedKeys(project, extraProtectedKey);
+  const evictable = entries
+    .map(([key, entry]) => ({
+      key,
+      entry,
+      priority: getLiveEvidencePrunePriority(entry, key, protectedKeys),
+      updatedAtMs: getLiveEvidenceUpdatedAtMs(entry),
+    }))
+    .sort((a, b) => (
+      a.priority - b.priority ||
+      a.updatedAtMs - b.updatedAtMs ||
+      a.key.localeCompare(b.key)
+    ));
+
+  const removeCount = entries.length - MAX_LIVE_EVIDENCE_CANDIDATES;
+  for (const item of evictable.slice(0, removeCount)) {
+    delete ledger.candidates[item.key];
+  }
+  ledger.schemaVersion = 1;
+  ledger.candidateLimit = MAX_LIVE_EVIDENCE_CANDIDATES;
+  ledger.prunedAt = new Date().toISOString();
+}
+
+function getLiveEvidenceLedger(project) {
+  if (!project || typeof project !== 'object') return null;
+  if (!project.liveEvidenceLedger || typeof project.liveEvidenceLedger !== 'object' || Array.isArray(project.liveEvidenceLedger)) {
+    project.liveEvidenceLedger = {
+      schemaVersion: 1,
+      candidates: {},
+    };
+  }
+  if (!project.liveEvidenceLedger.candidates || typeof project.liveEvidenceLedger.candidates !== 'object') {
+    project.liveEvidenceLedger.candidates = {};
+  }
+  project.liveEvidenceLedger.candidateLimit = MAX_LIVE_EVIDENCE_CANDIDATES;
+  return project.liveEvidenceLedger;
+}
+
+function recordLiveEvidence(project, fileEntry, classification) {
+  if (!classification || !classification.evidence || !classification.evidenceSummary) return;
+  const ledger = getLiveEvidenceLedger(project);
+  if (!ledger) return;
+  const summary = classification.evidenceSummary;
+  const key = summary.evidenceKey || classification.evidence.evidenceKeyHash;
+  if (!key) return;
+  const existing = ledger.candidates[key] || {
+    evidenceKey: key,
+    firstObservedAt: summary.observedAt || new Date().toISOString(),
+    strongestState: LIVE_CAPTURE_STATES.IGNORED,
+    observations: [],
+  };
+  const currentRank = getLiveCaptureStateRank(existing.strongestState);
+  const nextRank = getLiveCaptureStateRank(summary.captureRecommendation);
+  existing.strongestState = nextRank >= currentRank ? summary.captureRecommendation : existing.strongestState;
+  existing.latest = summary;
+  existing.updatedAt = summary.observedAt || new Date().toISOString();
+  const observerRecord = {
+    observerMethod: summary.observerMethod || null,
+    evidenceStrength: summary.evidenceStrength || null,
+    captureState: summary.captureRecommendation,
+    reason: summary.reason,
+    observedAt: summary.observedAt || null,
+  };
+  const observerKey = JSON.stringify(observerRecord);
+  const seen = new Set((existing.observations || []).map(item => JSON.stringify(item)));
+  if (!seen.has(observerKey)) {
+    existing.observations = [...(existing.observations || []), observerRecord]
+      .slice(-MAX_LIVE_EVIDENCE_OBSERVATIONS_PER_CANDIDATE);
+  }
+  ledger.candidates[key] = existing;
+  ledger.updatedAt = existing.updatedAt;
+  pruneLiveEvidenceLedger(project, key);
+}
+
+function shouldUpdatePendingCandidate(existingFile, classification) {
+  if (!existingFile || !classification) return false;
+  const existingState = normalizeLiveCaptureState(existingFile.captureState, LIVE_CAPTURE_STATES.PENDING);
+  const nextState = normalizeLiveCaptureState(classification.captureState, LIVE_CAPTURE_STATES.PENDING);
+  if (getLiveCaptureStateRank(nextState) > getLiveCaptureStateRank(existingState)) return true;
+  const existingMethod = existingFile.captureEvidence && existingFile.captureEvidence.observerMethod;
+  const nextMethod = classification.evidenceSummary && classification.evidenceSummary.observerMethod;
+  return !!(nextMethod && nextMethod !== existingMethod && getLiveCaptureStateRank(nextState) === getLiveCaptureStateRank(existingState));
+}
+
 function decorateLiveObservedFile(fileEntry, classification, observation = {}) {
-  const captureState = getLiveCaptureState(fileEntry, classification, observation);
-  const reason = normalizeLiveCaptureReason(observation.captureReason || observation.reason || classification.reason);
-  const appFamily = getLiveCaptureAppFamily(fileEntry, observation);
+  const captureState = normalizeLiveCaptureState(classification.captureState, LIVE_CAPTURE_STATES.PENDING);
+  const reason = normalizeLiveCaptureReason(classification.captureReason || classification.reason);
+  const appFamily = classification.evidence && classification.evidence.appFamily
+    ? classification.evidence.appFamily
+    : getLiveCaptureAppFamily(fileEntry, observation);
   const sourceName = typeof observation.relationshipSourcePath === 'string' && observation.relationshipSourcePath.trim()
     ? path.basename(observation.relationshipSourcePath)
     : null;
@@ -475,6 +961,9 @@ function decorateLiveObservedFile(fileEntry, classification, observation = {}) {
   if (appFamily) captureEvidence.appFamily = appFamily;
   if (sourceName) captureEvidence.sourceName = sourceName;
   if (observation.relationshipSourcePath) captureEvidence.relationship = 'source-linked';
+  if (classification.evidenceSummary) {
+    Object.assign(captureEvidence, classification.evidenceSummary);
+  }
 
   return {
     ...fileEntry,
@@ -498,47 +987,94 @@ function stripLiveCaptureMetadata(fileEntry) {
 function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
   if (!project || !fileEntry || !normalizedPath) {
-    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, reason: 'invalid-path', normalizedPath };
+    const evidence = normalizeLiveEvidence(project, fileEntry || {}, observation, normalizedPath);
+    const reason = 'invalid-path';
+    return {
+      decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED,
+      reason,
+      captureReason: reason,
+      captureState: LIVE_CAPTURE_STATES.IGNORED,
+      normalizedPath,
+      evidence,
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.IGNORED, reason),
+    };
   }
 
+  const evidence = normalizeLiveEvidence(project, fileEntry, observation, normalizedPath);
   if (isAutoCaptureExcludedPath(fileEntry.path)) {
-    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, reason: 'crate-output-path', normalizedPath };
+    const reason = 'crate-output-path';
+    return {
+      decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED,
+      reason,
+      captureReason: reason,
+      captureState: LIVE_CAPTURE_STATES.IGNORED,
+      normalizedPath,
+      evidence,
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.IGNORED, reason),
+    };
   }
 
   const candidateKey = getTrackedFileDedupKey(fileEntry);
   const acceptedKeys = getTrackedFileKeySet(project.files);
+  const directEligible = shouldDirectAddLiveEvidence(project, fileEntry, evidence);
+  const captureState = decideLiveCaptureState(project, fileEntry, evidence, directEligible);
+  const reason = getLiveCaptureReasonFromDecision(evidence, captureState);
+  const evidenceSummary = getPrivacySafeLiveEvidenceSummary(evidence, captureState, reason);
+
   if (acceptedKeys.has(candidateKey)) {
-    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_DUPLICATE, reason: 'already-accepted', normalizedPath };
+    return {
+      decision: LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
+      reason: 'already-accepted',
+      captureReason: 'already-accepted',
+      captureState: LIVE_CAPTURE_STATES.PACKAGE_READY,
+      normalizedPath,
+      evidence,
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.PACKAGE_READY, 'already-accepted'),
+    };
   }
 
   const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
   if (pendingKeys.has(candidateKey)) {
-    return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_DUPLICATE, reason: 'already-pending', normalizedPath };
+    if (directEligible) {
+      return {
+        decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD,
+        reason,
+        captureReason: reason,
+        captureState: LIVE_CAPTURE_STATES.PACKAGE_READY,
+        normalizedPath,
+        evidence,
+        evidenceSummary,
+      };
+    }
+    const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === candidateKey);
+    return {
+      decision: shouldUpdatePendingCandidate(pendingFile, { captureState, evidenceSummary })
+        ? LIVE_CAPTURE_DECISIONS.UPDATE_PENDING
+        : LIVE_CAPTURE_DECISIONS.KEEP_EXISTING,
+      reason: 'already-pending',
+      captureReason: reason,
+      captureState,
+      normalizedPath,
+      evidence,
+      evidenceSummary,
+    };
   }
 
-  if (observation.forcePending === true || BROAD_LIVE_CAPTURE_SOURCES.has(fileEntry.source)) {
-    return { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'broad-observer', normalizedPath };
-  }
-
-  if (
-    observation.allowDirect === true &&
-    STRONG_SESSION_LIVE_CAPTURE_REASONS.has(observation.reason)
-  ) {
-    return { decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD, reason: observation.reason || 'strong-session-observation', normalizedPath };
-  }
-
-  if (observation.relationshipSourcePath) {
-    return isAcceptedProjectFilePath(project, observation.relationshipSourcePath)
-      ? { decision: LIVE_CAPTURE_DECISIONS.DIRECT_ADD, reason: observation.reason || 'accepted-source-relationship', normalizedPath }
-      : { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'unaccepted-source-relationship', normalizedPath };
-  }
-
-  return { decision: LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE, reason: observation.reason || 'unclassified-auto-observer', normalizedPath };
+  return {
+    decision: directEligible ? LIVE_CAPTURE_DECISIONS.DIRECT_ADD : LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE,
+    reason,
+    captureReason: reason,
+    captureState,
+    normalizedPath,
+    evidence,
+    evidenceSummary,
+  };
 }
 
 function stageLiveObservedFile(project, fileEntry, observation = {}) {
   const classification = classifyLiveObservedFile(project, fileEntry, observation);
   const normalizedPath = classification.normalizedPath;
+  recordLiveEvidence(project, fileEntry, classification);
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
     const stagedFile = stripLiveCaptureMetadata(fileEntry);
@@ -551,6 +1087,24 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
     project.files.push(stagedFile);
     project.files = deduplicateFiles(project.files);
     return { ...classification, changed: true, file: stagedFile };
+  }
+
+  if (classification.decision === LIVE_CAPTURE_DECISIONS.UPDATE_PENDING) {
+    if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
+    const candidateKey = getTrackedFileDedupKey(fileEntry);
+    const idx = project.pendingFiles.findIndex(file => (
+      getTrackedFileDedupKey(file) === candidateKey ||
+      normalizeTrackedFilePath(file && file.path) === normalizedPath
+    ));
+    if (idx === -1) return { ...classification, changed: false, file: fileEntry };
+    const nextFile = decorateLiveObservedFile({
+      ...project.pendingFiles[idx],
+      source: fileEntry.source || project.pendingFiles[idx].source,
+      ext: fileEntry.ext || project.pendingFiles[idx].ext,
+      name: fileEntry.name || project.pendingFiles[idx].name,
+    }, classification, observation);
+    project.pendingFiles[idx] = nextFile;
+    return { ...classification, changed: true, file: nextFile };
   }
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -2580,6 +3134,7 @@ function mutateProject(projectId, fn) {
       return true;
     });
   }
+  pruneLiveEvidenceLedger(project);
   safelyEnsureProjectProvenance(project);
   store.set('projects', projects);
   return result;
@@ -3734,6 +4289,58 @@ function parseIllustratorActiveSessionOutput(output) {
   return { documents, links };
 }
 
+function createIllustratorLiveEvidenceRecords(projectId, activeState) {
+  const evidenceRecords = [];
+  for (const doc of (activeState && activeState.documents) || []) {
+    evidenceRecords.push(createLiveAppEvidence({
+      projectId,
+      filePath: doc.documentPath,
+      source: 'app-opened',
+      appFamily: 'illustrator',
+      observerMethod: LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION,
+      sourceDocumentPath: doc.documentPath,
+      sourceDocumentName: path.basename(doc.documentPath),
+      documentModified: doc.modified,
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
+      requiresSave: doc.modified,
+    }));
+  }
+  for (const link of (activeState && activeState.links) || []) {
+    evidenceRecords.push(createLiveAppEvidence({
+      projectId,
+      filePath: link.linkedPath,
+      source: 'ai-linked',
+      appFamily: 'illustrator',
+      observerMethod: LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION,
+      sourceDocumentPath: link.documentPath,
+      sourceDocumentName: link.documentPath ? path.basename(link.documentPath) : null,
+      relationshipSourcePath: link.documentPath,
+      documentModified: link.modified,
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
+      requiresSave: true,
+    }));
+  }
+  return evidenceRecords.filter(Boolean);
+}
+
+function createLinkedAssetLiveEvidenceRecord({
+  projectId,
+  filePath,
+  source,
+  appFamily,
+  observerMethod,
+}) {
+  return createLiveAppEvidence({
+    projectId,
+    filePath,
+    source,
+    appFamily,
+    observerMethod,
+    evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
+    requiresSave: true,
+  });
+}
+
 const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
   try
     set pathList to {}
@@ -3768,7 +4375,8 @@ async function pollPsForProject(projectId) {
   psInProgress.add(projectId);
 
   try {
-    const discoveredPaths = [];
+    const liveEvidenceRecords = [];
+    const polledApps = [];
 
     // --- Illustrator ---
     const { stdout: aiCheck } = await execAsync(
@@ -3777,6 +4385,7 @@ async function pollPsForProject(projectId) {
     ).catch(() => ({ stdout: '' }));
 
     if (aiCheck.trim()) {
+      polledApps.push('illustrator');
       try {
         const { stdout: aiOut } = await runOsascriptInPrivateTemp(
           () => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }),
@@ -3784,29 +4393,9 @@ async function pollPsForProject(projectId) {
           { timeout: 10000, encoding: 'utf8' }
         );
         const activeState = parseIllustratorActiveSessionOutput(aiOut);
-        for (const doc of activeState.documents) {
-          discoveredPaths.push({
-            filePath: doc.documentPath,
-            source: 'app-opened',
-            appFamily: 'illustrator',
-            captureReason: doc.modified ? 'unsaved-source-needs-save' : 'opened-after-watch',
-            captureState: doc.modified ? LIVE_CAPTURE_STATES.NEEDS_SAVE : LIVE_CAPTURE_STATES.OBSERVED,
-            requiresSave: doc.modified,
-          });
-        }
-        for (const link of activeState.links) {
-          discoveredPaths.push({
-            filePath: link.linkedPath,
-            source: 'ai-linked',
-            appFamily: 'illustrator',
-            captureReason: 'linked-asset-observed',
-            captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
-            relationshipSourcePath: link.documentPath,
-            requiresSave: true,
-          });
-        }
+        liveEvidenceRecords.push(...createIllustratorLiveEvidenceRecords(projectId, activeState));
       } catch (e) {
-        // Illustrator may be busy or script timed out — skip silently
+        logLiveAppEvidenceUnavailable('Illustrator', e);
       }
     }
 
@@ -3817,6 +4406,7 @@ async function pollPsForProject(projectId) {
     ).catch(() => ({ stdout: '' }));
 
     if (psCheck.trim()) {
+      polledApps.push('photoshop');
       try {
         const { stdout: psOut } = await runOsascriptInPrivateTemp(
           ({ resolveScriptPath }) => ({
@@ -3827,17 +4417,17 @@ async function pollPsForProject(projectId) {
           { timeout: 10000, encoding: 'utf8' }
         );
         for (const p of psOut.split('\n').filter(Boolean)) {
-          discoveredPaths.push({
+          const evidence = createLinkedAssetLiveEvidenceRecord({
+            projectId,
             filePath: p,
             source: 'ps-poll',
             appFamily: 'photoshop',
-            captureReason: 'linked-asset-observed',
-            captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
-            requiresSave: true,
+            observerMethod: LIVE_APP_OBSERVER_METHODS.PHOTOSHOP_LIVE_SCRIPT,
           });
+          if (evidence) liveEvidenceRecords.push(evidence);
         }
       } catch (e) {
-        // Photoshop may be busy or script timed out — skip silently
+        logLiveAppEvidenceUnavailable('Photoshop', e);
       }
     }
 
@@ -3848,6 +4438,7 @@ async function pollPsForProject(projectId) {
     ).catch(() => ({ stdout: '' }));
 
     if (inddCheck.trim()) {
+      polledApps.push('indesign');
       try {
         const { stdout: inddOut } = await runOsascriptInPrivateTemp(
           () => ({ 'crate-indd-poll.applescript': INDD_APPLESCRIPT }),
@@ -3857,32 +4448,37 @@ async function pollPsForProject(projectId) {
         for (const line of inddOut.split('\n')) {
           const p = line.trim();
           if (p) {
-            discoveredPaths.push({
+            const evidence = createLinkedAssetLiveEvidenceRecord({
+              projectId,
               filePath: p,
               source: 'indd-poll',
               appFamily: 'indesign',
-              captureReason: 'linked-asset-observed',
-              captureState: LIVE_CAPTURE_STATES.NEEDS_SAVE,
-              requiresSave: true,
+              observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
             });
+            if (evidence) liveEvidenceRecords.push(evidence);
           }
         }
       } catch (e) {
-        // InDesign may be busy or script timed out — skip silently
+        logLiveAppEvidenceUnavailable('InDesign', e);
       }
     }
 
-    if (discoveredPaths.length === 0) return;
+    if (polledApps.length > 0 && liveEvidenceRecords.length > 0) {
+      console.log(`[crate][live-app] Polled active app evidence for project ${projectId}: ${polledApps.join(', ')} (${liveEvidenceRecords.length} records)`);
+    }
 
-    // Deduplicate against accepted and pending project ledgers.
+    if (liveEvidenceRecords.length === 0) return;
+
+    // Skip accepted files, but let pending candidates reach the decision engine
+    // so stronger evidence can reconcile/promote them.
     const existingPaths = getNormalizedPathSet(project.files);
-    const pendingPaths = getNormalizedPathSet(project.pendingFiles);
+    const batchPaths = new Set();
     const newFiles = [];
 
-    for (const discovery of discoveredPaths) {
-      const { filePath, source } = discovery;
+    for (const evidence of liveEvidenceRecords) {
+      const { filePath, source } = evidence;
       const normalizedFilePath = normalizeTrackedFilePath(filePath);
-      if (existingPaths.has(normalizedFilePath) || pendingPaths.has(normalizedFilePath)) continue;
+      if (existingPaths.has(normalizedFilePath) || batchPaths.has(normalizedFilePath)) continue;
       const ext = path.extname(filePath).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       try {
@@ -3890,26 +4486,25 @@ async function pollPsForProject(projectId) {
       } catch (_) {
         continue; // File doesn't exist or not readable
       }
-      newFiles.push({ ...discovery, ext });
-      pendingPaths.add(normalizedFilePath); // prevent dupes within this batch
+      newFiles.push({ evidence, ext });
+      batchPaths.add(normalizedFilePath); // prevent dupes within this batch
     }
 
     if (newFiles.length === 0) return;
 
     let addedCount = 0;
+    const stagedStates = new Map();
     for (const discovery of newFiles) {
-      const { filePath, source, ext } = discovery;
+      const { evidence, ext } = discovery;
+      const { filePath, source } = evidence;
       const result = mutateProject(projectId, (proj) => {
         if (proj.status !== 'watching') return null;
         const fileEntry = buildAutoCaptureFileEntry(filePath, source, { ext });
         const staged = stageLiveObservedFile(proj, fileEntry, {
           forcePending: true,
-          reason: discovery.captureReason || 'app-script-broad-observer',
-          captureReason: discovery.captureReason || 'app-script-broad-observer',
-          captureState: discovery.captureState,
-          requiresSave: discovery.requiresSave === true,
-          appFamily: discovery.appFamily,
-          relationshipSourcePath: discovery.relationshipSourcePath,
+          reason: evidence.evidenceReason || 'app-script-broad-observer',
+          relationshipSourcePath: evidence.relationshipSourcePath,
+          liveEvidence: evidence,
         });
         if (!staged.changed) return null;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -3927,7 +4522,12 @@ async function pollPsForProject(projectId) {
         }
         return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
-      if (result) addedCount++;
+      if (result) {
+        addedCount++;
+        const state = result.pendingFiles.find(file => normalizeTrackedFilePath(file && file.path) === normalizeTrackedFilePath(filePath))?.captureState
+          || LIVE_CAPTURE_STATES.PENDING;
+        stagedStates.set(state, (stagedStates.get(state) || 0) + 1);
+      }
     }
 
     if (addedCount > 0) {
@@ -3939,10 +4539,13 @@ async function pollPsForProject(projectId) {
         sendToRenderer('files:updated', { projectId, files: updatedProject.files });
         sendToRenderer('files:pending', { projectId, pendingFiles: updatedProject.pendingFiles || [] });
       }
-      console.log(`[crate][ps-poll] Staged ${addedCount} linked assets for project ${projectId}`);
+      const stateSummary = Array.from(stagedStates.entries())
+        .map(([state, count]) => `${state}:${count}`)
+        .join(',');
+      console.log(`[crate][live-app] Staged ${addedCount} active-session evidence candidates for project ${projectId}${stateSummary ? ` (${stateSummary})` : ''}`);
     }
   } catch (e) {
-    console.error('[crate][ps-poll] pollPsForProject error:', e.message);
+    console.error('[crate][live-app] pollPsForProject error:', redactFigmaLogText(e && e.message));
   } finally {
     psInProgress.delete(projectId);
   }

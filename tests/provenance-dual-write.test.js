@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -20,6 +21,7 @@ const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
 const originalHomedir = os.homedir;
 const TEST_HOME = path.join(os.tmpdir(), 'crate-provenance-dual-write-home');
+const EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP = 500;
 const activeIntervals = new Set();
 const activeTimeouts = new Set();
 
@@ -349,12 +351,15 @@ function makePendingFile(filePath, source = 'lastused-scan') {
   };
 }
 
-async function setProjectFiles(projectId, { files = [], pendingFiles = [] } = {}) {
+async function setProjectFiles(projectId, { files = [], pendingFiles = [], liveEvidenceLedger } = {}) {
   const projects = await callIpc('projects:get-all');
   const project = projects.find(item => item.id === projectId);
   assert.ok(project, 'expected project to exist');
   project.files = files;
   project.pendingFiles = pendingFiles;
+  if (arguments[1] && Object.prototype.hasOwnProperty.call(arguments[1], 'liveEvidenceLedger')) {
+    project.liveEvidenceLedger = liveEvidenceLedger;
+  }
   return project;
 }
 
@@ -402,6 +407,55 @@ function assertTextExcludes(text, forbiddenValues, label) {
   forbiddenValues.forEach((value, index) => {
     assert.equal(text.includes(value), false, `${label} should exclude forbidden value ${index}`);
   });
+}
+
+function normalizeLedgerPathForTest(filePath) {
+  if (typeof filePath !== 'string' || filePath.trim() === '') return '';
+  const resolvedPath = path.resolve(filePath.trim()).replace(/\/+$/, '');
+  try {
+    return fs.realpathSync.native(resolvedPath).replace(/\/+$/, '').toLowerCase();
+  } catch (_) {
+    return resolvedPath.toLowerCase();
+  }
+}
+
+function liveEvidenceKeyForTest(filePath) {
+  const normalizedPath = normalizeLedgerPathForTest(filePath);
+  return crypto.createHash('sha256').update(normalizedPath).digest('hex').slice(0, 24);
+}
+
+function makeLiveEvidenceLedgerEntry(filePath, captureState, observedAtMs, overrides = {}) {
+  const key = liveEvidenceKeyForTest(filePath);
+  const observedAt = new Date(observedAtMs).toISOString();
+  const latest = {
+    schemaVersion: 1,
+    evidenceKey: key,
+    candidateName: path.basename(filePath),
+    candidateExt: path.extname(filePath).toLowerCase(),
+    source: 'lsof',
+    observerMethod: 'lsof',
+    evidenceStrength: 'broad-app-signal',
+    captureRecommendation: captureState,
+    reason: captureState === 'ignored' ? 'crate-output-path' : 'test-live-evidence',
+    designerReason: 'Waiting for review.',
+    observedAt,
+    ...(overrides.latest || {}),
+  };
+  return [key, {
+    evidenceKey: key,
+    firstObservedAt: observedAt,
+    strongestState: captureState,
+    latest,
+    updatedAt: observedAt,
+    observations: [{
+      observerMethod: latest.observerMethod,
+      evidenceStrength: latest.evidenceStrength,
+      captureState,
+      reason: latest.reason,
+      observedAt,
+    }],
+    ...overrides.entry,
+  }];
 }
 
 async function captureConsoleDuring(fn) {
@@ -1899,7 +1953,21 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
 
     const project = await createProject('Accept pending scan provenance');
     await setProjectFiles(project.id, {
-      pendingFiles: [makePendingFile(sourcePath, 'lsof')],
+      pendingFiles: [
+        makePendingFile(sourcePath, 'lsof'),
+        {
+          ...makePendingFile(linkedPath, 'ai-linked'),
+          captureState: 'needs-save',
+          captureReason: 'linked-asset-observed',
+          captureEvidence: {
+            appFamily: 'illustrator',
+            observerMethod: 'illustrator-active-session',
+            evidenceStrength: 'structured-app-link',
+            captureRecommendation: 'needs-save',
+            designerReason: 'Linked asset observed in Illustrator. Save to make package-ready.',
+          },
+        },
+      ],
     });
 
     const result = await callIpc('projects:accept-pending', project.id, sourcePath);
@@ -1915,7 +1983,11 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     assert.equal(fresh.pendingFiles.length, 0);
     assert.equal(fresh.files.some(file => file.path === sourcePath), true);
     const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.equal(linkedFile.source, 'scan-on-open');
     assert.equal(Object.prototype.hasOwnProperty.call(linkedFile, 'captureState'), false);
+    const linkedLedgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+      .filter(entry => entry.latest && entry.latest.candidateName === 'accepted-linked.png');
+    assert.ok(linkedLedgerEntries.some(entry => entry.strongestState === 'package-ready'));
     const acceptObservations = getSessionObservedByMethod(fresh, 'projects:accept-pending');
     assert.equal(acceptObservations.length, 1);
     assert.equal(acceptObservations[0].observer.kind, OBSERVER_KINDS.MANUAL_USER_ACTION);
@@ -2142,6 +2214,156 @@ test('automatic live capture ignores old package output and diagnostics folders'
   assert.deepEqual(fresh.files, []);
   assert.deepEqual(fresh.pendingFiles, []);
   assert.deepEqual(fresh.provenance.observations, []);
+  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
+  assert.ok(ignoredEvidence.length >= 3);
+  assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
+  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
+  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    packageRootFile,
+    diagnosticsFile,
+    quickPackageFile,
+    TEST_HOME,
+    'raw',
+    'stdout',
+  ], 'ignored live evidence ledger');
+});
+
+test('live evidence ledger caps candidates and preserves active project evidence', async () => {
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Ledger cap provenance');
+  const acceptedPath = path.join(TEST_HOME, 'Desktop', 'ledger-accepted.ai');
+  const pendingPath = path.join(TEST_HOME, 'Desktop', 'ledger-pending.ai');
+  const triggerPath = path.join(TEST_HOME, 'Desktop', 'ledger-trigger.ai');
+  const needsSavePath = path.join(TEST_HOME, 'Desktop', 'ledger-needs-save.ai');
+  const packageReadyPath = path.join(TEST_HOME, 'Desktop', 'ledger-package-ready.ai');
+  for (const filePath of [acceptedPath, pendingPath, triggerPath, needsSavePath, packageReadyPath]) {
+    fs.writeFileSync(filePath, 'ledger bytes');
+  }
+
+  const candidates = {};
+  const addCandidate = ([key, entry]) => {
+    candidates[key] = entry;
+    return key;
+  };
+  const baseMs = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const acceptedKey = addCandidate(makeLiveEvidenceLedgerEntry(acceptedPath, 'package-ready', baseMs, {
+    latest: {
+      source: 'scan-on-open',
+      observerMethod: 'scan-on-open',
+      evidenceStrength: 'parser-confirmed',
+      savedEvidence: true,
+      parserConfirmed: true,
+    },
+  }));
+  const pendingKey = addCandidate(makeLiveEvidenceLedgerEntry(pendingPath, 'pending', baseMs + 1, {
+    latest: {
+      source: 'lsof',
+      observerMethod: 'lsof',
+      evidenceStrength: 'broad-app-signal',
+    },
+  }));
+  const needsSaveKey = addCandidate(makeLiveEvidenceLedgerEntry(needsSavePath, 'needs-save', baseMs + 2, {
+    latest: {
+      source: 'ai-linked',
+      observerMethod: 'illustrator-active-session',
+      evidenceStrength: 'structured-app-link',
+      needsSave: true,
+    },
+  }));
+  const packageReadyKey = addCandidate(makeLiveEvidenceLedgerEntry(packageReadyPath, 'package-ready', baseMs + 3, {
+    latest: {
+      source: 'scan-on-open',
+      observerMethod: 'scan-on-open',
+      evidenceStrength: 'parser-confirmed',
+      savedEvidence: true,
+      parserConfirmed: true,
+    },
+  }));
+  const ignoredKeys = [];
+  for (let i = 0; i < EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP + 20; i++) {
+    const ignoredPath = path.join(
+      TEST_HOME,
+      'Desktop',
+      'package-outputs',
+      `legacy-package-output-${String(i).padStart(3, '0')}.ai`
+    );
+    ignoredKeys.push(addCandidate(makeLiveEvidenceLedgerEntry(ignoredPath, 'ignored', baseMs + 10 + i, {
+      latest: {
+        source: 'lsof',
+        observerMethod: 'lsof',
+        evidenceStrength: 'broad-app-signal',
+        sourceDocumentName: 'legacy-source.ai',
+        sourceName: 'legacy-source.ai',
+      },
+    })));
+  }
+
+  await setProjectFiles(project.id, {
+    files: [makePendingFile(acceptedPath, 'manual-browse')],
+    pendingFiles: [
+      makePendingFile(pendingPath, 'lsof'),
+      makePendingFile(triggerPath, 'lsof'),
+    ],
+    liveEvidenceLedger: {
+      schemaVersion: 1,
+      candidates,
+    },
+  });
+
+  const result = await callIpc('projects:reject-pending', project.id, triggerPath);
+  assert.ok(result);
+  const fresh = await getProject(project.id);
+  const retainedCandidates = (fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {};
+  assert.equal(Object.keys(retainedCandidates).length, EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP);
+  assert.equal(fresh.liveEvidenceLedger.candidateLimit, EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP);
+  assert.ok(fresh.liveEvidenceLedger.prunedAt);
+  assert.ok(retainedCandidates[acceptedKey], 'accepted project file ledger evidence should be preserved');
+  assert.ok(retainedCandidates[pendingKey], 'pending project file ledger evidence should be preserved');
+  assert.ok(retainedCandidates[needsSaveKey], 'needs-save ledger evidence should be preserved before ignored evidence');
+  assert.ok(retainedCandidates[packageReadyKey], 'package-ready ledger evidence should be preserved before ignored evidence');
+  assert.equal(Object.prototype.hasOwnProperty.call(retainedCandidates, ignoredKeys[0]), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(retainedCandidates, ignoredKeys[1]), false);
+
+  const retainedIgnored = Object.values(retainedCandidates)
+    .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
+  assert.ok(retainedIgnored.length < ignoredKeys.length);
+  assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
+  assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
+  assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceName')));
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    acceptedPath,
+    pendingPath,
+    needsSavePath,
+    packageReadyPath,
+    TEST_HOME,
+    'raw',
+    'stdout',
+    'stderr',
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    'tell application',
+    'signed_url_token',
+  ], 'pruned live evidence ledger');
+});
+
+test('live evidence ledger initializes safely when missing', async () => {
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Missing ledger initialization');
+  const storedProject = await getProject(project.id);
+  delete storedProject.liveEvidenceLedger;
+  const filePath = path.join(TEST_HOME, 'Desktop', 'missing-ledger.ai');
+  fs.writeFileSync(filePath, 'missing ledger bytes');
+
+  await emitWatcher('add', filePath);
+
+  const fresh = await getProject(project.id);
+  assert.ok(fresh.liveEvidenceLedger);
+  assert.equal(fresh.liveEvidenceLedger.schemaVersion, 1);
+  assert.equal(fresh.liveEvidenceLedger.candidateLimit, EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP);
+  assert.ok(Object.keys(fresh.liveEvidenceLedger.candidates || {}).length >= 1);
+  assert.ok(Object.keys(fresh.liveEvidenceLedger.candidates || {}).length <= EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP);
+  assert.equal(fresh.files.some(file => file.path === filePath), true);
 });
 
 test('lsof package-output image observations are ignored, not accepted or pending', async () => {
@@ -2283,13 +2505,16 @@ test('ongoing lsof poll stages broad observations as pending without captured-fi
   assert.equal(fresh.pendingFiles[0].source, 'lsof');
   assert.equal(fresh.pendingFiles[0].captureState, 'observed');
   assert.equal(fresh.pendingFiles[0].captureReason, 'opened-after-watch');
-  assert.deepEqual(fresh.pendingFiles[0].captureEvidence, {
-    reason: 'opened-after-watch',
-    state: 'observed',
-    source: 'lsof',
-    needsSave: false,
-    appFamily: 'figma',
-  });
+  assert.equal(fresh.pendingFiles[0].captureEvidence.reason, 'opened-after-watch');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.state, 'observed');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.source, 'lsof');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.needsSave, false);
+  assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'figma');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.observerMethod, 'lsof');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.evidenceStrength, 'broad-app-signal');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.captureRecommendation, 'observed');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.designerReason, 'Opened during this session in Figma.');
+  assert.equal(typeof fresh.pendingFiles[0].captureEvidence.evidenceKey, 'string');
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
@@ -2459,6 +2684,10 @@ test('ps-poll broad discovery stages pending candidate without captured-file pro
     assert.equal(fresh.pendingFiles[0].captureState, 'needs-save');
     assert.equal(fresh.pendingFiles[0].captureReason, 'linked-asset-observed');
     assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'photoshop');
+    assert.equal(fresh.pendingFiles[0].captureEvidence.observerMethod, 'photoshop-live-script');
+    assert.equal(fresh.pendingFiles[0].captureEvidence.evidenceStrength, 'structured-app-link');
+    assert.equal(fresh.pendingFiles[0].captureEvidence.captureRecommendation, 'needs-save');
+    assert.equal(fresh.pendingFiles[0].captureEvidence.designerReason, 'Linked asset observed in Photoshop. Save to make package-ready.');
 
     const observations = getSessionObservedByMethod(fresh, 'ps-poll');
     assert.equal(observations.length, 0);
@@ -2484,6 +2713,15 @@ test('ps-poll broad discovery stages pending candidate without captured-file pro
     assert.equal(provenanceText.includes(unrelatedPath), false);
     assert.equal(provenanceText.includes('raw'), false);
     assert.equal(provenanceText.includes('stdout'), false);
+    assertTextExcludes(JSON.stringify(fresh.pendingFiles[0].captureEvidence), [
+      'SHOULD_NOT_APPEAR_PROCESS_ARG',
+      '/Applications/Adobe Photoshop.app',
+      unrelatedPath,
+      'tell application',
+      'LayerKind.SMARTOBJECT',
+      'stdout',
+      'raw',
+    ], 'Photoshop live capture evidence');
   } finally {
     fs.promises.writeFile = originalWriteFile;
     fs.rmSync(sentinelDir, { recursive: true, force: true });
@@ -2517,12 +2755,24 @@ test('indd-poll broad discovery stages pending candidate without captured-file p
   assert.equal(fresh.pendingFiles[0].captureState, 'needs-save');
   assert.equal(fresh.pendingFiles[0].captureReason, 'linked-asset-observed');
   assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'indesign');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.observerMethod, 'indesign-live-applescript');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.evidenceStrength, 'structured-app-link');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(fresh.pendingFiles[0].captureEvidence.designerReason, 'Linked asset observed in InDesign. Save to make package-ready.');
 
   const observations = getSessionObservedByMethod(fresh, 'indd-poll');
   assert.equal(observations.length, 0);
   assert.deepEqual(fresh.provenance.edges, {});
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+  assertTextExcludes(JSON.stringify(fresh.pendingFiles[0].captureEvidence), [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe InDesign',
+    'tell application',
+    filePath,
+    'stdout',
+    'raw',
+  ], 'InDesign live capture evidence');
   for (const dir of osascriptDirs) {
     assert.equal(fs.existsSync(dir), false);
   }
@@ -2557,9 +2807,21 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   assert.equal(sourceCandidate.captureState, 'needs-save');
   assert.equal(sourceCandidate.captureReason, 'unsaved-source-needs-save');
   assert.equal(sourceCandidate.captureEvidence.appFamily, 'illustrator');
+  assert.equal(sourceCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(sourceCandidate.captureEvidence.evidenceStrength, 'structured-app-document');
+  assert.equal(sourceCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(sourceCandidate.captureEvidence.documentModified, true);
+  assert.equal(sourceCandidate.captureEvidence.designerReason, 'Observed in Illustrator. Save to make package-ready.');
   assert.equal(linkedCandidate.source, 'ai-linked');
   assert.equal(linkedCandidate.captureState, 'needs-save');
   assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.appFamily, 'illustrator');
+  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(linkedCandidate.captureEvidence.evidenceStrength, 'structured-app-link');
+  assert.equal(linkedCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
+  assert.equal(linkedCandidate.captureEvidence.designerReason, 'Linked asset observed in Illustrator. Save to make package-ready.');
+  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'live-illustrator.ai');
   assert.equal(linkedCandidate.captureEvidence.sourceName, 'live-illustrator.ai');
   assert.equal(linkedCandidate.captureEvidence.relationship, 'source-linked');
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
@@ -2571,6 +2833,127 @@ test('Illustrator live app evidence stages open source and linked asset as needs
     linkedPath,
     'stdout',
   ]);
+  assertTextExcludes(JSON.stringify([sourceCandidate.captureEvidence, linkedCandidate.captureEvidence]), [
+    'DOC\t',
+    'LINK\t',
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'tell application',
+    sourcePath,
+    linkedPath,
+    'stdout',
+    'raw',
+  ], 'Illustrator live capture evidence');
+  assert.equal(Object.prototype.hasOwnProperty.call(sourceCandidate.captureEvidence, 'ignoredCaptureHint'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(linkedCandidate.captureEvidence, 'ignoredCaptureHint'), false);
+  const ledgerText = JSON.stringify(fresh.liveEvidenceLedger);
+  assertTextExcludes(ledgerText, [
+    'DOC\t',
+    'LINK\t',
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'tell application',
+    sourcePath,
+    linkedPath,
+    'stdout',
+    'raw',
+  ], 'Illustrator live evidence ledger');
+  const ledgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {});
+  assert.equal(ledgerEntries.filter(entry => entry.strongestState === 'needs-save').length, 2);
+});
+
+test('strong Illustrator evidence updates an existing weak lsof pending candidate', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'reconciled-live-illustrator.ai');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: `DOC\t${sourcePath}\ttrue\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator evidence reconciliation');
+  await setProjectFiles(project.id, {
+    pendingFiles: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'lsof',
+      captureState: 'observed',
+      captureReason: 'opened-after-watch',
+      captureEvidence: {
+        observerMethod: 'lsof',
+        evidenceStrength: 'broad-app-signal',
+        captureRecommendation: 'observed',
+      },
+    }],
+  });
+
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === sourcePath && file.captureState === 'needs-save'),
+    5000
+  );
+  const candidate = fresh.pendingFiles.find(file => file.path === sourcePath);
+  assert.equal(candidate.source, 'app-opened');
+  assert.equal(candidate.captureReason, 'unsaved-source-needs-save');
+  assert.equal(candidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(candidate.captureEvidence.evidenceStrength, 'structured-app-document');
+  assert.equal(candidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(fresh.files.some(file => file.path === sourcePath), false);
+  const ledgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {});
+  assert.ok(ledgerEntries.some(entry => (
+    entry.latest &&
+    entry.latest.candidateName === 'reconciled-live-illustrator.ai' &&
+    entry.strongestState === 'needs-save'
+  )));
+});
+
+test('pending live app evidence is not packaged before acceptance or saved-file confirmation', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Pending Live Package Safety');
+    const pendingPath = path.join(tmpRoot, 'live-unsaved-link.jpg');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pendingPath, 'unsaved linked bytes');
+    await setProjectFiles(project.id, {
+      files: [],
+      pendingFiles: [{
+        path: pendingPath,
+        name: path.basename(pendingPath),
+        ext: '.jpg',
+        addedAt: Date.now(),
+        source: 'ai-linked',
+        captureState: 'needs-save',
+        captureReason: 'linked-asset-observed',
+        captureEvidence: {
+          appFamily: 'illustrator',
+          observerMethod: 'illustrator-active-session',
+          evidenceStrength: 'structured-app-link',
+          captureRecommendation: 'needs-save',
+          designerReason: 'Linked asset observed in Illustrator. Save to make package-ready.',
+        },
+      }],
+    });
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 0);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 0);
+    assert.deepEqual(result.errors, []);
+    if (fs.existsSync(result.folderPath)) {
+      assert.equal(fs.existsSync(path.join(result.folderPath, path.basename(pendingPath))), false);
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('repeated ps-poll pending insertion does not duplicate candidates or observations', async () => {
