@@ -234,6 +234,21 @@ function isOsascriptInvocation({ kind, command, args }, scriptName) {
     path.basename(args[0]) === scriptName;
 }
 
+function isIllustratorPgrepCheck({ kind, command, args }) {
+  return kind === 'execFile' &&
+    command === '/usr/bin/pgrep' &&
+    Array.isArray(args) &&
+    args[0] === '-x' &&
+    args[1] === 'Adobe Illustrator';
+}
+
+function isIllustratorPsCommCheck({ kind, command, args }) {
+  return kind === 'execFile' &&
+    command === '/bin/ps' &&
+    Array.isArray(args) &&
+    args.includes('comm=');
+}
+
 function assertPrivateTempScriptPath(scriptPath) {
   const scriptDir = path.dirname(scriptPath);
   assert.equal(path.resolve(path.dirname(scriptDir)), path.resolve(os.tmpdir()));
@@ -2868,13 +2883,14 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
   setChildProcessHandler(({ kind, command, args, commandText }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       assertPrivateTempScriptPath(args[0]);
       const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(commandText.includes('tell application'), false);
+      assert.equal(scriptText.includes('repeat with aDoc in every document'), true);
       assert.equal(scriptText.includes('file path of pItem'), true);
       assert.equal(scriptText.includes('linked of pItem'), false);
       return {
@@ -2954,25 +2970,31 @@ test('Illustrator live app evidence stages open source and linked asset as needs
 test('Illustrator live evidence refresh stages a newly placed linked asset with accepted files present', async () => {
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'refresh-illustrator.ai');
+  const unrelatedSourcePath = path.join(TEST_HOME, 'Desktop', 'unrelated-open.ai');
   const existingLinkedPath = path.join(TEST_HOME, 'Desktop', 'existing-linked.png');
   const newLinkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  const unrelatedLinkedPath = path.join(TEST_HOME, 'Desktop', 'unrelated-linked.jpg');
   const outputDir = path.join(TEST_HOME, 'Desktop', 'refresh-package-out');
   fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(unrelatedSourcePath, 'unrelated ai bytes');
   fs.writeFileSync(existingLinkedPath, 'existing linked bytes');
   fs.writeFileSync(newLinkedPath, 'new linked bytes');
+  fs.writeFileSync(unrelatedLinkedPath, 'unrelated linked bytes');
   fs.mkdirSync(outputDir, { recursive: true });
 
   let includeNewLink = false;
   setChildProcessHandler(({ kind, command, args }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       const lines = [
-        `DOC\t${sourcePath}\trefresh-illustrator.ai\ttrue`,
-        `LINK\t${sourcePath}\trefresh-illustrator.ai\t${existingLinkedPath}\ttrue`,
+        `DOC\t${sourcePath}\trefresh-illustrator.ai\ttrue\tfalse`,
+        `LINK\t${sourcePath}\trefresh-illustrator.ai\t${existingLinkedPath}\ttrue\tfalse`,
+        `DOC\t${unrelatedSourcePath}\tunrelated-open.ai\ttrue\ttrue`,
+        `LINK\t${unrelatedSourcePath}\tunrelated-open.ai\t${unrelatedLinkedPath}\ttrue\ttrue`,
       ];
-      if (includeNewLink) lines.push(`LINK\t${sourcePath}\trefresh-illustrator.ai\t${newLinkedPath}\ttrue`);
+      if (includeNewLink) lines.push(`LINK\t${sourcePath}\trefresh-illustrator.ai\t${newLinkedPath}\ttrue\tfalse`);
       return { stdout: `${lines.join('\n')}\n` };
     }
     return { stdout: '' };
@@ -3001,6 +3023,7 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
   await new Promise(resolve => originalSetTimeout(resolve, 900));
   let fresh = await getProject(project.id);
   assert.equal(fresh.pendingFiles.some(file => file.path === newLinkedPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), false);
   assert.equal(fresh.files.some(file => file.path === sourcePath), true);
   assert.equal(fresh.files.some(file => file.path === existingLinkedPath), true);
 
@@ -3022,6 +3045,8 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
   assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'refresh-illustrator.ai');
   assert.equal(imgCandidate.captureEvidence.relationship, 'source-linked');
   assert.equal(fresh.files.some(file => file.path === newLinkedPath), false);
+  assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), false);
 
   const sourceLedger = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
     .find(entry => entry.latest && entry.latest.candidateName === 'refresh-illustrator.ai');
@@ -3042,18 +3067,18 @@ test('Illustrator refresh invokes fallback process check and stages pathless sou
   resetTestHomeWorkspace();
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
   fs.writeFileSync(linkedPath, 'new linked bytes');
-  let primaryProcessChecks = 0;
-  let fallbackProcessChecks = 0;
+  let pgrepProcessChecks = 0;
+  let psCommProcessChecks = 0;
   let osascriptInvocations = 0;
 
   setChildProcessHandler(({ kind, command, args }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-      primaryProcessChecks++;
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      pgrepProcessChecks++;
       return { stdout: '' };
     }
-    if (kind === 'exec' && command.includes('Illustrator\\.app/Contents/MacOS')) {
-      fallbackProcessChecks++;
-      return { stdout: '/Applications/Illustrator.app/Contents/MacOS/Illustrator\n' };
+    if (isIllustratorPsCommCheck({ kind, command, args })) {
+      psCommProcessChecks++;
+      return { stdout: '/Applications/Adobe Illustrator 2026/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       osascriptInvocations++;
@@ -3071,8 +3096,8 @@ test('Illustrator refresh invokes fallback process check and stages pathless sou
     5000
   );
 
-  assert.ok(primaryProcessChecks >= 1);
-  assert.ok(fallbackProcessChecks >= 1);
+  assert.ok(pgrepProcessChecks >= 1);
+  assert.ok(psCommProcessChecks >= 1);
   assert.ok(osascriptInvocations >= 1);
   assert.deepEqual(fresh.files, []);
   assert.equal(fresh.pendingFiles.length, 1);
@@ -3087,14 +3112,67 @@ test('Illustrator refresh invokes fallback process check and stages pathless sou
   assert.equal(imgCandidate.captureEvidence.sourceName, 'Bris Invitation-03 copy.ai');
   assert.equal(Object.prototype.hasOwnProperty.call(imgCandidate.captureEvidence, 'relationship'), false);
   assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assertTextExcludes(JSON.stringify(fresh), [
+    '/Applications/Adobe Illustrator 2026',
+    'Contents/MacOS',
+    'stdout',
+    'raw',
+  ], 'Illustrator process detection state');
+});
+
+test('Illustrator pathless duplicate document names stay conservative', async () => {
+  resetTestHomeWorkspace();
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  const otherLinkedPath = path.join(TEST_HOME, 'Desktop', 'unrelated-duplicate.jpg');
+  fs.writeFileSync(linkedPath, 'new linked bytes');
+  fs.writeFileSync(otherLinkedPath, 'other linked bytes');
+  let osascriptInvocations = 0;
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return {
+        stdout: [
+          `DOC\t\tBris Invitation-03 copy.ai\ttrue\tfalse`,
+          `LINK\t\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\tfalse`,
+          `DOC\t\tBris Invitation-03 copy.ai\ttrue\tfalse`,
+          `LINK\t\tBris Invitation-03 copy.ai\t${otherLinkedPath}\ttrue\tfalse`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator ambiguous pathless refresh');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(output.includes('ambiguous-document-name'));
+  assertTextExcludes(output, [
+    linkedPath,
+    otherLinkedPath,
+    '/Applications/Adobe Illustrator',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'Illustrator ambiguous pathless diagnostics');
 });
 
 test('Illustrator live evidence Automation failure logs safe guidance without staging raw output', async () => {
   resetTestHomeWorkspace();
   let osascriptInvocations = 0;
   setChildProcessHandler(({ kind, command, args }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       osascriptInvocations++;
@@ -3131,8 +3209,8 @@ test('strong Illustrator evidence updates an existing weak lsof pending candidat
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'reconciled-live-illustrator.ai');
   fs.writeFileSync(sourcePath, 'ai bytes');
   setChildProcessHandler(({ kind, command, args }) => {
-    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       return { stdout: `DOC\t${sourcePath}\treconciled-live-illustrator.ai\ttrue\n` };

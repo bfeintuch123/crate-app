@@ -568,6 +568,29 @@ function logLiveAppEvidenceUnavailable(appLabel, error) {
   console.warn(`[crate][live-app] ${appLabel} evidence unavailable. Check Automation permissions if this persists.${suffix}`);
 }
 
+function logLiveAppDiagnostic(projectId, key, message, intervalMs = LIVE_APP_DIAGNOSTIC_LOG_INTERVAL_MS) {
+  const safeKey = `${projectId || 'unknown'}:${sanitizeLiveEvidenceText(key) || 'event'}`;
+  const now = Date.now();
+  const lastLoggedAt = liveAppDiagnosticLogTimestamps.get(safeKey) || 0;
+  if (now - lastLoggedAt < intervalMs) return;
+  liveAppDiagnosticLogTimestamps.set(safeKey, now);
+  console.log(`[crate][live-app] ${redactFigmaLogText(message)}`);
+}
+
+function incrementLiveAppSkipCount(skipCounts, reason) {
+  if (!skipCounts || typeof skipCounts !== 'object') return;
+  const safeReason = normalizeLiveCaptureReason(reason, 'skipped');
+  skipCounts[safeReason] = (skipCounts[safeReason] || 0) + 1;
+}
+
+function formatLiveAppSkipCounts(skipCounts) {
+  return Object.entries(skipCounts || {})
+    .filter(([, count]) => count > 0)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([reason, count]) => `${reason}:${count}`)
+    .join(',');
+}
+
 function getLiveCaptureAppFamily(fileEntry, observation = {}) {
   if (typeof observation.appFamily === 'string' && observation.appFamily.trim()) {
     return normalizeLiveCaptureReason(observation.appFamily, 'app');
@@ -3250,8 +3273,10 @@ const SAFE_FIGMA_ASSET_FORMATS = new Set([
 const psPollers = new Map();          // projectId -> setInterval id
 const psPollerStarting = new Set();   // guard: projectIds with initial poll in progress
 const psInProgress = new Set();       // projectIds currently mid-poll
+const liveAppDiagnosticLogTimestamps = new Map();
 const LIVE_APP_REFRESH_INTERVAL_MS = 3000; // 3 seconds
 const LIVE_APP_INITIAL_REFRESH_DELAY_MS = 500;
+const LIVE_APP_DIAGNOSTIC_LOG_INTERVAL_MS = 30000;
 const PS_POLL_INTERVAL_MS = LIVE_APP_REFRESH_INTERVAL_MS; // historical alias
 
 // --- PSD binary parser debounce (v2.3.6) ---
@@ -4240,37 +4265,47 @@ tell application "Adobe Illustrator"
     if (count of documents) is 0 then
       set end of outputLines to "STATUS" & tab & "no-documents"
     else
-      set aDoc to current document
-      set docPath to ""
-      set docName to ""
-      set docModified to "unknown"
+      set currentDocPath to ""
       try
-        set docName to name of aDoc as text
+        set currentDocPath to my crateLiveEvidencePath(full name of current document)
       end try
-      try
-        set docPath to my crateLiveEvidencePath(full name of aDoc)
-      end try
-      try
-        if modified of aDoc is true then
-          set docModified to "true"
-        else
-          set docModified to "false"
-        end if
-      end try
-      set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified
-      repeat with pItem in every placed item of aDoc
-        set linkedPath to ""
+      repeat with aDoc in every document
+        set docPath to ""
+        set docName to ""
+        set docModified to "unknown"
+        set docCurrent to "false"
         try
-          set linkedPath to my crateLiveEvidencePath(file of pItem)
+          set docName to name of aDoc as text
         end try
-        if linkedPath is "" then
+        try
+          set docPath to my crateLiveEvidencePath(full name of aDoc)
+        end try
+        try
+          if modified of aDoc is true then
+            set docModified to "true"
+          else
+            set docModified to "false"
+          end if
+        end try
+        try
+          if aDoc is current document then set docCurrent to "true"
+        end try
+        if docCurrent is "false" and docPath is not "" and currentDocPath is not "" and docPath is currentDocPath then set docCurrent to "true"
+        set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified & tab & docCurrent
+        repeat with pItem in every placed item of aDoc
+          set linkedPath to ""
           try
-            set linkedPath to my crateLiveEvidencePath(file path of pItem)
+            set linkedPath to my crateLiveEvidencePath(file of pItem)
           end try
-        end if
-        if linkedPath is not "" then
-          set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified
-        end if
+          if linkedPath is "" then
+            try
+              set linkedPath to my crateLiveEvidencePath(file path of pItem)
+            end try
+          end if
+          if linkedPath is not "" then
+            set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
+          end if
+        end repeat
       end repeat
     end if
     set AppleScript's text item delimiters to linefeed
@@ -4333,11 +4368,13 @@ function parseIllustratorActiveSessionOutput(output) {
       const documentPath = parts[1];
       const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
       const modifiedValue = hasDocumentName ? parts[3] : parts[2];
+      const currentValue = hasDocumentName && parts.length >= 5 ? parts[4] : null;
       if ((!documentPath || !path.isAbsolute(documentPath)) && !documentName) continue;
       documents.push({
         documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
         documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
         modified: modifiedValue === 'true',
+        current: currentValue === 'true',
       });
       continue;
     }
@@ -4347,21 +4384,103 @@ function parseIllustratorActiveSessionOutput(output) {
       const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
       const linkedPath = hasDocumentName ? parts[3] : parts[2];
       const modifiedValue = hasDocumentName ? parts[4] : parts[3];
+      const currentValue = hasDocumentName && parts.length >= 6 ? parts[5] : null;
       if (!linkedPath || !path.isAbsolute(linkedPath)) continue;
       links.push({
         documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
         documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
         linkedPath,
         modified: modifiedValue === 'true',
+        current: currentValue === 'true',
       });
     }
   }
   return { documents, links, statuses, errors };
 }
 
-function createIllustratorLiveEvidenceRecords(projectId, activeState) {
+const ILLUSTRATOR_SOURCE_EXTENSIONS = new Set(['.ai', '.eps', '.pdf', '.svg']);
+
+function normalizeIllustratorDocumentName(value) {
+  const safe = sanitizeLiveEvidenceText(value);
+  return safe ? safe.toLowerCase() : null;
+}
+
+function isIllustratorSourceCandidate(file) {
+  if (!file || typeof file !== 'object') return false;
+  const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
+  if (ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext)) return true;
+  const appFamily = file.captureEvidence && file.captureEvidence.appFamily;
+  return normalizeLiveCaptureReason(appFamily, '') === 'illustrator';
+}
+
+function buildIllustratorSessionScope(project, activeState) {
+  const trackedPaths = new Set();
+  const trackedNames = new Set();
+  const documents = (activeState && Array.isArray(activeState.documents)) ? activeState.documents : [];
+  const documentNameCounts = new Map();
+
+  for (const doc of documents) {
+    const normalizedName = normalizeIllustratorDocumentName(doc && doc.documentName);
+    if (!normalizedName) continue;
+    documentNameCounts.set(normalizedName, (documentNameCounts.get(normalizedName) || 0) + 1);
+  }
+
+  for (const file of [
+    ...((project && Array.isArray(project.files)) ? project.files : []),
+    ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
+  ]) {
+    if (!isIllustratorSourceCandidate(file)) continue;
+    const normalizedPath = normalizeTrackedFilePath(file && file.path);
+    if (normalizedPath) trackedPaths.add(normalizedPath);
+    const fileName = sanitizeLiveEvidenceText(file && (file.name || (file.path ? path.basename(file.path) : '')));
+    const normalizedName = normalizeIllustratorDocumentName(fileName);
+    if (normalizedName) trackedNames.add(normalizedName);
+  }
+
+  return {
+    documents,
+    trackedPaths,
+    trackedNames,
+    documentNameCounts,
+    hasTrackedSource: trackedPaths.size > 0 || trackedNames.size > 0,
+  };
+}
+
+function classifyIllustratorDocumentSessionRelevance(doc, scope) {
+  const normalizedPath = normalizeTrackedFilePath(doc && doc.documentPath);
+  const normalizedName = normalizeIllustratorDocumentName(doc && doc.documentName);
+  const duplicateNameCount = normalizedName ? (scope.documentNameCounts.get(normalizedName) || 0) : 0;
+
+  if (normalizedPath && scope.trackedPaths.has(normalizedPath)) {
+    return { relevant: true, reason: 'tracked-document-path' };
+  }
+  if (normalizedName && scope.trackedNames.has(normalizedName)) {
+    if (duplicateNameCount <= 1 || doc.current === true) {
+      return { relevant: true, reason: 'tracked-document-name' };
+    }
+    return { relevant: false, reason: 'ambiguous-document-name' };
+  }
+  if (!scope.hasTrackedSource && doc && doc.current === true) {
+    return { relevant: true, reason: 'current-document' };
+  }
+  if (!scope.hasTrackedSource && scope.documents.length === 1) {
+    return { relevant: true, reason: 'single-open-document' };
+  }
+  if (!normalizedPath && normalizedName && duplicateNameCount > 1 && doc && doc.current !== true) {
+    return { relevant: false, reason: 'ambiguous-document-name' };
+  }
+  return { relevant: false, reason: 'unrelated-document' };
+}
+
+function createIllustratorLiveEvidenceRecords(projectId, activeState, project = null, diagnostics = null) {
   const evidenceRecords = [];
+  const scope = buildIllustratorSessionScope(project, activeState);
   for (const doc of (activeState && activeState.documents) || []) {
+    const relevance = classifyIllustratorDocumentSessionRelevance(doc, scope);
+    if (!relevance.relevant) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
+      continue;
+    }
     if (!doc.documentPath) continue;
     evidenceRecords.push(createLiveAppEvidence({
       projectId,
@@ -4377,7 +4496,12 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState) {
     }));
   }
   for (const link of (activeState && activeState.links) || []) {
-    evidenceRecords.push(createLiveAppEvidence({
+    const relevance = classifyIllustratorDocumentSessionRelevance(link, scope);
+    if (!relevance.relevant) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
+      continue;
+    }
+    const evidence = createLiveAppEvidence({
       projectId,
       filePath: link.linkedPath,
       source: 'ai-linked',
@@ -4389,23 +4513,36 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState) {
       documentModified: link.modified,
       evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
       requiresSave: true,
-    }));
+    });
+    if (!evidence) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, 'invalid-evidence');
+      continue;
+    }
+    evidenceRecords.push(evidence);
   }
   return evidenceRecords.filter(Boolean);
 }
 
 async function isIllustratorRunningForLiveEvidence() {
-  const primary = await execAsync(
-    "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
-    { timeout: 3000, encoding: 'utf8' }
-  ).catch(() => ({ stdout: '' }));
-  if (primary.stdout && primary.stdout.trim()) return true;
+  const pgrep = await execFileAsync('/usr/bin/pgrep', ['-x', 'Adobe Illustrator'], {
+    timeout: 3000,
+    encoding: 'utf8',
+  }).catch(() => ({ stdout: '' }));
+  if (pgrep.stdout && pgrep.stdout.trim()) return true;
 
-  const fallback = await execAsync(
-    "/bin/ps ax -o command= 2>/dev/null | grep -Ei 'Illustrator\\.app/Contents/MacOS/(Adobe )?Illustrator' | grep -v grep",
-    { timeout: 3000, encoding: 'utf8' }
-  ).catch(() => ({ stdout: '' }));
-  return !!(fallback.stdout && fallback.stdout.trim());
+  const ps = await execFileAsync('/bin/ps', ['ax', '-o', 'comm='], {
+    timeout: 3000,
+    encoding: 'utf8',
+  }).catch(() => ({ stdout: '' }));
+  return String(ps.stdout || '')
+    .split('\n')
+    .some(line => {
+      const commandPath = line.trim();
+      if (!commandPath) return false;
+      const commandName = path.basename(commandPath).toLowerCase();
+      if (commandName === 'adobe illustrator' || commandName === 'illustrator') return true;
+      return /\/(?:adobe )?illustrator(?: \d{4})?\.app\/contents\/macos\/(?:adobe )?illustrator$/i.test(commandPath);
+    });
 }
 
 function createLinkedAssetLiveEvidenceRecord({
@@ -4426,31 +4563,54 @@ function createLinkedAssetLiveEvidenceRecord({
   });
 }
 
-function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
+function collectLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
   const candidates = [];
   const batchPaths = new Set();
+  const skipped = {};
 
   for (const evidence of Array.isArray(liveEvidenceRecords) ? liveEvidenceRecords : []) {
-    if (!evidence || typeof evidence.filePath !== 'string' || !path.isAbsolute(evidence.filePath)) continue;
+    if (!evidence || typeof evidence.filePath !== 'string' || !path.isAbsolute(evidence.filePath)) {
+      incrementLiveAppSkipCount(skipped, 'invalid-path');
+      continue;
+    }
     const normalizedFilePath = normalizeTrackedFilePath(evidence.filePath);
-    if (!normalizedFilePath || batchPaths.has(normalizedFilePath)) continue;
+    if (!normalizedFilePath) {
+      incrementLiveAppSkipCount(skipped, 'invalid-path');
+      continue;
+    }
+    if (batchPaths.has(normalizedFilePath)) {
+      incrementLiveAppSkipCount(skipped, 'duplicate-batch-path');
+      continue;
+    }
     const ext = path.extname(evidence.filePath).toLowerCase();
-    if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+    if (!DESIGN_FILE_EXTENSIONS.has(ext)) {
+      incrementLiveAppSkipCount(skipped, 'unsupported-extension');
+      continue;
+    }
     try {
       fs.accessSync(evidence.filePath, fs.constants.R_OK);
     } catch (_) {
+      incrementLiveAppSkipCount(skipped, 'unreadable-file');
       continue;
     }
     candidates.push({ evidence, ext, normalizedFilePath });
     batchPaths.add(normalizedFilePath);
   }
 
-  return candidates;
+  return { candidates, skipped };
+}
+
+function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
+  return collectLiveAppEvidenceCandidates(liveEvidenceRecords).candidates;
 }
 
 function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
-  const candidates = getLiveAppEvidenceCandidates(liveEvidenceRecords);
-  if (candidates.length === 0) return { changed: false, stagedCount: 0 };
+  const { candidates, skipped } = collectLiveAppEvidenceCandidates(liveEvidenceRecords);
+  const skipSummary = formatLiveAppSkipCounts(skipped);
+  if (skipSummary) {
+    logLiveAppDiagnostic(projectId, 'candidate-skips', `candidate skip counts for project ${projectId}: ${skipSummary}`);
+  }
+  if (candidates.length === 0) return { changed: false, stagedCount: 0, skipped };
 
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching') return null;
@@ -4542,13 +4702,16 @@ async function pollPsForProject(projectId) {
   if (!project || project.status !== 'watching') return;
 
   psInProgress.add(projectId);
+  logLiveAppDiagnostic(projectId, 'poll-fired', `live app evidence refresh fired for project ${projectId}`);
 
   try {
     const liveEvidenceRecords = [];
     const polledApps = [];
 
     // --- Illustrator ---
-    if (await isIllustratorRunningForLiveEvidence()) {
+    const illustratorRunning = await isIllustratorRunningForLiveEvidence();
+    logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
+    if (illustratorRunning) {
       polledApps.push('illustrator');
       try {
         const { stdout: aiOut } = await runOsascriptInPrivateTemp(
@@ -4556,11 +4719,25 @@ async function pollPsForProject(projectId) {
           'crate-ai-active-session.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
+        if (!String(aiOut || '').trim()) {
+          logLiveAppDiagnostic(projectId, 'illustrator-empty-output', `Illustrator returned no structured live evidence for project ${projectId}; check Automation permissions if this persists`);
+        }
         const activeState = parseIllustratorActiveSessionOutput(aiOut);
         for (const safeReason of activeState.errors || []) {
           logLiveAppEvidenceUnavailable('Illustrator', new Error(safeReason));
         }
-        liveEvidenceRecords.push(...createIllustratorLiveEvidenceRecords(projectId, activeState));
+        const illustratorDiagnostics = { skipped: {} };
+        const illustratorRecords = createIllustratorLiveEvidenceRecords(projectId, activeState, project, illustratorDiagnostics);
+        const illustratorSkipSummary = formatLiveAppSkipCounts(illustratorDiagnostics.skipped);
+        const statusSummary = [...(activeState.statuses || []), ...(activeState.errors || [])]
+          .filter(Boolean)
+          .join(',');
+        logLiveAppDiagnostic(
+          projectId,
+          'illustrator-summary',
+          `Illustrator live evidence summary for project ${projectId}: docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
+        );
+        liveEvidenceRecords.push(...illustratorRecords);
       } catch (e) {
         logLiveAppEvidenceUnavailable('Illustrator', e);
       }
@@ -4656,6 +4833,7 @@ async function pollPsForProject(projectId) {
 function startPsPolling(projectId) {
   if (psPollers.has(projectId) || psPollerStarting.has(projectId)) return;
   psPollerStarting.add(projectId);
+  logLiveAppDiagnostic(projectId, 'poll-installed', `live app evidence refresh installed for project ${projectId}`, 0);
 
   const intervalId = setInterval(() => {
     pollPsForProject(projectId);
@@ -4680,6 +4858,9 @@ function stopPsPolling(projectId) {
   }
   psPollerStarting.delete(projectId);
   psInProgress.delete(projectId);
+  for (const key of [...liveAppDiagnosticLogTimestamps.keys()]) {
+    if (key.startsWith(`${projectId}:`)) liveAppDiagnosticLogTimestamps.delete(key);
+  }
 }
 
 // --- Real-time kMDItemLastUsedDate Polling (v2.3.3) ---
@@ -7963,6 +8144,7 @@ ipcMain.handle('projects:delete-all', () => {
   psPollers.clear();
   psPollerStarting.clear();
   psInProgress.clear();
+  liveAppDiagnosticLogTimestamps.clear();
   // Clean up lastUsed pollers (v2.3.3)
   for (const [, intervalId] of lastUsedPollers) {
     clearInterval(intervalId);
@@ -8314,6 +8496,7 @@ app.on('before-quit', () => {
   psPollers.clear();
   psPollerStarting.clear();
   psInProgress.clear();
+  liveAppDiagnosticLogTimestamps.clear();
   // Clean up lastUsed pollers (v2.3.3)
   for (const [, intervalId] of lastUsedPollers) {
     clearInterval(intervalId);
