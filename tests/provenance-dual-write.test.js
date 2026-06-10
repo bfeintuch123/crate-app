@@ -2873,8 +2873,13 @@ test('Illustrator live app evidence stages open source and linked asset as needs
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       assertPrivateTempScriptPath(args[0]);
+      const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(commandText.includes('tell application'), false);
-      return { stdout: `DOC\t${sourcePath}\ttrue\nLINK\t${sourcePath}\t${linkedPath}\ttrue\n` };
+      assert.equal(scriptText.includes('file path of pItem'), true);
+      assert.equal(scriptText.includes('linked of pItem'), false);
+      return {
+        stdout: `DOC\t${sourcePath}\tlive-illustrator.ai\ttrue\nLINK\t${sourcePath}\tlive-illustrator.ai\t${linkedPath}\ttrue\n`,
+      };
     }
     return { stdout: '' };
   });
@@ -2964,10 +2969,10 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       const lines = [
-        `DOC\t${sourcePath}\ttrue`,
-        `LINK\t${sourcePath}\t${existingLinkedPath}\ttrue`,
+        `DOC\t${sourcePath}\trefresh-illustrator.ai\ttrue`,
+        `LINK\t${sourcePath}\trefresh-illustrator.ai\t${existingLinkedPath}\ttrue`,
       ];
-      if (includeNewLink) lines.push(`LINK\t${sourcePath}\t${newLinkedPath}\ttrue`);
+      if (includeNewLink) lines.push(`LINK\t${sourcePath}\trefresh-illustrator.ai\t${newLinkedPath}\ttrue`);
       return { stdout: `${lines.join('\n')}\n` };
     }
     return { stdout: '' };
@@ -3033,6 +3038,95 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
   assert.equal(fresh.files.some(file => file.path === newLinkedPath), false);
 });
 
+test('Illustrator refresh invokes fallback process check and stages pathless source-linked evidence', async () => {
+  resetTestHomeWorkspace();
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  fs.writeFileSync(linkedPath, 'new linked bytes');
+  let primaryProcessChecks = 0;
+  let fallbackProcessChecks = 0;
+  let osascriptInvocations = 0;
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+      primaryProcessChecks++;
+      return { stdout: '' };
+    }
+    if (kind === 'exec' && command.includes('Illustrator\\.app/Contents/MacOS')) {
+      fallbackProcessChecks++;
+      return { stdout: '/Applications/Illustrator.app/Contents/MacOS/Illustrator\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return {
+        stdout: `DOC\t\tBris Invitation-03 copy.ai\ttrue\nLINK\t\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator pathless refresh');
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === linkedPath),
+    5000
+  );
+
+  assert.ok(primaryProcessChecks >= 1);
+  assert.ok(fallbackProcessChecks >= 1);
+  assert.ok(osascriptInvocations >= 1);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(fresh.pendingFiles.length, 1);
+  const imgCandidate = fresh.pendingFiles[0];
+  assert.equal(imgCandidate.path, linkedPath);
+  assert.equal(imgCandidate.source, 'ai-linked');
+  assert.equal(imgCandidate.captureState, 'needs-save');
+  assert.equal(imgCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(imgCandidate.captureEvidence.documentModified, true);
+  assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'Bris Invitation-03 copy.ai');
+  assert.equal(imgCandidate.captureEvidence.sourceName, 'Bris Invitation-03 copy.ai');
+  assert.equal(Object.prototype.hasOwnProperty.call(imgCandidate.captureEvidence, 'relationship'), false);
+  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+});
+
+test('Illustrator live evidence Automation failure logs safe guidance without staging raw output', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
+      return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return {
+        stdout: 'ERROR\tautomation-not-authorized\nERROR\t/Users/private/client/SHOULD_NOT_APPEAR.ai\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator TCC failure');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(output.includes('Illustrator evidence unavailable'));
+  assert.ok(output.includes('Automation permissions'));
+  assert.ok(output.includes('automation-permission-denied'));
+  assertTextExcludes(output, [
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'Illustrator Automation failure log');
+});
+
 test('strong Illustrator evidence updates an existing weak lsof pending candidate', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'reconciled-live-illustrator.ai');
   fs.writeFileSync(sourcePath, 'ai bytes');
@@ -3041,7 +3135,7 @@ test('strong Illustrator evidence updates an existing weak lsof pending candidat
       return { stdout: '123 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
-      return { stdout: `DOC\t${sourcePath}\ttrue\n` };
+      return { stdout: `DOC\t${sourcePath}\treconciled-live-illustrator.ai\ttrue\n` };
     }
     return { stdout: '' };
   });
