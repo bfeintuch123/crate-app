@@ -45,7 +45,7 @@ function createElementStub(tagName = 'div') {
     getAttribute: name => attributes[name],
     removeAttribute: name => { delete attributes[name]; },
     querySelector: selector => {
-      if (selector === '.btn-accept-pending' || selector === '.btn-reject-pending') {
+      if (selector === '.btn-accept-pending' || selector === '.btn-reject-pending' || selector === '.app-file-remove') {
         return { addEventListener: () => {} };
       }
       return null;
@@ -298,6 +298,54 @@ test('Pending-only live session renders active review state instead of empty tra
   assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('provenance'), false);
   assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
   assert.equal(elements['file-list'].innerHTML.includes('No package-ready files yet'), true);
+  assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
+});
+
+test('Needs-save live candidates render when package-ready files already exist', () => {
+  const elements = {
+    'pending-section': createElementStub(),
+    'pending-file-list': createElementStub(),
+    'file-list': createElementStub(),
+  };
+  const renderer = loadRendererHelpers(createDocumentStub(elements));
+  const project = {
+    id: 'project-accepted-plus-live',
+    files: [{
+      path: '/Users/example/Desktop/Bris Invitation-03 copy.ai',
+      name: 'Bris Invitation-03 copy.ai',
+      ext: '.ai',
+      source: 'manual-browse',
+    }],
+    pendingFiles: [{
+      path: '/Users/example/Desktop/IMG_5331.JPG',
+      name: 'IMG_5331.JPG',
+      ext: '.jpg',
+      source: 'ai-linked',
+      captureState: 'needs-save',
+      captureReason: 'linked-asset-observed',
+      captureEvidence: {
+        state: 'needs-save',
+        reason: 'linked-asset-observed',
+        source: 'ai-linked',
+        needsSave: true,
+        appFamily: 'illustrator',
+        sourceName: 'Bris Invitation-03 copy.ai',
+        relationship: 'source-linked',
+      },
+    }],
+  };
+
+  renderer.renderPendingFiles(project);
+  renderer.renderFileList(project.files, { hasActiveCandidates: true });
+
+  assert.equal(elements['pending-section'].classList.contains('hidden'), false);
+  assert.equal(elements['pending-file-list'].children.length, 1);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('IMG_5331.JPG'), true);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('Save to make package-ready'), true);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('provenance'), false);
+  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
+  assert.equal(elements['file-list'].children.length, 1);
+  assert.equal(elements['file-list'].children[0].innerHTML.includes('Bris Invitation-03 copy.ai'), true);
   assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
 });
 
