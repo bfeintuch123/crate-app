@@ -1939,11 +1939,11 @@ test('accept pending preserves file ledger entry and records one confirmed sessi
   const result = await callIpc('projects:accept-pending', project.id, filePath);
 
   assert.equal(result.files.length, 1);
-  assert.deepEqual(result.files[0], pendingFile);
+  assert.deepEqual(result.files[0], { ...pendingFile, acceptedPending: true });
   assert.deepEqual(result.pendingFiles, []);
 
   const fresh = await getProject(project.id);
-  assert.deepEqual(fresh.files, [pendingFile]);
+  assert.deepEqual(fresh.files, [{ ...pendingFile, acceptedPending: true }]);
   assert.deepEqual(fresh.pendingFiles, []);
   assertSessionObservedFile(
     fresh,
@@ -1988,6 +1988,7 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     const result = await callIpc('projects:accept-pending', project.id, sourcePath);
     assert.equal(result.files.length, 1);
     assert.equal(result.files[0].path, sourcePath);
+    assert.equal(result.files[0].acceptedPending, true);
     assert.equal(Object.prototype.hasOwnProperty.call(result.files[0], 'captureState'), false);
 
     const fresh = await waitForProject(
@@ -2029,7 +2030,7 @@ test('duplicate or already-present pending accept does not duplicate observation
 
   const alreadyPresentProject = await createProject('Already-present pending accept provenance');
   const alreadyPresentPath = path.join(os.tmpdir(), 'already-present-pending.ai');
-  const alreadyPresentFile = makePendingFile(alreadyPresentPath);
+  const alreadyPresentFile = makePendingFile(alreadyPresentPath, 'manual-browse');
   await setProjectFiles(alreadyPresentProject.id, {
     files: [alreadyPresentFile],
     pendingFiles: [alreadyPresentFile],
@@ -2456,7 +2457,7 @@ test('manual add remains allowed for excluded-looking package output paths', asy
   );
 });
 
-test('initial lsof snapshot stages stale open files as pending without captured-file provenance', async () => {
+test('initial lsof snapshot quarantines stale open files outside session scope', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'initial-logo.ai');
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
@@ -2474,9 +2475,12 @@ test('initial lsof snapshot stages stale open files as pending without captured-
   const fresh = await getProject(project.id);
 
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.length, 1);
-  assert.equal(fresh.pendingFiles[0].path, filePath);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.deepEqual(fresh.pendingFiles, []);
+  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .filter(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session');
+  assert.ok(ignoredEvidence.length >= 1);
+  assert.ok(ignoredEvidence.every(entry => entry.latest.quarantined === true));
+  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
@@ -2495,7 +2499,7 @@ test('initial lsof snapshot stages stale open files as pending without captured-
   assert.equal(provenanceText.includes('stdout'), false);
 });
 
-test('ongoing lsof poll stages broad observations as pending without captured-file provenance', async () => {
+test('ongoing lsof poll quarantines broad observations outside session scope', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'poll-logo.ai');
   let pollReady = false;
   setChildProcessHandler(({ kind, command }) => {
@@ -2514,22 +2518,19 @@ test('ongoing lsof poll stages broad observations as pending without captured-fi
   const project = await createProject('Poll lsof provenance');
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  const fresh = await waitForProject(
+    project.id,
+    item => Object.values((item.liveEvidenceLedger && item.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'),
+    5000
+  );
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles[0].path, filePath);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof');
-  assert.equal(fresh.pendingFiles[0].captureState, 'observed');
-  assert.equal(fresh.pendingFiles[0].captureReason, 'opened-after-watch');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.reason, 'opened-after-watch');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.state, 'observed');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.source, 'lsof');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.needsSave, false);
-  assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'figma');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.observerMethod, 'lsof');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.evidenceStrength, 'broad-app-signal');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.captureRecommendation, 'observed');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.designerReason, 'Opened during this session in Figma.');
-  assert.equal(typeof fresh.pendingFiles[0].captureEvidence.evidenceKey, 'string');
+  assert.deepEqual(fresh.pendingFiles, []);
+  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .filter(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session');
+  assert.ok(ignoredEvidence.length >= 1);
+  assert.ok(ignoredEvidence.every(entry => entry.latest.captureRecommendation === 'ignored'));
+  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
 
   const appNodes = getProvenanceNodes(fresh, NODE_TYPES.APP);
   const processNodes = getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS);
@@ -2541,7 +2542,7 @@ test('ongoing lsof poll stages broad observations as pending without captured-fi
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
 });
 
-test('PowerPoint open-after-watch source is visible as pending without direct-add', async () => {
+test('PowerPoint lsof open-after-watch evidence stays quarantined until confirmed', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'open-after-watch.pptx');
   fs.writeFileSync(filePath, 'pptx bytes');
   let pollReady = false;
@@ -2559,13 +2560,16 @@ test('PowerPoint open-after-watch source is visible as pending without direct-ad
   const project = await callIpc('projects:create', 'Presentation open provenance', 'presentation', 'current-page', null);
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  const fresh = await waitForProject(
+    project.id,
+    item => Object.values((item.liveEvidenceLedger && item.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'),
+    5000
+  );
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles[0].path, filePath);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof');
-  assert.equal(fresh.pendingFiles[0].captureState, 'observed');
-  assert.equal(fresh.pendingFiles[0].captureReason, 'opened-after-watch');
-  assert.equal(fresh.pendingFiles[0].captureEvidence.appFamily, 'powerpoint');
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .some(entry => entry.latest && entry.latest.captureRecommendation === 'ignored'), true);
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assertProvenanceTextExcludes(fresh, [
     'SHOULD_NOT_APPEAR_PROCESS_ARG',
@@ -2597,8 +2601,9 @@ test('repeated lsof observations for the same pending file are deduped', async (
   const fresh = await getProject(project.id);
 
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.length, 1);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 0);
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
@@ -2625,7 +2630,7 @@ test('rejected lsof candidates do not record provenance', async () => {
   assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
 });
 
-test('lsof provenance failure does not block pending candidate staging', async () => {
+test('lsof provenance failure does not block broad observer quarantine', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'failure-logo.ai');
   let pollReady = false;
   setChildProcessHandler(({ kind, command }) => {
@@ -2648,10 +2653,14 @@ test('lsof provenance failure does not block pending candidate staging', async (
   });
   pollReady = true;
 
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 1);
+  const fresh = await waitForProject(
+    project.id,
+    item => Object.values((item.liveEvidenceLedger && item.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'),
+    5000
+  );
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles[0].path, filePath);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof');
+  assert.deepEqual(fresh.pendingFiles, []);
 });
 
 test('ps-poll broad discovery stages pending candidate without captured-file provenance', async () => {
@@ -3355,7 +3364,7 @@ test('ps-poll provenance failure does not block pending candidate staging', asyn
   assert.equal(fresh.pendingFiles[0].source, 'ps-poll');
 });
 
-test('lastused-poll broad discovery stages pending candidate without captured-file provenance', async () => {
+test('lastused-poll broad discovery outside session scope is quarantined', async () => {
   resetTestHomeWorkspace();
   const filePath = path.join(TEST_HOME, 'Desktop', 'lastused-logo.png');
   fs.writeFileSync(filePath, 'lastused bytes');
@@ -3376,11 +3385,17 @@ test('lastused-poll broad discovery stages pending candidate without captured-fi
   const project = await createProject('Lastused poll provenance');
   let fresh = await waitForProject(
     project.id,
-    item => item.pendingFiles.some(file => file.source === 'lastused-poll'),
+    item => Object.values((item.liveEvidenceLedger && item.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'),
     12000
   );
   assert.equal(fresh.files.filter(file => file.path === filePath).length, 0);
-  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 0);
+  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .filter(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session');
+  assert.ok(ignoredEvidence.length >= 1);
+  assert.ok(ignoredEvidence.every(entry => entry.latest.quarantined === true));
+  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
 
   let observations = getSessionObservedByMethod(fresh, 'lastused-poll');
   assert.equal(observations.length, 0);
@@ -3395,8 +3410,229 @@ test('lastused-poll broad discovery stages pending candidate without captured-fi
   fresh = await getProject(project.id);
   observations = getSessionObservedByMethod(fresh, 'lastused-poll');
   assert.equal(fresh.files.filter(file => file.path === filePath).length, 0);
-  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 0);
   assert.equal(observations.length, 0);
+});
+
+test('session-related broad observer evidence stages pending review without direct-add', async () => {
+  resetTestHomeWorkspace();
+  const projectRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.13-jenna', 'source-copies');
+  const sourcePath = path.join(projectRoot, 'current-layout.ai');
+  const broadPath = path.join(projectRoot, 'current-layout-reference.ai');
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.writeFileSync(sourcePath, 'source bytes');
+  fs.writeFileSync(broadPath, 'broad bytes');
+  let pollReady = false;
+  setChildProcessHandler(({ kind, command }) => {
+    if (!pollReady) return { stdout: '' };
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return { stdout: '111 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --token SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return { stdout: `p111\nf14\ntREG\nn${broadPath}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Session-related broad observer');
+  await setProjectFiles(project.id, {
+    files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }],
+  });
+  pollReady = true;
+
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === broadPath),
+    5000
+  );
+  const candidate = fresh.pendingFiles.find(file => file.path === broadPath);
+  assert.ok(candidate);
+  assert.equal(candidate.source, 'lsof');
+  assert.equal(candidate.captureState, 'observed');
+  assert.equal(fresh.files.some(file => file.path === broadPath), false);
+  assert.deepEqual(getSessionObservedByMethod(fresh, 'lsof'), []);
+  assertProvenanceTextExcludes(fresh, [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'stdout',
+  ]);
+});
+
+test('legacy broad-only accepted files are cleaned while trusted evidence is preserved', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Legacy broad cleanup');
+  const stalePath = path.join(TEST_HOME, 'Downloads', 'old-client-logo.ai');
+  const manualPath = path.join(TEST_HOME, 'Desktop', 'current-source.ai');
+  const parserPath = path.join(TEST_HOME, 'Desktop', 'linked-logo.png');
+  const figmaPath = path.join(TEST_HOME, 'Desktop', 'figma-cloud-asset.png');
+  const acceptedBroadPath = path.join(TEST_HOME, 'Desktop', 'accepted-broad.ai');
+  for (const filePath of [stalePath, manualPath, parserPath, figmaPath, acceptedBroadPath]) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+
+  await setProjectFiles(project.id, {
+    files: [
+      makePendingFile(stalePath, 'lastused-poll'),
+      makePendingFile(manualPath, 'manual-browse'),
+      makePendingFile(parserPath, 'scan-on-open'),
+      {
+        ...makePendingFile(figmaPath, 'figma-auto'),
+        figmaFileKey: 'file123',
+        figmaAssetKey: 'asset456',
+      },
+      {
+        ...makePendingFile(acceptedBroadPath, 'lastused-poll'),
+        acceptedPending: true,
+      },
+    ],
+  });
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === stalePath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === stalePath), false);
+  assert.equal(fresh.files.some(file => file.path === manualPath), true);
+  assert.equal(fresh.files.some(file => file.path === parserPath), true);
+  assert.equal(fresh.files.some(file => file.path === figmaPath), true);
+  assert.equal(fresh.files.some(file => file.path === acceptedBroadPath && file.acceptedPending === true), true);
+});
+
+test('stale broad pending rows from old QA roots are deduped and quarantined', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Broad pending dedupe cleanup');
+  const qa11Path = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.11-jenna', 'source-copies', 'Bris Invitation-03 copy.ai');
+  const qa12Path = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.12-jenna', 'source-copies', 'Bris Invitation-03 copy.ai');
+  fs.mkdirSync(path.dirname(qa11Path), { recursive: true });
+  fs.mkdirSync(path.dirname(qa12Path), { recursive: true });
+  fs.writeFileSync(qa11Path, 'qa11 bytes');
+  fs.writeFileSync(qa12Path, 'qa12 bytes');
+
+  await setProjectFiles(project.id, {
+    pendingFiles: [
+      {
+        ...makePendingFile(qa11Path, 'lastused-poll'),
+        captureState: 'pending',
+        captureReason: 'lastused-broad-observer',
+      },
+      {
+        ...makePendingFile(qa12Path, 'lastused-poll'),
+        captureState: 'pending',
+        captureReason: 'lastused-broad-observer',
+      },
+      {
+        ...makePendingFile(qa12Path, 'lastused-poll'),
+        captureState: 'pending',
+        captureReason: 'lastused-broad-observer',
+      },
+    ],
+  });
+
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+});
+
+test('package-time guard skips broad-only accepted files but keeps parser-confirmed assets', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Broad Package Guard');
+    const broadPath = path.join(tmpRoot, 'stale-broad.ai');
+    const parserPath = path.join(tmpRoot, 'parser-confirmed.png');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(broadPath, 'broad bytes');
+    fs.writeFileSync(parserPath, 'parser bytes');
+
+    await setProjectFiles(project.id, {
+      files: [
+        makePendingFile(broadPath, 'lastused-poll'),
+        makePendingFile(parserPath, 'scan-on-open'),
+      ],
+    });
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.equal(fs.existsSync(path.join(result.folderPath, path.basename(broadPath))), false);
+    assert.equal(fs.existsSync(path.join(result.folderPath, path.basename(parserPath))), true);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('broad observer quarantine does not block clean Illustrator DOC/LINK live evidence', async () => {
+  resetTestHomeWorkspace();
+  const qa13Root = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.13-jenna');
+  const sourcePath = path.join(qa13Root, 'source-copies', 'Bris Invitation-03 copy.ai');
+  const linkedPath = path.join(qa13Root, 'test-photos', 'IMG_5331.JPG');
+  const staleBroadPath = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.12-jenna', 'source-copies', 'Bris Invitation-03 copy.ai');
+  for (const filePath of [sourcePath, linkedPath, staleBroadPath]) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'execFile' && command === '/bin/ps') {
+      return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'execFile' && command === '/usr/sbin/lsof') {
+      return { stdout: `p444\nf14\ntREG\nn${staleBroadPath}\n` };
+    }
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return { stdout: `p444\nf14\ntREG\nn${staleBroadPath}\n` };
+    }
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '444\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tBris Invitation-03 copy.ai\ttrue\tfalse`,
+          `LINK\t${sourcePath}\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\tfalse`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Clean Illustrator quarantine regression');
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === linkedPath),
+    5000
+  );
+
+  const imgCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+  assert.ok(imgCandidate);
+  assert.equal(imgCandidate.source, 'ai-linked');
+  assert.equal(imgCandidate.captureState, 'needs-save');
+  assert.equal(imgCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(imgCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'Bris Invitation-03 copy.ai');
+  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assert.equal(fresh.files.some(file => file.path === staleBroadPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === staleBroadPath), false);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    staleBroadPath,
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'stdout',
+    'raw',
+  ], 'clean Illustrator quarantine regression ledger');
 });
 
 test('scan-on-open linked accepted insertion records one deduped candidate session observation', async () => {
@@ -3645,9 +3881,10 @@ test('initial snapshot does not parse linked assets from stale pending source fi
 
     const observations = getSessionObservedByMethod(fresh, 'initial-snapshot-linked-regex');
     assert.deepEqual(fresh.files, []);
-    assert.equal(fresh.pendingFiles.length, 1);
-    assert.equal(fresh.pendingFiles[0].path, sourcePath);
+    assert.deepEqual(fresh.pendingFiles, []);
     assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
     assert.equal(observations.length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
@@ -3663,11 +3900,13 @@ test('initial snapshot does not parse linked assets from stale pending source fi
   }
 });
 
-test('pre-package lsof package scan stages pending candidate without captured-file provenance', async () => {
+test('pre-package lsof package scan quarantines broad candidates outside session scope', async () => {
   resetTestHomeWorkspace();
-  const project = await createProject('Prepackage lsof provenance');
   const figPath = path.join(TEST_HOME, 'Desktop', 'package-open.fig');
   fs.writeFileSync(figPath, 'fig bytes');
+  const project = await createProject('Prepackage lsof provenance');
+  const storedProject = await getProject(project.id);
+  storedProject.watchStartedAt = Date.now() + 10000;
 
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid=')) {
@@ -3680,12 +3919,13 @@ test('pre-package lsof package scan stages pending candidate without captured-fi
   });
 
   const scan = await callIpc('projects:pre-package-scan', project.id);
-  assert.equal(scan.newCount, 1);
+  assert.equal(scan.newCount, 0);
 
   let fresh = await getProject(project.id);
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.length, 1);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof-package-scan');
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
 
   const observations = getSessionObservedByMethod(fresh, 'lsof-package-scan');
   assert.equal(observations.length, 0);
@@ -3695,7 +3935,7 @@ test('pre-package lsof package scan stages pending candidate without captured-fi
   await callIpc('projects:pre-package-scan', project.id);
   fresh = await getProject(project.id);
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.filter(file => file.source === 'lsof-package-scan').length, 1);
+  assert.equal(fresh.pendingFiles.filter(file => file.source === 'lsof-package-scan').length, 0);
   assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 0);
 });
 
@@ -3834,12 +4074,13 @@ test('pre-package app-script parser and regex recovered additions record session
   }
 });
 
-test('pre-package recovery provenance failure does not block pending candidate staging', async () => {
+test('pre-package recovery provenance failure does not block broad candidate quarantine', async () => {
   resetTestHomeWorkspace();
-  const project = await createProject('Prepackage provenance failure');
   const figPath = path.join(TEST_HOME, 'Desktop', 'failure-open.fig');
   fs.writeFileSync(figPath, 'fig bytes');
+  const project = await createProject('Prepackage provenance failure');
   const storedProject = await getProject(project.id);
+  storedProject.watchStartedAt = Date.now() + 10000;
   storedProject.provenance.nodes = new Proxy({}, {
     set() {
       throw new Error('forced pre-package provenance failure');
@@ -3857,18 +4098,23 @@ test('pre-package recovery provenance failure does not block pending candidate s
   });
 
   const scan = await callIpc('projects:pre-package-scan', project.id);
-  assert.equal(scan.newCount, 1);
+  assert.equal(scan.newCount, 0);
 
   const fresh = await getProject(project.id);
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.length, 1);
-  assert.equal(fresh.pendingFiles[0].source, 'lsof-package-scan');
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
 });
 
 test('pre-package pending candidates do not create captured-file observations until accepted', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Prepackage pending provenance');
-  const figPath = path.join(TEST_HOME, 'Desktop', 'pending-candidate.fig');
+  const storedProject = await getProject(project.id);
+  storedProject.watchStartedAt = Date.now() - 10000;
+  const figmaSupportDir = path.join(TEST_HOME, 'Library', 'Application Support', 'Figma');
+  fs.mkdirSync(figmaSupportDir, { recursive: true });
+  const figPath = path.join(figmaSupportDir, 'pending-candidate.fig');
   fs.writeFileSync(figPath, 'fig bytes');
 
   const scan = await callIpc('projects:pre-package-scan', project.id);
