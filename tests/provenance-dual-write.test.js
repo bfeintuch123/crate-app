@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
 
 const {
@@ -257,6 +258,10 @@ function assertPrivateTempScriptPath(scriptPath) {
     assert.equal(fs.statSync(scriptDir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(scriptPath).mode & 0o777, 0o600);
   }
+}
+
+function toStartupHfsPath(posixPath) {
+  return `Macintosh HD:${path.resolve(posixPath).replace(/^\/+/, '').split(path.sep).join(':')}`;
 }
 
 function createChildProcessStub() {
@@ -2901,6 +2906,7 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       assert.equal(commandText.includes('tell application'), false);
       assert.equal(scriptText.includes('repeat with aDoc in every document'), true);
       assert.equal(scriptText.includes('file path of pItem'), true);
+      assert.equal(scriptText.includes('candidateText contains ":"'), true);
       assert.equal(scriptText.includes('linked of pItem'), false);
       return {
         stdout: `DOC\t${sourcePath}\tlive-illustrator.ai\ttrue\nLINK\t${sourcePath}\tlive-illustrator.ai\t${linkedPath}\ttrue\n`,
@@ -2974,6 +2980,154 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   ], 'Illustrator live evidence ledger');
   const ledgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {});
   assert.equal(ledgerEntries.filter(entry => entry.strongestState === 'needs-save').length, 2);
+});
+
+test('Illustrator live evidence normalizes HFS placed asset paths before staging', async () => {
+  resetTestHomeWorkspace();
+  const qa14Root = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.14-jenna');
+  const sourcePath = path.join(qa14Root, 'source-copies', 'Bris Invitation-03 CLEAN QA14.ai');
+  const linkedPath = path.join(qa14Root, 'test-photos', 'IMG_5331_QA14_LIVE_ONLY.JPG');
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.mkdirSync(path.dirname(linkedPath), { recursive: true });
+  fs.writeFileSync(sourcePath, 'clean ai bytes');
+  fs.writeFileSync(linkedPath, 'live-only jpg bytes');
+  const hfsSourcePath = toStartupHfsPath(sourcePath);
+  const hfsLinkedPath = toStartupHfsPath(linkedPath);
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${hfsSourcePath}\tBris Invitation-03 CLEAN QA14.ai\ttrue\ttrue`,
+          `LINK\t${hfsSourcePath}\tBris Invitation-03 CLEAN QA14.ai\t${hfsLinkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator HFS path normalization');
+    return waitForProject(
+      project.id,
+      item => item.pendingFiles.some(file => file.path === linkedPath),
+      5000
+    );
+  });
+
+  const imgCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+  assert.ok(imgCandidate);
+  assert.equal(imgCandidate.source, 'ai-linked');
+  assert.equal(imgCandidate.captureState, 'needs-save');
+  assert.equal(imgCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(imgCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'Bris Invitation-03 CLEAN QA14.ai');
+  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assert.ok(output.includes('normalizedPaths='));
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    hfsSourcePath,
+    hfsLinkedPath,
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'Illustrator HFS live evidence ledger');
+});
+
+test('Illustrator live evidence normalizes file URL placed asset paths before staging', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'file-url-illustrator.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331_QA14_FILE_URL.JPG');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'jpg bytes');
+  const linkedFileUrl = pathToFileURL(linkedPath).href;
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tfile-url-illustrator.ai\ttrue\ttrue`,
+          `LINK\t${sourcePath}\tfile-url-illustrator.ai\t${linkedFileUrl}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator file URL path normalization');
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === linkedPath),
+    5000
+  );
+
+  const imgCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+  assert.ok(imgCandidate);
+  assert.equal(imgCandidate.captureState, 'needs-save');
+  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
+  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    linkedFileUrl,
+    'file://',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'Illustrator file URL live evidence ledger');
+});
+
+test('Illustrator live evidence rejects ambiguous placed asset paths safely', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return {
+        stdout: [
+          'DOC\t\tBris Invitation-03 CLEAN QA14.ai\ttrue\ttrue',
+          'LINK\t\tBris Invitation-03 CLEAN QA14.ai\tv2.8.0-qa.14-jenna:test-photos:IMG_5331_QA14_LIVE_ONLY.JPG\ttrue\ttrue',
+          'LINK\t\tBris Invitation-03 CLEAN QA14.ai\trelative/IMG_5331_QA14_LIVE_ONLY.JPG\ttrue\ttrue',
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator invalid path normalization');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(output.includes('pathSkipped='));
+  assertTextExcludes(output, [
+    'v2.8.0-qa.14-jenna:test-photos:IMG_5331_QA14_LIVE_ONLY.JPG',
+    'relative/IMG_5331_QA14_LIVE_ONLY.JPG',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'Illustrator invalid path diagnostics');
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
+    'v2.8.0-qa.14-jenna:test-photos:IMG_5331_QA14_LIVE_ONLY.JPG',
+    'relative/IMG_5331_QA14_LIVE_ONLY.JPG',
+    'IMG_5331_QA14_LIVE_ONLY.JPG',
+    'stdout',
+    'raw',
+  ], 'Illustrator invalid path ledger');
 });
 
 test('Illustrator live evidence refresh stages a newly placed linked asset with accepted files present', async () => {
