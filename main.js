@@ -877,9 +877,67 @@ function createLiveAppEvidence(input = {}) {
   return evidence;
 }
 
+function getSafeLiveAppUnavailableReason(error) {
+  const directReason = normalizeLiveCaptureReason(error && error.message, '');
+  if (
+    directReason === 'automation-permission-denied' ||
+    directReason === 'automation-not-authorized' ||
+    directReason === 'missing-usage-description' ||
+    directReason === 'illustrator-query-timeout' ||
+    directReason === 'no-documents'
+  ) {
+    return directReason === 'automation-not-authorized' ? 'automation-permission-denied' : directReason;
+  }
+
+  const rawText = [
+    error && error.code,
+    error && error.message,
+    error && error.stderr,
+    error && error.stdout,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (!rawText) return 'illustrator-query-failed';
+  if (rawText.includes('nsappleeventsusagedescription') || rawText.includes('usage description')) {
+    return 'missing-usage-description';
+  }
+  if (
+    rawText.includes('-1712') ||
+    rawText.includes('timed out') ||
+    rawText.includes('timeout')
+  ) {
+    return 'illustrator-query-timeout';
+  }
+  if (
+    rawText.includes('-1743') ||
+    rawText.includes('not authorized') ||
+    rawText.includes('not authorised') ||
+    rawText.includes('not permitted') ||
+    rawText.includes('operation not permitted') ||
+    rawText.includes('apple event') ||
+    rawText.includes('appleevent') ||
+    rawText.includes('automation') ||
+    rawText.includes('tcc') ||
+    rawText.includes('privacy')
+  ) {
+    return 'automation-permission-denied';
+  }
+  return 'illustrator-query-failed';
+}
+
+function getLiveAppUnavailableGuidance(reason) {
+  if (reason === 'automation-permission-denied') {
+    return ' Open System Settings > Privacy & Security > Automation and allow Crate to control Adobe Illustrator.';
+  }
+  if (reason === 'missing-usage-description') {
+    return ' Crate needs an Apple Events usage description in the app bundle before macOS can authorize Automation.';
+  }
+  return '';
+}
+
 function logLiveAppEvidenceUnavailable(appLabel, error) {
-  const suffix = error && error.message ? ` ${redactFigmaLogText(error.message)}` : '';
-  console.warn(`[crate][live-app] ${appLabel} evidence unavailable. Check Automation permissions if this persists.${suffix}`);
+  const reason = getSafeLiveAppUnavailableReason(error);
+  const guidance = getLiveAppUnavailableGuidance(reason);
+  console.warn(`[crate][live-app] ${appLabel} evidence unavailable. script-success=false reason=${reason}. Check Automation permissions if this persists.${guidance}`);
 }
 
 function logLiveAppDiagnostic(projectId, key, message, intervalMs = LIVE_APP_DIAGNOSTIC_LOG_INTERVAL_MS) {
@@ -4671,6 +4729,7 @@ end tell`;
 const SAFE_LIVE_APP_STATUS_CODES = new Set([
   'automation-permission-denied',
   'automation-not-authorized',
+  'missing-usage-description',
   'illustrator-query-failed',
   'illustrator-query-timeout',
   'no-documents',
@@ -5153,7 +5212,7 @@ async function pollPsForProject(projectId) {
         logLiveAppDiagnostic(
           projectId,
           'illustrator-summary',
-          `Illustrator live evidence summary for project ${projectId}: docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${pathSummary}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
+          `Illustrator live evidence summary for project ${projectId}: script-success=true docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${pathSummary}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
         );
         liveEvidenceRecords.push(...illustratorRecords);
       } catch (e) {
