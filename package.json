@@ -33,6 +33,9 @@
       "gatekeeperAssess": false,
       "entitlements": "entitlements.plist",
       "entitlementsInherit": "entitlements.plist",
+      "extendInfo": {
+        "NSAppleEventsUsageDescription": "Crate uses Automation to read open design documents and linked assets from apps like Adobe Illustrator while you are actively watching a project."
+      },
       "target": [
         {
           "target": "dmg",

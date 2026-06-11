@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
+const packageJson = require('../package.json');
 
 const {
   NODE_TYPES,
@@ -568,6 +569,24 @@ function assertPackageResultShape(result) {
     'totalFiles',
   ]);
 }
+
+test('mac build metadata declares Apple Events usage and preserves Automation entitlement', () => {
+  assert.equal(packageJson.build.appId, 'com.crate.app');
+  assert.equal(packageJson.build.mac.entitlements, 'entitlements.plist');
+  assert.equal(packageJson.build.mac.entitlementsInherit, 'entitlements.plist');
+  const usageDescription = packageJson.build.mac.extendInfo
+    && packageJson.build.mac.extendInfo.NSAppleEventsUsageDescription;
+  assert.match(
+    usageDescription,
+    /Automation.*open design documents.*linked assets.*Adobe Illustrator/i
+  );
+
+  const entitlementsPath = path.resolve(__dirname, '..', 'entitlements.plist');
+  const entitlements = fs.readFileSync(entitlementsPath, 'utf8');
+  assert.match(entitlements, /com\.apple\.security\.automation\.apple-events/);
+  assert.match(entitlements, /com\.apple\.security\.cs\.disable-library-validation/);
+  assert.equal(entitlements.includes('com.apple.security.app-sandbox'), false);
+});
 
 function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
   const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
@@ -3366,6 +3385,95 @@ test('Illustrator live evidence Automation failure logs safe guidance without st
     'stdout',
     'raw',
   ], 'Illustrator Automation failure log');
+});
+
+test('Illustrator live evidence thrown Automation errors log safe category without raw output', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      const error = new Error(
+        'Command failed: /usr/bin/osascript /private/var/folders/SHOULD_NOT_APPEAR/crate-ai-active-session.applescript'
+      );
+      error.stderr = 'Not authorized to send Apple events to Adobe Illustrator. /Users/private/client/SHOULD_NOT_APPEAR.ai';
+      return { error };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator thrown TCC failure');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(output.includes('Illustrator evidence unavailable'));
+  assert.ok(output.includes('reason=automation-permission-denied'));
+  assert.ok(output.includes('System Settings'));
+  assertTextExcludes(output, [
+    '/usr/bin/osascript',
+    '/private/var',
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'crate-ai-active-session.applescript',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator thrown Automation failure log');
+});
+
+test('Illustrator live evidence missing usage description errors log safe category without raw output', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      const error = new Error(
+        'Missing NSAppleEventsUsageDescription while running /usr/bin/osascript /private/var/folders/SHOULD_NOT_APPEAR/script.applescript'
+      );
+      error.stderr = 'Automation usage description failure for /Users/private/client/SHOULD_NOT_APPEAR.ai';
+      return { error };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator missing usage description failure');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(output.includes('Illustrator evidence unavailable'));
+  assert.ok(output.includes('script-success=false'));
+  assert.ok(output.includes('reason=missing-usage-description'));
+  assert.ok(output.includes('Apple Events usage description'));
+  assertTextExcludes(output, [
+    '/usr/bin/osascript',
+    '/private/var',
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'script.applescript',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator missing usage description failure log');
 });
 
 test('strong Illustrator evidence updates an existing weak lsof pending candidate', async () => {
