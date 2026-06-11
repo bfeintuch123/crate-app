@@ -318,6 +318,27 @@ const BROAD_LIVE_CAPTURE_SOURCES = new Set([
   'app-opened',
 ]);
 
+const WEAK_BROAD_OBSERVER_SOURCES = new Set([
+  'lsof',
+  'lastused-poll',
+  'lastused-scan',
+  'lsof-package-scan',
+]);
+
+const WEAK_BROAD_OBSERVER_REASONS = new Set([
+  'lastused-broad-observer',
+  'initial-lsof-snapshot',
+  'stale-prewatch-opened',
+  'pre-package-lsof-scan',
+  'pre-package-lastused-scan',
+  'pre-package-app-script-broad-observer',
+]);
+
+const EXPLICIT_USER_CAPTURE_SOURCES = new Set([
+  'manual',
+  'manual-browse',
+]);
+
 const STRONG_SESSION_LIVE_CAPTURE_REASONS = new Set([
   'chokidar-add',
   'chokidar-change',
@@ -448,6 +469,298 @@ function isAcceptedProjectFilePath(project, filePath) {
   const normalizedPath = normalizeTrackedFilePath(filePath);
   if (!normalizedPath) return false;
   return getNormalizedPathSet(project && project.files).has(normalizedPath);
+}
+
+function getFileCaptureSource(file) {
+  if (!file || typeof file !== 'object') return null;
+  return sanitizeLiveEvidenceText(file.source || (file.captureEvidence && file.captureEvidence.source));
+}
+
+function getFileCaptureReason(file) {
+  if (!file || typeof file !== 'object') return null;
+  return normalizeLiveCaptureReason(
+    file.captureReason ||
+    (file.captureEvidence && (file.captureEvidence.reason || file.captureEvidence.captureReason)) ||
+    getFileCaptureSource(file) ||
+    'unknown'
+  );
+}
+
+function isWeakBroadObserverSource(source) {
+  return !!(source && WEAK_BROAD_OBSERVER_SOURCES.has(source));
+}
+
+function isWeakBroadObserverReason(reason) {
+  return !!(reason && WEAK_BROAD_OBSERVER_REASONS.has(reason));
+}
+
+function isWeakBroadObserverEvidence(evidence = {}) {
+  const source = sanitizeLiveEvidenceText(evidence.source) || null;
+  const policyReason = normalizeLiveCaptureReason(evidence.policyReason || evidence.displayReason || evidence.reason || source || 'unknown');
+  return isWeakBroadObserverSource(source) || isWeakBroadObserverReason(policyReason);
+}
+
+function isWeakBroadObserverFile(file) {
+  const source = getFileCaptureSource(file);
+  const reason = getFileCaptureReason(file);
+  if (isWeakBroadObserverSource(source) || isWeakBroadObserverReason(reason)) return true;
+  const captureEvidence = file && file.captureEvidence;
+  return !!(
+    captureEvidence &&
+    captureEvidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL &&
+    (isWeakBroadObserverSource(captureEvidence.observerMethod) || isWeakBroadObserverReason(captureEvidence.reason))
+  );
+}
+
+function hasAcceptedPendingProvenance(project, filePath) {
+  const normalizedPath = normalizeTrackedFilePath(filePath);
+  if (!project || !normalizedPath || !project.provenance || !Array.isArray(project.provenance.observations)) return false;
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  return project.provenance.observations.some(observation => (
+    observation &&
+    observation.objectNodeId === fileNodeId &&
+    observation.observer &&
+    observation.observer.method === 'projects:accept-pending' &&
+    observation.observer.kind === OBSERVER_KINDS.MANUAL_USER_ACTION
+  ));
+}
+
+function isAcceptedPendingCapturedFile(project, file) {
+  return !!(file && file.acceptedPending === true) || hasAcceptedPendingProvenance(project, file && file.path);
+}
+
+function isExplicitUserCapturedFile(file) {
+  return EXPLICIT_USER_CAPTURE_SOURCES.has(getFileCaptureSource(file));
+}
+
+function isSavedOrConfirmedProjectFile(file) {
+  const source = getFileCaptureSource(file);
+  const reason = getFileCaptureReason(file);
+  const captureEvidence = file && file.captureEvidence;
+  return !!(
+    SAVED_OR_CONFIRMED_CAPTURE_SOURCES.has(source) ||
+    SAVED_OR_CONFIRMED_CAPTURE_REASONS.has(reason) ||
+    (captureEvidence && (
+      captureEvidence.savedEvidence === true ||
+      captureEvidence.parserConfirmed === true ||
+      captureEvidence.filesystemSaved === true ||
+      captureEvidence.projectScopedCloud === true
+    ))
+  );
+}
+
+function isCurrentSessionSavedSource(project, file) {
+  if (!project || !file || typeof file.path !== 'string') return false;
+  if (getFileCaptureSource(file)) return false;
+  const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+  if (!PRIMARY_DESIGN_EXTENSIONS.has(ext)) return false;
+  const watchStart = project.watchStartedAt || project.createdAt || 0;
+  const addedAt = typeof file.addedAt === 'number' ? file.addedAt : 0;
+  return !!(watchStart && addedAt >= watchStart);
+}
+
+function isTrustedSessionProjectFile(project, file) {
+  if (!file || typeof file.path !== 'string' || !file.path.trim()) return false;
+  if (isAutoCaptureExcludedPath(file.path)) return false;
+  if (isExplicitUserCapturedFile(file)) return true;
+  if (isAcceptedPendingCapturedFile(project, file)) return true;
+  if (isSavedOrConfirmedProjectFile(file)) return true;
+  if (isCurrentSessionSavedSource(project, file)) return true;
+  const captureEvidence = file.captureEvidence || {};
+  return captureEvidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT &&
+    PRIMARY_DESIGN_EXTENSIONS.has((file.ext || path.extname(file.path || '') || '').toLowerCase());
+}
+
+function isBroadRootSessionDir(dirPath) {
+  if (typeof dirPath !== 'string' || !dirPath.trim()) return false;
+  const home = os.homedir();
+  const roots = [
+    path.join(home, 'Desktop'),
+    path.join(home, 'Documents'),
+    path.join(home, 'Downloads'),
+    path.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Desktop'),
+    path.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Documents'),
+    path.join(home, 'Library', 'Application Support', 'Figma'),
+  ].map(root => path.resolve(root));
+  const resolvedDir = path.resolve(dirPath);
+  return roots.some(root => resolvedDir === root);
+}
+
+function buildProjectSessionScope(project) {
+  const scope = {
+    anchorPaths: new Set(),
+    anchorDirs: [],
+    sourceNameCounts: new Map(),
+  };
+  const files = [
+    ...((project && Array.isArray(project.files)) ? project.files : []),
+    ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
+  ];
+
+  for (const file of files) {
+    if (!isTrustedSessionProjectFile(project, file)) continue;
+    const normalizedPath = normalizeTrackedFilePath(file.path);
+    if (!normalizedPath) continue;
+    scope.anchorPaths.add(normalizedPath);
+
+    const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+    const isSourceLike = PRIMARY_DESIGN_EXTENSIONS.has(ext) || isExplicitUserCapturedFile(file);
+    const fileName = path.basename(file.path).toLowerCase();
+    scope.sourceNameCounts.set(fileName, (scope.sourceNameCounts.get(fileName) || 0) + 1);
+    if (isSourceLike) {
+      const dir = path.dirname(file.path);
+      if (!isBroadRootSessionDir(dir)) scope.anchorDirs.push(dir);
+    }
+  }
+
+  return scope;
+}
+
+function isRelationshipSourceSessionTrusted(project, sourcePath) {
+  if (typeof sourcePath !== 'string' || !sourcePath.trim()) return false;
+  const normalizedSourcePath = normalizeTrackedFilePath(sourcePath);
+  if (!normalizedSourcePath) return false;
+  const files = [
+    ...((project && Array.isArray(project.files)) ? project.files : []),
+    ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
+  ];
+  return files.some(file => (
+    normalizeTrackedFilePath(file && file.path) === normalizedSourcePath &&
+    isTrustedSessionProjectFile(project, file)
+  ));
+}
+
+function isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence = {}) {
+  if (!project || !fileEntry || typeof fileEntry.path !== 'string') return false;
+  if (evidence.explicitUserAdd || evidence.acceptedPending || isSavedOrConfirmedLiveEvidence(evidence)) return true;
+  if (evidence.relationshipSourcePath && isRelationshipSourceSessionTrusted(project, evidence.relationshipSourcePath)) return true;
+  if (evidence.sourceDocumentPath && isRelationshipSourceSessionTrusted(project, evidence.sourceDocumentPath)) return true;
+
+  const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+  const scope = buildProjectSessionScope(project);
+  if (normalizedPath && scope.anchorPaths.has(normalizedPath)) return true;
+
+  if (evidence.sourceDocumentName) {
+    const sourceName = String(evidence.sourceDocumentName).toLowerCase();
+    if (scope.sourceNameCounts.get(sourceName) === 1) return true;
+  }
+
+  return scope.anchorDirs.some(anchorDir => isPathInsideOrEqual(anchorDir, fileEntry.path));
+}
+
+function isBroadObserverOnlyAcceptedFile(project, file) {
+  if (!isWeakBroadObserverFile(file)) return false;
+  if (isExplicitUserCapturedFile(file)) return false;
+  if (isAcceptedPendingCapturedFile(project, file)) return false;
+  if (isSavedOrConfirmedProjectFile(file)) return false;
+  if (isCurrentSessionSavedSource(project, file)) return false;
+  return true;
+}
+
+function shouldKeepPendingFileForSession(project, file) {
+  if (!file || typeof file.path !== 'string' || !file.path.trim()) return false;
+  if (isAutoCaptureExcludedPath(file.path)) return false;
+  if (!isWeakBroadObserverFile(file)) return true;
+  return isWeakBroadEvidenceSessionRelated(project, file, {
+    source: getFileCaptureSource(file),
+    policyReason: getFileCaptureReason(file),
+    evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
+    broadObserver: true,
+  });
+}
+
+function demoteBroadObserverFileForReview(file) {
+  const source = getFileCaptureSource(file) || 'broad-observer';
+  const captureState = LIVE_CAPTURE_STATES.PENDING;
+  const reason = 'broad-observer-needs-review';
+  return {
+    ...file,
+    captureState,
+    captureReason: reason,
+    captureEvidence: {
+      schemaVersion: 1,
+      source,
+      reason,
+      state: captureState,
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
+      captureRecommendation: captureState,
+      needsSave: false,
+      designerReason: getDesignerReasonForLiveEvidence({ captureState }),
+    },
+  };
+}
+
+function cleanupBroadObserverProjectState(project) {
+  if (!project || !Array.isArray(project.files)) return false;
+  let changed = false;
+  const keptFiles = [];
+  const demotedPending = [];
+
+  for (const file of project.files) {
+    if (!isBroadObserverOnlyAcceptedFile(project, file)) {
+      keptFiles.push(file);
+      continue;
+    }
+
+    changed = true;
+    if (isWeakBroadEvidenceSessionRelated(project, file, {
+      source: getFileCaptureSource(file),
+      policyReason: getFileCaptureReason(file),
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
+      broadObserver: true,
+    })) {
+      demotedPending.push(demoteBroadObserverFileForReview(file));
+    }
+  }
+
+  if (changed) {
+    project.files = keptFiles;
+    if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
+    project.pendingFiles.push(...demotedPending);
+  }
+  return changed;
+}
+
+function normalizeAutoCaptureProjectState(project) {
+  if (!project || typeof project !== 'object') return false;
+  let changed = false;
+
+  if (!Array.isArray(project.files)) {
+    project.files = [];
+    changed = true;
+  } else {
+    const beforeLength = project.files.length;
+    if (pruneExcludedAutoCapturedFiles(project)) changed = true;
+    if (cleanupBroadObserverProjectState(project)) changed = true;
+    project.files = deduplicateFiles(project.files);
+    if (project.files.length !== beforeLength) changed = true;
+  }
+
+  if (!Array.isArray(project.pendingFiles)) {
+    project.pendingFiles = [];
+    changed = true;
+  } else {
+    const beforeLength = project.pendingFiles.length;
+    const acceptedKeys = getTrackedFileKeySet(project.files);
+    const seenPendingKeys = new Set();
+    const seenWeakBroadPendingNames = new Set();
+    project.pendingFiles = project.pendingFiles.filter(file => {
+      const key = getTrackedFileDedupKey(file);
+      if (!key || acceptedKeys.has(key) || seenPendingKeys.has(key)) return false;
+      if (!shouldKeepPendingFileForSession(project, file)) return false;
+      if (isWeakBroadObserverFile(file)) {
+        const nameKey = `${getFileCaptureSource(file) || 'broad'}:${path.basename(file.path || file.name || '').toLowerCase()}`;
+        if (seenWeakBroadPendingNames.has(nameKey)) return false;
+        seenWeakBroadPendingNames.add(nameKey);
+      }
+      seenPendingKeys.add(key);
+      return true;
+    });
+    if (project.pendingFiles.length !== beforeLength) changed = true;
+  }
+
+  pruneLiveEvidenceLedger(project);
+  return changed;
 }
 
 function buildAutoCaptureFileEntry(filePath, source, extra = {}) {
@@ -676,6 +989,7 @@ function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedP
 
   evidence.evidenceStrength = deriveLiveEvidenceStrength(fileEntry, liveEvidence);
   evidence.broadObserver = evidence.forcePending || BROAD_LIVE_CAPTURE_SOURCES.has(source);
+  evidence.weakBroadObserver = isWeakBroadObserverEvidence(evidence);
   evidence.parserConfirmed = observation.parserConfirmed === true
     || SAVED_OR_CONFIRMED_CAPTURE_SOURCES.has(source)
     || SAVED_OR_CONFIRMED_CAPTURE_REASONS.has(policyReason);
@@ -698,6 +1012,7 @@ function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedP
     );
   evidence.evidenceKey = normalizedPath || normalizeTrackedFilePath(fileEntry && fileEntry.path);
   evidence.evidenceKeyHash = getLiveEvidenceKeyHash(evidence.evidenceKey);
+  evidence.sessionRelated = !evidence.weakBroadObserver || isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence);
   return evidence;
 }
 
@@ -799,6 +1114,7 @@ function getPrivacySafeLiveEvidenceSummary(evidence, captureState, reason) {
   if (evidence.filesystemSaved) summary.filesystemSaved = true;
   if (evidence.projectScopedCloud) summary.projectScopedCloud = true;
   if (evidence.captureHint && evidence.captureHint !== captureState) summary.ignoredCaptureHint = evidence.captureHint;
+  if (evidence.weakBroadObserver && captureState === LIVE_CAPTURE_STATES.IGNORED) summary.quarantined = true;
   return summary;
 }
 
@@ -1039,6 +1355,26 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
 
   const candidateKey = getTrackedFileDedupKey(fileEntry);
   const acceptedKeys = getTrackedFileKeySet(project.files);
+  const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
+
+  if (
+    evidence.weakBroadObserver &&
+    evidence.sessionRelated !== true &&
+    !acceptedKeys.has(candidateKey) &&
+    !pendingKeys.has(candidateKey)
+  ) {
+    const reason = 'broad-observer-outside-session';
+    return {
+      decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED,
+      reason,
+      captureReason: reason,
+      captureState: LIVE_CAPTURE_STATES.IGNORED,
+      normalizedPath,
+      evidence,
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.IGNORED, reason),
+    };
+  }
+
   const directEligible = shouldDirectAddLiveEvidence(project, fileEntry, evidence);
   const captureState = decideLiveCaptureState(project, fileEntry, evidence, directEligible);
   const reason = getLiveCaptureReasonFromDecision(evidence, captureState);
@@ -1062,7 +1398,6 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
     };
   }
 
-  const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
   if (pendingKeys.has(candidateKey)) {
     if (directEligible) {
       return {
@@ -1620,6 +1955,14 @@ async function selectProjectFilesForPackaging(project) {
   const packageFiles = [];
 
   for (const file of dedupedFiles) {
+    if (isBroadObserverOnlyAcceptedFile(project, file)) {
+      console.log(
+        `[crate][package] filtered broad observer-only file pending review: ` +
+        `localName=${formatFigmaLocalNameForLog(file.path)}`
+      );
+      continue;
+    }
+
     if (getProjectFigmaScopeMode(project) === FIGMA_SCOPE_CURRENT_PAGE && file.ext === '.fig') {
       console.log(
         `[crate][package] skipped .fig file for current-page Figma session: ` +
@@ -3144,26 +3487,7 @@ function mutateProject(projectId, fn) {
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
   const result = fn(project, projects);
-  if (!Array.isArray(project.files)) {
-    project.files = [];
-  } else {
-    pruneExcludedAutoCapturedFiles(project);
-    project.files = deduplicateFiles(project.files);
-  }
-  if (!Array.isArray(project.pendingFiles)) {
-    project.pendingFiles = [];
-  } else {
-    const acceptedKeys = getTrackedFileKeySet(project.files);
-    const seenPendingKeys = new Set();
-    project.pendingFiles = project.pendingFiles.filter(file => {
-      const key = getTrackedFileDedupKey(file);
-      if (!key || acceptedKeys.has(key) || seenPendingKeys.has(key)) return false;
-      if (isAutoCaptureExcludedPath(file && file.path)) return false;
-      seenPendingKeys.add(key);
-      return true;
-    });
-  }
-  pruneLiveEvidenceLedger(project);
+  normalizeAutoCaptureProjectState(project);
   safelyEnsureProjectProvenance(project);
   store.set('projects', projects);
   return result;
@@ -6556,7 +6880,13 @@ function startInactivityChecker() {
 // --- IPC Handlers ---
 
 ipcMain.handle('projects:get-all', () => {
-  return getProjects();
+  const projects = getProjects();
+  let changed = false;
+  for (const project of projects) {
+    if (normalizeAutoCaptureProjectState(project)) changed = true;
+  }
+  if (changed) store.set('projects', projects);
+  return projects;
 });
 
 ipcMain.handle('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
@@ -6698,7 +7028,10 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
     const acceptedPaths = getTrackedFileKeySet(project.files);
 
     if (!acceptedPaths.has(acceptedKey)) {
-      const acceptedFile = stripLiveCaptureMetadata(file);
+      const acceptedFile = {
+        ...stripLiveCaptureMetadata(file),
+        acceptedPending: true,
+      };
       project.files.push(acceptedFile);
       recordPendingFileDecision(project, acceptedFile, 'accepted');
       project.files = deduplicateFiles(project.files);
