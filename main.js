@@ -10,6 +10,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
 const os = require('os');
+const { fileURLToPath } = require('url');
 const { readPsd } = require('ag-psd');
 const fetch = require('node-fetch');
 const {
@@ -4574,11 +4575,24 @@ const AI_ACTIVE_SESSION_APPLESCRIPT = `on crateLiveEvidencePath(candidateValue)
     return POSIX path of (candidateValue as alias)
   end try
   try
+    return POSIX path of (candidateValue as file)
+  end try
+  try
     return POSIX path of candidateValue
   end try
   try
     set candidateText to candidateValue as text
     if candidateText starts with "/" then return candidateText
+    if candidateText starts with "file:" then return candidateText
+    if candidateText contains ":" then
+      try
+        return POSIX path of (candidateText as alias)
+      end try
+      try
+        return POSIX path of (candidateText as file)
+      end try
+      return candidateText
+    end if
   end try
   return ""
 end crateLiveEvidencePath
@@ -4669,11 +4683,85 @@ function normalizeLiveAppStatusCode(value, fallback = 'illustrator-query-failed'
   return SAFE_LIVE_APP_STATUS_CODES.has(code) ? code : fallback;
 }
 
+function normalizeIllustratorHfsPath(rawPath) {
+  const trimmed = typeof rawPath === 'string' ? rawPath.trim().replace(/:+$/, '') : '';
+  if (!trimmed || !trimmed.includes(':')) {
+    return { path: null, reason: 'not-hfs-path' };
+  }
+  if (trimmed.includes('/') || trimmed.startsWith(':')) {
+    return { path: null, reason: 'ambiguous-hfs-path' };
+  }
+
+  const parts = trimmed.split(':');
+  if (parts.length < 2 || parts.some(part => !part || part === '.' || part === '..' || part.includes('\0'))) {
+    return { path: null, reason: 'ambiguous-hfs-path' };
+  }
+
+  const volumeName = parts[0];
+  const rest = parts.slice(1);
+  const startupCandidate = path.join('/', ...rest);
+  if (path.isAbsolute(startupCandidate) && fs.existsSync(startupCandidate)) {
+    return { path: startupCandidate, reason: null };
+  }
+
+  const volumesCandidate = path.join('/Volumes', volumeName, ...rest);
+  if (path.isAbsolute(volumesCandidate) && fs.existsSync(volumesCandidate)) {
+    return { path: volumesCandidate, reason: null };
+  }
+
+  return { path: null, reason: 'unresolved-hfs-path' };
+}
+
+function normalizeIllustratorEvidencePath(rawPath) {
+  const value = typeof rawPath === 'string' ? rawPath.trim() : '';
+  if (!value) return { path: null, reason: 'empty-path' };
+  if (value.includes('\0') || value.length > 4096) return { path: null, reason: 'invalid-path' };
+
+  if (path.isAbsolute(value)) {
+    return { path: path.normalize(value).replace(/\/+$/, '') || '/', reason: null };
+  }
+
+  if (/^file:/i.test(value)) {
+    try {
+      const filePath = fileURLToPath(value);
+      if (filePath && path.isAbsolute(filePath) && !filePath.includes('\0')) {
+        return { path: path.normalize(filePath).replace(/\/+$/, '') || '/', reason: null };
+      }
+    } catch (_) {}
+    return { path: null, reason: 'invalid-file-url' };
+  }
+
+  if (value.includes(':')) {
+    return normalizeIllustratorHfsPath(value);
+  }
+
+  return { path: null, reason: 'relative-path' };
+}
+
+function recordIllustratorPathNormalization(diagnostics, kind, result) {
+  if (!diagnostics || typeof diagnostics !== 'object') return;
+  if (kind === 'doc') diagnostics.docRowsSeen = (diagnostics.docRowsSeen || 0) + 1;
+  if (kind === 'link') diagnostics.linkRowsSeen = (diagnostics.linkRowsSeen || 0) + 1;
+  if (result && result.path) {
+    diagnostics.normalizedPaths = (diagnostics.normalizedPaths || 0) + 1;
+    return;
+  }
+  const reason = result && result.reason ? result.reason : 'invalid-path';
+  if (!diagnostics.pathSkipped || typeof diagnostics.pathSkipped !== 'object') diagnostics.pathSkipped = {};
+  incrementLiveAppSkipCount(diagnostics.pathSkipped, `${kind}-${reason}`);
+}
+
 function parseIllustratorActiveSessionOutput(output) {
   const documents = [];
   const links = [];
   const statuses = [];
   const errors = [];
+  const diagnostics = {
+    docRowsSeen: 0,
+    linkRowsSeen: 0,
+    normalizedPaths: 0,
+    pathSkipped: {},
+  };
   for (const rawLine of String(output || '').split('\n')) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -4689,14 +4777,15 @@ function parseIllustratorActiveSessionOutput(output) {
     }
     if (kind === 'DOC' && parts.length >= 3) {
       const hasDocumentName = parts.length >= 4;
-      const documentPath = parts[1];
+      const documentPath = normalizeIllustratorEvidencePath(parts[1]);
+      recordIllustratorPathNormalization(diagnostics, 'doc', documentPath);
       const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
       const modifiedValue = hasDocumentName ? parts[3] : parts[2];
       const currentValue = hasDocumentName && parts.length >= 5 ? parts[4] : null;
-      if ((!documentPath || !path.isAbsolute(documentPath)) && !documentName) continue;
+      if (!documentPath.path && !documentName) continue;
       documents.push({
-        documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
-        documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
+        documentPath: documentPath.path,
+        documentName: documentName || (documentPath.path ? path.basename(documentPath.path) : null),
         modified: modifiedValue === 'true',
         current: currentValue === 'true',
       });
@@ -4704,22 +4793,23 @@ function parseIllustratorActiveSessionOutput(output) {
     }
     if (kind === 'LINK' && parts.length >= 4) {
       const hasDocumentName = parts.length >= 5;
-      const documentPath = parts[1];
+      const documentPath = normalizeIllustratorEvidencePath(parts[1]);
       const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
-      const linkedPath = hasDocumentName ? parts[3] : parts[2];
+      const linkedPath = normalizeIllustratorEvidencePath(hasDocumentName ? parts[3] : parts[2]);
+      recordIllustratorPathNormalization(diagnostics, 'link', linkedPath);
       const modifiedValue = hasDocumentName ? parts[4] : parts[3];
       const currentValue = hasDocumentName && parts.length >= 6 ? parts[5] : null;
-      if (!linkedPath || !path.isAbsolute(linkedPath)) continue;
+      if (!linkedPath.path) continue;
       links.push({
-        documentPath: documentPath && path.isAbsolute(documentPath) ? documentPath : null,
-        documentName: documentName || (documentPath && path.isAbsolute(documentPath) ? path.basename(documentPath) : null),
-        linkedPath,
+        documentPath: documentPath.path,
+        documentName: documentName || (documentPath.path ? path.basename(documentPath.path) : null),
+        linkedPath: linkedPath.path,
         modified: modifiedValue === 'true',
         current: currentValue === 'true',
       });
     }
   }
-  return { documents, links, statuses, errors };
+  return { documents, links, statuses, errors, diagnostics };
 }
 
 const ILLUSTRATOR_SOURCE_EXTENSIONS = new Set(['.ai', '.eps', '.pdf', '.svg']);
@@ -5056,10 +5146,14 @@ async function pollPsForProject(projectId) {
         const statusSummary = [...(activeState.statuses || []), ...(activeState.errors || [])]
           .filter(Boolean)
           .join(',');
+        const pathSkipSummary = formatLiveAppSkipCounts(activeState.diagnostics && activeState.diagnostics.pathSkipped);
+        const pathSummary = activeState.diagnostics
+          ? ` linkRows=${activeState.diagnostics.linkRowsSeen || 0} normalizedPaths=${activeState.diagnostics.normalizedPaths || 0}${pathSkipSummary ? ` pathSkipped=${pathSkipSummary}` : ''}`
+          : '';
         logLiveAppDiagnostic(
           projectId,
           'illustrator-summary',
-          `Illustrator live evidence summary for project ${projectId}: docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
+          `Illustrator live evidence summary for project ${projectId}: docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${pathSummary}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
         );
         liveEvidenceRecords.push(...illustratorRecords);
       } catch (e) {
