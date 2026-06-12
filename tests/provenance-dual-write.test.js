@@ -8,6 +8,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
 const packageJson = require('../package.json');
+const helperPlistPatch = require('../scripts/patch-helper-info-plists');
 
 const {
   NODE_TYPES,
@@ -25,6 +26,7 @@ const originalHomedir = os.homedir;
 const TEST_HOME = path.join(os.tmpdir(), 'crate-provenance-dual-write-home');
 const EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP = 500;
 const activeIntervals = new Set();
+const activeIntervalCallbacks = new Map();
 const activeTimeouts = new Set();
 
 fs.rmSync(TEST_HOME, { recursive: true, force: true });
@@ -36,11 +38,13 @@ os.homedir = () => TEST_HOME;
 global.setInterval = function trackedSetInterval(fn, delay, ...args) {
   const timer = originalSetInterval(fn, delay, ...args);
   activeIntervals.add(timer);
+  activeIntervalCallbacks.set(timer, () => fn(...args));
   return timer;
 };
 
 global.clearInterval = function trackedClearInterval(timer) {
   activeIntervals.delete(timer);
+  activeIntervalCallbacks.delete(timer);
   return originalClearInterval(timer);
 };
 
@@ -66,6 +70,15 @@ function clearTrackedTimers() {
   }
   for (const timer of [...activeTimeouts]) {
     global.clearTimeout(timer);
+  }
+}
+
+async function runTrackedIntervalCallbacks(iterations = 1) {
+  for (let i = 0; i < iterations; i++) {
+    const callbacks = [...activeIntervalCallbacks.values()];
+    for (const callback of callbacks) {
+      await Promise.resolve(callback());
+    }
   }
 }
 
@@ -249,6 +262,14 @@ function isIllustratorPsCommCheck({ kind, command, args }) {
     command === '/bin/ps' &&
     Array.isArray(args) &&
     args.includes('comm=');
+}
+
+function isIllustratorPsCommandCheck({ kind, command, args }) {
+  return kind === 'execFile' &&
+    command === '/bin/ps' &&
+    Array.isArray(args) &&
+    args[0] === 'axww' &&
+    args.includes('command=');
 }
 
 function assertPrivateTempScriptPath(scriptPath) {
@@ -529,6 +550,19 @@ function getSessionObservedByMethod(project, method) {
     .filter(observation => observation.observer && observation.observer.method === method);
 }
 
+function getLiveAppStatusEntries(project, appFamily = 'illustrator') {
+  const appStatus = project &&
+    project.liveAppEvidenceStatus &&
+    project.liveAppEvidenceStatus.apps &&
+    project.liveAppEvidenceStatus.apps[appFamily];
+  return appStatus && Array.isArray(appStatus.entries) ? appStatus.entries : [];
+}
+
+function getLatestLiveAppStatus(project, appFamily = 'illustrator') {
+  const entries = getLiveAppStatusEntries(project, appFamily);
+  return entries[entries.length - 1] || null;
+}
+
 function assertNoRelationshipEdges(project) {
   assert.equal(getProvenanceEdges(project, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
   assert.equal(getProvenanceEdges(project, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
@@ -572,6 +606,7 @@ function assertPackageResultShape(result) {
 
 test('mac build metadata declares Apple Events usage and preserves Automation entitlement', () => {
   assert.equal(packageJson.build.appId, 'com.crate.app');
+  assert.equal(packageJson.build.afterPack, 'scripts/patch-helper-info-plists.js');
   assert.equal(packageJson.build.mac.entitlements, 'entitlements.plist');
   assert.equal(packageJson.build.mac.entitlementsInherit, 'entitlements.plist');
   const usageDescription = packageJson.build.mac.extendInfo
@@ -586,6 +621,66 @@ test('mac build metadata declares Apple Events usage and preserves Automation en
   assert.match(entitlements, /com\.apple\.security\.automation\.apple-events/);
   assert.match(entitlements, /com\.apple\.security\.cs\.disable-library-validation/);
   assert.equal(entitlements.includes('com.apple.security.app-sandbox'), false);
+});
+
+test('helper Info.plist patch adds Apple Events usage before signing and is idempotent', () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const appOutDir = path.join(tmpRoot, 'mac-arm64');
+    const appBundle = path.join(appOutDir, 'Crate.app');
+    const helperInfoPlist = path.join(
+      appBundle,
+      'Contents',
+      'Frameworks',
+      'Crate Helper.app',
+      'Contents',
+      'Info.plist'
+    );
+    const rendererHelperInfoPlist = path.join(
+      appBundle,
+      'Contents',
+      'Frameworks',
+      'Crate Helper (Renderer).app',
+      'Contents',
+      'Info.plist'
+    );
+    const mainInfoPlist = path.join(appBundle, 'Contents', 'Info.plist');
+    for (const plistPath of [helperInfoPlist, rendererHelperInfoPlist, mainInfoPlist]) {
+      fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      fs.writeFileSync(plistPath, [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<plist version="1.0">',
+        '<dict>',
+        '<key>CFBundleIdentifier</key>',
+        '<string>com.crate.app.helper</string>',
+        '</dict>',
+        '</plist>',
+        '',
+      ].join('\n'));
+    }
+
+    const resolvedBundle = helperPlistPatch.resolveAppBundlePath({
+      appOutDir,
+      packager: { appInfo: { productFilename: 'Crate' } },
+    });
+    assert.equal(resolvedBundle, appBundle);
+
+    const patched = helperPlistPatch.patchHelperInfoPlists(appBundle);
+    assert.deepEqual(patched.sort(), [helperInfoPlist, rendererHelperInfoPlist].sort());
+    const secondPatch = helperPlistPatch.patchHelperInfoPlists(appBundle);
+    assert.deepEqual(secondPatch, []);
+
+    const helperText = fs.readFileSync(helperInfoPlist, 'utf8');
+    const rendererText = fs.readFileSync(rendererHelperInfoPlist, 'utf8');
+    const mainText = fs.readFileSync(mainInfoPlist, 'utf8');
+    assert.ok(helperText.includes('NSAppleEventsUsageDescription'));
+    assert.ok(rendererText.includes('NSAppleEventsUsageDescription'));
+    assert.ok(helperText.includes(helperPlistPatch.APPLE_EVENTS_USAGE_DESCRIPTION));
+    assert.ok(rendererText.includes(helperPlistPatch.APPLE_EVENTS_USAGE_DESCRIPTION));
+    assert.equal(mainText.includes('NSAppleEventsUsageDescription'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
@@ -2999,6 +3094,152 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   ], 'Illustrator live evidence ledger');
   const ledgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {});
   assert.equal(ledgerEntries.filter(entry => entry.strongestState === 'needs-save').length, 2);
+  const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
+  assert.ok(statusEntries.some(entry => entry.pollInstalled === true));
+  assert.ok(statusEntries.some(entry => entry.pollFired === true && entry.projectWatching === true));
+  assert.ok(statusEntries.some(entry => (
+    entry.appRunning === true &&
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 1 &&
+    entry.linksCount === 1 &&
+    entry.normalizedCount >= 2
+  )));
+  assert.ok(statusEntries.some(entry => entry.stagedCount === 2));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    'DOC\t',
+    'LINK\t',
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe Illustrator.app',
+    'tell application',
+    sourcePath,
+    linkedPath,
+    'stdout',
+    'raw',
+  ], 'Illustrator live app status breadcrumbs');
+});
+
+test('live app breadcrumbs persist zero-file poll and app-not-running status safely', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '' };
+    }
+    if (isIllustratorPsCommCheck({ kind, command, args })) {
+      return { stdout: '' };
+    }
+    if (isIllustratorPsCommandCheck({ kind, command, args })) {
+      return {
+        stdout: '/Applications/Preview.app/Contents/MacOS/Preview /Users/private/SHOULD_NOT_APPEAR.ai\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Zero file live app diagnostics');
+  const fresh = await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.errorCategory === 'app-not-running'),
+    5000
+  );
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.ok(statusEntries.some(entry => entry.pollInstalled === true));
+  assert.ok(statusEntries.some(entry => entry.pollFired === true && entry.projectWatching === true));
+  const latest = getLatestLiveAppStatus(fresh);
+  assert.equal(latest.appRunning, false);
+  assert.equal(latest.scriptAttempted, false);
+  assert.equal(latest.scriptSuccess, false);
+  assert.equal(latest.stagedCount, 0);
+  assert.equal(latest.errorCategory, 'app-not-running');
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    '/Applications/Preview.app',
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'command=',
+    'raw',
+    'stdout',
+  ], 'zero-file live app status breadcrumbs');
+});
+
+test('live app breadcrumbs are capped per app family across repeated watch starts', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+
+  const project = await createProject('Capped live app diagnostics');
+  await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.pollInstalled === true),
+    5000
+  );
+
+  await runTrackedIntervalCallbacks(25);
+
+  const fresh = await getProject(project.id);
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.equal(statusEntries.length, 20);
+  assert.equal(fresh.liveAppEvidenceStatus.entryLimit, 20);
+  assert.ok(statusEntries.every(entry => entry.appFamily === 'illustrator'));
+  assert.ok(statusEntries.every(entry => entry.pollFired === true));
+  assert.ok(statusEntries.some(entry => entry.errorCategory === 'app-not-running'));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    'raw',
+    'stdout',
+    'stderr',
+    'command=',
+  ], 'capped live app status breadcrumbs');
+});
+
+test('Illustrator running detection recognizes realistic command paths without retaining process output', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '' };
+    }
+    if (isIllustratorPsCommCheck({ kind, command, args })) {
+      return { stdout: '' };
+    }
+    if (isIllustratorPsCommandCheck({ kind, command, args })) {
+      return {
+        stdout: '/Applications/Adobe Illustrator 2026/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --private /Users/private/SHOULD_NOT_APPEAR.ai\n',
+      };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return { stdout: 'STATUS\tno-documents\n' };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator process command detection');
+  const fresh = await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.scriptAttempted === true),
+    5000
+  );
+
+  assert.equal(osascriptInvocations >= 1, true);
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.ok(statusEntries.some(entry => entry.appRunning === true));
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 0 &&
+    entry.linksCount === 0 &&
+    entry.errorCategory === 'no-documents'
+  )));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    '/Applications/Adobe Illustrator',
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    '--private',
+    'command=',
+    'raw',
+    'stdout',
+  ], 'Illustrator process detection status breadcrumbs');
 });
 
 test('Illustrator live evidence normalizes HFS placed asset paths before staging', async () => {
@@ -3462,6 +3703,25 @@ test('Illustrator live evidence missing usage description errors log safe catego
   assert.ok(output.includes('script-success=false'));
   assert.ok(output.includes('reason=missing-usage-description'));
   assert.ok(output.includes('Apple Events usage description'));
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === false &&
+    entry.stagedCount === 0 &&
+    entry.errorCategory === 'missing-usage-description'
+  )));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    '/usr/bin/osascript',
+    '/private/var',
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'script.applescript',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator missing usage description status');
   assertTextExcludes(output, [
     '/usr/bin/osascript',
     '/private/var',

@@ -300,6 +300,7 @@ const LIVE_APP_EVIDENCE_STRENGTHS = Object.freeze({
 
 const MAX_LIVE_EVIDENCE_CANDIDATES = 500;
 const MAX_LIVE_EVIDENCE_OBSERVATIONS_PER_CANDIDATE = 8;
+const MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP = 20;
 
 const AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES = new Set([
   'crate diagnostics',
@@ -947,6 +948,118 @@ function logLiveAppDiagnostic(projectId, key, message, intervalMs = LIVE_APP_DIA
   if (now - lastLoggedAt < intervalMs) return;
   liveAppDiagnosticLogTimestamps.set(safeKey, now);
   console.log(`[crate][live-app] ${redactFigmaLogText(message)}`);
+}
+
+const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
+  'app-not-running',
+  'project-not-watching',
+  'script-not-attempted',
+  'script-success',
+  'script-timeout',
+  'automation-permission-denied',
+  'missing-usage-description',
+  'empty-output',
+  'parse-empty',
+  'no-documents',
+  'unknown-script-error',
+  'illustrator-query-failed',
+  'illustrator-query-timeout',
+]);
+
+function normalizeLiveAppStatusErrorCategory(value, fallback = null) {
+  const normalized = normalizeLiveCaptureReason(value, '');
+  if (!normalized) return fallback;
+  if (normalized === 'automation-not-authorized') return 'automation-permission-denied';
+  if (normalized === 'illustrator-query-timeout') return 'script-timeout';
+  if (SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES.has(normalized)) return normalized;
+  return fallback;
+}
+
+function sanitizeLiveAppStatusCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return Math.min(Math.floor(count), 100000);
+}
+
+function sanitizeLiveAppStatusCounts(counts) {
+  if (!counts || typeof counts !== 'object' || Array.isArray(counts)) return {};
+  const sanitized = {};
+  for (const [rawReason, rawCount] of Object.entries(counts)) {
+    const reason = normalizeLiveCaptureReason(rawReason, '');
+    if (!reason) continue;
+    sanitized[reason] = sanitizeLiveAppStatusCount(rawCount);
+  }
+  return sanitized;
+}
+
+function mergeLiveAppStatusCounts(...countSets) {
+  const merged = {};
+  for (const counts of countSets) {
+    const sanitized = sanitizeLiveAppStatusCounts(counts);
+    for (const [reason, count] of Object.entries(sanitized)) {
+      merged[reason] = (merged[reason] || 0) + count;
+    }
+  }
+  return merged;
+}
+
+function setLiveAppStatusBoolean(entry, key, value) {
+  if (typeof value === 'boolean') entry[key] = value;
+}
+
+function buildLiveAppStatusBreadcrumb(appFamily, input = {}) {
+  const entry = {
+    appFamily: normalizeLiveCaptureReason(appFamily, 'live-app'),
+    observedAt: new Date().toISOString(),
+  };
+  for (const key of [
+    'pollInstalled',
+    'pollFired',
+    'projectWatching',
+    'appRunning',
+    'scriptAttempted',
+    'scriptSuccess',
+  ]) {
+    setLiveAppStatusBoolean(entry, key, input[key]);
+  }
+  for (const key of ['docsCount', 'linksCount', 'normalizedCount', 'stagedCount']) {
+    if (input[key] !== undefined) entry[key] = sanitizeLiveAppStatusCount(input[key]);
+  }
+  const skipReasonCounts = sanitizeLiveAppStatusCounts(input.skipReasonCounts);
+  if (Object.keys(skipReasonCounts).length > 0) entry.skipReasonCounts = skipReasonCounts;
+  const errorCategory = normalizeLiveAppStatusErrorCategory(input.errorCategory, null);
+  if (errorCategory) entry.errorCategory = errorCategory;
+  return entry;
+}
+
+function recordLiveAppStatusBreadcrumb(projectId, appFamily, input = {}) {
+  const safeAppFamily = normalizeLiveCaptureReason(appFamily, 'live-app');
+  const entry = buildLiveAppStatusBreadcrumb(safeAppFamily, input);
+  mutateProject(projectId, (project) => {
+    if (!project || typeof project !== 'object') return null;
+    if (!project.liveAppEvidenceStatus || typeof project.liveAppEvidenceStatus !== 'object' || Array.isArray(project.liveAppEvidenceStatus)) {
+      project.liveAppEvidenceStatus = {
+        schemaVersion: 1,
+        entryLimit: MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP,
+        apps: {},
+      };
+    }
+    if (!project.liveAppEvidenceStatus.apps || typeof project.liveAppEvidenceStatus.apps !== 'object' || Array.isArray(project.liveAppEvidenceStatus.apps)) {
+      project.liveAppEvidenceStatus.apps = {};
+    }
+    const appStatus = project.liveAppEvidenceStatus.apps[safeAppFamily] || {
+      entries: [],
+    };
+    appStatus.entries = [...(Array.isArray(appStatus.entries) ? appStatus.entries : []), entry]
+      .slice(-MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP);
+    appStatus.latest = entry;
+    appStatus.lastUpdatedAt = entry.observedAt;
+    project.liveAppEvidenceStatus.apps[safeAppFamily] = appStatus;
+    project.liveAppEvidenceStatus.schemaVersion = 1;
+    project.liveAppEvidenceStatus.entryLimit = MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP;
+    return { liveAppEvidenceStatus: project.liveAppEvidenceStatus };
+  });
+  return entry;
 }
 
 function incrementLiveAppSkipCount(skipCounts, reason) {
@@ -5007,7 +5120,7 @@ async function isIllustratorRunningForLiveEvidence() {
     timeout: 3000,
     encoding: 'utf8',
   }).catch(() => ({ stdout: '' }));
-  return String(ps.stdout || '')
+  if (String(ps.stdout || '')
     .split('\n')
     .some(line => {
       const commandPath = line.trim();
@@ -5015,6 +5128,21 @@ async function isIllustratorRunningForLiveEvidence() {
       const commandName = path.basename(commandPath).toLowerCase();
       if (commandName === 'adobe illustrator' || commandName === 'illustrator') return true;
       return /\/(?:adobe )?illustrator(?: \d{4})?\.app\/contents\/macos\/(?:adobe )?illustrator$/i.test(commandPath);
+    })) {
+    return true;
+  }
+
+  const psCommand = await execFileAsync('/bin/ps', ['axww', '-o', 'command='], {
+    timeout: 3000,
+    encoding: 'utf8',
+  }).catch(() => ({ stdout: '' }));
+  return String(psCommand.stdout || '')
+    .split('\n')
+    .some(line => {
+      const commandText = line.trim();
+      if (!commandText) return false;
+      if (/^Adobe Illustrator(?:\s|$)/i.test(commandText)) return true;
+      return /\/(?:adobe )?illustrator(?: \d{4})?\.app\/contents\/macos\/(?:adobe )?illustrator(?:\s|$)/i.test(commandText);
     });
 }
 
@@ -5090,6 +5218,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
     let changed = false;
     let stagedCount = 0;
     const stagedStates = new Map();
+    const stagedByApp = new Map();
 
     for (const { evidence, ext } of candidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
@@ -5103,6 +5232,8 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
       stagedCount++;
       changed = true;
       stagedStates.set(staged.captureState, (stagedStates.get(staged.captureState) || 0) + 1);
+      const stagedAppFamily = normalizeLiveCaptureReason(evidence.appFamily, 'live-app');
+      stagedByApp.set(stagedAppFamily, (stagedByApp.get(stagedAppFamily) || 0) + 1);
       if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
         const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
         if (storedFile) {
@@ -5122,13 +5253,14 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
       changed,
       stagedCount,
       stagedStates: Array.from(stagedStates.entries()),
+      stagedByApp: Array.from(stagedByApp.entries()),
       files: proj.files,
       pendingFiles: proj.pendingFiles || [],
     };
   });
 
   if (!result || result.stagedCount === 0) {
-    return { changed: false, stagedCount: 0 };
+    return { changed: false, stagedCount: 0, skipped };
   }
 
   lastFileActivity.set(projectId, Date.now());
@@ -5172,7 +5304,19 @@ async function pollPsForProject(projectId) {
 
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
-  if (!project || project.status !== 'watching') return;
+  if (!project) return;
+  if (project.status !== 'watching') {
+    for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
+      recordLiveAppStatusBreadcrumb(projectId, appFamily, {
+        pollFired: true,
+        projectWatching: false,
+        scriptAttempted: false,
+        scriptSuccess: false,
+        errorCategory: 'project-not-watching',
+      });
+    }
+    return;
+  }
 
   psInProgress.add(projectId);
   logLiveAppDiagnostic(projectId, 'poll-fired', `live app evidence refresh fired for project ${projectId}`);
@@ -5184,14 +5328,31 @@ async function pollPsForProject(projectId) {
     // --- Illustrator ---
     const illustratorRunning = await isIllustratorRunningForLiveEvidence();
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
+    recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+      pollFired: true,
+      projectWatching: true,
+      appRunning: illustratorRunning,
+      scriptAttempted: false,
+      scriptSuccess: false,
+      stagedCount: 0,
+      errorCategory: illustratorRunning ? 'script-not-attempted' : 'app-not-running',
+    });
     if (illustratorRunning) {
       polledApps.push('illustrator');
       try {
+        recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+        });
         const { stdout: aiOut } = await runOsascriptInPrivateTemp(
           () => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }),
           'crate-ai-active-session.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
+        const aiOutputText = String(aiOut || '');
+        const aiOutputEmpty = !aiOutputText.trim();
         if (!String(aiOut || '').trim()) {
           logLiveAppDiagnostic(projectId, 'illustrator-empty-output', `Illustrator returned no structured live evidence for project ${projectId}; check Automation permissions if this persists`);
         }
@@ -5209,14 +5370,45 @@ async function pollPsForProject(projectId) {
         const pathSummary = activeState.diagnostics
           ? ` linkRows=${activeState.diagnostics.linkRowsSeen || 0} normalizedPaths=${activeState.diagnostics.normalizedPaths || 0}${pathSkipSummary ? ` pathSkipped=${pathSkipSummary}` : ''}`
           : '';
+        const safeStatusReasons = [...(activeState.statuses || []), ...(activeState.errors || [])]
+          .filter(Boolean);
+        const scriptErrorCategory = aiOutputEmpty
+          ? 'empty-output'
+          : normalizeLiveAppStatusErrorCategory(safeStatusReasons[0], null);
+        const scriptSuccess = !aiOutputEmpty && (!activeState.errors || activeState.errors.length === 0);
+        recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess,
+          docsCount: activeState.documents.length,
+          linksCount: activeState.links.length,
+          normalizedCount: activeState.diagnostics && activeState.diagnostics.normalizedPaths,
+          stagedCount: 0,
+          skipReasonCounts: mergeLiveAppStatusCounts(
+            activeState.diagnostics && activeState.diagnostics.pathSkipped,
+            illustratorDiagnostics.skipped
+          ),
+          errorCategory: scriptErrorCategory || (scriptSuccess ? 'script-success' : 'unknown-script-error'),
+        });
         logLiveAppDiagnostic(
           projectId,
           'illustrator-summary',
-          `Illustrator live evidence summary for project ${projectId}: script-success=true docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${pathSummary}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
+          `Illustrator live evidence summary for project ${projectId}: script-success=${scriptSuccess ? 'true' : 'false'} docs=${activeState.documents.length} links=${activeState.links.length} records=${illustratorRecords.length}${pathSummary}${statusSummary ? ` status=${statusSummary}` : ''}${illustratorSkipSummary ? ` skipped=${illustratorSkipSummary}` : ''}`
         );
         liveEvidenceRecords.push(...illustratorRecords);
       } catch (e) {
         logLiveAppEvidenceUnavailable('Illustrator', e);
+        recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess: false,
+          stagedCount: 0,
+          errorCategory: getSafeLiveAppUnavailableReason(e),
+        });
       }
     }
 
@@ -5226,9 +5418,26 @@ async function pollPsForProject(projectId) {
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
 
-    if (psCheck.trim()) {
+    const photoshopRunning = Boolean(psCheck.trim());
+    recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
+      pollFired: true,
+      projectWatching: true,
+      appRunning: photoshopRunning,
+      scriptAttempted: false,
+      scriptSuccess: false,
+      stagedCount: 0,
+      errorCategory: photoshopRunning ? 'script-not-attempted' : 'app-not-running',
+    });
+
+    if (photoshopRunning) {
       polledApps.push('photoshop');
       try {
+        recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+        });
         const { stdout: psOut } = await runOsascriptInPrivateTemp(
           ({ resolveScriptPath }) => ({
             'crate-ps-poll.js': PS_DOJAVASCRIPT,
@@ -5237,7 +5446,19 @@ async function pollPsForProject(projectId) {
           'crate-ps-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
-        for (const p of psOut.split('\n').filter(Boolean)) {
+        const psLines = psOut.split('\n').filter(Boolean);
+        recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess: true,
+          linksCount: psLines.length,
+          normalizedCount: psLines.length,
+          stagedCount: 0,
+          errorCategory: psLines.length > 0 ? 'script-success' : 'parse-empty',
+        });
+        for (const p of psLines) {
           const evidence = createLinkedAssetLiveEvidenceRecord({
             projectId,
             filePath: p,
@@ -5249,6 +5470,15 @@ async function pollPsForProject(projectId) {
         }
       } catch (e) {
         logLiveAppEvidenceUnavailable('Photoshop', e);
+        recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess: false,
+          stagedCount: 0,
+          errorCategory: getSafeLiveAppUnavailableReason(e),
+        });
       }
     }
 
@@ -5258,29 +5488,64 @@ async function pollPsForProject(projectId) {
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
 
-    if (inddCheck.trim()) {
+    const indesignRunning = Boolean(inddCheck.trim());
+    recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
+      pollFired: true,
+      projectWatching: true,
+      appRunning: indesignRunning,
+      scriptAttempted: false,
+      scriptSuccess: false,
+      stagedCount: 0,
+      errorCategory: indesignRunning ? 'script-not-attempted' : 'app-not-running',
+    });
+
+    if (indesignRunning) {
       polledApps.push('indesign');
       try {
+        recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+        });
         const { stdout: inddOut } = await runOsascriptInPrivateTemp(
           () => ({ 'crate-indd-poll.applescript': INDD_APPLESCRIPT }),
           'crate-indd-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
-        for (const line of inddOut.split('\n')) {
-          const p = line.trim();
-          if (p) {
-            const evidence = createLinkedAssetLiveEvidenceRecord({
-              projectId,
-              filePath: p,
-              source: 'indd-poll',
-              appFamily: 'indesign',
-              observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
-            });
-            if (evidence) liveEvidenceRecords.push(evidence);
-          }
+        const inddLines = inddOut.split('\n').map(line => line.trim()).filter(Boolean);
+        recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess: true,
+          linksCount: inddLines.length,
+          normalizedCount: inddLines.length,
+          stagedCount: 0,
+          errorCategory: inddLines.length > 0 ? 'script-success' : 'parse-empty',
+        });
+        for (const p of inddLines) {
+          const evidence = createLinkedAssetLiveEvidenceRecord({
+            projectId,
+            filePath: p,
+            source: 'indd-poll',
+            appFamily: 'indesign',
+            observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
+          });
+          if (evidence) liveEvidenceRecords.push(evidence);
         }
       } catch (e) {
         logLiveAppEvidenceUnavailable('InDesign', e);
+        recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
+          pollFired: true,
+          projectWatching: true,
+          appRunning: true,
+          scriptAttempted: true,
+          scriptSuccess: false,
+          stagedCount: 0,
+          errorCategory: getSafeLiveAppUnavailableReason(e),
+        });
       }
     }
 
@@ -5291,6 +5556,16 @@ async function pollPsForProject(projectId) {
     if (liveEvidenceRecords.length === 0) return;
 
     const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords);
+    for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
+      recordLiveAppStatusBreadcrumb(projectId, appFamily, {
+        pollFired: true,
+        projectWatching: true,
+        scriptAttempted: true,
+        scriptSuccess: true,
+        stagedCount,
+        errorCategory: stagedCount > 0 ? 'script-success' : 'parse-empty',
+      });
+    }
     if (refreshResult.stagedCount > 0) {
       const stateSummary = Array.from(refreshResult.stagedStates || [])
         .map(([state, count]) => `${state}:${count}`)
@@ -5311,9 +5586,17 @@ function startPsPolling(projectId) {
   if (psPollers.has(projectId) || psPollerStarting.has(projectId)) return;
   psPollerStarting.add(projectId);
   logLiveAppDiagnostic(projectId, 'poll-installed', `live app evidence refresh installed for project ${projectId}`, 0);
+  for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
+    recordLiveAppStatusBreadcrumb(projectId, appFamily, {
+      pollInstalled: true,
+      projectWatching: true,
+      scriptAttempted: false,
+      errorCategory: 'script-not-attempted',
+    });
+  }
 
   const intervalId = setInterval(() => {
-    pollPsForProject(projectId);
+    return pollPsForProject(projectId);
   }, PS_POLL_INTERVAL_MS);
   psPollers.set(projectId, intervalId);
 
