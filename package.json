@@ -24,6 +24,7 @@
   },
   "build": {
     "appId": "com.crate.app",
+    "afterPack": "scripts/patch-helper-info-plists.js",
     "afterSign": "scripts/notarize.js",
     "mac": {
       "icon": "assets/icon.icns",
