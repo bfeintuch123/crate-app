@@ -909,6 +909,12 @@ function getSafeLiveAppUnavailableReason(error) {
     return 'illustrator-query-timeout';
   }
   if (
+    rawText.includes('file path of pitem') ||
+    (rawText.includes('placed item') && rawText.includes('file path'))
+  ) {
+    return 'illustrator-placed-item-path-query-failed';
+  }
+  if (
     rawText.includes('-1743') ||
     rawText.includes('not authorized') ||
     rawText.includes('not authorised') ||
@@ -964,6 +970,7 @@ const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
   'unknown-script-error',
   'illustrator-query-failed',
   'illustrator-query-timeout',
+  'illustrator-placed-item-path-query-failed',
 ]);
 
 function normalizeLiveAppStatusErrorCategory(value, fallback = null) {
@@ -4806,11 +4813,6 @@ tell application "Adobe Illustrator"
           try
             set linkedPath to my crateLiveEvidencePath(file of pItem)
           end try
-          if linkedPath is "" then
-            try
-              set linkedPath to my crateLiveEvidencePath(file path of pItem)
-            end try
-          end if
           if linkedPath is not "" then
             set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
           end if

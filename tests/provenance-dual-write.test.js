@@ -3019,7 +3019,8 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(commandText.includes('tell application'), false);
       assert.equal(scriptText.includes('repeat with aDoc in every document'), true);
-      assert.equal(scriptText.includes('file path of pItem'), true);
+      assert.equal(scriptText.includes('file of pItem'), true);
+      assert.equal(scriptText.includes('file path of pItem'), false);
       assert.equal(scriptText.includes('candidateText contains ":"'), true);
       assert.equal(scriptText.includes('linked of pItem'), false);
       return {
@@ -3670,6 +3671,58 @@ test('Illustrator live evidence thrown Automation errors log safe category witho
     'stderr',
     'raw',
   ], 'Illustrator thrown Automation failure log');
+});
+
+test('Illustrator placed item path query failures record safe category without raw output', async () => {
+  resetTestHomeWorkspace();
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      const error = new Error(
+        'Expected end of line but found identifier file path of pItem /Users/private/client/SHOULD_NOT_APPEAR.ai'
+      );
+      error.stderr = 'Could not read placed item file path for /Users/private/client/SHOULD_NOT_APPEAR.ai';
+      return { error };
+    }
+    return { stdout: '' };
+  });
+
+  const { result: fresh, output } = await captureConsoleDuring(async () => {
+    const project = await createProject('Illustrator placed path failure');
+    await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    return getProject(project.id);
+  });
+
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === false &&
+    entry.stagedCount === 0 &&
+    entry.errorCategory === 'illustrator-placed-item-path-query-failed'
+  )));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'file path of pItem',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator placed item path query failure status');
+  assertTextExcludes(output, [
+    '/Users/private',
+    'SHOULD_NOT_APPEAR',
+    'file path of pItem',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator placed item path query failure log');
 });
 
 test('Illustrator live evidence missing usage description errors log safe category without raw output', async () => {
