@@ -3019,8 +3019,12 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(commandText.includes('tell application'), false);
       assert.equal(scriptText.includes('repeat with aDoc in every document'), true);
+      assert.equal(scriptText.includes('file path of current document'), true);
+      assert.equal(scriptText.includes('file path of aDoc'), true);
+      assert.equal(scriptText.includes('aDoc is current document'), true);
       assert.equal(scriptText.includes('file of pItem'), true);
       assert.equal(scriptText.includes('file path of pItem'), false);
+      assert.equal(scriptText.includes('full name of'), false);
       assert.equal(scriptText.includes('candidateText contains ":"'), true);
       assert.equal(scriptText.includes('linked of pItem'), false);
       return {
@@ -3118,6 +3122,68 @@ test('Illustrator live app evidence stages open source and linked asset as needs
     'stdout',
     'raw',
   ], 'Illustrator live app status breadcrumbs');
+});
+
+test('Illustrator live app evidence stages valid rows when placed item reads report safe partial status', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator-partial.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'jpg bytes');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      const scriptText = fs.readFileSync(args[0], 'utf8');
+      assert.equal(scriptText.includes('illustrator-document-query-failed'), true);
+      assert.equal(scriptText.includes('illustrator-placed-items-query-failed'), true);
+      assert.equal(scriptText.includes('illustrator-placed-item-file-query-failed'), true);
+      assert.equal(scriptText.includes('file path of current document'), true);
+      assert.equal(scriptText.includes('file path of aDoc'), true);
+      assert.equal(scriptText.includes('file path of pItem'), false);
+      assert.equal(scriptText.includes('full name of'), false);
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tlive-illustrator-partial.ai\ttrue\ttrue`,
+          'STATUS\tillustrator-placed-item-file-query-failed',
+          `LINK\t${sourcePath}\tlive-illustrator-partial.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator partial placed item status');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const sourceCandidate = fresh.pendingFiles.find(file => file.path === sourcePath);
+  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+
+  assert.ok(sourceCandidate);
+  assert.ok(linkedCandidate);
+  assert.equal(linkedCandidate.source, 'ai-linked');
+  assert.equal(linkedCandidate.captureState, 'needs-save');
+  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
+  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'live-illustrator-partial.ai');
+  const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 1 &&
+    entry.linksCount === 1 &&
+    entry.errorCategory === 'illustrator-placed-item-file-query-failed'
+  )));
+  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    sourcePath,
+    linkedPath,
+    'file path of pItem',
+    'SHOULD_NOT_APPEAR',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator partial status breadcrumbs');
 });
 
 test('live app breadcrumbs persist zero-file poll and app-not-running status safely', async () => {
