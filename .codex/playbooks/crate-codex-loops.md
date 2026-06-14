@@ -5,22 +5,28 @@ Define true autonomous Codex loops for Crate work.
 
 A Crate Loop means Codex continues iterating after one initial prompt until the defined goal is reached or a stop condition is hit. A loop is not a prompt chain. Bryant should not need to provide the next prompt after every step when the loop is inside an approved action set and has a clear definition of done.
 
-This playbook orchestrates existing Crate playbooks. It does not replace focused fix, review, QA, release gate, security, provenance, or package-diff playbooks.
+This playbook orchestrates existing Crate playbooks. It does not replace focused fix, review, QA, release gate, security, provenance, handoff, or package-diff playbooks.
 
 ## When To Use
-- When Bryant wants Codex to continue working without being prompted for each next step.
-- When the task has a clear goal, allowed action set, definition of done, and stop gates.
-- When long-running review, QA, fix, release-gate, or readiness work needs durable state and explicit autonomy boundaries.
-- When Codex should produce the next safe prompt or approval request after reaching a stop gate.
+- Bryant explicitly asks for an autonomous loop.
+- The task has a clear goal, allowed action set, definition of done, and stop gates.
+- Long-running review, QA, fix, release-gate, readiness, or smoke-failure work needs durable state and explicit autonomy boundaries.
+- Codex should choose the next safe step without Bryant providing every next prompt.
+- Codex should produce a handoff or exact approval request after reaching a stop gate.
 
 ## Start Prompt
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-codex-loops.md for <loop name>. Goal: <goal>. Allowed actions: <allowed action set>. Definition of done: <done criteria>. Stop at approval gates and do not commit, push, release, build, deploy, tag, notarize, mutate dependencies, or touch out-of-scope files unless explicitly approved.
+Use .codex/playbooks/crate-codex-loops.md for <loop name>.
+Preauthorization mode: <no-autonomy|fix-only|fix-and-PR|fix-PR-and-merge-if-clean|release-gate-only-when-explicitly-approved>.
+Goal: <goal>.
+Allowed actions: <allowed action set>.
+Definition of done: <done criteria>.
+Stop at approval gates and do not commit, push, merge, release, build, deploy, tag, notarize, mutate dependencies, or touch out-of-scope files unless explicitly approved by the selected preauthorization mode.
 ```
 
-If the loop is a focused code fix, also use `clawpatch-fix.md`. If it is review-only, also use `crate-autoreview.md` or the relevant review playbook. If it is GUI QA, also use `crate-computer-use-qa.md` or `crate-gui-repro-flow.md`. If it is prerelease readiness, also use `crate-release-gate.md`.
+If the loop is a focused code fix, also use `clawpatch-fix.md`. If it is review-only, also use `crate-autoreview.md` or the relevant review playbook. If it is PR or merge work, also use `review-crate-pr.md`. If it is GUI QA, also use `crate-computer-use-qa.md` or `crate-gui-repro-flow.md`. If it is prerelease readiness, also use `crate-release-gate.md`. If it needs a restartable handoff, also use `crate-handoff.md`.
 
 ## Required Start Gate
 Before acting, Codex must confirm:
@@ -31,6 +37,7 @@ Before acting, Codex must confirm:
 - whether the branch is based on the required base branch, usually latest `origin/v2.4.x`
 - working tree state
 - loop name
+- preauthorization mode
 - goal
 - allowed action set
 - definition of done
@@ -49,39 +56,144 @@ In an assisted workflow:
 - Codex waits for Bryant to provide the next prompt or approval.
 - The next action is not selected or executed unless Bryant asks for it.
 
-Use assisted workflow mode when the task lacks a clear action set, has unresolved product ambiguity, needs credentials or account decisions, or requires a high-risk mutation such as commit, push, merge, release, deploy, tag, notarization, dependency mutation, or public site changes.
+Use assisted workflow mode when the task lacks a clear action set, has unresolved product ambiguity, needs credentials or account decisions, or requires a high-risk mutation that Bryant did not preauthorize.
 
 ### Autonomous Loop
 An autonomous loop is an approved bounded workflow.
 
 In an autonomous loop:
-- Codex observes current state.
-- Codex chooses the next allowed action.
-- Codex executes it.
+- Codex observes state.
+- Codex plans the next safe action.
+- Codex acts inside the allowed scope.
 - Codex runs checks.
 - Codex evaluates the result.
-- Codex updates loop state when useful.
-- Codex continues without Bryant providing the next prompt.
-- Codex stops only at explicit stop gates, definition of done, or a blocker that cannot be safely resolved inside the allowed action set.
+- Codex updates loop state.
+- Codex continues until done or stopped.
 
-Autonomy is scoped. Codex may continue without additional Bryant prompts only inside the loop's allowed action set.
+Autonomy is scoped. Codex may continue without additional Bryant prompts only inside the loop's allowed action set and selected preauthorization mode.
 
-## Autonomous Loop Contract
+## Loop Cycle
 Every autonomous Crate Loop follows this cycle:
 
-1. Observe current state.
-2. Compare against goal and definition of done.
-3. Plan the next smallest safe action.
-4. Act only inside the allowed action set.
-5. Run checks/tests.
-6. Evaluate result.
-7. Update loop state.
-8. Continue or stop.
+```text
+Observe -> Plan -> Act -> Check -> Evaluate -> Handoff/Continue
+```
+
+Iteration rules:
+- Observe current repo, PR, QA, artifact, or app state from authoritative sources.
+- Plan the next smallest safe action inside the allowed scope.
+- Act only inside the selected preauthorization mode.
+- Check with the narrowest meaningful tests, commands, or UI verification.
+- Evaluate whether the goal is complete, blocked, or still needs another allowed iteration.
+- Handoff if a stop gate or approval gate is hit; otherwise continue.
 
 Codex must keep each iteration small enough that the next state can be inspected, explained, and reversed without broad unrelated churn. If the next smallest safe action is outside the approved action set, Codex stops and asks Bryant for approval.
 
+## Preauthorization Modes
+
+### no-autonomy
+Codex may inspect, plan, and report one step at a time. It must wait after each substantive action.
+
+Allowed:
+- read files
+- inspect git/GitHub state
+- run read-only checks
+- propose exact next prompt
+
+Forbidden unless separately approved:
+- edit
+- commit
+- push
+- open PR
+- merge
+- build
+- release
+- deploy
+- tag
+- notarize
+- mutate dependencies
+
+### fix-only
+Codex may create or use a branch, implement a scoped fix, run checks, self-review, and stop before commit.
+
+Allowed:
+- create branch from approved base
+- edit scoped files
+- add/update tests
+- run focused checks
+- update local loop state
+
+Forbidden unless separately approved:
+- commit
+- push
+- open PR
+- merge
+- build
+- release
+- deploy
+- tag
+- notarize
+- mutate dependencies
+
+### fix-and-PR
+Codex may complete the fix, commit, push the branch, and open a draft PR after checks pass.
+
+Allowed:
+- everything in `fix-only`
+- commit scoped changes
+- push branch
+- open draft PR
+- return review and merge-readiness prompt
+
+Forbidden unless separately approved:
+- mark PR ready
+- merge
+- release
+- deploy
+- tag
+- notarize
+- mutate dependencies
+
+### fix-PR-and-merge-if-clean
+Codex may complete the fix, open a PR, run merge-readiness checks, and merge only if every required gate is clean and Bryant explicitly preauthorized merge for that exact loop.
+
+Allowed:
+- everything in `fix-and-PR`
+- run `review-crate-pr.md`
+- inspect requested changes and unresolved comments
+- merge only if no blockers, no requested changes, clean checks, correct base, and the prompt explicitly permits merge
+
+Must stop before merge if:
+- merge-readiness requests changes
+- status checks fail or are missing
+- branch is not mergeable
+- review comments are unresolved
+- PR base is not `v2.4.x`
+- changed files exceed the loop scope
+- Bryant's prompt did not explicitly preauthorize merge
+
+### release-gate-only-when-explicitly-approved
+Codex may run the release gate only to the exact mutation boundary Bryant approved.
+
+Allowed only when the prompt explicitly says so:
+- version bump
+- build
+- signing validation
+- notarization validation
+- commit package metadata
+- tag
+- push
+- GitHub prerelease
+
+Forbidden unless separately approved:
+- final public `v2.8.0`
+- `get-crate.com` updates
+- site deploy
+- stable release publication
+- dependency mutation
+
 ## Loop State File
-Codex should maintain a lightweight loop state file when useful, especially for long-running loops, interrupted work, multi-pass QA, prerelease gates, or review loops that produce staged findings.
+Codex should maintain a lightweight loop state file when useful, especially for long-running loops, interrupted work, multi-pass QA, prerelease gates, smoke-failure fixes, or review loops that produce staged findings.
 
 Suggested path:
 
@@ -104,12 +216,14 @@ Loop-state files must not contain:
 
 Suggested loop-state fields:
 - loop name
+- preauthorization mode
 - goal
 - definition of done
 - current branch
 - current commit
 - current PR
 - current artifact/version
+- keepalive status
 - current blocker
 - last action
 - last observation
@@ -120,33 +234,69 @@ Suggested loop-state fields:
 - approval needed
 - risks/open questions
 
-## Global Autonomy Rules
-Codex may continue without additional Bryant prompts only inside the loop's allowed action set.
+## Mac Keepalive / Loop Heartbeat
+Use this only when Bryant approves a long-running local Codex App loop and the Mac should stay awake. The heartbeat keeps the Mac awake; it does not grant permission to bypass stop gates.
 
-Codex must stop for:
-- wrong repo/path/branch
-- unexpected dirty working tree
-- scope creep into another lane
-- failed tests that cannot be safely resolved
-- product decision ambiguity
-- private file ambiguity
+Start:
+
+```sh
+caffeinate -dimsu -t 43200 &
+echo $! > /tmp/crate-caffeinate.pid
+
+while true; do
+  date "+%Y-%m-%d %H:%M:%S Crate Codex loop heartbeat"
+  caffeinate -u -t 30
+  sleep 300
+done &
+echo $! > /tmp/crate-heartbeat.pid
+```
+
+Stop:
+
+```sh
+kill "$(cat /tmp/crate-heartbeat.pid)" 2>/dev/null || true
+kill "$(cat /tmp/crate-caffeinate.pid)" 2>/dev/null || true
+rm -f /tmp/crate-heartbeat.pid /tmp/crate-caffeinate.pid
+```
+
+Check:
+
+```sh
+ps -p "$(cat /tmp/crate-caffeinate.pid)" -o pid,command
+ps -p "$(cat /tmp/crate-heartbeat.pid)" -o pid,command
+```
+
+Rules:
+- Heartbeat does not override stop gates.
+- Do not commit PID files.
+- Include keepalive status in `/handoff state`.
+- Stop the heartbeat when the loop is done, blocked, or handed back to Bryant unless Bryant asks to keep it running.
+- If the heartbeat fails to start, report it as an operational limitation, not a product blocker.
+
+## Hard Stop Gates
+Codex must stop immediately and report if any of these appear:
 - credentials/tokens/passwords
 - Keychain/signing prompts
+- Apple Developer secrets
+- private-file ambiguity
+- product decision ambiguity
+- dependency mutation outside explicit scope
+- `crate-web` changes
+- build/release/tag/notarize unless explicitly approved
+- final public `v2.8.0`
+- `get-crate.com` or site deploy
+- merge-readiness requests changes
+- tests fail and cannot be safely resolved inside the loop scope
+- scope expands beyond loop goal
+- wrong repo, path, branch, base, or unexpected dirty tree
 - account/security/billing/admin prompts
-- dependency mutation unless explicitly approved
-- commit approval unless preapproved
-- push approval unless preapproved
-- PR creation approval unless preapproved
-- merge approval
-- build/release/tag/notarization approval
-- `get-crate.com` or site deploy approval
-- final public `v2.8.0` approval
+- unapproved private/client files or artifacts
 
-Codex must not treat silence as approval for any stop gate. If a loop reaches a stop gate, Codex reports the current state, risk, exact approval needed, and the safest next prompt Bryant can use.
+Codex must not treat silence as approval for any stop gate. If a loop reaches a stop gate, Codex reports current state, risk, exact approval needed, and the safest next prompt Bryant can use.
 
 ## Loop Types
 
-### A. Autonomous Fix Loop
+### 1. Autonomous Fix Loop
 Purpose:
 - Implement a focused bug fix or product behavior fix.
 
@@ -156,7 +306,7 @@ Recommended orchestrated playbooks:
 - `crate-provenance-review.md` when provenance behavior is touched
 - `crate-security-scan.md` when path, parser, token, shell, package, or privacy risk is present
 
-Allowed:
+Allowed according to preauthorization:
 - create branch
 - inspect code
 - edit relevant files
@@ -165,18 +315,7 @@ Allowed:
 - rerun failed tests
 - revise implementation
 - update loop state
-
-Forbidden unless explicitly approved:
-- commit
-- push
-- open PR
-- merge
-- build
-- release
-- deploy
-- tag
-- notarize
-- mutate dependencies
+- commit/push/PR only in `fix-and-PR` or stronger mode
 
 Definition of done:
 - fix implemented
@@ -185,11 +324,11 @@ Definition of done:
 - `git diff --check` passes
 - no unrelated files changed
 - self-review ready
-- final review prompt returned
+- final review prompt or PR returned
 
-### B. Autonomous Review Loop
+### 2. Autonomous Review Loop
 Purpose:
-- Read-only investigation or release-blocker review.
+- Read-only investigation, PR review, release-blocker review, or fix recommendation.
 
 Recommended orchestrated playbooks:
 - `crate-autoreview.md`
@@ -224,27 +363,60 @@ Definition of done:
 - tests/checks reported
 - exact next prompt produced
 
-### C. Autonomous QA Loop
+### 3. Autonomous PR/Merge Loop
 Purpose:
-- Installed-app QA with Computer Use/System Events.
+- Carry a clean scoped branch through PR creation, review-readiness, and optionally merge if explicitly preauthorized.
+
+Recommended orchestrated playbooks:
+- `review-crate-pr.md`
+- `crate-autoreview.md` when release-blocker review is needed
+- `crate-regression-detector.md`
+- `crate-pr-documenter.md`
+
+Allowed according to preauthorization:
+- inspect branch and base
+- push branch and open draft PR in `fix-and-PR` mode
+- run merge-readiness checks
+- update PR description through approved tooling
+- merge only in `fix-PR-and-merge-if-clean` mode and only if all merge gates pass
+
+Must stop if:
+- PR base is not `v2.4.x`
+- mergeability is not clean
+- checks fail or are missing
+- review requests changes
+- unresolved review threads remain
+- changed files exceed scope
+- Bryant did not explicitly preauthorize merge
+
+Definition of done:
+- PR is open and documented, or merged if explicitly preauthorized and clean
+- merge-readiness state is reported
+- next release/QA prompt is returned if relevant
+
+### 4. Autonomous QA Loop
+Purpose:
+- Installed-app QA with Computer Use, Finder, and scoped creative-app workflows.
 
 Recommended orchestrated playbooks:
 - `crate-computer-use-qa.md`
 - `crate-gui-repro-flow.md`
 - `crate-manual-qa-matrix.md`
 - `crate-package-diff.md` when output comparison is in scope
+- `crate-handoff.md` for restartable QA state
 
 Allowed:
 - launch installed app
 - inspect visible UI
 - run approved QA workflows
 - use Finder and approved creative apps
-- use Terminal only for safe QA setup/read-only checks/System Events automation when approved
+- use Terminal only for safe QA setup, read-only checks, or System Events automation when approved
 - record pass/fail
+- update local loop state
 
 Forbidden:
 - source code edits
-- Git operations
+- Git operations unless scoped by the prompt
 - build/release/deploy/tag/notarize
 - account/security/billing/admin settings
 - credentials/tokens
@@ -254,17 +426,18 @@ Forbidden:
 Definition of done:
 - QA matrix step passes
 - or first blocker is captured with reproducible details
-- artifacts/paths recorded
+- artifacts/paths are recorded only when privacy-safe and approved
 - next action recommended
 
-### D. Autonomous Release Gate Loop
+### 5. Autonomous Release Gate Loop
 Purpose:
-- Internal QA prerelease gate such as `qa.10`, `qa.11`, or final release candidate.
+- Internal QA prerelease gate or release-readiness gate.
 
 Recommended orchestrated playbooks:
 - `crate-release-gate.md`
 - `release-crate.md` only after Bryant explicitly approves release execution
 - `crate-pr-documenter.md` for release notes or tester notes
+- `crate-handoff.md` for restartable release state
 
 Allowed only when explicitly approved:
 - version bump
@@ -283,16 +456,16 @@ Must stop for:
 - `latest-mac.yml` mismatch
 - tag/release conflict
 - dirty tree
-- public stable release action
+- final public release action
+- site deploy action
 
 Definition of done:
-- release created as approved prerelease
-- all artifacts uploaded
-- hashes reported
-- no final public release/site deploy occurred
-- QA checklist returned
+- approved gate completes or stops at first blocker
+- artifacts and hashes reported if built
+- no final public release/site deploy occurred unless explicitly approved
+- QA checklist or exact next prompt returned
 
-### E. Autonomous Public v2.8 Readiness Loop
+### 6. Public v2.8 Readiness Loop
 Purpose:
 - Maintain public `v2.8` go/no-go state.
 
@@ -301,6 +474,7 @@ Recommended orchestrated playbooks:
 - `crate-release-gate.md`
 - `crate-qa-results-synthesizer.md`
 - `crate-pr-documenter.md`
+- `crate-manual-qa-matrix.md`
 
 Allowed:
 - inspect branch/PR/release state
@@ -314,13 +488,15 @@ Forbidden unless separately approved:
 - release
 - deploy
 - final public tag
+- final public `v2.8.0`
 
 Definition of done:
 - current readiness matrix complete
+- blockers and non-blockers separated
 - next highest-leverage action identified
 - exact next prompt returned
 
-### F. Autonomous Provenance / AI-Readiness Loop
+### 7. Provenance / AI-Readiness Loop
 Purpose:
 - Evolve Crate Provenance into deterministic capture intelligence and future AI-ready evidence.
 
@@ -342,6 +518,7 @@ Allowed:
 - planning/review
 - evidence schema inspection
 - deterministic decision-layer fixes if approved through Fix Loop
+- package/provenance snapshot analysis with approved artifacts
 
 Forbidden unless explicitly approved:
 - AI/LLM calls
@@ -352,11 +529,11 @@ Forbidden unless explicitly approved:
 Definition of done:
 - evidence model assessed
 - risks stated
-- next safe PR identified
+- next safe PR or research prompt identified
 
-### G. Autonomous Security / Dependency Loop
+### 8. Security / Dependency Loop
 Purpose:
-- npm audit/security remediation.
+- Security review, npm audit triage, dependency remediation planning, or approved dependency remediation.
 
 Recommended orchestrated playbooks:
 - `crate-security-scan.md`
@@ -391,16 +568,75 @@ Definition of done:
 - remediation path proposed or implemented
 - tests run
 
+## Autonomous Smoke Failure Fix Loop Template
+Use this template when Bryant wants Codex to fix a smoke failure end-to-end without waiting for each next prompt.
+
+```text
+Use .codex/playbooks/crate-codex-loops.md for smoke failure <short-name>.
+Preauthorization mode: <fix-only|fix-and-PR|fix-PR-and-merge-if-clean>.
+Goal: triage and fix <exact smoke failure> from <version/artifact/PR>.
+Allowed actions:
+- verify repo path, remote, branch, base, and clean tree
+- create a focused branch from latest origin/v2.4.x
+- inspect the exact failing command and error text
+- identify the smallest plausible code or docs surface
+- implement the smallest safe fix
+- add or update focused tests when appropriate
+- run focused tests and git diff --check
+- self-review the diff
+- commit, push, and open a draft PR only if preauthorization mode allows it
+- run merge-readiness only if preauthorization mode allows it
+- merge only if preauthorized and no blockers exist
+- return the next QA release prompt
+
+Stop conditions:
+- credentials/tokens/passwords
+- Keychain/signing prompts
+- Apple Developer secrets
+- private-file ambiguity
+- product decision ambiguity
+- dependency mutation
+- crate-web changes
+- build/release/tag/notarize unless explicitly approved
+- final public v2.8.0
+- get-crate.com/site deploy
+- merge-readiness requests changes
+- tests fail and cannot be safely resolved
+- scope expands beyond loop goal
+```
+
+Smoke failure loop phases:
+1. Triage failure.
+2. Create branch.
+3. Implement fix.
+4. Run tests.
+5. Self-review.
+6. Commit if preauthorized.
+7. Push if preauthorized.
+8. Open PR if preauthorized.
+9. Run merge-readiness if preauthorized.
+10. Merge if preauthorized and no blockers.
+11. Return next QA release prompt.
+
+Required final output:
+- root cause or best-supported failure path
+- files changed
+- tests/checks run
+- PR URL if opened
+- merge status if preauthorized
+- remaining risk
+- exact next QA release prompt
+
 ## Crate-Specific Loop Examples
 
-### 1. v2.8 QA Prerelease Loop
+### v2.8 QA Prerelease Loop
 Goal:
 - Run release gates until the approved prerelease is published or a stop condition is hit.
 
 Allowed:
 - use `crate-release-gate.md`
 - run approved tests/checks
-- perform each release mutation only after explicit approval
+- perform each release mutation only after explicit approval or exact release-gate preauthorization
 - record artifact/version/hash state
 
 Stop:
@@ -417,7 +653,7 @@ Done:
 - QA checklist is returned
 - no final public release/site deploy occurred
 
-### 2. Jenna Real-File QA Loop
+### Jenna Real-File QA Loop
 Goal:
 - Run installed-app QA on Jenna's approved real-file workflows without contaminating packages or exposing private files.
 
@@ -425,7 +661,7 @@ Allowed:
 - launch installed Crate
 - use explicit-add and live-watch workflows
 - use Finder and approved creative apps
-- record pass/fail and package output paths
+- record pass/fail and approved package output paths
 
 Stop:
 - unexpected files
@@ -435,9 +671,9 @@ Stop:
 - unapproved client data exposure
 
 Done:
-- approved workflow passes, or first blocker has reproducible details and artifact paths.
+- approved workflow passes, or first blocker has reproducible details and safe artifact references.
 
-### 3. Active-Session Provenance Fix Loop
+### Active-Session Provenance Fix Loop
 Goal:
 - Fix active-session provenance behavior using the central evidence collection and decision layer.
 
@@ -452,15 +688,15 @@ Stop:
 - scope drift into unrelated parser/watcher behavior
 - product ambiguity
 - failing tests that require broader design decisions
-- commit approval
+- commit approval when not preauthorized
 
 Done:
 - fix and tests are ready
 - checks pass
 - no unrelated files changed
-- Codex stops before commit and returns final review prompt.
+- Codex stops before commit unless preauthorization allows it.
 
-### 4. Figma Scope QA Loop
+### Figma Scope QA Loop
 Goal:
 - Verify Figma Current Page Only and Entire File behavior with diagnostics privacy and no token leakage.
 
@@ -483,7 +719,7 @@ Done:
 - token leakage risk is reported
 - exact next prompt is returned if a fix is needed.
 
-### 5. Final Public v2.8 Readiness Loop
+### Final Public v2.8 Readiness Loop
 Goal:
 - Aggregate blockers, non-blockers, QA state, release state, and next action for public `v2.8`.
 
@@ -518,25 +754,30 @@ This playbook orchestrates existing playbooks. It does not replace:
 - `crate-computer-use-qa.md`
 - `crate-gui-repro-flow.md`
 - `crate-package-diff.md`
+- `crate-handoff.md`
 
 When another playbook has stricter gates, the stricter gate wins.
 
 ## Definition Of Done
 - Loop type is named.
+- Preauthorization mode is named.
 - Goal and definition of done are explicit.
 - Allowed actions and forbidden actions are explicit.
 - Start gate has been checked.
 - Loop state is maintained when useful and kept local unless Bryant approves committing it.
-- Each iteration observes, acts, checks, evaluates, and continues or stops.
+- Keepalive status is captured in `/handoff state` when heartbeat is used.
+- Each iteration observes, plans, acts, checks, evaluates, and either continues or hands off.
 - Stop gates are honored.
 - Final report includes commands run, files changed, tests/checks, risks, approval needed, and the exact next prompt if Bryant action is required.
 
 ## Report Format
 - Active loop and orchestrated playbooks.
+- Preauthorization mode.
 - Branch, base, HEAD, PR, and working tree state.
 - Goal and definition of done.
 - Allowed action set used.
 - Iterations completed.
+- Keepalive status, if used.
 - Files changed, if any.
 - Tests/checks run, with exact commands.
 - Current blocker or stop condition.

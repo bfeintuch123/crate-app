@@ -76,7 +76,7 @@ Use:
 - `crate-qa-results-synthesizer.md` for turning Jenna or tester QA artifacts into classifications, severity, next playbooks, and release recommendations.
 - `crate-computer-use-qa.md` for scoped Codex Computer Use GUI QA of Crate-supported creative apps and workflows, starting with Crate, Finder, Figma, PowerPoint, and Keynote.
 - `crate-gui-repro-flow.md` for reproducing GUI-only Crate bugs across scoped creative app lanes with exact steps, screenshots, package output, Package Details, and manifest comparison.
-- `crate-codex-loops.md` for true autonomous Codex loops with allowed action sets, loop state, stop gates, and orchestration across existing Crate playbooks.
+- `crate-codex-loops.md` for true autonomous Codex loops with preauthorization modes, allowed action sets, loop state, keepalive heartbeat guidance, stop gates, and orchestration across existing Crate playbooks.
 - `crate-codex-qa-assistant.md` for durable Codex QA assistant workflows that split crate-web browser QA from crate-app desktop Computer Use QA, produce proof artifacts, and route fixes through Bryant-approved draft PRs or follow-up prompts.
 - `crate-cmux-workbench.md` for optional cmux-style organization of multiple Codex CLI sessions while preserving Codex CLI, Computer Use, scoped app-lane QA, and Bryant approval boundaries.
 - `crate-handoff.md` for restartable Codex App session handoffs and fresh-agent Crate prompts with portable anchors, privacy filters, exact next prompts, and explicit stop conditions.
