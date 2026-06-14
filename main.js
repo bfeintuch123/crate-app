@@ -970,6 +970,9 @@ const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
   'unknown-script-error',
   'illustrator-query-failed',
   'illustrator-query-timeout',
+  'illustrator-document-query-failed',
+  'illustrator-placed-items-query-failed',
+  'illustrator-placed-item-file-query-failed',
   'illustrator-placed-item-path-query-failed',
 ]);
 
@@ -4778,46 +4781,68 @@ end crateLiveEvidencePath
 tell application "Adobe Illustrator"
   try
     set outputLines to {}
-    if (count of documents) is 0 then
+    try
+      set documentCount to count of documents
+    on error errMsg number errNum
+      set safeReason to "illustrator-document-query-failed"
+      if errNum is -1743 then set safeReason to "automation-permission-denied"
+      if errNum is -1712 then set safeReason to "illustrator-query-timeout"
+      return "ERROR" & tab & safeReason
+    end try
+    if documentCount is 0 then
       set end of outputLines to "STATUS" & tab & "no-documents"
     else
       set currentDocPath to ""
       try
-        set currentDocPath to my crateLiveEvidencePath(full name of current document)
+        set currentDocPath to my crateLiveEvidencePath(file path of current document)
       end try
-      repeat with aDoc in every document
-        set docPath to ""
-        set docName to ""
-        set docModified to "unknown"
-        set docCurrent to "false"
-        try
-          set docName to name of aDoc as text
-        end try
-        try
-          set docPath to my crateLiveEvidencePath(full name of aDoc)
-        end try
-        try
-          if modified of aDoc is true then
-            set docModified to "true"
-          else
-            set docModified to "false"
-          end if
-        end try
-        try
-          if aDoc is current document then set docCurrent to "true"
-        end try
-        if docCurrent is "false" and docPath is not "" and currentDocPath is not "" and docPath is currentDocPath then set docCurrent to "true"
-        set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified & tab & docCurrent
-        repeat with pItem in every placed item of aDoc
-          set linkedPath to ""
+      try
+        repeat with aDoc in every document
           try
-            set linkedPath to my crateLiveEvidencePath(file of pItem)
+            set docPath to ""
+            set docName to ""
+            set docModified to "unknown"
+            set docCurrent to "false"
+            try
+              set docName to name of aDoc as text
+            end try
+            try
+              set docPath to my crateLiveEvidencePath(file path of aDoc)
+            end try
+            try
+              if modified of aDoc is true then
+                set docModified to "true"
+              else
+                set docModified to "false"
+              end if
+            end try
+            try
+              if aDoc is current document then set docCurrent to "true"
+            end try
+            if docCurrent is "false" and docPath is not "" and currentDocPath is not "" and docPath is currentDocPath then set docCurrent to "true"
+            set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified & tab & docCurrent
+            try
+              repeat with pItem in every placed item of aDoc
+                set linkedPath to ""
+                try
+                  set linkedPath to my crateLiveEvidencePath(file of pItem)
+                on error
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
+                end try
+                if linkedPath is not "" then
+                  set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
+                end if
+              end repeat
+            on error
+              set end of outputLines to "STATUS" & tab & "illustrator-placed-items-query-failed"
+            end try
+          on error
+            set end of outputLines to "STATUS" & tab & "illustrator-document-query-failed"
           end try
-          if linkedPath is not "" then
-            set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
-          end if
         end repeat
-      end repeat
+      on error
+        set end of outputLines to "ERROR" & tab & "illustrator-document-query-failed"
+      end try
     end if
     set AppleScript's text item delimiters to linefeed
     return outputLines as text
@@ -4847,6 +4872,10 @@ const SAFE_LIVE_APP_STATUS_CODES = new Set([
   'missing-usage-description',
   'illustrator-query-failed',
   'illustrator-query-timeout',
+  'illustrator-document-query-failed',
+  'illustrator-placed-items-query-failed',
+  'illustrator-placed-item-file-query-failed',
+  'illustrator-placed-item-path-query-failed',
   'no-documents',
 ]);
 
