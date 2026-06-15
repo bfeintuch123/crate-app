@@ -1032,7 +1032,7 @@ function buildLiveAppStatusBreadcrumb(appFamily, input = {}) {
   ]) {
     setLiveAppStatusBoolean(entry, key, input[key]);
   }
-  for (const key of ['docsCount', 'linksCount', 'normalizedCount', 'stagedCount']) {
+  for (const key of ['docsCount', 'linksCount', 'placedItemsCount', 'normalizedCount', 'stagedCount']) {
     if (input[key] !== undefined) entry[key] = sanitizeLiveAppStatusCount(input[key]);
   }
   const skipReasonCounts = sanitizeLiveAppStatusCounts(input.skipReasonCounts);
@@ -4748,6 +4748,67 @@ const PS_DOJAVASCRIPT = `(function() {
   return paths.join('\\n');
 })();`;
 
+const AI_PLACED_ITEM_FALLBACK_JAVASCRIPT = `(function() {
+  var rows = [];
+  function clean(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/[\\r\\n\\t]/g, ' ').replace(/\\s+/g, ' ').trim();
+  }
+  function filePath(fileRef) {
+    try {
+      if (!fileRef) return '';
+      if (fileRef.fsName) return clean(fileRef.fsName);
+      if (fileRef.absoluteURI) return clean(fileRef.absoluteURI);
+      return clean(fileRef);
+    } catch (e) {
+      return '';
+    }
+  }
+  function pushStatus(code) {
+    rows.push(['STATUS', code].join('\\t'));
+  }
+  function pushLink(docName, linkedPath, modified, current) {
+    if (!linkedPath) return;
+    rows.push(['LINK', '', clean(docName), linkedPath, modified ? 'true' : 'false', current ? 'true' : 'false'].join('\\t'));
+  }
+  try {
+    var activeDoc = null;
+    try { activeDoc = app.activeDocument; } catch (e) {}
+    for (var d = 0; d < app.documents.length; d++) {
+      var doc = app.documents[d];
+      var docName = '';
+      var docModified = false;
+      var docCurrent = false;
+      try { docName = clean(doc.name); } catch (e) {}
+      try { docModified = !!doc.modified; } catch (e) {}
+      try { docCurrent = activeDoc && doc === activeDoc; } catch (e) {}
+      try {
+        var placedItems = doc.placedItems;
+        for (var i = 0; i < placedItems.length; i++) {
+          try {
+            var placedFile = placedItems[i].file;
+            var linkedPath = filePath(placedFile);
+            if (linkedPath) {
+              pushLink(docName, linkedPath, docModified, docCurrent);
+            } else {
+              pushStatus('illustrator-placed-item-file-query-failed');
+            }
+          } catch (e) {
+            pushStatus('illustrator-placed-item-file-query-failed');
+          }
+        }
+      } catch (e) {
+        pushStatus('illustrator-placed-items-query-failed');
+      }
+    }
+  } catch (e) {
+    pushStatus('illustrator-placed-items-query-failed');
+  }
+  return rows.join('\\n');
+})();`;
+
+const AI_PLACED_ITEM_FALLBACK_APPLESCRIPT_LITERAL = JSON.stringify(AI_PLACED_ITEM_FALLBACK_JAVASCRIPT);
+
 const AI_ACTIVE_SESSION_APPLESCRIPT = `on crateLiveEvidencePath(candidateValue)
   try
     if candidateValue is missing value then return ""
@@ -4778,9 +4839,21 @@ const AI_ACTIVE_SESSION_APPLESCRIPT = `on crateLiveEvidencePath(candidateValue)
   return ""
 end crateLiveEvidencePath
 
+on crateIllustratorPlacedItemFallbackRows()
+  try
+    tell application "Adobe Illustrator"
+      return do javascript ${AI_PLACED_ITEM_FALLBACK_APPLESCRIPT_LITERAL}
+    end tell
+  on error
+    return ""
+  end try
+end crateIllustratorPlacedItemFallbackRows
+
 tell application "Adobe Illustrator"
   try
     set outputLines to {}
+    set placedItemCount to 0
+    set placedItemFileFailures to 0
     try
       set documentCount to count of documents
     on error errMsg number errNum
@@ -4823,10 +4896,12 @@ tell application "Adobe Illustrator"
             set end of outputLines to "DOC" & tab & docPath & tab & docName & tab & docModified & tab & docCurrent
             try
               repeat with pItem in every placed item of aDoc
+                set placedItemCount to placedItemCount + 1
                 set linkedPath to ""
                 try
                   set linkedPath to my crateLiveEvidencePath(file of pItem)
                 on error
+                  set placedItemFileFailures to placedItemFileFailures + 1
                   set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
                 end try
                 if linkedPath is not "" then
@@ -4843,6 +4918,21 @@ tell application "Adobe Illustrator"
       on error
         set end of outputLines to "ERROR" & tab & "illustrator-document-query-failed"
       end try
+      set end of outputLines to "PLACED" & tab & placedItemCount
+      if placedItemFileFailures > 0 then
+        set fallbackRows to my crateIllustratorPlacedItemFallbackRows()
+        if fallbackRows is not "" then
+          set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-fallback-used"
+          set AppleScript's text item delimiters to linefeed
+          set fallbackLines to text items of fallbackRows
+          repeat with fallbackLine in fallbackLines
+            set fallbackText to fallbackLine as text
+            if fallbackText is not "" then set end of outputLines to fallbackText
+          end repeat
+        else
+          set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-fallback-failed"
+        end if
+      end if
     end if
     set AppleScript's text item delimiters to linefeed
     return outputLines as text
@@ -4875,6 +4965,8 @@ const SAFE_LIVE_APP_STATUS_CODES = new Set([
   'illustrator-document-query-failed',
   'illustrator-placed-items-query-failed',
   'illustrator-placed-item-file-query-failed',
+  'illustrator-placed-item-file-fallback-used',
+  'illustrator-placed-item-file-fallback-failed',
   'illustrator-placed-item-path-query-failed',
   'no-documents',
 ]);
@@ -4962,6 +5054,7 @@ function parseIllustratorActiveSessionOutput(output) {
   const diagnostics = {
     docRowsSeen: 0,
     linkRowsSeen: 0,
+    placedItemsCount: 0,
     normalizedPaths: 0,
     pathSkipped: {},
   };
@@ -4976,6 +5069,10 @@ function parseIllustratorActiveSessionOutput(output) {
     }
     if (kind === 'ERROR' && parts.length >= 2) {
       errors.push(normalizeLiveAppStatusCode(parts[1], 'illustrator-query-failed'));
+      continue;
+    }
+    if (kind === 'PLACED' && parts.length >= 2) {
+      diagnostics.placedItemsCount = sanitizeLiveAppStatusCount(parts[1]);
       continue;
     }
     if (kind === 'DOC' && parts.length >= 3) {
@@ -5415,6 +5512,7 @@ async function pollPsForProject(projectId) {
           scriptSuccess,
           docsCount: activeState.documents.length,
           linksCount: activeState.links.length,
+          placedItemsCount: activeState.diagnostics && activeState.diagnostics.placedItemsCount,
           normalizedCount: activeState.diagnostics && activeState.diagnostics.normalizedPaths,
           stagedCount: 0,
           skipReasonCounts: mergeLiveAppStatusCounts(
