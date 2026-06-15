@@ -272,6 +272,20 @@ function isIllustratorPsCommandCheck({ kind, command, args }) {
     args.includes('command=');
 }
 
+function countTextOccurrences(text, needle) {
+  return String(text || '').split(needle).length - 1;
+}
+
+function assertIllustratorPlacedItemPathFallbackGuarded(scriptText) {
+  assert.equal(scriptText.includes('on crateLiveEvidencePlacedItemPath(pItem)'), true);
+  assert.equal(scriptText.includes('set pathResult to my crateLiveEvidencePlacedItemPath(pItem)'), true);
+  assert.equal(scriptText.includes('set linkedPath to my crateLiveEvidencePath(file of pItem)'), true);
+  assert.equal(scriptText.includes('set linkedPath to my crateLiveEvidencePath(file path of pItem)'), true);
+  assert.equal(scriptText.includes('set pathQueryFailed to "true"'), true);
+  assert.equal(scriptText.includes('illustrator-placed-item-path-fallback-used'), true);
+  assert.equal(countTextOccurrences(scriptText, 'file path of pItem'), 1);
+}
+
 function assertPrivateTempScriptPath(scriptPath) {
   const scriptDir = path.dirname(scriptPath);
   assert.equal(path.resolve(path.dirname(scriptDir)), path.resolve(os.tmpdir()));
@@ -3023,7 +3037,7 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       assert.equal(scriptText.includes('file path of aDoc'), true);
       assert.equal(scriptText.includes('aDoc is current document'), true);
       assert.equal(scriptText.includes('file of pItem'), true);
-      assert.equal(scriptText.includes('file path of pItem'), false);
+      assertIllustratorPlacedItemPathFallbackGuarded(scriptText);
       assert.equal(scriptText.includes('full name of'), false);
       assert.equal(scriptText.includes('do javascript'), true);
       assert.equal(scriptText.includes('fsName'), true);
@@ -3150,7 +3164,7 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
       assert.equal(scriptText.includes('illustrator-placed-item-file-fallback-failed'), true);
       assert.equal(scriptText.includes('file path of current document'), true);
       assert.equal(scriptText.includes('file path of aDoc'), true);
-      assert.equal(scriptText.includes('file path of pItem'), false);
+      assertIllustratorPlacedItemPathFallbackGuarded(scriptText);
       assert.equal(scriptText.includes('full name of'), false);
       return {
         stdout: [
@@ -3198,6 +3212,86 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
   ], 'Illustrator partial status breadcrumbs');
 });
 
+test('Illustrator guarded placed item path fallback stages linked asset when file object query fails', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'path-fallback-illustrator.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa21-live-only-IMG_5331.JPG');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'jpg bytes');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      const scriptText = fs.readFileSync(args[0], 'utf8');
+      assertIllustratorPlacedItemPathFallbackGuarded(scriptText);
+      assert.equal(scriptText.includes('do javascript'), true);
+      assert.equal(scriptText.includes('fsName'), true);
+      assert.equal(scriptText.includes('fullName'), false);
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tpath-fallback-illustrator.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          'STATUS\tillustrator-placed-item-file-query-failed',
+          'STATUS\tillustrator-placed-item-path-fallback-used',
+          `LINK\t${sourcePath}\tpath-fallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator placed path fallback');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+
+  assert.ok(linkedCandidate);
+  assert.equal(linkedCandidate.source, 'ai-linked');
+  assert.equal(linkedCandidate.captureState, 'needs-save');
+  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
+  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'path-fallback-illustrator.ai');
+  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
+
+  const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 1 &&
+    entry.linksCount === 1 &&
+    entry.placedItemsCount === 1 &&
+    entry.errorCategory === 'illustrator-placed-item-file-query-failed' &&
+    entry.statusReasonCounts &&
+    entry.statusReasonCounts['illustrator-placed-item-file-query-failed'] === 1 &&
+    entry.statusReasonCounts['illustrator-placed-item-path-fallback-used'] === 1
+  )));
+  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    sourcePath,
+    linkedPath,
+    'DOC\t',
+    'LINK\t',
+    'file path of pItem',
+    'SHOULD_NOT_APPEAR',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator path fallback status breadcrumbs');
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    sourcePath,
+    linkedPath,
+    'DOC\t',
+    'LINK\t',
+    'file path of pItem',
+    'SHOULD_NOT_APPEAR',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator path fallback live evidence ledger');
+});
+
 test('Illustrator placed item file fallback stages live linked asset when AppleScript file query fails', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'fallback-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa20-live-only-IMG_5331.JPG');
@@ -3210,7 +3304,7 @@ test('Illustrator placed item file fallback stages live linked asset when AppleS
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(scriptText.includes('file of pItem'), true);
-      assert.equal(scriptText.includes('file path of pItem'), false);
+      assertIllustratorPlacedItemPathFallbackGuarded(scriptText);
       assert.equal(scriptText.includes('do javascript'), true);
       assert.equal(scriptText.includes('fsName'), true);
       assert.equal(scriptText.includes('fullName'), false);

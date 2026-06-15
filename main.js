@@ -973,6 +973,9 @@ const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
   'illustrator-document-query-failed',
   'illustrator-placed-items-query-failed',
   'illustrator-placed-item-file-query-failed',
+  'illustrator-placed-item-file-fallback-used',
+  'illustrator-placed-item-file-fallback-failed',
+  'illustrator-placed-item-path-fallback-used',
   'illustrator-placed-item-path-query-failed',
 ]);
 
@@ -1000,6 +1003,16 @@ function sanitizeLiveAppStatusCounts(counts) {
     sanitized[reason] = sanitizeLiveAppStatusCount(rawCount);
   }
   return sanitized;
+}
+
+function countLiveAppStatusReasons(reasons) {
+  const counts = {};
+  for (const reason of Array.isArray(reasons) ? reasons : []) {
+    const normalized = normalizeLiveAppStatusCode(reason, '');
+    if (!normalized) continue;
+    counts[normalized] = (counts[normalized] || 0) + 1;
+  }
+  return counts;
 }
 
 function mergeLiveAppStatusCounts(...countSets) {
@@ -1037,6 +1050,8 @@ function buildLiveAppStatusBreadcrumb(appFamily, input = {}) {
   }
   const skipReasonCounts = sanitizeLiveAppStatusCounts(input.skipReasonCounts);
   if (Object.keys(skipReasonCounts).length > 0) entry.skipReasonCounts = skipReasonCounts;
+  const statusReasonCounts = sanitizeLiveAppStatusCounts(input.statusReasonCounts);
+  if (Object.keys(statusReasonCounts).length > 0) entry.statusReasonCounts = statusReasonCounts;
   const errorCategory = normalizeLiveAppStatusErrorCategory(input.errorCategory, null);
   if (errorCategory) entry.errorCategory = errorCategory;
   return entry;
@@ -4849,6 +4864,27 @@ on crateIllustratorPlacedItemFallbackRows()
   end try
 end crateIllustratorPlacedItemFallbackRows
 
+on crateLiveEvidencePlacedItemPath(pItem)
+  set linkedPath to ""
+  set usedPathFallback to "false"
+  set fileQueryFailed to "false"
+  set pathQueryFailed to "false"
+  try
+    set linkedPath to my crateLiveEvidencePath(file of pItem)
+  on error
+    set fileQueryFailed to "true"
+  end try
+  if linkedPath is "" then
+    try
+      set linkedPath to my crateLiveEvidencePath(file path of pItem)
+      if linkedPath is not "" then set usedPathFallback to "true"
+    on error
+      set pathQueryFailed to "true"
+    end try
+  end if
+  return linkedPath & tab & usedPathFallback & tab & fileQueryFailed & tab & pathQueryFailed
+end crateLiveEvidencePlacedItemPath
+
 tell application "Adobe Illustrator"
   try
     set outputLines to {}
@@ -4898,14 +4934,30 @@ tell application "Adobe Illustrator"
               repeat with pItem in every placed item of aDoc
                 set placedItemCount to placedItemCount + 1
                 set linkedPath to ""
+                set usedPathFallback to "false"
+                set fileQueryFailed to "false"
+                set pathQueryFailed to "false"
                 try
-                  set linkedPath to my crateLiveEvidencePath(file of pItem)
+                  set pathResult to my crateLiveEvidencePlacedItemPath(pItem)
+                  set AppleScript's text item delimiters to tab
+                  set pathResultItems to text items of pathResult
+                  if (count of pathResultItems) >= 1 then set linkedPath to item 1 of pathResultItems
+                  if (count of pathResultItems) >= 2 then set usedPathFallback to item 2 of pathResultItems
+                  if (count of pathResultItems) >= 3 then set fileQueryFailed to item 3 of pathResultItems
+                  if (count of pathResultItems) >= 4 then set pathQueryFailed to item 4 of pathResultItems
                 on error
                   set placedItemFileFailures to placedItemFileFailures + 1
                   set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
                 end try
+                if fileQueryFailed is "true" then
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
+                end if
+                if pathQueryFailed is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-query-failed"
+                if usedPathFallback is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-fallback-used"
                 if linkedPath is not "" then
                   set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
+                else if fileQueryFailed is "true" or pathQueryFailed is "true" then
+                  set placedItemFileFailures to placedItemFileFailures + 1
                 end if
               end repeat
             on error
@@ -4967,6 +5019,7 @@ const SAFE_LIVE_APP_STATUS_CODES = new Set([
   'illustrator-placed-item-file-query-failed',
   'illustrator-placed-item-file-fallback-used',
   'illustrator-placed-item-file-fallback-failed',
+  'illustrator-placed-item-path-fallback-used',
   'illustrator-placed-item-path-query-failed',
   'no-documents',
 ]);
@@ -5519,6 +5572,7 @@ async function pollPsForProject(projectId) {
             activeState.diagnostics && activeState.diagnostics.pathSkipped,
             illustratorDiagnostics.skipped
           ),
+          statusReasonCounts: countLiveAppStatusReasons(safeStatusReasons),
           errorCategory: scriptErrorCategory || (scriptSuccess ? 'script-success' : 'unknown-script-error'),
         });
         logLiveAppDiagnostic(
