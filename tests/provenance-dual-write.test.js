@@ -294,6 +294,12 @@ function assertIllustratorPlacedItemPathFallbackGuarded(scriptText) {
   assert.notEqual(helperStart, -1);
   assert.notEqual(helperEnd, -1);
   const helperText = scriptText.slice(helperStart, helperEnd);
+  const helperTellStart = helperText.indexOf('tell application "Adobe Illustrator"');
+  const helperTellEnd = helperText.indexOf('end tell', helperTellStart);
+  assert.notEqual(helperTellStart, -1);
+  assert.notEqual(helperTellEnd, -1);
+  assert.ok(helperTellStart < helperText.indexOf('file of pItem'));
+  assert.ok(helperTellEnd > helperText.lastIndexOf('file path of pItem'));
   assert.equal(
     countTextOccurrences(scriptText, 'file path of pItem'),
     countTextOccurrences(helperText, 'file path of pItem')
