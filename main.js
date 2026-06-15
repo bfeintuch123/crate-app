@@ -973,9 +973,15 @@ const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
   'illustrator-document-query-failed',
   'illustrator-placed-items-query-failed',
   'illustrator-placed-item-file-query-failed',
+  'illustrator-placed-item-file-of-query-failed',
+  'illustrator-placed-item-file-path-object-query-failed',
+  'illustrator-placed-item-file-path-text-query-failed',
+  'illustrator-placed-item-file-path-alias-query-failed',
   'illustrator-placed-item-file-fallback-used',
   'illustrator-placed-item-file-fallback-failed',
   'illustrator-placed-item-path-fallback-used',
+  'illustrator-placed-item-file-path-text-fallback-used',
+  'illustrator-placed-item-file-path-alias-fallback-used',
   'illustrator-placed-item-path-query-failed',
 ]);
 
@@ -4867,8 +4873,12 @@ end crateIllustratorPlacedItemFallbackRows
 on crateLiveEvidencePlacedItemPath(pItem)
   set linkedPath to ""
   set usedPathFallback to "false"
+  set usedPathTextFallback to "false"
+  set usedPathAliasFallback to "false"
   set fileQueryFailed to "false"
   set pathQueryFailed to "false"
+  set pathTextQueryFailed to "false"
+  set pathAliasQueryFailed to "false"
   try
     set linkedPath to my crateLiveEvidencePath(file of pItem)
   on error
@@ -4882,7 +4892,23 @@ on crateLiveEvidencePlacedItemPath(pItem)
       set pathQueryFailed to "true"
     end try
   end if
-  return linkedPath & tab & usedPathFallback & tab & fileQueryFailed & tab & pathQueryFailed
+  if linkedPath is "" then
+    try
+      set linkedPath to my crateLiveEvidencePath((file path of pItem) as text)
+      if linkedPath is not "" then set usedPathTextFallback to "true"
+    on error
+      set pathTextQueryFailed to "true"
+    end try
+  end if
+  if linkedPath is "" then
+    try
+      set linkedPath to POSIX path of ((file path of pItem) as alias)
+      if linkedPath is not "" then set usedPathAliasFallback to "true"
+    on error
+      set pathAliasQueryFailed to "true"
+    end try
+  end if
+  return linkedPath & tab & usedPathFallback & tab & usedPathTextFallback & tab & usedPathAliasFallback & tab & fileQueryFailed & tab & pathQueryFailed & tab & pathTextQueryFailed & tab & pathAliasQueryFailed
 end crateLiveEvidencePlacedItemPath
 
 tell application "Adobe Illustrator"
@@ -4935,28 +4961,50 @@ tell application "Adobe Illustrator"
                 set placedItemCount to placedItemCount + 1
                 set linkedPath to ""
                 set usedPathFallback to "false"
+                set usedPathTextFallback to "false"
+                set usedPathAliasFallback to "false"
                 set fileQueryFailed to "false"
                 set pathQueryFailed to "false"
+                set pathTextQueryFailed to "false"
+                set pathAliasQueryFailed to "false"
                 try
                   set pathResult to my crateLiveEvidencePlacedItemPath(pItem)
                   set AppleScript's text item delimiters to tab
                   set pathResultItems to text items of pathResult
                   if (count of pathResultItems) >= 1 then set linkedPath to item 1 of pathResultItems
                   if (count of pathResultItems) >= 2 then set usedPathFallback to item 2 of pathResultItems
-                  if (count of pathResultItems) >= 3 then set fileQueryFailed to item 3 of pathResultItems
-                  if (count of pathResultItems) >= 4 then set pathQueryFailed to item 4 of pathResultItems
+                  if (count of pathResultItems) >= 3 then set usedPathTextFallback to item 3 of pathResultItems
+                  if (count of pathResultItems) >= 4 then set usedPathAliasFallback to item 4 of pathResultItems
+                  if (count of pathResultItems) >= 5 then set fileQueryFailed to item 5 of pathResultItems
+                  if (count of pathResultItems) >= 6 then set pathQueryFailed to item 6 of pathResultItems
+                  if (count of pathResultItems) >= 7 then set pathTextQueryFailed to item 7 of pathResultItems
+                  if (count of pathResultItems) >= 8 then set pathAliasQueryFailed to item 8 of pathResultItems
                 on error
                   set placedItemFileFailures to placedItemFileFailures + 1
                   set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
                 end try
                 if fileQueryFailed is "true" then
                   set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-query-failed"
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-of-query-failed"
                 end if
-                if pathQueryFailed is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-query-failed"
+                if pathQueryFailed is "true" then
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-query-failed"
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-path-object-query-failed"
+                end if
+                if pathTextQueryFailed is "true" then
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-query-failed"
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-path-text-query-failed"
+                end if
+                if pathAliasQueryFailed is "true" then
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-query-failed"
+                  set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-path-alias-query-failed"
+                end if
                 if usedPathFallback is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-path-fallback-used"
+                if usedPathTextFallback is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-path-text-fallback-used"
+                if usedPathAliasFallback is "true" then set end of outputLines to "STATUS" & tab & "illustrator-placed-item-file-path-alias-fallback-used"
                 if linkedPath is not "" then
                   set end of outputLines to "LINK" & tab & docPath & tab & docName & tab & linkedPath & tab & docModified & tab & docCurrent
-                else if fileQueryFailed is "true" or pathQueryFailed is "true" then
+                else if fileQueryFailed is "true" or pathQueryFailed is "true" or pathTextQueryFailed is "true" or pathAliasQueryFailed is "true" then
                   set placedItemFileFailures to placedItemFileFailures + 1
                 end if
               end repeat
@@ -5017,9 +5065,15 @@ const SAFE_LIVE_APP_STATUS_CODES = new Set([
   'illustrator-document-query-failed',
   'illustrator-placed-items-query-failed',
   'illustrator-placed-item-file-query-failed',
+  'illustrator-placed-item-file-of-query-failed',
+  'illustrator-placed-item-file-path-object-query-failed',
+  'illustrator-placed-item-file-path-text-query-failed',
+  'illustrator-placed-item-file-path-alias-query-failed',
   'illustrator-placed-item-file-fallback-used',
   'illustrator-placed-item-file-fallback-failed',
   'illustrator-placed-item-path-fallback-used',
+  'illustrator-placed-item-file-path-text-fallback-used',
+  'illustrator-placed-item-file-path-alias-fallback-used',
   'illustrator-placed-item-path-query-failed',
   'no-documents',
 ]);
