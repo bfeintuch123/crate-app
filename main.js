@@ -4879,35 +4879,37 @@ on crateLiveEvidencePlacedItemPath(pItem)
   set pathQueryFailed to "false"
   set pathTextQueryFailed to "false"
   set pathAliasQueryFailed to "false"
-  try
-    set linkedPath to my crateLiveEvidencePath(file of pItem)
-  on error
-    set fileQueryFailed to "true"
-  end try
-  if linkedPath is "" then
+  tell application "Adobe Illustrator"
     try
-      set linkedPath to my crateLiveEvidencePath(file path of pItem)
-      if linkedPath is not "" then set usedPathFallback to "true"
+      set linkedPath to my crateLiveEvidencePath(file of pItem)
     on error
-      set pathQueryFailed to "true"
+      set fileQueryFailed to "true"
     end try
-  end if
-  if linkedPath is "" then
-    try
-      set linkedPath to my crateLiveEvidencePath((file path of pItem) as text)
-      if linkedPath is not "" then set usedPathTextFallback to "true"
-    on error
-      set pathTextQueryFailed to "true"
-    end try
-  end if
-  if linkedPath is "" then
-    try
-      set linkedPath to POSIX path of ((file path of pItem) as alias)
-      if linkedPath is not "" then set usedPathAliasFallback to "true"
-    on error
-      set pathAliasQueryFailed to "true"
-    end try
-  end if
+    if linkedPath is "" then
+      try
+        set linkedPath to my crateLiveEvidencePath(file path of pItem)
+        if linkedPath is not "" then set usedPathFallback to "true"
+      on error
+        set pathQueryFailed to "true"
+      end try
+    end if
+    if linkedPath is "" then
+      try
+        set linkedPath to my crateLiveEvidencePath((file path of pItem) as text)
+        if linkedPath is not "" then set usedPathTextFallback to "true"
+      on error
+        set pathTextQueryFailed to "true"
+      end try
+    end if
+    if linkedPath is "" then
+      try
+        set linkedPath to POSIX path of ((file path of pItem) as alias)
+        if linkedPath is not "" then set usedPathAliasFallback to "true"
+      on error
+        set pathAliasQueryFailed to "true"
+      end try
+    end if
+  end tell
   return linkedPath & tab & usedPathFallback & tab & usedPathTextFallback & tab & usedPathAliasFallback & tab & fileQueryFailed & tab & pathQueryFailed & tab & pathTextQueryFailed & tab & pathAliasQueryFailed
 end crateLiveEvidencePlacedItemPath
 
