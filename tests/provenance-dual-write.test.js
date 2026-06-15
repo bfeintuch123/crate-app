@@ -3025,10 +3025,17 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       assert.equal(scriptText.includes('file of pItem'), true);
       assert.equal(scriptText.includes('file path of pItem'), false);
       assert.equal(scriptText.includes('full name of'), false);
+      assert.equal(scriptText.includes('do javascript'), true);
+      assert.equal(scriptText.includes('fsName'), true);
+      assert.equal(scriptText.includes('fullName'), false);
       assert.equal(scriptText.includes('candidateText contains ":"'), true);
       assert.equal(scriptText.includes('linked of pItem'), false);
       return {
-        stdout: `DOC\t${sourcePath}\tlive-illustrator.ai\ttrue\nLINK\t${sourcePath}\tlive-illustrator.ai\t${linkedPath}\ttrue\n`,
+        stdout: [
+          `DOC\t${sourcePath}\tlive-illustrator.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          `LINK\t${sourcePath}\tlive-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
       };
     }
     return { stdout: '' };
@@ -3108,6 +3115,7 @@ test('Illustrator live app evidence stages open source and linked asset as needs
     entry.scriptSuccess === true &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
+    entry.placedItemsCount === 1 &&
     entry.normalizedCount >= 2
   )));
   assert.ok(statusEntries.some(entry => entry.stagedCount === 2));
@@ -3138,6 +3146,8 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
       assert.equal(scriptText.includes('illustrator-document-query-failed'), true);
       assert.equal(scriptText.includes('illustrator-placed-items-query-failed'), true);
       assert.equal(scriptText.includes('illustrator-placed-item-file-query-failed'), true);
+      assert.equal(scriptText.includes('illustrator-placed-item-file-fallback-used'), true);
+      assert.equal(scriptText.includes('illustrator-placed-item-file-fallback-failed'), true);
       assert.equal(scriptText.includes('file path of current document'), true);
       assert.equal(scriptText.includes('file path of aDoc'), true);
       assert.equal(scriptText.includes('file path of pItem'), false);
@@ -3145,6 +3155,7 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
       return {
         stdout: [
           `DOC\t${sourcePath}\tlive-illustrator-partial.ai\ttrue\ttrue`,
+          'PLACED\t2',
           'STATUS\tillustrator-placed-item-file-query-failed',
           `LINK\t${sourcePath}\tlive-illustrator-partial.ai\t${linkedPath}\ttrue\ttrue`,
         ].join('\n') + '\n',
@@ -3172,6 +3183,7 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
     entry.scriptSuccess === true &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
+    entry.placedItemsCount === 2 &&
     entry.errorCategory === 'illustrator-placed-item-file-query-failed'
   )));
   assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
@@ -3184,6 +3196,85 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
     'stderr',
     'raw',
   ], 'Illustrator partial status breadcrumbs');
+});
+
+test('Illustrator placed item file fallback stages live linked asset when AppleScript file query fails', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'fallback-illustrator.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa20-live-only-IMG_5331.JPG');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'jpg bytes');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      const scriptText = fs.readFileSync(args[0], 'utf8');
+      assert.equal(scriptText.includes('file of pItem'), true);
+      assert.equal(scriptText.includes('file path of pItem'), false);
+      assert.equal(scriptText.includes('do javascript'), true);
+      assert.equal(scriptText.includes('fsName'), true);
+      assert.equal(scriptText.includes('fullName'), false);
+      assert.equal(scriptText.includes('illustrator-placed-item-file-query-failed'), true);
+      assert.equal(scriptText.includes('illustrator-placed-item-file-fallback-used'), true);
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tfallback-illustrator.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          'STATUS\tillustrator-placed-item-file-query-failed',
+          'STATUS\tillustrator-placed-item-file-fallback-used',
+          `LINK\t\tfallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator placed file fallback');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+
+  assert.ok(linkedCandidate);
+  assert.equal(linkedCandidate.source, 'ai-linked');
+  assert.equal(linkedCandidate.captureState, 'needs-save');
+  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
+  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
+  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'fallback-illustrator.ai');
+  assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
+
+  const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 1 &&
+    entry.linksCount === 1 &&
+    entry.placedItemsCount === 1 &&
+    entry.errorCategory === 'illustrator-placed-item-file-query-failed'
+  )));
+  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+
+  assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
+    sourcePath,
+    linkedPath,
+    'DOC\t',
+    'LINK\t',
+    'file path of pItem',
+    'SHOULD_NOT_APPEAR',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator fallback status breadcrumbs');
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+    sourcePath,
+    linkedPath,
+    'DOC\t',
+    'LINK\t',
+    'file path of pItem',
+    'SHOULD_NOT_APPEAR',
+    'stdout',
+    'stderr',
+    'raw',
+  ], 'Illustrator fallback live evidence ledger');
 });
 
 test('live app breadcrumbs persist zero-file poll and app-not-running status safely', async () => {
