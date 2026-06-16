@@ -51,6 +51,15 @@ Use ChatGPT app for:
 ## Playbooks
 Reusable Crate workflow playbooks live in `.codex/playbooks/`.
 
+Use `.codex/ROUTER.md` and the `crate-router` skill when Bryant gives a short Crate request and expects Codex to choose the correct playbooks, loop mode, checks, and stop gates.
+
+Supporting workflow references:
+- `WORKSPACE.md` maps crate-app, crate-web, and mission-control boundaries.
+- `.codex/state/current-workstream.md` records the compact active Crate state and next prompt.
+- `.codex/playbooks/_shared-gates.md` contains common repo, mutation, release, dependency, privacy, review, and final-report gates.
+- `.codex/checks/crate-check-suites.md` defines named docs, focused QA, provenance, Figma, package-parser, and release-gate check suites.
+- `docs/crate/qa-smokes/` stores reusable Jenna-machine smoke prompt templates.
+
 Use:
 - `review-crate-pr.md` for merge-readiness review of a Crate PR.
 - `figma-regression-audit.md` for Figma scope, page lock, package, and multi-app regression checks.
@@ -81,6 +90,7 @@ Use:
 - `crate-codex-qa-assistant.md` for durable Codex QA assistant workflows that split crate-web browser QA from crate-app desktop Computer Use QA, produce proof artifacts, and route fixes through Bryant-approved draft PRs or follow-up prompts.
 - `crate-cmux-workbench.md` for optional cmux-style organization of multiple Codex CLI sessions while preserving Codex CLI, Computer Use, scoped app-lane QA, and Bryant approval boundaries.
 - `crate-handoff.md` for restartable Codex App session handoffs and fresh-agent Crate prompts with portable anchors, privacy filters, exact next prompts, and explicit stop conditions.
+- `_shared-gates.md` for common gates that other Crate playbooks and router-selected workflows should apply.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Crate Router"
+  short_description: "Route Crate work to the right playbook"
+  default_prompt: "Use $crate-router to choose the correct Crate playbook, loop mode, checks, and stop gates for this request."
