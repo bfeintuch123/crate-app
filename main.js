@@ -986,7 +986,7 @@ const SAFE_LIVE_APP_STATUS_ERROR_CATEGORIES = new Set([
 ]);
 
 function normalizeLiveAppStatusErrorCategory(value, fallback = null) {
-  const normalized = normalizeLiveCaptureReason(value, '');
+  const normalized = normalizeLiveAppStatusCode(value, '');
   if (!normalized) return fallback;
   if (normalized === 'automation-not-authorized') return 'automation-permission-denied';
   if (normalized === 'illustrator-query-timeout') return 'script-timeout';
@@ -5064,9 +5064,17 @@ end tell`;
 }
 
 const SAFE_LIVE_APP_STATUS_CODES = new Set([
+  'app-not-running',
+  'project-not-watching',
+  'script-not-attempted',
+  'script-success',
+  'script-timeout',
   'automation-permission-denied',
   'automation-not-authorized',
   'missing-usage-description',
+  'empty-output',
+  'parse-empty',
+  'unknown-script-error',
   'illustrator-query-failed',
   'illustrator-query-timeout',
   'illustrator-document-query-failed',
