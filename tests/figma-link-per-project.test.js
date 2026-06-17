@@ -327,6 +327,26 @@ function setFigmaDownloadResponse(body = 'figma asset bytes') {
   });
 }
 
+function setDelayedFigmaDownloadResponse(body = 'figma asset bytes', delayMs = 50) {
+  let startedResolve;
+  const started = new Promise(resolve => { startedResolve = resolve; });
+  fetchHandler = async () => {
+    if (startedResolve) {
+      startedResolve();
+      startedResolve = null;
+    }
+    return new Promise(resolve => {
+      originalSetTimeout(() => resolve({
+        ok: true,
+        status: 200,
+        buffer: async () => Buffer.from(body),
+        json: async () => ({}),
+      }), delayMs);
+    });
+  };
+  return started;
+}
+
 function modeOf(filePath) {
   return fs.statSync(filePath).mode & 0o777;
 }
@@ -748,6 +768,94 @@ test('explicit Current Page Only packages only locked-page Figma assets', async 
     const packagedFolder = packageFolder(outputDir, 'Figma Explicit Current');
     assert.equal(fs.readFileSync(path.join(packagedFolder, 'in-scope.png'), 'utf8'), 'in scope asset');
     assert.equal(fs.existsSync(path.join(packagedFolder, 'out-of-scope.png')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('parser-shaped Figma assets retain fileKey for Current Page Only packaging', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-parser-key-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Parser FileKey Package');
+    setFigmaDownloadResponse('parser file key asset');
+    nextFigmaScanResult = figmaScanResult([{
+      url: 'https://cdn.figma.example/parser-key.png?token=SHOULD_NOT_APPEAR_TOKEN',
+      nodeId: 'node-parser-key',
+      imageRef: 'img-parser-key',
+      name: 'Parser Key Asset',
+      format: 'png',
+      fileKey: 'FIG22',
+      figmaFileName: 'Brand Cloud',
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    }], [{
+      fileKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      warning: null,
+    }]);
+
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+    const scanned = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should enter the ledger');
+    assert.equal(scanned.files[0].figmaFileKey, 'FIG22');
+    assert.equal(scanned.files[0].figmaAssetKey, 'FIG22:img-parser-key');
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const packagedFolder = packageFolder(outputDir, 'Figma Parser FileKey Package');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'Brand_Cloud_Parser_Key_Asset.png'), 'utf8'), 'parser file key asset');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package waits for in-flight Figma scan downloads before selecting package files', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-package-wait-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Package Waits For Scan');
+    const downloadStarted = setDelayedFigmaDownloadResponse('delayed figma asset', 60);
+    nextFigmaScanResult = figmaScanResult([{
+      url: 'https://cdn.figma.example/delayed.png?token=SHOULD_NOT_APPEAR_TOKEN',
+      nodeId: 'node-delayed',
+      imageRef: 'img-delayed',
+      name: 'Delayed Asset',
+      format: 'png',
+      figmaFileKey: 'FIG22',
+      figmaFileName: 'Brand Cloud',
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    }], [{
+      fileKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      warning: null,
+    }]);
+
+    const scanPromise = callIpc('figma:scan-project', project.id);
+    await downloadStarted;
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.totalFiles, 1);
+    assert.deepEqual(result.errors, []);
+
+    const scan = await scanPromise;
+    assert.equal(scan.success, true);
+    const packagedFolder = packageFolder(outputDir, 'Figma Package Waits For Scan');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'Brand_Cloud_Delayed_Asset.png'), 'utf8'), 'delayed figma asset');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

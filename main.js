@@ -3782,6 +3782,7 @@ const figmaInProgress = new Set(); // projectIds currently mid-poll
 const figmaManualScanInFlight = new Set(); // projectIds currently running a manual Scan Now
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
+const PACKAGE_SCAN_WAIT_TIMEOUT_MS = 30000;
 // Keep a narrow overlap between incremental polls so a just-added image ref can't
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
 const FIGMA_INCREMENTAL_OVERLAP_MS = FIGMA_POLL_INTERVAL_MS * 2; // 2 minutes
@@ -4402,8 +4403,12 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
   let addedCount = 0;
 
   for (const asset of assets) {
+    const figmaFileKey = typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
+      ? asset.figmaFileKey.trim()
+      : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null);
     const figmaAssetKey = getFigmaAssetDedupKey({
-      figmaFileKey: asset.figmaFileKey,
+      figmaFileKey,
+      fileKey: asset.fileKey,
       figmaAssetKey: asset.imageRef || asset.nodeId || asset.url,
       imageRef: asset.imageRef,
       nodeId: asset.nodeId,
@@ -4411,7 +4416,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     });
     if (figmaAssetKey && existingFigmaAssetKeys.has(figmaAssetKey)) {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(figmaFileKey)} ` +
         `assetKeyPresent=true reason=existing_asset_key`
       );
       continue;
@@ -4423,7 +4428,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
 
     if (!localPath) {
       console.log(
-        `[crate][figma] asset skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `[crate][figma] asset skip (${contextLabel}): fileKey=${formatFigmaLogScalar(figmaFileKey)} ` +
         `name=${formatFigmaLogScalar(asset.name)} reason=download_failed`
       );
       continue;
@@ -4431,7 +4436,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     const normalizedLocalPath = normalizeTrackedFilePath(localPath);
     if (existingPaths.has(normalizedLocalPath)) {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(figmaFileKey)} ` +
         `localName=${formatFigmaLocalNameForLog(localPath)} reason=existing_path`
       );
       continue;
@@ -4450,7 +4455,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         ext: `.${assetFormat}`,
         addedAt: Date.now(),
         source: 'figma-auto',
-        figmaFileKey: asset.figmaFileKey,
+        figmaFileKey,
         figmaFileName: asset.figmaFileName,
         figmaPageId: asset.figmaPageId || null,
         figmaPageName: asset.figmaPageName || null,
@@ -4463,7 +4468,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       });
       if (!staged.changed || staged.decision !== LIVE_CAPTURE_DECISIONS.DIRECT_ADD) return null;
       console.log(
-        `[crate][figma] asset inserted (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `[crate][figma] asset inserted (${contextLabel}): fileKey=${formatFigmaLogScalar(figmaFileKey)} ` +
         `name=${formatFigmaLocalNameForLog(fileRecord.name)} localName=${formatFigmaLocalNameForLog(localPath)}`
       );
       return { files: proj.files, fileRecord };
@@ -4489,7 +4494,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
       if (figmaAssetKey) existingFigmaAssetKeys.add(figmaAssetKey);
     } else {
       console.log(
-        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(asset.figmaFileKey)} ` +
+        `[crate][figma] asset duplicate skip (${contextLabel}): fileKey=${formatFigmaLogScalar(figmaFileKey)} ` +
         `assetKeyPresent=${!!figmaAssetKey} localName=${formatFigmaLocalNameForLog(localPath)} reason=already_in_project`
       );
     }
@@ -8880,6 +8885,19 @@ function findEmbeddedPsdLinkedFile(file, linkedFiles) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function hasInFlightPackageInputScan(projectId) {
+  return scanInFlight.has(projectId) ||
+    figmaInProgress.has(projectId) ||
+    figmaManualScanInFlight.has(projectId);
+}
+
+async function waitForPackageInputScans(projectId, timeoutMs = PACKAGE_SCAN_WAIT_TIMEOUT_MS) {
+  const scanWaitStart = Date.now();
+  while (hasInFlightPackageInputScan(projectId) && Date.now() - scanWaitStart < timeoutMs) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
 async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
   const parentPsd = file.parentPsd || file.path;
   if (!parentPsd || !packageSourceExists(parentPsd)) {
@@ -8908,13 +8926,10 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   packageInFlight = true;
 
   try {
-  // FIX 2 (C2): Wait for in-flight pre-scan to complete before packaging
-  if (scanInFlight.has(id)) {
-    const scanWaitStart = Date.now();
-    while (scanInFlight.has(id) && Date.now() - scanWaitStart < 10000) {
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-  }
+  // Wait for in-flight pre-package and Figma scans to finish before selecting
+  // package files. Large Figma pages can still be downloading when the user
+  // clicks Package, and selecting too early yields a zero-file package.
+  await waitForPackageInputScans(id);
 
   checkAndResetUsage();
   const usage = store.get('usage');
