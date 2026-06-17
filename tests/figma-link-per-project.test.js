@@ -564,6 +564,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
 
 test('projects:set-figma-link starts a scan for a watching project with a connected token', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
+  const modernFileKey = 'FIG_22-Test';
   storedFigmaToken = 'test-token';
   setFigmaDownloadResponse('linked current page asset');
   nextFigmaScanResult = figmaScanResult([{
@@ -572,12 +573,12 @@ test('projects:set-figma-link starts a scan for a watching project with a connec
     imageRef: 'img-current-page',
     name: 'Current Page Asset',
     format: 'png',
-    figmaFileKey: 'FIG22',
+    figmaFileKey: modernFileKey,
     figmaFileName: 'Brand Cloud',
     figmaPageId: '1:1',
     figmaPageName: 'Page One',
   }], [{
-    fileKey: 'FIG22',
+    fileKey: modernFileKey,
     fileName: 'Brand Cloud',
     scopeMode: 'current-page',
     lockStatus: 'locked',
@@ -585,6 +586,7 @@ test('projects:set-figma-link starts a scan for a watching project with a connec
     lockedPageName: 'Page One',
     warning: null,
   }]);
+  nextFigmaScanResult.files[0].key = modernFileKey;
 
   const project = await callIpc(
     'projects:create',
@@ -596,20 +598,21 @@ test('projects:set-figma-link starts a scan for a watching project with a connec
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 
   const result = await callIpc('projects:set-figma-link', project.id, {
-    url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1',
+    url: 'https://www.figma.com/design/FIG_22-Test/Brand-Cloud#node-id=2-1',
     scopeMode: 'current-page'
   });
   assert.equal(result.success, true);
 
   const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should be staged after adding a link while watching');
-  assert.deepEqual(lastFigmaScanOptions.fileKeys, ['FIG22']);
+  assert.deepEqual(lastFigmaScanOptions.fileKeys, [modernFileKey]);
   assert.equal(lastFigmaScanOptions.scopeEntries.length, 1);
-  assert.equal(lastFigmaScanOptions.scopeEntries[0].requestedPageId, '1:1');
+  assert.equal(lastFigmaScanOptions.scopeEntries[0].requestedPageId, null);
+  assert.equal(lastFigmaScanOptions.scopeEntries[0].requestedNodeId, '2:1');
   assert.equal(lastFigmaScanOptions.scopeEntries[0].scopeMode, 'current-page');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Page One');
   assert.equal(fresh.files[0].source, 'figma-auto');
-  assert.equal(fresh.files[0].figmaFileKey, 'FIG22');
+  assert.equal(fresh.files[0].figmaFileKey, modernFileKey);
   assert.equal(fresh.files[0].figmaPageId, '1:1');
   assert.equal(fs.readFileSync(fresh.files[0].path, 'utf8'), 'linked current page asset');
   assert.equal(JSON.stringify(fresh).includes('SHOULD_NOT_APPEAR_TOKEN'), false);
