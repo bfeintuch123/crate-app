@@ -179,6 +179,24 @@ test('renderer Figma scope helper preserves explicit scope choices', () => {
   }), 'Current Page Only - Page One');
 });
 
+test('renderer Figma scope helper does not call pending or unresolved locks locked', () => {
+  const renderer = loadRendererHelpers();
+
+  assert.equal(renderer.getProjectFigmaScopeLabel({
+    figmaScopeMode: 'current-page',
+    figmaSession: {
+      trackedFiles: [{ lockStatus: 'pending', requestedNodeId: '1:2' }],
+    },
+  }), 'Current Page Only (resolving page lock)');
+  assert.equal(renderer.getProjectFigmaScopeLabel({
+    figmaScopeMode: 'current-page',
+    figmaSession: {
+      trackedFiles: [{ lockStatus: 'unresolved', warning: 'Current Page Only could not be locked.' }],
+      warnings: ['Current Page Only could not be locked.'],
+    },
+  }), 'Current Page Only (page lock unresolved)');
+});
+
 test('Package Details shows the no-issue state without issue messages', () => {
   const { document, elements } = createPackageDetailsDom();
   const renderer = loadRendererHelpers(document);
