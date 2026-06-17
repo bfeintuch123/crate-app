@@ -650,9 +650,12 @@ class FigmaParser extends BaseParser {
 
     // Match Figma URL patterns
     const patterns = [
-      /figma\.com\/file\/([a-zA-Z0-9]+)/,
-      /figma\.com\/design\/([a-zA-Z0-9]+)/,
-      /figma\.com\/proto\/([a-zA-Z0-9]+)/
+      /(?:https?:\/\/)?(?:www\.)?figma\.com\/file\/([a-zA-Z0-9_-]+)/i,
+      /(?:https?:\/\/)?(?:www\.)?figma\.com\/design\/([a-zA-Z0-9_-]+)/i,
+      /(?:https?:\/\/)?(?:www\.)?figma\.com\/proto\/([a-zA-Z0-9_-]+)/i,
+      /^figma:\/\/file\/([a-zA-Z0-9_-]+)/i,
+      /^figma:\/\/design\/([a-zA-Z0-9_-]+)/i,
+      /^figma:\/\/proto\/([a-zA-Z0-9_-]+)/i
     ];
 
     for (const pattern of patterns) {
@@ -700,18 +703,44 @@ class FigmaParser extends BaseParser {
       return result;
     }
 
+    const readParam = (params, names) => {
+      for (const name of names) {
+        const value = params.get(name);
+        if (value) return value;
+      }
+      return null;
+    };
+
+    const mergeParams = (params) => {
+      if (!result.requestedPageId) {
+        result.requestedPageId = FigmaParser.normalizeNodeId(readParam(params, ['page-id', 'pageId']));
+      }
+      if (!result.requestedNodeId) {
+        result.requestedNodeId = FigmaParser.normalizeNodeId(readParam(params, ['node-id', 'nodeId']));
+      }
+    };
+
     try {
       const parsed = new URL(url);
-      result.requestedPageId = FigmaParser.normalizeNodeId(parsed.searchParams.get('page-id'));
-      result.requestedNodeId = FigmaParser.normalizeNodeId(parsed.searchParams.get('node-id'));
-      return result;
+      mergeParams(parsed.searchParams);
+      if (parsed.hash) {
+        const hashText = parsed.hash.replace(/^#/, '').replace(/^\?/, '');
+        mergeParams(new URLSearchParams(hashText));
+        const hashQueryIndex = hashText.indexOf('?');
+        if (hashQueryIndex >= 0) {
+          mergeParams(new URLSearchParams(hashText.slice(hashQueryIndex + 1)));
+        }
+      }
+      if (result.requestedPageId || result.requestedNodeId) return result;
     } catch (e) {
-      const pageMatch = url.match(/[?&]page-id=([^&#]+)/i);
-      const nodeMatch = url.match(/[?&]node-id=([^&#]+)/i);
-      result.requestedPageId = FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
-      result.requestedNodeId = FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
-      return result;
+      // Fall through to regex extraction for malformed or desktop-style links.
     }
+
+    const pageMatch = url.match(/[?&#](?:page-id|pageId)=([^&#]+)/i);
+    const nodeMatch = url.match(/[?&#](?:node-id|nodeId)=([^&#]+)/i);
+    result.requestedPageId = result.requestedPageId || FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
+    result.requestedNodeId = result.requestedNodeId || FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
+    return result;
   }
 
   _resolveScopeRoot(document, scopeEntry = null) {

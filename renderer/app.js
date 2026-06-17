@@ -28,7 +28,7 @@ let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 
 // Lightweight Figma URL validator — must match the patterns the main process accepts.
-const FIGMA_URL_PATTERN = /figma\.com\/(file|design|proto)\/([a-zA-Z0-9]+)/;
+const FIGMA_URL_PATTERN = /(?:(?:https?:\/\/)?(?:www\.)?figma\.com\/(?:file|design|proto)\/|figma:\/\/(?:file|design|proto)\/)([a-zA-Z0-9_-]+)/i;
 function isValidFigmaUrl(url) {
   return typeof url === 'string' && FIGMA_URL_PATTERN.test(url.trim());
 }
@@ -1487,8 +1487,12 @@ function updateFigmaScanStatus(data) {
     return;
   }
 
+  const warning = data.warning || '';
   const errors = data.errors || [];
-  if (errors.length > 0) {
+  if (warning) {
+    el.style.color = '#f59e0b';
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${warning}`;
+  } else if (errors.length > 0) {
     el.style.color = '#f59e0b';
     el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}`;
   } else {

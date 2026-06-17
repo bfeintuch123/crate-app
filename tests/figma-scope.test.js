@@ -9,8 +9,10 @@ async function captureConsole(fn) {
   const messages = [];
   const originalLog = console.log;
   const originalWarn = console.warn;
+  const originalError = console.error;
   console.log = (...args) => messages.push(args.map(String).join(' '));
   console.warn = (...args) => messages.push(args.map(String).join(' '));
+  console.error = (...args) => messages.push(args.map(String).join(' '));
   try {
     return {
       result: await fn(),
@@ -19,6 +21,7 @@ async function captureConsole(fn) {
   } finally {
     console.log = originalLog;
     console.warn = originalWarn;
+    console.error = originalError;
   }
 }
 
@@ -110,6 +113,90 @@ class SensitiveUrlFigmaParser extends StubFigmaParser {
     return super._fetchAPI(endpoint);
   }
 }
+
+const MODERN_FILE_KEY = 'Petra_logo-File_123';
+
+class MetadataFailureFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async verifyToken() {
+    return { valid: true, user: { id: '1', handle: 'tester', email: 'tester@example.com' } };
+  }
+
+  async _fetchAPI(endpoint) {
+    if (
+      endpoint === `/files/${MODERN_FILE_KEY}/metadata` ||
+      endpoint === `/files/${MODERN_FILE_KEY}?depth=1`
+    ) {
+      throw new Error('metadata unavailable for https://figma.example/SHOULD_NOT_APPEAR');
+    }
+
+    if (endpoint === `/files/${MODERN_FILE_KEY}`) {
+      return { document: DOCUMENT_FIXTURE };
+    }
+
+    if (endpoint === `/files/${MODERN_FILE_KEY}/images`) {
+      return {
+        images: {
+          'img-ref-page-one': 'https://cdn.example.com/page-one.png',
+          'img-ref-page-two': 'https://cdn.example.com/page-two.png'
+        }
+      };
+    }
+
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+test('Figma URL parsing preserves modern keys and page or node scope params', () => {
+  const designUrl = 'https://www.figma.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1&t=abc';
+  const hashUrl = 'https://www.figma.com/file/HashKey_456/Petra#node-id=2-1';
+  const desktopUrl = 'figma://design/Desktop-Key_789/Petra?pageId=1-1';
+
+  assert.equal(FigmaParser.extractFileKey(designUrl), 'Petra_logo-File_123');
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(designUrl), {
+    fileKey: 'Petra_logo-File_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(hashUrl), {
+    fileKey: 'HashKey_456',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(desktopUrl), {
+    fileKey: 'Desktop-Key_789',
+    requestedPageId: '1:1',
+    requestedNodeId: null,
+  });
+});
+
+test('metadata failure does not block direct tracked current-page extraction', async () => {
+  const parser = new MetadataFailureFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.autoTrackScan({
+    fileKeys: [MODERN_FILE_KEY],
+    scopeEntries: [{
+      key: MODERN_FILE_KEY,
+      scopeMode: 'current-page',
+      requestedNodeId: '2:1'
+    }]
+  }));
+
+  assert.equal(result.files.length, 1);
+  assert.equal(result.assets.length, 1);
+  assert.equal(result.assets[0].figmaPageId, '1:1');
+  assert.equal(result.scopeEntries.length, 1);
+  assert.equal(result.scopeEntries[0].lockStatus, 'locked');
+  assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
+  assert.ok(result.errors.some(error => String(error).includes('Metadata fetch failed for tracked file Petra_logo-File_123')));
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+  assert.equal(serialized.includes('https://figma.example'), false);
+});
 
 test('current-page node lock extracts only the locked page assets', async () => {
   const parser = new StubFigmaParser();

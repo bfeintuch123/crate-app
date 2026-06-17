@@ -179,6 +179,15 @@ test('renderer Figma scope helper preserves explicit scope choices', () => {
   }), 'Current Page Only - Page One');
 });
 
+test('renderer accepts modern Figma URL shapes that the main process parses', () => {
+  const renderer = loadRendererHelpers();
+
+  assert.equal(renderer.isValidFigmaUrl('https://www.figma.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), true);
+  assert.equal(renderer.isValidFigmaUrl('https://figma.com/file/HashKey_456/Petra#node-id=2-1'), true);
+  assert.equal(renderer.isValidFigmaUrl('figma://design/Desktop-Key_789/Petra?pageId=1-1'), true);
+  assert.equal(renderer.isValidFigmaUrl('https://example.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), false);
+});
+
 test('renderer Figma scope helper does not call pending or unresolved locks locked', () => {
   const renderer = loadRendererHelpers();
 
@@ -195,6 +204,25 @@ test('renderer Figma scope helper does not call pending or unresolved locks lock
       warnings: ['Current Page Only could not be locked.'],
     },
   }), 'Current Page Only (page lock unresolved)');
+});
+
+test('renderer Figma scan status shows page-lock warning before metadata fallback error', () => {
+  const elements = {
+    'figma-scan-status': createElementStub(),
+  };
+  const renderer = loadRendererHelpers(createDocumentStub(elements));
+
+  renderer.updateFigmaScanStatus({
+    filesFound: 1,
+    assetsFound: 0,
+    errors: ['Metadata fetch failed for tracked file [redacted]; proceeding to extraction anyway.'],
+    warning: 'Current Page Only could not be locked from the tracked Figma URL. No Figma assets will be captured for this file in this session.',
+    timestamp: Date.UTC(2026, 5, 17, 12, 0, 0),
+  });
+
+  assert.match(elements['figma-scan-status'].textContent, /1 files, 0 assets/);
+  assert.match(elements['figma-scan-status'].textContent, /Current Page Only could not be locked/);
+  assert.equal(elements['figma-scan-status'].textContent.includes('Metadata fetch failed'), false);
 });
 
 test('Package Details shows the no-issue state without issue messages', () => {
