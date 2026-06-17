@@ -418,6 +418,18 @@ function getProjectFigmaScopeLabel(project) {
   if (lockedPageNames.length > 1) {
     return `Current Page Only - ${lockedPageNames.length} locked pages`;
   }
+
+  const lockStatuses = new Set(
+    trackedFiles
+      .map(file => file && file.lockStatus)
+      .filter(Boolean)
+  );
+  if (lockStatuses.has('unresolved')) {
+    return 'Current Page Only (page lock unresolved)';
+  }
+  if (lockStatuses.has('pending')) {
+    return 'Current Page Only (resolving page lock)';
+  }
   return 'Current Page Only (locked at session start)';
 }
 

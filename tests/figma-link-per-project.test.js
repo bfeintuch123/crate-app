@@ -198,6 +198,7 @@ setStub('node-fetch', () => (...args) => fetchHandler(...args));
 const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
 let storedFigmaToken = null;
 let nextFigmaScanResult = null;
+let lastFigmaScanOptions = null;
 class TestFigmaParser extends RealFigmaParser {
   async getStoredToken() {
     return storedFigmaToken;
@@ -215,7 +216,8 @@ class TestFigmaParser extends RealFigmaParser {
     return hadToken;
   }
 
-  async autoTrackScan() {
+  async autoTrackScan(options = {}) {
+    lastFigmaScanOptions = JSON.parse(JSON.stringify(options));
     return JSON.parse(JSON.stringify(nextFigmaScanResult || {
       files: [],
       assets: [],
@@ -277,6 +279,7 @@ async function resetProjects() {
 async function cleanupProjectsAndTimers() {
   storedFigmaToken = null;
   nextFigmaScanResult = null;
+  lastFigmaScanOptions = null;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
   await callIpc('projects:delete-all');
@@ -559,6 +562,60 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
+test('projects:set-figma-link starts a scan for a watching project with a connected token', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
+  storedFigmaToken = 'test-token';
+  setFigmaDownloadResponse('linked current page asset');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/current-page.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-current-page',
+    imageRef: 'img-current-page',
+    name: 'Current Page Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const project = await callIpc(
+    'projects:create',
+    'Phase2-link-while-watching-scan',
+    'branding',
+    'current-page',
+    null
+  );
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+
+  const result = await callIpc('projects:set-figma-link', project.id, {
+    url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1',
+    scopeMode: 'current-page'
+  });
+  assert.equal(result.success, true);
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should be staged after adding a link while watching');
+  assert.deepEqual(lastFigmaScanOptions.fileKeys, ['FIG22']);
+  assert.equal(lastFigmaScanOptions.scopeEntries.length, 1);
+  assert.equal(lastFigmaScanOptions.scopeEntries[0].requestedPageId, '1:1');
+  assert.equal(lastFigmaScanOptions.scopeEntries[0].scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Page One');
+  assert.equal(fresh.files[0].source, 'figma-auto');
+  assert.equal(fresh.files[0].figmaFileKey, 'FIG22');
+  assert.equal(fresh.files[0].figmaPageId, '1:1');
+  assert.equal(fs.readFileSync(fresh.files[0].path, 'utf8'), 'linked current page asset');
+  assert.equal(JSON.stringify(fresh).includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+  await waitForActiveFigmaPollerCount(activePollersBefore + 1);
+});
+
 test('figma:connect starts polling for linked watching projects', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(
@@ -685,6 +742,8 @@ test('Current Page Only without a page-linked URL fails closed at package time',
     const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
     assert.equal(fresh.figmaSession.scopeMode, 'current-page');
     assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
+    assert.match(fresh.figmaSession.trackedFiles[0].warning, /could not be locked/i);
+    assert.match(fresh.figmaSession.warnings[0], /No Figma assets will be captured/i);
 
     const outputDir = path.join(tmpRoot, 'out');
     const result = await callIpc('projects:package', project.id, outputDir);
