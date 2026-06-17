@@ -1780,17 +1780,22 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
       let lockStatus = scopeMode === FIGMA_SCOPE_CURRENT_PAGE ? 'pending' : 'entire-file';
       let warning = null;
       let lockedPageId = null;
+      let statusReason = null;
 
       if (scopeMode === FIGMA_SCOPE_CURRENT_PAGE) {
         if (!trackedFile.url) {
           lockStatus = 'unresolved';
-          warning = `Current Page Only could not be locked for Figma file ${trackedFile.key} because this session does not have a page-linked URL snapshot. No Figma assets will be captured for this file in this session.`;
+          statusReason = 'figma-current-page-no-url-snapshot';
+          warning = 'Current Page Only could not be locked because this session does not have a page-linked Figma URL snapshot. No Figma assets will be captured for this file in this session.';
         } else if (!parsedScope.requestedPageId && !parsedScope.requestedNodeId) {
           lockStatus = 'unresolved';
-          warning = `Current Page Only could not be locked from the tracked Figma URL for file ${trackedFile.key}. No Figma assets will be captured for this file in this session.`;
+          statusReason = 'figma-current-page-no-page-or-node-param';
+          warning = 'Current Page Only could not find a page or node in the tracked Figma URL. No Figma assets will be captured for this file in this session.';
         } else if (parsedScope.requestedPageId) {
           lockStatus = 'locked';
           lockedPageId = parsedScope.requestedPageId;
+        } else if (parsedScope.requestedNodeId) {
+          statusReason = 'figma-current-page-node-param-parsed';
         }
       }
 
@@ -1803,6 +1808,7 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
         lockedPageId,
         lockedPageName: null,
         scopeMode,
+        statusReason,
         warning,
       };
     }),
@@ -1854,6 +1860,7 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       const nextLockStatus = typeof nextScope.lockStatus === 'string' ? nextScope.lockStatus : trackedFile.lockStatus;
       const nextLockedPageId = nextScope.lockedPageId != null ? nextScope.lockedPageId : trackedFile.lockedPageId;
       const nextLockedPageName = nextScope.lockedPageName != null ? nextScope.lockedPageName : trackedFile.lockedPageName;
+      const nextStatusReason = nextScope.statusReason != null ? nextScope.statusReason : trackedFile.statusReason;
       const nextWarning = nextScope.warning != null ? nextScope.warning : trackedFile.warning;
 
       if (trackedFile.lockStatus !== nextLockStatus) {
@@ -1866,6 +1873,10 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       }
       if (trackedFile.lockedPageName !== nextLockedPageName) {
         trackedFile.lockedPageName = nextLockedPageName;
+        changed = true;
+      }
+      if (trackedFile.statusReason !== nextStatusReason) {
+        trackedFile.statusReason = nextStatusReason;
         changed = true;
       }
       if (trackedFile.warning !== nextWarning) {
@@ -2125,6 +2136,7 @@ function summarizeTrackedFigmaFilesForLog(rawTrackedFiles) {
     hasUrl: !!(entry && typeof entry.url === 'string' && entry.url.trim()),
     hasRequestedScope: !!(entry && (entry.requestedPageId || entry.requestedNodeId)),
     hasLockedPage: !!(entry && entry.lockedPageId),
+    statusReason: formatFigmaLogScalar(entry && entry.statusReason, 'none'),
     hasWarning: !!(entry && entry.warning),
   }));
 }

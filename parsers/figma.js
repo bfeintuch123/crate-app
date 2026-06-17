@@ -118,6 +118,31 @@ function safeFigmaParserError(message) {
   return error;
 }
 
+const FIGMA_SCOPE_REASONS = Object.freeze({
+  NO_PAGE_OR_NODE: 'figma-current-page-no-page-or-node-param',
+  REQUESTED_PAGE_NOT_FOUND: 'figma-current-page-requested-page-not-found',
+  REQUESTED_NODE_NOT_FOUND: 'figma-current-page-requested-node-not-found',
+  FILE_FETCH_FAILED: 'figma-current-page-file-fetch-failed',
+  ZERO_IMAGE_REFS: 'figma-current-page-zero-image-refs'
+});
+
+function currentPageScopeWarning(statusReason) {
+  switch (statusReason) {
+    case FIGMA_SCOPE_REASONS.NO_PAGE_OR_NODE:
+      return 'Current Page Only could not find a page or node in the tracked Figma URL. No Figma assets will be captured for this file in this session.';
+    case FIGMA_SCOPE_REASONS.REQUESTED_PAGE_NOT_FOUND:
+      return 'Current Page Only could not find the requested page in the tracked Figma file. No Figma assets will be captured for this file in this session.';
+    case FIGMA_SCOPE_REASONS.REQUESTED_NODE_NOT_FOUND:
+      return 'Current Page Only could not find the requested node in the tracked Figma file. No Figma assets will be captured for this file in this session.';
+    case FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED:
+      return 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.';
+    case FIGMA_SCOPE_REASONS.ZERO_IMAGE_REFS:
+      return 'Current Page Only resolved the page, but Crate found no exportable image assets on that page.';
+    default:
+      return null;
+  }
+}
+
 class FigmaParser extends BaseParser {
   /**
    * Figma-specific dedupe.
@@ -623,7 +648,8 @@ class FigmaParser extends BaseParser {
   _figmaExtractionResult({ assets = [], errors = [], warnings = [], scope }) {
     const safeScope = scope ? {
       ...scope,
-      warning: scope.warning ? redactFigmaParserText(scope.warning) : scope.warning
+      warning: scope.warning ? redactFigmaParserText(scope.warning) : scope.warning,
+      statusReason: scope.statusReason ? formatFigmaParserScalar(scope.statusReason) : null
     } : scope;
 
     return {
@@ -658,12 +684,82 @@ class FigmaParser extends BaseParser {
       /^figma:\/\/proto\/([a-zA-Z0-9_-]+)/i
     ];
 
-    for (const pattern of patterns) {
-      const match = url.match(pattern);
-      if (match) return match[1];
+    for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
+      for (const pattern of patterns) {
+        const match = candidate.match(pattern);
+        if (match) return match[1];
+      }
     }
 
     return null;
+  }
+
+  static _figmaUrlCandidates(url) {
+    if (!url || typeof url !== 'string') return [];
+
+    const candidates = [];
+    const seen = new Set();
+    const queue = [url.trim()];
+    const pushCandidate = (value) => {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (!trimmed || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      candidates.push(trimmed);
+      queue.push(trimmed);
+    };
+
+    while (queue.length > 0 && candidates.length < 16) {
+      const current = queue.shift();
+      if (typeof current !== 'string' || !current.trim()) continue;
+      if (!seen.has(current)) {
+        seen.add(current);
+        candidates.push(current);
+      }
+
+      let decoded = current;
+      try {
+        decoded = decodeURIComponent(current);
+      } catch (e) {
+        decoded = current;
+      }
+      if (decoded && decoded !== current) {
+        pushCandidate(decoded);
+      }
+
+      try {
+        const parsed = new URL(current);
+        for (const name of ['url', 'href', 'link', 'u', 'redirect']) {
+          const value = parsed.searchParams.get(name);
+          if (value && /(?:figma\.com|^figma:\/\/)/i.test(value)) {
+            pushCandidate(value);
+          }
+        }
+
+        if (parsed.hash) {
+          const hashText = parsed.hash.replace(/^#/, '').replace(/^\?/, '');
+          if (hashText) {
+            pushCandidate(hashText);
+            const hashParams = new URLSearchParams(hashText);
+            for (const name of ['url', 'href', 'link', 'u', 'redirect']) {
+              const value = hashParams.get(name);
+              if (value && /(?:figma\.com|^figma:\/\/)/i.test(value)) {
+                pushCandidate(value);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Keep regex extraction for malformed desktop handoff strings.
+      }
+
+      const embeddedMatches = String(decoded).match(/(?:https?:\/\/(?:www\.)?figma\.com|figma:\/\/)[^\s"'<>]+/gi) || [];
+      for (const embedded of embeddedMatches) {
+        pushCandidate(embedded);
+      }
+    }
+
+    return candidates;
   }
 
   /**
@@ -721,25 +817,30 @@ class FigmaParser extends BaseParser {
     };
 
     try {
-      const parsed = new URL(url);
-      mergeParams(parsed.searchParams);
-      if (parsed.hash) {
-        const hashText = parsed.hash.replace(/^#/, '').replace(/^\?/, '');
-        mergeParams(new URLSearchParams(hashText));
-        const hashQueryIndex = hashText.indexOf('?');
-        if (hashQueryIndex >= 0) {
-          mergeParams(new URLSearchParams(hashText.slice(hashQueryIndex + 1)));
+      for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
+        const parsed = new URL(candidate);
+        mergeParams(parsed.searchParams);
+        if (parsed.hash) {
+          const hashText = parsed.hash.replace(/^#/, '').replace(/^\?/, '');
+          mergeParams(new URLSearchParams(hashText));
+          const hashQueryIndex = hashText.indexOf('?');
+          if (hashQueryIndex >= 0) {
+            mergeParams(new URLSearchParams(hashText.slice(hashQueryIndex + 1)));
+          }
         }
+        if (result.requestedPageId || result.requestedNodeId) return result;
       }
-      if (result.requestedPageId || result.requestedNodeId) return result;
     } catch (e) {
       // Fall through to regex extraction for malformed or desktop-style links.
     }
 
-    const pageMatch = url.match(/[?&#](?:page-id|pageId)=([^&#]+)/i);
-    const nodeMatch = url.match(/[?&#](?:node-id|nodeId)=([^&#]+)/i);
-    result.requestedPageId = result.requestedPageId || FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
-    result.requestedNodeId = result.requestedNodeId || FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
+    for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
+      const pageMatch = candidate.match(/[?&#](?:page-id|pageId)=([^&#]+)/i);
+      const nodeMatch = candidate.match(/[?&#](?:node-id|nodeId)=([^&#]+)/i);
+      result.requestedPageId = result.requestedPageId || FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
+      result.requestedNodeId = result.requestedNodeId || FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
+      if (result.requestedPageId || result.requestedNodeId) break;
+    }
     return result;
   }
 
@@ -754,6 +855,7 @@ class FigmaParser extends BaseParser {
       lockedPageId: null,
       lockedPageName: null,
       warning: null,
+      statusReason: null,
       rootNode: document,
     };
 
@@ -766,7 +868,8 @@ class FigmaParser extends BaseParser {
     const existingWarning = scopeEntry && scopeEntry.warning;
 
     if (!requestedPageId && !requestedNodeId) {
-      scope.warning = existingWarning || 'Current Page Only could not be locked from the tracked Figma URL. No Figma assets will be captured for this file in this session.';
+      scope.statusReason = FIGMA_SCOPE_REASONS.NO_PAGE_OR_NODE;
+      scope.warning = existingWarning || currentPageScopeWarning(scope.statusReason);
       return scope;
     }
 
@@ -783,8 +886,10 @@ class FigmaParser extends BaseParser {
     }
 
     if (!pageNode) {
-      const lockRef = requestedPageId || requestedNodeId;
-      scope.warning = existingWarning || `Current Page Only is locked for this session, but Crate could not resolve the starting page (${lockRef}). No Figma assets will be captured for this file in this session.`;
+      scope.statusReason = requestedPageId && !requestedNodeId
+        ? FIGMA_SCOPE_REASONS.REQUESTED_PAGE_NOT_FOUND
+        : FIGMA_SCOPE_REASONS.REQUESTED_NODE_NOT_FOUND;
+      scope.warning = existingWarning || currentPageScopeWarning(scope.statusReason);
       return scope;
     }
 
@@ -1147,6 +1252,7 @@ class FigmaParser extends BaseParser {
           lockStatus: 'unresolved',
           lockedPageId: null,
           lockedPageName: null,
+          statusReason: scopeEntry && scopeEntry.scopeMode === 'current-page' ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
           warning: null
         }
       });
@@ -1175,6 +1281,7 @@ class FigmaParser extends BaseParser {
             lockStatus: scope.lockStatus,
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
+            statusReason: scope.statusReason,
             warning: scope.warning
           }
         });
@@ -1253,6 +1360,7 @@ class FigmaParser extends BaseParser {
             lockStatus: scope.lockStatus,
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
+            statusReason: scope.statusReason,
             warning: scope.warning
           }
         });
@@ -1263,6 +1371,11 @@ class FigmaParser extends BaseParser {
       const nodeNames = {};
       this._findImageNodes(scopedRoot, imageNodeIds, nodeNames);
       if (imageNodeIds.length === 0) {
+        if (scope.scopeMode === 'current-page') {
+          scope.statusReason = FIGMA_SCOPE_REASONS.ZERO_IMAGE_REFS;
+          scope.warning = scope.warning || currentPageScopeWarning(scope.statusReason);
+          warnings.push(redactFigmaParserText(scope.warning));
+        }
         return this._figmaExtractionResult({
           assets: [],
           errors,
@@ -1272,6 +1385,7 @@ class FigmaParser extends BaseParser {
             lockStatus: scope.lockStatus,
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
+            statusReason: scope.statusReason,
             warning: scope.warning
           }
         });
@@ -1324,21 +1438,25 @@ class FigmaParser extends BaseParser {
           lockStatus: scope.lockStatus,
           lockedPageId: scope.lockedPageId,
           lockedPageName: scope.lockedPageName,
+          statusReason: scope.statusReason,
           warning: scope.warning
         }
       });
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', redactFigmaParserText(e.message));
+      const isCurrentPage = scopeEntry && scopeEntry.scopeMode === 'current-page';
+      const warning = isCurrentPage ? currentPageScopeWarning(FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED) : null;
       return this._figmaExtractionResult({
         assets: [],
         errors: [redactFigmaParserText(e.message)],
-        warnings: [],
+        warnings: warning ? [warning] : [],
         scope: {
-          scopeMode: scopeEntry && scopeEntry.scopeMode === 'current-page' ? 'current-page' : 'entire-file',
+          scopeMode: isCurrentPage ? 'current-page' : 'entire-file',
           lockStatus: 'unresolved',
           lockedPageId: null,
           lockedPageName: null,
-          warning: null
+          statusReason: isCurrentPage ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
+          warning
         }
       });
     }
@@ -1417,6 +1535,7 @@ class FigmaParser extends BaseParser {
             lockStatus: extractResult.scope.lockStatus,
             lockedPageId: extractResult.scope.lockedPageId,
             lockedPageName: extractResult.scope.lockedPageName,
+            statusReason: extractResult.scope.statusReason || null,
             warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null
           });
         }
