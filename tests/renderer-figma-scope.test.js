@@ -185,6 +185,8 @@ test('renderer accepts modern Figma URL shapes that the main process parses', ()
   assert.equal(renderer.isValidFigmaUrl('https://www.figma.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), true);
   assert.equal(renderer.isValidFigmaUrl('https://figma.com/file/HashKey_456/Petra#node-id=2-1'), true);
   assert.equal(renderer.isValidFigmaUrl('figma://design/Desktop-Key_789/Petra?pageId=1-1'), true);
+  assert.equal(renderer.isValidFigmaUrl('figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26file-key%3DPetra_logo-File_123'), true);
+  assert.equal(renderer.isValidFigmaUrl('figma://open?file-id=Petra_logo-File_123&node-id=2-1'), true);
   assert.equal(renderer.isValidFigmaUrl('https://example.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), false);
 });
 

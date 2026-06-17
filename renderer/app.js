@@ -28,9 +28,24 @@ let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 
 // Lightweight Figma URL validator — must match the patterns the main process accepts.
-const FIGMA_URL_PATTERN = /(?:(?:https?:\/\/)?(?:www\.)?figma\.com\/(?:file|design|proto)\/|figma:\/\/(?:file|design|proto)\/)([a-zA-Z0-9_-]+)/i;
+const FIGMA_URL_PATTERN = /(?:(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design|proto)\/|figma:\/\/(?:file|design|proto)\/)([a-zA-Z0-9_-]+)/i;
+const FIGMA_OPEN_URL_PATTERN = /figma:\/\/open\?/i;
+const FIGMA_FILE_KEY_PARAM_PATTERN = /[?&#](?:file-key|fileKey|file_key|file-id|fileId|file_id)=([a-zA-Z0-9_-]+)/i;
 function isValidFigmaUrl(url) {
-  return typeof url === 'string' && FIGMA_URL_PATTERN.test(url.trim());
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  const candidates = [trimmed];
+  try {
+    const decoded = decodeURIComponent(trimmed);
+    if (decoded && decoded !== trimmed) candidates.push(decoded);
+  } catch (e) {
+    // Keep the raw URL for validation.
+  }
+  return candidates.some(candidate => (
+    FIGMA_URL_PATTERN.test(candidate) ||
+    (FIGMA_OPEN_URL_PATTERN.test(candidate) && FIGMA_FILE_KEY_PARAM_PATTERN.test(candidate))
+  ));
 }
 
 function sanitizeRendererLogText(value) {

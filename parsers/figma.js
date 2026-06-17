@@ -125,6 +125,7 @@ const FIGMA_SCOPE_REASONS = Object.freeze({
   FILE_FETCH_FAILED: 'figma-current-page-file-fetch-failed',
   ZERO_IMAGE_REFS: 'figma-current-page-zero-image-refs'
 });
+const FIGMA_FILE_KEY_PARAM_NAMES = ['file-key', 'fileKey', 'file_key', 'file-id', 'fileId', 'file_id'];
 
 function currentPageScopeWarning(statusReason) {
   switch (statusReason) {
@@ -674,24 +675,95 @@ class FigmaParser extends BaseParser {
   static extractFileKey(url) {
     if (!url || typeof url !== 'string') return null;
 
-    // Match Figma URL patterns
-    const patterns = [
-      /(?:https?:\/\/)?(?:www\.)?figma\.com\/file\/([a-zA-Z0-9_-]+)/i,
-      /(?:https?:\/\/)?(?:www\.)?figma\.com\/design\/([a-zA-Z0-9_-]+)/i,
-      /(?:https?:\/\/)?(?:www\.)?figma\.com\/proto\/([a-zA-Z0-9_-]+)/i,
-      /^figma:\/\/file\/([a-zA-Z0-9_-]+)/i,
-      /^figma:\/\/design\/([a-zA-Z0-9_-]+)/i,
+    const candidates = FigmaParser._figmaFileKeyCandidates(url);
+    return candidates.length > 0 ? candidates[0] : null;
+  }
+
+  static _normalizeFigmaFileKey(value) {
+    if (!value || typeof value !== 'string') return null;
+
+    let key = value.trim();
+    try {
+      key = decodeURIComponent(key);
+    } catch (e) {
+      // Keep the raw value when decoding fails.
+    }
+
+    key = key.trim();
+    return /^[a-zA-Z0-9_-]+$/.test(key) ? key : null;
+  }
+
+  static _figmaFileKeyCandidates(url) {
+    if (!url || typeof url !== 'string') return [];
+
+    const matches = [];
+    let order = 0;
+    const matchByKey = new Map();
+    const addMatch = (key, priority) => {
+      const normalized = FigmaParser._normalizeFigmaFileKey(key);
+      if (!normalized) return;
+      const existing = matchByKey.get(normalized);
+      if (existing) {
+        if (priority < existing.priority) existing.priority = priority;
+        return;
+      }
+      const match = { key: normalized, priority, order: order++ };
+      matchByKey.set(normalized, match);
+      matches.push(match);
+    };
+
+    const directRoutePatterns = [
+      /(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design)\/([a-zA-Z0-9_-]+)/i,
+      /^figma:\/\/(?:file|design)\/([a-zA-Z0-9_-]+)/i
+    ];
+    const protoRoutePatterns = [
+      /(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/proto\/([a-zA-Z0-9_-]+)/i,
       /^figma:\/\/proto\/([a-zA-Z0-9_-]+)/i
     ];
 
+    const readFileKeyParams = (params) => {
+      for (const name of FIGMA_FILE_KEY_PARAM_NAMES) {
+        addMatch(params.get(name), 1);
+      }
+    };
+
     for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
-      for (const pattern of patterns) {
+      for (const pattern of directRoutePatterns) {
         const match = candidate.match(pattern);
-        if (match) return match[1];
+        if (match) addMatch(match[1], 0);
+      }
+
+      try {
+        const parsed = new URL(candidate);
+        readFileKeyParams(parsed.searchParams);
+        if (parsed.hash) {
+          const hashText = parsed.hash.replace(/^#/, '').replace(/^\?/, '');
+          if (hashText) {
+            readFileKeyParams(new URLSearchParams(hashText));
+            const hashQueryIndex = hashText.indexOf('?');
+            if (hashQueryIndex >= 0) {
+              readFileKeyParams(new URLSearchParams(hashText.slice(hashQueryIndex + 1)));
+            }
+          }
+        }
+      } catch (e) {
+        // Regex fallback below handles malformed desktop handoff strings.
+      }
+
+      const fileKeyParamPattern = /[?&#](?:file-key|fileKey|file_key|file-id|fileId|file_id)=([^&#]+)/gi;
+      let paramMatch = null;
+      while ((paramMatch = fileKeyParamPattern.exec(candidate)) !== null) {
+        addMatch(paramMatch[1], 1);
+      }
+
+      for (const pattern of protoRoutePatterns) {
+        const match = candidate.match(pattern);
+        if (match) addMatch(match[1], 2);
       }
     }
 
-    return null;
+    matches.sort((a, b) => (a.priority - b.priority) || (a.order - b.order));
+    return matches.map(match => match.key);
   }
 
   static _figmaUrlCandidates(url) {
