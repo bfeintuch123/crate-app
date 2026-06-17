@@ -199,6 +199,10 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
   const desktopUrl = 'figma://design/Desktop-Key_789/Petra?pageId=1-1';
   const desktopHostUrl = 'figma://www.figma.com/design/DesktopHost-Key_123/Petra?page-id=1-1&node-id=2-1';
   const nestedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fdesign%2FNested-Key_123%2FPetra%3Fnode-id%3D2-1%26t%3Dabc';
+  const designWithConflictingParamUrl = 'https://www.figma.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1&file-key=Wrong-File_456';
+  const prototypeWithNestedDesignUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26redirect%3Dhttps%253A%252F%252Fwww.figma.com%252Fdesign%252FPetra_logo-File_123%252FPetra%253Fnode-id%253D2-1';
+  const prototypeWithFileKeyParamUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_456%2FPetra%3Fnode-id%3D2-1%26file-key%3DPetra_logo-File_123';
+  const openUrlWithFileIdParam = 'figma://open?file-id=Petra_logo-File_123&node-id=2-1';
 
   assert.equal(FigmaParser.extractFileKey(designUrl), 'Petra_logo-File_123');
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(designUrl), {
@@ -223,6 +227,26 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
   });
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(nestedUrl), {
     fileKey: 'Nested-Key_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(designWithConflictingParamUrl), {
+    fileKey: 'Petra_logo-File_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(prototypeWithNestedDesignUrl), {
+    fileKey: 'Petra_logo-File_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(prototypeWithFileKeyParamUrl), {
+    fileKey: 'Petra_logo-File_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(openUrlWithFileIdParam), {
+    fileKey: 'Petra_logo-File_123',
     requestedPageId: null,
     requestedNodeId: '2:1',
   });
@@ -272,6 +296,31 @@ test('metadata failure does not block nested desktop URL current-page extraction
   assert.equal(result.assets.length, 1);
   assert.equal(result.scopeEntries[0].lockStatus, 'locked');
   assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
+});
+
+test('metadata failure does not block prototype desktop URL with canonical file key extraction', async () => {
+  const parser = new MetadataFailureFigmaParser();
+  const trackedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26file-id%3DPetra_logo-File_123%26t%3Dabc';
+  const parsedScope = FigmaParser.parseScopeFromTrackedUrl(trackedUrl);
+
+  const { result, output } = await captureConsole(() => parser.autoTrackScan({
+    fileKeys: [parsedScope.fileKey],
+    scopeEntries: [{
+      key: parsedScope.fileKey,
+      scopeMode: 'current-page',
+      requestedNodeId: parsedScope.requestedNodeId
+    }]
+  }));
+
+  assert.equal(parsedScope.fileKey, MODERN_FILE_KEY);
+  assert.equal(parsedScope.requestedNodeId, '2:1');
+  assert.equal(result.assets.length, 1);
+  assert.equal(result.scopeEntries[0].lockStatus, 'locked');
+  assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('figma://open'), false);
+  assert.equal(serialized.includes('Prototype-Route_123'), false);
 });
 
 test('current-page node lock extracts only the locked page assets', async () => {
