@@ -150,10 +150,55 @@ class MetadataFailureFigmaParser extends FigmaParser {
   }
 }
 
+class FileFetchFailureFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}`) {
+      throw new Error('Figma file not found at https://figma.example/SHOULD_NOT_APPEAR');
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+class EmptyPageFigmaParser extends StubFigmaParser {
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}`) {
+      return {
+        document: {
+          id: '0:0',
+          type: 'DOCUMENT',
+          name: 'Empty Fixture',
+          children: [
+            {
+              id: '1:1',
+              type: 'CANVAS',
+              name: 'Page One',
+              children: [
+                {
+                  id: '2:1',
+                  type: 'RECTANGLE',
+                  name: 'Plain Shape',
+                  fills: [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }]
+                }
+              ]
+            }
+          ]
+        }
+      };
+    }
+    return super._fetchAPI(endpoint);
+  }
+}
+
 test('Figma URL parsing preserves modern keys and page or node scope params', () => {
   const designUrl = 'https://www.figma.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1&t=abc';
   const hashUrl = 'https://www.figma.com/file/HashKey_456/Petra#node-id=2-1';
   const desktopUrl = 'figma://design/Desktop-Key_789/Petra?pageId=1-1';
+  const desktopHostUrl = 'figma://www.figma.com/design/DesktopHost-Key_123/Petra?page-id=1-1&node-id=2-1';
+  const nestedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fdesign%2FNested-Key_123%2FPetra%3Fnode-id%3D2-1%26t%3Dabc';
 
   assert.equal(FigmaParser.extractFileKey(designUrl), 'Petra_logo-File_123');
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(designUrl), {
@@ -170,6 +215,16 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
     fileKey: 'Desktop-Key_789',
     requestedPageId: '1:1',
     requestedNodeId: null,
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(desktopHostUrl), {
+    fileKey: 'DesktopHost-Key_123',
+    requestedPageId: '1:1',
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(nestedUrl), {
+    fileKey: 'Nested-Key_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
   });
 });
 
@@ -196,6 +251,27 @@ test('metadata failure does not block direct tracked current-page extraction', a
   const serialized = `${JSON.stringify(result)}\n${output}`;
   assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
   assert.equal(serialized.includes('https://figma.example'), false);
+});
+
+test('metadata failure does not block nested desktop URL current-page extraction', async () => {
+  const parser = new MetadataFailureFigmaParser();
+  const trackedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fdesign%2FPetra_logo-File_123%2FPetra-Logo%3Fnode-id%3D2-1%26t%3Dabc';
+  const parsedScope = FigmaParser.parseScopeFromTrackedUrl(trackedUrl);
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [parsedScope.fileKey],
+    scopeEntries: [{
+      key: parsedScope.fileKey,
+      scopeMode: 'current-page',
+      requestedNodeId: parsedScope.requestedNodeId
+    }]
+  });
+
+  assert.equal(parsedScope.fileKey, MODERN_FILE_KEY);
+  assert.equal(parsedScope.requestedNodeId, '2:1');
+  assert.equal(result.assets.length, 1);
+  assert.equal(result.scopeEntries[0].lockStatus, 'locked');
+  assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
 });
 
 test('current-page node lock extracts only the locked page assets', async () => {
@@ -441,5 +517,87 @@ test('unresolved current-page lock never widens to entire-file', async () => {
   assert.equal(result.assets.length, 0);
   assert.equal(result.scopeEntries.length, 1);
   assert.equal(result.scopeEntries[0].lockStatus, 'unresolved');
-  assert.match(result.scopeEntries[0].warning || '', /could not resolve the starting page/i);
+  assert.equal(result.scopeEntries[0].statusReason, 'figma-current-page-requested-page-not-found');
+  assert.match(result.scopeEntries[0].warning || '', /could not find the requested page/i);
+  assert.equal((result.scopeEntries[0].warning || '').includes('9:9'), false);
+});
+
+test('current-page missing node id fails closed with a safe diagnostic', async () => {
+  const parser = new StubFigmaParser();
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [
+      {
+        key: FILE_KEY,
+        scopeMode: 'current-page',
+        requestedNodeId: '9:9'
+      }
+    ]
+  });
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries[0].lockStatus, 'unresolved');
+  assert.equal(result.scopeEntries[0].statusReason, 'figma-current-page-requested-node-not-found');
+  assert.match(result.scopeEntries[0].warning || '', /could not find the requested node/i);
+  assert.equal((result.scopeEntries[0].warning || '').includes('9:9'), false);
+});
+
+test('current-page without page or node id fails closed with a safe diagnostic', async () => {
+  const parser = new StubFigmaParser();
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [
+      {
+        key: FILE_KEY,
+        scopeMode: 'current-page'
+      }
+    ]
+  });
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries[0].lockStatus, 'unresolved');
+  assert.equal(result.scopeEntries[0].statusReason, 'figma-current-page-no-page-or-node-param');
+  assert.match(result.scopeEntries[0].warning || '', /could not find a page or node/i);
+});
+
+test('current-page file fetch failure surfaces a safe diagnostic before metadata errors', async () => {
+  const parser = new FileFetchFailureFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  }));
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.lockStatus, 'unresolved');
+  assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
+  assert.match(result.scope.warning || '', /could not read the tracked Figma file/i);
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+});
+
+test('current-page locked page with no exportable image refs reports zero image refs safely', async () => {
+  const parser = new EmptyPageFigmaParser();
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [
+      {
+        key: FILE_KEY,
+        scopeMode: 'current-page',
+        requestedNodeId: '2:1'
+      }
+    ]
+  });
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries[0].lockStatus, 'locked');
+  assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
+  assert.equal(result.scopeEntries[0].statusReason, 'figma-current-page-zero-image-refs');
+  assert.match(result.scopeEntries[0].warning || '', /found no exportable image assets/i);
 });

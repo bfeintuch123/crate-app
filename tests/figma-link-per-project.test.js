@@ -745,7 +745,8 @@ test('Current Page Only without a page-linked URL fails closed at package time',
     const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
     assert.equal(fresh.figmaSession.scopeMode, 'current-page');
     assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
-    assert.match(fresh.figmaSession.trackedFiles[0].warning, /could not be locked/i);
+    assert.equal(fresh.figmaSession.trackedFiles[0].statusReason, 'figma-current-page-no-page-or-node-param');
+    assert.match(fresh.figmaSession.trackedFiles[0].warning, /could not find a page or node/i);
     assert.match(fresh.figmaSession.warnings[0], /No Figma assets will be captured/i);
 
     const outputDir = path.join(tmpRoot, 'out');
