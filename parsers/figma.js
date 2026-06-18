@@ -124,6 +124,7 @@ const FIGMA_SCOPE_REASONS = Object.freeze({
   REQUESTED_PAGE_NOT_FOUND: 'figma-current-page-requested-page-not-found',
   REQUESTED_NODE_NOT_FOUND: 'figma-current-page-requested-node-not-found',
   FILE_FETCH_FAILED: 'figma-current-page-file-fetch-failed',
+  PROTOTYPE_FILE_FETCH_FAILED: 'figma-current-page-prototype-link-file-fetch-failed',
   ZERO_IMAGE_REFS: 'figma-current-page-zero-image-refs'
 });
 const FIGMA_CANONICAL_FILE_KEY_PARAM_NAMES = ['file-key', 'fileKey', 'file_key'];
@@ -159,6 +160,8 @@ function currentPageScopeWarning(statusReason) {
       return 'Current Page Only could not find the requested node in the tracked Figma file. No Figma assets will be captured for this file in this session.';
     case FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED:
       return 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.';
+    case FIGMA_SCOPE_REASONS.PROTOTYPE_FILE_FETCH_FAILED:
+      return 'Current Page Only could not read this Figma prototype link through the Figma API. Copy a design/file link from the Figma editor for this page, then relink the project.';
     case FIGMA_SCOPE_REASONS.ZERO_IMAGE_REFS:
       return 'Current Page Only resolved the page, but Crate found no exportable image assets on that page.';
     default:
@@ -186,6 +189,7 @@ function summarizeFigmaCandidateDiagnostics({
   const summary = {
     candidateCount: uniqueCandidateCount,
     candidateStrategyCounts: {},
+    candidateSourceCounts: {},
     parsedScopeCounts: {
       withPageOrNode: 0,
       withoutPageOrNode: 0
@@ -202,6 +206,7 @@ function summarizeFigmaCandidateDiagnostics({
 
   for (const entry of Array.isArray(scopeEntries) ? scopeEntries : []) {
     incrementCount(summary.candidateStrategyCounts, entry && entry.isCandidateFallback ? 'fallback' : 'primary');
+    incrementCount(summary.candidateSourceCounts, entry && entry.candidateSource ? entry.candidateSource : 'unknown');
     if (entry && (entry.requestedPageId || entry.requestedNodeId)) {
       summary.parsedScopeCounts.withPageOrNode += 1;
     } else {
@@ -774,20 +779,27 @@ class FigmaParser extends BaseParser {
   }
 
   static _figmaFileKeyCandidates(url) {
+    return FigmaParser._figmaFileKeyCandidateDetails(url).map(match => match.key);
+  }
+
+  static _figmaFileKeyCandidateDetails(url) {
     if (!url || typeof url !== 'string') return [];
 
     const matches = [];
     let order = 0;
     const matchByKey = new Map();
-    const addMatch = (key, priority) => {
+    const addMatch = (key, priority, source) => {
       const normalized = FigmaParser._normalizeFigmaFileKey(key);
       if (!normalized) return;
       const existing = matchByKey.get(normalized);
       if (existing) {
-        if (priority < existing.priority) existing.priority = priority;
+        if (priority < existing.priority) {
+          existing.priority = priority;
+          existing.source = source;
+        }
         return;
       }
-      const match = { key: normalized, priority, order: order++ };
+      const match = { key: normalized, priority, order: order++, source };
       matchByKey.set(normalized, match);
       matches.push(match);
     };
@@ -803,17 +815,17 @@ class FigmaParser extends BaseParser {
 
     const readFileKeyParams = (params) => {
       for (const name of FIGMA_CANONICAL_FILE_KEY_PARAM_NAMES) {
-        addMatch(params.get(name), 1);
+        addMatch(params.get(name), 1, 'canonical-param');
       }
       for (const name of FIGMA_AMBIGUOUS_FILE_ID_PARAM_NAMES) {
-        addMatch(params.get(name), 3);
+        addMatch(params.get(name), 3, 'ambiguous-file-id-param');
       }
     };
 
     for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
       for (const pattern of directRoutePatterns) {
         const match = candidate.match(pattern);
-        if (match) addMatch(match[1], 0);
+        if (match) addMatch(match[1], 0, 'direct-route');
       }
 
       try {
@@ -837,17 +849,18 @@ class FigmaParser extends BaseParser {
       let paramMatch = null;
       while ((paramMatch = fileKeyParamPattern.exec(candidate)) !== null) {
         const priority = FIGMA_AMBIGUOUS_FILE_ID_PARAM_NAMES.includes(paramMatch[1]) ? 3 : 1;
-        addMatch(paramMatch[2], priority);
+        const source = priority === 1 ? 'canonical-param' : 'ambiguous-file-id-param';
+        addMatch(paramMatch[2], priority, source);
       }
 
       for (const pattern of protoRoutePatterns) {
         const match = candidate.match(pattern);
-        if (match) addMatch(match[1], 2);
+        if (match) addMatch(match[1], 2, 'prototype-route');
       }
     }
 
     matches.sort((a, b) => (a.priority - b.priority) || (a.order - b.order));
-    return matches.map(match => match.key);
+    return matches;
   }
 
   static _figmaUrlCandidates(url) {
@@ -1621,7 +1634,10 @@ class FigmaParser extends BaseParser {
     } catch (e) {
       console.error('[crate][figma] extractAssetsFromFileKey error:', redactFigmaParserText(e.message));
       const isCurrentPage = scopeEntry && scopeEntry.scopeMode === 'current-page';
-      const warning = isCurrentPage ? currentPageScopeWarning(FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED) : null;
+      const statusReason = isCurrentPage && scopeEntry && scopeEntry.candidateSource === 'prototype-route'
+        ? FIGMA_SCOPE_REASONS.PROTOTYPE_FILE_FETCH_FAILED
+        : FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED;
+      const warning = isCurrentPage ? currentPageScopeWarning(statusReason) : null;
       return this._figmaExtractionResult({
         assets: [],
         errors: [redactFigmaParserText(e.message)],
@@ -1631,7 +1647,7 @@ class FigmaParser extends BaseParser {
           lockStatus: 'unresolved',
           lockedPageId: null,
           lockedPageName: null,
-          statusReason: isCurrentPage ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
+          statusReason: isCurrentPage ? statusReason : null,
           warning,
           fileFetchStatus: 'failed'
         }
@@ -1705,7 +1721,8 @@ class FigmaParser extends BaseParser {
     // Extract assets from each file
     for (const file of result.files) {
       try {
-        const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntriesByKey.get(file.key) || null);
+        const scopeEntry = scopeEntriesByKey.get(file.key) || null;
+        const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntry);
         if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...redactFigmaParserIssues(extractResult.errors)); }
         if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...redactFigmaParserIssues(extractResult.warnings)); }
         if (extractResult.scope) {
@@ -1713,11 +1730,13 @@ class FigmaParser extends BaseParser {
             fileFetchStatus: extractResult.scope.fileFetchStatus || 'unknown',
             lockStatus: extractResult.scope.lockStatus || 'unknown',
             statusReason: extractResult.scope.statusReason || null,
+            candidateSource: scopeEntry && scopeEntry.candidateSource,
             assetCount: Array.isArray(extractResult.assets) ? extractResult.assets.length : 0
           });
           result.scopeEntries.push({
             fileKey: file.key,
             fileName: file.name,
+            candidateSource: scopeEntry && scopeEntry.candidateSource,
             scopeMode: extractResult.scope.scopeMode,
             lockStatus: extractResult.scope.lockStatus,
             lockedPageId: extractResult.scope.lockedPageId,

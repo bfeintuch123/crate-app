@@ -276,6 +276,16 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
     'Prototype-Route_789',
     'Desktop-File_Id',
   ]);
+  assert.deepEqual(
+    FigmaParser._figmaFileKeyCandidateDetails(prototypeWithAmbiguousFileIdUrl).map(candidate => ({
+      key: candidate.key,
+      source: candidate.source
+    })),
+    [
+      { key: 'Prototype-Route_789', source: 'prototype-route' },
+      { key: 'Desktop-File_Id', source: 'ambiguous-file-id-param' },
+    ]
+  );
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(prototypeWithAmbiguousFileIdUrl), {
     fileKey: 'Prototype-Route_789',
     requestedPageId: null,
@@ -374,12 +384,14 @@ test('all current-page candidate failures surface privacy-safe diagnostics', asy
         key: 'Prototype-Route_123',
         scopeMode: 'current-page',
         requestedNodeId: '2:1',
+        candidateSource: 'prototype-route',
         isCandidateFallback: false
       },
       {
         key: MODERN_FILE_KEY,
         scopeMode: 'current-page',
         requestedNodeId: '2:1',
+        candidateSource: 'canonical-param',
         isCandidateFallback: true
       }
     ]
@@ -390,13 +402,19 @@ test('all current-page candidate failures surface privacy-safe diagnostics', asy
   assert.equal(result.candidateDiagnostics.candidateCount, 2);
   assert.equal(result.candidateDiagnostics.candidateStrategyCounts.primary, 1);
   assert.equal(result.candidateDiagnostics.candidateStrategyCounts.fallback, 1);
+  assert.equal(result.candidateDiagnostics.candidateSourceCounts['prototype-route'], 1);
+  assert.equal(result.candidateDiagnostics.candidateSourceCounts['canonical-param'], 1);
   assert.equal(result.candidateDiagnostics.parsedScopeCounts.withPageOrNode, 2);
   assert.equal(result.candidateDiagnostics.metadataStatusCounts.failed, 2);
   assert.equal(result.candidateDiagnostics.fileFetchStatusCounts.failed, 2);
   assert.equal(result.candidateDiagnostics.lockStatusCounts.unresolved, 2);
   assert.equal(
+    result.candidateDiagnostics.statusReasonCounts['figma-current-page-prototype-link-file-fetch-failed'],
+    1
+  );
+  assert.equal(
     result.candidateDiagnostics.statusReasonCounts['figma-current-page-file-fetch-failed'],
-    2
+    1
   );
   assert.equal(result.candidateDiagnostics.assetResultCounts.withoutAssets, 2);
 
@@ -709,6 +727,27 @@ test('current-page file fetch failure surfaces a safe diagnostic before metadata
   assert.equal(result.scope.lockStatus, 'unresolved');
   assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
   assert.match(result.scope.warning || '', /could not read the tracked Figma file/i);
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+});
+
+test('current-page prototype candidate file fetch failure asks for a design file link safely', async () => {
+  const parser = new FileFetchFailureFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1',
+    candidateSource: 'prototype-route'
+  }));
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.lockStatus, 'unresolved');
+  assert.equal(result.scope.statusReason, 'figma-current-page-prototype-link-file-fetch-failed');
+  assert.match(result.scope.warning || '', /prototype link/i);
+  assert.match(result.scope.warning || '', /design\/file link/i);
 
   const serialized = `${JSON.stringify(result)}\n${output}`;
   assert.equal(serialized.includes('https://figma.example'), false);
