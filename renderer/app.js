@@ -1504,16 +1504,44 @@ function updateFigmaScanStatus(data) {
 
   const warning = data.warning || '';
   const errors = data.errors || [];
+  const candidateSummary = formatFigmaCandidateDiagnostics(data.candidateDiagnostics);
+  const candidateSuffix = candidateSummary ? ` ${candidateSummary}` : '';
   if (warning) {
     el.style.color = '#f59e0b';
-    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${warning}`;
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${warning}${candidateSuffix}`;
   } else if (errors.length > 0) {
     el.style.color = '#f59e0b';
-    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}`;
+    el.textContent = `Last scan (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets — ${errors[0]}${candidateSuffix}`;
   } else {
     el.style.color = '#9ca3af';
-    el.textContent = `Scan completed (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new`;
+    el.textContent = `Scan completed (${time}): ${data.filesFound || 0} files, ${data.assetsFound || 0} assets, ${data.addedCount || 0} new${candidateSuffix}`;
   }
+}
+
+function countFrom(summary, group, key) {
+  const values = summary && summary[group];
+  const count = values && Number.isFinite(values[key]) ? values[key] : 0;
+  return count;
+}
+
+function formatFigmaCandidateDiagnostics(summary) {
+  if (!summary || typeof summary !== 'object') return '';
+  const candidateCount = Number.isFinite(summary.candidateCount) ? summary.candidateCount : 0;
+  if (candidateCount <= 0) return '';
+
+  const metadataFailed = countFrom(summary, 'metadataStatusCounts', 'failed');
+  const metadataSucceeded = countFrom(summary, 'metadataStatusCounts', 'success');
+  const fileFetchFailed = countFrom(summary, 'fileFetchStatusCounts', 'failed');
+  const fileFetchSucceeded = countFrom(summary, 'fileFetchStatusCounts', 'success');
+  const withPageOrNode = summary.parsedScopeCounts && Number.isFinite(summary.parsedScopeCounts.withPageOrNode)
+    ? summary.parsedScopeCounts.withPageOrNode
+    : 0;
+
+  const parts = [`Figma candidate check: ${candidateCount} candidate${candidateCount === 1 ? '' : 's'}`];
+  parts.push(`page/node parsed ${withPageOrNode}`);
+  parts.push(`metadata ok ${metadataSucceeded}/failed ${metadataFailed}`);
+  parts.push(`file ok ${fileFetchSucceeded}/failed ${fileFetchFailed}`);
+  return `(${parts.join('; ')})`;
 }
 
 // ===== Toast =====

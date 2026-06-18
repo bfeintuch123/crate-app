@@ -227,6 +227,41 @@ test('renderer Figma scan status shows page-lock warning before metadata fallbac
   assert.equal(elements['figma-scan-status'].textContent.includes('Metadata fetch failed'), false);
 });
 
+test('renderer Figma scan status shows privacy-safe candidate diagnostics', () => {
+  const elements = {
+    'figma-scan-status': createElementStub(),
+  };
+  const renderer = loadRendererHelpers(createDocumentStub(elements));
+
+  renderer.updateFigmaScanStatus({
+    filesFound: 2,
+    assetsFound: 0,
+    errors: ['Metadata fetch failed for tracked file [redacted]; proceeding to extraction anyway.'],
+    warning: 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.',
+    candidateDiagnostics: {
+      candidateCount: 2,
+      parsedScopeCounts: { withPageOrNode: 2, withoutPageOrNode: 0 },
+      metadataStatusCounts: { failed: 2 },
+      fileFetchStatusCounts: { failed: 2 },
+      lockStatusCounts: { unresolved: 2 },
+      statusReasonCounts: { 'figma-current-page-file-fetch-failed': 2 },
+      assetResultCounts: { withAssets: 0, withoutAssets: 2 }
+    },
+    timestamp: Date.UTC(2026, 5, 17, 12, 0, 0),
+  });
+
+  const text = elements['figma-scan-status'].textContent;
+  assert.match(text, /2 files, 0 assets/);
+  assert.match(text, /Figma candidate check: 2 candidates/);
+  assert.match(text, /page\/node parsed 2/);
+  assert.match(text, /metadata ok 0\/failed 2/);
+  assert.match(text, /file ok 0\/failed 2/);
+  assert.equal(text.includes('figma.com'), false);
+  assert.equal(text.includes('token'), false);
+  assert.equal(text.includes('Bearer'), false);
+  assert.equal(text.includes('1:1'), false);
+});
+
 test('Package Details shows the no-issue state without issue messages', () => {
   const { document, elements } = createPackageDetailsDom();
   const renderer = loadRendererHelpers(document);

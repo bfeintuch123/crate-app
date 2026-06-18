@@ -163,6 +163,26 @@ class FileFetchFailureFigmaParser extends FigmaParser {
   }
 }
 
+class AllCandidateFailureFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async verifyToken() {
+    return { valid: true, user: { id: '1', handle: 'tester', email: 'tester@example.com' } };
+  }
+
+  async _fetchAPI(endpoint) {
+    if (endpoint.includes('/metadata') || endpoint.includes('depth=1')) {
+      throw new Error('metadata denied for https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+    }
+    if (/^\/files\/[^/?]+$/.test(endpoint)) {
+      throw new Error('file fetch denied for https://figma.example/SHOULD_NOT_APPEAR Authorization=Bearer SHOULD_NOT_APPEAR');
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
 class EmptyPageFigmaParser extends StubFigmaParser {
   async _fetchAPI(endpoint) {
     if (endpoint === `/files/${FILE_KEY}`) {
@@ -333,10 +353,59 @@ test('metadata failure does not block prototype desktop URL with canonical file 
   assert.equal(result.assets.length, 1);
   assert.equal(result.scopeEntries[0].lockStatus, 'locked');
   assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
+  assert.equal(result.candidateDiagnostics.candidateCount, 1);
+  assert.equal(result.candidateDiagnostics.metadataStatusCounts.failed, 1);
+  assert.equal(result.candidateDiagnostics.fileFetchStatusCounts.success, 1);
+  assert.equal(result.candidateDiagnostics.lockStatusCounts.locked, 1);
+  assert.equal(result.candidateDiagnostics.assetResultCounts.withAssets, 1);
 
   const serialized = `${JSON.stringify(result)}\n${output}`;
   assert.equal(serialized.includes('figma://open'), false);
   assert.equal(serialized.includes('Prototype-Route_123'), false);
+});
+
+test('all current-page candidate failures surface privacy-safe diagnostics', async () => {
+  const parser = new AllCandidateFailureFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.autoTrackScan({
+    fileKeys: ['Prototype-Route_123', MODERN_FILE_KEY],
+    scopeEntries: [
+      {
+        key: 'Prototype-Route_123',
+        scopeMode: 'current-page',
+        requestedNodeId: '2:1',
+        isCandidateFallback: false
+      },
+      {
+        key: MODERN_FILE_KEY,
+        scopeMode: 'current-page',
+        requestedNodeId: '2:1',
+        isCandidateFallback: true
+      }
+    ]
+  }));
+
+  assert.equal(result.files.length, 2);
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.candidateDiagnostics.candidateCount, 2);
+  assert.equal(result.candidateDiagnostics.candidateStrategyCounts.primary, 1);
+  assert.equal(result.candidateDiagnostics.candidateStrategyCounts.fallback, 1);
+  assert.equal(result.candidateDiagnostics.parsedScopeCounts.withPageOrNode, 2);
+  assert.equal(result.candidateDiagnostics.metadataStatusCounts.failed, 2);
+  assert.equal(result.candidateDiagnostics.fileFetchStatusCounts.failed, 2);
+  assert.equal(result.candidateDiagnostics.lockStatusCounts.unresolved, 2);
+  assert.equal(
+    result.candidateDiagnostics.statusReasonCounts['figma-current-page-file-fetch-failed'],
+    2
+  );
+  assert.equal(result.candidateDiagnostics.assetResultCounts.withoutAssets, 2);
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+  assert.equal(serialized.includes('Authorization'), false);
+  assert.equal(serialized.includes('Bearer'), false);
+  assert.equal(serialized.includes('figma://open'), false);
 });
 
 test('current-page node lock extracts only the locked page assets', async () => {
