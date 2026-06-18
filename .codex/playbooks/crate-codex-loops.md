@@ -10,7 +10,7 @@ This playbook orchestrates existing Crate playbooks. It does not replace focused
 ## When To Use
 - Bryant explicitly asks for an autonomous loop.
 - The task has a clear goal, allowed action set, definition of done, and stop gates.
-- Long-running review, QA, fix, release-gate, readiness, or smoke-failure work needs durable state and explicit autonomy boundaries.
+- Long-running review, QA, fix, release-gate, readiness, crate-failure, or smoke-failure work needs durable state and explicit autonomy boundaries.
 - Codex should choose the next safe step without Bryant providing every next prompt.
 - Codex should produce a handoff or exact approval request after reaching a stop gate.
 
@@ -26,7 +26,7 @@ Definition of done: <done criteria>.
 Stop at approval gates and do not commit, push, merge, release, build, deploy, tag, notarize, mutate dependencies, or touch out-of-scope files unless explicitly approved by the selected preauthorization mode.
 ```
 
-If the loop is a focused code fix, also use `clawpatch-fix.md`. If it is review-only, also use `crate-autoreview.md` or the relevant review playbook. If it is PR or merge work, also use `review-crate-pr.md`. If it is GUI QA, also use `crate-computer-use-qa.md` or `crate-gui-repro-flow.md`. If it is prerelease readiness, also use `crate-release-gate.md`. If it needs a restartable handoff, also use `crate-handoff.md`.
+If the loop is a focused code fix, also use the Crate Fix Review Stack below. If it is review-only, also use `crate-autoreview.md` or the relevant review playbook. If it is PR or merge work, also use `review-crate-pr.md`. If it is GUI QA, also use `crate-computer-use-qa.md` or `crate-gui-repro-flow.md`. If it is prerelease readiness, also use `crate-release-gate.md`. If it needs a restartable handoff, also use `crate-handoff.md`.
 
 ## Required Start Gate
 Before acting, Codex must confirm:
@@ -296,15 +296,106 @@ Codex must not treat silence as approval for any stop gate. If a loop reaches a 
 
 ## Loop Types
 
-### 1. Autonomous Fix Loop
+### Crate Fix Review Stack
+Every autonomous Crate code-fix loop must use this stack unless Bryant explicitly scopes the work as docs-only, review-only, or no-review.
+
+Mandatory playbooks:
+- `crate-bug-triage.md` before editing to classify the failure, evidence quality, severity, and whether a fix is actually warranted.
+- `clawpatch-fix.md` for the implementation path so the change stays small, branch-gated, and test-backed.
+- `crate-autoreview.md` before and after the fix to challenge assumptions, stale evidence, over-scope, and release-blocking risk.
+- `crate-regression-detector.md` to identify blast radius and required focused checks.
+- `crate-security-scan.md` to check token, path, package, parser, shell, filesystem-boundary, and privacy risks.
+- `crate-provenance-review.md` when the change touches package output, Figma, diagnostics, live evidence, provenance, pending files, asset classification, or session decisions.
+- `crate-runner-loop.md` to record repeatable command evidence, environment, branch/commit, pass/fail, duration, failures, and next action.
+- `review-crate-pr.md` before merge when a PR exists or merge is preauthorized.
+- `crate-handoff.md` whenever the loop stops, blocks, or needs a restartable next prompt.
+
+Stack rules:
+- Do not skip triage and autoreview just because the likely fix seems obvious.
+- Do not edit code before classifying whether the issue is a real app bug, QA setup problem, automation blocker, product follow-up, stale report, dependency/security issue, or release blocker.
+- Use the strictest stop gate from all selected playbooks.
+- If a playbook says to stop, the loop stops even if the preauthorization mode would otherwise allow more work.
+- Preserve privacy filters across all evidence, logs, QA reports, runner output, and handoffs.
+- For dependency remediation, use the Security / Dependency Loop rules in addition to this stack.
+- For release-gate failures, use this stack only for the remediation branch; run `crate-release-gate.md` again only after the fix merges and Bryant approves the next QA prerelease.
+
+### 1. Autonomous Crate Failure Loop
+Purpose:
+- Triage and resolve Crate failures from any approved source, not only QA smoke reports.
+
+Failure sources include:
+- Jenna QA smoke report
+- external tester report
+- GitHub issue
+- release-gate failure
+- dependency audit failure
+- PR review finding
+- package/provenance diff
+- GUI reproduction finding
+- installed-app regression
+- public or private beta user bug report
+
+Recommended orchestrated playbooks:
+- Crate Fix Review Stack when the loop may edit code
+- `crate-qa-results-synthesizer.md` for Jenna/tester QA artifacts
+- `crate-tester-intake.md` for external designer or beta-user feedback
+- `crate-gui-repro-flow.md` or `crate-computer-use-qa.md` when GUI reproduction is needed
+- `crate-package-diff.md` and `crate-provenance-snapshot.md` when package output or provenance artifacts are central evidence
+- `crate-release-gate.md` only after a merged fix and explicit QA prerelease approval
+
+Failure classification:
+- `pass`
+- `fail-likely-app-bug`
+- `fail-qa-setup`
+- `blocked-automation`
+- `product-follow-up`
+- `release-blocker`
+- `dependency-security`
+- `needs-more-evidence`
+- `non-blocking-public-release-follow-up`
+- `stale-or-already-fixed`
+
+Loop phases:
+1. Intake failure report and source.
+2. Classify failure type, severity, evidence quality, and scope.
+3. Decide whether evidence is sufficient to fix or whether QA/repro/product input is needed.
+4. Select the required playbooks from the Crate Fix Review Stack and any source-specific playbooks.
+5. Create a focused branch only after classification supports implementation and the selected mode allows edits.
+6. Implement the smallest safe fix if warranted.
+7. Run runner-compatible checks and focused tests.
+8. Run autoreview, regression, security, provenance, and PR review gates as applicable.
+9. Commit, push, open PR, and merge only when the selected mode allows it and all gates pass.
+10. Return handoff state and the next QA, release-gate, tester, or follow-up prompt.
+
+Allowed according to preauthorization:
+- inspect reports, code, GitHub state, and safe artifacts
+- run read-only checks
+- create a focused branch after start gate passes
+- edit scoped app or test files only when classification supports a real fix
+- add/update tests
+- commit/push/PR/merge only in modes that explicitly allow those actions
+
+Must stop if:
+- classification is product decision, QA setup, automation blocker, or needs-more-evidence and no safe next action is approved
+- fix would broaden beyond the failure source
+- fix requires credentials, private file inspection, dependency mutation, release/build/deploy/tag/notarization, crate-web changes, or final public release action outside explicit scope
+- any selected playbook requests changes or hits a stop gate
+
+Definition of done:
+- failure source and classification are reported
+- root cause is identified or narrowed
+- fix is implemented only if warranted
+- required checks pass
+- review stack is clean
+- PR/merge state is reported when applicable
+- exact next prompt is returned
+
+### 2. Autonomous Fix Loop
 Purpose:
 - Implement a focused bug fix or product behavior fix.
 
 Recommended orchestrated playbooks:
-- `clawpatch-fix.md`
-- `crate-regression-detector.md` when regression coverage is needed
-- `crate-provenance-review.md` when provenance behavior is touched
-- `crate-security-scan.md` when path, parser, token, shell, package, or privacy risk is present
+- Crate Fix Review Stack
 
 Allowed according to preauthorization:
 - create branch
@@ -326,7 +417,7 @@ Definition of done:
 - self-review ready
 - final review prompt or PR returned
 
-### 2. Autonomous Review Loop
+### 3. Autonomous Review Loop
 Purpose:
 - Read-only investigation, PR review, release-blocker review, or fix recommendation.
 
@@ -363,7 +454,7 @@ Definition of done:
 - tests/checks reported
 - exact next prompt produced
 
-### 3. Autonomous PR/Merge Loop
+### 4. Autonomous PR/Merge Loop
 Purpose:
 - Carry a clean scoped branch through PR creation, review-readiness, and optionally merge if explicitly preauthorized.
 
@@ -394,7 +485,7 @@ Definition of done:
 - merge-readiness state is reported
 - next release/QA prompt is returned if relevant
 
-### 4. Autonomous QA Loop
+### 5. Autonomous QA Loop
 Purpose:
 - Installed-app QA with Computer Use, Finder, and scoped creative-app workflows.
 
@@ -429,7 +520,7 @@ Definition of done:
 - artifacts/paths are recorded only when privacy-safe and approved
 - next action recommended
 
-### 5. Autonomous Release Gate Loop
+### 6. Autonomous Release Gate Loop
 Purpose:
 - Internal QA prerelease gate or release-readiness gate.
 
@@ -465,7 +556,7 @@ Definition of done:
 - no final public release/site deploy occurred unless explicitly approved
 - QA checklist or exact next prompt returned
 
-### 6. Public v2.8 Readiness Loop
+### 7. Public v2.8 Readiness Loop
 Purpose:
 - Maintain public `v2.8` go/no-go state.
 
@@ -496,7 +587,7 @@ Definition of done:
 - next highest-leverage action identified
 - exact next prompt returned
 
-### 7. Provenance / AI-Readiness Loop
+### 8. Provenance / AI-Readiness Loop
 Purpose:
 - Evolve Crate Provenance into deterministic capture intelligence and future AI-ready evidence.
 
@@ -531,7 +622,7 @@ Definition of done:
 - risks stated
 - next safe PR or research prompt identified
 
-### 8. Security / Dependency Loop
+### 9. Security / Dependency Loop
 Purpose:
 - Security review, npm audit triage, dependency remediation planning, or approved dependency remediation.
 
@@ -568,26 +659,29 @@ Definition of done:
 - remediation path proposed or implemented
 - tests run
 
-## Autonomous Smoke Failure Fix Loop Template
-Use this template when Bryant wants Codex to fix a smoke failure end-to-end without waiting for each next prompt.
+## Autonomous Crate Failure Loop Template
+Use this template when Bryant wants Codex to triage and resolve a Crate failure end-to-end without waiting for each next prompt.
 
 ```text
-Use .codex/playbooks/crate-codex-loops.md for smoke failure <short-name>.
+Use .codex/playbooks/crate-codex-loops.md for Crate failure <short-name>.
 Preauthorization mode: <fix-only|fix-and-PR|fix-PR-and-merge-if-clean>.
-Goal: triage and fix <exact smoke failure> from <version/artifact/PR>.
+Failure source: <qa-smoke|tester-report|github-issue|release-gate-failure|dependency-audit|pr-review-finding|package-diff|provenance-anomaly|production-bug>.
+Goal: triage and fix <exact failure> from <version/artifact/PR/report>.
 Allowed actions:
 - verify repo path, remote, branch, base, and clean tree
-- create a focused branch from latest origin/v2.4.x
-- inspect the exact failing command and error text
+- classify the failure with `crate-bug-triage.md`
+- use the Crate Fix Review Stack
+- create a focused branch from latest origin/v2.4.x only if classification supports a real fix
+- inspect the exact failing command, error text, report, or privacy-safe artifact
 - identify the smallest plausible code or docs surface
 - implement the smallest safe fix
 - add or update focused tests when appropriate
-- run focused tests and git diff --check
-- self-review the diff
+- run focused tests, runner-compatible checks, and git diff --check
+- run autoreview, regression, security, provenance, and merge-readiness gates as applicable
 - commit, push, and open a draft PR only if preauthorization mode allows it
 - run merge-readiness only if preauthorization mode allows it
 - merge only if preauthorized and no blockers exist
-- return the next QA release prompt
+- return the next QA, tester, release-gate, or follow-up prompt
 
 Stop conditions:
 - credentials/tokens/passwords
@@ -605,7 +699,7 @@ Stop conditions:
 - scope expands beyond loop goal
 ```
 
-Smoke failure loop phases:
+Crate failure loop phases:
 1. Triage failure.
 2. Create branch.
 3. Implement fix.
@@ -618,7 +712,17 @@ Smoke failure loop phases:
 10. Merge if preauthorized and no blockers.
 11. Return next QA release prompt.
 
+## Autonomous Smoke Failure Fix Loop Variant
+The old smoke-failure loop is retained as a named variant:
+
+```text
+Autonomous Smoke Failure Fix Loop = Autonomous Crate Failure Loop with Failure source: qa-smoke
+```
+
+Use this variant when the input is a Jenna installed-app smoke report or another structured QA smoke result. It must still use the Crate Fix Review Stack before implementation and before merge.
+
 Required final output:
+- failure source and classification
 - root cause or best-supported failure path
 - files changed
 - tests/checks run
@@ -748,6 +852,9 @@ This playbook orchestrates existing playbooks. It does not replace:
 - `clawpatch-fix.md`
 - `review-crate-pr.md`
 - `crate-bug-triage.md`
+- `crate-runner-loop.md`
+- `crate-qa-results-synthesizer.md`
+- `crate-tester-intake.md`
 - `crate-regression-detector.md`
 - `crate-security-scan.md`
 - `crate-provenance-review.md`

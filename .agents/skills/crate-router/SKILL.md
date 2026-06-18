@@ -31,11 +31,23 @@ Use `.codex/ROUTER.md` to choose the workflow:
 
 - status or next action: current workstream plus workstream-status playbook.
 - Jenna QA report: QA results synthesizer, then bug triage if needed.
-- smoke failure: autonomous loop plus focused fix, autoreview, regression, security, provenance, and PR review playbooks.
+- Crate failure: Autonomous Crate Failure Loop plus the full Crate Fix Review Stack.
+- smoke failure: Autonomous Smoke Failure Fix Loop variant, which is the Crate Failure Loop with `qa-smoke` as the failure source.
 - internal QA prerelease: release gate plus release-blocker review playbooks.
 - PR merge readiness: review-crate-pr plus relevant review playbooks.
 - Jenna prompt generation: smoke prompt bank plus privacy gates.
 - handoff: crate-handoff skill and playbook.
+
+For Crate Failure Loop or Smoke Failure Fix Loop requests, automatically include:
+- `crate-bug-triage.md`
+- `clawpatch-fix.md`
+- `crate-autoreview.md`
+- `crate-regression-detector.md`
+- `crate-security-scan.md`
+- `crate-provenance-review.md`
+- `crate-runner-loop.md`
+- `review-crate-pr.md`
+- `crate-handoff.md`
 
 ## Output
 
