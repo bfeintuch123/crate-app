@@ -1709,15 +1709,40 @@ function getProjectFigmaScopeMode(project) {
 function normalizeTrackedFigmaFiles(rawTrackedFiles) {
   const { FigmaParser } = require('./parsers/figma');
 
+  const normalizeCandidateKeys = (primaryKey, url = null, rawCandidateKeys = []) => {
+    const keys = [];
+    const seen = new Set();
+    const pushKey = (value) => {
+      if (typeof value !== 'string' || !value.trim()) return;
+      const trimmed = value.trim();
+      if (seen.has(trimmed)) return;
+      seen.add(trimmed);
+      keys.push(trimmed);
+    };
+
+    pushKey(primaryKey);
+    if (url) {
+      for (const candidate of FigmaParser._figmaFileKeyCandidates(url)) {
+        pushKey(candidate);
+      }
+    }
+    for (const candidate of Array.isArray(rawCandidateKeys) ? rawCandidateKeys : []) {
+      pushKey(candidate);
+    }
+    return keys;
+  };
+
   return (Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [])
     .map((entry) => {
       if (typeof entry === 'string') {
         const trimmed = entry.trim();
         if (!trimmed) return null;
         const parsedKey = FigmaParser.extractFileKey(trimmed);
+        const candidateKeys = normalizeCandidateKeys(parsedKey || trimmed, parsedKey ? trimmed : null);
         return {
           key: parsedKey || trimmed,
           url: parsedKey ? trimmed : null,
+          candidateKeys,
         };
       }
 
@@ -1725,7 +1750,8 @@ function normalizeTrackedFigmaFiles(rawTrackedFiles) {
       const key = typeof entry.key === 'string' ? entry.key.trim() : '';
       if (!key) return null;
       const url = typeof entry.url === 'string' && entry.url.trim() ? entry.url.trim() : null;
-      return { key, url };
+      const candidateKeys = normalizeCandidateKeys(key, url, entry.candidateKeys);
+      return { key, url, candidateKeys };
     })
     .filter(Boolean);
 }
@@ -1802,6 +1828,7 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
       return {
         key: trackedFile.key,
         url: trackedFile.url,
+        candidateKeys: trackedFile.candidateKeys,
         requestedPageId: parsedScope.requestedPageId || null,
         requestedNodeId: parsedScope.requestedNodeId || null,
         lockStatus,
@@ -1817,6 +1844,60 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
 
   snapshot.warnings = rebuildFigmaSessionWarnings(snapshot);
   return snapshot;
+}
+
+function figmaTrackedFileKeys(trackedFile) {
+  const keys = [];
+  const seen = new Set();
+  const pushKey = (value) => {
+    if (typeof value !== 'string' || !value.trim()) return;
+    const trimmed = value.trim();
+    if (seen.has(trimmed)) return;
+    seen.add(trimmed);
+    keys.push(trimmed);
+  };
+  pushKey(trackedFile && trackedFile.key);
+  for (const candidate of Array.isArray(trackedFile && trackedFile.candidateKeys) ? trackedFile.candidateKeys : []) {
+    pushKey(candidate);
+  }
+  if (typeof (trackedFile && trackedFile.resolvedKey) === 'string') {
+    pushKey(trackedFile.resolvedKey);
+  }
+  return keys;
+}
+
+function figmaTrackedFileMatchesKey(trackedFile, fileKey) {
+  if (typeof fileKey !== 'string' || !fileKey.trim()) return false;
+  return figmaTrackedFileKeys(trackedFile).includes(fileKey.trim());
+}
+
+function expandFigmaTrackedFilesForScan(rawTrackedFiles) {
+  const expanded = [];
+  const seen = new Set();
+  for (const trackedFile of Array.isArray(rawTrackedFiles) ? rawTrackedFiles : []) {
+    const candidateKeys = figmaTrackedFileKeys(trackedFile);
+    for (const key of candidateKeys) {
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      expanded.push({
+        ...trackedFile,
+        key,
+        primaryKey: trackedFile.key,
+        candidateKeys,
+        isCandidateFallback: key !== trackedFile.key,
+      });
+    }
+  }
+  return expanded;
+}
+
+function figmaScopeRank(scope) {
+  if (!scope || typeof scope !== 'object') return 0;
+  if (scope.lockStatus === 'locked') return 4;
+  if (scope.lockStatus === 'entire-file') return 3;
+  if (scope.lockStatus === 'pending') return 2;
+  if (scope.lockStatus === 'unresolved') return 1;
+  return 0;
 }
 
 function ensureProjectFigmaSession(projectId) {
@@ -1854,7 +1935,10 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
 
     let changed = false;
     for (const trackedFile of project.figmaSession.trackedFiles) {
-      const nextScope = scopeByKey.get(trackedFile.key);
+      const candidateScopes = figmaTrackedFileKeys(trackedFile)
+        .map(key => scopeByKey.get(key))
+        .filter(Boolean);
+      const nextScope = candidateScopes.sort((a, b) => figmaScopeRank(b) - figmaScopeRank(a))[0];
       if (!nextScope) continue;
 
       const nextLockStatus = typeof nextScope.lockStatus === 'string' ? nextScope.lockStatus : trackedFile.lockStatus;
@@ -1862,6 +1946,9 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       const nextLockedPageName = nextScope.lockedPageName != null ? nextScope.lockedPageName : trackedFile.lockedPageName;
       const nextStatusReason = nextScope.statusReason != null ? nextScope.statusReason : trackedFile.statusReason;
       const nextWarning = nextScope.warning != null ? nextScope.warning : trackedFile.warning;
+      const nextResolvedKey = typeof nextScope.fileKey === 'string' && nextScope.fileKey.trim()
+        ? nextScope.fileKey.trim()
+        : trackedFile.resolvedKey;
 
       if (trackedFile.lockStatus !== nextLockStatus) {
         trackedFile.lockStatus = nextLockStatus;
@@ -1881,6 +1968,10 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       }
       if (trackedFile.warning !== nextWarning) {
         trackedFile.warning = nextWarning;
+        changed = true;
+      }
+      if (trackedFile.resolvedKey !== nextResolvedKey) {
+        trackedFile.resolvedKey = nextResolvedKey;
         changed = true;
       }
     }
@@ -1908,7 +1999,7 @@ function shouldIncludeFigmaAssetForPackaging(file, project) {
     return false;
   }
 
-  const trackedFile = session.trackedFiles.find(entry => entry.key === file.figmaFileKey);
+  const trackedFile = session.trackedFiles.find(entry => figmaTrackedFileMatchesKey(entry, file.figmaFileKey));
   if (!trackedFile || trackedFile.lockStatus !== 'locked' || !trackedFile.lockedPageId) {
     return false;
   }
@@ -2112,6 +2203,7 @@ function redactFigmaLogText(value) {
     .replace(/\bcookie\b\s*[:=]\s*[^,\s)]+/gi, 'cookie=[redacted]')
     .replace(/\btoken\b\s*[:=]\s*[^,\s)]+/gi, 'token=[redacted]')
     .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/\b\d+:\d+\b/g, '[redacted-figma-scope-id]')
     .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var)\/[^\s"'<>]+/g, '[redacted-path]');
 }
 
@@ -2134,6 +2226,7 @@ function summarizeTrackedFigmaFilesForLog(rawTrackedFiles) {
     scopeMode: formatFigmaLogScalar(entry && entry.scopeMode),
     lockStatus: formatFigmaLogScalar(entry && entry.lockStatus),
     hasUrl: !!(entry && typeof entry.url === 'string' && entry.url.trim()),
+    candidateCount: figmaTrackedFileKeys(entry).length,
     hasRequestedScope: !!(entry && (entry.requestedPageId || entry.requestedNodeId)),
     hasLockedPage: !!(entry && entry.lockedPageId),
     statusReason: formatFigmaLogScalar(entry && entry.statusReason, 'none'),
@@ -4543,8 +4636,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     const latestProject = getProjects().find(p => p.id === projectId) || project;
     const figmaSession = latestProject.figmaSession || ensuredSession || null;
     const rawTrackedFiles = (figmaSession && Array.isArray(figmaSession.trackedFiles)) ? figmaSession.trackedFiles : [];
+    const scanTrackedFiles = expandFigmaTrackedFilesForScan(rawTrackedFiles);
     const teamIds = (figmaSession && Array.isArray(figmaSession.teamIds)) ? figmaSession.teamIds : [];
-    const fileKeys = rawTrackedFiles.map(entry => entry.key);
+    const fileKeys = scanTrackedFiles.map(entry => entry.key);
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
@@ -4576,7 +4670,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       maxFiles: isInitialScan ? 20 : 10,
       teamIds,
       fileKeys,
-      scopeEntries: rawTrackedFiles
+      scopeEntries: scanTrackedFiles
     });
 
     const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
@@ -4659,8 +4753,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       sendToRenderer('project:updated', { projectId });
     }
 
-    const errors = scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
-    const warning = activeWarnings[0] || (scanResult.warnings && scanResult.warnings[0]) || null;
+    const errors = addedCount > 0 ? [] : scanResult.errors.map(e => typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e));
+    const warning = activeWarnings[0] || (addedCount > 0 ? null : ((scanResult.warnings && scanResult.warnings[0]) || null));
     sendToRenderer('figma:scan-complete', {
       projectId,
       filesFound: scanResult.files.length,
@@ -8419,8 +8513,9 @@ end tell`;
     const latestProject = getProjects().find(p => p.id === projectId) || project;
     const figmaSession = latestProject.figmaSession || ensuredSession || null;
     const rawTrackedFiles = (figmaSession && Array.isArray(figmaSession.trackedFiles)) ? figmaSession.trackedFiles : [];
+    const scanTrackedFiles = expandFigmaTrackedFilesForScan(rawTrackedFiles);
     const teamIds = (figmaSession && Array.isArray(figmaSession.teamIds)) ? figmaSession.teamIds : [];
-    const fileKeys = rawTrackedFiles.map(entry => entry.key);
+    const fileKeys = scanTrackedFiles.map(entry => entry.key);
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
@@ -8444,7 +8539,7 @@ end tell`;
         maxFiles: 20,
         teamIds,
         fileKeys,
-        scopeEntries: rawTrackedFiles
+        scopeEntries: scanTrackedFiles
       });
 
       mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
