@@ -63,6 +63,7 @@ function redactFigmaParserText(value) {
     .replace(/\bBearer\s+[^\s,;)]+/gi, '[redacted-credential]')
     .replace(/\b(?:token|access_token|auth|sig|signature|client_secret|secret|key|cookie)\b\s*[:=]\s*[^\s,;)]+/gi, '[redacted-credential]')
     .replace(/[A-Za-z0-9._-]*(?:token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/\b\d+:\d+\b/g, '[redacted-figma-scope-id]')
     .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var|\/tmp)\/[^\s"'<>),]+/g, '[redacted-path]');
 }
 

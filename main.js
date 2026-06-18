@@ -2203,6 +2203,7 @@ function redactFigmaLogText(value) {
     .replace(/\bcookie\b\s*[:=]\s*[^,\s)]+/gi, 'cookie=[redacted]')
     .replace(/\btoken\b\s*[:=]\s*[^,\s)]+/gi, 'token=[redacted]')
     .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
+    .replace(/\b\d+:\d+\b/g, '[redacted-figma-scope-id]')
     .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var)\/[^\s"'<>]+/g, '[redacted-path]');
 }
 
@@ -8512,8 +8513,9 @@ end tell`;
     const latestProject = getProjects().find(p => p.id === projectId) || project;
     const figmaSession = latestProject.figmaSession || ensuredSession || null;
     const rawTrackedFiles = (figmaSession && Array.isArray(figmaSession.trackedFiles)) ? figmaSession.trackedFiles : [];
+    const scanTrackedFiles = expandFigmaTrackedFilesForScan(rawTrackedFiles);
     const teamIds = (figmaSession && Array.isArray(figmaSession.teamIds)) ? figmaSession.teamIds : [];
-    const fileKeys = rawTrackedFiles.map(entry => entry.key);
+    const fileKeys = scanTrackedFiles.map(entry => entry.key);
     const normalizedTrackedFileKeys = Array.from(new Set(
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ));
@@ -8537,7 +8539,7 @@ end tell`;
         maxFiles: 20,
         teamIds,
         fileKeys,
-        scopeEntries: rawTrackedFiles
+        scopeEntries: scanTrackedFiles
       });
 
       mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);

@@ -1302,6 +1302,11 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
   assert.match(output, /fileKey=FIGLOG/);
   assert.match(output, /localName=Brand_Cloud_Log_Privacy_Asset\.png/);
   assert.match(output, /\[redacted-url\]/);
+  assert.doesNotMatch(
+    output,
+    /(?:page-id|pageId|page_id|node-id|nodeId|node_id|lockedPageId|requestedPageId|figmaPageId)[^\n]{0,120}1:1/,
+    'log output should not include raw Figma scope IDs in page or node contexts'
+  );
 
   for (const forbidden of [
     sensitiveFigmaUrl,
@@ -1312,7 +1317,7 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
     'Secret-File',
     'page-id',
     '1%3A1',
-    '1:1',
+    '"1:1"',
     'SHOULD_NOT_APPEAR',
     'Authorization',
     'Bearer',
