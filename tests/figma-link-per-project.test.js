@@ -619,6 +619,74 @@ test('projects:set-figma-link starts a scan for a watching project with a connec
   await waitForActiveFigmaPollerCount(activePollersBefore + 1);
 });
 
+test('Figma link candidate fallback can lock and stage assets without widening scope', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
+  const primaryKey = 'BadPrimaryKey';
+  const fallbackKey = 'ProtoCandidateKey';
+  storedFigmaToken = 'test-token';
+  setFigmaDownloadResponse('fallback current page asset');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/fallback-current-page.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-current-page',
+    imageRef: 'img-current-page',
+    name: 'Fallback Current Page Asset',
+    format: 'png',
+    figmaFileKey: fallbackKey,
+    figmaFileName: 'Petra Logo',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: fallbackKey,
+    fileName: 'Petra Logo',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+  nextFigmaScanResult.files[0].key = fallbackKey;
+
+  const project = await callIpc(
+    'projects:create',
+    'Phase2-link-candidate-fallback',
+    'branding',
+    'current-page',
+    null
+  );
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+
+  const result = await callIpc('projects:set-figma-link', project.id, {
+    url: `https://www.figma.com/proto/${fallbackKey}/Petra-Logo?node-id=2-1&file-key=${primaryKey}`,
+    scopeMode: 'current-page'
+  });
+  assert.equal(result.success, true);
+
+  const fresh = await waitForProject(project.id, item => item.files.length === 1, 'Figma fallback asset should be staged');
+  assert.deepEqual(lastFigmaScanOptions.fileKeys, [primaryKey, fallbackKey]);
+  assert.equal(lastFigmaScanOptions.scopeEntries.length, 2);
+  assert.deepEqual(lastFigmaScanOptions.scopeEntries.map(entry => entry.key), [primaryKey, fallbackKey]);
+  assert.equal(fresh.figmaSession.trackedFiles[0].key, primaryKey);
+  assert.deepEqual(fresh.figmaSession.trackedFiles[0].candidateKeys, [primaryKey, fallbackKey]);
+  assert.equal(fresh.figmaSession.trackedFiles[0].resolvedKey, fallbackKey);
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Page One');
+  assert.equal(fresh.files[0].source, 'figma-auto');
+  assert.equal(fresh.files[0].figmaFileKey, fallbackKey);
+  assert.equal(fresh.files[0].figmaPageId, '1:1');
+  await waitForActiveFigmaPollerCount(activePollersBefore + 1);
+
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-fallback-package-'));
+  try {
+    const packageResult = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(packageResult.success, true);
+    assert.equal(packageResult.copiedCount, 1);
+    assert.equal(fs.existsSync(path.join(packageFolder(outputDir, 'Phase2-link-candidate-fallback'), fresh.files[0].name)), true);
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+  assert.equal(JSON.stringify(fresh).includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+});
+
 test('figma:connect starts polling for linked watching projects', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(

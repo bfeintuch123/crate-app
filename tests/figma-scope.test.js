@@ -203,6 +203,8 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
   const prototypeWithNestedDesignUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26redirect%3Dhttps%253A%252F%252Fwww.figma.com%252Fdesign%252FPetra_logo-File_123%252FPetra%253Fnode-id%253D2-1';
   const prototypeWithFileKeyParamUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_456%2FPetra%3Fnode-id%3D2-1%26file-key%3DPetra_logo-File_123';
   const openUrlWithFileIdParam = 'figma://open?file-id=Petra_logo-File_123&node-id=2-1';
+  const prototypeWithAmbiguousFileIdUrl = 'https://www.figma.com/proto/Prototype-Route_789/Petra?node_id=2-1&file-id=Desktop-File_Id';
+  const embedUrl = 'https://embed.figma.com/design/Embedded-Key_123/Petra?node-id=2-1&embed-host=share';
 
   assert.equal(FigmaParser.extractFileKey(designUrl), 'Petra_logo-File_123');
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(designUrl), {
@@ -247,6 +249,20 @@ test('Figma URL parsing preserves modern keys and page or node scope params', ()
   });
   assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(openUrlWithFileIdParam), {
     fileKey: 'Petra_logo-File_123',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser._figmaFileKeyCandidates(prototypeWithAmbiguousFileIdUrl), [
+    'Prototype-Route_789',
+    'Desktop-File_Id',
+  ]);
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(prototypeWithAmbiguousFileIdUrl), {
+    fileKey: 'Prototype-Route_789',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+  assert.deepEqual(FigmaParser.parseScopeFromTrackedUrl(embedUrl), {
+    fileKey: 'Embedded-Key_123',
     requestedPageId: null,
     requestedNodeId: '2:1',
   });
@@ -300,7 +316,7 @@ test('metadata failure does not block nested desktop URL current-page extraction
 
 test('metadata failure does not block prototype desktop URL with canonical file key extraction', async () => {
   const parser = new MetadataFailureFigmaParser();
-  const trackedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26file-id%3DPetra_logo-File_123%26t%3Dabc';
+  const trackedUrl = 'figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26file-key%3DPetra_logo-File_123%26t%3Dabc';
   const parsedScope = FigmaParser.parseScopeFromTrackedUrl(trackedUrl);
 
   const { result, output } = await captureConsole(() => parser.autoTrackScan({

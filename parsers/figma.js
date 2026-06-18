@@ -125,7 +125,28 @@ const FIGMA_SCOPE_REASONS = Object.freeze({
   FILE_FETCH_FAILED: 'figma-current-page-file-fetch-failed',
   ZERO_IMAGE_REFS: 'figma-current-page-zero-image-refs'
 });
-const FIGMA_FILE_KEY_PARAM_NAMES = ['file-key', 'fileKey', 'file_key', 'file-id', 'fileId', 'file_id'];
+const FIGMA_CANONICAL_FILE_KEY_PARAM_NAMES = ['file-key', 'fileKey', 'file_key'];
+const FIGMA_AMBIGUOUS_FILE_ID_PARAM_NAMES = ['file-id', 'fileId', 'file_id'];
+const FIGMA_NESTED_URL_PARAM_NAMES = [
+  'url',
+  'href',
+  'link',
+  'u',
+  'redirect',
+  'redirectUrl',
+  'redirect_url',
+  'target',
+  'targetUrl',
+  'target_url',
+  'fileUrl',
+  'file_url',
+  'file-url',
+  'openUrl',
+  'open_url',
+  'deepLink',
+  'deep_link',
+  'deeplink'
+];
 
 function currentPageScopeWarning(statusReason) {
   switch (statusReason) {
@@ -713,8 +734,8 @@ class FigmaParser extends BaseParser {
     };
 
     const directRoutePatterns = [
-      /(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design)\/([a-zA-Z0-9_-]+)/i,
-      /^figma:\/\/(?:file|design)\/([a-zA-Z0-9_-]+)/i
+      /(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design|board|slides|deck)\/([a-zA-Z0-9_-]+)/i,
+      /^figma:\/\/(?:file|design|board|slides|deck)\/([a-zA-Z0-9_-]+)/i
     ];
     const protoRoutePatterns = [
       /(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/proto\/([a-zA-Z0-9_-]+)/i,
@@ -722,8 +743,11 @@ class FigmaParser extends BaseParser {
     ];
 
     const readFileKeyParams = (params) => {
-      for (const name of FIGMA_FILE_KEY_PARAM_NAMES) {
+      for (const name of FIGMA_CANONICAL_FILE_KEY_PARAM_NAMES) {
         addMatch(params.get(name), 1);
+      }
+      for (const name of FIGMA_AMBIGUOUS_FILE_ID_PARAM_NAMES) {
+        addMatch(params.get(name), 3);
       }
     };
 
@@ -750,10 +774,11 @@ class FigmaParser extends BaseParser {
         // Regex fallback below handles malformed desktop handoff strings.
       }
 
-      const fileKeyParamPattern = /[?&#](?:file-key|fileKey|file_key|file-id|fileId|file_id)=([^&#]+)/gi;
+      const fileKeyParamPattern = /[?&#](file-key|fileKey|file_key|file-id|fileId|file_id)=([^&#]+)/gi;
       let paramMatch = null;
       while ((paramMatch = fileKeyParamPattern.exec(candidate)) !== null) {
-        addMatch(paramMatch[1], 1);
+        const priority = FIGMA_AMBIGUOUS_FILE_ID_PARAM_NAMES.includes(paramMatch[1]) ? 3 : 1;
+        addMatch(paramMatch[2], priority);
       }
 
       for (const pattern of protoRoutePatterns) {
@@ -801,7 +826,7 @@ class FigmaParser extends BaseParser {
 
       try {
         const parsed = new URL(current);
-        for (const name of ['url', 'href', 'link', 'u', 'redirect']) {
+        for (const name of FIGMA_NESTED_URL_PARAM_NAMES) {
           const value = parsed.searchParams.get(name);
           if (value && /(?:figma\.com|^figma:\/\/)/i.test(value)) {
             pushCandidate(value);
@@ -813,7 +838,7 @@ class FigmaParser extends BaseParser {
           if (hashText) {
             pushCandidate(hashText);
             const hashParams = new URLSearchParams(hashText);
-            for (const name of ['url', 'href', 'link', 'u', 'redirect']) {
+            for (const name of FIGMA_NESTED_URL_PARAM_NAMES) {
               const value = hashParams.get(name);
               if (value && /(?:figma\.com|^figma:\/\/)/i.test(value)) {
                 pushCandidate(value);
@@ -825,7 +850,7 @@ class FigmaParser extends BaseParser {
         // Keep regex extraction for malformed desktop handoff strings.
       }
 
-      const embeddedMatches = String(decoded).match(/(?:https?:\/\/(?:www\.)?figma\.com|figma:\/\/)[^\s"'<>]+/gi) || [];
+      const embeddedMatches = String(decoded).match(/(?:https?:\/\/(?:(?:www|embed)\.)?figma\.com|figma:\/\/)[^\s"'<>]+/gi) || [];
       for (const embedded of embeddedMatches) {
         pushCandidate(embedded);
       }
@@ -881,10 +906,17 @@ class FigmaParser extends BaseParser {
 
     const mergeParams = (params) => {
       if (!result.requestedPageId) {
-        result.requestedPageId = FigmaParser.normalizeNodeId(readParam(params, ['page-id', 'pageId']));
+        result.requestedPageId = FigmaParser.normalizeNodeId(readParam(params, ['page-id', 'pageId', 'page_id']));
       }
       if (!result.requestedNodeId) {
-        result.requestedNodeId = FigmaParser.normalizeNodeId(readParam(params, ['node-id', 'nodeId']));
+        result.requestedNodeId = FigmaParser.normalizeNodeId(readParam(params, [
+          'node-id',
+          'nodeId',
+          'node_id',
+          'starting-point-node-id',
+          'startingPointNodeId',
+          'starting_point_node_id'
+        ]));
       }
     };
 
@@ -907,8 +939,8 @@ class FigmaParser extends BaseParser {
     }
 
     for (const candidate of FigmaParser._figmaUrlCandidates(url)) {
-      const pageMatch = candidate.match(/[?&#](?:page-id|pageId)=([^&#]+)/i);
-      const nodeMatch = candidate.match(/[?&#](?:node-id|nodeId)=([^&#]+)/i);
+      const pageMatch = candidate.match(/[?&#](?:page-id|pageId|page_id)=([^&#]+)/i);
+      const nodeMatch = candidate.match(/[?&#](?:node-id|nodeId|node_id|starting-point-node-id|startingPointNodeId|starting_point_node_id)=([^&#]+)/i);
       result.requestedPageId = result.requestedPageId || FigmaParser.normalizeNodeId(pageMatch ? pageMatch[1] : null);
       result.requestedNodeId = result.requestedNodeId || FigmaParser.normalizeNodeId(nodeMatch ? nodeMatch[1] : null);
       if (result.requestedPageId || result.requestedNodeId) break;
