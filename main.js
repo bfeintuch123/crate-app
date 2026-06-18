@@ -2240,6 +2240,42 @@ function summarizeFigmaErrorsForLog(errors) {
     .map(error => redactFigmaLogText(error));
 }
 
+function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return null;
+  const safeCounts = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return Object.entries(value).reduce((acc, [key, count]) => {
+      const safeKey = formatFigmaLogScalar(key, 'unknown');
+      acc[safeKey] = Number.isFinite(count) ? count : 0;
+      return acc;
+    }, {});
+  };
+  return {
+    candidateCount: Number.isFinite(diagnostics.candidateCount) ? diagnostics.candidateCount : 0,
+    candidateStrategyCounts: safeCounts(diagnostics.candidateStrategyCounts),
+    parsedScopeCounts: {
+      withPageOrNode: Number.isFinite(diagnostics.parsedScopeCounts && diagnostics.parsedScopeCounts.withPageOrNode)
+        ? diagnostics.parsedScopeCounts.withPageOrNode
+        : 0,
+      withoutPageOrNode: Number.isFinite(diagnostics.parsedScopeCounts && diagnostics.parsedScopeCounts.withoutPageOrNode)
+        ? diagnostics.parsedScopeCounts.withoutPageOrNode
+        : 0
+    },
+    metadataStatusCounts: safeCounts(diagnostics.metadataStatusCounts),
+    fileFetchStatusCounts: safeCounts(diagnostics.fileFetchStatusCounts),
+    lockStatusCounts: safeCounts(diagnostics.lockStatusCounts),
+    statusReasonCounts: safeCounts(diagnostics.statusReasonCounts),
+    assetResultCounts: {
+      withAssets: Number.isFinite(diagnostics.assetResultCounts && diagnostics.assetResultCounts.withAssets)
+        ? diagnostics.assetResultCounts.withAssets
+        : 0,
+      withoutAssets: Number.isFinite(diagnostics.assetResultCounts && diagnostics.assetResultCounts.withoutAssets)
+        ? diagnostics.assetResultCounts.withoutAssets
+        : 0
+    }
+  };
+}
+
 async function shouldKeepObservedSourceFileForPackaging(file, project) {
   const watchStart = project.watchStartedAt || project.createdAt || 0;
   if (!watchStart || !file || !file.path) return true;
@@ -4676,6 +4712,10 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
     const activeProject = getProjects().find(p => p.id === projectId) || latestProject;
     const activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
+    const candidateDiagnostics = summarizeFigmaCandidateDiagnosticsForLog(scanResult.candidateDiagnostics);
+    if (candidateDiagnostics) {
+      console.log(`[crate][figma] candidate diagnostics: ${JSON.stringify(candidateDiagnostics)}`);
+    }
 
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', summarizeFigmaErrorsForLog(scanResult.errors));
@@ -4704,13 +4744,15 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
           errors: scanErrors, timestamp: Date.now(),
-          warning: sessionWarning || 'No recent Figma files found. Make sure your file was modified recently.'
+          warning: sessionWarning || 'No recent Figma files found. Make sure your file was modified recently.',
+          candidateDiagnostics
         });
       } else {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0,
           errors: scanErrors, timestamp: Date.now(),
-          warning: sessionWarning
+          warning: sessionWarning,
+          candidateDiagnostics
         });
       }
       if (scopeStateResult) {
@@ -4723,7 +4765,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
         assetsFound: 0,
         addedCount: 0,
         errors: scanErrors,
-        warning: sessionWarning
+        warning: sessionWarning,
+        candidateDiagnostics
       };
     }
 
@@ -4762,7 +4805,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       addedCount,
       errors,
       timestamp: Date.now(),
-      warning
+      warning,
+      candidateDiagnostics
     });
 
     figmaScanTimestamps.set(projectId, scanStartedAt);
@@ -4772,7 +4816,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       assetsFound: scanResult.assets.length,
       addedCount,
       errors,
-      warning
+      warning,
+      candidateDiagnostics
     };
   } catch (e) {
     console.error('[crate][figma] pollFigmaForProject error:', redactFigmaLogText(e.message));

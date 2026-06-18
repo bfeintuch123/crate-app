@@ -166,6 +166,64 @@ function currentPageScopeWarning(statusReason) {
   }
 }
 
+function incrementCount(target, key) {
+  const safeKey = formatFigmaParserScalar(key || 'unknown', 'unknown');
+  target[safeKey] = (target[safeKey] || 0) + 1;
+}
+
+function summarizeFigmaCandidateDiagnostics({
+  fileKeys = [],
+  scopeEntries = [],
+  metadataDiagnostics = [],
+  extractionDiagnostics = []
+} = {}) {
+  const uniqueCandidateCount = new Set(
+    (Array.isArray(fileKeys) ? fileKeys : [])
+      .filter(key => typeof key === 'string' && key.trim())
+      .map(key => key.trim())
+  ).size;
+
+  const summary = {
+    candidateCount: uniqueCandidateCount,
+    candidateStrategyCounts: {},
+    parsedScopeCounts: {
+      withPageOrNode: 0,
+      withoutPageOrNode: 0
+    },
+    metadataStatusCounts: {},
+    fileFetchStatusCounts: {},
+    lockStatusCounts: {},
+    statusReasonCounts: {},
+    assetResultCounts: {
+      withAssets: 0,
+      withoutAssets: 0
+    }
+  };
+
+  for (const entry of Array.isArray(scopeEntries) ? scopeEntries : []) {
+    incrementCount(summary.candidateStrategyCounts, entry && entry.isCandidateFallback ? 'fallback' : 'primary');
+    if (entry && (entry.requestedPageId || entry.requestedNodeId)) {
+      summary.parsedScopeCounts.withPageOrNode += 1;
+    } else {
+      summary.parsedScopeCounts.withoutPageOrNode += 1;
+    }
+  }
+
+  for (const diagnostic of Array.isArray(metadataDiagnostics) ? metadataDiagnostics : []) {
+    incrementCount(summary.metadataStatusCounts, diagnostic && diagnostic.metadataStatus);
+  }
+
+  for (const diagnostic of Array.isArray(extractionDiagnostics) ? extractionDiagnostics : []) {
+    incrementCount(summary.fileFetchStatusCounts, diagnostic && diagnostic.fileFetchStatus);
+    incrementCount(summary.lockStatusCounts, diagnostic && diagnostic.lockStatus);
+    incrementCount(summary.statusReasonCounts, diagnostic && diagnostic.statusReason ? diagnostic.statusReason : 'none');
+    if (diagnostic && diagnostic.assetCount > 0) summary.assetResultCounts.withAssets += 1;
+    else summary.assetResultCounts.withoutAssets += 1;
+  }
+
+  return summary;
+}
+
 class FigmaParser extends BaseParser {
   /**
    * Figma-specific dedupe.
@@ -1179,6 +1237,7 @@ class FigmaParser extends BaseParser {
     const fileKeys = Array.from(new Set((options.fileKeys || []).filter(key => typeof key === 'string' && key.trim())));
     const recentFiles = [];
     const errors = [];
+    const candidateDiagnostics = [];
     const seenKeys = new Set();
     const trackedKeySet = new Set(fileKeys);
     const trackedKeyIndex = new Map(fileKeys.map((key, index) => [key, index]));
@@ -1285,8 +1344,13 @@ class FigmaParser extends BaseParser {
 
       // --- Method 2: Direct file tracking (ALL plans, authoritative) ---
       for (const [trackedIndex, fileKey] of fileKeys.entries()) {
+        const candidateDiagnostic = {
+          metadataStatus: 'not-attempted'
+        };
         const meta = await this.getFileMetadata(fileKey);
         if (meta) {
+          candidateDiagnostic.metadataStatus = 'success';
+          candidateDiagnostics.push(candidateDiagnostic);
           upsertRecentFile({
             ...meta,
             trackedIndex
@@ -1300,6 +1364,8 @@ class FigmaParser extends BaseParser {
           continue;
         }
 
+        candidateDiagnostic.metadataStatus = 'failed';
+        candidateDiagnostics.push(candidateDiagnostic);
         upsertRecentFile({
           key: fileKey,
           name: `Tracked File ${trackedKeyIndex.get(fileKey) != null ? trackedKeyIndex.get(fileKey) + 1 : ''}`.trim(),
@@ -1330,11 +1396,11 @@ class FigmaParser extends BaseParser {
         return bLastModified - aLastModified;
       });
 
-      return { recentFiles, errors: redactFigmaParserIssues(errors) };
+      return { recentFiles, errors: redactFigmaParserIssues(errors), candidateDiagnostics };
     } catch (e) {
       console.error('[crate][figma] discoverRecentFiles error:', redactFigmaParserText(e.message));
       errors.push(`discoverRecentFiles failed: ${redactFigmaParserText(e.message)}`);
-      return { recentFiles, errors: redactFigmaParserIssues(errors) };
+      return { recentFiles, errors: redactFigmaParserIssues(errors), candidateDiagnostics };
     }
   }
 
@@ -1358,7 +1424,8 @@ class FigmaParser extends BaseParser {
           lockedPageId: null,
           lockedPageName: null,
           statusReason: scopeEntry && scopeEntry.scopeMode === 'current-page' ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
-          warning: null
+          warning: null,
+          fileFetchStatus: 'not-attempted'
         }
       });
     }
@@ -1387,7 +1454,8 @@ class FigmaParser extends BaseParser {
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
-            warning: scope.warning
+            warning: scope.warning,
+            fileFetchStatus: 'success'
           }
         });
       }
@@ -1466,7 +1534,8 @@ class FigmaParser extends BaseParser {
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
-            warning: scope.warning
+            warning: scope.warning,
+            fileFetchStatus: 'success'
           }
         });
       }
@@ -1491,7 +1560,8 @@ class FigmaParser extends BaseParser {
             lockedPageId: scope.lockedPageId,
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
-            warning: scope.warning
+            warning: scope.warning,
+            fileFetchStatus: 'success'
           }
         });
       }
@@ -1544,7 +1614,8 @@ class FigmaParser extends BaseParser {
           lockedPageId: scope.lockedPageId,
           lockedPageName: scope.lockedPageName,
           statusReason: scope.statusReason,
-          warning: scope.warning
+          warning: scope.warning,
+          fileFetchStatus: 'success'
         }
       });
     } catch (e) {
@@ -1561,7 +1632,8 @@ class FigmaParser extends BaseParser {
           lockedPageId: null,
           lockedPageName: null,
           statusReason: isCurrentPage ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
-          warning
+          warning,
+          fileFetchStatus: 'failed'
         }
       });
     }
@@ -1580,7 +1652,7 @@ class FigmaParser extends BaseParser {
    * @returns {Promise<{files: Array, assets: Array, errors: Array}>}
    */
   async autoTrackScan(options = {}) {
-    const result = { files: [], assets: [], errors: [], warnings: [], scopeEntries: [] };
+    const result = { files: [], assets: [], errors: [], warnings: [], scopeEntries: [], candidateDiagnostics: null };
 
     // Verify token first
     const tokenStatus = await this.verifyToken();
@@ -1613,6 +1685,10 @@ class FigmaParser extends BaseParser {
 
     // Handle both old array format and new {recentFiles, errors} format
     const files = Array.isArray(discovery) ? discovery : (discovery.recentFiles || []);
+    const metadataDiagnostics = Array.isArray(discovery && discovery.candidateDiagnostics)
+      ? discovery.candidateDiagnostics
+      : [];
+    const extractionDiagnostics = [];
     if (discovery.errors && discovery.errors.length > 0) {
       result.errors.push(...redactFigmaParserIssues(discovery.errors));
     }
@@ -1633,6 +1709,12 @@ class FigmaParser extends BaseParser {
         if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...redactFigmaParserIssues(extractResult.errors)); }
         if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...redactFigmaParserIssues(extractResult.warnings)); }
         if (extractResult.scope) {
+          extractionDiagnostics.push({
+            fileFetchStatus: extractResult.scope.fileFetchStatus || 'unknown',
+            lockStatus: extractResult.scope.lockStatus || 'unknown',
+            statusReason: extractResult.scope.statusReason || null,
+            assetCount: Array.isArray(extractResult.assets) ? extractResult.assets.length : 0
+          });
           result.scopeEntries.push({
             fileKey: file.key,
             fileName: file.name,
@@ -1641,7 +1723,8 @@ class FigmaParser extends BaseParser {
             lockedPageId: extractResult.scope.lockedPageId,
             lockedPageName: extractResult.scope.lockedPageName,
             statusReason: extractResult.scope.statusReason || null,
-            warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null
+            warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null,
+            fileFetchStatus: extractResult.scope.fileFetchStatus || null
           });
         }
         for (const asset of extractResult.assets) {
@@ -1654,6 +1737,12 @@ class FigmaParser extends BaseParser {
       }
     }
 
+    result.candidateDiagnostics = summarizeFigmaCandidateDiagnostics({
+      fileKeys,
+      scopeEntries,
+      metadataDiagnostics,
+      extractionDiagnostics
+    });
     result.errors = redactFigmaParserIssues(result.errors);
     result.warnings = redactFigmaParserIssues(result.warnings);
     return result;
