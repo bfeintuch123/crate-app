@@ -240,6 +240,7 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
     warning: 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.',
     candidateDiagnostics: {
       candidateCount: 2,
+      candidateSourceCounts: { 'prototype-route': 1, 'canonical-param': 1 },
       parsedScopeCounts: { withPageOrNode: 2, withoutPageOrNode: 0 },
       metadataStatusCounts: { failed: 2 },
       fileFetchStatusCounts: { failed: 2 },
@@ -253,6 +254,7 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
   const text = elements['figma-scan-status'].textContent;
   assert.match(text, /2 files, 0 assets/);
   assert.match(text, /Figma candidate check: 2 candidates/);
+  assert.match(text, /sources prototype-route 1, canonical-param 1/);
   assert.match(text, /page\/node parsed 2/);
   assert.match(text, /metadata ok 0\/failed 2/);
   assert.match(text, /file ok 0\/failed 2/);

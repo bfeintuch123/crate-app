@@ -665,8 +665,13 @@ test('Figma link candidate fallback can lock and stage assets without widening s
   assert.deepEqual(lastFigmaScanOptions.fileKeys, [primaryKey, fallbackKey]);
   assert.equal(lastFigmaScanOptions.scopeEntries.length, 2);
   assert.deepEqual(lastFigmaScanOptions.scopeEntries.map(entry => entry.key), [primaryKey, fallbackKey]);
+  assert.deepEqual(lastFigmaScanOptions.scopeEntries.map(entry => entry.candidateSource), ['canonical-param', 'prototype-route']);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, primaryKey);
   assert.deepEqual(fresh.figmaSession.trackedFiles[0].candidateKeys, [primaryKey, fallbackKey]);
+  assert.deepEqual(fresh.figmaSession.trackedFiles[0].candidateKeyDetails, [
+    { key: primaryKey, source: 'canonical-param' },
+    { key: fallbackKey, source: 'prototype-route' },
+  ]);
   assert.equal(fresh.figmaSession.trackedFiles[0].resolvedKey, fallbackKey);
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Page One');

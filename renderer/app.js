@@ -1536,8 +1536,15 @@ function formatFigmaCandidateDiagnostics(summary) {
   const withPageOrNode = summary.parsedScopeCounts && Number.isFinite(summary.parsedScopeCounts.withPageOrNode)
     ? summary.parsedScopeCounts.withPageOrNode
     : 0;
+  const sourceParts = summary.candidateSourceCounts && typeof summary.candidateSourceCounts === 'object'
+    ? Object.entries(summary.candidateSourceCounts)
+      .filter(([, count]) => Number.isFinite(count) && count > 0)
+      .map(([source, count]) => `${String(source).replace(/[^\w:.-]/g, '_').slice(0, 40)} ${count}`)
+      .slice(0, 4)
+    : [];
 
   const parts = [`Figma candidate check: ${candidateCount} candidate${candidateCount === 1 ? '' : 's'}`];
+  if (sourceParts.length > 0) parts.push(`sources ${sourceParts.join(', ')}`);
   parts.push(`page/node parsed ${withPageOrNode}`);
   parts.push(`metadata ok ${metadataSucceeded}/failed ${metadataFailed}`);
   parts.push(`file ok ${fileFetchSucceeded}/failed ${fileFetchFailed}`);

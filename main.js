@@ -1709,27 +1709,36 @@ function getProjectFigmaScopeMode(project) {
 function normalizeTrackedFigmaFiles(rawTrackedFiles) {
   const { FigmaParser } = require('./parsers/figma');
 
-  const normalizeCandidateKeys = (primaryKey, url = null, rawCandidateKeys = []) => {
-    const keys = [];
+  const normalizeCandidateKeyDetails = (primaryKey, url = null, rawCandidateKeys = [], rawCandidateDetails = []) => {
+    const details = [];
     const seen = new Set();
-    const pushKey = (value) => {
+    const pushKey = (value, source = 'unknown') => {
       if (typeof value !== 'string' || !value.trim()) return;
       const trimmed = value.trim();
       if (seen.has(trimmed)) return;
       seen.add(trimmed);
-      keys.push(trimmed);
+      details.push({
+        key: trimmed,
+        source: formatFigmaLogScalar(source, 'unknown')
+      });
     };
 
-    pushKey(primaryKey);
+    const urlCandidateDetails = url ? FigmaParser._figmaFileKeyCandidateDetails(url) : [];
+    const urlSourceByKey = new Map(urlCandidateDetails.map(candidate => [candidate.key, candidate.source]));
+    pushKey(primaryKey, urlSourceByKey.get(primaryKey) || 'primary');
     if (url) {
-      for (const candidate of FigmaParser._figmaFileKeyCandidates(url)) {
-        pushKey(candidate);
+      for (const candidate of urlCandidateDetails) {
+        pushKey(candidate.key, candidate.source);
       }
     }
     for (const candidate of Array.isArray(rawCandidateKeys) ? rawCandidateKeys : []) {
-      pushKey(candidate);
+      pushKey(candidate, urlSourceByKey.get(candidate) || 'stored-candidate');
     }
-    return keys;
+    for (const candidate of Array.isArray(rawCandidateDetails) ? rawCandidateDetails : []) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      pushKey(candidate.key, candidate.source || urlSourceByKey.get(candidate.key) || 'stored-candidate');
+    }
+    return details;
   };
 
   return (Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [])
@@ -1738,11 +1747,13 @@ function normalizeTrackedFigmaFiles(rawTrackedFiles) {
         const trimmed = entry.trim();
         if (!trimmed) return null;
         const parsedKey = FigmaParser.extractFileKey(trimmed);
-        const candidateKeys = normalizeCandidateKeys(parsedKey || trimmed, parsedKey ? trimmed : null);
+        const candidateKeyDetails = normalizeCandidateKeyDetails(parsedKey || trimmed, parsedKey ? trimmed : null);
+        const candidateKeys = candidateKeyDetails.map(candidate => candidate.key);
         return {
           key: parsedKey || trimmed,
           url: parsedKey ? trimmed : null,
           candidateKeys,
+          candidateKeyDetails,
         };
       }
 
@@ -1750,8 +1761,9 @@ function normalizeTrackedFigmaFiles(rawTrackedFiles) {
       const key = typeof entry.key === 'string' ? entry.key.trim() : '';
       if (!key) return null;
       const url = typeof entry.url === 'string' && entry.url.trim() ? entry.url.trim() : null;
-      const candidateKeys = normalizeCandidateKeys(key, url, entry.candidateKeys);
-      return { key, url, candidateKeys };
+      const candidateKeyDetails = normalizeCandidateKeyDetails(key, url, entry.candidateKeys, entry.candidateKeyDetails);
+      const candidateKeys = candidateKeyDetails.map(candidate => candidate.key);
+      return { key, url, candidateKeys, candidateKeyDetails };
     })
     .filter(Boolean);
 }
@@ -1829,6 +1841,7 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
         key: trackedFile.key,
         url: trackedFile.url,
         candidateKeys: trackedFile.candidateKeys,
+        candidateKeyDetails: trackedFile.candidateKeyDetails,
         requestedPageId: parsedScope.requestedPageId || null,
         requestedNodeId: parsedScope.requestedNodeId || null,
         lockStatus,
@@ -1847,21 +1860,37 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
 }
 
 function figmaTrackedFileKeys(trackedFile) {
+  return figmaTrackedFileKeyDetails(trackedFile).map(candidate => candidate.key);
+}
+
+function figmaTrackedFileKeyDetails(trackedFile) {
   const keys = [];
   const seen = new Set();
-  const pushKey = (value) => {
+  const pushKey = (value, source = 'unknown') => {
     if (typeof value !== 'string' || !value.trim()) return;
     const trimmed = value.trim();
     if (seen.has(trimmed)) return;
     seen.add(trimmed);
-    keys.push(trimmed);
+    keys.push({
+      key: trimmed,
+      source: formatFigmaLogScalar(source, 'unknown')
+    });
   };
-  pushKey(trackedFile && trackedFile.key);
+  const sourceByKey = new Map(
+    (Array.isArray(trackedFile && trackedFile.candidateKeyDetails) ? trackedFile.candidateKeyDetails : [])
+      .filter(candidate => candidate && typeof candidate.key === 'string' && candidate.key.trim())
+      .map(candidate => [candidate.key.trim(), formatFigmaLogScalar(candidate.source, 'unknown')])
+  );
+  pushKey(trackedFile && trackedFile.key, sourceByKey.get(trackedFile && trackedFile.key) || 'primary');
   for (const candidate of Array.isArray(trackedFile && trackedFile.candidateKeys) ? trackedFile.candidateKeys : []) {
-    pushKey(candidate);
+    pushKey(candidate, sourceByKey.get(candidate) || 'stored-candidate');
+  }
+  for (const candidate of Array.isArray(trackedFile && trackedFile.candidateKeyDetails) ? trackedFile.candidateKeyDetails : []) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    pushKey(candidate.key, candidate.source);
   }
   if (typeof (trackedFile && trackedFile.resolvedKey) === 'string') {
-    pushKey(trackedFile.resolvedKey);
+    pushKey(trackedFile.resolvedKey, sourceByKey.get(trackedFile.resolvedKey) || 'resolved');
   }
   return keys;
 }
@@ -1875,8 +1904,10 @@ function expandFigmaTrackedFilesForScan(rawTrackedFiles) {
   const expanded = [];
   const seen = new Set();
   for (const trackedFile of Array.isArray(rawTrackedFiles) ? rawTrackedFiles : []) {
-    const candidateKeys = figmaTrackedFileKeys(trackedFile);
-    for (const key of candidateKeys) {
+    const candidateDetails = figmaTrackedFileKeyDetails(trackedFile);
+    const candidateKeys = candidateDetails.map(candidate => candidate.key);
+    for (const candidate of candidateDetails) {
+      const key = candidate.key;
       if (!key || seen.has(key)) continue;
       seen.add(key);
       expanded.push({
@@ -1884,6 +1915,7 @@ function expandFigmaTrackedFilesForScan(rawTrackedFiles) {
         key,
         primaryKey: trackedFile.key,
         candidateKeys,
+        candidateSource: candidate.source,
         isCandidateFallback: key !== trackedFile.key,
       });
     }
@@ -2227,6 +2259,11 @@ function summarizeTrackedFigmaFilesForLog(rawTrackedFiles) {
     lockStatus: formatFigmaLogScalar(entry && entry.lockStatus),
     hasUrl: !!(entry && typeof entry.url === 'string' && entry.url.trim()),
     candidateCount: figmaTrackedFileKeys(entry).length,
+    candidateSourceCounts: figmaTrackedFileKeyDetails(entry).reduce((acc, candidate) => {
+      const source = formatFigmaLogScalar(candidate && candidate.source, 'unknown');
+      acc[source] = (acc[source] || 0) + 1;
+      return acc;
+    }, {}),
     hasRequestedScope: !!(entry && (entry.requestedPageId || entry.requestedNodeId)),
     hasLockedPage: !!(entry && entry.lockedPageId),
     statusReason: formatFigmaLogScalar(entry && entry.statusReason, 'none'),
@@ -2253,6 +2290,7 @@ function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
   return {
     candidateCount: Number.isFinite(diagnostics.candidateCount) ? diagnostics.candidateCount : 0,
     candidateStrategyCounts: safeCounts(diagnostics.candidateStrategyCounts),
+    candidateSourceCounts: safeCounts(diagnostics.candidateSourceCounts),
     parsedScopeCounts: {
       withPageOrNode: Number.isFinite(diagnostics.parsedScopeCounts && diagnostics.parsedScopeCounts.withPageOrNode)
         ? diagnostics.parsedScopeCounts.withPageOrNode
