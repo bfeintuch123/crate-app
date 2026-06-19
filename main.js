@@ -2316,6 +2316,71 @@ function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
   };
 }
 
+function hasFigmaRateLimitDiagnostic(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return false;
+  const metadataReasons = diagnostics.metadataFailureReasonCounts || {};
+  const fileFetchReasons = diagnostics.fileFetchFailureReasonCounts || {};
+  return Number(metadataReasons['rate-limited'] || 0) > 0 ||
+    Number(fileFetchReasons['rate-limited'] || 0) > 0;
+}
+
+function figmaRateLimitWarning() {
+  return 'Figma is temporarily rate limiting this scan. Crate will retry after a cooldown; no Figma assets will be captured for this file in this session until Figma allows the request.';
+}
+
+function setFigmaRateLimitBackoff(projectId) {
+  const retryAt = Date.now() + FIGMA_RATE_LIMIT_BACKOFF_MS;
+  figmaRateLimitBackoffs.set(projectId, retryAt);
+  return retryAt;
+}
+
+function clearFigmaRateLimitBackoff(projectId) {
+  figmaRateLimitBackoffs.delete(projectId);
+}
+
+function getFigmaTrackingProjects() {
+  return getProjects().filter(project =>
+    project &&
+    project.status === 'watching' &&
+    projectHasFigmaTrackedFiles(project)
+  );
+}
+
+function getActiveFigmaPollerProjectCount() {
+  const activeProjectIds = new Set([
+    ...figmaPollers.keys(),
+    ...figmaPollerStarting,
+    ...figmaInProgress,
+    ...figmaManualScanInFlight,
+  ]);
+  return activeProjectIds.size;
+}
+
+function updateFigmaSessionRateLimitWarning(projectId) {
+  return mutateProject(projectId, (project) => {
+    if (!project.figmaSession || !Array.isArray(project.figmaSession.trackedFiles)) return null;
+    let changed = false;
+    const warning = figmaRateLimitWarning();
+    for (const trackedFile of project.figmaSession.trackedFiles) {
+      if (trackedFile.lockStatus !== 'unresolved') {
+        trackedFile.lockStatus = 'unresolved';
+        changed = true;
+      }
+      if (trackedFile.statusReason !== 'figma-current-page-rate-limited') {
+        trackedFile.statusReason = 'figma-current-page-rate-limited';
+        changed = true;
+      }
+      if (trackedFile.warning !== warning) {
+        trackedFile.warning = warning;
+        changed = true;
+      }
+    }
+    if (!changed) return null;
+    project.figmaSession.warnings = rebuildFigmaSessionWarnings(project.figmaSession);
+    return { figmaSession: project.figmaSession };
+  });
+}
+
 async function shouldKeepObservedSourceFileForPackaging(file, project) {
   const watchStart = project.watchStartedAt || project.createdAt || 0;
   if (!watchStart || !file || !file.path) return true;
@@ -3962,7 +4027,9 @@ const figmaPollerStarting = new Set(); // guard: projectIds with initial poll in
 const figmaInProgress = new Set(); // projectIds currently mid-poll
 const figmaManualScanInFlight = new Set(); // projectIds currently running a manual Scan Now
 const figmaScanTimestamps = new Map(); // projectId -> last scan timestamp (ms)
+const figmaRateLimitBackoffs = new Map(); // projectId -> retry-after timestamp (ms)
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
+const FIGMA_RATE_LIMIT_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes
 const PACKAGE_SCAN_WAIT_TIMEOUT_MS = 30000;
 // Keep a narrow overlap between incremental polls so a just-added image ref can't
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
@@ -4695,6 +4762,21 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   const project = currentProjects.find(p => p.id === projectId);
   if (!project || project.status !== 'watching') return { skipped: true, reason: 'not-watching' };
   const scanStartedAt = Date.now();
+  const rateLimitRetryAt = figmaRateLimitBackoffs.get(projectId) || 0;
+  if (rateLimitRetryAt > scanStartedAt) {
+    const warning = figmaRateLimitWarning();
+    sendToRenderer('figma:scan-complete', {
+      projectId,
+      filesFound: 0,
+      assetsFound: 0,
+      addedCount: 0,
+      errors: [],
+      timestamp: Date.now(),
+      warning,
+      retryAfterMs: rateLimitRetryAt - scanStartedAt
+    });
+    return { skipped: true, reason: 'rate-limited-backoff', retryAfterMs: rateLimitRetryAt - scanStartedAt, warning };
+  }
 
   // Check if Figma is connected
   const { FigmaParser } = require('./parsers/figma');
@@ -4751,10 +4833,22 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
 
     const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
     const activeProject = getProjects().find(p => p.id === projectId) || latestProject;
-    const activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
+    let activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
     const candidateDiagnostics = summarizeFigmaCandidateDiagnosticsForLog(scanResult.candidateDiagnostics);
     if (candidateDiagnostics) {
       console.log(`[crate][figma] candidate diagnostics: ${JSON.stringify(candidateDiagnostics)}`);
+    }
+    const isRateLimited = hasFigmaRateLimitDiagnostic(candidateDiagnostics);
+    if (isRateLimited) {
+      setFigmaRateLimitBackoff(projectId);
+      const rateLimitScopeUpdate = updateFigmaSessionRateLimitWarning(projectId);
+      if (rateLimitScopeUpdate) {
+        sendToRenderer('project:updated', { projectId });
+      }
+      const refreshedProject = getProjects().find(p => p.id === projectId) || activeProject;
+      activeWarnings = (((refreshedProject || {}).figmaSession || {}).warnings) || activeWarnings;
+    } else {
+      clearFigmaRateLimitBackoff(projectId);
     }
 
     if (scanResult.errors.length > 0) {
@@ -4940,6 +5034,7 @@ function stopFigmaPolling(projectId) {
   figmaInProgress.delete(projectId);
   figmaManualScanInFlight.delete(projectId);
   figmaScanTimestamps.delete(projectId);
+  figmaRateLimitBackoffs.delete(projectId);
 }
 
 // --- Photoshop + InDesign Polling (v2.3.0) ---
@@ -9370,6 +9465,7 @@ ipcMain.handle('projects:delete-all', () => {
   figmaInProgress.clear();
   figmaManualScanInFlight.clear();
   figmaScanTimestamps.clear();
+  figmaRateLimitBackoffs.clear();
   // Clean up PS/InDesign pollers (v2.3.0)
   for (const [, intervalId] of psPollers) {
     clearInterval(intervalId);
@@ -9455,13 +9551,10 @@ ipcMain.handle('figma:status', async () => {
 
   // Get auto-tracking stats
   const projects = getProjects();
-  const activePollers = [];
+  const trackingProjects = getFigmaTrackingProjects();
   let totalFigmaAssets = 0;
 
   for (const project of projects) {
-    if (figmaPollers.has(project.id)) {
-      activePollers.push(project.id);
-    }
     // Count Figma-sourced files across all projects
     const figmaFiles = (project.files || []).filter(f => f.source === 'figma-auto');
     totalFigmaAssets += figmaFiles.length;
@@ -9469,8 +9562,9 @@ ipcMain.handle('figma:status', async () => {
 
   return {
     connected: !!token,
-    autoTracking: activePollers.length > 0,
-    activeProjectCount: activePollers.length,
+    autoTracking: !!token && trackingProjects.length > 0,
+    activeProjectCount: trackingProjects.length,
+    activePollerCount: getActiveFigmaPollerProjectCount(),
     totalFigmaAssets
   };
 });
@@ -9483,6 +9577,7 @@ ipcMain.handle('figma:connect', async (event, token) => {
   const stored = await parser.storeToken(token);
 
   if (stored) {
+    figmaRateLimitBackoffs.clear();
     // Start Figma polling for any currently watching projects
     const projects = getProjects();
     for (const project of projects) {
@@ -9509,6 +9604,7 @@ ipcMain.handle('figma:disconnect', async () => {
   figmaInProgress.clear();
   figmaManualScanInFlight.clear();
   figmaScanTimestamps.clear();
+  figmaRateLimitBackoffs.clear();
 
   return { success: deleted };
 });

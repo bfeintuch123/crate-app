@@ -199,6 +199,8 @@ const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
 let storedFigmaToken = null;
 let nextFigmaScanResult = null;
 let lastFigmaScanOptions = null;
+let figmaScanInvocationCount = 0;
+let figmaScanDelayMs = 0;
 class TestFigmaParser extends RealFigmaParser {
   async getStoredToken() {
     return storedFigmaToken;
@@ -217,7 +219,11 @@ class TestFigmaParser extends RealFigmaParser {
   }
 
   async autoTrackScan(options = {}) {
+    figmaScanInvocationCount += 1;
     lastFigmaScanOptions = JSON.parse(JSON.stringify(options));
+    if (figmaScanDelayMs > 0) {
+      await new Promise(resolve => originalSetTimeout(resolve, figmaScanDelayMs));
+    }
     return JSON.parse(JSON.stringify(nextFigmaScanResult || {
       files: [],
       assets: [],
@@ -256,7 +262,7 @@ async function callIpc(channel, ...args) {
 
 async function getActiveFigmaPollerCount() {
   const status = await callIpc('figma:status');
-  return status.activeProjectCount || 0;
+  return status.activePollerCount || 0;
 }
 
 async function waitForActiveFigmaPollerCount(expected) {
@@ -280,6 +286,8 @@ async function cleanupProjectsAndTimers() {
   storedFigmaToken = null;
   nextFigmaScanResult = null;
   lastFigmaScanOptions = null;
+  figmaScanInvocationCount = 0;
+  figmaScanDelayMs = 0;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
   await callIpc('projects:delete-all');
@@ -361,6 +369,40 @@ function figmaScanResult(assets, scopeEntries = []) {
     errors: [],
     warnings: [],
     scopeEntries,
+  };
+}
+
+function figmaRateLimitedScanResult() {
+  return {
+    files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
+    assets: [],
+    errors: [],
+    warnings: [],
+    scopeEntries: [{
+      fileKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'unresolved',
+      lockedPageId: null,
+      lockedPageName: null,
+      statusReason: 'figma-current-page-file-fetch-failed',
+      warning: 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.',
+      fileFetchStatus: 'failed',
+      fileFetchFailureReason: 'rate-limited',
+    }],
+    candidateDiagnostics: {
+      candidateCount: 1,
+      candidateStrategyCounts: { primary: 1 },
+      candidateSourceCounts: { 'direct-route': 1 },
+      parsedScopeCounts: { withPageOrNode: 1, withoutPageOrNode: 0 },
+      metadataStatusCounts: { failed: 1 },
+      metadataFailureReasonCounts: { 'rate-limited': 1 },
+      fileFetchStatusCounts: { failed: 1 },
+      fileFetchFailureReasonCounts: { 'rate-limited': 1 },
+      lockStatusCounts: { unresolved: 1 },
+      statusReasonCounts: { 'figma-current-page-file-fetch-failed': 1 },
+      assetResultCounts: { withAssets: 0, withoutAssets: 1 },
+    },
   };
 }
 
@@ -712,6 +754,83 @@ test('figma:connect starts polling for linked watching projects', async () => {
   const disconnected = await callIpc('figma:disconnect');
   assert.equal(disconnected.success, true);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('figma:status counts linked watching projects separately from active pollers', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Phase2-status-linked-project-count',
+    'branding',
+    'current-page',
+    'https://www.figma.com/design/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+
+  let status = await callIpc('figma:status');
+  assert.equal(status.connected, false);
+  assert.equal(status.activeProjectCount, 1);
+  assert.equal(status.activePollerCount, 0);
+
+  figmaScanDelayMs = 80;
+  nextFigmaScanResult = figmaScanResult([], []);
+  const connectPromise = callIpc('figma:connect', 'test-token');
+
+  await waitForActiveFigmaPollerCount(1);
+  status = await callIpc('figma:status');
+  assert.equal(status.connected, true);
+  assert.equal(status.autoTracking, true);
+  assert.equal(status.activeProjectCount, 1);
+  assert.equal(status.activePollerCount, 1);
+
+  const connected = await connectPromise;
+  assert.equal(connected.success, true);
+  await waitForActiveFigmaPollerCount(1);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+});
+
+test('Figma rate-limit diagnostics enter cooldown and surface a safe project warning', async () => {
+  const project = await createLinkedFigmaProject('Figma Rate Limit Cooldown');
+  nextFigmaScanResult = figmaRateLimitedScanResult();
+
+  const firstScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(firstScan.success, true);
+  assert.equal(figmaScanInvocationCount, 1);
+
+  const rateLimitedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const tracked = rateLimitedProject.figmaSession.trackedFiles[0];
+  assert.equal(tracked.lockStatus, 'unresolved');
+  assert.equal(tracked.statusReason, 'figma-current-page-rate-limited');
+  assert.match(tracked.warning, /rate limiting/i);
+  assert.equal(tracked.warning.includes('figma.com'), false);
+  assert.equal(tracked.warning.includes('token'), false);
+  assert.equal(rateLimitedProject.files.length, 0);
+
+  setFigmaDownloadResponse('should not download during cooldown');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/rate-limit-follow-up.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-rate-follow-up',
+    imageRef: 'img-rate-follow-up',
+    name: 'Rate Limit Follow Up',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const secondScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(secondScan.success, true);
+  assert.equal(figmaScanInvocationCount, 1, 'cooldown should prevent an immediate second API scan');
+  const afterCooldownSkip = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(afterCooldownSkip.files.length, 0);
 });
 
 test('figmaSession snapshot reads tracked files from the project, not settings', async () => {
