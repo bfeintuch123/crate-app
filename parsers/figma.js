@@ -113,10 +113,44 @@ function figmaApiFailureMessage(endpoint, status = null, detail = null) {
   return `Figma API request failed (${parts.join(', ')})`;
 }
 
-function safeFigmaParserError(message) {
+function safeFigmaParserError(message, details = {}) {
   const error = new Error(message);
   error._crateFigmaParserSafe = true;
+  if (details && typeof details === 'object') {
+    if (details.status != null) error._crateFigmaApiStatus = details.status;
+    if (details.endpointCategory) error._crateFigmaApiEndpointCategory = details.endpointCategory;
+    if (details.reason) error._crateFigmaApiFailureReason = details.reason;
+  }
   return error;
+}
+
+function figmaApiFailureReasonFromStatus(status) {
+  if (status === 401) return 'invalid-token';
+  if (status === 403) return 'access-denied';
+  if (status === 404) return 'file-not-found';
+  if (status === 429) return 'rate-limited';
+  if (Number.isInteger(status) && status >= 500) return 'server-error';
+  if (Number.isInteger(status)) return `status-${status}`;
+  return 'request-failed';
+}
+
+function classifyFigmaParserFailure(value) {
+  if (value && typeof value === 'object') {
+    if (typeof value._crateFigmaApiFailureReason === 'string' && value._crateFigmaApiFailureReason.trim()) {
+      return formatFigmaParserScalar(value._crateFigmaApiFailureReason, 'request-failed');
+    }
+    if (Number.isInteger(value._crateFigmaApiStatus)) {
+      return figmaApiFailureReasonFromStatus(value._crateFigmaApiStatus);
+    }
+  }
+
+  const text = figmaParserText(value).toLowerCase();
+  if (text.includes('invalid figma api token') || text.includes('personal access token')) return 'invalid-token';
+  if (text.includes('access denied') || text.includes('permission') || text.includes('forbidden') || text.includes('denied')) return 'access-denied';
+  if (text.includes('not found')) return 'file-not-found';
+  if (text.includes('rate limit')) return 'rate-limited';
+  if (text.includes('timed out') || text.includes('timeout')) return 'timeout';
+  return 'request-failed';
 }
 
 const FIGMA_SCOPE_REASONS = Object.freeze({
@@ -195,7 +229,9 @@ function summarizeFigmaCandidateDiagnostics({
       withoutPageOrNode: 0
     },
     metadataStatusCounts: {},
+    metadataFailureReasonCounts: {},
     fileFetchStatusCounts: {},
+    fileFetchFailureReasonCounts: {},
     lockStatusCounts: {},
     statusReasonCounts: {},
     assetResultCounts: {
@@ -216,10 +252,16 @@ function summarizeFigmaCandidateDiagnostics({
 
   for (const diagnostic of Array.isArray(metadataDiagnostics) ? metadataDiagnostics : []) {
     incrementCount(summary.metadataStatusCounts, diagnostic && diagnostic.metadataStatus);
+    if (diagnostic && diagnostic.metadataStatus === 'failed') {
+      incrementCount(summary.metadataFailureReasonCounts, diagnostic.metadataFailureReason || 'unknown');
+    }
   }
 
   for (const diagnostic of Array.isArray(extractionDiagnostics) ? extractionDiagnostics : []) {
     incrementCount(summary.fileFetchStatusCounts, diagnostic && diagnostic.fileFetchStatus);
+    if (diagnostic && diagnostic.fileFetchStatus === 'failed') {
+      incrementCount(summary.fileFetchFailureReasonCounts, diagnostic.fileFetchFailureReason || 'unknown');
+    }
     incrementCount(summary.lockStatusCounts, diagnostic && diagnostic.lockStatus);
     incrementCount(summary.statusReasonCounts, diagnostic && diagnostic.statusReason ? diagnostic.statusReason : 'none');
     if (diagnostic && diagnostic.assetCount > 0) summary.assetResultCounts.withAssets += 1;
@@ -534,28 +576,36 @@ class FigmaParser extends BaseParser {
 
       if (!response.ok) {
         const status = response.status;
+        const reason = figmaApiFailureReasonFromStatus(status);
+        const endpointCategory = figmaEndpointCategory(endpoint);
         if (status === 401) {
-          throw safeFigmaParserError('Invalid Figma API token. Please check your Personal Access Token.');
+          throw safeFigmaParserError('Invalid Figma API token. Please check your Personal Access Token.', { status, reason, endpointCategory });
         } else if (status === 403) {
-          throw safeFigmaParserError('Access denied. You may not have permission to view this Figma file.');
+          throw safeFigmaParserError('Access denied. You may not have permission to view this Figma file.', { status, reason, endpointCategory });
         } else if (status === 404) {
-          throw safeFigmaParserError('Figma file not found. Check that the file URL is correct and the file still exists.');
+          throw safeFigmaParserError('Figma file not found. Check that the file URL is correct and the file still exists.', { status, reason, endpointCategory });
         } else if (status === 429) {
-          throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.');
+          throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.', { status, reason, endpointCategory });
         } else {
-          throw safeFigmaParserError(figmaApiFailureMessage(endpoint, status));
+          throw safeFigmaParserError(figmaApiFailureMessage(endpoint, status), { status, reason, endpointCategory });
         }
       }
 
       try {
         return await response.json();
       } catch (e) {
-        throw safeFigmaParserError(figmaApiFailureMessage(endpoint));
+        throw safeFigmaParserError(figmaApiFailureMessage(endpoint), {
+          reason: 'invalid-json',
+          endpointCategory: figmaEndpointCategory(endpoint)
+        });
       }
     } catch (e) {
       clearTimeout(timeoutId);
       if (e && e.name === 'AbortError') {
-        throw safeFigmaParserError(figmaApiFailureMessage(endpoint, null, 'timed out after 30s'));
+        throw safeFigmaParserError(figmaApiFailureMessage(endpoint, null, 'timed out after 30s'), {
+          reason: 'timeout',
+          endpointCategory: figmaEndpointCategory(endpoint)
+        });
       }
       if (e && e._crateFigmaParserSafe) throw e;
       throw safeFigmaParserError(figmaApiFailureMessage(endpoint));
@@ -1184,7 +1234,7 @@ class FigmaParser extends BaseParser {
    * @param {string} fileKey - Figma file key
    * @returns {Promise<{key: string, name: string, lastModified: string, lastModifiedMs: number}|null>}
    */
-  async getFileMetadata(fileKey) {
+  async getFileMetadata(fileKey, diagnostic = null) {
     const token = await this.getStoredToken();
     if (!token || !fetch) return null;
 
@@ -1214,6 +1264,9 @@ class FigmaParser extends BaseParser {
           teamName: 'Manual'
         };
       } catch (e) {
+        if (diagnostic && typeof diagnostic === 'object') {
+          diagnostic.metadataFailureReason = classifyFigmaParserFailure(e);
+        }
         console.error(
           `[crate][figma] getFileMetadata error for ${formatFigmaParserScalar(fileKey)}:`,
           redactFigmaParserText(e.message)
@@ -1360,7 +1413,7 @@ class FigmaParser extends BaseParser {
         const candidateDiagnostic = {
           metadataStatus: 'not-attempted'
         };
-        const meta = await this.getFileMetadata(fileKey);
+        const meta = await this.getFileMetadata(fileKey, candidateDiagnostic);
         if (meta) {
           candidateDiagnostic.metadataStatus = 'success';
           candidateDiagnostics.push(candidateDiagnostic);
@@ -1438,7 +1491,8 @@ class FigmaParser extends BaseParser {
           lockedPageName: null,
           statusReason: scopeEntry && scopeEntry.scopeMode === 'current-page' ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
           warning: null,
-          fileFetchStatus: 'not-attempted'
+          fileFetchStatus: 'not-attempted',
+          fileFetchFailureReason: 'not-connected'
         }
       });
     }
@@ -1638,6 +1692,7 @@ class FigmaParser extends BaseParser {
         ? FIGMA_SCOPE_REASONS.PROTOTYPE_FILE_FETCH_FAILED
         : FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED;
       const warning = isCurrentPage ? currentPageScopeWarning(statusReason) : null;
+      const fileFetchFailureReason = classifyFigmaParserFailure(e);
       return this._figmaExtractionResult({
         assets: [],
         errors: [redactFigmaParserText(e.message)],
@@ -1649,7 +1704,8 @@ class FigmaParser extends BaseParser {
           lockedPageName: null,
           statusReason: isCurrentPage ? statusReason : null,
           warning,
-          fileFetchStatus: 'failed'
+          fileFetchStatus: 'failed',
+          fileFetchFailureReason
         }
       });
     }
@@ -1728,6 +1784,7 @@ class FigmaParser extends BaseParser {
         if (extractResult.scope) {
           extractionDiagnostics.push({
             fileFetchStatus: extractResult.scope.fileFetchStatus || 'unknown',
+            fileFetchFailureReason: extractResult.scope.fileFetchFailureReason || null,
             lockStatus: extractResult.scope.lockStatus || 'unknown',
             statusReason: extractResult.scope.statusReason || null,
             candidateSource: scopeEntry && scopeEntry.candidateSource,
@@ -1743,7 +1800,8 @@ class FigmaParser extends BaseParser {
             lockedPageName: extractResult.scope.lockedPageName,
             statusReason: extractResult.scope.statusReason || null,
             warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null,
-            fileFetchStatus: extractResult.scope.fileFetchStatus || null
+            fileFetchStatus: extractResult.scope.fileFetchStatus || null,
+            fileFetchFailureReason: extractResult.scope.fileFetchFailureReason || null
           });
         }
         for (const asset of extractResult.assets) {
