@@ -163,6 +163,19 @@ class FileFetchFailureFigmaParser extends FigmaParser {
   }
 }
 
+class RateLimitedFileFetchFigmaParser extends FigmaParser {
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}`) {
+      throw new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
 class AllCandidateFailureFigmaParser extends FigmaParser {
   async getStoredToken() {
     return 'token';
@@ -757,6 +770,28 @@ test('current-page prototype candidate file fetch failure asks for a design file
   const serialized = `${JSON.stringify(result)}\n${output}`;
   assert.equal(serialized.includes('https://figma.example'), false);
   assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+});
+
+test('current-page rate-limited file fetch surfaces a safe retry warning', async () => {
+  const parser = new RateLimitedFileFetchFigmaParser();
+
+  const { result, output } = await captureConsole(() => parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  }));
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.lockStatus, 'unresolved');
+  assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
+  assert.equal(result.scope.fileFetchFailureReason, 'rate-limited');
+  assert.match(result.scope.warning || '', /rate limiting/i);
+  assert.match(result.scope.warning || '', /retry after a cooldown/i);
+
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
+  assert.equal(serialized.includes('Bearer'), false);
 });
 
 test('current-page locked page with no exportable image refs reports zero image refs safely', async () => {

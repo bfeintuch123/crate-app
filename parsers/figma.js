@@ -184,7 +184,11 @@ const FIGMA_NESTED_URL_PARAM_NAMES = [
   'deeplink'
 ];
 
-function currentPageScopeWarning(statusReason) {
+function currentPageScopeWarning(statusReason, failureReason = null) {
+  if (failureReason === 'rate-limited') {
+    return 'Figma is temporarily rate limiting this scan. Crate will retry after a cooldown; no Figma assets will be captured for this file in this session until Figma allows the request.';
+  }
+
   switch (statusReason) {
     case FIGMA_SCOPE_REASONS.NO_PAGE_OR_NODE:
       return 'Current Page Only could not find a page or node in the tracked Figma URL. No Figma assets will be captured for this file in this session.';
@@ -1691,8 +1695,8 @@ class FigmaParser extends BaseParser {
       const statusReason = isCurrentPage && scopeEntry && scopeEntry.candidateSource === 'prototype-route'
         ? FIGMA_SCOPE_REASONS.PROTOTYPE_FILE_FETCH_FAILED
         : FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED;
-      const warning = isCurrentPage ? currentPageScopeWarning(statusReason) : null;
       const fileFetchFailureReason = classifyFigmaParserFailure(e);
+      const warning = isCurrentPage ? currentPageScopeWarning(statusReason, fileFetchFailureReason) : null;
       return this._figmaExtractionResult({
         assets: [],
         errors: [redactFigmaParserText(e.message)],
