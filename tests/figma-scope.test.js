@@ -365,6 +365,7 @@ test('metadata failure does not block prototype desktop URL with canonical file 
   assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
   assert.equal(result.candidateDiagnostics.candidateCount, 1);
   assert.equal(result.candidateDiagnostics.metadataStatusCounts.failed, 1);
+  assert.equal(result.candidateDiagnostics.metadataFailureReasonCounts['request-failed'], 1);
   assert.equal(result.candidateDiagnostics.fileFetchStatusCounts.success, 1);
   assert.equal(result.candidateDiagnostics.lockStatusCounts.locked, 1);
   assert.equal(result.candidateDiagnostics.assetResultCounts.withAssets, 1);
@@ -406,7 +407,9 @@ test('all current-page candidate failures surface privacy-safe diagnostics', asy
   assert.equal(result.candidateDiagnostics.candidateSourceCounts['canonical-param'], 1);
   assert.equal(result.candidateDiagnostics.parsedScopeCounts.withPageOrNode, 2);
   assert.equal(result.candidateDiagnostics.metadataStatusCounts.failed, 2);
+  assert.equal(result.candidateDiagnostics.metadataFailureReasonCounts['access-denied'], 2);
   assert.equal(result.candidateDiagnostics.fileFetchStatusCounts.failed, 2);
+  assert.equal(result.candidateDiagnostics.fileFetchFailureReasonCounts['access-denied'], 2);
   assert.equal(result.candidateDiagnostics.lockStatusCounts.unresolved, 2);
   assert.equal(
     result.candidateDiagnostics.statusReasonCounts['figma-current-page-prototype-link-file-fetch-failed'],
@@ -726,6 +729,7 @@ test('current-page file fetch failure surfaces a safe diagnostic before metadata
   assert.equal(result.assets.length, 0);
   assert.equal(result.scope.lockStatus, 'unresolved');
   assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
+  assert.equal(result.scope.fileFetchFailureReason, 'file-not-found');
   assert.match(result.scope.warning || '', /could not read the tracked Figma file/i);
 
   const serialized = `${JSON.stringify(result)}\n${output}`;
@@ -746,6 +750,7 @@ test('current-page prototype candidate file fetch failure asks for a design file
   assert.equal(result.assets.length, 0);
   assert.equal(result.scope.lockStatus, 'unresolved');
   assert.equal(result.scope.statusReason, 'figma-current-page-prototype-link-file-fetch-failed');
+  assert.equal(result.scope.fileFetchFailureReason, 'file-not-found');
   assert.match(result.scope.warning || '', /prototype link/i);
   assert.match(result.scope.warning || '', /design\/file link/i);
 

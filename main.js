@@ -2300,7 +2300,9 @@ function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
         : 0
     },
     metadataStatusCounts: safeCounts(diagnostics.metadataStatusCounts),
+    metadataFailureReasonCounts: safeCounts(diagnostics.metadataFailureReasonCounts),
     fileFetchStatusCounts: safeCounts(diagnostics.fileFetchStatusCounts),
+    fileFetchFailureReasonCounts: safeCounts(diagnostics.fileFetchFailureReasonCounts),
     lockStatusCounts: safeCounts(diagnostics.lockStatusCounts),
     statusReasonCounts: safeCounts(diagnostics.statusReasonCounts),
     assetResultCounts: {
@@ -4758,14 +4760,24 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', summarizeFigmaErrorsForLog(scanResult.errors));
       // Detect token expiry / auth failures — stop polling instead of retrying every 60s
+      const hasInvalidTokenDiagnostic = !!(
+        candidateDiagnostics &&
+        (
+          Number(candidateDiagnostics.metadataFailureReasonCounts && candidateDiagnostics.metadataFailureReasonCounts['invalid-token']) > 0 ||
+          Number(candidateDiagnostics.fileFetchFailureReasonCounts && candidateDiagnostics.fileFetchFailureReasonCounts['invalid-token']) > 0
+        )
+      );
       const authError = scanResult.errors.find(e => {
         const msg = typeof e === 'string' ? e : (e && e.message) || '';
         const type = (e && e.type) || '';
-        return type === 'auth' || msg.includes('401') || msg.includes('403') ||
-               msg.toLowerCase().includes('unauthorized') || msg.toLowerCase().includes('forbidden') ||
-               msg.toLowerCase().includes('token invalid');
+        const lower = msg.toLowerCase();
+        return type === 'auth' || msg.includes('401') ||
+               lower.includes('unauthorized') ||
+               lower.includes('token invalid') ||
+               lower.includes('invalid figma api token') ||
+               lower.includes('personal access token');
       });
-      if (authError) {
+      if (authError || hasInvalidTokenDiagnostic) {
         console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
         stopFigmaPolling(projectId);
         // Notify renderer about auth failure
@@ -4862,7 +4874,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     sendToRenderer('figma:scan-error', { projectId, error: e.message });
     // Detect token expiry / auth failures at the network level
     const msg = (e.message || '').toLowerCase();
-    if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized') || msg.includes('token invalid') || msg.includes('invalid figma')) {
+    if (msg.includes('401') || msg.includes('unauthorized') || msg.includes('token invalid') || msg.includes('invalid figma api token') || msg.includes('personal access token')) {
       console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
       stopFigmaPolling(projectId);
       sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });

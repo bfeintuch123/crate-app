@@ -1542,12 +1542,22 @@ function formatFigmaCandidateDiagnostics(summary) {
       .map(([source, count]) => `${String(source).replace(/[^\w:.-]/g, '_').slice(0, 40)} ${count}`)
       .slice(0, 4)
     : [];
+  const safeCountParts = (counts) => counts && typeof counts === 'object'
+    ? Object.entries(counts)
+      .filter(([, count]) => Number.isFinite(count) && count > 0)
+      .map(([reason, count]) => `${String(reason).replace(/[^\w:.-]/g, '_').slice(0, 40)} ${count}`)
+      .slice(0, 4)
+    : [];
+  const metadataReasonParts = safeCountParts(summary.metadataFailureReasonCounts);
+  const fileFetchReasonParts = safeCountParts(summary.fileFetchFailureReasonCounts);
 
   const parts = [`Figma candidate check: ${candidateCount} candidate${candidateCount === 1 ? '' : 's'}`];
   if (sourceParts.length > 0) parts.push(`sources ${sourceParts.join(', ')}`);
   parts.push(`page/node parsed ${withPageOrNode}`);
   parts.push(`metadata ok ${metadataSucceeded}/failed ${metadataFailed}`);
+  if (metadataReasonParts.length > 0) parts.push(`metadata reasons ${metadataReasonParts.join(', ')}`);
   parts.push(`file ok ${fileFetchSucceeded}/failed ${fileFetchFailed}`);
+  if (fileFetchReasonParts.length > 0) parts.push(`file reasons ${fileFetchReasonParts.join(', ')}`);
   return `(${parts.join('; ')})`;
 }
 

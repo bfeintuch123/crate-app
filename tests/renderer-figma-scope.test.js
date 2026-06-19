@@ -243,7 +243,9 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
       candidateSourceCounts: { 'prototype-route': 1, 'canonical-param': 1 },
       parsedScopeCounts: { withPageOrNode: 2, withoutPageOrNode: 0 },
       metadataStatusCounts: { failed: 2 },
+      metadataFailureReasonCounts: { 'access-denied': 1, 'file-not-found': 1 },
       fileFetchStatusCounts: { failed: 2 },
+      fileFetchFailureReasonCounts: { 'access-denied': 2 },
       lockStatusCounts: { unresolved: 2 },
       statusReasonCounts: { 'figma-current-page-file-fetch-failed': 2 },
       assetResultCounts: { withAssets: 0, withoutAssets: 2 }
@@ -257,7 +259,9 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
   assert.match(text, /sources prototype-route 1, canonical-param 1/);
   assert.match(text, /page\/node parsed 2/);
   assert.match(text, /metadata ok 0\/failed 2/);
+  assert.match(text, /metadata reasons access-denied 1, file-not-found 1/);
   assert.match(text, /file ok 0\/failed 2/);
+  assert.match(text, /file reasons access-denied 2/);
   assert.equal(text.includes('figma.com'), false);
   assert.equal(text.includes('token'), false);
   assert.equal(text.includes('Bearer'), false);
