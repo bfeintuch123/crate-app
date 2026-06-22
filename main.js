@@ -2399,6 +2399,105 @@ async function shouldKeepObservedSourceFileForPackaging(file, project) {
   return evidence.lastUsedMs >= confirmationThreshold;
 }
 
+function isPackagePrimarySourceMaster(file) {
+  if (!file || file.embedded || typeof file.path !== 'string') return false;
+  const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+  return PRIMARY_DESIGN_EXTENSIONS.has(ext);
+}
+
+function getPackageSourceMasterCollisionKey(file) {
+  if (!isPackagePrimarySourceMaster(file)) return null;
+  const displayName = getPackageFileDisplayName(file);
+  return typeof displayName === 'string' && displayName.trim()
+    ? displayName.trim().toLowerCase()
+    : null;
+}
+
+function getPackageSourceMasterStat(file) {
+  try {
+    const stat = fs.statSync(file.path);
+    return {
+      mtimeMs: stat.mtimeMs || 0,
+      birthtimeMs: stat.birthtimeMs || 0,
+    };
+  } catch (_) {
+    return { mtimeMs: 0, birthtimeMs: 0 };
+  }
+}
+
+function getPackageSourceMasterDedupePriority(project, file) {
+  let priority = 0;
+  const source = getFileCaptureSource(file);
+  const evidence = file && file.captureEvidence;
+
+  if (isAcceptedPendingCapturedFile(project, file)) priority += 80;
+  if (isSavedOrConfirmedProjectFile(file)) priority += 70;
+  if (isCurrentSessionSavedSource(project, file)) priority += 60;
+  if (evidence && evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT) {
+    priority += 55;
+  }
+  if (source === 'lsof') priority += 20;
+  if (isWeakBroadObserverFile(file)) priority -= 25;
+  if (file && typeof file.path === 'string' && isAutoCaptureExcludedPath(file.path)) priority -= 100;
+
+  return priority;
+}
+
+function comparePackageSourceMasterDedupeCandidates(left, right) {
+  if (left.priority !== right.priority) return right.priority - left.priority;
+  if (left.stat.mtimeMs !== right.stat.mtimeMs) return right.stat.mtimeMs - left.stat.mtimeMs;
+  if (left.stat.birthtimeMs !== right.stat.birthtimeMs) return right.stat.birthtimeMs - left.stat.birthtimeMs;
+  if (left.addedAt !== right.addedAt) return right.addedAt - left.addedAt;
+  return left.index - right.index;
+}
+
+function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
+  const byOutputName = new Map();
+
+  packageFiles.forEach((file, index) => {
+    const key = getPackageSourceMasterCollisionKey(file);
+    if (!key) return;
+    if (!byOutputName.has(key)) byOutputName.set(key, []);
+    byOutputName.get(key).push({ file, index });
+  });
+
+  const droppedIndexes = new Set();
+
+  for (const entries of byOutputName.values()) {
+    if (entries.length < 2) continue;
+
+    const explicitEntries = entries.filter(entry => isExplicitUserCapturedFile(entry.file));
+    if (explicitEntries.length === entries.length) continue;
+
+    const keepIndexes = new Set();
+    if (explicitEntries.length > 0) {
+      for (const entry of explicitEntries) keepIndexes.add(entry.index);
+    } else {
+      const [bestEntry] = entries.map(entry => ({
+        ...entry,
+        stat: getPackageSourceMasterStat(entry.file),
+        addedAt: typeof entry.file.addedAt === 'number' ? entry.file.addedAt : 0,
+        priority: getPackageSourceMasterDedupePriority(project, entry.file),
+      })).sort(comparePackageSourceMasterDedupeCandidates);
+      keepIndexes.add(bestEntry.index);
+    }
+
+    for (const entry of entries) {
+      if (keepIndexes.has(entry.index)) continue;
+      droppedIndexes.add(entry.index);
+      console.log(
+        `[crate][package] filtered duplicate auto-captured source master: ` +
+        `localName=${formatFigmaLocalNameForLog(entry.file.path)} ` +
+        `source=${formatFigmaLogScalar(getFileCaptureSource(entry.file) || 'unknown')} ` +
+        `ext=${formatFigmaLogScalar((entry.file.ext || path.extname(entry.file.path || '') || '').toLowerCase(), 'unknown')}`
+      );
+    }
+  }
+
+  if (droppedIndexes.size === 0) return packageFiles;
+  return packageFiles.filter((_, index) => !droppedIndexes.has(index));
+}
+
 async function selectProjectFilesForPackaging(project) {
   const dedupedFiles = deduplicateFiles(project.files || []);
   const packageFiles = [];
@@ -2445,7 +2544,7 @@ async function selectProjectFilesForPackaging(project) {
     );
   }
 
-  return deduplicateFiles(packageFiles);
+  return deduplicateFiles(deduplicatePackageSourceMastersForOutput(project, packageFiles));
 }
 
 // projectType: optional — if provided, Check 1 is scoped to that type's app list.

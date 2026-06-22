@@ -4912,6 +4912,144 @@ test('pre-package deduped-away recovery candidate does not record session observ
   assert.equal(getSessionObservedByMethod(fresh, 'lsof-package-scan').length, 0);
 });
 
+test('package dedupes auto-captured duplicate InDesign masters while preserving used links', async () => {
+  resetTestHomeWorkspace();
+  const projectName = 'InDesign Master Dedupe';
+  const project = await createProject(projectName);
+  const now = Date.now();
+  const oldRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.5-jenna', 'source-copies');
+  const currentRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.34-jenna', 'source-copies');
+  const downloadsRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.34-jenna', 'web-downloads');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.34-jenna', 'package-outputs');
+  const masterName = 'Crate InDesign Downloaded Unused QA qa34.indd';
+  const oldMasterPath = path.join(oldRoot, masterName);
+  const currentMasterPath = path.join(currentRoot, masterName);
+  const usedOnePath = path.join(downloadsRoot, 'qa34-used-web-01.jpg');
+  const usedTwoPath = path.join(downloadsRoot, 'qa34-used-web-02.jpg');
+  const unusedPath = path.join(downloadsRoot, 'qa34-unused-web-03.jpg');
+
+  for (const dirPath of [oldRoot, currentRoot, downloadsRoot, outputDir]) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  fs.writeFileSync(oldMasterPath, 'old false-start InDesign bytes');
+  fs.writeFileSync(currentMasterPath, 'current saved InDesign bytes with linked images');
+  fs.writeFileSync(usedOnePath, 'used image one');
+  fs.writeFileSync(usedTwoPath, 'used image two');
+  fs.writeFileSync(unusedPath, 'unused image should stay out');
+  const oldDate = new Date(now - 120000);
+  const currentDate = new Date(now);
+  fs.utimesSync(oldMasterPath, oldDate, oldDate);
+  fs.utimesSync(currentMasterPath, currentDate, currentDate);
+
+  const storedProject = await setProjectFiles(project.id, {
+    files: [
+      {
+        path: oldMasterPath,
+        name: masterName,
+        ext: '.indd',
+        addedAt: now - 60000,
+        source: 'scan-on-open',
+        captureReason: 'scan-on-open-source-relationship',
+        captureEvidence: { source: 'scan-on-open', parserConfirmed: true },
+      },
+      {
+        path: currentMasterPath,
+        name: masterName,
+        ext: '.indd',
+        addedAt: now,
+        source: 'scan-on-open',
+        captureReason: 'scan-on-open-source-relationship',
+        captureEvidence: { source: 'scan-on-open', parserConfirmed: true, filesystemSaved: true },
+      },
+      {
+        path: usedOnePath,
+        name: path.basename(usedOnePath),
+        ext: '.jpg',
+        addedAt: now,
+        source: 'indd-linked',
+        captureReason: 'indesign-linked-asset',
+      },
+      {
+        path: usedTwoPath,
+        name: path.basename(usedTwoPath),
+        ext: '.jpg',
+        addedAt: now,
+        source: 'indd-linked',
+        captureReason: 'indesign-linked-asset',
+      },
+    ],
+  });
+  storedProject.watchStartedAt = now - 30000;
+
+  const result = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(result);
+  assert.equal(result.success, true);
+  assert.equal(result.totalFiles, 3);
+  assert.equal(result.copiedCount, 3);
+  assert.deepEqual(result.errors, []);
+
+  const destFolder = packageFolder(outputDir, projectName);
+  const outputFileNames = fs.readdirSync(destFolder)
+    .filter(fileName => fs.statSync(path.join(destFolder, fileName)).isFile())
+    .sort();
+  assert.deepEqual(outputFileNames, [
+    masterName,
+    'qa34-used-web-01.jpg',
+    'qa34-used-web-02.jpg',
+  ].sort());
+  assert.equal(fs.readFileSync(path.join(destFolder, masterName), 'utf8'), 'current saved InDesign bytes with linked images');
+  assert.equal(fs.existsSync(path.join(destFolder, 'Crate InDesign Downloaded Unused QA qa34_1.indd')), false);
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(unusedPath))), false);
+});
+
+test('package preserves explicitly added same-name source masters', async () => {
+  resetTestHomeWorkspace();
+  const projectName = 'Manual Same Name Sources';
+  const project = await createProject(projectName);
+  const firstRoot = path.join(TEST_HOME, 'Desktop', 'Client A');
+  const secondRoot = path.join(TEST_HOME, 'Desktop', 'Client B');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'manual-output');
+  const masterName = 'Layout.indd';
+  const firstPath = path.join(firstRoot, masterName);
+  const secondPath = path.join(secondRoot, masterName);
+
+  for (const dirPath of [firstRoot, secondRoot, outputDir]) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  fs.writeFileSync(firstPath, 'manual source one');
+  fs.writeFileSync(secondPath, 'manual source two');
+
+  await setProjectFiles(project.id, {
+    files: [
+      {
+        path: firstPath,
+        name: masterName,
+        ext: '.indd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+      {
+        path: secondPath,
+        name: masterName,
+        ext: '.indd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+    ],
+  });
+
+  const result = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(result);
+  assert.equal(result.success, true);
+  assert.equal(result.totalFiles, 2);
+  assert.equal(result.copiedCount, 2);
+  assert.deepEqual(result.errors, []);
+
+  const destFolder = packageFolder(outputDir, projectName);
+  assert.equal(fs.readFileSync(path.join(destFolder, 'Layout.indd'), 'utf8'), 'manual source one');
+  assert.equal(fs.readFileSync(path.join(destFolder, 'Layout_1.indd'), 'utf8'), 'manual source two');
+});
+
 test('pre-package app-script parser and regex recovered additions record session observations without package count drift', async () => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), '.test-prepackage-provenance');
