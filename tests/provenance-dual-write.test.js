@@ -3111,6 +3111,174 @@ test('Photoshop and InDesign live evidence refresh newly linked assets conservat
   ], 'Adobe suite live refresh state');
 });
 
+test('InDesign live save refresh stages saved open document and linked assets without reopen', async () => {
+  resetTestHomeWorkspace();
+  const qaRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.38-jenna');
+  const sourceDir = path.join(qaRoot, 'source-copies');
+  const existingDir = path.join(qaRoot, 'linked-assets', 'indesign-manual-save');
+  const downloadsDir = path.join(qaRoot, 'web-downloads', 'indesign-manual-save');
+  const outputDir = path.join(qaRoot, 'package-outputs');
+  const sourcePath = path.join(sourceDir, 'Crate InDesign Manual Save Timing QA qa38.indd');
+  const existingOnePath = path.join(existingDir, 'qa38-indesign-manual-existing-01.jpg');
+  const existingTwoPath = path.join(existingDir, 'qa38-indesign-manual-existing-02.jpg');
+  const newOnePath = path.join(downloadsDir, 'qa38-indesign-manual-new-used-01.jpg');
+  const newTwoPath = path.join(downloadsDir, 'qa38-indesign-manual-new-used-02.jpg');
+  const newThreePath = path.join(downloadsDir, 'qa38-indesign-manual-new-used-03.jpg');
+  const unusedOnePath = path.join(downloadsDir, 'qa38-indesign-manual-new-unused-04.jpg');
+  const unusedTwoPath = path.join(downloadsDir, 'qa38-indesign-manual-new-unused-05.jpg');
+
+  for (const dirPath of [sourceDir, existingDir, downloadsDir, outputDir]) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  for (const filePath of [
+    sourcePath,
+    existingOnePath,
+    existingTwoPath,
+    newOnePath,
+    newTwoPath,
+    newThreePath,
+    unusedOnePath,
+    unusedTwoPath,
+  ]) {
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return {
+        stdout: '456 /Applications/Adobe InDesign 2026/Adobe InDesign.app/Contents/MacOS/Adobe InDesign --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n',
+      };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      assertPrivateTempScriptPath(args[0]);
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${existingOnePath}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${existingTwoPath}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${newOnePath}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${newTwoPath}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${newThreePath}\tfalse\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const projectName = 'InDesign manual save refresh';
+  const project = await createProject(projectName);
+  const expectedPaths = [
+    sourcePath,
+    existingOnePath,
+    existingTwoPath,
+    newOnePath,
+    newTwoPath,
+    newThreePath,
+  ];
+  const fresh = await waitForProject(
+    project.id,
+    item => expectedPaths.every(filePath => item.files.some(file => file.path === filePath)),
+    7000
+  );
+
+  assert.equal(fresh.pendingFiles.length, 0);
+  assert.deepEqual(fresh.files.map(file => file.path).sort(), expectedPaths.sort());
+  assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+  assert.equal(fresh.files.some(file => file.path === unusedOnePath), false);
+  assert.equal(fresh.files.some(file => file.path === unusedTwoPath), false);
+  assert.equal(getSessionObservedByMethod(fresh, 'indd-poll').length, 5);
+
+  const statusEntries = getLiveAppStatusEntries(fresh, 'indesign');
+  assert.ok(statusEntries.some(entry => (
+    entry.appRunning === true &&
+    entry.scriptAttempted === true &&
+    entry.scriptSuccess === true &&
+    entry.docsCount === 1 &&
+    entry.linksCount === 5 &&
+    entry.normalizedCount >= 6
+  )));
+
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
+    'DOC\t',
+    'LINK\t',
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe InDesign',
+    sourcePath,
+    newOnePath,
+    'stdout',
+    'raw',
+  ], 'InDesign save refresh live evidence ledger');
+
+  const result = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(result);
+  assert.equal(result.success, true);
+  assert.equal(result.totalFiles, 6);
+  assert.equal(result.copiedCount, 6);
+  assert.deepEqual(result.errors, []);
+
+  const destFolder = packageFolder(outputDir, projectName);
+  const outputFileNames = fs.readdirSync(destFolder)
+    .filter(fileName => fs.statSync(path.join(destFolder, fileName)).isFile())
+    .sort();
+  assert.deepEqual(outputFileNames, expectedPaths.map(filePath => path.basename(filePath)).sort());
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(unusedOnePath))), false);
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(unusedTwoPath))), false);
+});
+
+test('InDesign modified live document and links remain needs-save until saved', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'indesign-unsaved-live.indd');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'indesign-unsaved-linked.jpg');
+  fs.writeFileSync(sourcePath, 'indd bytes');
+  fs.writeFileSync(linkedPath, 'linked bytes');
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return {
+        stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n',
+      };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\ttrue\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('InDesign unsaved live session');
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const sourceCandidate = fresh.pendingFiles.find(file => file.path === sourcePath);
+  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+
+  assert.ok(sourceCandidate);
+  assert.ok(linkedCandidate);
+  assert.deepEqual(fresh.files, []);
+  assert.equal(sourceCandidate.source, 'app-opened');
+  assert.equal(sourceCandidate.captureState, 'needs-save');
+  assert.equal(sourceCandidate.captureReason, 'unsaved-source-needs-save');
+  assert.equal(sourceCandidate.captureEvidence.appFamily, 'indesign');
+  assert.equal(sourceCandidate.captureEvidence.observerMethod, 'indesign-live-applescript');
+  assert.equal(sourceCandidate.captureEvidence.documentModified, true);
+  assert.equal(linkedCandidate.source, 'indd-poll');
+  assert.equal(linkedCandidate.captureState, 'needs-save');
+  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
+  assert.equal(linkedCandidate.captureEvidence.relationship, 'source-linked');
+  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, path.basename(sourcePath));
+  assert.equal(getSessionObservedByMethod(fresh, 'indd-poll').length, 0);
+  assertTextExcludes(JSON.stringify(fresh.pendingFiles), [
+    'SHOULD_NOT_APPEAR_PROCESS_ARG',
+    '/Applications/Adobe InDesign.app',
+    'DOC\t',
+    'LINK\t',
+    'stdout',
+    'raw',
+  ], 'InDesign unsaved live session pending files');
+});
+
 test('Illustrator live app evidence stages open source and linked asset as needs-save candidates', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
@@ -3872,7 +4040,7 @@ test('live app breadcrumbs persist zero-file poll and app-not-running status saf
 
   assert.deepEqual(fresh.files, []);
   assert.deepEqual(fresh.pendingFiles, []);
-  const statusEntries = getLiveAppStatusEntries(fresh);
+  const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => entry.pollInstalled === true));
   assert.ok(statusEntries.some(entry => entry.pollFired === true && entry.projectWatching === true));
   const latest = getLatestLiveAppStatus(fresh);
