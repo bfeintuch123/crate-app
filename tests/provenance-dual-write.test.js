@@ -1197,6 +1197,76 @@ test('PowerPoint package extraction records deterministic media provenance and d
   }
 });
 
+test('PowerPoint packaging dedupes scan-on-save media collision copies', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PowerPoint Duplicate Media Dedupe');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const cachedOne = path.join(tmpRoot, 'Deck — image1.jpeg');
+    const cachedDuplicate = path.join(tmpRoot, 'Deck — image1_1.jpeg');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+
+    const mediaBytes = Buffer.from('PPT_DUPLICATE_SCAN_MEDIA_BYTES_SHOULD_NOT_LEAK'.repeat(40));
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.writeFileSync(cachedOne, mediaBytes);
+    fs.writeFileSync(cachedDuplicate, mediaBytes);
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: mediaBytes,
+    }]);
+
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: cachedOne,
+          name: 'Deck — image1.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+        {
+          path: cachedDuplicate,
+          name: 'Deck — image1_1.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 2);
+    assert.equal(result.embeddedCount, 0);
+    assert.equal(result.totalFiles, 2);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'PowerPoint Duplicate Media Dedupe');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck.pptx'), 'utf8'), 'pptx container bytes');
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — image1.jpeg'), 'utf8'), mediaBytes.toString('utf8'));
+    assert.equal(fs.existsSync(path.join(destFolder, 'Deck — image1_1.jpeg')), false);
+    assert.equal(fs.existsSync(path.join(destFolder, 'Deck — image1_2.jpeg')), false);
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 2);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assertTextExcludes(JSON.stringify(fresh), [
+      'PPT_DUPLICATE_SCAN_MEDIA_BYTES_SHOULD_NOT_LEAK',
+    ], 'PowerPoint duplicate media project state');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('PowerPoint package extraction surfaces per-entry media failures without blocking successes', async () => {
   const tmpRoot = makeTempDir();
   try {
