@@ -5649,6 +5649,7 @@ function buildIllustratorSessionScope(project, activeState) {
   const trackedNames = new Set();
   const documents = (activeState && Array.isArray(activeState.documents)) ? activeState.documents : [];
   const documentNameCounts = new Map();
+  let hasAnyTrustedPrimarySource = false;
 
   for (const doc of documents) {
     const normalizedName = normalizeIllustratorDocumentName(doc && doc.documentName);
@@ -5660,6 +5661,10 @@ function buildIllustratorSessionScope(project, activeState) {
     ...((project && Array.isArray(project.files)) ? project.files : []),
     ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
   ]) {
+    const ext = (file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase();
+    if (PRIMARY_DESIGN_EXTENSIONS.has(ext) && isTrustedSessionProjectFile(project, file)) {
+      hasAnyTrustedPrimarySource = true;
+    }
     if (!isIllustratorSourceCandidate(file)) continue;
     const normalizedPath = normalizeTrackedFilePath(file && file.path);
     if (normalizedPath) trackedPaths.add(normalizedPath);
@@ -5673,6 +5678,7 @@ function buildIllustratorSessionScope(project, activeState) {
     trackedPaths,
     trackedNames,
     documentNameCounts,
+    hasAnyTrustedPrimarySource,
     hasTrackedSource: trackedPaths.size > 0 || trackedNames.size > 0,
   };
 }
@@ -5691,10 +5697,10 @@ function classifyIllustratorDocumentSessionRelevance(doc, scope) {
     }
     return { relevant: false, reason: 'ambiguous-document-name' };
   }
-  if (!scope.hasTrackedSource && doc && doc.current === true) {
+  if (!scope.hasTrackedSource && !scope.hasAnyTrustedPrimarySource && doc && doc.current === true) {
     return { relevant: true, reason: 'current-document' };
   }
-  if (!scope.hasTrackedSource && scope.documents.length === 1) {
+  if (!scope.hasTrackedSource && !scope.hasAnyTrustedPrimarySource && scope.documents.length === 1) {
     return { relevant: true, reason: 'single-open-document' };
   }
   if (!normalizedPath && normalizedName && duplicateNameCount > 1 && doc && doc.current !== true) {
