@@ -906,9 +906,10 @@ function createLiveAppEvidence(input = {}) {
     : null;
   const relationshipSourcePath = typeof input.relationshipSourcePath === 'string' && path.isAbsolute(input.relationshipSourcePath)
     ? input.relationshipSourcePath
-    : sourceDocumentPath;
+    : null;
   const sourceDocumentName = sanitizeLiveEvidenceText(input.sourceDocumentName)
-    || (relationshipSourcePath ? path.basename(relationshipSourcePath) : null);
+    || (relationshipSourcePath ? path.basename(relationshipSourcePath) : null)
+    || (sourceDocumentPath ? path.basename(sourceDocumentPath) : null);
 
   const evidence = {
     appFamily,
@@ -924,6 +925,11 @@ function createLiveAppEvidence(input = {}) {
     evidenceStrength: sanitizeLiveEvidenceText(input.evidenceStrength) || LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
     evidenceReason: normalizeLiveCaptureReason(input.evidenceReason || input.captureReason, 'app-live-evidence'),
     requiresSave: input.requiresSave === true || input.documentModified === true,
+    savedEvidence: input.savedEvidence === true || input.filesystemSaved === true,
+    filesystemSaved: input.filesystemSaved === true,
+    parserConfirmed: input.parserConfirmed === true,
+    allowDirect: input.allowDirect === true,
+    forcePending: input.forcePending === true ? true : (input.forcePending === false ? false : null),
   };
 
   if (input.captureRecommendation || input.captureHint) {
@@ -1248,12 +1254,15 @@ function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedP
   evidence.broadObserver = evidence.forcePending || BROAD_LIVE_CAPTURE_SOURCES.has(source);
   evidence.weakBroadObserver = isWeakBroadObserverEvidence(evidence);
   evidence.parserConfirmed = observation.parserConfirmed === true
+    || liveEvidence.parserConfirmed === true
     || SAVED_OR_CONFIRMED_CAPTURE_SOURCES.has(source)
     || SAVED_OR_CONFIRMED_CAPTURE_REASONS.has(policyReason);
   evidence.filesystemSaved = observation.filesystemSaved === true
+    || liveEvidence.filesystemSaved === true
     || (evidence.allowDirect && STRONG_SESSION_LIVE_CAPTURE_REASONS.has(policyReason));
   evidence.projectScopedCloud = source === 'figma-auto' && policyReason === 'figma-project-tracked-cloud';
   evidence.savedEvidence = observation.savedEvidence === true
+    || liveEvidence.savedEvidence === true
     || evidence.parserConfirmed
     || evidence.filesystemSaved
     || evidence.projectScopedCloud;
@@ -1288,6 +1297,13 @@ function shouldDirectAddLiveEvidence(project, fileEntry, evidence) {
   if (!evidence) return false;
   if (evidence.explicitUserAdd || evidence.acceptedPending) return true;
   if (evidence.forcePending || (evidence.broadObserver && !isSavedOrConfirmedLiveEvidence(evidence))) return false;
+  if (
+    evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT &&
+    isSavedOrConfirmedLiveEvidence(evidence) &&
+    evidence.documentModified !== true
+  ) {
+    return true;
+  }
   if (evidence.allowDirect && STRONG_SESSION_LIVE_CAPTURE_REASONS.has(evidence.policyReason)) return true;
   if (evidence.relationshipSourcePath) {
     return evidence.relationshipAccepted && isSavedOrConfirmedLiveEvidence(evidence) && evidence.documentModified !== true;
@@ -5927,8 +5943,16 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
 
     for (const { evidence, ext } of candidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
+      const shouldForcePending = evidence.forcePending === true || (
+        evidence.forcePending !== false &&
+        !(evidence.savedEvidence === true && evidence.documentModified !== true)
+      );
       const staged = stageLiveObservedFile(proj, fileEntry, {
-        forcePending: true,
+        forcePending: shouldForcePending,
+        allowDirect: evidence.allowDirect === true,
+        savedEvidence: evidence.savedEvidence === true,
+        filesystemSaved: evidence.filesystemSaved === true,
+        parserConfirmed: evidence.parserConfirmed === true,
         reason: evidence.evidenceReason || 'app-script-broad-observer',
         relationshipSourcePath: evidence.relationshipSourcePath,
         liveEvidence: evidence,
@@ -5982,23 +6006,252 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
 
 const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
   try
-    set pathList to {}
+    set rowList to {}
     repeat with aDoc in every document
+      set docName to ""
+      set docPathText to ""
+      set docModified to false
+      set docCurrent to false
+      try
+        set docName to name of aDoc
+      end try
+      try
+        set docModified to modified of aDoc
+      end try
+      try
+        set docCurrent to (aDoc is active document)
+      end try
+      try
+        set docPathValue to file path of aDoc
+        if docPathValue is not missing value then
+          set docPathText to POSIX path of (docPathValue as alias)
+          if docPathText ends with "/" then set docPathText to docPathText & docName
+        end if
+      end try
+      set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text)
       repeat with aLink in every link of aDoc
         try
           set fp to file path of aLink
           if fp is not missing value then
-            set end of pathList to POSIX path of (fp as alias)
+            set linkPathText to POSIX path of (fp as alias)
+            set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
           end if
         end try
       end repeat
     end repeat
     set AppleScript's text item delimiters to linefeed
-    return pathList as text
+    return rowList as text
   on error
     return ""
   end try
 end tell`;
+
+function parseInDesignActiveSessionOutput(output) {
+  const documents = [];
+  const links = [];
+  const diagnostics = {
+    docRowsSeen: 0,
+    linkRowsSeen: 0,
+    normalizedPaths: 0,
+    pathSkipped: {},
+  };
+
+  for (const rawLine of String(output || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split('\t');
+    const kind = parts[0];
+
+    if (kind === 'DOC' && parts.length >= 3) {
+      const documentPath = normalizeIllustratorEvidencePath(parts[1]);
+      recordIllustratorPathNormalization(diagnostics, 'doc', documentPath);
+      const documentName = sanitizeLiveEvidenceText(parts[2]) || (documentPath.path ? path.basename(documentPath.path) : null);
+      if (!documentPath.path && !documentName) continue;
+      documents.push({
+        documentPath: documentPath.path,
+        documentName,
+        modified: parts[3] === 'true',
+        current: parts[4] === 'true',
+      });
+      continue;
+    }
+
+    if (kind === 'LINK' && parts.length >= 4) {
+      const documentPath = normalizeIllustratorEvidencePath(parts[1]);
+      const linkedPath = normalizeIllustratorEvidencePath(parts[3]);
+      recordIllustratorPathNormalization(diagnostics, 'link', linkedPath);
+      if (!linkedPath.path) continue;
+      links.push({
+        documentPath: documentPath.path,
+        documentName: sanitizeLiveEvidenceText(parts[2]) || (documentPath.path ? path.basename(documentPath.path) : null),
+        linkedPath: linkedPath.path,
+        modified: parts[4] === 'true',
+        current: parts[5] === 'true',
+      });
+      continue;
+    }
+
+    const legacyPath = normalizeIllustratorEvidencePath(line);
+    recordIllustratorPathNormalization(diagnostics, 'link', legacyPath);
+    if (legacyPath.path) {
+      links.push({
+        documentPath: null,
+        documentName: null,
+        linkedPath: legacyPath.path,
+        modified: true,
+        current: false,
+      });
+    }
+  }
+
+  return { documents, links, diagnostics };
+}
+
+function normalizeInDesignDocumentName(value) {
+  const safe = sanitizeLiveEvidenceText(value);
+  return safe ? safe.toLowerCase() : null;
+}
+
+function isInDesignSourceCandidate(file) {
+  if (!file || typeof file !== 'object') return false;
+  const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
+  if (ext === '.indd' || ext === '.idml') return true;
+  const appFamily = file.captureEvidence && file.captureEvidence.appFamily;
+  return normalizeLiveCaptureReason(appFamily, '') === 'indesign';
+}
+
+function buildInDesignSessionScope(project, activeState) {
+  const documents = (activeState && Array.isArray(activeState.documents)) ? activeState.documents : [];
+  const trackedPaths = new Set();
+  const trackedNames = new Set();
+  const documentNameCounts = new Map();
+  let hasAnyTrustedPrimarySource = false;
+
+  for (const doc of documents) {
+    const normalizedName = normalizeInDesignDocumentName(doc && doc.documentName);
+    if (!normalizedName) continue;
+    documentNameCounts.set(normalizedName, (documentNameCounts.get(normalizedName) || 0) + 1);
+  }
+
+  for (const file of [
+    ...((project && Array.isArray(project.files)) ? project.files : []),
+    ...((project && Array.isArray(project.pendingFiles)) ? project.pendingFiles : []),
+  ]) {
+    const ext = (file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase();
+    if (PRIMARY_DESIGN_EXTENSIONS.has(ext) && isTrustedSessionProjectFile(project, file)) {
+      hasAnyTrustedPrimarySource = true;
+    }
+    if (!isInDesignSourceCandidate(file)) continue;
+    const normalizedPath = normalizeTrackedFilePath(file && file.path);
+    if (normalizedPath) trackedPaths.add(normalizedPath);
+    const fileName = sanitizeLiveEvidenceText(file && (file.name || (file.path ? path.basename(file.path) : '')));
+    const normalizedName = normalizeInDesignDocumentName(fileName);
+    if (normalizedName) trackedNames.add(normalizedName);
+  }
+
+  return {
+    documents,
+    trackedPaths,
+    trackedNames,
+    documentNameCounts,
+    hasAnyTrustedPrimarySource,
+    hasTrackedSource: trackedPaths.size > 0 || trackedNames.size > 0,
+  };
+}
+
+function classifyInDesignDocumentSessionRelevance(doc, scope) {
+  const normalizedPath = normalizeTrackedFilePath(doc && doc.documentPath);
+  const normalizedName = normalizeInDesignDocumentName(doc && doc.documentName);
+  const duplicateNameCount = normalizedName ? (scope.documentNameCounts.get(normalizedName) || 0) : 0;
+
+  if (normalizedPath && scope.trackedPaths.has(normalizedPath)) {
+    return { relevant: true, reason: 'tracked-document-path' };
+  }
+  if (normalizedName && scope.trackedNames.has(normalizedName)) {
+    if (duplicateNameCount <= 1 || doc.current === true) {
+      return { relevant: true, reason: 'tracked-document-name' };
+    }
+    return { relevant: false, reason: 'ambiguous-document-name' };
+  }
+  if (!scope.hasTrackedSource && !scope.hasAnyTrustedPrimarySource && doc && doc.current === true) {
+    return { relevant: true, reason: 'current-document' };
+  }
+  if (!scope.hasTrackedSource && !scope.hasAnyTrustedPrimarySource && scope.documents.length === 1) {
+    return { relevant: true, reason: 'single-open-document' };
+  }
+  if (!normalizedPath && normalizedName && duplicateNameCount > 1 && doc && doc.current !== true) {
+    return { relevant: false, reason: 'ambiguous-document-name' };
+  }
+  return { relevant: false, reason: 'unrelated-document' };
+}
+
+function createInDesignLiveEvidenceRecords(projectId, activeState, project = null, diagnostics = null) {
+  const evidenceRecords = [];
+  const scope = buildInDesignSessionScope(project, activeState);
+
+  for (const doc of (activeState && activeState.documents) || []) {
+    const relevance = classifyInDesignDocumentSessionRelevance(doc, scope);
+    if (!relevance.relevant) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
+      continue;
+    }
+    if (!doc.documentPath) continue;
+    const saved = doc.modified !== true;
+    evidenceRecords.push(createLiveAppEvidence({
+      projectId,
+      filePath: doc.documentPath,
+      source: 'app-opened',
+      appFamily: 'indesign',
+      observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
+      sourceDocumentPath: doc.documentPath,
+      sourceDocumentName: doc.documentName || path.basename(doc.documentPath),
+      documentModified: doc.modified,
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
+      requiresSave: !saved,
+      savedEvidence: saved,
+      filesystemSaved: saved,
+      allowDirect: saved,
+      forcePending: !saved,
+      evidenceReason: saved ? 'indesign-saved-document' : 'app-live-evidence',
+    }));
+  }
+
+  for (const link of (activeState && activeState.links) || []) {
+    const relevance = (!link.documentPath && scope.documents.length === 0)
+      ? { relevant: true, reason: 'legacy-link-output' }
+      : classifyInDesignDocumentSessionRelevance(link, scope);
+    if (!relevance.relevant) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
+      continue;
+    }
+    const saved = link.modified !== true && !!link.documentPath;
+    const evidence = createLiveAppEvidence({
+      projectId,
+      filePath: link.linkedPath,
+      source: 'indd-poll',
+      appFamily: 'indesign',
+      observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
+      sourceDocumentPath: link.documentPath,
+      sourceDocumentName: link.documentName || (link.documentPath ? path.basename(link.documentPath) : null),
+      relationshipSourcePath: link.documentPath,
+      documentModified: link.modified,
+      evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
+      requiresSave: !saved,
+      savedEvidence: saved,
+      filesystemSaved: saved,
+      allowDirect: saved,
+      forcePending: !saved,
+      evidenceReason: saved ? 'indesign-saved-link' : 'app-live-evidence',
+    });
+    if (!evidence) {
+      incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, 'invalid-evidence');
+      continue;
+    }
+    evidenceRecords.push(evidence);
+  }
+
+  return evidenceRecords.filter(Boolean);
+}
 
 /**
  * Poll Photoshop and InDesign for open smart objects / linked assets (embedded + linked).
@@ -6220,28 +6473,26 @@ async function pollPsForProject(projectId) {
           'crate-indd-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
-        const inddLines = inddOut.split('\n').map(line => line.trim()).filter(Boolean);
+        const inddActiveState = parseInDesignActiveSessionOutput(inddOut);
+        const inddDiagnostics = { skipped: {} };
+        const inddRecords = createInDesignLiveEvidenceRecords(projectId, inddActiveState, project, inddDiagnostics);
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
           pollFired: true,
           projectWatching: true,
           appRunning: true,
           scriptAttempted: true,
           scriptSuccess: true,
-          linksCount: inddLines.length,
-          normalizedCount: inddLines.length,
+          docsCount: inddActiveState.documents.length,
+          linksCount: inddActiveState.links.length,
+          normalizedCount: inddActiveState.diagnostics && inddActiveState.diagnostics.normalizedPaths,
           stagedCount: 0,
-          errorCategory: inddLines.length > 0 ? 'script-success' : 'parse-empty',
+          skipReasonCounts: mergeLiveAppStatusCounts(
+            inddActiveState.diagnostics && inddActiveState.diagnostics.pathSkipped,
+            inddDiagnostics.skipped
+          ),
+          errorCategory: inddRecords.length > 0 ? 'script-success' : 'parse-empty',
         });
-        for (const p of inddLines) {
-          const evidence = createLinkedAssetLiveEvidenceRecord({
-            projectId,
-            filePath: p,
-            source: 'indd-poll',
-            appFamily: 'indesign',
-            observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
-          });
-          if (evidence) liveEvidenceRecords.push(evidence);
-        }
+        liveEvidenceRecords.push(...inddRecords);
       } catch (e) {
         logLiveAppEvidenceUnavailable('InDesign', e);
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
