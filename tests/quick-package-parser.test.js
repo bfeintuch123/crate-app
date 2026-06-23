@@ -172,6 +172,47 @@ test('Quick Package extracts PowerPoint embedded media without reporting them mi
   }
 });
 
+test('Quick Package dedupes duplicate PowerPoint embedded media by content', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Presentation1.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.writeFileSync(deckPath, Buffer.from('pptx container bytes'));
+
+    const duplicateImage = 'PPT_DUPLICATE_IMAGE_BYTES_SHOULD_NOT_LEAK'.repeat(40);
+    unzipFixture = new Map([
+      ['ppt/media/image1.jpeg', duplicateImage],
+      ['ppt/media/image2.jpeg', duplicateImage],
+      ['ppt/media/image3.png', 'PPT_UNIQUE_IMAGE_BYTES_SHOULD_NOT_LEAK'.repeat(40)],
+    ]);
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.equal(result.assetsFound, 3);
+    assert.equal(result.assetsCopied, 2);
+    assert.deepEqual(result.assetsMissing, []);
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Presentation1 — image1.jpeg'), 'utf8'),
+      duplicateImage
+    );
+    assert.equal(fs.existsSync(path.join(outputDir, 'Presentation1 — image2.jpeg')), false);
+    assert.equal(
+      fs.readFileSync(path.join(outputDir, 'Presentation1 — image3.png'), 'utf8'),
+      'PPT_UNIQUE_IMAGE_BYTES_SHOULD_NOT_LEAK'.repeat(40)
+    );
+    assert.deepEqual(
+      result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })),
+      [
+        { copied: 'Presentation1.pptx', source: 'master' },
+        { copied: 'Presentation1 — image1.jpeg', source: 'embedded' },
+        { copied: 'Presentation1 — image3.png', source: 'embedded' },
+      ]
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Quick Package reports only failed PowerPoint embedded media as missing', async () => {
   const tmpRoot = makeTempDir();
   try {

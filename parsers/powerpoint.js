@@ -267,6 +267,7 @@ class PowerPointParser extends BaseParser {
     const ext = path.extname(archivePath).toLowerCase();
     const baseName = path.basename(archivePath, ext);
     const extracted = [];
+    const seenPowerPointMedia = new Set();
 
     const outputRoot = ensureSafePackageDirectory(destDir);
 
@@ -275,6 +276,12 @@ class PowerPointParser extends BaseParser {
 
       try {
         const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
+        if (ext === '.pptx' || ext === '.ppt') {
+          const hash = crypto.createHash('md5').update(data).digest('hex');
+          const fingerprint = `${data.length}:${hash}`;
+          if (seenPowerPointMedia.has(fingerprint)) continue;
+          seenPowerPointMedia.add(fingerprint);
+        }
 
         // Generate output filename
         let outputName = outputTail || path.basename(asset.zipPath);

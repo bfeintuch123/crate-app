@@ -252,10 +252,34 @@ function deduplicateFiles(files) {
     return true;
   });
 
-  // Pass 3: Figma asset identity dedup — protects startup scans from adding the
+  // Pass 3: presentation scan-on-save collision dedup. PowerPoint can emit more
+  // than one save/change pulse while Crate is still materializing the same
+  // archive media, which leaves cache files like "Deck — image1.jpg" and
+  // "Deck — image1_1.jpg". Keep one copy only when the normalized generated
+  // media name and content fingerprint match.
+  const seenPresentationMedia = new Set();
+  const presentationDeduped = embeddedDeduped.filter(f => {
+    if (f.source !== 'scan-on-save-presentation') return true;
+    const fileName = path.basename(f.name || f.path || '');
+    const ext = path.extname(fileName).toLowerCase();
+    const base = path.basename(fileName, ext).replace(/_\d+$/i, '').toLowerCase();
+    if (!base || !ext) return true;
+    try {
+      const buf = fs.readFileSync(f.path);
+      const hash = crypto.createHash('md5').update(buf).digest('hex');
+      const key = `${base}:${ext}:${buf.length}:${hash}`;
+      if (seenPresentationMedia.has(key)) return false;
+      seenPresentationMedia.add(key);
+      return true;
+    } catch (e) {
+      return true;
+    }
+  });
+
+  // Pass 4: Figma asset identity dedup — protects startup scans from adding the
   // same cloud asset more than once under different local filenames.
   const seenFigmaAssets = new Set();
-  return embeddedDeduped.filter(f => {
+  return presentationDeduped.filter(f => {
     if (f.source !== 'figma-auto') return true;
     const figmaKey = getFigmaAssetDedupKey(f);
     if (!figmaKey) return true;
@@ -7206,6 +7230,24 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         } catch (e) { /* file may no longer exist */ }
       }
     }
+    const extractedPresentationFingerprints = new Set(contentFingerprints);
+
+    const cacheHasMatchingPresentationMedia = (fingerprint) => {
+      if (!fingerprint) return false;
+      try {
+        for (const entryName of fs.readdirSync(tempDir)) {
+          const candidatePath = path.join(tempDir, entryName);
+          const stat = fs.statSync(candidatePath);
+          if (!stat.isFile()) continue;
+          const buf = fs.readFileSync(candidatePath);
+          const hash = crypto.createHash('md5').update(buf).digest('hex');
+          if (`${buf.length}:${hash}` === fingerprint) return true;
+        }
+      } catch (e) {
+        return false;
+      }
+      return false;
+    };
 
     // List zip contents
     const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', presentationPath], {
@@ -7259,14 +7301,16 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
           timeout: 10000, maxBuffer: 50 * 1024 * 1024,
           encoding: 'buffer'
         });
+        let extractedFingerprint = null;
 
         // Content-based dedup for .pptx
-        if ((ext === '.pptx' || ext === '.ppt') && contentFingerprints.size > 0) {
+        if (ext === '.pptx' || ext === '.ppt') {
           const extractedSize = data.length;
-          if (capturedSizes.has(extractedSize)) {
-            const extractedHash = crypto.createHash('md5').update(data).digest('hex');
-            if (contentFingerprints.has(`${extractedSize}:${extractedHash}`)) continue;
-          }
+          const extractedHash = crypto.createHash('md5').update(data).digest('hex');
+          extractedFingerprint = `${extractedSize}:${extractedHash}`;
+          if (extractedPresentationFingerprints.has(extractedFingerprint)) continue;
+          if (cacheHasMatchingPresentationMedia(extractedFingerprint)) continue;
+          extractedPresentationFingerprints.add(extractedFingerprint);
         }
 
         // Recover original filename (strip Keynote's trailing -NNNN suffix)
@@ -7281,11 +7325,25 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         let counter = 1;
         while (fs.existsSync(destPath)) {
           hardenPresentationCacheFileIfPresent(destPath, tempDir);
+          if (ext === '.pptx' || ext === '.ppt') {
+            try {
+              const existingBuf = fs.readFileSync(destPath);
+              const existingHash = crypto.createHash('md5').update(existingBuf).digest('hex');
+              if (`${existingBuf.length}:${existingHash}` === extractedFingerprint) {
+                destPath = null;
+                break;
+              }
+            } catch (e) {
+              // Fall through to collision suffixing if the existing cache file
+              // cannot be inspected.
+            }
+          }
           const e = path.extname(outputName);
           const b = path.basename(outputName, e);
           destPath = path.join(tempDir, `${b}_${counter}${e}`);
           counter++;
         }
+        if (!destPath) continue;
 
         writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
@@ -9093,6 +9151,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       }
     }
   }
+  const extractedPresentationFingerprints = new Set(contentFingerprints);
 
   try {
     // List the zip contents — format: "  length  MM-DD-YYYY HH:MM  filename"
@@ -9198,17 +9257,20 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
       try {
         const { data, outputTail } = await extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths);
+        let extractedFingerprint = null;
 
         // v1.3.18: Content-based dedup for .pptx — skip if identical to a captured file.
-        if ((ext === '.pptx' || ext === '.ppt') && contentFingerprints.size > 0) {
+        if (ext === '.pptx' || ext === '.ppt') {
           const extractedSize = data.length;
-          if (capturedSizes.has(extractedSize)) {
-            const extractedHash = crypto.createHash('md5').update(data).digest('hex');
-            if (contentFingerprints.has(`${extractedSize}:${extractedHash}`)) {
+          const extractedHash = crypto.createHash('md5').update(data).digest('hex');
+          extractedFingerprint = `${extractedSize}:${extractedHash}`;
+          if (extractedPresentationFingerprints.has(extractedFingerprint)) {
+            if (capturedSizes.has(extractedSize)) {
               console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes, md5:${extractedHash})`);
-              continue;
             }
+            continue;
           }
+          extractedPresentationFingerprints.add(extractedFingerprint);
         }
 
         // Recover the original filename: strip Keynote's trailing "-NNNN" suffix
