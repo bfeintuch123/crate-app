@@ -588,11 +588,26 @@ function isBroadRootSessionDir(dirPath) {
   return roots.some(root => resolvedDir === root);
 }
 
+function getPrimaryDesignAppFamilyForExt(ext) {
+  const normalizedExt = String(ext || '').toLowerCase();
+  if (['.ai', '.eps', '.svg'].includes(normalizedExt)) return 'illustrator';
+  if (['.psd', '.psb', '.pxd'].includes(normalizedExt)) return 'photoshop';
+  if (['.indd', '.idml'].includes(normalizedExt)) return 'indesign';
+  if (normalizedExt === '.fig') return 'figma';
+  if (normalizedExt === '.sketch') return 'sketch';
+  if (normalizedExt === '.xd') return 'adobe-xd';
+  if (['.afdesign', '.afphoto', '.afpub'].includes(normalizedExt)) return 'affinity';
+  if (normalizedExt === '.key') return 'keynote';
+  if (['.pptx', '.ppt'].includes(normalizedExt)) return 'powerpoint';
+  return null;
+}
+
 function buildProjectSessionScope(project) {
   const scope = {
     anchorPaths: new Set(),
     anchorDirs: [],
     sourceNameCounts: new Map(),
+    primaryAppFamilies: new Set(),
   };
   const files = [
     ...((project && Array.isArray(project.files)) ? project.files : []),
@@ -609,6 +624,10 @@ function buildProjectSessionScope(project) {
     const isSourceLike = PRIMARY_DESIGN_EXTENSIONS.has(ext) || isExplicitUserCapturedFile(file);
     const fileName = path.basename(file.path).toLowerCase();
     scope.sourceNameCounts.set(fileName, (scope.sourceNameCounts.get(fileName) || 0) + 1);
+    if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
+      const appFamily = getPrimaryDesignAppFamilyForExt(ext);
+      if (appFamily) scope.primaryAppFamilies.add(appFamily);
+    }
     if (isSourceLike) {
       const dir = path.dirname(file.path);
       if (!isBroadRootSessionDir(dir)) scope.anchorDirs.push(dir);
@@ -645,6 +664,17 @@ function isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence = {}) {
   if (evidence.sourceDocumentName) {
     const sourceName = String(evidence.sourceDocumentName).toLowerCase();
     if (scope.sourceNameCounts.get(sourceName) === 1) return true;
+  }
+
+  const candidateExt = (fileEntry.ext || path.extname(fileEntry.path || '') || '').toLowerCase();
+  const candidateFamily = getPrimaryDesignAppFamilyForExt(candidateExt);
+  if (
+    PRIMARY_DESIGN_EXTENSIONS.has(candidateExt) &&
+    candidateFamily &&
+    scope.primaryAppFamilies.size > 0 &&
+    !scope.primaryAppFamilies.has(candidateFamily)
+  ) {
+    return false;
   }
 
   return scope.anchorDirs.some(anchorDir => isPathInsideOrEqual(anchorDir, fileEntry.path));
