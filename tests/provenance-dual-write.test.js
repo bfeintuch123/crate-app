@@ -3168,6 +3168,176 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   ], 'Illustrator live app status breadcrumbs');
 });
 
+test('Illustrator live app fallback does not leak stale source into InDesign-anchored project', async () => {
+  resetTestHomeWorkspace();
+  const qa35Root = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.35-jenna');
+  const sourceDir = path.join(qa35Root, 'source-copies');
+  const downloadsDir = path.join(qa35Root, 'web-downloads', 'indesign-unused-exclusion');
+  const outputDir = path.join(qa35Root, 'package-outputs');
+  const indesignPath = path.join(sourceDir, 'Crate InDesign Downloaded Unused QA qa35.indd');
+  const staleIllustratorPath = path.join(sourceDir, 'Bris Invitation-03 copy.ai');
+  const usedOnePath = path.join(downloadsDir, 'qa35-used-web-01.jpg');
+  const usedTwoPath = path.join(downloadsDir, 'qa35-used-web-02.jpg');
+  const unusedPath = path.join(downloadsDir, 'qa35-unused-web-03.jpg');
+  const staleIllustratorLinkedPath = path.join(qa35Root, 'test-photos', 'IMG_5331.JPG');
+
+  for (const dirPath of [sourceDir, downloadsDir, outputDir, path.dirname(staleIllustratorLinkedPath)]) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+  fs.writeFileSync(indesignPath, 'saved InDesign bytes');
+  fs.writeFileSync(staleIllustratorPath, 'stale Illustrator bytes');
+  fs.writeFileSync(usedOnePath, 'used image one');
+  fs.writeFileSync(usedTwoPath, 'used image two');
+  fs.writeFileSync(unusedPath, 'unused image should stay out');
+  fs.writeFileSync(staleIllustratorLinkedPath, 'stale Illustrator linked image');
+
+  const priorIllustratorProject = await createProject('Prior Illustrator lane before clear');
+  await setProjectFiles(priorIllustratorProject.id, {
+    pendingFiles: [{
+      path: staleIllustratorPath,
+      name: path.basename(staleIllustratorPath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'app-opened',
+      captureState: 'needs-save',
+      captureReason: 'unsaved-source-needs-save',
+      captureEvidence: {
+        source: 'app-opened',
+        appFamily: 'illustrator',
+        observerMethod: 'illustrator-active-session',
+        evidenceStrength: 'structured-app-document',
+        captureRecommendation: 'needs-save',
+      },
+    }],
+    liveEvidenceLedger: {
+      schemaVersion: 1,
+      candidates: {
+        [liveEvidenceKeyForTest(staleIllustratorPath)]: {
+          evidenceKey: liveEvidenceKeyForTest(staleIllustratorPath),
+          strongestState: 'needs-save',
+          latest: {
+            candidateName: path.basename(staleIllustratorPath),
+            captureRecommendation: 'needs-save',
+            reason: 'unsaved-source-needs-save',
+          },
+        },
+      },
+    },
+  });
+  await callIpc('projects:delete-all');
+  assert.equal((await callIpc('projects:get-all')).length, 0);
+
+  let illustratorScriptAttempts = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      illustratorScriptAttempts++;
+      return {
+        stdout: [
+          `DOC\t${staleIllustratorPath}\tBris Invitation-03 copy.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          `LINK\t${staleIllustratorPath}\tBris Invitation-03 copy.ai\t${staleIllustratorLinkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const projectName = 'InDesign anchored stale Illustrator guard';
+  const project = await createProject(projectName);
+  const now = Date.now();
+  await setProjectFiles(project.id, {
+    files: [
+      {
+        path: indesignPath,
+        name: path.basename(indesignPath),
+        ext: '.indd',
+        addedAt: now,
+        source: 'scan-on-open',
+        captureReason: 'scan-on-open-source-relationship',
+        captureEvidence: {
+          source: 'scan-on-open',
+          parserConfirmed: true,
+          filesystemSaved: true,
+        },
+      },
+      {
+        path: usedOnePath,
+        name: path.basename(usedOnePath),
+        ext: '.jpg',
+        addedAt: now,
+        source: 'indd-linked',
+        captureReason: 'linked-asset-observed',
+        captureEvidence: {
+          source: 'indd-poll',
+          appFamily: 'indesign',
+          evidenceStrength: 'structured-app-link',
+          captureRecommendation: 'package-ready',
+          parserConfirmed: true,
+        },
+      },
+      {
+        path: usedTwoPath,
+        name: path.basename(usedTwoPath),
+        ext: '.jpg',
+        addedAt: now,
+        source: 'indd-linked',
+        captureReason: 'linked-asset-observed',
+        captureEvidence: {
+          source: 'indd-poll',
+          appFamily: 'indesign',
+          evidenceStrength: 'structured-app-link',
+          captureRecommendation: 'package-ready',
+          parserConfirmed: true,
+        },
+      },
+    ],
+    pendingFiles: [],
+  });
+
+  await waitForProject(project.id, () => illustratorScriptAttempts > 0, 5000);
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === staleIllustratorPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === staleIllustratorPath), false);
+  assert.equal(fresh.files.some(file => file.path === staleIllustratorLinkedPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === staleIllustratorLinkedPath), false);
+  assert.equal(fresh.files.some(file => file.path === indesignPath), true);
+  assert.equal(fresh.files.some(file => file.path === usedOnePath), true);
+  assert.equal(fresh.files.some(file => file.path === usedTwoPath), true);
+  assert.equal(fresh.files.some(file => file.path === unusedPath), false);
+
+  const result = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(result);
+  assert.equal(result.success, true);
+  assert.equal(result.totalFiles, 3);
+  assert.equal(result.copiedCount, 3);
+  assert.deepEqual(result.errors, []);
+
+  const destFolder = packageFolder(outputDir, projectName);
+  const outputFileNames = fs.readdirSync(destFolder)
+    .filter(fileName => fs.statSync(path.join(destFolder, fileName)).isFile())
+    .sort();
+  assert.deepEqual(outputFileNames, [
+    path.basename(indesignPath),
+    path.basename(usedOnePath),
+    path.basename(usedTwoPath),
+  ].sort());
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(staleIllustratorPath))), false);
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(staleIllustratorLinkedPath))), false);
+  assert.equal(fs.existsSync(path.join(destFolder, path.basename(unusedPath))), false);
+
+  fresh = await getProject(project.id);
+  assertProvenanceTextExcludes(fresh, [
+    staleIllustratorPath,
+    staleIllustratorLinkedPath,
+    '/usr/bin/osascript',
+    'stdout',
+    'raw',
+  ]);
+});
+
 test('Illustrator live app evidence stages valid rows when placed item reads report safe partial status', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator-partial.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
