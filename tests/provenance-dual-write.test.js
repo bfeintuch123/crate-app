@@ -1571,6 +1571,99 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
   }
 });
 
+test('Keynote scan-on-save captures distinct pasted images with same cleaned base after prior captures', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Keynote Pasted Image Save Refresh');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const paths = presentationCachePaths(project.id);
+    fs.mkdirSync(paths.projectDir, { recursive: true, mode: 0o700 });
+
+    const mediaBytes = (label) => Buffer.from(`${label}_KEYNOTE_MEDIA_BYTES_SHOULD_NOT_LEAK`.repeat(40));
+    const existingOne = path.join(paths.projectDir, 'Deck — pasted-image.jpeg');
+    const existingTwo = path.join(paths.projectDir, 'Deck — pasted-image_1.jpeg');
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    fs.writeFileSync(existingOne, mediaBytes('EXISTING_ONE'));
+    fs.writeFileSync(existingTwo, mediaBytes('EXISTING_TWO'));
+
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: keynotePath,
+          name: 'Deck.key',
+          ext: '.key',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: existingOne,
+          name: 'Deck — pasted-image.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+        {
+          path: existingTwo,
+          name: 'Deck — pasted-image_1.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setKeynoteUnzipFixture([
+      { internalPath: 'Data/pasted-image-1001.jpeg', data: mediaBytes('EXISTING_ONE') },
+      { internalPath: 'Data/pasted-image-1002.jpeg', data: mediaBytes('EXISTING_TWO') },
+      { internalPath: 'Data/pasted-image-1003.jpeg', data: mediaBytes('NEW_ONE') },
+      { internalPath: 'Data/pasted-image-1004.jpeg', data: mediaBytes('NEW_TWO') },
+      { internalPath: 'Data/pasted-image-1005.jpeg', data: mediaBytes('NEW_THREE') },
+    ]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', keynotePath);
+      return waitForProject(
+        project.id,
+        item => item.files.filter(file => file.source === 'scan-on-save-presentation').length === 5,
+        5000
+      );
+    });
+
+    const fresh = captured.result;
+    const extractedNames = fresh.files
+      .filter(file => file.source === 'scan-on-save-presentation')
+      .map(file => file.name)
+      .sort();
+    assert.deepEqual(extractedNames, [
+      'Deck — pasted-image.jpeg',
+      'Deck — pasted-image_1.jpeg',
+      'Deck — pasted-image_2.jpeg',
+      'Deck — pasted-image_3.jpeg',
+      'Deck — pasted-image_4.jpeg',
+    ]);
+    assert.equal(
+      fs.readFileSync(fresh.files.find(file => file.name === 'Deck — pasted-image_2.jpeg').path, 'utf8'),
+      mediaBytes('NEW_ONE').toString('utf8')
+    );
+    assert.equal(
+      fs.readFileSync(fresh.files.find(file => file.name === 'Deck — pasted-image_3.jpeg').path, 'utf8'),
+      mediaBytes('NEW_TWO').toString('utf8')
+    );
+    assert.equal(
+      fs.readFileSync(fresh.files.find(file => file.name === 'Deck — pasted-image_4.jpeg').path, 'utf8'),
+      mediaBytes('NEW_THREE').toString('utf8')
+    );
+    assertTextExcludes(captured.output, [
+      'EXISTING_ONE_KEYNOTE_MEDIA_BYTES_SHOULD_NOT_LEAK',
+      'NEW_ONE_KEYNOTE_MEDIA_BYTES_SHOULD_NOT_LEAK',
+    ], 'Keynote pasted image scan-on-save logs');
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 3);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 3);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('Keynote package extraction records deterministic Data media provenance and diagnostics graph', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -1668,6 +1761,92 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(duplicateResult.totalFiles, 1);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Keynote package extraction recovers new pasted images when prior scan media shares the cleaned base', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Keynote Pasted Image Package Refresh');
+    const keynotePath = path.join(tmpRoot, 'Deck.key');
+    const existingOne = path.join(tmpRoot, 'Deck — pasted-image.jpeg');
+    const existingTwo = path.join(tmpRoot, 'Deck — pasted-image_1.jpeg');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+
+    const mediaBytes = (label) => Buffer.from(`${label}_KEYNOTE_PACKAGE_BYTES_SHOULD_NOT_LEAK`.repeat(40));
+    fs.writeFileSync(keynotePath, Buffer.from('keynote container bytes'));
+    fs.writeFileSync(existingOne, mediaBytes('EXISTING_ONE'));
+    fs.writeFileSync(existingTwo, mediaBytes('EXISTING_TWO'));
+    setKeynoteUnzipFixture([
+      { internalPath: 'Data/pasted-image-1001.jpeg', data: mediaBytes('EXISTING_ONE') },
+      { internalPath: 'Data/pasted-image-1002.jpeg', data: mediaBytes('EXISTING_TWO') },
+      { internalPath: 'Data/pasted-image-1003.jpeg', data: mediaBytes('NEW_ONE') },
+      { internalPath: 'Data/pasted-image-1004.jpeg', data: mediaBytes('NEW_TWO') },
+      { internalPath: 'Data/pasted-image-1005.jpeg', data: mediaBytes('NEW_THREE') },
+    ]);
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: keynotePath,
+          name: 'Deck.key',
+          ext: '.key',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: existingOne,
+          name: 'Deck — pasted-image.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+        {
+          path: existingTwo,
+          name: 'Deck — pasted-image_1.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+
+    const captured = await captureConsoleDuring(async () => callIpc('projects:package', project.id, outputDir));
+    const result = captured.result;
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 3);
+    assert.equal(result.embeddedCount, 3);
+    assert.equal(result.totalFiles, 3);
+    assert.deepEqual(result.errors, []);
+
+    const destFolder = packageFolder(outputDir, 'Keynote Pasted Image Package Refresh');
+    const packageEntries = fs.readdirSync(destFolder).sort();
+    assert.deepEqual(packageEntries, [
+      'Deck — pasted-image.jpeg',
+      'Deck — pasted-image_1.jpeg',
+      'Deck — pasted-image_2.jpeg',
+      'Deck — pasted-image_3.jpeg',
+      'Deck — pasted-image_4.jpeg',
+      'Deck.key',
+    ]);
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — pasted-image.jpeg'), 'utf8'), mediaBytes('EXISTING_ONE').toString('utf8'));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — pasted-image_1.jpeg'), 'utf8'), mediaBytes('EXISTING_TWO').toString('utf8'));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — pasted-image_2.jpeg'), 'utf8'), mediaBytes('NEW_ONE').toString('utf8'));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — pasted-image_3.jpeg'), 'utf8'), mediaBytes('NEW_TWO').toString('utf8'));
+    assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — pasted-image_4.jpeg'), 'utf8'), mediaBytes('NEW_THREE').toString('utf8'));
+    assertTextExcludes(captured.output, [
+      'EXISTING_ONE_KEYNOTE_PACKAGE_BYTES_SHOULD_NOT_LEAK',
+      'NEW_ONE_KEYNOTE_PACKAGE_BYTES_SHOULD_NOT_LEAK',
+    ], 'Keynote pasted image package logs');
+
+    const fresh = await getProject(project.id);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 3);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 3);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 3);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 3);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
