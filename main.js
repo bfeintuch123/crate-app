@@ -7449,29 +7449,30 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     if (!project || project.status !== 'watching') return;
     const projectFiles = project.files || [];
 
-    // Name-based dedup for .key files
+    // Name-based dedup for .key files. Do not add prior scan-on-save media to
+    // this base-name set: Keynote commonly saves multiple distinct pasted
+    // images as pasted-image-NNNN.jpeg, and stripping the suffix collapses them
+    // all to the same display base. Exact duplicate scan media is handled by
+    // content fingerprints below.
     const alreadyCapturedBases = new Set();
     for (const f of projectFiles) {
       if (f && f.source === 'scan-on-save-presentation') {
         hardenPresentationCacheFileIfPresent(f.path, tempDir);
+        continue;
       }
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
-      // v2.6.1: scan-on-save prefixes filenames with "{PresentationName} — ".
-      // On subsequent saves, Keynote dedup checks the raw embedded name (e.g. "image-001")
-      // which never matches the prefixed form ("mykeynote — image-001"). Strip the prefix
-      // so existing files are recognised and not re-extracted.
-      if (f.source === 'scan-on-save-presentation') {
-        const separatorIdx = n.indexOf(' — ');
-        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
-      }
     }
 
-    // Content-based dedup for .pptx files
+    // Content-based dedup for presentation media. PowerPoint renames images
+    // generically, and Keynote may give multiple distinct pasted images the same
+    // cleaned display base. Content identity is the safe cross-save dedupe key.
     const contentFingerprints = new Set();
     const capturedSizes = new Set();
-    if (ext === '.pptx' || ext === '.ppt') {
+    if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
       for (const f of projectFiles) {
+        const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
+        if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
         try {
           const buf = fs.readFileSync(f.path);
           const size = buf.length;
@@ -7554,8 +7555,8 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         });
         let extractedFingerprint = null;
 
-        // Content-based dedup for .pptx
-        if (ext === '.pptx' || ext === '.ppt') {
+        // Content-based dedup for presentation media.
+        if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
           const extractedSize = data.length;
           const extractedHash = crypto.createHash('md5').update(data).digest('hex');
           extractedFingerprint = `${extractedSize}:${extractedHash}`;
@@ -7576,7 +7577,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         let counter = 1;
         while (fs.existsSync(destPath)) {
           hardenPresentationCacheFileIfPresent(destPath, tempDir);
-          if (ext === '.pptx' || ext === '.ppt') {
+          if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
             try {
               const existingBuf = fs.readFileSync(destPath);
               const existingHash = crypto.createHash('md5').update(existingBuf).digest('hex');
@@ -9365,32 +9366,30 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
   // v1.3.10: Build a set of base names already captured by chokidar/lsof.
   // Normalise: lowercase, strip extension, collapse whitespace.
   // If chokidar already captured "shopping (6).webp", the embedded copy
-  // ("shopping (6).jpeg") is a lower-quality duplicate — skip it.
+  // ("shopping (6).jpeg") is a lower-quality duplicate — skip it. Prior
+  // scan-on-save media is intentionally excluded from this name set because
+  // Keynote can save multiple distinct pasted images as pasted-image-NNNN.jpeg;
+  // exact duplicates are handled by content fingerprints below.
   const alreadyCapturedBases = new Set();
   if (projectFiles) {
     for (const f of projectFiles) {
+      if (f && f.source === 'scan-on-save-presentation') continue;
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
       alreadyCapturedBases.add(n);
-      // v2.5.9: scan-on-save-presentation prefixes filenames with "{PresentationName} — ".
-      // At package time the Keynote dedup checks the raw embedded name (e.g. "image-001"),
-      // which never matches the prefixed version ("mypresentation — image-001"). Strip the
-      // prefix so both forms are in the set and dedup works correctly.
-      if (f.source === 'scan-on-save-presentation') {
-        const separatorIdx = n.indexOf(' — ');
-        if (separatorIdx !== -1) alreadyCapturedBases.add(n.slice(separatorIdx + 3).trim());
-      }
     }
   }
 
-  // v1.3.18: Content-based dedup for .pptx files.
+  // v1.3.18: Content-based dedup for presentation media.
   // PowerPoint renames all embedded images generically (image1.png, image2.png),
-  // so name-based dedup can't match them against originals captured by chokidar.
-  // Build a Set of size:md5 fingerprints from already-captured files, then check
-  // each extracted pptx entry against it. Same size + same hash = same file, skip it.
+  // and Keynote can collapse distinct pasted images to the same cleaned display
+  // base. Build a Set of size:md5 fingerprints from already-captured media, then
+  // check each extracted entry against it. Same size + same hash = same file.
   const contentFingerprints = new Set();
   const capturedSizes = new Set();
-  if ((ext === '.pptx' || ext === '.ppt') && projectFiles) {
+  if ((ext === '.pptx' || ext === '.ppt' || ext === '.key') && projectFiles) {
     for (const f of projectFiles) {
+      const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
+      if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
       try {
         const buf = fs.readFileSync(f.path);
         const size = buf.length;
@@ -9510,8 +9509,9 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         const { data, outputTail } = await extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths);
         let extractedFingerprint = null;
 
-        // v1.3.18: Content-based dedup for .pptx — skip if identical to a captured file.
-        if (ext === '.pptx' || ext === '.ppt') {
+        // v1.3.18: Content-based dedup for presentation media — skip if
+        // identical to a captured file.
+        if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
           const extractedSize = data.length;
           const extractedHash = crypto.createHash('md5').update(data).digest('hex');
           extractedFingerprint = `${extractedSize}:${extractedHash}`;
