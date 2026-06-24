@@ -1642,12 +1642,20 @@ async function handleV2FileDrop(filePath) {
 
     $('#modal-progress').classList.add('hidden');
 
+    if (result.error === 'limit_reached') {
+      $('#upgrade-days-left').textContent = result.daysLeft;
+      $('#modal-upgrade').classList.remove('hidden');
+      return;
+    }
+
     if (result.error) {
       showToast('Error: ' + result.error);
       return;
     }
 
     showV2Results(result);
+    state.usage = await window.crate.getUsage();
+    renderFooter();
   } finally {
     v2PackageInFlight = false;
   }

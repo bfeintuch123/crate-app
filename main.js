@@ -2769,6 +2769,23 @@ function checkAndResetUsage() {
   }
 }
 
+function getPackageLimitResult() {
+  checkAndResetUsage();
+  const usage = store.get('usage');
+  if (usage.packagesThisMonth >= 10) {
+    const daysLeft = Math.ceil((new Date(usage.resetDate) - new Date()) / (1000 * 60 * 60 * 24));
+    return { error: 'limit_reached', daysLeft };
+  }
+  return null;
+}
+
+function incrementPackageUsage() {
+  const usage = store.get('usage');
+  usage.packagesThisMonth++;
+  store.set('usage', usage);
+  return usage;
+}
+
 // v2.4.2: Validated accessor — always returns an array even if store is corrupted/missing
 function getProjects() {
   const val = store.get('projects', []);
@@ -9684,14 +9701,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   // clicks Package, and selecting too early yields a zero-file package.
   await waitForPackageInputScans(id);
 
-  checkAndResetUsage();
-  const usage = store.get('usage');
-
   // Check freemium limit
-  if (usage.packagesThisMonth >= 10) {
-    const daysLeft = Math.ceil((new Date(usage.resetDate) - new Date()) / (1000 * 60 * 60 * 24));
-    return { error: 'limit_reached', daysLeft };
-  }
+  const limitResult = getPackageLimitResult();
+  if (limitResult) return limitResult;
 
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
@@ -9839,9 +9851,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     });
     rememberGeneratedPackageOutputPath(destFolder);
 
-    // Increment usage
-    usage.packagesThisMonth++;
-    store.set('usage', usage);
+    incrementPackageUsage();
 
     // Send notification if enabled
     if (settings.notifications && Notification.isSupported()) {
@@ -9957,6 +9967,9 @@ ipcMain.handle('v2:browse-file', async () => {
 ipcMain.handle('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
+  const limitResult = getPackageLimitResult();
+  if (limitResult) return limitResult;
+
   // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
   // Previously showed an output directory picker, which combined with the browse file
   // picker created a double-prompt regression.
@@ -9971,6 +9984,7 @@ ipcMain.handle('v2:package-file', async (event, filePath) => {
   try {
     const result = await packageMasterFile(filePath, destFolder);
     rememberGeneratedPackageOutputPath(destFolder);
+    incrementPackageUsage();
     return {
       success: true,
       masterFile: result.masterFile,
