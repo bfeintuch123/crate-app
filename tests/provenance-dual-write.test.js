@@ -617,6 +617,12 @@ function packageFolder(outputDir, projectName) {
   return path.join(outputDir, `${projectName}_${dateStr}`);
 }
 
+function quickPackageFolder(masterFilePath) {
+  const dateStr = new Date().toISOString().split('T')[0];
+  const baseName = path.basename(masterFilePath, path.extname(masterFilePath));
+  return path.join(TEST_HOME, 'Desktop', `${baseName}_${dateStr}`);
+}
+
 function manifestPath(outputDir, projectName) {
   return path.join(packageFolder(outputDir, projectName), 'Crate Diagnostics', 'crate-provenance.json');
 }
@@ -1192,6 +1198,76 @@ test('PowerPoint package extraction records deterministic media provenance and d
     assert.equal(duplicateResult.totalFiles, 1);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package consumes package quota only after successful packaging', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Quick Quota Deck.pptx');
+    fs.writeFileSync(deckPath, Buffer.from('quick package pptx bytes'));
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('QUICK_PACKAGE_QUOTA_IMAGE_BYTES'.repeat(40)),
+    }]);
+
+    storeInstance.set('usage.packagesThisMonth', 2);
+    const result = await callIpc('v2:package-file', deckPath);
+    assert.equal(result.success, true);
+    assert.equal(result.assetsFound, 1);
+    assert.equal(result.assetsCopied, 1);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 3);
+    assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'Quick Quota Deck.pptx')), true);
+    assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'Crate Diagnostics', 'crate-provenance.json')), false);
+    assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'crate-provenance.json')), false);
+
+    const missingPath = path.join(tmpRoot, 'Missing Quick Quota Deck.pptx');
+    const failedResult = await callIpc('v2:package-file', missingPath);
+    assert.equal(failedResult.success, undefined);
+    assert.match(failedResult.error, /Master file not found/);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 3);
+    assert.equal(fs.existsSync(quickPackageFolder(missingPath)), false);
+
+    const limitPath = path.join(tmpRoot, 'Limit Quick Quota Deck.pptx');
+    fs.writeFileSync(limitPath, Buffer.from('limit quick package pptx bytes'));
+    storeInstance.set('usage.packagesThisMonth', 10);
+    const limitResult = await callIpc('v2:package-file', limitPath);
+    assert.equal(limitResult.error, 'limit_reached');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 10);
+    assert.equal(fs.existsSync(quickPackageFolder(limitPath)), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(path.join(TEST_HOME, 'Desktop', 'Quick Quota Deck_' + new Date().toISOString().split('T')[0]), { recursive: true, force: true });
+    fs.rmSync(path.join(TEST_HOME, 'Desktop', 'Limit Quick Quota Deck_' + new Date().toISOString().split('T')[0]), { recursive: true, force: true });
+  }
+});
+
+test('normal project package still consumes package quota after success', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Normal Package Quota');
+    const sourcePath = path.join(tmpRoot, 'Logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('normal package source bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    storeInstance.set('usage.packagesThisMonth', 4);
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 5);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
