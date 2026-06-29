@@ -179,6 +179,39 @@ test('renderer Figma scope helper preserves explicit scope choices', () => {
   }), 'Current Page Only - Page One');
 });
 
+test('renderer only shows package review Figma scope for Figma context', () => {
+  const renderer = loadRendererHelpers();
+
+  assert.equal(renderer.projectHasFigmaContext({
+    type: 'presentation',
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [],
+    files: [{
+      name: 'Crate PowerPoint QA.pptx',
+      ext: '.pptx',
+      source: 'manual-browse',
+    }],
+  }), false);
+
+  assert.equal(renderer.projectHasFigmaContext({
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [{ status: 'tracked' }],
+    files: [],
+  }), true);
+
+  assert.equal(renderer.projectHasFigmaContext({
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [],
+    files: [{
+      name: 'Petra_Logo_Group_1.png',
+      ext: '.png',
+      source: 'figma-auto',
+      figmaFileKey: 'FIG22',
+      figmaPageName: 'Page One',
+    }],
+  }), true);
+});
+
 test('renderer accepts modern Figma URL shapes that the main process parses', () => {
   const renderer = loadRendererHelpers();
 
