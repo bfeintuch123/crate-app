@@ -12,28 +12,42 @@
 </head>
 <body>
   <div id="app">
-    <!-- CRATE Header Bar -->
-    <div class="app-header">
-      <span class="app-logo">CRATE</span>
-      <span class="app-badge" id="header-badge">Free Plan</span>
-    </div>
+    <aside class="app-sidebar" aria-label="Crate navigation">
+      <div class="sidebar-brand">
+        <span class="app-logo">CRATE</span>
+      </div>
 
-    <!-- Tab Bar -->
-    <div class="app-tabs">
-      <button class="app-tab active" data-tab="projects">Projects</button>
-      <button class="app-tab" data-tab="files">Files</button>
-      <button class="app-tab" data-tab="settings">Settings</button>
-    </div>
+      <nav class="app-tabs" aria-label="Primary">
+        <button class="app-tab active" data-tab="projects">Projects</button>
+        <button class="app-tab" data-tab="current-project">Current Project</button>
+      </nav>
 
-    <!-- Scrollable Content Area -->
-    <div class="app-content">
+      <button class="sidebar-quick-action" id="btn-sidebar-quick-package" type="button">Quick Package</button>
+
+      <div class="sidebar-spacer"></div>
+
+      <nav class="app-tabs app-tabs-secondary" aria-label="Support">
+        <button class="app-tab" data-tab="settings">Settings</button>
+        <button class="app-tab" data-tab="help">Help</button>
+      </nav>
+
+      <div class="sidebar-plan-card">
+        <div class="sidebar-plan-title">Free Plan</div>
+        <div class="app-usage" id="footer-usage">0 of 10 packages used this month</div>
+        <a class="app-upgrade" href="#">Upgrade</a>
+      </div>
+    </aside>
+
+    <main class="app-main">
+      <!-- Scrollable Content Area -->
+      <div class="app-content">
       <!-- Projects Tab -->
       <div class="tab-content active" id="tab-projects">
         <!-- Empty State -->
         <div id="projects-empty" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
           <div class="app-empty-title">No active projects</div>
-          <div class="app-empty-desc">Start a project and Crate will automatically track every file you open.</div>
+          <div class="app-empty-desc">Start a project or use Quick Package to gather files.</div>
           <button class="app-btn" id="btn-start-project">+ Start Project</button>
         </div>
 
@@ -46,7 +60,7 @@
         <!-- New Project Form -->
         <div id="new-project-form" class="hidden">
           <div class="app-label">New Project</div>
-          <div class="form-subtitle">Name your project &mdash; Crate will start watching every file you open.</div>
+          <div class="form-subtitle">Name your project &mdash; Crate will watch project dependencies while you work.</div>
           <div class="form-field">
             <div class="app-label">Project Name</div>
             <div class="form-input-wrap">
@@ -107,12 +121,12 @@
         </div>
       </div>
 
-      <!-- Files Tab -->
-      <div class="tab-content" id="tab-files">
+      <!-- Current Project Tab -->
+      <div class="tab-content" id="tab-current-project">
         <div id="files-no-project" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
           <div class="app-empty-title">No project selected</div>
-          <div class="app-empty-desc">Select a project from the Projects tab to view its files.</div>
+          <div class="app-empty-desc">Choose a project or start a new one.</div>
         </div>
 
         <div id="files-view" class="hidden">
@@ -126,7 +140,7 @@
             Crate only sees files opened by design apps during this session.
           </div>
           <div id="files-figma-scope" class="figma-link-row" style="margin-top:8px;" title="Edit Figma link"></div>
-          <div id="files-figma-warning" class="privacy-hint" style="margin-top:8px;color:#f59e0b;"></div>
+          <div id="files-figma-warning" class="figma-warning-card hidden"></div>
 
           <!-- Tier 2: files awaiting user review -->
           <div id="pending-section" class="hidden">
@@ -157,7 +171,7 @@
           <div class="settings-section-title">Preferences</div>
           <div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label">Notifications</div>
+              <div class="settings-label">Package alerts</div>
               <div class="settings-desc">Get alerts when a package is complete or Crate notices you've stopped working.</div>
             </div>
             <label class="toggle">
@@ -168,13 +182,14 @@
           <div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label">Include diagnostic report in packages</div>
-              <div class="settings-desc">Adds a troubleshooting report for support and QA. Not needed for normal client handoff.</div>
+              <div class="settings-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
             </div>
             <label class="toggle">
               <input type="checkbox" id="toggle-diagnostic-report">
               <span class="toggle-slider"></span>
             </label>
           </div>
+          <div class="diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div>
           <div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label">Show Package Details after packaging</div>
@@ -189,12 +204,12 @@
 
         <div class="settings-section">
           <div class="settings-section-title">Figma Integration</div>
-          <div class="settings-desc" style="margin-bottom:12px;">Connect your Figma account &mdash; Crate will automatically track your Figma files.</div>
+          <div class="settings-desc" style="margin-bottom:12px;">Connect Figma, then add a Figma link inside a project.</div>
           <div id="figma-status">
             <div id="figma-connected" class="hidden">
               <div class="figma-status-row">
                 <span class="figma-status-dot connected"></span>
-                <span>Connected &mdash; Auto-tracking enabled</span>
+                <span>Figma connected &mdash; Project links enabled</span>
               </div>
               <div class="figma-tracking-info" id="figma-tracking-info">
                 <div class="figma-tracking-stat">
@@ -207,18 +222,18 @@
                 </div>
               </div>
               <div class="figma-auto-info">
-                <div class="figma-auto-title">&#x2705; Auto-tracking active</div>
-                <div class="figma-auto-desc">Crate scans your tracked Figma files every 60 seconds and automatically captures assets &mdash; desktop app or web.</div>
+                <div class="figma-auto-title">&#x2705; Project links enabled</div>
+                <div class="figma-auto-desc">Crate scans Figma links that you add to projects and captures approved assets.</div>
               </div>
               <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
               <button class="app-btn outline" id="btn-figma-scan-now" style="width:100%;margin-top:8px;">Scan Now</button>
-              <div class="settings-desc" style="margin-top:12px;">Link a Figma file to a project from the project itself &mdash; open a project's Files tab and click the Figma link row to add or change it.</div>
+              <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Current Project to add or change project Figma assets.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
             <div id="figma-disconnected">
               <div class="figma-status-row">
                 <span class="figma-status-dot"></span>
-                <span>Not connected</span>
+                <span>Figma disconnected</span>
               </div>
               <div class="figma-setup-steps">
                 <div class="figma-step">1. Go to <strong>figma.com/developers/api</strong></div>
@@ -226,9 +241,9 @@
                 <div class="figma-step">3. Paste it below &mdash; that's it!</div>
               </div>
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
-              <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Connect Figma</button>
+              <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Reconnect Figma</button>
               <div class="figma-benefit-hint">
-                Once connected, add Figma file URLs to track &mdash; Crate will automatically capture assets from them.
+                Once connected, add Figma file URLs inside Current Project.
               </div>
             </div>
           </div>
@@ -238,10 +253,37 @@
         </div>
 
         <div class="settings-section">
-          <div class="settings-section-title">Account</div>
-          <div class="settings-plan">
-            <span class="settings-plan-name" id="plan-info">Free Plan &middot; 0/10 packages</span>
-            <span class="settings-plan-badge">Upgrade</span>
+          <div class="settings-section-title">Quota / Plan</div>
+          <div class="settings-desc quota-section-desc">Plan limits and upgrade state.</div>
+          <div class="quota-state-list">
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title">Free</div>
+                <div class="quota-state-copy" id="plan-info">10 packages/month</div>
+              </div>
+              <span class="quota-state-badge upgrade">Upgrade to Premium</span>
+            </div>
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title">Closed beta</div>
+                <div class="quota-state-copy">25 packages/month</div>
+              </div>
+              <span class="quota-state-badge beta">Beta tester</span>
+            </div>
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title">Premium</div>
+                <div class="quota-state-copy">Future paid state</div>
+              </div>
+              <span class="quota-state-badge premium">Upgrade state</span>
+            </div>
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title">Limit reached</div>
+                <div class="quota-state-copy">No output written when blocked</div>
+              </div>
+              <span class="quota-state-badge available" id="quota-limit-state">Available</span>
+            </div>
           </div>
         </div>
 
@@ -250,20 +292,34 @@
           <button class="btn-danger-outline" id="btn-clear-all">Clear All Projects</button>
         </div>
       </div>
-    </div>
 
-    <!-- Footer Usage Strip -->
-    <div class="app-footer">
-      <span class="app-usage" id="footer-usage">0 of 10 packages used this month</span>
-      <a class="app-upgrade" href="#">Go Pro &rarr;</a>
+      <!-- Help Tab -->
+      <div class="tab-content" id="tab-help">
+        <div class="settings-section">
+          <div class="settings-section-title">Help</div>
+          <div class="help-card">
+            <div class="help-card-title">Support</div>
+            <div class="settings-desc">Crate packages the files your design project depends on. For support, include your app version and a short description of what you expected to package.</div>
+          </div>
+          <div class="help-card">
+            <div class="help-card-title">Privacy</div>
+            <div class="settings-desc">Crate does not package unrelated Desktop, Downloads, package-output folders, tokens, Figma URLs, file keys, signed URLs, or private paths.</div>
+          </div>
+          <div class="help-card">
+            <div class="help-card-title">Figma</div>
+            <div class="settings-desc">Connect Figma in Settings, then add a Figma link from Current Project. Current Page Only is the default; Entire File is opt-in.</div>
+          </div>
+        </div>
+      </div>
     </div>
+    </main>
 
     <!-- Package Confirmation Modal -->
     <div class="modal-overlay hidden" id="modal-package">
       <div class="modal">
         <div class="modal-header-area">
-          <div class="modal-title">Package Project</div>
-          <div class="modal-subtitle">Review and confirm your package settings.</div>
+          <div class="modal-title">Package Review</div>
+          <div class="modal-subtitle">Confirm included files before writing output.</div>
         </div>
         <div class="modal-body">
           <div class="modal-info-row">
@@ -301,19 +357,23 @@
     <div class="modal-overlay hidden" id="modal-success">
       <div class="modal modal-centered">
         <div class="success-icon-wrap">&#x2705;</div>
-        <div class="success-title">Project Packaged!</div>
+        <div class="success-title">Package Complete</div>
         <div class="success-desc" id="success-message">14 files gathered. Your project is ready.</div>
         <div class="success-path" id="success-path"></div>
         <details class="package-details hidden" id="package-details">
           <summary>Package Details</summary>
           <div class="package-details-body">
             <div class="package-details-row">
-              <div class="package-details-label">Included Files</div>
+              <div class="package-details-label">Files included</div>
               <div class="package-details-value" id="package-details-included"></div>
             </div>
             <div class="package-details-row">
-              <div class="package-details-label">File Sources</div>
+              <div class="package-details-label">Gathered files</div>
               <div class="package-details-value" id="package-details-sources"></div>
+            </div>
+            <div class="package-details-row">
+              <div class="package-details-label">Extracted media</div>
+              <div class="package-details-value" id="package-details-extracted"></div>
             </div>
             <div class="package-details-row">
               <div class="package-details-label">Needs Review</div>
@@ -321,6 +381,10 @@
                 <div class="package-details-value" id="package-details-review"></div>
                 <ul class="package-details-issues hidden" id="package-details-issues"></ul>
               </div>
+            </div>
+            <div class="package-details-row">
+              <div class="package-details-label">Diagnostics</div>
+              <div class="package-details-value" id="package-details-diagnostics"></div>
             </div>
           </div>
         </details>
@@ -336,12 +400,12 @@
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title">You've used all 10 packages</div>
-          <div class="modal-subtitle">Upgrade to Crate Pro for unlimited packaging.</div>
+          <div class="modal-subtitle">Upgrade to Crate Pro for higher package limits.</div>
         </div>
         <div class="modal-body">
           <ul class="feature-list">
-            <li>Unlimited packages per month</li>
-            <li>AI-powered naming suggestions</li>
+            <li>Higher package limits</li>
+            <li>Beta and paid plan options</li>
             <li>Custom naming templates</li>
             <li>Priority support</li>
           </ul>
