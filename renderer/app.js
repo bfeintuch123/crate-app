@@ -418,6 +418,28 @@ function getProjectFigmaScopeMode(project) {
   return 'current-page';
 }
 
+function isFigmaFile(file) {
+  if (!file || typeof file !== 'object') return false;
+  if (file.source === 'figma-auto' || file.source === 'fig-scan') return true;
+  return Boolean(file.figmaFileKey || file.figmaAssetKey || file.figmaPageId || file.figmaPageName);
+}
+
+function projectHasFigmaContext(project) {
+  if (!project || typeof project !== 'object') return false;
+  const trackedFiles = Array.isArray(project.figmaTrackedFiles) ? project.figmaTrackedFiles : [];
+  const sessionTrackedFiles = project.figmaSession && Array.isArray(project.figmaSession.trackedFiles)
+    ? project.figmaSession.trackedFiles
+    : [];
+  if (trackedFiles.length > 0) return true;
+  if (sessionTrackedFiles.length > 0) return true;
+  const files = Array.isArray(project.files) ? project.files : [];
+  const pendingFiles = Array.isArray(project.pendingFiles) ? project.pendingFiles : [];
+  return [
+    ...files,
+    ...pendingFiles
+  ].some(isFigmaFile);
+}
+
 function getProjectFigmaScopeLabel(project) {
   const scopeMode = getProjectFigmaScopeMode(project);
   if (scopeMode === 'entire-file') return 'Entire File';
@@ -879,10 +901,18 @@ function showPackageModal() {
   if (!project) return;
 
   $('#modal-project-name').textContent = project.name;
-  $('#modal-figma-scope').textContent = getProjectFigmaScopeLabel(project);
+  const hasFigmaContext = projectHasFigmaContext(project);
+  const figmaScopeRow = $('#modal-figma-scope-row');
+  const figmaScopeValue = $('#modal-figma-scope');
+  if (figmaScopeRow) {
+    figmaScopeRow.classList.toggle('hidden', !hasFigmaContext);
+  }
+  if (figmaScopeValue) {
+    figmaScopeValue.textContent = hasFigmaContext ? getProjectFigmaScopeLabel(project) : '';
+  }
   const modalWarning = $('#modal-figma-warning');
   if (modalWarning) {
-    const warning = getProjectFigmaWarning(project);
+    const warning = hasFigmaContext ? getProjectFigmaWarning(project) : '';
     modalWarning.textContent = warning;
     modalWarning.style.display = warning ? 'block' : 'none';
   }
