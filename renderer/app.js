@@ -158,16 +158,18 @@ async function init() {
 
 // ===== Tab Switching =====
 function switchTab(tabName) {
-  $$('.app-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+  const normalizedTab = tabName === 'files' ? 'current-project' : tabName;
+
+  $$('.app-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === normalizedTab));
   $$('.tab-content').forEach(tc => {
-    tc.classList.toggle('active', tc.id === `tab-${tabName}`);
+    tc.classList.toggle('active', tc.id === `tab-${normalizedTab}`);
   });
 
-  if (tabName === 'files') {
+  if (normalizedTab === 'current-project') {
     renderFiles();
-  } else if (tabName === 'settings') {
+  } else if (normalizedTab === 'settings') {
     renderSettings();
-  } else if (tabName === 'projects') {
+  } else if (normalizedTab === 'projects') {
     renderProjects();
   }
 }
@@ -216,11 +218,11 @@ function renderProjectRows() {
       <button class="project-delete" data-id="${project.id}" title="Remove project">&times;</button>
     `;
 
-    // Click row -> go to files
+    // Click row -> go to Current Project
     row.addEventListener('click', (e) => {
       if (e.target.classList.contains('project-pill') || e.target.classList.contains('project-delete')) return;
       state.selectedProjectId = project.id;
-      switchTab('files');
+      switchTab('current-project');
     });
 
     // Click pill -> toggle watching
@@ -380,7 +382,7 @@ async function createProject() {
   state.selectedProjectId = result.id;
   hideNewProjectForm();
   renderProjects();
-  switchTab('files');
+  switchTab('current-project');
 }
 
 function setFigmaSectionExpanded(expanded) {
@@ -453,6 +455,47 @@ function getProjectFigmaWarning(project) {
   return warnings[0] || '';
 }
 
+function renderFigmaWarningCard(container, warning) {
+  if (!container) return;
+  const message = typeof warning === 'string' ? warning.trim() : '';
+  container.innerHTML = '';
+  container.className = 'figma-warning-card hidden';
+
+  if (!message) return;
+
+  const safeMessage = sanitizeRendererLogText(message);
+  const lowerMessage = message.toLowerCase();
+  const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
+  const title = isRateLimited ? 'Figma rate limiting' : 'File cannot be read';
+  const action = isRateLimited
+    ? 'Crate will retry after Figma allows the request.'
+    : 'Reconnect Figma or check file access.';
+
+  container.classList.remove('hidden');
+
+  const titleEl = document.createElement('div');
+  titleEl.className = 'figma-warning-title';
+  titleEl.textContent = title;
+
+  const actionEl = document.createElement('div');
+  actionEl.className = 'figma-warning-copy';
+  actionEl.textContent = action;
+
+  const statusEl = document.createElement('div');
+  statusEl.className = 'figma-warning-status';
+  statusEl.textContent = 'Blocked';
+
+  const noteTitle = document.createElement('div');
+  noteTitle.className = 'figma-warning-title';
+  noteTitle.textContent = 'Do not package yet';
+
+  const noteCopy = document.createElement('div');
+  noteCopy.className = 'figma-warning-copy';
+  noteCopy.textContent = safeMessage;
+
+  container.append(titleEl, actionEl, statusEl, noteTitle, noteCopy);
+}
+
 function updateNamingPreview() {
   const template = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   const input = $('#input-project-name');
@@ -477,7 +520,7 @@ async function renderFiles() {
   }
 
   if (!state.selectedProjectId) {
-    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -485,7 +528,7 @@ async function renderFiles() {
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
-    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No active project</div><div class="app-empty-desc">Start watching a project to see its files here.</div>';
+    noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
@@ -543,8 +586,7 @@ async function renderFiles() {
   }
   if (figmaWarningText) {
     const warning = getProjectFigmaWarning(project);
-    figmaWarningText.textContent = warning;
-    figmaWarningText.style.display = warning ? 'block' : 'none';
+    renderFigmaWarningCard(figmaWarningText, warning);
   }
 
   // Pending files (Tier 2)
@@ -759,7 +801,14 @@ function renderSettingsControls() {
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
 
   const used = Number(state.usage.packagesThisMonth) || 0;
-  $('#plan-info').textContent = `Free Plan \u00B7 ${used}/10 packages`;
+  const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
+  $('#plan-info').textContent = `${packageLimit} packages/month \u00B7 ${used}/${packageLimit} used`;
+  const limitState = $('#quota-limit-state');
+  if (limitState) {
+    const isBlocked = used >= packageLimit;
+    limitState.textContent = isBlocked ? 'Blocked' : 'Available';
+    limitState.className = `quota-state-badge ${isBlocked ? 'blocked' : 'available'}`;
+  }
 
   updateSettingsNamingPreview();
 }
@@ -796,7 +845,7 @@ async function renderFigmaSettings() {
     connected.classList.remove('hidden');
     disconnected.classList.add('hidden');
 
-    // Update auto-tracking stats
+    // Update project-link stats
     const projectCountEl = $('#figma-project-count');
     const assetCountEl = $('#figma-asset-count');
 
@@ -900,13 +949,22 @@ function renderPackageDetails(result) {
 
   $('#package-details-included').textContent = `${formatFileCount(includedCount)} included`;
 
-  const sources = [`Gathered files: ${copiedCount}`];
-  if (embeddedCount > 0) sources.push(`Extracted media: ${embeddedCount}`);
-  $('#package-details-sources').textContent = sources.join(' | ');
+  $('#package-details-sources').textContent = `${formatFileCount(copiedCount)} gathered`;
+  const extractedEl = $('#package-details-extracted');
+  if (extractedEl) {
+    extractedEl.textContent = `${formatFileCount(embeddedCount, 'extracted media file', 'extracted media files')}`;
+  }
 
   $('#package-details-review').textContent = errors.length === 0
     ? 'No issues found'
     : `${formatFileCount(errors.length, 'issue', 'issues')} need review`;
+
+  const diagnosticsEl = $('#package-details-diagnostics');
+  if (diagnosticsEl) {
+    diagnosticsEl.textContent = state.settings.includeDiagnosticReport === true
+      ? 'Diagnostics on'
+      : 'Diagnostics off';
+  }
 
   const issuesEl = $('#package-details-issues');
   if (issuesEl) {
@@ -1051,7 +1109,7 @@ function setupEventListeners() {
     if (e.key === 'Escape') hideNewProjectForm();
   });
 
-  // Files tab
+  // Current Project tab
   $('#btn-add-files').addEventListener('click', async () => {
     if (!state.selectedProjectId) {
       showToast('Select a project first');
@@ -1070,7 +1128,7 @@ function setupEventListeners() {
 
     const project = state.projects.find(p => p.id === projectId);
     if (!project || project.files.length === 0) {
-      showToast('No files captured yet. Keep watching or tap + Files to add manually.');
+      showToast('No files captured yet. Keep watching or tap + Add files to add manually.');
       return;
     }
     // M4: Confirm before re-packaging an already-packaged project
@@ -1199,6 +1257,17 @@ function setupEventListeners() {
       handleV2FileDrop(filePath);
     }
   });
+
+  const quickPackageShortcut = $('#btn-sidebar-quick-package');
+  if (quickPackageShortcut) {
+    quickPackageShortcut.addEventListener('click', () => {
+      switchTab('projects');
+      const quickPackage = document.querySelector('.v2-quick-package');
+      if (quickPackage) {
+        quickPackage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  }
 
   // V2 Results modal
   $('#btn-v2-done').addEventListener('click', () => {
@@ -1356,7 +1425,7 @@ async function saveEditFigmaLinkModal() {
 
 // ===== Tab State Helper =====
 const isFilesTabActive = () => {
-  const tab = document.querySelector("#tab-files");
+  const tab = document.querySelector("#tab-current-project");
   return tab && tab.classList.contains("active");
 };
 
