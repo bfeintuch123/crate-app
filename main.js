@@ -4145,6 +4145,8 @@ const inactivityNotified = new Set(); // projectIds already notified
 
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
+const MAIN_WINDOW_HIDDEN_RECREATE_AFTER = 3;
+let mainWindowHiddenShowAttempts = 0;
 
 function sendToRenderer(channel, data) {
   if (trayWindow && !trayWindow.isDestroyed()) {
@@ -7692,7 +7694,7 @@ function scheduleMainWindowStartupRetries() {
   for (const delay of MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS) {
     const timerId = setTimeout(() => {
       mainWindowStartupRetryTimers.delete(timerId);
-      showMainWindow();
+      showMainWindow({ reason: `startup-retry-${delay}` });
     }, delay);
     if (timerId && typeof timerId.unref === 'function') {
       timerId.unref();
@@ -7701,15 +7703,59 @@ function scheduleMainWindowStartupRetries() {
   }
 }
 
-function adoptExistingMainWindow() {
-  if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
+function getLiveBrowserWindows() {
   if (typeof BrowserWindow.getAllWindows !== 'function') return null;
-  const existingWindow = BrowserWindow.getAllWindows()
+  return BrowserWindow.getAllWindows()
+    .filter((win) => win && typeof win.isDestroyed === 'function' && !win.isDestroyed());
+}
+
+function adoptExistingMainWindow() {
+  const liveWindows = getLiveBrowserWindows();
+  if (trayWindow && !trayWindow.isDestroyed()) {
+    if (!liveWindows || liveWindows.includes(trayWindow)) return trayWindow;
+    console.warn('[main-window] cached window missing from live window list; recreating');
+    trayWindow = null;
+  }
+  if (!liveWindows) return null;
+  const existingWindow = liveWindows
     .find((win) => win && typeof win.isDestroyed === 'function' && !win.isDestroyed());
   if (existingWindow) {
     trayWindow = existingWindow;
   }
   return trayWindow;
+}
+
+function recreateMainWindow(reason = 'hidden-window') {
+  const previousWindow = trayWindow;
+  if (previousWindow && typeof previousWindow.isDestroyed === 'function' && !previousWindow.isDestroyed()) {
+    try {
+      previousWindow.destroy();
+    } catch (e) {
+      console.error('[main-window] failed to destroy hidden window:', redactFigmaLogText(e && e.message));
+    }
+  }
+  trayWindow = null;
+  mainWindowHiddenShowAttempts = 0;
+  const nextWindow = createMainWindow();
+  if (nextWindow && !nextWindow.isDestroyed()) {
+    showMainWindow({ reason, allowHiddenRecreate: false });
+  }
+  return nextWindow;
+}
+
+function verifyMainWindowVisible(reason = 'show') {
+  if (!trayWindow || trayWindow.isDestroyed()) return false;
+  if (typeof trayWindow.isVisible !== 'function' || trayWindow.isVisible()) {
+    mainWindowHiddenShowAttempts = 0;
+    return true;
+  }
+
+  mainWindowHiddenShowAttempts += 1;
+  console.warn('[main-window] window remained hidden after show:', redactFigmaLogText(`${reason} attempt=${mainWindowHiddenShowAttempts}`));
+  if (mainWindowHiddenShowAttempts >= MAIN_WINDOW_HIDDEN_RECREATE_AFTER) {
+    recreateMainWindow('recreate-hidden-window');
+  }
+  return false;
 }
 
 function createMainWindow() {
@@ -7745,7 +7791,7 @@ function createMainWindow() {
 
   const revealLoadedMainWindow = () => {
     clearMainWindowShowFallback();
-    showMainWindow();
+    showMainWindow({ reason: 'renderer-ready' });
   };
 
   if (typeof trayWindow.once === 'function') {
@@ -7759,11 +7805,11 @@ function createMainWindow() {
   if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
     trayWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
       console.error('[main-window] renderer failed to load:', redactFigmaLogText(`${errorCode || ''} ${errorDescription || ''}`));
-      showMainWindow();
+      showMainWindow({ reason: 'renderer-failed-load' });
     });
     trayWindow.webContents.on('render-process-gone', (_event, details = {}) => {
       console.error('[main-window] renderer process exited:', redactFigmaLogText(details.reason || 'unknown'));
-      showMainWindow();
+      showMainWindow({ reason: 'renderer-process-gone' });
     });
   }
 
@@ -7771,22 +7817,25 @@ function createMainWindow() {
   if (loadResult && typeof loadResult.catch === 'function') {
     loadResult.catch((error) => {
       console.error('[main-window] renderer load failed:', redactFigmaLogText(error && error.message));
-      showMainWindow();
+      showMainWindow({ reason: 'renderer-load-failed' });
     });
   }
 
   clearMainWindowShowFallback();
   mainWindowShowFallback = setTimeout(() => {
     mainWindowShowFallback = null;
-    showMainWindow();
+    showMainWindow({ reason: 'show-fallback' });
   }, MAIN_WINDOW_SHOW_FALLBACK_MS);
   if (mainWindowShowFallback && typeof mainWindowShowFallback.unref === 'function') {
     mainWindowShowFallback.unref();
   }
 
+  const createdWindow = trayWindow;
   trayWindow.on('closed', () => {
+    if (trayWindow !== createdWindow) return;
     clearMainWindowShowFallback();
     clearMainWindowStartupRetries();
+    mainWindowHiddenShowAttempts = 0;
     trayWindow = null;
   });
 
@@ -7794,10 +7843,14 @@ function createMainWindow() {
 }
 
 function toggleTrayWindow() {
-  showMainWindow();
+  showMainWindow({ reason: 'tray-click' });
 }
 
-function showMainWindow() {
+function showMainWindow(options = {}) {
+  const {
+    reason = 'show',
+    allowHiddenRecreate = true,
+  } = options || {};
   if (typeof app.isReady === 'function' && !app.isReady()) return;
 
   adoptExistingMainWindow();
@@ -7826,6 +7879,10 @@ function showMainWindow() {
     app.focus({ steal: true });
   }
   trayWindow.focus();
+
+  if (allowHiddenRecreate) {
+    verifyMainWindowVisible(reason);
+  }
 }
 
 // Backward-compatible name for package/dialog flows that reveal the app UI.
@@ -10255,9 +10312,9 @@ app.whenReady().then(async () => {
       ]));
     }
 
-    createMainWindow();
-    showMainWindow();
     scheduleMainWindowStartupRetries();
+    createMainWindow();
+    showMainWindow({ reason: 'startup' });
     createTray();
 
     // Resume watching for any active projects without letting watcher recovery block the UI.
@@ -10273,8 +10330,9 @@ app.whenReady().then(async () => {
     }
   } catch (e) {
     console.error('[startup] app initialization failed:', redactFigmaLogText(e && e.message));
+    scheduleMainWindowStartupRetries();
     try {
-      showMainWindow();
+      showMainWindow({ reason: 'startup-error' });
     } catch (showError) {
       console.error('[startup] failed to show main window:', redactFigmaLogText(showError && showError.message));
     }
@@ -10285,15 +10343,15 @@ app.whenReady().then(async () => {
 });
 
 app.on('activate', () => {
-  showMainWindow();
+  showMainWindow({ reason: 'activate' });
 });
 
 app.on('did-become-active', () => {
-  showMainWindow();
+  showMainWindow({ reason: 'did-become-active' });
 });
 
 app.on('second-instance', () => {
-  showMainWindow();
+  showMainWindow({ reason: 'second-instance' });
 });
 
 // Track intentional quit so we don't block Dock right-click → Quit
