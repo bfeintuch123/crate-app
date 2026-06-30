@@ -12,6 +12,7 @@ test('main window uses normal macOS app lifecycle', async () => {
   const originalSetTimeout = global.setTimeout;
   const originalClearTimeout = global.clearTimeout;
   const originalConsoleError = console.error;
+  const originalConsoleWarn = console.warn;
   const stubs = new Map();
   const appHandlers = new Map();
   const ipcHandlers = new Map();
@@ -67,6 +68,7 @@ test('main window uses normal macOS app lifecycle', async () => {
   console.error = (...args) => {
     errorLogs.push(args.join(' '));
   };
+  console.warn = () => {};
 
   class TestBrowserWindow {
     constructor(options) {
@@ -90,7 +92,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     }
 
     static getAllWindows() {
-      return windows.filter(win => !win.destroyed);
+      return windows.filter(win => !win.destroyed && !win.detached);
     }
 
     loadFile(filePath) {
@@ -100,7 +102,9 @@ test('main window uses normal macOS app lifecycle', async () => {
     on(channel, fn) { this.handlers.set(channel, fn); }
     once(channel, fn) { this.handlers.set(channel, fn); }
     isDestroyed() { return this.destroyed; }
-    isVisible() { return this.showCount > 0 && !this.destroyed; }
+    isVisible() {
+      return this.showCount > 0 && !this.destroyed && !this.forceHidden;
+    }
     isMinimized() { return this.minimized; }
     restore() {
       this.minimized = false;
@@ -253,17 +257,46 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.showCount, 5);
     assert.equal(win.focusCount, 5);
 
-    win.destroyed = true;
+    win.forceHidden = true;
+    appHandlers.get('did-become-active')();
+    appHandlers.get('did-become-active')();
+    appHandlers.get('did-become-active')();
+    assert.equal(win.destroyed, true);
+    assert.equal(windows.length, 2);
+    assert.equal(windows[1].showCount, 1);
+    assert.equal(windows[1].focusCount, 1);
+    assert.equal(appShowCount, 9);
+    assert.equal(appFocusCount, 9);
+
+    const recreatedWin = windows[1];
     win.handlers.get('closed')();
+    appHandlers.get('did-become-active')();
+    assert.equal(windows.length, 2);
+    assert.equal(recreatedWin.showCount, 2);
+    assert.equal(recreatedWin.focusCount, 2);
+    assert.equal(appShowCount, 10);
+    assert.equal(appFocusCount, 10);
+
+    recreatedWin.detached = true;
+    appHandlers.get('did-become-active')();
+    assert.equal(windows.length, 3);
+    assert.equal(windows[2].showCount, 1);
+    assert.equal(windows[2].focusCount, 1);
+    assert.equal(appShowCount, 11);
+    assert.equal(appFocusCount, 11);
+
+    const liveRecreatedWin = windows[2];
+    liveRecreatedWin.destroyed = true;
+    liveRecreatedWin.handlers.get('closed')();
     let preventedWindowCloseQuit = false;
     appHandlers.get('window-all-closed')({
       preventDefault() { preventedWindowCloseQuit = true; }
     });
     assert.equal(preventedWindowCloseQuit, true);
     appHandlers.get('second-instance')();
-    assert.equal(windows.length, 2);
-    assert.equal(windows[1].showCount, 1);
-    assert.equal(windows[1].focusCount, 1);
+    assert.equal(windows.length, 4);
+    assert.equal(windows[3].showCount, 1);
+    assert.equal(windows[3].focusCount, 1);
   } finally {
     Module._resolveFilename = originalResolve;
     Module._load = originalLoad;
@@ -272,6 +305,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     global.setTimeout = originalSetTimeout;
     global.clearTimeout = originalClearTimeout;
     console.error = originalConsoleError;
+    console.warn = originalConsoleWarn;
     intervals.clear();
     timeouts.clear();
   }
