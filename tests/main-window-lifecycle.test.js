@@ -9,6 +9,8 @@ test('main window uses normal macOS app lifecycle', async () => {
   const originalLoad = Module._load;
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
   const originalConsoleError = console.error;
   const stubs = new Map();
   const appHandlers = new Map();
@@ -16,10 +18,12 @@ test('main window uses normal macOS app lifecycle', async () => {
   const windows = [];
   const trays = [];
   const intervals = new Set();
+  const timeouts = new Set();
   const errorLogs = [];
   let appReady = false;
   let readyCallback = null;
   let appFocusCount = 0;
+  let appShowCount = 0;
 
   function setStub(name, factory) {
     stubs.set(name, factory);
@@ -45,6 +49,21 @@ test('main window uses normal macOS app lifecycle', async () => {
     intervals.delete(interval);
   };
 
+  global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
+    const timeout = {
+      fn,
+      delay,
+      args,
+      unref() { this.unrefed = true; },
+    };
+    timeouts.add(timeout);
+    return timeout;
+  };
+
+  global.clearTimeout = function trackedClearTimeout(timeout) {
+    timeouts.delete(timeout);
+  };
+
   console.error = (...args) => {
     errorLogs.push(args.join(' '));
   };
@@ -64,9 +83,14 @@ test('main window uses normal macOS app lifecycle', async () => {
       this.showCount = 0;
       this.focusCount = 0;
       this.restoreCount = 0;
+      this.moveTopCount = 0;
       this.focusable = options.focusable !== false;
       this.ignoreMouseEvents = false;
       windows.push(this);
+    }
+
+    static getAllWindows() {
+      return windows.filter(win => !win.destroyed);
     }
 
     loadFile(filePath) {
@@ -84,6 +108,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     }
     show() { this.showCount += 1; }
     focus() { this.focusCount += 1; }
+    moveTop() { this.moveTopCount += 1; }
     setFocusable(value) { this.focusable = value; }
     setIgnoreMouseEvents(value) { this.ignoreMouseEvents = value; }
     destroy() { this.destroyed = true; }
@@ -139,6 +164,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       }),
       on(channel, fn) { appHandlers.set(channel, fn); },
       isReady: () => appReady,
+      show: () => { appShowCount += 1; },
       focus: () => { appFocusCount += 1; },
       getPath: () => path.join(os.tmpdir(), 'crate-main-window-test-userdata'),
       dock: { setMenu: () => {} },
@@ -194,14 +220,22 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
     assert.equal(win.showCount, 1);
     assert.equal(win.focusCount, 1);
+    assert.equal(win.moveTopCount, 1);
     assert.equal(win.focusable, true);
     assert.equal(win.ignoreMouseEvents, false);
+    assert.equal(appShowCount, 1);
     assert.equal(appFocusCount, 1);
     assert.equal(trays.length, 1);
+    assert.deepEqual(
+      [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
+      [500, 1500, 1500, 5000, 10000]
+    );
+    assert.ok([...timeouts].every(timeout => timeout.unrefed === true));
 
     win.webContents.handlers.get('did-fail-load')({}, -6, 'ERR_FILE_NOT_FOUND');
     assert.equal(win.showCount, 2);
     assert.equal(win.focusCount, 2);
+    assert.equal(appShowCount, 2);
     assert.equal(appFocusCount, 2);
     assert.ok(errorLogs.some((line) => line.includes('[main-window] renderer failed to load')));
 
@@ -215,8 +249,17 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.showCount, 4);
     assert.equal(win.focusCount, 4);
 
+    appHandlers.get('did-become-active')();
+    assert.equal(win.showCount, 5);
+    assert.equal(win.focusCount, 5);
+
     win.destroyed = true;
     win.handlers.get('closed')();
+    let preventedWindowCloseQuit = false;
+    appHandlers.get('window-all-closed')({
+      preventDefault() { preventedWindowCloseQuit = true; }
+    });
+    assert.equal(preventedWindowCloseQuit, true);
     appHandlers.get('second-instance')();
     assert.equal(windows.length, 2);
     assert.equal(windows[1].showCount, 1);
@@ -226,7 +269,10 @@ test('main window uses normal macOS app lifecycle', async () => {
     Module._load = originalLoad;
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
     console.error = originalConsoleError;
     intervals.clear();
+    timeouts.clear();
   }
 });
