@@ -7890,6 +7890,48 @@ function showTrayWindow() {
   showMainWindow();
 }
 
+function isMainWindowForegroundVisible() {
+  if (!trayWindow || typeof trayWindow.isDestroyed !== 'function' || trayWindow.isDestroyed()) {
+    return false;
+  }
+  if (typeof trayWindow.isVisible === 'function' && !trayWindow.isVisible()) {
+    return false;
+  }
+  if (typeof app.isActive === 'function') {
+    return app.isActive();
+  }
+  return true;
+}
+
+function showPackageCompleteNotification(projectName, fileCount) {
+  if (!Notification.isSupported()) return false;
+  try {
+    const notification = new Notification({
+      title: 'Project Packaged!',
+      body: `${projectName} \u2014 ${fileCount} files gathered.`
+    });
+    activeNativeNotifications.add(notification);
+    const cleanup = () => {
+      activeNativeNotifications.delete(notification);
+    };
+    notification.on('close', cleanup);
+    notification.on('failed', (_event, error) => {
+      cleanup();
+      const message = error && error.message ? error.message : String(error || 'unknown');
+      console.warn('[notifications] package-complete notification failed:', redactFigmaLogText(message));
+      showMainWindow({ reason: 'package-notification-failed' });
+    });
+    notification.on('click', () => {
+      showMainWindow({ reason: 'package-notification-click' });
+    });
+    notification.show();
+    return true;
+  } catch (error) {
+    console.warn('[notifications] package-complete notification failed:', redactFigmaLogText(error && error.message));
+    return false;
+  }
+}
+
 function createTray() {
   const iconPath = path.join(__dirname, 'assets', 'tray-icon.png');
   let trayIcon;
@@ -8348,6 +8390,7 @@ function stopWatching(projectId) {
 // --- Inactivity Checker ---
 
 let inactivityCheckerInterval = null; // C4: stored so it can be cleared on quit
+const activeNativeNotifications = new Set();
 
 function startInactivityChecker() {
   inactivityCheckerInterval = setInterval(() => {
@@ -9953,16 +9996,16 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
     incrementPackageUsage();
 
-    // Send notification if enabled
-    if (settings.notifications && Notification.isSupported()) {
-      new Notification({
-        title: 'Project Packaged!',
-        body: `${project.name} \u2014 ${copiedCount + embeddedCount} files gathered.`
-      }).show();
-    }
+    const packageWindowWasForeground = isMainWindowForegroundVisible();
+    const packageNotificationShown = settings.notifications
+      ? showPackageCompleteNotification(project.name, copiedCount + embeddedCount)
+      : false;
 
-    // Show the app window so user sees the success confirmation.
-    showTrayWindow();
+    // If Crate was backgrounded, leave focus alone so macOS can surface the native
+    // notification. The renderer still shows Package Complete when the user returns.
+    if (packageWindowWasForeground || !packageNotificationShown) {
+      showTrayWindow();
+    }
 
     return {
       success: true,
@@ -10407,6 +10450,7 @@ app.on('before-quit', () => {
     clearInterval(inactivityCheckerInterval);
     inactivityCheckerInterval = null;
   }
+  activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
   for (const [, timerId] of scanOnSaveTimers) {
     clearTimeout(timerId);

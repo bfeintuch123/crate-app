@@ -106,9 +106,14 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 
 const ipcHandlers = new Map();
 let nextOpenDialogResult = { canceled: true };
+let testNotificationSupported = false;
+let testAppActive = true;
+let testBrowserWindowCreateCount = 0;
+const testNotifications = [];
 
 class TestBrowserWindow {
   constructor() {
+    testBrowserWindowCreateCount += 1;
     this.webContents = { send: () => {} };
   }
   loadFile() {}
@@ -124,9 +129,15 @@ class TestBrowserWindow {
 }
 
 class TestNotification {
-  static isSupported() { return false; }
-  show() {}
-  on() {}
+  constructor(options = {}) {
+    this.options = options;
+    this.handlers = new Map();
+    this.shown = false;
+    testNotifications.push(this);
+  }
+  static isSupported() { return testNotificationSupported; }
+  show() { this.shown = true; }
+  on(channel, handler) { this.handlers.set(channel, handler); }
 }
 
 setStub('electron', () => ({
@@ -135,6 +146,7 @@ setStub('electron', () => ({
     quit: () => {},
     whenReady: () => ({ then: () => {} }),
     on: () => {},
+    isActive: () => testAppActive,
     getPath: () => path.join(os.tmpdir(), 'crate-provenance-dual-write-userdata'),
     dock: { setMenu: () => {} },
   },
@@ -840,6 +852,10 @@ test.afterEach(async () => {
   if (storeInstance) storeInstance.set('projects', []);
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
+  testNotificationSupported = false;
+  testAppActive = true;
+  testBrowserWindowCreateCount = 0;
+  testNotifications.length = 0;
   watcherRecords.length = 0;
   clearTrackedTimers();
 });
@@ -1268,6 +1284,85 @@ test('normal project package still consumes package quota after success', async 
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 5);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('background project package leaves app hidden when native notification is shown', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Background Package Notification');
+    const sourcePath = path.join(tmpRoot, 'Logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('background package notification bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    testNotificationSupported = true;
+    testAppActive = false;
+    testBrowserWindowCreateCount = 0;
+    testNotifications.length = 0;
+    await callIpc('settings:update', 'notifications', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(testNotifications.length, 1);
+    assert.deepEqual(testNotifications[0].options, {
+      title: 'Project Packaged!',
+      body: 'Background Package Notification — 1 files gathered.',
+    });
+    assert.equal(testNotifications[0].shown, true);
+    assert.equal(typeof testNotifications[0].handlers.get('click'), 'function');
+    assert.equal(typeof testNotifications[0].handlers.get('failed'), 'function');
+    assert.equal(testBrowserWindowCreateCount, 0);
+    testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));
+    assert.equal(testBrowserWindowCreateCount, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('background project package reveals app when native notification is unavailable', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Background Package Fallback');
+    const sourcePath = path.join(tmpRoot, 'Logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('background package fallback bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    testNotificationSupported = false;
+    testAppActive = false;
+    testBrowserWindowCreateCount = 0;
+    testNotifications.length = 0;
+    await callIpc('settings:update', 'notifications', true);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(testNotifications.length, 0);
+    assert.equal(testBrowserWindowCreateCount, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
