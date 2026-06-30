@@ -40,9 +40,10 @@ body {
 /* ===== App Container ===== */
 #app {
   background:
-    radial-gradient(circle at 85% 12%, rgba(216, 230, 226, 0.58), transparent 28%),
-    radial-gradient(circle at 82% 88%, rgba(236, 218, 226, 0.62), transparent 34%),
-    linear-gradient(135deg, #ebe8e2 0%, #f1eee9 50%, #e3e8e4 100%);
+    radial-gradient(circle at 22% 8%, rgba(247, 213, 225, 0.62), transparent 34%),
+    radial-gradient(circle at 88% 4%, rgba(220, 238, 229, 0.72), transparent 32%),
+    radial-gradient(circle at 80% 92%, rgba(238, 221, 231, 0.66), transparent 36%),
+    linear-gradient(135deg, #ebe7e0 0%, #f3eee9 48%, #e3eae5 100%);
   display: flex;
   flex-direction: row;
   height: 100vh;
@@ -108,14 +109,26 @@ body {
   padding: 10px 12px;
   font-size: 12px;
   font-weight: 600;
-  color: rgba(255, 255, 255, 0.58);
+  color: rgba(255, 255, 255, 0.66);
   border: none;
   border-radius: 8px;
   background: transparent;
   cursor: pointer;
   font-family: inherit;
   text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.app-tab::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.32);
+  flex: 0 0 auto;
 }
 
 .app-tab:hover {
@@ -124,33 +137,17 @@ body {
 }
 
 .app-tab.active {
-  color: var(--black);
-  background: rgba(255, 255, 255, 0.92);
-  font-weight: 600;
+  color: var(--white);
+  background: rgba(255, 255, 255, 0.12);
+  font-weight: 700;
+}
+
+.app-tab.active::before {
+  background: rgba(255, 255, 255, 0.94);
 }
 
 .app-tabs-secondary {
   margin-top: auto;
-}
-
-.sidebar-quick-action {
-  width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--white);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 12px;
-  font-weight: 700;
-  font-family: inherit;
-  cursor: pointer;
-  text-align: left;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
-}
-
-.sidebar-quick-action:hover {
-  background: rgba(255, 255, 255, 0.14);
-  border-color: rgba(255, 255, 255, 0.36);
 }
 
 .sidebar-spacer {
@@ -176,15 +173,20 @@ body {
 .app-main {
   flex: 1;
   min-width: 0;
-  padding: 28px;
+  padding: 18px 20px;
   overflow: hidden;
 }
 
 .app-content {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   overflow-y: auto;
   height: 100%;
-  background: rgba(255, 255, 255, 0.32);
+  background:
+    radial-gradient(circle at 14% 5%, rgba(249, 218, 229, 0.62), transparent 36%),
+    radial-gradient(circle at 92% 2%, rgba(221, 238, 229, 0.68), transparent 32%),
+    linear-gradient(135deg, rgba(255, 254, 250, 0.54), rgba(244, 248, 245, 0.46));
   border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 20px;
   box-shadow:
@@ -195,13 +197,22 @@ body {
 
 .tab-content {
   display: none;
-  padding: 44px 52px;
+  padding: 28px;
   flex: 1;
+  min-width: 0;
 }
 
 .tab-content.active {
   display: flex;
   flex-direction: column;
+  align-items: stretch;
+}
+
+#tab-projects.active,
+#tab-quick-package.active,
+#tab-current-project.active,
+#tab-help.active {
+  gap: 18px;
 }
 
 /* ===== App Labels ===== */
@@ -1908,9 +1919,39 @@ body {
 .tab-content > #projects-list,
 .tab-content > #new-project-form,
 .tab-content > #files-view,
+.tab-content > .v2-quick-package,
 .tab-content > .settings-section {
-  max-width: 920px;
-  margin: 0 auto;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  box-sizing: border-box;
+}
+
+#tab-settings.active {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.8fr) minmax(420px, 1.2fr);
+  align-content: start;
+  gap: 22px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(49, 43, 36, 0.06);
+  backdrop-filter: blur(12px);
+}
+
+#tab-settings > .settings-section {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+#tab-settings > .settings-section:nth-of-type(n + 3) {
+  grid-column: 1 / -1;
 }
 
 #projects-list,
@@ -1929,13 +1970,23 @@ body {
 #projects-list,
 #files-view,
 #new-project-form,
-.settings-section {
+.settings-section,
+.v2-quick-package {
   padding: 22px;
+}
+
+.v2-quick-package {
+  margin-top: 0;
+  border-top: 0;
 }
 
 .settings-section {
   margin-bottom: 16px;
   border-bottom: 0;
+}
+
+#tab-settings > .settings-section {
+  margin-bottom: 0;
 }
 
 .settings-section-title,
@@ -1995,6 +2046,17 @@ body {
 
 .app-btn {
   max-width: 240px;
+}
+
+#btn-add-project {
+  background: var(--black);
+  color: var(--white);
+  border-color: var(--black);
+}
+
+#btn-add-project:hover {
+  background: #333;
+  border-color: #333;
 }
 
 .v2-drop-zone .app-btn,
@@ -2106,8 +2168,7 @@ body {
     flex-wrap: wrap;
   }
 
-  .app-tab,
-  .sidebar-quick-action {
+  .app-tab {
     width: auto;
   }
 
@@ -2122,5 +2183,13 @@ body {
 
   .tab-content {
     padding: 24px 18px;
+  }
+
+  #tab-settings.active {
+    grid-template-columns: 1fr;
+  }
+
+  #tab-settings > .settings-section:nth-of-type(n + 3) {
+    grid-column: auto;
   }
 }
