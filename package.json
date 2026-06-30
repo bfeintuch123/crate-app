@@ -1,6 +1,6 @@
 {
   "name": "crate-app",
-  "version": "2.8.0-qa.43",
+  "version": "2.8.0-qa.44",
   "productName": "Crate",
   "description": "Universal project file packager for graphic designers — macOS desktop app",
   "main": "main.js",
