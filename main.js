@@ -4138,11 +4138,13 @@ let tray = null;
 // Historical name retained for existing renderer send paths; this is now the main app window.
 let trayWindow = null;
 let mainWindowShowFallback = null;
+const mainWindowStartupRetryTimers = new Set();
 const watchers = new Map(); // projectId -> chokidar watcher
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
 
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
+const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
 
 function sendToRenderer(channel, data) {
   if (trayWindow && !trayWindow.isDestroyed()) {
@@ -7671,7 +7673,47 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
   }
 }
 
+function clearMainWindowShowFallback() {
+  if (mainWindowShowFallback) {
+    clearTimeout(mainWindowShowFallback);
+    mainWindowShowFallback = null;
+  }
+}
+
+function clearMainWindowStartupRetries() {
+  for (const timerId of mainWindowStartupRetryTimers) {
+    clearTimeout(timerId);
+  }
+  mainWindowStartupRetryTimers.clear();
+}
+
+function scheduleMainWindowStartupRetries() {
+  clearMainWindowStartupRetries();
+  for (const delay of MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS) {
+    const timerId = setTimeout(() => {
+      mainWindowStartupRetryTimers.delete(timerId);
+      showMainWindow();
+    }, delay);
+    if (timerId && typeof timerId.unref === 'function') {
+      timerId.unref();
+    }
+    mainWindowStartupRetryTimers.add(timerId);
+  }
+}
+
+function adoptExistingMainWindow() {
+  if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
+  if (typeof BrowserWindow.getAllWindows !== 'function') return null;
+  const existingWindow = BrowserWindow.getAllWindows()
+    .find((win) => win && typeof win.isDestroyed === 'function' && !win.isDestroyed());
+  if (existingWindow) {
+    trayWindow = existingWindow;
+  }
+  return trayWindow;
+}
+
 function createMainWindow() {
+  adoptExistingMainWindow();
   if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
 
   trayWindow = new BrowserWindow({
@@ -7700,13 +7742,6 @@ function createMainWindow() {
   });
 
   const rendererEntry = path.join(__dirname, 'renderer', 'index.html');
-
-  const clearMainWindowShowFallback = () => {
-    if (mainWindowShowFallback) {
-      clearTimeout(mainWindowShowFallback);
-      mainWindowShowFallback = null;
-    }
-  };
 
   const revealLoadedMainWindow = () => {
     clearMainWindowShowFallback();
@@ -7751,6 +7786,7 @@ function createMainWindow() {
 
   trayWindow.on('closed', () => {
     clearMainWindowShowFallback();
+    clearMainWindowStartupRetries();
     trayWindow = null;
   });
 
@@ -7764,11 +7800,15 @@ function toggleTrayWindow() {
 function showMainWindow() {
   if (typeof app.isReady === 'function' && !app.isReady()) return;
 
+  adoptExistingMainWindow();
   if (!trayWindow || trayWindow.isDestroyed()) {
     createMainWindow();
   }
   if (!trayWindow || trayWindow.isDestroyed()) return;
 
+  if (typeof app.show === 'function') {
+    app.show();
+  }
   if (typeof trayWindow.isMinimized === 'function' && trayWindow.isMinimized()) {
     trayWindow.restore();
   }
@@ -7779,6 +7819,9 @@ function showMainWindow() {
     trayWindow.setFocusable(true);
   }
   trayWindow.show();
+  if (typeof trayWindow.moveTop === 'function') {
+    trayWindow.moveTop();
+  }
   if (typeof app.focus === 'function') {
     app.focus({ steal: true });
   }
@@ -10214,6 +10257,7 @@ app.whenReady().then(async () => {
 
     createMainWindow();
     showMainWindow();
+    scheduleMainWindowStartupRetries();
     createTray();
 
     // Resume watching for any active projects without letting watcher recovery block the UI.
@@ -10241,6 +10285,10 @@ app.whenReady().then(async () => {
 });
 
 app.on('activate', () => {
+  showMainWindow();
+});
+
+app.on('did-become-active', () => {
   showMainWindow();
 });
 
