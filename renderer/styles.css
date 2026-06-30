@@ -319,6 +319,12 @@ body {
   overflow-y: auto;
 }
 
+.project-list-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
 #files-view {
   flex: 1;
   display: flex;
@@ -2052,6 +2058,8 @@ body {
   background: var(--black);
   color: var(--white);
   border-color: var(--black);
+  width: 156px;
+  min-width: 0;
 }
 
 #btn-add-project:hover {
