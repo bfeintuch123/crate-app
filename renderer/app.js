@@ -1288,17 +1288,6 @@ function setupEventListeners() {
     }
   });
 
-  const quickPackageShortcut = $('#btn-sidebar-quick-package');
-  if (quickPackageShortcut) {
-    quickPackageShortcut.addEventListener('click', () => {
-      switchTab('projects');
-      const quickPackage = document.querySelector('.v2-quick-package');
-      if (quickPackage) {
-        quickPackage.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    });
-  }
-
   // V2 Results modal
   $('#btn-v2-done').addEventListener('click', () => {
     $('#modal-v2-results').classList.add('hidden');
