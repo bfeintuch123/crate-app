@@ -1368,6 +1368,26 @@ test('background project package reveals app when native notification is unavail
   }
 });
 
+test('package destination selection does not foreground Crate after confirmed output', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const outputDir = path.join(tmpRoot, 'package-output');
+    fs.mkdirSync(outputDir);
+    nextOpenDialogResult = {
+      canceled: false,
+      filePaths: [outputDir],
+    };
+    testBrowserWindowCreateCount = 0;
+
+    const selectedPath = await callIpc('projects:select-output');
+
+    assert.equal(selectedPath, outputDir);
+    assert.equal(testBrowserWindowCreateCount, 0);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('PowerPoint packaging dedupes scan-on-save media collision copies', async () => {
   const tmpRoot = makeTempDir();
   try {

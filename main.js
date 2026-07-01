@@ -10030,9 +10030,13 @@ ipcMain.handle('projects:select-output', async () => {
     title: 'Choose Package Destination',
     defaultPath: path.join(os.homedir(), 'Desktop')
   });
-  // Show the app window after native dialog closes.
-  showTrayWindow();
-  if (result.canceled) return null;
+  if (result.canceled) {
+    // Restore the app after canceling the picker so the user can continue editing.
+    showTrayWindow();
+    return null;
+  }
+  // Do not force foreground after a successful destination selection. Packaging may
+  // continue in the background so macOS can deliver the package-complete banner.
   return result.filePaths[0];
 });
 
