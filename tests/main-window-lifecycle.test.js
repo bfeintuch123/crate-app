@@ -232,7 +232,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(trays.length, 1);
     assert.deepEqual(
       [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
-      [500, 1500, 1500, 5000, 10000]
+      [1500]
     );
     assert.ok([...timeouts].every(timeout => timeout.unrefed === true));
 
@@ -288,6 +288,10 @@ test('main window uses normal macOS app lifecycle', async () => {
     const liveRecreatedWin = windows[2];
     liveRecreatedWin.destroyed = true;
     liveRecreatedWin.handlers.get('closed')();
+    assert.deepEqual(
+      [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
+      []
+    );
     let preventedWindowCloseQuit = false;
     appHandlers.get('window-all-closed')({
       preventDefault() { preventedWindowCloseQuit = true; }
@@ -308,5 +312,203 @@ test('main window uses normal macOS app lifecycle', async () => {
     console.warn = originalConsoleWarn;
     intervals.clear();
     timeouts.clear();
+  }
+});
+
+test('startup recovery recreates window if first launch window closes before becoming visible', async () => {
+  const originalResolve = Module._resolveFilename;
+  const originalLoad = Module._load;
+  const originalSetInterval = global.setInterval;
+  const originalClearInterval = global.clearInterval;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const originalConsoleError = console.error;
+  const originalConsoleWarn = console.warn;
+  const stubs = new Map();
+  const appHandlers = new Map();
+  const ipcHandlers = new Map();
+  const windows = [];
+  const timeouts = new Set();
+  let appReady = false;
+  let readyCallback = null;
+
+  function setStub(name, factory) {
+    stubs.set(name, factory);
+  }
+
+  Module._resolveFilename = function patchedResolve(request, parent, ...rest) {
+    if (stubs.has(request)) return `\0stub:${request}`;
+    return originalResolve.call(this, request, parent, ...rest);
+  };
+
+  Module._load = function patchedLoad(request, parent, ...rest) {
+    if (stubs.has(request)) return stubs.get(request)();
+    return originalLoad.call(this, request, parent, ...rest);
+  };
+
+  global.setInterval = function trackedSetInterval(fn, delay, ...args) {
+    return { fn, delay, args, unref() {} };
+  };
+
+  global.clearInterval = function trackedClearInterval() {};
+
+  global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
+    const timeout = {
+      fn,
+      delay,
+      args,
+      unref() { this.unrefed = true; },
+    };
+    timeouts.add(timeout);
+    return timeout;
+  };
+
+  global.clearTimeout = function trackedClearTimeout(timeout) {
+    timeouts.delete(timeout);
+  };
+
+  console.error = () => {};
+  console.warn = () => {};
+
+  class TestBrowserWindow {
+    constructor(options) {
+      this.options = options;
+      this.handlers = new Map();
+      this.webContents = {
+        handlers: new Map(),
+        send: () => {},
+        on(channel, fn) { this.handlers.set(channel, fn); },
+        once(channel, fn) { this.handlers.set(channel, fn); },
+      };
+      this.destroyed = false;
+      this.showCount = 0;
+      this.focusCount = 0;
+      this.forceHidden = windows.length === 0;
+      windows.push(this);
+    }
+
+    static getAllWindows() {
+      return windows.filter(win => !win.destroyed && !win.detached);
+    }
+
+    loadFile(filePath) {
+      this.loadedFile = filePath;
+      return Promise.resolve();
+    }
+    on(channel, fn) { this.handlers.set(channel, fn); }
+    once(channel, fn) { this.handlers.set(channel, fn); }
+    isDestroyed() { return this.destroyed; }
+    isVisible() { return this.showCount > 0 && !this.forceHidden && !this.destroyed; }
+    isMinimized() { return false; }
+    restore() {}
+    show() { this.showCount += 1; }
+    focus() { this.focusCount += 1; }
+    moveTop() {}
+    setFocusable() {}
+    setIgnoreMouseEvents() {}
+    destroy() { this.destroyed = true; }
+  }
+
+  class FakeStore {
+    constructor(opts = {}) {
+      this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
+    }
+    get(key, fallback) {
+      if (!key) return this.data;
+      const parts = key.split('.');
+      let cur = this.data;
+      for (const part of parts) {
+        if (cur && Object.prototype.hasOwnProperty.call(cur, part)) cur = cur[part];
+        else return fallback;
+      }
+      return cur === undefined ? fallback : cur;
+    }
+    set(key, value) {
+      const parts = key.split('.');
+      let cur = this.data;
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        if (typeof cur[parts[i]] !== 'object' || cur[parts[i]] === null) cur[parts[i]] = {};
+        cur = cur[parts[i]];
+      }
+      cur[parts[parts.length - 1]] = value;
+    }
+  }
+
+  setStub('electron', () => ({
+    app: {
+      requestSingleInstanceLock: () => true,
+      quit: () => {},
+      whenReady: () => ({
+        then(fn) {
+          readyCallback = fn;
+        }
+      }),
+      on(channel, fn) { appHandlers.set(channel, fn); },
+      isReady: () => appReady,
+      show: () => {},
+      focus: () => {},
+      getPath: () => path.join(os.tmpdir(), 'crate-main-window-hidden-startup-test-userdata'),
+      dock: { setMenu: () => {} },
+    },
+    BrowserWindow: TestBrowserWindow,
+    Tray: class { setToolTip() {} on() {} isDestroyed() { return false; } destroy() {} },
+    ipcMain: { handle(channel, fn) { ipcHandlers.set(channel, fn); } },
+    dialog: {
+      showOpenDialog: async () => ({ canceled: true }),
+      showSaveDialog: async () => ({ canceled: true }),
+      showMessageBox: async () => ({ response: 0 }),
+    },
+    shell: { openPath: () => {} },
+    nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
+    Notification: class { static isSupported() { return false; } },
+    Menu: { buildFromTemplate: () => ({}) },
+  }));
+  setStub('electron-store', () => FakeStore);
+  setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
+  setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+
+  try {
+    delete require.cache[require.resolve('../main')];
+    require('../main');
+
+    assert.equal(typeof readyCallback, 'function');
+    appReady = true;
+    await readyCallback();
+
+    assert.equal(windows.length, 1);
+    assert.equal(windows[0].isVisible(), false);
+    assert.deepEqual(
+      [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
+      [500, 1500, 1500, 5000, 10000]
+    );
+
+    windows[0].destroyed = true;
+    windows[0].handlers.get('closed')();
+    assert.deepEqual(
+      [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
+      [500, 1500, 5000, 10000]
+    );
+
+    const retry = [...timeouts].find(timeout => timeout.delay === 500);
+    timeouts.delete(retry);
+    retry.fn();
+    assert.equal(windows.length, 2);
+    assert.equal(windows[1].isVisible(), true);
+    assert.equal(windows[1].showCount, 1);
+    assert.equal(windows[1].focusCount, 1);
+    assert.deepEqual(
+      [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
+      [1500]
+    );
+  } finally {
+    delete require.cache[require.resolve('../main')];
+    Module._resolveFilename = originalResolve;
+    Module._load = originalLoad;
+    global.setInterval = originalSetInterval;
+    global.clearInterval = originalClearInterval;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+    console.error = originalConsoleError;
+    console.warn = originalConsoleWarn;
   }
 });

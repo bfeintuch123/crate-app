@@ -4156,6 +4156,7 @@ const MAIN_WINDOW_HIDDEN_RECREATE_AFTER = 3;
 const PACKAGE_FOREGROUND_SUPPRESSION_MS = 10 * 60 * 1000;
 const PACKAGE_NOTIFICATION_SHOW_DELAY_MS = 750;
 let mainWindowHiddenShowAttempts = 0;
+let mainWindowVisibleSinceStartup = false;
 let packageForegroundSuppressionUntil = 0;
 
 function suppressPackageAutoForeground() {
@@ -7772,6 +7773,8 @@ function verifyMainWindowVisible(reason = 'show') {
   if (!trayWindow || trayWindow.isDestroyed()) return false;
   if (typeof trayWindow.isVisible !== 'function' || trayWindow.isVisible()) {
     mainWindowHiddenShowAttempts = 0;
+    mainWindowVisibleSinceStartup = true;
+    clearMainWindowStartupRetries();
     return true;
   }
 
@@ -7859,7 +7862,11 @@ function createMainWindow() {
   trayWindow.on('closed', () => {
     if (trayWindow !== createdWindow) return;
     clearMainWindowShowFallback();
-    clearMainWindowStartupRetries();
+    if (mainWindowVisibleSinceStartup) {
+      clearMainWindowStartupRetries();
+    } else {
+      scheduleMainWindowStartupRetries();
+    }
     mainWindowHiddenShowAttempts = 0;
     trayWindow = null;
   });
@@ -10486,6 +10493,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  mainWindowVisibleSinceStartup = true;
   // Clean up all watchers
   for (const [id, watcher] of watchers) {
     watcher.close();
