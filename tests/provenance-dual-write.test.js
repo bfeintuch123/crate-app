@@ -1289,6 +1289,56 @@ test('normal project package still consumes package quota after success', async 
   }
 });
 
+test('normal project package quota survives UTC rollover before local reset day', async () => {
+  const tmpRoot = makeTempDir();
+  const RealDate = global.Date;
+  const fixedLocalRollover = new RealDate(2026, 5, 30, 23, 30, 0);
+  class FixedDate extends RealDate {
+    constructor(...args) {
+      if (args.length === 0) {
+        super(fixedLocalRollover.getTime());
+      } else {
+        super(...args);
+      }
+    }
+    static now() { return fixedLocalRollover.getTime(); }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  }
+
+  try {
+    global.Date = FixedDate;
+    const project = await createProject('Normal Package Local Rollover Quota');
+    const sourcePath = path.join(tmpRoot, 'Logo.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('normal package local rollover bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    storeInstance.set('usage', {
+      packagesThisMonth: 2,
+      resetDate: '2026-07-01',
+    });
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 3);
+    assert.equal(storeInstance.get('usage.resetDate'), '2026-07-01');
+  } finally {
+    global.Date = RealDate;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('background project package leaves app hidden when native notification is shown', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -1327,6 +1377,55 @@ test('background project package leaves app hidden when native notification is s
     assert.equal(typeof testNotifications[0].handlers.get('failed'), 'function');
     assert.equal(testBrowserWindowCreateCount, 0);
     testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));
+    assert.equal(testBrowserWindowCreateCount, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('background package after destination picker stays hidden despite stale active app state', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Destination Picker Background Package');
+    const sourcePath = path.join(tmpRoot, 'Logo.ai');
+    const outputDir = path.join(tmpRoot, 'package-output');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('destination picker background package bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    nextOpenDialogResult = {
+      canceled: false,
+      filePaths: [outputDir],
+    };
+    testNotificationSupported = true;
+    testAppActive = true;
+    testBrowserWindowCreateCount = 0;
+    testNotifications.length = 0;
+    await callIpc('settings:update', 'notifications', true);
+
+    const selectedPath = await callIpc('projects:select-output');
+    assert.equal(selectedPath, outputDir);
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(testNotifications.length, 1);
+    assert.equal(testNotifications[0].shown, true);
+    assert.equal(testBrowserWindowCreateCount, 0);
+
+    testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));
+    assert.equal(testBrowserWindowCreateCount, 0);
+
+    testNotifications[0].handlers.get('click')();
     assert.equal(testBrowserWindowCreateCount, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
