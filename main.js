@@ -2752,15 +2752,22 @@ function migrateSettings() {
 }
 migrateSettings();
 
+function formatLocalDateForUsage(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function getNextMonthReset() {
   const now = new Date();
   const next = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  return next.toISOString().split('T')[0];
+  return formatLocalDateForUsage(next);
 }
 
 function checkAndResetUsage() {
   const usage = store.get('usage');
-  const now = new Date().toISOString().split('T')[0];
+  const now = formatLocalDateForUsage();
   if (now >= usage.resetDate) {
     store.set('usage', {
       packagesThisMonth: 0,
@@ -4146,7 +4153,24 @@ const inactivityNotified = new Set(); // projectIds already notified
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
 const MAIN_WINDOW_HIDDEN_RECREATE_AFTER = 3;
+const PACKAGE_FOREGROUND_SUPPRESSION_MS = 10 * 60 * 1000;
 let mainWindowHiddenShowAttempts = 0;
+let packageForegroundSuppressionUntil = 0;
+
+function suppressPackageAutoForeground() {
+  packageForegroundSuppressionUntil = Math.max(
+    packageForegroundSuppressionUntil,
+    Date.now() + PACKAGE_FOREGROUND_SUPPRESSION_MS
+  );
+}
+
+function clearPackageAutoForegroundSuppression() {
+  packageForegroundSuppressionUntil = 0;
+}
+
+function isPackageAutoForegroundSuppressed() {
+  return Date.now() < packageForegroundSuppressionUntil;
+}
 
 function sendToRenderer(channel, data) {
   if (trayWindow && !trayWindow.isDestroyed()) {
@@ -7919,9 +7943,12 @@ function showPackageCompleteNotification(projectName, fileCount) {
       cleanup();
       const message = error && error.message ? error.message : String(error || 'unknown');
       console.warn('[notifications] package-complete notification failed:', redactFigmaLogText(message));
-      showMainWindow({ reason: 'package-notification-failed' });
+      if (!isPackageAutoForegroundSuppressed()) {
+        showMainWindow({ reason: 'package-notification-failed' });
+      }
     });
     notification.on('click', () => {
+      clearPackageAutoForegroundSuppression();
       showMainWindow({ reason: 'package-notification-click' });
     });
     notification.show();
@@ -9996,7 +10023,8 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
 
     incrementPackageUsage();
 
-    const packageWindowWasForeground = isMainWindowForegroundVisible();
+    const preferBackgroundNotification = settings.notifications === true && isPackageAutoForegroundSuppressed();
+    const packageWindowWasForeground = preferBackgroundNotification ? false : isMainWindowForegroundVisible();
     const packageNotificationShown = settings.notifications
       ? showPackageCompleteNotification(project.name, copiedCount + embeddedCount)
       : false;
@@ -10004,6 +10032,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     // If Crate was backgrounded, leave focus alone so macOS can surface the native
     // notification. The renderer still shows Package Complete when the user returns.
     if (packageWindowWasForeground || !packageNotificationShown) {
+      clearPackageAutoForegroundSuppression();
       showTrayWindow();
     }
 
@@ -10016,6 +10045,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
       errors
     };
   } catch (err) {
+    clearPackageAutoForegroundSuppression();
     showTrayWindow();
     return { error: err.message };
   }
@@ -10037,6 +10067,7 @@ ipcMain.handle('projects:select-output', async () => {
   }
   // Do not force foreground after a successful destination selection. Packaging may
   // continue in the background so macOS can deliver the package-complete banner.
+  suppressPackageAutoForeground();
   return result.filePaths[0];
 });
 
@@ -10394,6 +10425,7 @@ app.on('activate', () => {
 });
 
 app.on('did-become-active', () => {
+  if (isPackageAutoForegroundSuppressed()) return;
   showMainWindow({ reason: 'did-become-active' });
 });
 
