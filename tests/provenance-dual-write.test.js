@@ -415,6 +415,17 @@ async function waitForProject(projectId, predicate, timeoutMs = 3000) {
   return project;
 }
 
+async function waitForNotificationShown(index = 0, timeoutMs = 1500) {
+  const startedAt = Date.now();
+  while (!testNotifications[index] || !testNotifications[index].shown) {
+    if (Date.now() - startedAt > timeoutMs) {
+      assert.fail(`timed out waiting for notification ${index} to be shown`);
+    }
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+  }
+  return testNotifications[index];
+}
+
 function latestWatcherHandlers() {
   const record = watcherRecords[watcherRecords.length - 1];
   assert.ok(record, 'expected chokidar watcher to be created');
@@ -1368,10 +1379,10 @@ test('background project package leaves app hidden when native notification is s
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(testNotifications.length, 1);
-    assert.deepEqual(testNotifications[0].options, {
-      title: 'Project Packaged!',
-      body: 'Background Package Notification — 1 files gathered.',
-    });
+    assert.equal(testNotifications[0].options.title, 'Project Packaged!');
+    assert.equal(testNotifications[0].options.body, 'Background Package Notification — 1 files gathered.');
+    assert.equal(testNotifications[0].options.silent, false);
+    assert.equal(testNotifications[0].options.icon, path.resolve(__dirname, '..', 'assets', 'icon.png'));
     assert.equal(testNotifications[0].shown, true);
     assert.equal(typeof testNotifications[0].handlers.get('click'), 'function');
     assert.equal(typeof testNotifications[0].handlers.get('failed'), 'function');
@@ -1419,7 +1430,12 @@ test('background package after destination picker stays hidden despite stale act
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(testNotifications.length, 1);
-    assert.equal(testNotifications[0].shown, true);
+    assert.equal(testNotifications[0].shown, false);
+    assert.equal(testNotifications[0].options.silent, false);
+    assert.equal(testNotifications[0].options.icon, path.resolve(__dirname, '..', 'assets', 'icon.png'));
+    assert.equal(testBrowserWindowCreateCount, 0);
+
+    await waitForNotificationShown(0);
     assert.equal(testBrowserWindowCreateCount, 0);
 
     testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));

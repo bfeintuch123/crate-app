@@ -4154,6 +4154,7 @@ const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
 const MAIN_WINDOW_HIDDEN_RECREATE_AFTER = 3;
 const PACKAGE_FOREGROUND_SUPPRESSION_MS = 10 * 60 * 1000;
+const PACKAGE_NOTIFICATION_SHOW_DELAY_MS = 750;
 let mainWindowHiddenShowAttempts = 0;
 let packageForegroundSuppressionUntil = 0;
 
@@ -7927,16 +7928,45 @@ function isMainWindowForegroundVisible() {
   return true;
 }
 
-function showPackageCompleteNotification(projectName, fileCount) {
+function getNotificationIconPath() {
+  const iconPath = path.join(__dirname, 'assets', 'icon.png');
+  return fs.existsSync(iconPath) ? iconPath : null;
+}
+
+function showPackageCompleteNotification(projectName, fileCount, options = {}) {
   if (!Notification.isSupported()) return false;
+  const { deferShow = false } = options || {};
   try {
-    const notification = new Notification({
+    const notificationOptions = {
       title: 'Project Packaged!',
-      body: `${projectName} \u2014 ${fileCount} files gathered.`
-    });
+      body: `${projectName} \u2014 ${fileCount} files gathered.`,
+      silent: false,
+    };
+    const iconPath = getNotificationIconPath();
+    if (iconPath) {
+      notificationOptions.icon = iconPath;
+    }
+    const notification = new Notification(notificationOptions);
+    let showTimer = null;
     activeNativeNotifications.add(notification);
     const cleanup = () => {
+      if (showTimer) {
+        clearTimeout(showTimer);
+        showTimer = null;
+      }
       activeNativeNotifications.delete(notification);
+    };
+    const showNotification = () => {
+      showTimer = null;
+      try {
+        notification.show();
+      } catch (error) {
+        cleanup();
+        console.warn('[notifications] package-complete notification failed:', redactFigmaLogText(error && error.message));
+        if (!isPackageAutoForegroundSuppressed()) {
+          showMainWindow({ reason: 'package-notification-failed' });
+        }
+      }
     };
     notification.on('close', cleanup);
     notification.on('failed', (_event, error) => {
@@ -7951,7 +7981,14 @@ function showPackageCompleteNotification(projectName, fileCount) {
       clearPackageAutoForegroundSuppression();
       showMainWindow({ reason: 'package-notification-click' });
     });
-    notification.show();
+    if (deferShow) {
+      showTimer = setTimeout(showNotification, PACKAGE_NOTIFICATION_SHOW_DELAY_MS);
+      if (showTimer && typeof showTimer.unref === 'function') {
+        showTimer.unref();
+      }
+    } else {
+      showNotification();
+    }
     return true;
   } catch (error) {
     console.warn('[notifications] package-complete notification failed:', redactFigmaLogText(error && error.message));
@@ -10026,7 +10063,9 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
     const preferBackgroundNotification = settings.notifications === true && isPackageAutoForegroundSuppressed();
     const packageWindowWasForeground = preferBackgroundNotification ? false : isMainWindowForegroundVisible();
     const packageNotificationShown = settings.notifications
-      ? showPackageCompleteNotification(project.name, copiedCount + embeddedCount)
+      ? showPackageCompleteNotification(project.name, copiedCount + embeddedCount, {
+        deferShow: preferBackgroundNotification,
+      })
       : false;
 
     // If Crate was backgrounded, leave focus alone so macOS can surface the native
