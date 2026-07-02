@@ -61,10 +61,14 @@ Secondary:
   - `git diff --check` passed.
   - trailing-whitespace scan was clean.
   - repo-wide ASCII scan found pre-existing non-ASCII in historical QA state text; no new ops docs intentionally use non-ASCII.
+- Formalization:
+  - committed as `b839b74` (`Formalize Crate ops loop layer`)
+  - pushed branch `codex/crate-ops-loop-hardening`
+  - opened PR #121: `https://github.com/bfeintuch123/crate-app/pull/121`
 
 ### Next Action
 
-- Review the ops docs and decide whether to commit/open PR for the loop hardening branch.
+- Review PR #121 and run merge-readiness if Bryant wants it merged.
 
 ## 2026-06-24
 

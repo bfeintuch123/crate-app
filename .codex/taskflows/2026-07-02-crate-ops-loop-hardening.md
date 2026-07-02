@@ -42,11 +42,11 @@ Forbidden:
 
 ## State
 
-- current phase: ready for Bryant review / optional PR
-- last completed checkpoint: ops docs, skills, doctor tool, router/loop updates, decision, ledger, workstream state, and docs/ops checks
-- next action: review diff, then decide whether to commit/open PR
+- current phase: PR review
+- last completed checkpoint: ops docs, skills, doctor tool, router/loop updates, decision, ledger, workstream state, docs/ops checks, commit, push, and PR
+- next action: review PR #121, then merge only after Bryant approval and merge-readiness if requested
 - blocker: none
-- approval state: Bryant approved implementing the ops/workflow improvements
+- approval state: Bryant approved implementing and formalizing the ops/workflow improvements; merge not yet approved
 
 ## Checkpoints
 
@@ -56,7 +56,7 @@ Forbidden:
 - [x] verification
 - [x] proof bundle
 - [x] ledger/state update
-- [ ] handoff or next prompt
+- [x] handoff or next prompt
 
 ## Evidence
 
@@ -68,6 +68,7 @@ Forbidden:
 | 2026-07-02 | Ran doctor | `python3 .codex/tools/crate_doctor.py` | pass with expected warnings for feature branch and dirty docs worktree |
 | 2026-07-02 | Ran syntax/diff checks | `python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py`; `git diff --check` | pass |
 | 2026-07-02 | Ran docs hygiene checks | trailing whitespace clean; ASCII check found pre-existing non-ASCII in historical QA state text | pass with known pre-existing note |
+| 2026-07-02 | Committed/pushed/opened PR | commit `b839b74`; PR #121 | pass |
 
 ## Risks
 
@@ -79,5 +80,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Review the ops hardening diff, then decide whether to commit/open a PR for codex/crate-ops-loop-hardening.
+Review PR #121. If Bryant wants it merged, run merge-readiness first and merge only if clean.
 ```

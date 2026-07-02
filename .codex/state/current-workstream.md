@@ -12,7 +12,7 @@ Last updated: 2026-07-02
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` is built, signed, notarized, stapled, tagged, pushed, published as a GitHub prerelease, and live on `get-crate.com` from the qa51 validated baseline. Next work is tester outreach/readiness and eventual site/payment rebuild planning.
 - Active ops branch: `codex/crate-ops-loop-hardening`
-- Current ops work: Bryant approved adopting the full Crate ops layer: standing orders, taskflows, memory tiers, proof bundles, skill/playbook registry, doctor preflight, Cloudflare deploy playbook/skill, docs routing metadata, local-first tester archive, tester triage schema, and loop integration.
+- Current ops work: Bryant approved adopting and formalizing the full Crate ops layer: standing orders, taskflows, memory tiers, proof bundles, skill/playbook registry, doctor preflight, Cloudflare deploy playbook/skill, docs routing metadata, local-first tester archive, tester triage schema, and loop integration. PR #121 is open for this work.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 
@@ -32,6 +32,13 @@ The Crate ops loop-hardening branch adds the durable operating layer under exist
 - doctor tool: `.codex/tools/crate_doctor.py`
 
 Existing loops and gates now route through standing orders, taskflows, memory load, doctor preflight where appropriate, and proof bundle closeout.
+
+Formalization state:
+
+- Commit: `b839b74` (`Formalize Crate ops loop layer`)
+- Branch: `codex/crate-ops-loop-hardening`
+- PR: `https://github.com/bfeintuch123/crate-app/pull/121`
+- Merge status: not merged; run merge-readiness before merge if Bryant approves.
 
 ## Latest Release / Tester Build Result
 
