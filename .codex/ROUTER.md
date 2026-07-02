@@ -16,6 +16,18 @@ Before acting on Crate work, confirm:
 
 If the task is ambiguous, choose the safest read-only path and ask Bryant for the missing approval before mutating files, opening PRs, merging, building, releasing, deploying, tagging, notarizing, or touching credentials.
 
+## Ops Layer
+
+For any non-trivial Crate request, select:
+
+- standing order from `.codex/ops/standing-orders.md`
+- taskflow file from `.codex/taskflows/`, or create one when work spans turns/threads/machines
+- memory load set from `.codex/ops/crate-memory-model.md`
+- proof bundle closeout from `.codex/ops/proof-bundle-template.md`
+- routeable skills/tools from `.codex/ops/skill-registry.md`
+
+Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work.
+
 ## Route Table
 
 | Bryant says | Use first | Also use | Default mode |
@@ -30,7 +42,11 @@ If the task is ambiguous, choose the safest read-only path and ask Bryant for th
 | "Triage tester feedback" | `.codex/playbooks/crate-tester-intake.md` | `crate-qa-results-synthesizer.md`, `crate-bug-triage.md` | read-only |
 | "Run Jenna GUI QA" | `.codex/playbooks/crate-computer-use-qa.md` | `crate-gui-repro-flow.md` for repros | explicit app/file approval required |
 | "Create a handoff" | `.codex/playbooks/crate-handoff.md` | `.agents/skills/crate-handoff/SKILL.md` | read-only |
+| "Use external controls / spawn Crate side threads / coordinate agents" | `.codex/playbooks/crate-external-control-layer.md` | `.codex/playbooks/crate-handoff.md` when a portable handoff prompt is needed | source-of-truth thread coordinates; sidecars read-only by default |
 | "Import Crate ChatGPT export" | future import plan | `crate-decision-log.md`, `crate-qa-results-synthesizer.md`, `crate-handoff.md` | read-only first pass |
+| "Deploy get-crate.com / Cloudflare" | `.codex/playbooks/crate-cloudflare-deploy.md` | `SO-004`, `crate-doctor`, proof bundle | deploy only when explicitly approved |
+| "Run Crate doctor / preflight" | `.agents/skills/crate-doctor/SKILL.md` | `.codex/tools/crate_doctor.py` | read-only |
+| "Tighten Crate ops / workflow / loops" | `.codex/ops/crate-ops-improvement-plan.md` | standing orders, taskflows, memory model, proof bundles, registry | docs/ops-only unless approved |
 
 ## Common Loop Modes
 
@@ -80,3 +96,12 @@ Never infer approval to:
 - broaden scope beyond the requested loop
 
 Use `.codex/playbooks/_shared-gates.md` for common stop gates, privacy filters, and final report shape.
+
+## Closeout
+
+For meaningful work, close with:
+
+- proof bundle or proof section
+- daily ledger update
+- current-workstream update if next action changed
+- active taskflow update if one exists

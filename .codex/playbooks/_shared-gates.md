@@ -2,6 +2,18 @@
 
 Shared gates are reusable constraints for Crate playbooks, loops, release gates, reviews, and handoffs. A specific user prompt or playbook may be stricter; the stricter instruction wins.
 
+## Ops Gate
+
+For non-trivial Crate work, confirm the ops layer before acting:
+
+- applicable standing order from `.codex/ops/standing-orders.md`
+- active taskflow path, or reason no taskflow is needed
+- memory/context files selected from `.codex/ops/crate-memory-model.md`
+- proof bundle expectation from `.codex/ops/proof-bundle-template.md`
+- relevant skill/tool metadata from `.codex/ops/skill-registry.md`
+
+Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control coordination. Warnings must be classified. Failures stop the work unless clearly outside scope.
+
 ## Repo Gate
 
 Confirm before mutating work:
@@ -93,11 +105,14 @@ Stop if merge-readiness requests changes.
 Return the fields relevant to the work:
 
 - result
+- standing order
+- taskflow
 - branch
 - PR URL
 - commit hash
 - files changed
 - tests/checks run and results
+- proof bundle or proof summary
 - release/artifact URLs when applicable
 - risks and known follow-ups
 - merge/release/deploy status

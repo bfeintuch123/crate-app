@@ -7,6 +7,24 @@ A Runner Loop means Codex verifies work through repeatable commands and evidence
 
 This playbook complements `crate-codex-loops.md`. Use `crate-codex-loops.md` for autonomy boundaries and stop gates; use this playbook for runner tiers, repeatable command sets, and evidence format.
 
+## Ops Integration
+
+Runner loops must use the Crate ops layer:
+
+- standing order: `.codex/ops/standing-orders.md`
+- taskflow state: `.codex/taskflows/README.md`
+- memory routing: `.codex/ops/crate-memory-model.md`
+- proof closeout: `.codex/ops/proof-bundle-template.md`
+- skill/tool registry: `.codex/ops/skill-registry.md`
+
+For release, deploy, long-running QA, or external-control work, run Crate Doctor before selecting runner commands:
+
+```sh
+python3 .codex/tools/crate_doctor.py
+```
+
+If the doctor reports warnings, classify them before continuing. If it reports failures, stop unless the active playbook says the failed area is outside scope.
+
 ## When To Use
 - Bryant asks for Crabbox-style, runner-backed, or self-verifying Crate loops.
 - Codex needs a repeatable non-GUI command suite before making or approving changes.
@@ -40,6 +58,8 @@ Every runner-backed step should capture:
 - command
 - environment
 - branch/commit
+- standing order
+- taskflow path
 - run id if Crabbox
 - logs/evidence location
 - pass/fail
@@ -162,6 +182,8 @@ Use this format in reports, loop state, PR notes, or handoffs:
 - command:
 - environment:
 - branch/commit:
+- standing order:
+- taskflow:
 - run id if Crabbox:
 - logs/evidence location:
 - pass/fail:
@@ -178,6 +200,8 @@ Example:
 - command: `node --test tests/provenance-dual-write.test.js`
 - environment: Tier A, Codex App on Mac mini
 - branch/commit: `fix/example`, `abc1234`
+- standing order: `SO-002 Autonomous Crate Failure Loop`
+- taskflow: `.codex/taskflows/2026-07-02-example.md`
 - run id if Crabbox: not applicable
 - logs/evidence location: terminal output in current Codex session
 - pass/fail: pass
