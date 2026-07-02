@@ -9,6 +9,19 @@ Use for workflow docs, playbooks, skills, and Markdown-only changes.
 ```sh
 git diff --check
 git diff --name-only
+python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py
+rg -n "[[:blank:]]$" AGENTS.md WORKSPACE.md docs .codex .agents
+LC_ALL=C rg -n "[^[:ascii:]]" AGENTS.md WORKSPACE.md docs .codex .agents
+```
+
+## ops-layer
+
+Use when changes affect Crate standing orders, taskflows, memory, proof bundles, doctor tooling, Cloudflare deploy workflow, or thread-control workflow.
+
+```sh
+python3 .codex/tools/crate_doctor.py
+python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py
+git diff --check
 rg -n "[[:blank:]]$" AGENTS.md WORKSPACE.md docs .codex .agents
 LC_ALL=C rg -n "[^[:ascii:]]" AGENTS.md WORKSPACE.md docs .codex .agents
 ```

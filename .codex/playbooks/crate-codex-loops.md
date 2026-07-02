@@ -7,6 +7,38 @@ A Crate Loop means Codex continues iterating after one initial prompt until the 
 
 This playbook orchestrates existing Crate playbooks. It does not replace focused fix, review, QA, release gate, security, provenance, handoff, or package-diff playbooks.
 
+## Ops Layer
+
+Every Crate loop now runs on the durable ops layer:
+
+```text
+User intent
+  -> Crate router
+  -> standing order
+  -> taskflow state
+  -> memory/context load
+  -> selected playbooks/check suites
+  -> execution loop
+  -> proof bundle
+  -> decision log / daily ledger / vault update
+```
+
+Before starting a loop, identify the applicable standing order in `.codex/ops/standing-orders.md`.
+
+Use:
+
+- `.codex/ops/crate-ops-improvement-plan.md` for the full ops architecture.
+- `.codex/ops/crate-memory-model.md` for memory tiers and action-sensitive authority.
+- `.codex/taskflows/README.md` for durable state and resume tokens.
+- `.codex/ops/proof-bundle-template.md` for loop closeout evidence.
+- `.codex/ops/skill-registry.md` when selecting tools, skills, or playbooks.
+
+For release, deploy, QA, or long-running coordination loops, run or review Crate Doctor before acting:
+
+```sh
+python3 .codex/tools/crate_doctor.py
+```
+
 ## When To Use
 - Bryant explicitly asks for an autonomous loop.
 - The task has a clear goal, allowed action set, definition of done, and stop gates.
@@ -38,6 +70,8 @@ Before acting, Codex must confirm:
 - working tree state
 - loop name
 - preauthorization mode
+- applicable standing order
+- active taskflow path, if any
 - goal
 - allowed action set
 - definition of done
@@ -76,15 +110,17 @@ Autonomy is scoped. Codex may continue without additional Bryant prompts only in
 Every autonomous Crate Loop follows this cycle:
 
 ```text
-Observe -> Plan -> Act -> Check -> Evaluate -> Handoff/Continue
+Observe -> Load Ops State -> Plan -> Act -> Check -> Evaluate -> Proof -> Handoff/Continue
 ```
 
 Iteration rules:
 - Observe current repo, PR, QA, artifact, or app state from authoritative sources.
+- Load the applicable standing order, active taskflow, current workstream, and relevant memory/decision files.
 - Plan the next smallest safe action inside the allowed scope.
 - Act only inside the selected preauthorization mode.
 - Check with the narrowest meaningful tests, commands, or UI verification.
 - Evaluate whether the goal is complete, blocked, or still needs another allowed iteration.
+- Record proof in the active taskflow or proof bundle before handoff.
 - Handoff if a stop gate or approval gate is hit; otherwise continue.
 
 Codex must keep each iteration small enough that the next state can be inspected, explained, and reversed without broad unrelated churn. If the next smallest safe action is outside the approved action set, Codex stops and asks Bryant for approval.
@@ -198,10 +234,10 @@ Codex should maintain a lightweight loop state file when useful, especially for 
 Suggested path:
 
 ```text
-.codex/loop-state/<loop-name>.md
+.codex/taskflows/<date>-<loop-name>.md
 ```
 
-Loop-state files are local working artifacts by default. Do not commit loop-state files unless Bryant explicitly approves.
+Taskflow files may be committed when they document durable Crate workflow state and contain no private data. Temporary loop scratch files should stay uncommitted.
 
 Loop-state files must not contain:
 - secrets
@@ -233,6 +269,28 @@ Suggested loop-state fields:
 - stop condition
 - approval needed
 - risks/open questions
+
+## Proof Bundle Closeout
+
+Every major loop must close with a proof bundle or proof section based on `.codex/ops/proof-bundle-template.md`.
+
+At minimum include:
+
+- result
+- branch/commit/PR
+- standing order and taskflow
+- files changed
+- checks run
+- privacy/security result
+- package/provenance/release/deploy evidence when relevant
+- risks
+- next exact prompt or action
+
+Then update:
+
+- `.codex/state/daily-crate-ledger.md`
+- `.codex/state/current-workstream.md` when the active next action changes
+- active taskflow state
 
 ## Mac Keepalive / Loop Heartbeat
 Use this only when Bryant approves a long-running local Codex App loop and the Mac should stay awake. The heartbeat keeps the Mac awake; it does not grant permission to bypass stop gates.

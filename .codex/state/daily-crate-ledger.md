@@ -32,6 +32,40 @@ Secondary:
 - `/Users/bryantfeintuchclaw/Projects/docs/crate/qa-smokes/`
 - recent `v2.4.x` git log and release tags
 
+## 2026-07-02
+
+### Crate Ops Loop Hardening
+
+- Bryant approved implementing all 12 Crate ops/workflow improvements derived from the Peter Steinberger/OpenClaw research pass.
+- Created branch `codex/crate-ops-loop-hardening` from `v2.4.x`.
+- Added the Crate ops layer:
+  - `.codex/ops/crate-ops-improvement-plan.md`
+  - `.codex/ops/standing-orders.md`
+  - `.codex/taskflows/README.md`
+  - `.codex/ops/crate-memory-model.md`
+  - `.codex/ops/proof-bundle-template.md`
+  - `.codex/ops/tester-feedback-archive.md`
+  - `.codex/ops/skill-registry.md`
+  - `.codex/ops/docs-index.md`
+  - `.codex/playbooks/crate-cloudflare-deploy.md`
+  - `.agents/skills/crate-cloudflare-deploy/SKILL.md`
+  - `.agents/skills/crate-doctor/SKILL.md`
+  - `.codex/tools/crate_doctor.py`
+- Updated existing loop/router docs so Crate loops use standing orders, taskflows, memory load, proof bundles, and Crate Doctor preflights where appropriate.
+- Updated `AGENTS.md`, `.codex/ROUTER.md`, `_shared-gates.md`, `crate-codex-loops.md`, `crate-runner-loop.md`, `crate-external-control-layer.md`, and `crate-check-suites.md`.
+- Recorded the decision in `.codex/decisions/v3-crate-ops-loop-hardening.md`.
+- Scope stayed docs/ops/tooling only; no Crate app source, package engine, parser, provenance, dependency, build, release, tag, notarization, crate-web, or deploy state was intentionally changed.
+- Verification:
+  - `python3 .codex/tools/crate_doctor.py` passed with expected warnings for feature branch and dirty docs worktree.
+  - `python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py` passed.
+  - `git diff --check` passed.
+  - trailing-whitespace scan was clean.
+  - repo-wide ASCII scan found pre-existing non-ASCII in historical QA state text; no new ops docs intentionally use non-ASCII.
+
+### Next Action
+
+- Review the ops docs and decide whether to commit/open PR for the loop hardening branch.
+
 ## 2026-06-24
 
 ### Current QA State
@@ -377,3 +411,985 @@ Secondary:
 
 - Wait for Bryant to provide the implementation branch, PR, build artifact, or Figma/plugin output details.
 - Then inspect changed app files, verify no unintended package/backend changes, run focused renderer checks, and prepare a post-redesign QA smoke plan before any tester distribution.
+
+### qa.42 Post-Redesign Smoke Result
+
+- Internal QA prerelease `v2.8.0-qa.42` passed the post-redesign renderer smoke on Jenna's Mac.
+- Installed app metadata was correct:
+  - `/Applications/Crate.app`
+  - version `2.8.0-qa.42`
+  - bundle ID `com.crate.app`
+  - Apple Events usage string present
+  - Apple Events entitlement present
+  - previous qa41 app moved to Trash before install
+- Redesign validation passed:
+  - default launch lands on `Projects`
+  - no `Home`
+  - no top-level `Files`
+  - nav labels are `Projects`, `Current Project`, `Settings`, `Help`
+  - Quick Package is prominent but not a nav tab
+  - Current Project workspace is reachable
+  - Settings and Help are reachable
+  - Crate wordmark is intact
+- Functional spot checks passed:
+  - Projects create/start/watch
+  - Current Project no-project, no-files, watching, ready, and Needs save states
+  - Illustrator Smoke 2 no-save linked JPG
+  - Package Review, Package Complete, and Package Details
+  - Diagnostics OFF and ON placement
+  - Quick Package scoped output and quota increment
+- Figma Pro Current Page Only was not run in this qa42 pass because no fresh approved page-node link was used.
+- Privacy and package-scope checks were clean:
+  - no token, full Figma URL, file key, signed URL, or unrelated private path leakage
+  - package-output folders excluded
+  - old QA roots excluded
+  - diagnostics isolated only when enabled
+
+### qa.42 Follow-Ups
+
+- Bryant noted from the screenshot that the redesigned app feels visually cluttered: too many boxes/items spread across the workspace. This is a UI/design polish issue to review with Jenna, not a qa42 functional blocker.
+- Empty Projects copy currently says `No active projects`; Jenna/Bryant may prefer `No projects yet`.
+- Package Review shows `FIGMA SCOPE Current Page Only` even for non-Figma projects such as PowerPoint. This should be treated as a renderer copy/conditional-visibility follow-up before tester rollout.
+- qa42 briefly staged an already-open stale Illustrator qa40 document when a new project started before Illustrator was closed. Cleanup fixed the lane and no package contamination occurred. Keep as a product/session-scope decision: Crate may capture already-open creative documents at watch start, so tester prompts should close unrelated creative apps before each lane unless Bryant decides to make the app stricter.
+
+### Recommended Next Action
+
+- Do not run a failure loop for qa42 core functionality.
+- First, Bryant and Jenna should review the screenshot and decide the simpler visual layout direction.
+- Then run a small renderer-only polish pass for:
+  - conditional Figma scope row visibility
+  - empty-state copy
+  - reduced visual clutter/density in Projects and Current Project
+- After that, prepare qa43 if code changes land.
+
+### qa.42 Renderer Polish PR
+
+- Opened draft PR #112: `codex/qa42-renderer-polish` into `v2.4.x`.
+- Scope:
+  - hide Package Review Figma scope/warning rows unless the project has actual Figma context
+  - change Projects empty state copy to `No projects yet`
+  - add renderer regression coverage for Figma vs non-Figma package-review scope visibility
+- Changed app/test files:
+  - `renderer/app.js`
+  - `renderer/index.html`
+  - `tests/renderer-figma-scope.test.js`
+- Merge-readiness review was clean:
+  - base `v2.4.x`
+  - branch mergeable
+  - no package engine/parser/provenance/dependency/crate-web changes
+  - focused checks passed
+
+### qa.43 Internal QA Prerelease
+
+- PR #112 was merged into `v2.4.x`.
+- Merge commit: `22aee850cdb527bf8a6ecff3ea4d60df161cfcb5`.
+- Prepared internal QA prerelease `v2.8.0-qa.43`.
+- Release commit: `87c47f4271e2a695ba9c48ad8d45880e93ddfa04`.
+- GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.43`.
+- Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.43/Crate-2.8.0-qa.43-arm64.dmg`.
+- Release commit changed only:
+  - `package.json`
+  - `package-lock.json`
+- Internal QA release guardrails held:
+  - no public final `v2.8.0`
+  - no get-crate.com update
+  - no crate-web/site deploy
+  - no dependency mutation
+  - no package engine/parser/provenance changes
+- Build validation:
+  - signed/notarized/stapled app passed validation
+  - DMG envelope was signed, notarized, stapled, and accepted by Gatekeeper
+  - mounted DMG app reports version `2.8.0-qa.43`
+  - Apple Events usage string and entitlement are present
+  - packaged ASAR contains the PR #112 renderer fix:
+    - `No projects yet`
+    - Figma scope row hidden by default
+    - Figma context predicate present
+    - no Home tab
+    - no top-level Files tab
+    - Current Project nav present
+- qa43 smoke target:
+  - non-Figma Package Review must not show Figma Scope
+  - Figma Package Review must still show Current Page Only / Entire File scope
+  - empty Projects copy should say `No projects yet`
+  - rerun the core qa42 redesign smoke spot checks at lightweight level
+
+### qa.43 Jenna Smoke Result
+
+- Jenna's Mac completed the targeted post-redesign renderer smoke for `v2.8.0-qa.43`.
+- Result: PASS.
+- Installed app metadata was correct:
+  - `/Applications/Crate.app`
+  - version `2.8.0-qa.43`
+  - bundle ID `com.crate.app`
+  - Apple Events usage string present
+  - Apple Events entitlement present
+  - prior app moved to Trash before install
+- Redesign checks passed:
+  - default launch lands on Projects
+  - no Home view
+  - no top-level Files tab
+  - nav labels are `Projects`, `Current Project`, `Settings`, `Help`
+  - Quick Package is prominent but not a primary nav tab
+  - empty copy is `No projects yet`
+  - Help reachable
+- PR #112 regression passed:
+  - non-Figma PowerPoint Package Review did not show `Figma Scope` or `Current Page Only`
+- Functional spot checks passed:
+  - Diagnostics OFF normal project
+  - Diagnostics ON normal project with diagnostics isolated under `Crate Diagnostics/crate-provenance.json`
+  - Quick Package scoped output and quota increment
+  - Illustrator Smoke 2 no-save linked JPG
+- Figma Package Review regression was skipped because no fresh safe approved Pro workspace page-node link was available.
+- Privacy and package-scope checks were clean:
+  - no package-output folder inclusion
+  - no old QA root inclusion
+  - no unused control inclusion
+  - no root `crate-provenance.json`
+  - no token, Figma URL, file key, signed URL, auth, or Bearer markers
+- Non-blocking follow-ups:
+  - Quick Package still defaults output to Desktop, which Bryant has accepted.
+  - Package Review still shows the general PowerPoint/Keynote save-before-packaging reminder even when the fixture was already saved; output/package behavior was correct.
+
+### Updated Next Action
+
+- qa43 is a clean targeted pass.
+- Next engineering/design work should wait for Bryant and Jenna's broader UI review, unless Bryant wants to address the presentation save-reminder copy before that review.
+
+### External Control Layer Progress
+
+- Bryant started the Crate external-control workstream with the goal of making this source-of-truth thread able to create/message/read/list persistent user-owned Crate threads when those tools are exposed.
+- Tool discovery confirmed persistent user-owned thread tools are not currently exposed in this session:
+  - `create_thread`
+  - `send_message_to_thread`
+  - `read_thread`
+  - `list_threads`
+  - related persistent thread-management tools
+- Tool discovery confirmed sub-agent controls are exposed:
+  - `spawn_agent`
+  - `send_input`
+  - `wait_agent`
+  - `resume_agent`
+  - `close_agent`
+- A read-only probe sub-agent successfully accessed the Crate repo, read the repo/router/workstream guardrails, confirmed `v2.4.x`, and reported that sidecar Crate agents should operate read-only by default under this source-of-truth thread.
+- Added `.codex/playbooks/crate-external-control-layer.md`.
+- Updated `AGENTS.md`, `.codex/ROUTER.md`, and `.codex/decisions/v2.8-crate-thread-orchestration-source-of-truth.md` to route Crate external-control requests through the new playbook.
+- Current operating model:
+  - this thread remains Crate source of truth
+  - persistent user-owned thread tools should be used directly when exposed
+  - until they are exposed, sub-agents are available for bounded read-only sidecar work
+  - paste-ready prompts remain the fallback only when a visible user-owned sidebar thread is needed and thread tools are unavailable
+
+### External Control Layer Remaining Gap
+
+- Native model-visible thread tools are still not exposed in this session.
+- However, a local Codex app-server bridge is now implemented and verified:
+  - `.codex/tools/codex_thread_control.py`
+  - uses local app-server protocol methods:
+    - `thread/start`
+    - `thread/list`
+    - `thread/read`
+    - `thread/name/set`
+    - `thread/resume`
+    - `turn/start`
+- Verified bridge probe:
+  - created persistent thread `Crate Control Probe`
+  - thread id `019f1601-f049-72a0-a5cb-841a4b306598`
+  - workspace `/Users/bryantfeintuchclaw/Projects`
+  - sent prompt: `External control probe: reply PONG only. Do not edit files.`
+  - read persisted response: `PONG`
+- Current operating model:
+  - this source-of-truth thread should use the bridge for persistent Crate side threads when native thread tools are unavailable
+  - use sub-agents for bounded sidecar work
+  - use paste-ready prompts only if both bridge/native thread control are unavailable or Bryant explicitly wants manual control
+- Remaining nice-to-have:
+  - native model-visible tools would still be cleaner than shelling through the app-server bridge:
+    - `create_thread`
+    - `send_message_to_thread`
+    - `read_thread`
+    - `list_threads`
+    - title/pin/archive tools
+
+### qa43 Redesign Layout Feedback And Local CSS Polish
+
+- Bryant reviewed the qa43 redesigned app on the Mac mini and flagged layout polish before reviewing with Jenna:
+  - Projects and other workspace surfaces should extend closer to the app edges.
+  - Workspace panels should grow when the window grows, not visually shrink or stay capped.
+  - The same responsive behavior should apply across Projects, Current Project, Quick Package, Settings, and Help.
+  - Settings specifically looked messy: sections were visually stacked too tightly and appeared to sit on top of each other.
+- Local renderer-only CSS polish was applied in `renderer/styles.css`:
+  - reduced outer app/content padding
+  - removed the late redesign layer's `920px` content cap
+  - made main tab surfaces full-width/responsive
+  - changed Settings into one full-width settings surface with a responsive internal grid, consistent gaps, and full-width large sections
+  - added Quick Package to the same full-width surface sizing behavior as Projects and Current Project
+- No backend/package-engine/parser/provenance/dependency/release files were touched.
+- Checks run:
+  - `node --check renderer/app.js`
+  - `git diff --check -- renderer/styles.css`
+- Local `npm start` preview eventually produced a visible Electron window and confirmed:
+  - Projects rows now stretch wider with the app window.
+  - Settings no longer appears as a stack of overlapping cards; Naming/Preferences sit across the top and Figma/Quota use wider sections.
+- Preview screenshot captured at `/tmp/crate-qa44-settings-layout-preview.png`.
+- Follow-up renderer-only polish moved Quick Package out of Projects:
+  - Quick Package is now its own primary sidebar tab between Projects and Current Project.
+  - The old Quick Package sidebar shortcut and scroll-to-Projects behavior were removed.
+  - Quick Package keeps the existing drag/drop/browse behavior and remains wired to the same renderer handlers.
+- Sidebar tab styling was adjusted toward the Figma mockup:
+  - dark-sidebar active tab treatment
+  - small square indicators
+  - muted inactive labels instead of large pale active pills
+- The soft pink/green/cream background treatment was strengthened on both the app shell and content surface so the mockup color direction is visible in-app.
+- The Projects list `+ Add Project` action was restored to a black primary button to match the older Crate builds instead of the pale outline treatment.
+- This polish was finalized as PR #113:
+  - branch `codex/qa44-redesign-layout-polish`
+  - PR `https://github.com/bfeintuch123/crate-app/pull/113`
+  - merge commit `0c2d42659a0c9817d9c4c300debc9c5708b28184`
+- Internal QA prerelease `v2.8.0-qa.44` was prepared from latest `origin/v2.4.x`:
+  - release commit `42ac2a5` (`Prepare v2.8.0-qa.44 QA prerelease`)
+  - tag `v2.8.0-qa.44`
+  - GitHub prerelease `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.44`
+  - direct DMG `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.44/Crate-2.8.0-qa.44-arm64.dmg`
+- qa.44 build validation:
+  - app version `2.8.0-qa.44`
+  - bundle id `com.crate.app`
+  - signed app verifies with `codesign --verify --deep --strict`
+  - mounted DMG app is accepted by Gatekeeper as `Notarized Developer ID`
+  - stapler validation passed for the app inside the DMG
+  - DMG container itself is not signed/stapled under the current electron-builder config, matching the existing app-notarization path
+- qa.44 scope remains internal QA only:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no package-engine/parser/provenance/dependency mutation
+
+### qa44 Visual And Alert QA
+
+- Jenna-machine qa.44 visual confirmation passed:
+  - app opened to Projects
+  - no Home and no top-level Files tab
+  - sidebar order is `Projects`, `Quick Package`, `Current Project`, `Settings`, `Help`
+  - Quick Package is a primary sidebar tab
+  - Projects surface expands wider with app width
+  - Add Project button is black/dark primary
+  - Settings spacing/layout is no longer cramped or overlapping
+  - Help is reachable
+  - background/gradient treatment is visible
+- One visual state was not confirmed in that pass:
+  - `Current Project / No Project Selected`, because prior qa43 project records persisted
+- Alert confirmation:
+  - Settings `Package alerts` was ON
+  - visible inactivity alert passed after the 10-minute threshold
+  - package-complete screen and Package Details passed
+  - foreground native `Project Packaged!` notification was not observed; classify as inconclusive because macOS may suppress visible banners while Crate is foregrounded
+- Background package-alert confirmation was blocked before package:
+  - after relaunch, Crate process was running but exposed zero windows
+  - `System Events` reported `windows=0`
+  - `open`, `open -n`, `Show All`, and `Bring All to Front` did not restore a visible window
+  - background notification lane could not confirm macOS notification permission or native package-complete notification
+- Current interpretation:
+  - do not classify package-complete notification as app bug yet
+  - first run a focused visible-window recovery / clean relaunch check
+  - if window recovery is stable, rerun background package-alert lane
+  - if Crate again runs with zero windows after relaunch, route to Autonomous Crate Failure Loop for installed-app lifecycle/window restore
+
+### qa44 Zero-Window Failure And qa45 Recovery Build
+
+- qa44 zero-window isolation failed:
+  - force quit and fresh open started the Crate process, but visible windows stayed at `0`
+  - Dock icon was present, but Dock click, `Show All`, `Bring All to Front`, and normal app open did not restore a window
+  - moving the active Crate config aside for a temporary fresh-config launch still produced `windows=0`
+  - restored config also reproduced `windows=0`
+  - fresh-config launch log category checks did not show renderer load failure, renderer process exit, startup initialization failure, uncaught exception, crash, permission error, or other logged error category
+- Ran the Autonomous Crate Failure Loop full stack for the installed-app lifecycle/window restore blocker.
+- PR #114 fixed lifecycle/window restoration hardening:
+  - branch `codex/qa44-window-lifecycle-restore`
+  - PR `https://github.com/bfeintuch123/crate-app/pull/114`
+  - merge commit `cac6888a035e607cf655be25e92bcca28f23dff8`
+  - changed `main.js` and `tests/main-window-lifecycle.test.js`
+  - fix reconnects to existing BrowserWindow instances, calls `app.show()` before foreground restore, adds startup show retries, handles `did-become-active`, and preserves the existing no-quit-on-window-close behavior without forcing red-close auto-reopen
+- qa45 internal QA prerelease was prepared from latest `origin/v2.4.x`:
+  - release commit `24d239b` (`Prepare v2.8.0-qa.45 QA prerelease`)
+  - tag `v2.8.0-qa.45`
+  - GitHub prerelease `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.45`
+  - direct DMG `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.45/Crate-2.8.0-qa.45-arm64.dmg`
+- qa45 build validation:
+  - app version `2.8.0-qa.45`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app pass `xcrun stapler validate`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- qa45 scope remains internal QA only:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no package-engine/parser/provenance changes
+- Next qa45 validation target on Jenna's Mac:
+  - delete old `/Applications/Crate.app`, install qa45, and confirm visible Projects window after clean launch
+  - repeat clean launch after force quit
+  - confirm Dock/app activation restores a visible window when the process is running
+  - if visible-window recovery passes, rerun background package-alert lane
+  - confirm qa44 visual layout remains present at spot-check level
+
+### qa45 Zero-Window Failure And PR #115
+
+- Jenna-machine qa45 install passed, but zero-window recovery still failed:
+  - old `/Applications/Crate.app` moved to Trash
+  - installed app reported `2.8.0-qa.45`, bundle id `com.crate.app`, correct process path, Apple Events usage string, and Apple Events entitlement
+  - force quit left no Crate process
+  - fresh launch started the Crate process but still showed `windows=0`
+  - Dock click, `Show All`, `Bring All to Front`, and `Window > Crate` did not restore a visible window
+  - temporary fresh config also produced `windows=0`
+  - original config was restored and still produced `windows=0`
+- Ran the Autonomous Crate Failure Loop full stack again for the continuing installed-app lifecycle/window creation failure.
+- PR #115 merged into `v2.4.x`:
+  - branch `codex/qa45-zero-window-lifecycle`
+  - PR `https://github.com/bfeintuch123/crate-app/pull/115`
+  - merge commit `dace1b736ba860a68d270ec172482cf0ad71d1a1`
+  - changed `main.js` and `tests/main-window-lifecycle.test.js`
+- PR #115 lifecycle hardening:
+  - schedules startup retries before first BrowserWindow creation, so transient creation errors still get recovery attempts
+  - treats existing-but-hidden main windows as failed show attempts and recreates after repeated hidden checks
+  - discards cached `BrowserWindow` references missing from Electron's live window list
+  - prevents an old hidden window's late `closed` event from clearing the replacement main-window reference
+- Checks passed:
+  - high-severity audit gate passed; known moderate `uuid` advisory remains and was not remediated because it requires a forced breaking upgrade
+  - syntax checks for main, provenance, renderer, parsers, and dual-write test file passed
+  - lifecycle, provenance, provenance dual-write, PSD, Figma scope/link/token privacy, renderer Figma, and Quick Package parser tests passed
+  - local `npm start` smoke showed `windows=1` and `frontmost=true`
+  - `git diff --check` passed
+- One temporary dual-write test failure occurred only when global-stub-heavy main-process suites were run in parallel. The isolated test and the full dual-write suite run alone both passed.
+- Next needed release-gate:
+  - prepare internal QA prerelease `v2.8.0-qa.46` from latest `origin/v2.4.x`
+  - validate PR #115 / merge commit `dace1b736ba860a68d270ec172482cf0ad71d1a1` in the signed app
+  - do not update get-crate.com, crate-web, final public release, dependencies, package engine, parser, or provenance behavior
+
+### qa46 Release Gate For PR #115
+
+- Prepared internal QA prerelease `v2.8.0-qa.46` from latest `origin/v2.4.x`.
+- Validated PR #115 / merge commit `dace1b736ba860a68d270ec172482cf0ad71d1a1` in the signed app.
+- Release commit: `ba74ab5ba773b24504334fea8815abaec299b5dc` (`Prepare v2.8.0-qa.46 QA prerelease`)
+- Tag: `v2.8.0-qa.46`
+- GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.46`
+- Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.46/Crate-2.8.0-qa.46-arm64.dmg`
+- Release assets:
+  - `Crate-2.8.0-qa.46-arm64.dmg`
+  - `Crate-2.8.0-qa.46-arm64.dmg.blockmap`
+  - `Crate-2.8.0-qa.46-arm64-mac.zip`
+  - `Crate-2.8.0-qa.46-arm64-mac.zip.blockmap`
+  - `latest-mac.yml`
+- Build validation:
+  - built app and mounted-DMG app report version `2.8.0-qa.46`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app pass `xcrun stapler validate`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - app ASARs contain PR #115 lifecycle markers: `MAIN_WINDOW_HIDDEN_RECREATE_AFTER`, cached-window live-list recreation, and `recreate-hidden-window`
+  - `latest-mac.yml` points to qa46 ZIP and DMG artifacts
+- Checks passed before build:
+  - `npm audit --audit-level=high`
+  - `node --check main.js`
+  - `node --check provenance.js`
+  - `node --check renderer/app.js`
+  - parser syntax checks
+  - `node --test tests/main-window-lifecycle.test.js`
+  - provenance, PSD, Figma scope/link/token privacy, renderer Figma, Quick Package parser, and provenance dual-write suites
+- Known non-blocking release-gate note:
+  - high-severity audit gate passed; known moderate `uuid` advisory remains and requires a forced breaking upgrade, so dependencies were not changed.
+  - DMG envelope itself remains unsigned/unstapled under current builder config; the app inside validates, matching the existing internal QA notarization path.
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no package-engine/parser/provenance changes
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - delete old `/Applications/Crate.app` before installing qa46
+  - confirm clean launch opens a visible Projects window
+  - confirm force quit/reopen restores a visible window
+  - confirm Dock/app activation restores a visible window when process is running
+  - if needed, confirm temporary fresh config launch also opens a visible window
+  - if visible-window recovery passes, rerun background package-alert lane
+  - spot-check qa44 visual layout and privacy behavior
+
+### qa46 Jenna-Machine Result
+
+- qa46 installed successfully on Jenna's Mac:
+  - app path `/Applications/Crate.app`
+  - version `2.8.0-qa.46`
+  - bundle id `com.crate.app`
+  - process path `/Applications/Crate.app/Contents/MacOS/Crate`
+  - Apple Events usage string present
+  - Apple Events entitlement present
+  - old app moved to Trash during install
+- Zero-window recovery: PASS.
+  - force quit/reopen worked
+  - `System Events`: `process_count=1`, `windows=1`
+  - Dock icon present
+  - Dock click restored/brought Crate forward
+  - fresh config fallback not needed
+- Visual layout: PASS.
+  - default launch Projects
+  - no Home
+  - no top-level Files
+  - sidebar `Projects`, `Quick Package`, `Current Project`, `Settings`, `Help`
+  - Quick Package primary tab
+  - Add Project / Start Project dark primary
+  - wide responsive surfaces
+  - Settings spacing clean, no overlap
+  - Package alerts ON, Diagnostics OFF, Package Details ON
+- Background package-alert lane: PARTIAL PASS.
+  - clean project `Jenna qa46 Background Package Alert QA`
+  - safe fixture `Crate qa46 Background Alert Fixture.pptx`
+  - Package Complete appeared after returning to Crate
+  - Package Details opened
+  - package counter incremented `4/10` to `5/10`
+  - output contained fixture PPTX plus one extracted image
+  - Diagnostics OFF emitted no diagnostics folder or root provenance
+  - package-output recapture absent
+  - targeted privacy grep clean
+  - native macOS package-complete notification while backgrounded was not observed
+  - macOS notification permission was not confirmed; private Notification Center content was not inspected
+- Classification:
+  - qa46 fixes the release-blocking zero-window lifecycle issue.
+  - qa46 passes visual layout, package correctness, Package Complete, Package Details, quota increment, and privacy/scope checks for this lane.
+  - native package-complete notification delivery remains a focused follow-up, likely notification permission/delivery/order related until proven otherwise.
+- Next recommended action:
+  - decide whether native package-complete notification delivery is required before tester rollout.
+  - if required, run a focused notification triage loop before another broad QA build.
+
+### qa47 Notification Fix + Release Gate
+
+- Focused notification triage loop completed for qa46 remaining alert issue.
+- Root cause addressed:
+  - successful project packaging always called `showTrayWindow()` after scheduling the native notification.
+  - when Crate was intentionally backgrounded during packaging, immediately foregrounding Crate could suppress or hide the native macOS package-complete banner.
+- PR #116:
+  - URL: `https://github.com/bfeintuch123/crate-app/pull/116`
+  - branch: `codex/qa46-package-notification-delivery`
+  - merge commit: `bbbbe0c`
+  - changed files: `main.js`, `tests/provenance-dual-write.test.js`
+- Fix summary:
+  - added focused `showPackageCompleteNotification()`.
+  - retained native notification objects in `activeNativeNotifications` until close/failure.
+  - if native notification delivery succeeds while Crate is backgrounded, Crate leaves focus alone so macOS can show the banner.
+  - clicking the native notification brings Crate forward.
+  - if native notification delivery fails, Crate logs a privacy-safe failure category and falls back to showing the app window.
+  - if native notifications are unavailable, Crate still shows the app window after package success.
+- Checks passed:
+  - `node --check main.js`
+  - `node --check tests/provenance-dual-write.test.js`
+  - `node --test tests/provenance-dual-write.test.js` (103/103)
+  - `git diff --check`
+  - `npm audit --audit-level=high`
+- Audit note:
+  - high-severity gate passed.
+  - known moderate `uuid` advisory remains and would require a breaking `npm audit fix --force`; dependencies were not mutated.
+- qa47 release-gate result:
+  - Release commit: `81f6615` (`Prepare v2.8.0-qa.47 QA prerelease`)
+  - Tag: `v2.8.0-qa.47`
+  - GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.47`
+  - Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.47/Crate-2.8.0-qa.47-arm64.dmg`
+  - built app and mounted-DMG app report version `2.8.0-qa.47`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passes `xcrun stapler validate`
+  - app ASAR contains PR #116 markers: `showPackageCompleteNotification`, `activeNativeNotifications`, `packageWindowWasForeground`, and `package-notification-failed`
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no package-engine/parser/provenance behavior change
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - install qa47 after moving old `/Applications/Crate.app` to Trash
+  - confirm visible Projects launch and Dock/activation recovery remain passing
+  - confirm Package alerts is ON
+  - safely confirm macOS Notifications permission for Crate if visible in System Settings
+  - package a safe fixture while Crate is backgrounded
+  - expect native `Project Packaged!` notification while Crate remains backgrounded, if macOS permission allows
+  - click the notification and confirm it brings Crate forward
+  - confirm Package Complete, Package Details, quota increment, scoped output, and privacy checks remain passing
+
+### qa48 Projects Button + Notification Focus Follow-Up
+
+- Jenna-machine qa47 result:
+  - install/window recovery passed
+  - package/output behavior passed
+  - Package alerts was ON and macOS Crate notification permission was allowed
+  - background package notification failed because Crate became frontmost at about `t+1s` after destination confirmation
+  - no native package-complete notification appeared
+- Root cause found:
+  - qa47 fixed the package-success foreground path, but `projects:select-output` still called `showTrayWindow()` immediately after the package destination picker closed.
+  - this meant Crate could steal focus before package completion, preventing the native package-complete banner from surfacing.
+- PR #117:
+  - URL: `https://github.com/bfeintuch123/crate-app/pull/117`
+  - branch: `codex/qa47-project-add-button-align`
+  - merge commit: `244a18c0632cad80d1a367c71c8cd07c0df41baa`
+  - changed files: `main.js`, `renderer/index.html`, `renderer/styles.css`, `tests/provenance-dual-write.test.js`
+- Fix summary:
+  - `+ Add Project` in the populated Projects list is now right-aligned and narrower to visually match project status/action pills.
+  - successful package destination selection no longer foregrounds Crate.
+  - canceling the destination picker still restores Crate so the user can keep working.
+  - added a regression test proving confirmed output selection does not foreground Crate.
+- Full-stack review notes:
+  - PR base was `v2.4.x`, mergeable, and clean.
+  - changed files stayed in scoped UI/package-focus/test surfaces.
+  - no dependency, crate-web, parser, provenance, Figma, release-site, or broad watcher changes.
+  - security/provenance review found no new token, path, manifest, package escape, or Figma privacy surface.
+  - full `tests/provenance-dual-write.test.js` run passed the new tests but had one unrelated Illustrator process-detection flicker; the exact failing test passed on isolated rerun.
+- Checks passed:
+  - `node --check main.js`
+  - `node --check renderer/app.js`
+  - `node --check tests/provenance-dual-write.test.js`
+  - `git diff --check`
+  - `git diff --check origin/v2.4.x...HEAD`
+  - `node --test --test-name-pattern "background project package|package destination selection" tests/provenance-dual-write.test.js`
+  - `node --test --test-name-pattern "Illustrator running detection recognizes realistic command paths" tests/provenance-dual-write.test.js`
+  - `node --test tests/main-window-lifecycle.test.js`
+  - `node --test tests/quick-package-parser.test.js`
+  - `node --test tests/provenance.test.js`
+  - `npm audit --audit-level=high`
+- Audit note:
+  - high-severity gate passed.
+  - known moderate `uuid` advisory remains and would require a breaking `npm audit fix --force`; dependencies were not mutated.
+- qa48 release-gate result:
+  - Release commit: `92e6bdb` (`Prepare v2.8.0-qa.48 QA prerelease`)
+  - Tag: `v2.8.0-qa.48`
+  - GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.48`
+  - Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.48/Crate-2.8.0-qa.48-arm64.dmg`
+  - built app and mounted-DMG app report version `2.8.0-qa.48`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passes `xcrun stapler validate`
+  - app ASAR contains PR #117 markers: `project-list-actions`, `btn-add-project`, and background-safe destination selection copy
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no parser/provenance behavior change
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - install qa48 after moving old `/Applications/Crate.app` to Trash
+  - confirm visible Projects launch and Dock/activation recovery remain passing
+  - confirm populated Projects `+ Add Project` button is right-aligned and visually narrower
+  - confirm Package alerts is ON and macOS notification permission is allowed
+  - package a safe fixture while Crate is backgrounded immediately after destination confirmation
+  - expect Crate to stay backgrounded until notification click or manual return
+  - expect native `Project Packaged!` banner if macOS permission allows
+  - confirm Package Complete, Package Details, quota increment, scoped output, and privacy checks remain passing
+
+### qa49 Notification Focus + Rollover Quota Release Gate
+
+- Bryant approved merging PR #118 if merge-readiness remained clean, then preparing qa49 for Jenna-machine validation.
+- PR #118:
+  - URL: `https://github.com/bfeintuch123/crate-app/pull/118`
+  - branch: `codex/qa48-notification-quota-fix`
+  - base: `v2.4.x`
+  - merge state before merge: clean / mergeable
+  - merge commit: `17eb7c665b6ed97a37c4d14057277f24d94601a5`
+  - changed files: `main.js`, `tests/provenance-dual-write.test.js`
+- Fix summary:
+  - successful package destination selection now starts a focused package-background handoff window instead of bringing Crate foreground.
+  - package-complete notification delivery respects that handoff window even if Electron reports stale foreground state.
+  - native notification failure no longer forces foreground during the handoff window.
+  - notification click still brings Crate forward.
+  - Dock/app activation remains able to restore a visible Crate window.
+  - quota reset now uses local-month reset-date formatting so successful packages still increment correctly on UTC/local rollover days.
+- Review/checks:
+  - PR base confirmed `v2.4.x`.
+  - changed files stayed scoped to package focus/quota logic and tests.
+  - high-severity audit gate passed; known moderate `uuid` advisory remains and was not mutated.
+  - syntax checks passed for `main.js`, `provenance.js`, `renderer/app.js`, selected parsers, and touched tests.
+  - focused notification/quota tests passed.
+  - main window lifecycle, Quick Package parser, provenance, PSD, Figma scope/link/token/privacy, and renderer Figma scope tests passed at appropriate scope.
+  - one full dual-write run had an unrelated process-detection timing flicker; the exact test passed on isolated rerun.
+  - `git diff --check` passed.
+- qa49 release-gate result:
+  - Release commit: `7e947023bbcc5ab613dd81a976322727304dffd4` (`Prepare v2.8.0-qa.49 QA prerelease`)
+  - Tag: `v2.8.0-qa.49`
+  - GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.49`
+  - Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.49/Crate-2.8.0-qa.49-arm64.dmg`
+  - app version in built app and mounted DMG: `2.8.0-qa.49`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passes `xcrun stapler validate`
+  - DMG container was signed, notarized, stapled, and accepted by Gatekeeper
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no parser/provenance behavior change
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - install qa49 after moving old `/Applications/Crate.app` to Trash
+  - confirm visible Projects launch, force-quit/reopen, and Dock/app activation remain passing
+  - confirm qa48 visual polish remains: no Home, no top-level Files, sidebar `Projects / Quick Package / Current Project / Settings / Help`, Quick Package primary tab, right-aligned dark `+ Add Project`, wide surfaces, and clean Settings spacing
+  - confirm Package alerts is ON and macOS Notifications permission for Crate is allowed if visible safely
+  - package a safe fixture while Crate is backgrounded immediately after destination confirmation
+  - expect Crate to stay backgrounded until notification click or manual return
+  - expect native `Project Packaged!` notification if macOS permission allows
+  - confirm Package Complete, Package Details, quota increment on month-boundary/reset-day state, quota-block no-output behavior, scoped output, and privacy checks remain passing
+
+### qa49 Jenna-Machine Validation Result
+
+- Installed app:
+  - version `2.8.0-qa.49`
+  - bundle id `com.crate.app`
+  - process path `/Applications/Crate.app/Contents/MacOS/Crate`
+  - Apple Events usage string present
+  - Apple Events entitlement present
+  - old app moved to Trash before install
+- Visual/window checks: PASS.
+  - clean launch opened visible Projects window
+  - force quit/reopen restored visible window
+  - Dock/app activation brought Crate forward
+  - no Home
+  - no top-level Files
+  - sidebar: `Projects`, `Quick Package`, `Current Project`, `Settings`, `Help`
+  - Quick Package is a primary tab
+  - `+ Add Project` is dark, narrower, and right-aligned under project rows
+  - wide surfaces and Settings spacing remain intact
+- Notification/package lane: PARTIAL.
+  - Package alerts ON
+  - macOS notification permission allowed with Temporary banner style
+  - Diagnostics OFF
+  - Package Details ON
+  - project: `Jenna qa49 Background Package Alert QA`
+  - fixture: `Crate qa49 Background Alert Fixture.pptx`
+  - output path stayed within approved qa49 package-output root
+  - Crate stayed backgrounded after `Package Now`; Finder remained frontmost from `t+1` through `t+5`
+  - native `Project Packaged!` notification was not observed
+  - Package Complete: PASS
+  - Package Details: PASS
+- Quota/output lane: PASS.
+  - counter/config moved from `0/10` to `1/10`
+  - temporary `10/10` quota block showed existing limit flow
+  - quota-block output was not written
+  - counter restored to `1/10`
+  - output files were only the fixture PPTX and expected extracted image
+  - no diagnostics folder with Diagnostics OFF
+  - no root `crate-provenance.json`
+  - no package-output recapture
+  - no stale QA roots
+  - targeted privacy grep clean for token/Figma URL/file key/signed URL/private-path markers
+- Classification:
+  - qa49 fixed the qa48/qa47 focus and quota failures.
+  - qa49 is not fully release-clear if native package-complete banner delivery is required before testers.
+  - remaining issue is limited to native notification delivery while backgrounded; package correctness, quota, focus, and privacy are clean.
+- Next recommendation:
+  - run one focused notification failure loop if Bryant wants native package-complete banner as a tester-readiness requirement.
+  - likely code area: `showPackageCompleteNotification()` and package-completion notification timing/options, compared with the inactivity notification path that has shown visible alerts.
+  - keep scope narrow and preserve background focus, quota increment, Package Complete/Details, package output scope, and privacy behavior.
+
+### qa50 Native Package Notification Release Gate
+
+- Bryant approved committing, pushing, opening PR, running merge-readiness, merging if clean, then preparing qa50 for native package-complete notification validation.
+- PR #119:
+  - URL: `https://github.com/bfeintuch123/crate-app/pull/119`
+  - branch: `codex/qa49-native-notification-delivery`
+  - base: `v2.4.x`
+  - merge commit: `d70e927308f6e7a5d2b0154393ebf9c0a3f50f25`
+  - changed files: `main.js`, `tests/provenance-dual-write.test.js`
+- Fix summary:
+  - package-complete native notification now uses an explicit show delay for background package handoff cases.
+  - package-complete notification includes a non-silent native notification configuration and app icon when available.
+  - click-to-open behavior remains intact.
+  - background package tests assert the notification is created before delayed show and shown later while Crate stays hidden.
+- Merge-readiness:
+  - PR base confirmed `v2.4.x`.
+  - changed files stayed scoped to notification delivery and tests.
+  - merge state was clean / mergeable.
+  - focused notification/quota tests passed before merge.
+  - no dependency, crate-web, parser, provenance, Figma, package-scope, or release-site changes.
+- Release-gate checks passed:
+  - `npm audit --audit-level=high` passed; known moderate `uuid` advisory remains and was not force-fixed.
+  - syntax checks passed for `main.js`, `provenance.js`, `renderer/app.js`, selected parsers, and touched tests.
+  - focused notification/quota tests passed.
+  - `tests/main-window-lifecycle.test.js`, `tests/quick-package-parser.test.js`, `tests/provenance.test.js`, `tests/psd-embedded-safety.test.js`, Figma scope/link/token/privacy, renderer Figma scope, and full `tests/provenance-dual-write.test.js` all passed.
+  - full dual-write result: 106 tests passing.
+- qa50 release-gate result:
+  - Release commit: `362d2d0faad785bb935e2517d498b296e0ad935c` (`Prepare v2.8.0-qa.50 QA prerelease`)
+  - Tag: `v2.8.0-qa.50`
+  - GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.50`
+  - Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.50/Crate-2.8.0-qa.50-arm64.dmg`
+  - built app and mounted-DMG app report version `2.8.0-qa.50`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passes `xcrun stapler validate`
+  - DMG container was signed, notarized, stapled, and accepted by Gatekeeper
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no parser/provenance behavior change
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - install qa50 after moving old `/Applications/Crate.app` to Trash
+  - confirm visible Projects launch, force-quit/reopen, and Dock/app activation remain passing
+  - confirm qa49 visual polish remains: no Home, no top-level Files, sidebar `Projects / Quick Package / Current Project / Settings / Help`, Quick Package primary tab, right-aligned dark `+ Add Project`, wide surfaces, and clean Settings spacing
+  - confirm Package alerts is ON and macOS Notifications permission for Crate is allowed if visible safely
+  - package a safe fixture while Crate is backgrounded immediately after destination confirmation
+  - expect Crate to stay backgrounded until notification click or manual return
+  - expect native `Project Packaged!` notification if macOS permission allows
+  - confirm Package Complete, Package Details, quota increment, quota-block no-output behavior, scoped output, and privacy checks remain passing
+
+### qa50 Jenna Result + qa51 Zero-Window Recovery Release Gate
+
+- qa50 Jenna-machine result:
+  - installed app version `2.8.0-qa.50`
+  - qa50 package scoping, Package Complete, Package Details, quota increment, quota block, diagnostics-off behavior, and privacy checks passed
+  - qa50 failed initial clean launch / force quit-reopen because Crate could start as a process with `windows=0`
+  - fresh config also reproduced `windows=0`, so the issue was classified as likely app lifecycle/window-creation bug, not persisted user config
+  - native package-complete banner was still not observed, but Bryant clarified that this banner is not required for tester rollout because Crate already shows the in-app Package Complete screen and Package Details
+- PR #120:
+  - URL: `https://github.com/bfeintuch123/crate-app/pull/120`
+  - branch: `codex/qa50-zero-window-launch-recovery`
+  - base: `v2.4.x`
+  - merge commit: `ccbaffcb699fd909337f17d60749c7d40760833b`
+  - changed files: `main.js`, `renderer/index.html`, `tests/main-window-lifecycle.test.js`
+- Fix summary:
+  - startup retry timers now stay alive until Crate confirms a visible main window
+  - if the first launch window closes before visibility is established, retry recovery creates a replacement visible window instead of leaving a headless process
+  - once a window is confirmed visible, startup retries clear normally
+  - Package Alerts settings copy now describes the proven idle-project reminder behavior instead of promising package-complete native banners
+- Merge-readiness:
+  - PR base confirmed `v2.4.x`
+  - changed files stayed scoped to app lifecycle, renderer copy, and lifecycle tests
+  - merge state was clean / mergeable
+  - no dependency, crate-web, parser, provenance, Figma, package-scope, or release-site changes
+- Checks passed:
+  - `npm audit --audit-level=high` passed; known moderate `uuid` advisory remains and was not force-fixed
+  - `node --check main.js`
+  - `node --check provenance.js`
+  - `node --check renderer/app.js`
+  - `node --check parsers/index.js`
+  - `node --check parsers/powerpoint.js`
+  - `node --check parsers/figma.js`
+  - `node --check parsers/package-safety.js`
+  - `node --check tests/main-window-lifecycle.test.js`
+  - `node --test tests/main-window-lifecycle.test.js`
+  - `node --test tests/renderer-figma-scope.test.js`
+  - focused package/notification/quota subset from `tests/provenance-dual-write.test.js`
+  - `node --test tests/quick-package-parser.test.js`
+  - `node --test tests/provenance.test.js`
+  - `git diff --check`
+- qa51 release-gate result:
+  - Release commit: `e17c98e` (`Prepare v2.8.0-qa.51 QA prerelease`)
+  - Tag: `v2.8.0-qa.51`
+  - GitHub prerelease: `https://github.com/bfeintuch123/crate-app/releases/tag/v2.8.0-qa.51`
+  - Direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v2.8.0-qa.51/Crate-2.8.0-qa.51-arm64.dmg`
+  - built app and mounted-DMG app report version `2.8.0-qa.51`
+  - bundle id `com.crate.app`
+  - built app and mounted-DMG app pass `codesign --verify --deep --strict`
+  - built app and mounted-DMG app are accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passes `xcrun stapler validate`
+  - DMG container was signed, notarized, stapled, and accepted by Gatekeeper
+  - release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+- Scope kept:
+  - no get-crate.com update
+  - no crate-web deploy
+  - no final public v2.8.0 release
+  - no dependency mutation
+  - no parser/provenance behavior change
+  - package metadata bump only in `package.json` and `package-lock.json`
+- Next Jenna-machine validation:
+  - install qa51 after moving old `/Applications/Crate.app` to Trash
+  - confirm clean launch opens visible Projects window
+  - confirm force quit/reopen restores visible window
+  - confirm Dock/app activation brings Crate forward
+  - confirm no Home, no top-level Files, sidebar `Projects / Quick Package / Current Project / Settings / Help`, Quick Package primary tab, right-aligned dark `+ Add Project`, wide surfaces, and clean Settings spacing
+  - confirm Package Alerts copy says Crate alerts when a watched project is idle
+  - confirm Package Complete screen and Package Details still work after a normal package
+  - confirm quota increments by exactly one
+  - confirm quota-block writes no output
+  - confirm scoped output, diagnostics behavior, and privacy checks remain passing
+
+### qa51 Jenna-Machine Validation Result
+
+- QA version: `v2.8.0-qa.51`.
+- Installed app:
+  - `/Applications/Crate.app`
+  - version/build `2.8.0-qa.51`
+  - bundle id `com.crate.app`
+  - process path `/Applications/Crate.app/Contents/MacOS/Crate`
+  - `NSAppleEventsUsageDescription` present
+  - Apple Events entitlement present
+  - old qa50 app moved to Trash before install
+- Window / visual validation: PASS.
+  - clean launch opened visible Projects window
+  - force quit/reopen restored visible window with `process_count=1, windows=1`
+  - app activation brought Crate forward
+  - no Home
+  - no top-level Files
+  - sidebar shows `Projects`, `Quick Package`, `Current Project`, `Settings`, `Help`
+  - Quick Package is a primary tab
+  - `+ Add Project` is dark, narrower, and right-aligned
+  - wide surfaces and Settings spacing remain intact
+- Package Alerts copy: PASS.
+  - Settings copy now says `Get alerts when Crate notices a watched project has been idle.`
+  - Native package-complete banner is not a tester-readiness requirement; in-app Package Complete and Package Details are the accepted completion confirmation.
+- Package smoke: PASS.
+  - project `Jenna qa51 Package Smoke QA`
+  - fixture `Crate qa51 Package Smoke Fixture.pptx`
+  - output path under approved `v2.8.0-qa.51-jenna/package-outputs`
+  - Package Complete: `2 files packaged`
+  - Package Details: `2 files included`, `1 file gathered`, `1 extracted media file`, `No issues found`, `Diagnostics off`
+  - quota incremented exactly +1 (`1/10` to `2/10`)
+  - output contained only the fixture PPTX and expected extracted image
+- Quota block: PASS, with setup caveat.
+  - temporarily set counter to `10/10` with backup
+  - at `10/10`, Projects disabled `+ Add Project`
+  - Quick Package quota-block flow showed existing `You've used all 10 packages` / upgrade / reset copy
+  - no quota-block output was written
+  - counter restored to real tested value `2/10`, reset date `2026-08-01`
+- Privacy / scope: PASS.
+  - no `Crate Diagnostics` folder with Diagnostics OFF
+  - no root `crate-provenance.json`
+  - no package-output recapture
+  - no stale QA roots or unrelated files in package
+  - no token, Figma URL, file key, signed URL, or private-path leakage in targeted checks
+- Classification:
+  - qa51 passes PR #120's core installed-app targets and closes the release-blocking zero-window regression for this lane.
+  - package output, Package Details, quota increment, quota block, and privacy checks are clean.
+  - package-complete native banner is intentionally out of scope after the copy/requirement clarification.
+- Separate follow-up:
+  - a stale qa50 idle alert appeared once after install; clicking `Pause` caused Crate to quit, but relaunch recovered normally.
+  - classify as idle-alert button interaction follow-up, not a qa51 package/window/quota blocker.
+  - if Bryant wants extra confidence before testers, run a focused qa51 idle-alert button smoke covering `Keep Watching`, `Pause`, and `Package Now` on a current qa51 project.
+
+### qa51 Idle Alert Button Smoke
+
+- QA version: `v2.8.0-qa.51`.
+- Installed app:
+  - `/Applications/Crate.app`
+  - version `2.8.0-qa.51`
+  - bundle id `com.crate.app`
+  - process path `/Applications/Crate.app/Contents/MacOS/Crate`
+  - `NSAppleEventsUsageDescription` present
+  - Apple Events entitlement present
+- Settings:
+  - Package alerts ON
+  - Diagnostics OFF
+  - Package Details ON
+  - package counter before focused smoke: `2 of 10`
+  - package counter after focused smoke: `3 of 10`
+- Part A, `Keep Watching`: PASS.
+  - alert appeared after 12 minutes
+  - alert referenced fresh project `Jenna qa51 Idle Alert Keep Watching QA`
+  - Crate did not quit
+  - window remained visible
+  - project remained Watching
+  - no output written
+  - counter stayed `2/10`
+- Part B, `Pause`: PASS.
+  - alert appeared after 12 minutes
+  - alert referenced fresh project `Jenna qa51 Idle Alert Pause QA`
+  - Crate did not quit
+  - window remained visible / recoverable
+  - UI showed `Paused · 1 file`
+  - no output written
+  - counter stayed `2/10`
+  - no zero-window regression
+- Part C, `Package Now`: PASS.
+  - alert appeared after 12 minutes
+  - alert referenced fresh project `Jenna qa51 Idle Alert Package Now QA`
+  - package flow opened normally through destination chooser
+  - Package Complete showed `2 files packaged`
+  - Package Details showed `2 files included`, `1 file gathered`, `1 extracted media file`, `No issues found`, `Diagnostics off`
+  - counter changed `2/10` to `3/10`
+  - output path under approved `v2.8.0-qa.51-jenna/package-outputs`
+  - output files were only `Crate qa51 Idle Package Now Fixture.pptx` and `Crate qa51 Idle Package Now Fixture — image1.jpg`
+  - no unexpected files
+- Privacy / scope:
+  - Diagnostics with Diagnostics OFF absent
+  - root `crate-provenance.json` absent
+  - package-output recapture absent
+  - stale QA roots absent
+  - unrelated files absent from output
+  - no token, Figma URL, file key, signed URL, or private-path leakage in output text-file scan
+- Classification:
+  - likely app bug: no
+  - likely QA setup issue: no
+  - likely permissions/TCC issue: no
+  - likely package/scope issue: no
+  - release/tester blocker: no
+- Result:
+  - qa51 idle-alert buttons are tester-ready.
+  - `Keep Watching`, `Pause`, and `Package Now` all worked from fresh qa51 projects.
+  - The earlier stale qa50 idle-alert `Pause` behavior does not reproduce on fresh qa51 projects and is not an active tester blocker.
+
+### v3.0.0-beta.1 Tester Release
+
+- Bryant decided the redesigned Crate app should move to v3.0 rather than final public `v2.8.0`.
+- Release target selected: `v3.0.0-beta.1`.
+- Release branch: `v2.4.x`.
+- Docs/control-layer dirty state was stashed before release mutation and restored afterward.
+- Release-gate checks before version bump:
+  - branch was `v2.4.x`
+  - local branch matched `origin/v2.4.x`
+  - working tree was clean after stashing docs/control-layer files
+  - package metadata before bump was `2.8.0-qa.51`
+  - `npm audit --audit-level=high` passed; known moderate `uuid` advisory remains and was not force-fixed
+  - syntax checks passed for `main.js`, `provenance.js`, `renderer/app.js`, `parsers/index.js`, `parsers/powerpoint.js`, `parsers/figma.js`, and `parsers/package-safety.js`
+  - focused lifecycle, Quick Package, provenance, PSD, Figma, renderer, and token privacy tests passed
+  - full `tests/provenance-dual-write.test.js` passed: 106 tests passing
+- Version bump:
+  - `package.json`: `3.0.0-beta.1`
+  - `package-lock.json`: `3.0.0-beta.1`
+- Build / artifact result:
+  - `npx electron-builder --mac --arm64` succeeded
+  - built app version: `3.0.0-beta.1`
+  - bundle id: `com.crate.app`
+  - artifacts:
+    - `dist/Crate-3.0.0-beta.1-arm64.dmg`
+    - `dist/Crate-3.0.0-beta.1-arm64.dmg.blockmap`
+    - `dist/Crate-3.0.0-beta.1-arm64-mac.zip`
+    - `dist/Crate-3.0.0-beta.1-arm64-mac.zip.blockmap`
+    - `dist/latest-mac.yml`
+- Signing / notarization:
+  - built app passed `codesign --verify --deep --strict`
+  - built app was accepted by Gatekeeper as `Notarized Developer ID`
+  - built app passed `xcrun stapler validate`
+  - DMG container was signed, notarized, stapled, validated, and accepted by Gatekeeper as `Notarized Developer ID`
+  - mounted-DMG app reported version `3.0.0-beta.1`, bundle id `com.crate.app`, passed codesign, and was accepted by Gatekeeper
+- Git / GitHub release:
+  - release commit: `fcef32f` (`Prepare v3.0.0-beta.1 release`)
+  - tag: `v3.0.0-beta.1`
+  - branch and tag pushed to origin
+  - GitHub prerelease created: `https://github.com/bfeintuch123/crate-app/releases/tag/v3.0.0-beta.1`
+  - direct DMG: `https://github.com/bfeintuch123/crate-app/releases/download/v3.0.0-beta.1/Crate-3.0.0-beta.1-arm64.dmg`
+  - GitHub release assets include DMG, DMG blockmap, ZIP, ZIP blockmap, and `latest-mac.yml`
+  - direct GitHub DMG URL resolves successfully
+- Site update:
+  - `crate-site/index.html` was updated and committed so regular download CTAs point to the v3 beta DMG.
+  - updated CTA copy includes `Download v3 Beta` and `For Mac · v3 beta · Free to start`.
+  - this change was included in release commit `fcef32f` and pushed to `origin/v2.4.x`.
+- Site deploy status:
+  - Cloudflare Pages project: `get-crate`.
+  - first deploy to branch `main` updated preview URLs but not custom domain production.
+  - production deployment list showed the custom domain production branch is `v2.4.x`.
+  - production deploy was then run for branch `v2.4.x`.
+  - production deployment URL: `https://51c5bf53.get-crate.pages.dev`.
+  - live `https://get-crate.com/` verified with cache-busting and now serves v3 beta download links.
+  - verified live HTML contains `v3.0.0-beta.1` and `Crate-3.0.0-beta.1-arm64.dmg`.
+  - verified live HTML no longer contains old `v2.7.1` / `Crate-2.7.1` download links.
+- Security follow-up:
+  - Cloudflare API token was exposed in a Terminal screenshot/transcript while enabling deploy access.
+  - Rotate the exposed token in Cloudflare.
+  - Going forward, use a secure Codex-accessible deployment path rather than relying on manual Terminal exports.

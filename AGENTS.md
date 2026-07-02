@@ -58,6 +58,11 @@ Supporting workflow references:
 - `.codex/state/current-workstream.md` records the compact active Crate state and next prompt.
 - `.codex/playbooks/_shared-gates.md` contains common repo, mutation, release, dependency, privacy, review, and final-report gates.
 - `.codex/checks/crate-check-suites.md` defines named docs, focused QA, provenance, Figma, package-parser, and release-gate check suites.
+- `.codex/ops/crate-ops-improvement-plan.md` maps the Crate ops layer: standing orders, taskflows, memory, proof bundles, skill registry, doctor, Cloudflare deploy, and tester archive.
+- `.codex/ops/standing-orders.md` defines durable authority for recurring Crate programs.
+- `.codex/taskflows/README.md` defines durable taskflow state and resume-token format for multi-step loops.
+- `.codex/ops/crate-memory-model.md` defines memory tiers and action-sensitive approval memory.
+- `.codex/ops/proof-bundle-template.md` defines proof-bundle closeout evidence.
 - `docs/crate/qa-smokes/` stores reusable Jenna-machine smoke prompt templates.
 
 Use:
@@ -89,11 +94,25 @@ Use:
 - `crate-codex-loops.md` also defines the Autonomous Crate Failure Loop. Use it for QA smoke failures, tester reports, GitHub issues, release-gate failures, dependency audits, PR review findings, package/provenance anomalies, installed-app regressions, and public/beta bug reports. For any code-fix loop, automatically use the Crate Fix Review Stack: `crate-bug-triage.md`, `clawpatch-fix.md`, `crate-autoreview.md`, `crate-regression-detector.md`, `crate-security-scan.md`, `crate-provenance-review.md`, `crate-runner-loop.md`, `review-crate-pr.md`, and `crate-handoff.md`.
 - `crate-runner-loop.md` for Crabbox-style self-verifying Codex App loops with execution tiers, safe runner command suites, evidence format, and Mac-only release/signing boundaries.
 - `crate-codex-qa-assistant.md` for durable Codex QA assistant workflows that split crate-web browser QA from crate-app desktop Computer Use QA, produce proof artifacts, and route fixes through Bryant-approved draft PRs or follow-up prompts.
+- `crate-external-control-layer.md` for Crate thread/sub-agent orchestration, including native persistent user-owned thread tools when available, the local app-server bridge at `.codex/tools/codex_thread_control.py`, and sub-agent sidecars when persistent thread control is unnecessary.
 - `crate-cmux-workbench.md` for optional cmux-style organization of multiple Codex CLI sessions while preserving Codex CLI, Computer Use, scoped app-lane QA, and Bryant approval boundaries.
 - `crate-handoff.md` for restartable Codex App session handoffs and fresh-agent Crate prompts with portable anchors, privacy filters, exact next prompts, and explicit stop conditions.
+- `crate-cloudflare-deploy.md` for safe get-crate.com Cloudflare Pages deploys using the Keychain token path, Wrangler verification, and no token exposure.
 - `_shared-gates.md` for common gates that other Crate playbooks and router-selected workflows should apply.
 
 When using a playbook, state which playbook is active, confirm the current branch, and follow the approval gates in that playbook.
+
+## Ops Layer
+
+For non-trivial Crate work, route through the ops layer:
+
+1. Select a standing order from `.codex/ops/standing-orders.md`.
+2. Create or update a taskflow under `.codex/taskflows/` if the work spans turns, threads, agents, machines, or approval gates.
+3. Load memory according to `.codex/ops/crate-memory-model.md`.
+4. Use `.codex/ops/skill-registry.md` when selecting routeable skills/tools.
+5. Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running QA, or external-control work.
+6. Close major work with a proof bundle or proof section based on `.codex/ops/proof-bundle-template.md`.
+7. Update `.codex/state/daily-crate-ledger.md` and `.codex/state/current-workstream.md` when state changes.
 
 ## PR Review Rules
 Before merge:
