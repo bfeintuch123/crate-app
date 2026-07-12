@@ -266,8 +266,24 @@ def check_hygiene() -> list[Check]:
     return checks
 
 
+def check_automation_registry() -> list[Check]:
+    path = ROOT / ".codex" / "ops" / "crate-automations.json"
+    if not path.is_file():
+        return [warn("automation.registry", "privacy-safe automation registry is missing")]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return [fail("automation.registry", "automation registry is unreadable or invalid JSON")]
+    entries = payload.get("automations")
+    if not isinstance(entries, list):
+        return [fail("automation.registry", "automations must be a JSON array")]
+    status = payload.get("inventory_status", "unknown")
+    detail = f"{len(entries)} registered automations; status={status}"
+    return [warn("automation.registry", f"{detail}; repo metadata cannot prove live state, verify through the automation tool")]
+
+
 def main() -> int:
-    checks = check_repo() + check_tools() + check_auth() + check_hygiene()
+    checks = check_repo() + check_tools() + check_auth() + check_hygiene() + check_automation_registry()
     failures = [check for check in checks if check.status == "fail"]
     warnings = [check for check in checks if check.status == "warn"]
 

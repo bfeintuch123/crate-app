@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "inventory_status": "requires-live-export",
+  "last_reviewed": "2026-07-11",
+  "coverage_note": "This repo catalog is intentionally empty until the live Codex automation tool exports current automation IDs and schedules. Do not infer active automations from old calendar events, taskflow prose, or chat history.",
+  "automations": []
+}

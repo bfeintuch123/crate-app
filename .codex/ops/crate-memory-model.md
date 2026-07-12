@@ -130,3 +130,18 @@ Before a long thread, loop, or side thread is compacted or handed off:
 - produce a privacy-safe handoff
 
 The nightly vault automation should read the ledger and taskflows first, not raw transcripts.
+
+## Bounded Context Packs
+
+Use a context pack when a task crosses threads, agents, or machines but does not need the full Crate memory surface.
+
+A context pack must:
+
+- name one active route and taskflow
+- include source paths and hashes
+- load only the hard rules, active state, standing order, decisions, and workflows required for that task
+- stay within an explicit size budget
+- redact credential-like values and normalize private home paths
+- exclude raw transcripts, research caches, tester artifacts, diagnostics, package outputs, and unrelated generated outputs by default
+
+The pack is a bounded snapshot, not a new source of truth. Reread linked sources before action-sensitive work.

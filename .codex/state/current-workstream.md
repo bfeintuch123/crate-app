@@ -10,9 +10,9 @@ Last updated: 2026-07-11
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batch 1-8 is implemented and validated in isolated app/plugin branches, with no app runtime or release mutation.
-- Active ops branches: `codex/ops-repo-safety-inventory` and Crate Ops `codex/ops-safety-feedback-loops`
-- Current ops work: destructive-command guard, safe worktree policy, reviewable skill workshop, loop retrospectives, canonical feature inventory, architecture-health audit, operational hygiene, and the merged private X research inbox. Crate Ops PR #5 and Crate app PR #122 are merge-ready; stop before merging them without Bryant's separate approval.
+- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batch 1-8 is merged; batch 9-16 is in scoped ops-only implementation with no app runtime or release mutation.
+- Active ops branches: `codex/ops-quality-catalogs` and Crate Ops `codex/ops-quality-intelligence`
+- Current ops work: coverage states, loop catalog/patrol discovery, instruction audit, bounded context packs, visual evidence manifests, richer architecture signals, automation hygiene, and advisory model/cost routing. Crate Ops PR #6 and Crate app PR #123 are merge-ready; stop before merging without Bryant's separate approval.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

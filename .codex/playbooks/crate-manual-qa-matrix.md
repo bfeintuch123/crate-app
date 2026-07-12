@@ -7,6 +7,24 @@ Manual QA validates real designer behavior, cross-app workflows, scope choices, 
 
 Provenance may be partial and should not overclaim certainty. Reports must distinguish confirmed package actions from likely, candidate, weak, missing, or unknown relationships.
 
+## Stable Lane IDs
+
+These IDs are referenced by the canonical feature inventory. They identify procedures, not current pass results.
+
+| Lane ID | Procedure owner |
+| --- | --- |
+| `install-launch` | `docs/crate/qa-smokes/smoke-01-install-launch.md` |
+| `projects-current-project` | Projects / Current Project installed-app workflow |
+| `multi-app-capture` | Workflow Matrix creative-app lanes below |
+| `quick-package` | `docs/crate/qa-smokes/smoke-03-quick-package.md` |
+| `package-review-complete-details` | Package Output Review below |
+| `illustrator-no-save-linked-jpg` | `docs/crate/qa-smokes/smoke-02-illustrator-no-save-linked-jpg.md` |
+| `figma-scope` | `docs/crate/qa-smokes/smoke-04-figma-scope.md` |
+| `figma-errors-privacy` | Figma workflow lanes plus privacy checks below |
+| `package-details-diagnostics` | `docs/crate/qa-smokes/smoke-07-package-details-diagnostics.md` |
+| `quota-limit-no-output` | Quota block installed-app lane |
+| `idle-alert-buttons` | Keep Watching / Pause / Package Now installed-app lane |
+
 ## When To Use
 - Before external tester rollout.
 - Before release readiness when recent PRs affect Figma, Adobe, PowerPoint, package output, provenance, parser behavior, privacy, or install flow.

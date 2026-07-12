@@ -41,7 +41,13 @@ This registry makes Crate workflows discoverable, pinned, and auditable. It is t
 | Crate Feature Inventory | `.codex/ops/crate-feature-inventory.json` and `crate-ops-plugin/skills/crate-feature-inventory/` | skill/tool | Audit product stories and evidence coverage | read-only | low | repo/external | Does not replace supported-app claims or manual QA matrix. |
 | Crate Architecture Health | `crate-ops-plugin/skills/crate-architecture-health/` | skill/tool | Complexity or change-amplification review | read-only | low | external | Metrics are triage signals; no automatic refactors. |
 | Crate Ops Hygiene | `.codex/tools/crate_doctor.py` and `crate-ops-plugin/skills/crate-ops-hygiene/` | skill/tool | Disk, cache, log, worktree, or temp growth | read-only | medium | Aggregate counts only; never delete or reveal private filenames. |
-| Crate X Research | `crate-ops-plugin/skills/crate-x-research/` | skill/tool | Pull and evaluate X bookmarks | read-only network | high | Read cap, Keychain token, owner-only cache, primary-source verification. |
+| Crate X Research | `crate-ops-plugin/skills/crate-x-research/` | skill/tool | Pull and evaluate X bookmarks | read-only network | high | external | Read cap, Keychain token, owner-only cache, primary-source verification. |
+| Crate Loop Catalog | `.codex/ops/crate-loop-catalog.json` and `crate-ops-plugin/scripts/audit_loop_catalog.py` | catalog/tool | Discover or audit recurring Crate loops | read-only | medium | repo/external | Discovery cannot execute, schedule, edit, or open PRs. |
+| Crate Instruction Audit | `crate-ops-plugin/skills/crate-instruction-audit/` | skill/tool | Review instruction duplication, staleness, or weight | proposal-only | medium | external | Never rewrites hard rules or authority automatically. |
+| Crate Context Pack | `crate-ops-plugin/scripts/create_context_pack.py` | tool | Prepare bounded source-linked context | read-only evidence | medium | external | Excludes raw transcripts and private/generated artifacts by default. |
+| Crate Visual Evidence Pack | `crate-ops-plugin/scripts/create_visual_evidence_pack.py` | tool | Index screenshots/appshots for QA proof | evidence | medium | external | Approved fixtures/public UI only; privacy and redaction status required. |
+| Crate Automation Hygiene | `.codex/ops/crate-automations.json` and `crate-ops-plugin/skills/crate-automation-hygiene/` | skill/tool | Review heartbeats, monitors, and schedules | read-only | high | repo/external | Live automation tool is authoritative; never disables or reschedules automatically. |
+| Crate Model And Cost Routing | `.codex/ops/crate-model-routing.md` and `crate-ops-plugin/skills/crate-model-cost-routing/` | skill | Choose advisory capability tier and budget | advisory | medium | repo/external | No automatic model/provider switch or paid usage; verify current claims. |
 
 ## Pinning Rules
 

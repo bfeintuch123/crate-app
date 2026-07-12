@@ -58,6 +58,7 @@ Forbidden and not done:
 | security | | |
 | provenance/package scope | | |
 | release/deploy/artifact | | |
+| visual evidence manifest | build/state/viewport/hash/declared privacy status | |
 
 ## Commands Run
 
@@ -124,3 +125,5 @@ Forbidden:
 - full Figma URLs or file keys
 - signed URLs
 - unrelated private/client paths
+
+For screenshot or appshot proof, store an ordered manifest with build, workflow, state, viewport, expected/observed result, content hash, declared privacy review, and redaction status. Manifest validation does not inspect image pixels or prove redaction; human/Computer Use review remains required. Use approved fixtures or public UI only. Committed proof should retain only the sanitized filename/hash unless Bryant approves otherwise.

@@ -47,6 +47,12 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Deploy get-crate.com / Cloudflare" | `.codex/playbooks/crate-cloudflare-deploy.md` | `SO-004`, `crate-doctor`, proof bundle | deploy only when explicitly approved |
 | "Run Crate doctor / preflight" | `.agents/skills/crate-doctor/SKILL.md` | `.codex/tools/crate_doctor.py` | read-only |
 | "Tighten Crate ops / workflow / loops" | `.codex/ops/crate-ops-improvement-plan.md` | standing orders, taskflows, memory model, proof bundles, registry | docs/ops-only unless approved |
+| "Discover useful loops / run patrol" | `.codex/ops/crate-loop-catalog.json` | Crate Ops `audit_loop_catalog.py`, loop retrospective, skill workshop | report-only |
+| "Audit or optimize our instructions" | Crate Ops `crate-instruction-audit` | simplify guardrails, skill workshop | proposal-only |
+| "Create a bounded context pack" | `.codex/ops/crate-memory-model.md` | Crate Ops `create_context_pack.py`, handoff | read-only |
+| "Build screenshot/appshot proof" | `.codex/ops/proof-bundle-template.md` | QA evidence normalizer, visual-evidence pack | evidence-only |
+| "Review automations / heartbeats" | `.codex/ops/crate-automations.json` | Crate Ops `crate-automation-hygiene` | report-only |
+| "Choose model tier / control usage" | `.codex/ops/crate-model-routing.md` | Crate Ops `crate-model-cost-routing` | advisory-only |
 
 ## Common Loop Modes
 
