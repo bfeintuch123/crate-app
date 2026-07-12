@@ -10,7 +10,7 @@
 - branches: `codex/chief-of-staff-attention-queue-catalog` and `codex/chief-of-staff-attention-queue`
 - bases: `origin/v2.4.x` and Crate Ops `origin/main`
 - mode: fix-and-PR
-- status: ready-for-pr
+- status: waiting-for-merge-approval
 
 ## Goal
 
@@ -31,9 +31,9 @@ Forbidden:
 
 ## State
 
-- current phase: coordinated PR publication and merge-readiness
-- last completed checkpoint: implementation, 83-test regression suite, strict schema probes, route-catalog audit, and independent product/security reviews completed with no P0/P1/P2 findings
-- next action: open the plugin PR first, then the dependent app catalog/docs PR, and run merge-readiness
+- current phase: merge approval
+- last completed checkpoint: Crate Ops PR #9 and dependent Crate app PR #126 are clean and mergeable; plugin CI passes
+- next action: after Bryant approval, merge Crate Ops PR #9 first and Crate app PR #126 second
 - blocker: none
 - approval state: Bryant approved item 1 implementation; merge requires separate approval
 
@@ -45,7 +45,7 @@ Forbidden:
 - [x] synthetic and adversarial verification
 - [x] independent review
 - [x] proof and state update
-- [ ] separate PRs and merge-readiness
+- [x] separate PRs and merge-readiness
 
 ## Evidence
 
@@ -56,6 +56,8 @@ Forbidden:
 - App loop catalog JSON, playbook existence, and diff checks passed.
 - Crate Doctor reported zero failures; environment warnings were pre-existing and outside this docs/plugin scope.
 - Independent product and security reviews reported no P0/P1/P2 blockers and recommended plugin-first coordinated PRs.
+- Crate Ops PR #9 targets `main`, is mergeable/clean, and its `validate` GitHub Actions check passes.
+- Crate app PR #126 targets `v2.4.x`, is mergeable/clean, and has no configured checks.
 
 ## Risks
 

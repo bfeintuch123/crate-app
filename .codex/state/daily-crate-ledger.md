@@ -1456,3 +1456,5 @@ Secondary:
 - Added dedicated attention, support/email, calendar, and business-operation routes under SO-011 through SO-014; existing engineering, QA, release, design, tester, and deploy loops remain owners of their current scopes.
 - Full verification: 83 plugin tests, both plugin validators, strict Ajv probes, plugin/app route-catalog consistency, standing-order contract audit, app JSON/diff checks, and Crate Doctor with zero failures.
 - Independent product and security rereviews found no P0/P1/P2 blockers and recommended coordinated PRs in plugin-first order.
+- Opened Crate Ops PR #9 and dependent Crate app PR #126. A Linux-only test-path failure on PR #9 was fixed by selecting the platform's real system temp directory; the full 83-test suite remained green locally and GitHub `validate` now passes.
+- Final merge-readiness: both PRs are clean and mergeable. Merge order is #9 then #126; stop before merge pending Bryant approval.

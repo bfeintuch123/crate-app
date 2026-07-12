@@ -12,7 +12,7 @@ Last updated: 2026-07-12
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops PRs #7 and #8 and Crate app PRs #124 and #125 are merged. Canonical tester-feedback JSON 1.0 is available before Olivia's first session. Chief-of-staff attention management is now the active ops-only improvement.
 - Active ops branches: `codex/chief-of-staff-attention-queue-catalog` and Crate Ops `codex/chief-of-staff-attention-queue`
-- Current ops work: the privacy-safe freshness-aware attention queue and bounded support, calendar, and business routes are implementation-complete and independently cleared for coordinated PRs. Existing engineering loops, taskflows, tester records, GitHub, decisions, and proof remain authoritative. No live queue, tester data, app/runtime, release, or site mutation is in scope.
+- Current ops work: Crate Ops PR #9 and dependent Crate app PR #126 contain the privacy-safe attention queue and bounded support, calendar, and business routes. Both are clean and mergeable; plugin CI passes. Merge #9 first and #126 second only after Bryant approval. No live queue, tester data, app/runtime, release, or site mutation is in scope.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 
