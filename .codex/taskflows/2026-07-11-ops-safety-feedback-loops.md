@@ -34,9 +34,9 @@ Forbidden:
 
 ## State
 
-- current phase: PR preparation
-- last completed checkpoint: both scoped branches passed validation and independent review
-- next action: commit, push, open separate PRs, and run merge-readiness checks
+- current phase: merge-ready review
+- last completed checkpoint: separate plugin/app PRs opened and passed merge-readiness review
+- next action: wait for Bryant's separate approval before merging PR #5 or PR #122
 - blocker: none
 - approval state: Bryant approved implementation; only PR #4 merge was preapproved
 
@@ -47,8 +47,8 @@ Forbidden:
 - [x] implementation or execution
 - [x] verification
 - [x] proof bundle
-- [ ] ledger/state update
-- [ ] handoff or next prompt
+- [x] ledger/state update
+- [x] handoff or next prompt
 
 ## Evidence
 
@@ -59,6 +59,8 @@ Forbidden:
 | 2026-07-11 | App ops validation | 12-feature evidence inventory, Crate Doctor, JSON, ignore and diff checks | pass with expected branch/auth warnings |
 | 2026-07-11 | Focused app regression suites | renderer/Figma, parser, privacy, lifecycle, provenance dual-write | 214 tests passed |
 | 2026-07-11 | Independent safety review | destructive-command hook and wrapper/environment bypass rereview | clean |
+| 2026-07-11 | Crate Ops PR | `https://github.com/bfeintuch123/crate-ops-plugin/pull/5` | mergeable; CI pass |
+| 2026-07-11 | Crate app ops PR | `https://github.com/bfeintuch123/crate-app/pull/122` | mergeable; no configured branch checks |
 
 ## Risks
 
@@ -71,5 +73,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Open separate plugin and app-ops PRs, run merge-readiness checks, and stop before merging either batch PR unless Bryant separately approves.
+PR #5 and PR #122 are merge-ready. Stop before merging either PR unless Bryant separately approves.
 ```
