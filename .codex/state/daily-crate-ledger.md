@@ -1458,3 +1458,14 @@ Secondary:
 - Independent product and security rereviews found no P0/P1/P2 blockers and recommended coordinated PRs in plugin-first order.
 - Opened Crate Ops PR #9 and dependent Crate app PR #126. A Linux-only test-path failure on PR #9 was fixed by selecting the platform's real system temp directory; the full 83-test suite remained green locally and GitHub `validate` now passes.
 - Final merge-readiness: both PRs are clean and mergeable. Merge order is #9 then #126; stop before merge pending Bryant approval.
+
+### 2026-07-12 Chief-Of-Staff Learning And Workflow Evaluations
+
+- Bryant approved and merged Crate Ops PR #9 as `9f8ceb3a16125e741cb81be158cf0095feb27cbc`, then dependent Crate app PR #126 as `a47b27643b80b8b4a7022b54c5b8793511afbd21`.
+- The next ops batch reuses SO-007 and the existing ops-improvement loop; it does not create another memory system, standing order, or top-level loop.
+- Implemented decision-backed explicit preference records with exact owner, subject, statement, content hash, review date, expiry, conflict, and supersession checks. Preferences remain advisory defaults and never grant action authority.
+- Implemented privacy-reviewed synthetic workflow evaluations pinned to deterministic routing contracts, plus stale-contract and mismatch failure probes.
+- Implemented private locally signed aggregate outcome receipts that require real bounded evidence files and retain only content-derived opaque hashes. Receipt identity, work identity, signatures, route fields, and evidence matching are fail closed.
+- Implemented advisory model/agent routing based on exact current eval and receipt evidence. It cannot switch models, create agents, begin paid usage, or bypass existing approval gates.
+- Validation: 103 plugin tests, both plugin validators, strict Draft 2020-12 schema validation with date formats, Python compilation, loop-catalog audit, JSON/diff checks, and Crate Doctor with zero failures.
+- Active branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app `codex/chief-of-staff-learning-evals-catalog`. Next gate is final independent rereview followed by plugin-first coordinated PRs; stop before merge without Bryant approval.

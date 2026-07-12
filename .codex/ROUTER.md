@@ -44,6 +44,8 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Create a handoff" | `.codex/playbooks/crate-handoff.md` | `.agents/skills/crate-handoff/SKILL.md` | read-only |
 | "Use external controls / spawn Crate side threads / coordinate agents" | `.codex/playbooks/crate-external-control-layer.md` | `.codex/playbooks/crate-handoff.md` when a portable handoff prompt is needed | source-of-truth thread coordinates; sidecars read-only by default |
 | "What needs my attention? / act as chief of staff / coordinate everything" | Crate Ops `crate-attention-queue` under `SO-011` | `crate-router`, then `crate-thread-chief` for bounded execution | freshness-aware control index; existing authority gates remain |
+| "Remember this preference / learn how Bryant or Jenna wants this handled" | `.codex/ops/crate-preferences.md` | Crate Ops `crate-preference-ledger` | explicit, source-linked, expiring; never inferred authority |
+| "Evaluate this workflow / prove the loop improved" | `.codex/playbooks/crate-workflow-evaluation.md` | Crate Ops `crate-workflow-evals`, outcome receipt, loop retrospective | synthetic and evidence-only |
 | "Handle Crate support/business email" | Crate Ops `crate-support-inbox` under `SO-012` | `.codex/playbooks/crate-chief-business-operations.md` | read/draft by default; exact send approval required |
 | "Coordinate a meeting or calendar event" | `crate-calendar-coordination` under `SO-013` | `.codex/playbooks/crate-chief-business-operations.md` | exact event and attendee approval required before mutation |
 | "Handle approved business operations" | `crate-business-operations` under `SO-014` | `.codex/playbooks/crate-chief-business-operations.md` | exact Bryant approval required for money, legal, remote, credential, or private-data actions |
@@ -56,7 +58,7 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Create a bounded context pack" | `.codex/ops/crate-memory-model.md` | Crate Ops `create_context_pack.py`, handoff | read-only |
 | "Build screenshot/appshot proof" | `.codex/ops/proof-bundle-template.md` | QA evidence normalizer, visual-evidence pack | evidence-only |
 | "Review automations / heartbeats" | `.codex/ops/crate-automations.json` | Crate Ops `crate-automation-hygiene` | report-only |
-| "Choose model tier / control usage" | `.codex/ops/crate-model-routing.md` | Crate Ops `crate-model-cost-routing` | advisory-only |
+| "Choose model tier / control usage" | `.codex/ops/crate-model-routing.md` | Crate Ops `crate-model-cost-routing`; current evals and outcome receipts when available | advisory-only |
 | "Review the app/site design quality" | Crate Ops `crate-design-review` | visual evidence, accessibility, supported-app claims | report/brief only |
 | "Record this recurring workflow" | Crate Ops `crate-workflow-recorder` | Record & Replay, then skill workshop | proposal-only |
 | "What are testers collectively telling us?" | Crate Ops `crate-tester-insights` | normalized feedback archive | read-only synthesis |

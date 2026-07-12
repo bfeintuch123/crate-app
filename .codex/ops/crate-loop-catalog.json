@@ -8,7 +8,7 @@
       "standing_order": "SO-002",
       "modes": ["triage", "fix", "verify", "handoff"],
       "stop_gates": ["approval required before code mutation unless the active mode already authorizes it", "stop before release or deploy"],
-      "evidence_outputs": ["bug classification", "focused test results", "PR or handoff"]
+      "evidence_outputs": ["bug classification", "focused test results", "PR or handoff", "outcome receipt"]
     },
     {
       "id": "pr-review-loop",
@@ -26,7 +26,7 @@
       "standing_order": "SO-003",
       "modes": ["read-only gate", "approved release execution"],
       "stop_gates": ["explicit version and release approval required", "site deploy requires separate approval"],
-      "evidence_outputs": ["release proof bundle", "artifact metadata", "QA prompt"]
+      "evidence_outputs": ["release proof bundle", "artifact metadata", "QA prompt", "outcome receipt"]
     },
     {
       "id": "site-deploy-loop",
@@ -35,7 +35,7 @@
       "standing_order": "SO-004",
       "modes": ["preflight", "approved deploy", "post-deploy check"],
       "stop_gates": ["target must be get-crate", "never print the Cloudflare token"],
-      "evidence_outputs": ["deployment URL", "live-site verification"]
+      "evidence_outputs": ["deployment URL", "live-site verification", "outcome receipt"]
     },
     {
       "id": "tester-feedback-loop",
@@ -62,16 +62,16 @@
       "standing_order": "SO-006",
       "modes": ["thread", "subagent", "handoff"],
       "stop_gates": ["one builder edits app code at a time", "do not delegate secrets or release mutation"],
-      "evidence_outputs": ["thread or agent ID", "integrated result", "state update"]
+      "evidence_outputs": ["thread or agent ID", "routing rationale", "integrated result", "outcome receipt", "state update"]
     },
     {
       "id": "ops-improvement-loop",
       "owner": "crate-skill-workshop",
       "playbook": ".codex/playbooks/crate-codex-loops.md",
       "standing_order": "SO-007",
-      "modes": ["research", "proposal", "prototype", "review"],
+      "modes": ["research", "proposal", "prototype", "evaluate", "review"],
       "stop_gates": ["external research is not proof", "do not install or merge without approval"],
-      "evidence_outputs": ["duplication assessment", "validation", "PR state"]
+      "evidence_outputs": ["duplication assessment", "synthetic workflow eval summary", "outcome receipt", "validation", "PR state"]
     },
     {
       "id": "design-review-loop",
@@ -134,7 +134,7 @@
       "standing_order": "SO-012",
       "modes": ["read", "triage", "draft", "approved-send"],
       "stop_gates": ["exact recipients and message authority required", "no raw private content in queue state", "stop before legal or credential changes"],
-      "evidence_outputs": ["mailbox scope", "message category", "draft or send result", "privacy outcome"]
+      "evidence_outputs": ["mailbox scope", "message category", "draft or send result", "privacy outcome", "outcome receipt"]
     },
     {
       "id": "calendar-coordination-loop",
@@ -143,7 +143,7 @@
       "standing_order": "SO-013",
       "modes": ["availability", "draft-event", "approved-create", "approved-update", "approved-delete"],
       "stop_gates": ["exact event and attendees required", "no unrelated calendar mutation", "no private calendar disclosure"],
-      "evidence_outputs": ["calendar scope", "event action", "attendee confirmation", "resulting event state"]
+      "evidence_outputs": ["calendar scope", "event action", "attendee confirmation", "resulting event state", "outcome receipt"]
     },
     {
       "id": "business-operations-loop",
@@ -152,7 +152,7 @@
       "standing_order": "SO-014",
       "modes": ["research", "approved-decision", "approved-remote-mutation", "approved-money", "approved-legal", "approved-private-access"],
       "stop_gates": ["exact Bryant authority required", "stop on ambiguous amount counterparty document target or scope", "engineering and release actions route elsewhere"],
-      "evidence_outputs": ["action class", "authority source", "bounded target", "external state result"]
+      "evidence_outputs": ["action class", "authority source", "bounded target", "external state result", "outcome receipt"]
     }
   ]
 }

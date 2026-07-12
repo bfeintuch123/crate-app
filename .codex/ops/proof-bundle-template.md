@@ -60,6 +60,23 @@ Forbidden and not done:
 | release/deploy/artifact | | |
 | visual evidence manifest | build/state/viewport/hash/declared privacy status | |
 
+## Outcome Receipt
+
+- receipt ID:
+- work reference:
+- intended action and authority reference:
+- routing decision:
+- aggregate attempts/retries/agents/tool-call band/approvals:
+- before/after state category:
+- observed outcome:
+- checks and opaque evidence references:
+- local receipt signature verified: yes | no | not-applicable
+- receipt evidence references derived from bounded canonical evidence files: yes | no | not-applicable
+- side effects and rollback status:
+- avoided work:
+- usage measurement: platform-reported | not-available | not-measured
+- privacy status: aggregate-only | sanitized
+
 ## Commands Run
 
 ```sh
