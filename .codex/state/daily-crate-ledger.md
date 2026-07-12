@@ -1413,4 +1413,5 @@ Secondary:
 - Duplication review selected extensions for feature coverage, loop discovery, handoff/context, QA visual evidence, architecture health, and ops hygiene; only instruction audit, automation hygiene, and model/cost routing are new skills.
 - Work remains ops-only and review-first. No app runtime, dependency, release, deploy, model switch, automation mutation, or paid API usage is authorized by this batch.
 - Validation passed after three adversarial hardening rounds: contained atomic report outputs, fail-closed credential/Figma/signed-URL filtering, repo-contained catalog evidence, no-write-on-invalid behavior, automation live-state distrust, and Git-history fail-closed reporting.
-- Proof: 14 plugin tests, plugin validators, Crate Doctor with zero failures, 12-feature/7-loop catalogs, 214 focused app tests, and two clean independent rereviews.
+- Proof: 13 plugin tests, plugin validators, Crate Doctor with zero failures, 12-feature/7-loop catalogs, 214 focused app tests, and two clean independent rereviews.
+- PRs: Crate Ops #6 and Crate app #123 are clean and mergeable; plugin CI passed after replacing a platform-dependent test assumption with portable collision coverage.

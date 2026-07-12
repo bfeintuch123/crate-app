@@ -12,7 +12,7 @@ Last updated: 2026-07-11
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batch 1-8 is merged; batch 9-16 is in scoped ops-only implementation with no app runtime or release mutation.
 - Active ops branches: `codex/ops-quality-catalogs` and Crate Ops `codex/ops-quality-intelligence`
-- Current ops work: coverage states, loop catalog/patrol discovery, instruction audit, bounded context packs, visual evidence manifests, richer architecture signals, automation hygiene, and advisory model/cost routing. Stop before merging new PRs without Bryant's separate approval.
+- Current ops work: coverage states, loop catalog/patrol discovery, instruction audit, bounded context packs, visual evidence manifests, richer architecture signals, automation hygiene, and advisory model/cost routing. Crate Ops PR #6 and Crate app PR #123 are merge-ready; stop before merging without Bryant's separate approval.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

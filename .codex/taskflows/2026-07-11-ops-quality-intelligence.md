@@ -23,9 +23,9 @@ Implement X-research batch 9-16 by extending existing Crate owners for feature c
 
 ## State
 
-- current phase: PR preparation
-- last completed checkpoint: implementation, adversarial hardening, and full validation passed
-- next action: commit, open separate PRs, and run merge-readiness review
+- current phase: merge-ready review
+- last completed checkpoint: PR #6 and PR #123 opened and passed merge-readiness review
+- next action: wait for Bryant's separate approval before merging either PR
 - blocker: none
 - approval state: Bryant approved moving to the next batch; new PR merges require separate approval
 
@@ -35,8 +35,8 @@ Implement X-research batch 9-16 by extending existing Crate owners for feature c
 - [x] duplication and source-evidence audit
 - [x] implementation
 - [x] validation and adversarial review
-- [ ] separate PRs and merge-readiness
-- [ ] proof/state closeout
+- [x] separate PRs and merge-readiness
+- [x] proof/state closeout
 
 ## Stop Condition
 
@@ -48,7 +48,7 @@ Stop before merging new PRs, changing app behavior, enabling automations, or inc
 | --- | --- |
 | duplication/source audit | existing owners extended; only three genuinely new skills |
 | plugin contract and official validator | pass |
-| plugin unit/adversarial tests | 14 pass |
+| plugin unit/adversarial tests | 13 pass |
 | safety hook tests | pass |
 | feature inventory | 12 features, 0 missing evidence procedures |
 | loop/automation/context/architecture tools | pass |
@@ -56,3 +56,5 @@ Stop before merging new PRs, changing app behavior, enabling automations, or inc
 | focused app regression suites | 214 pass, including 106 provenance dual-write tests |
 | independent ownership/security rereviews | clean |
 | scope | no app runtime, dependency, release, deploy, or paid API mutation |
+| Crate Ops PR | `https://github.com/bfeintuch123/crate-ops-plugin/pull/6`; clean, mergeable, CI pass |
+| Crate app ops PR | `https://github.com/bfeintuch123/crate-app/pull/123`; clean, mergeable, correct `v2.4.x` base |
