@@ -1425,3 +1425,4 @@ Secondary:
 - Next gate: validate, open separate PRs, run merge-readiness, and stop before merge without Bryant's separate approval.
 - Validation completed after adversarial hardening: target-specific launch assets, plain-text tester/launch evidence, symlink-safe report roots, canonical tester source IDs, real full-vs-production npm audit comparison, strict npm schema/count consistency, and escaped dependency output.
 - Proof: 31 plugin tests, both plugin validators, loop catalog validation, Crate Doctor with zero failures, 214 existing app tests, and clean independent security/ownership rereviews.
+- PRs: Crate Ops #7 and Crate app #124 are clean and mergeable; plugin CI passed. Merge order is plugin first, then app catalog. Stop before either merge without Bryant's separate approval.

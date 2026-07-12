@@ -23,9 +23,9 @@ Implement X-research batch 17-23 as non-duplicative, review-first capabilities f
 
 ## State
 
-- current phase: open separate PRs and run merge-readiness
-- last completed checkpoint: implementation, validation, and independent adversarial rereviews completed cleanly
-- next action: open separate PRs, run merge-readiness, then stop before merge
+- current phase: merge-ready review complete
+- last completed checkpoint: Crate Ops PR #7 and Crate app PR #124 are clean and mergeable; plugin CI passed
+- next action: wait for Bryant's separate approval before merging either PR; merge plugin PR #7 first
 - blocker: none
 - approval state: Bryant approved moving to the next batch; new PR merges require separate approval
 
@@ -35,7 +35,7 @@ Implement X-research batch 17-23 as non-duplicative, review-first capabilities f
 - [x] duplication and source-evidence audit
 - [x] implementation
 - [x] validation and adversarial review
-- [ ] separate PRs and merge-readiness
+- [x] separate PRs and merge-readiness
 - [x] proof/state closeout
 
 ## Stop Condition
@@ -54,3 +54,5 @@ Stop before merging new PRs, changing app or site behavior, recording a live wor
 | app regression baseline | 214 tests pass; one timing-sensitive Keynote case passed on isolated rerun |
 | independent security and ownership rereviews | clean |
 | app/runtime/dependency scope | no app runtime, renderer, parser, provenance, package, site, or dependency files changed |
+| Crate Ops PR | `https://github.com/bfeintuch123/crate-ops-plugin/pull/7`; clean, mergeable, CI pass |
+| Crate app ops PR | `https://github.com/bfeintuch123/crate-app/pull/124`; clean, mergeable, correct `v2.4.x` base |

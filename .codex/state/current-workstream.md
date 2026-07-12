@@ -12,7 +12,7 @@ Last updated: 2026-07-12
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batches 1-16 are merged; batch 17-23 is scoped to review-first design, workflow capture, tester learning, launch readiness, product metrics, dependency posture, and incident rehearsal with no app runtime or release mutation.
 - Active ops branches: `codex/ops-design-launch-catalogs` and Crate Ops `codex/ops-design-launch-readiness`
-- Current ops work: implement and validate batch 17-23, open separate app/plugin PRs, run merge-readiness, and stop before merge without Bryant's separate approval.
+- Current ops work: batch 17-23 is implemented and merge-ready in Crate Ops PR #7 and Crate app PR #124. Plugin CI and both mergeability gates pass; stop before merge without Bryant's separate approval and merge PR #7 first.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 
