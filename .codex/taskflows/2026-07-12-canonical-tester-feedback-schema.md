@@ -9,7 +9,7 @@
 - branches: `codex/tester-feedback-schema-catalog`, `codex/canonical-tester-feedback-schema`
 - bases: `origin/v2.4.x`, Crate Ops `origin/main`
 - mode: fix-and-PR
-- status: validated; PR preparation
+- status: PRs open; merge-readiness clean
 
 ## Goal
 
@@ -23,9 +23,9 @@ Create canonical, versioned, privacy-safe tester-feedback JSON before Olivia's f
 
 ## State
 
-- current phase: final review and separate PR preparation
-- last completed checkpoint: canonical schema, privacy controls, independent JSON Schema compile, adversarial validation, and loop ownership passed
-- next action: open plugin PR first, then dependent app catalog PR; run merge-readiness and stop before merge
+- current phase: awaiting Bryant merge approval
+- last completed checkpoint: plugin PR #8 and app PR #125 are mergeable; plugin CI passed and app docs checks passed
+- next action: merge plugin PR #8 first, then app PR #125 after Bryant approval
 - blocker: none
 - approval state: Bryant approved canonical schema work; new PR merges require separate approval
 
@@ -35,7 +35,7 @@ Create canonical, versioned, privacy-safe tester-feedback JSON before Olivia's f
 - [x] implementation
 - [x] synthetic and adversarial validation
 - [x] independent review
-- [ ] separate PRs and merge-readiness
+- [x] separate PRs and merge-readiness
 
 ## Merge Order
 
@@ -43,6 +43,9 @@ Create canonical, versioned, privacy-safe tester-feedback JSON before Olivia's f
 2. Crate app docs, standing order, router, and loop catalog that reference those plugin capabilities.
 
 The app catalog PR must not merge before the plugin PR is available.
+
+- Crate Ops PR: `https://github.com/bfeintuch123/crate-ops-plugin/pull/8`
+- Crate app PR: `https://github.com/bfeintuch123/crate-app/pull/125`
 
 ## Validation Evidence
 

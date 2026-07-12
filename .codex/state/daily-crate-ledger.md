@@ -1439,3 +1439,4 @@ Secondary:
 - Split loop ownership: private intake/evidence custody, canonicalization/privacy validation, downstream bug triage, and cross-tester synthesis. Cross-tester synthesis now requires at least two independent sources.
 - Validation proof: 47 plugin tests, both plugin validators, independent Ajv Draft 2020-12 compilation and privacy probes, Crate Doctor with zero failures, loop-catalog JSON validation, clean diffs, and independent security/product rereviews.
 - Merge dependency: plugin PR first, then app catalog PR. Stop before merge without Bryant's approval.
+- PRs opened and merge-readiness passed: Crate Ops PR #8 is mergeable with CI passing; Crate app PR #125 is mergeable with local docs/doctor validation passing and no configured PR checks.

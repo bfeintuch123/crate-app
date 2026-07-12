@@ -12,7 +12,7 @@ Last updated: 2026-07-12
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batches 1-16 are merged; batch 17-23 is scoped to review-first design, workflow capture, tester learning, launch readiness, product metrics, dependency posture, and incident rehearsal with no app runtime or release mutation.
 - Active ops branches: `codex/tester-feedback-schema-catalog` and Crate Ops `codex/canonical-tester-feedback-schema`
-- Current ops work: Crate Ops PR #7 and Crate app PR #124 are merged. Canonical tester-feedback JSON 1.0 is implemented and adversarially validated before Olivia's first session; separate plugin-first and app-catalog PRs are being prepared, with no real tester ingestion or app/runtime mutation.
+- Current ops work: Crate Ops PR #7 and Crate app PR #124 are merged. Canonical tester-feedback JSON 1.0 is implemented and adversarially validated before Olivia's first session. Crate Ops PR #8 and dependent Crate app PR #125 are mergeable; plugin CI passed. Merge plugin first, then app catalog after Bryant approval. No real tester ingestion or app/runtime mutation occurred.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 
