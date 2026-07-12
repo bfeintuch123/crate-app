@@ -1405,3 +1405,12 @@ Secondary:
 - Added defense-in-depth destructive-command and repo-boundary checks, safe worktree policy, reviewable skill proposals, loop retrospectives, feature inventory, architecture-health audit, and aggregate-only operational hygiene checks.
 - Validation passed: plugin validator, adversarial hook tests, Crate Doctor, 12-feature evidence inventory, diff/whitespace checks, independent safety rereview, and 214 focused app tests.
 - Next gate: open separate PRs and stop before merging either new PR without Bryant's separate approval.
+
+### 2026-07-11 Crate Ops Quality Intelligence
+
+- Crate Ops PR #5 merged as `3537c3b`; Crate app PR #122 merged as `3afc7e0`.
+- Bryant approved moving to X-research batch 9-16.
+- Duplication review selected extensions for feature coverage, loop discovery, handoff/context, QA visual evidence, architecture health, and ops hygiene; only instruction audit, automation hygiene, and model/cost routing are new skills.
+- Work remains ops-only and review-first. No app runtime, dependency, release, deploy, model switch, automation mutation, or paid API usage is authorized by this batch.
+- Validation passed after three adversarial hardening rounds: contained atomic report outputs, fail-closed credential/Figma/signed-URL filtering, repo-contained catalog evidence, no-write-on-invalid behavior, automation live-state distrust, and Git-history fail-closed reporting.
+- Proof: 14 plugin tests, plugin validators, Crate Doctor with zero failures, 12-feature/7-loop catalogs, 214 focused app tests, and two clean independent rereviews.

@@ -19,6 +19,10 @@ This index gives Crate docs lightweight routing metadata so Codex can select the
 | `.codex/ops/proof-bundle-template.md` | Evidence closeout template for loops and releases. | Finishing a major loop, QA, release, deploy, or review. |
 | `.codex/ops/tester-feedback-archive.md` | Tester feedback schema and routing. | Bryant provides tester/support/Jenna feedback. |
 | `.codex/ops/skill-registry.md` | Registry for Crate playbooks, skills, tools, pins, and security notes. | Adding or selecting skills/tools/playbooks. |
+| `.codex/ops/crate-feature-inventory.json` | Canonical feature, risk, coverage-state, suite, manual-lane, and proof catalog. | Auditing product/test coverage. |
+| `.codex/ops/crate-loop-catalog.json` | Review-first inventory of Crate loops, owners, modes, stop gates, and evidence. | Discovering or auditing recurring loops. |
+| `.codex/ops/crate-automations.json` | Privacy-safe automation metadata; live automation tool remains authoritative. | Reviewing heartbeats, monitors, or scheduled work. |
+| `.codex/ops/crate-model-routing.md` | Advisory capability tiers, escalation signals, and usage controls. | Selecting a model tier or cost/context budget. |
 | `.codex/playbooks/crate-codex-loops.md` | Autonomous loop modes, stop gates, and loop lifecycle. | Bryant asks for an autonomous loop or failure loop. |
 | `.codex/playbooks/crate-runner-loop.md` | Runner tiers, command suites, and evidence format. | Work needs command-backed proof. |
 | `.codex/playbooks/crate-external-control-layer.md` | Native/thread bridge/subagent coordination. | Codex should spawn/message side threads or agents. |
