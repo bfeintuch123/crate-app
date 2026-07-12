@@ -40,6 +40,10 @@ Capture enough context to interpret the report without collecting unnecessary pe
 - whether the tester was supervised live, self-guided, or reviewing a prepared scenario
 - whether artifacts are synthetic, cleared client work, or private work that must not be shared further
 
+Profile and recruiting context belongs in the approved private intake system. Do not copy names, emails, profile/portfolio links, demographics, or raw project details into canonical tester-feedback JSON. Canonical findings use only pseudonymous `source_id` and `session_id` values.
+
+Generate those IDs with Crate Ops `create_tester_feedback_ids.py`, keep the source-to-tester mapping private, and reuse a tester's source ID in later sessions. Use a session-level collection date rather than an exact interview timestamp. Before canonical validation, Bryant, Jenna, or both must confirm the record contains no identity, filename, path, URL, private asset, or recruiting detail and populate the required privacy-review owner and date fields.
+
 ## Creative Stack Capture
 Capture the tester's normal creative stack and which pieces were active during the session:
 
@@ -281,6 +285,8 @@ Use this template for each session:
 - Follow-up questions:
 - Suggested next playbook:
 ```
+
+After reviewing this human-facing intake, convert each distinct finding into one schema-valid JSON record using Crate Ops `schemas/crate-tester-feedback-record.schema.json`. Do not treat the Markdown intake itself as canonical structured evidence. Intake and private evidence custody remain owned by `tester-feedback-loop`; sanitized conversion and validation are owned by `tester-canonicalization-loop`; confirmed bugs continue to QA synthesis and bug triage.
 
 ## Files Codex May Read
 - `AGENTS.md`

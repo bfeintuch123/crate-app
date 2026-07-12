@@ -142,7 +142,7 @@ State files:
 
 ## SO-005: Tester Feedback Intake
 
-Authority: convert tester feedback into structured, privacy-safe work items.
+Authority: intake tester feedback, keep private evidence under controlled custody, and convert distinct findings into canonical privacy-safe records before downstream triage.
 
 Trigger:
 - Bryant provides tester portal results
@@ -152,6 +152,10 @@ Trigger:
 Allowed actions:
 - summarize feedback
 - redact sensitive artifacts
+- generate or reuse pseudonymous source IDs from the private tester mapping
+- normalize one finding per canonical JSON record
+- perform and record the required human privacy review
+- validate canonical tester-feedback JSON without printing record content
 - classify as UX, onboarding, packaging, permissions, Figma, quota, support, or billing
 - create issue/bug prompt or UX backlog entry
 
@@ -161,7 +165,8 @@ Approval gates:
 - stop before app code changes unless Bryant routes to a failure loop
 
 Proof required:
-- triage schema fields
+- canonical schema validation summary
+- human privacy review owner and date
 - severity
 - evidence available
 - recommended next route

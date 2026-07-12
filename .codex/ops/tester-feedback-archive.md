@@ -20,55 +20,28 @@ Temporary/private raw artifacts:
 
 Do not commit raw screenshots, recordings, diagnostics, private package outputs, or private tester assets unless Bryant explicitly approves a sanitized artifact.
 
-## Triage Schema
+## Canonical Finding Schema
 
-```markdown
-# Tester Feedback: <short title>
-
-## Metadata
-
-- id:
-- date received:
-- source: tester portal | support mailbox | Jenna QA | Bryant note
-- app version:
-- macOS version:
-- tester persona:
-- workflow:
-- severity: blocker | high | medium | low | polish
-- classification: UX | onboarding | packaging | permissions | Figma | quota | support | billing | docs | unknown
-
-## Report
-
-- expected:
-- actual:
-- steps:
-- files/apps involved:
-- package output present:
-- screenshots/video present:
-- diagnostics present:
-- privacy review:
-
-## Evidence
-
-- approved artifacts:
-- redacted artifacts:
-- unavailable evidence:
-
-## Decision
-
-- likely app bug:
-- likely setup issue:
-- likely product/design issue:
-- route:
-- owner:
-- next playbook:
-
-## Follow-Up Prompt
+Canonical normalized findings use Crate Ops schema version `1.0`:
 
 ```text
-...
+crate-ops-plugin/schemas/crate-tester-feedback-record.schema.json
+crate-ops-plugin/schemas/crate-tester-feedback-collection.schema.json
 ```
+
+Use one JSON record per finding. Several findings from one session share a pseudonymous `source_id` and `session_id`, so one tester is counted as one independent source.
+
+Generate IDs with Crate Ops `create_tester_feedback_ids.py`; never derive them from a tester name, email, portal ID, or portfolio. Store the source-to-tester mapping only in the approved private intake system, and reuse the same source ID for later sessions with that tester. Use the session-level `collected_on` date rather than the exact interview time. Every canonical record requires `privacy_review_owner` and `privacy_reviewed_on`, completed by Bryant, Jenna, or both before validation.
+
+Canonical severity values are `critical`, `high`, `medium`, and `low`; map human intake `blocker` to `critical` and `polish` to `low`.
+
+After human privacy review, validate records before archive or synthesis:
+
+```sh
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/scripts/validate_tester_feedback.py /path/to/tester-feedback.json
 ```
+
+Names, emails, profiles, portfolios, demographics, recruiting notes, raw paths, URLs, screenshots, recordings, and private assets stay outside canonical JSON. A controlled product-use `tester_segment`, such as `graphic-design-power-user`, is allowed because it measures target workflow fit rather than personal identity. Operational tester context may remain in the approved private intake system when needed.
 
 ## Routing
 
@@ -91,10 +64,9 @@ Do not store:
 
 Store:
 
-- sanitized summaries
-- app version
-- workflow attempted
-- approved fixture names
-- observed UI copy
-- package file counts
-- pass/fail classifications
+- schema-valid sanitized finding records
+- pseudonymous source and session IDs
+- Crate build version
+- workflow and optional canonical feature ID
+- theme, finding type, severity, reproducibility, status, and next route
+- opaque evidence IDs for separately governed approved evidence
