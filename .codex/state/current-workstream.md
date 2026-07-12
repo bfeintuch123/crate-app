@@ -1,6 +1,6 @@
 # Crate Current Workstream
 
-Last updated: 2026-07-02
+Last updated: 2026-07-11
 
 ## Current Status
 
@@ -10,9 +10,9 @@ Last updated: 2026-07-02
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: `v3.0.0-beta.1` is built, signed, notarized, stapled, tagged, pushed, published as a GitHub prerelease, and live on `get-crate.com` from the qa51 validated baseline. Next work is tester outreach/readiness and eventual site/payment rebuild planning.
-- Active ops branch: `codex/crate-ops-loop-hardening`
-- Current ops work: Bryant approved adopting and formalizing the full Crate ops layer: standing orders, taskflows, memory tiers, proof bundles, skill/playbook registry, doctor preflight, Cloudflare deploy playbook/skill, docs routing metadata, local-first tester archive, tester triage schema, and loop integration. PR #121 is open for this work.
+- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batch 1-8 is implemented and validated in isolated app/plugin branches, with no app runtime or release mutation.
+- Active ops branches: `codex/ops-repo-safety-inventory` and Crate Ops `codex/ops-safety-feedback-loops`
+- Current ops work: destructive-command guard, safe worktree policy, reviewable skill workshop, loop retrospectives, canonical feature inventory, architecture-health audit, operational hygiene, and the merged private X research inbox. Crate Ops PR #5 and Crate app PR #122 are merge-ready; stop before merging them without Bryant's separate approval.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

@@ -1,0 +1,4 @@
+# Crate intentionally copies no ignored files into managed worktrees.
+# Never add .env, credentials, tokens, private tester assets, package outputs,
+# diagnostics, X research, signing files, or release secrets here.
+# Tracked AGENTS.md, playbooks, fixtures, and tests already arrive via Git.

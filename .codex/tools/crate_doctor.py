@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ROOT = Path("/Users/bryantfeintuchclaw/Projects")
+ROOT = Path(os.environ.get("CRATE_REPO", "/Users/bryantfeintuchclaw/Projects")).expanduser().resolve()
 EXPECTED_REMOTE = "bfeintuch123/crate-app"
 EXPECTED_BRANCH = "v2.4.x"
 KEYCHAIN_SERVICE = "crate-cloudflare-api-token"
+MIB = 1024 * 1024
 
 
 @dataclass
@@ -56,6 +57,40 @@ def fail(name: str, detail: str) -> Check:
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
+
+
+def human_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < MIB:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / MIB:.1f} MiB"
+
+
+def directory_summary(path: Path) -> tuple[int, int, int]:
+    """Return aggregate file count and bytes without exposing private names."""
+    count = 0
+    size = 0
+    errors = 0
+    if not path.exists():
+        return count, size, errors
+
+    def onerror(_error: OSError) -> None:
+        nonlocal errors
+        errors += 1
+
+    for current, directories, files in os.walk(path, followlinks=False, onerror=onerror):
+        directories[:] = [name for name in directories if not (Path(current) / name).is_symlink()]
+        for name in files:
+            candidate = Path(current) / name
+            try:
+                if candidate.is_symlink():
+                    continue
+                size += candidate.stat().st_size
+                count += 1
+            except OSError:
+                errors += 1
+    return count, size, errors
 
 
 def check_repo() -> list[Check]:
@@ -153,8 +188,86 @@ def check_auth() -> list[Check]:
     return checks
 
 
+def check_hygiene() -> list[Check]:
+    checks: list[Check] = []
+    thresholds = {
+        "research": (ROOT / ".codex" / "research", 25 * MIB),
+        "outputs": (ROOT / "outputs", 500 * MIB),
+        "proof_bundles": (ROOT / ".codex" / "proof-bundles", 50 * MIB),
+        "codex_logs": (Path.home() / ".codex" / "logs", 500 * MIB),
+        "codex_worktrees": (Path.home() / ".codex" / "worktrees", 2 * 1024 * MIB),
+    }
+    for label, (path, threshold) in thresholds.items():
+        count, size, errors = directory_summary(path)
+        detail = f"{count} files, {human_size(size)}"
+        if errors:
+            checks.append(warn(f"hygiene.{label}", f"{detail}; {errors} unreadable entries, result incomplete"))
+        elif size > threshold:
+            checks.append(warn(f"hygiene.{label}", f"{detail}; review before cleanup"))
+        else:
+            checks.append(ok(f"hygiene.{label}", detail))
+
+    worktrees = run(["git", "worktree", "list", "--porcelain"])
+    worktree_count = sum(1 for line in worktrees.stdout.splitlines() if line.startswith("worktree "))
+    if worktree_count > 12:
+        checks.append(warn("hygiene.worktrees", f"{worktree_count} registered worktrees; review stale entries"))
+    else:
+        checks.append(ok("hygiene.worktrees", f"{worktree_count} registered worktrees"))
+
+    temp_count = 0
+    temp_size = 0
+    for candidate in Path("/private/tmp").glob("crate-*"):
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        count, size, errors = directory_summary(candidate)
+        temp_count += 1
+        temp_size += size
+        if errors:
+            checks.append(warn("hygiene.temp_workspaces_access", "one or more temporary workspace entries were unreadable"))
+    temp_detail = f"{temp_count} directories, {human_size(temp_size)} aggregate"
+    if temp_count > 20 or temp_size > 2 * 1024 * MIB:
+        checks.append(warn("hygiene.temp_workspaces", f"{temp_detail}; review before cleanup"))
+    else:
+        checks.append(ok("hygiene.temp_workspaces", temp_detail))
+
+    include = ROOT / ".worktreeinclude"
+    if not include.exists():
+        checks.append(warn("hygiene.worktreeinclude", "missing explicit managed-worktree policy"))
+    else:
+        entries = [
+            line.strip()
+            for line in include.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        sensitive_terms = (
+            ".env",
+            "secret",
+            "token",
+            "credential",
+            "diagnostic",
+            "research",
+            "tester",
+            "package",
+            "signing",
+            "certificate",
+            "provision",
+            "private",
+            ".pem",
+            ".p12",
+            ".key",
+            ".npmrc",
+            ".mobileprovision",
+        )
+        sensitive = [entry for entry in entries if any(word in entry.lower() for word in sensitive_terms)]
+        if sensitive:
+            checks.append(fail("hygiene.worktreeinclude", "contains a sensitive-file pattern"))
+        else:
+            checks.append(ok("hygiene.worktreeinclude", f"{len(entries)} approved ignored-file patterns; no sensitive patterns"))
+    return checks
+
+
 def main() -> int:
-    checks = check_repo() + check_tools() + check_auth()
+    checks = check_repo() + check_tools() + check_auth() + check_hygiene()
     failures = [check for check in checks if check.status == "fail"]
     warnings = [check for check in checks if check.status == "warn"]
 
