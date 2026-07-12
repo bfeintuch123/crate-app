@@ -12,7 +12,7 @@ Last updated: 2026-07-12
 - Latest public-stable release: not updated in this workstream
 - Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops PR #9 and Crate app PR #126 are merged. The privacy-safe attention queue and bounded support, calendar, and business routes are canonical. Chief-of-staff learning and workflow evaluation are the active ops-only improvement.
 - Active ops branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app catalog `codex/chief-of-staff-learning-evals-catalog`
-- Current ops work: explicit decision-backed preferences, pinned synthetic workflow evaluations, evidence-bound locally signed aggregate outcome receipts, and advisory model/agent routing. Full local validation passes; coordinated PRs are the next gate. No live inbox/calendar/tester data, app runtime, release, deploy, model switching, paid usage, or automatic agent creation is in scope.
+- Current ops work: explicit decision-backed preferences, pinned synthetic workflow evaluations, evidence-bound locally signed aggregate outcome receipts, and advisory model/agent routing. Crate Ops PR #10 and dependent Crate app PR #127 are clean and mergeable; plugin CI and the 103-test local suite pass. Merge #10 before #127 only after Bryant approval. No live inbox/calendar/tester data, app runtime, release, deploy, model switching, paid usage, or automatic agent creation is in scope.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

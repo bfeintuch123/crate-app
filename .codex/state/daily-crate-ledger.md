@@ -1468,4 +1468,6 @@ Secondary:
 - Implemented private locally signed aggregate outcome receipts that require real bounded evidence files and retain only content-derived opaque hashes. Receipt identity, work identity, signatures, route fields, and evidence matching are fail closed.
 - Implemented advisory model/agent routing based on exact current eval and receipt evidence. It cannot switch models, create agents, begin paid usage, or bypass existing approval gates.
 - Validation: 103 plugin tests, both plugin validators, strict Draft 2020-12 schema validation with date formats, Python compilation, loop-catalog audit, JSON/diff checks, and Crate Doctor with zero failures.
-- Active branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app `codex/chief-of-staff-learning-evals-catalog`. Next gate is final independent rereview followed by plugin-first coordinated PRs; stop before merge without Bryant approval.
+- Active branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app `codex/chief-of-staff-learning-evals-catalog`.
+- Independent product and security rereviews found no P0/P1/P2 blockers. The only residual P3 limits are that evidence hashes do not prove every semantic claim and repo decision provenance is not cryptographic identity; both remain non-authoritative and advisory.
+- Coordinated PRs: Crate Ops #10 and dependent Crate app #127 are clean and mergeable; plugin CI passes. Merge #10 before #127 only after Bryant approval.

@@ -10,7 +10,7 @@
 - branches: `codex/chief-of-staff-learning-evals`, `codex/chief-of-staff-learning-evals-catalog`
 - bases: `main`, `v2.4.x`
 - mode: implementation, validation, PR; no merge without separate approval
-- status: ready for coordinated PR review
+- status: merge-ready pending Bryant approval
 
 ## Goal
 
@@ -31,9 +31,9 @@ Forbidden:
 
 ## State
 
-- current phase: final independent review and coordinated PR preparation
-- last completed checkpoint: implementation, 103-test validation, strict schema validation, loop-catalog audit, and Crate Doctor
-- next action: resolve final rereview findings, open plugin-first coordinated PRs, and stop before merge
+- current phase: coordinated PR merge-readiness complete
+- last completed checkpoint: Crate Ops PR #10 and Crate app PR #127 are clean and mergeable; plugin CI passes
+- next action: obtain Bryant approval, then merge plugin PR #10 before dependent app PR #127
 - blocker: none
 - approval state: Bryant approved implementation; new PR merge requires separate approval
 - preferences applied: current Codex task remains chief of staff; explicit preferences only
@@ -49,7 +49,7 @@ Forbidden:
 - [x] verification
 - [x] proof bundle / outcome-receipt mechanism validated
 - [x] ledger/state update
-- [ ] coordinated PRs and handoff
+- [x] coordinated PRs and handoff
 
 ## Risks
 
@@ -60,4 +60,4 @@ Forbidden:
 
 ## Handoff
 
-Next exact action: complete independent rereview, open plugin-first coordinated PRs, run merge-readiness, and stop before merge pending Bryant approval.
+Next exact action: after Bryant approval, merge `bfeintuch123/crate-ops-plugin#10` first, then merge `bfeintuch123/crate-app#127`; do not start release, deploy, dependency, app-runtime, model-switch, or paid-usage work.
