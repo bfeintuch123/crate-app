@@ -35,6 +35,13 @@ This registry makes Crate workflows discoverable, pinned, and auditable. It is t
 | Memory Model | `.codex/ops/crate-memory-model.md` | playbook | Context load, handoff, vault, source-of-truth work | state | medium | repo | Action-sensitive memory must include scope and source. |
 | Proof Bundle Template | `.codex/ops/proof-bundle-template.md` | playbook | Closeout for major Crate work | evidence | medium | repo | Privacy filters required. |
 | Tester Feedback Archive | `.codex/ops/tester-feedback-archive.md` | playbook | Paid tester/support/Jenna feedback intake | triage | medium | repo | Raw tester artifacts are private by default. |
+| Crate Safety Guard | `crate-ops-plugin/hooks/` and `crate-safety-guard` | hook/skill | Destructive command or repo-boundary edit | guardrail | high | external | Partial tool coverage; keep sandbox/approvals; trust hook changes explicitly. |
+| Crate Skill Workshop | `crate-ops-plugin/skills/crate-skill-workshop/` | skill | Repeated work may deserve a skill | proposal-only | medium | external | Must check this registry and cannot install without approval. |
+| Crate Loop Retrospective | `crate-ops-plugin/skills/crate-loop-retrospective/` | skill | Completed loop should improve its next run | evidence | low | external | Optional proof/taskflow attachment; no silent policy changes. |
+| Crate Feature Inventory | `.codex/ops/crate-feature-inventory.json` and `crate-ops-plugin/skills/crate-feature-inventory/` | skill/tool | Audit product stories and evidence coverage | read-only | low | repo/external | Does not replace supported-app claims or manual QA matrix. |
+| Crate Architecture Health | `crate-ops-plugin/skills/crate-architecture-health/` | skill/tool | Complexity or change-amplification review | read-only | low | external | Metrics are triage signals; no automatic refactors. |
+| Crate Ops Hygiene | `.codex/tools/crate_doctor.py` and `crate-ops-plugin/skills/crate-ops-hygiene/` | skill/tool | Disk, cache, log, worktree, or temp growth | read-only | medium | Aggregate counts only; never delete or reveal private filenames. |
+| Crate X Research | `crate-ops-plugin/skills/crate-x-research/` | skill/tool | Pull and evaluate X bookmarks | read-only network | high | Read cap, Keychain token, owner-only cache, primary-source verification. |
 
 ## Pinning Rules
 

@@ -196,3 +196,34 @@ Proof required:
 State files:
 - `.codex/state/daily-crate-ledger.md`
 - active taskflow
+
+## SO-007: Crate Ops Improvement Proposal
+
+Authority: inspect, prototype, and propose Crate operational workflow improvements within Bryant's approved scope.
+
+Trigger:
+- Bryant approves an ops/workflow improvement batch
+- a loop retrospective identifies repeated friction
+- X or external research identifies a potentially useful workflow
+
+Allowed actions:
+- compare proposals against the skill registry and existing playbooks
+- create reviewable skill proposals, hooks, scripts, tests, inventory updates, and doctor checks on scoped branches
+- run read-only validation and open PRs when the active mode permits it
+
+Approval gates:
+- stop before enabling or trusting a changed hook unless Bryant approved that rollout
+- stop before app runtime changes, dependency mutation, merge, release, deploy, credentials, or private artifacts unless separately approved
+- external research is inspiration only until primary-source or reproducible validation passes
+
+Proof required:
+- duplication assessment
+- files and ownership boundaries
+- validation and adversarial review
+- privacy/security impact
+- PR and merge state
+
+State files:
+- active taskflow
+- `.codex/state/daily-crate-ledger.md`
+- `.codex/state/current-workstream.md` when the durable next action changes

@@ -1397,3 +1397,11 @@ Secondary:
   - Cloudflare API token was exposed in a Terminal screenshot/transcript while enabling deploy access.
   - Rotate the exposed token in Cloudflare.
   - Going forward, use a secure Codex-accessible deployment path rather than relying on manual Terminal exports.
+
+### 2026-07-11 Crate Ops Safety And Feedback Loops
+
+- Crate Ops PR #4 merged after privacy hardening as `89aa76b`.
+- Batch 1-8 was implemented on isolated app and plugin branches without changing app runtime, dependencies, package behavior, parsers, provenance, release, or site state.
+- Added defense-in-depth destructive-command and repo-boundary checks, safe worktree policy, reviewable skill proposals, loop retrospectives, feature inventory, architecture-health audit, and aggregate-only operational hygiene checks.
+- Validation passed: plugin validator, adversarial hook tests, Crate Doctor, 12-feature evidence inventory, diff/whitespace checks, independent safety rereview, and 214 focused app tests.
+- Next gate: open separate PRs and stop before merging either new PR without Bryant's separate approval.
