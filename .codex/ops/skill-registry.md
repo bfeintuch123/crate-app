@@ -48,6 +48,13 @@ This registry makes Crate workflows discoverable, pinned, and auditable. It is t
 | Crate Visual Evidence Pack | `crate-ops-plugin/scripts/create_visual_evidence_pack.py` | tool | Index screenshots/appshots for QA proof | evidence | medium | external | Approved fixtures/public UI only; privacy and redaction status required. |
 | Crate Automation Hygiene | `.codex/ops/crate-automations.json` and `crate-ops-plugin/skills/crate-automation-hygiene/` | skill/tool | Review heartbeats, monitors, and schedules | read-only | high | repo/external | Live automation tool is authoritative; never disables or reschedules automatically. |
 | Crate Model And Cost Routing | `.codex/ops/crate-model-routing.md` and `crate-ops-plugin/skills/crate-model-cost-routing/` | skill | Choose advisory capability tier and budget | advisory | medium | repo/external | No automatic model/provider switch or paid usage; verify current claims. |
+| Crate Design Review | `crate-ops-plugin/skills/crate-design-review/` | skill | Review design quality, fidelity, responsive behavior, or implementation scope | report-only | medium | external | Approved/public UI evidence only; no silent Figma or code mutation. |
+| Crate Workflow Recorder | `crate-ops-plugin/skills/crate-workflow-recorder/` | skill | Record a recurring Crate operations workflow | proposal-only | high | external | Raw event streams are private; exclude credentials, payments, signing, and client files. |
+| Crate Tester Insights | `crate-ops-plugin/skills/crate-tester-insights/` | skill/tool | Learn across multiple normalized tester records | read-only | medium | external | No identities, protected-trait inference, rankings, or raw tester assets. |
+| Crate Launch Readiness | `crate-ops-plugin/skills/crate-launch-readiness/` | skill/tool | Audit customer journey and public launch assets before `crate-ship` | evidence-only | high | external | Does not own go/no-go and cannot authorize build, release, deploy, billing, or legal publication. |
+| Crate Product Metrics | `crate-ops-plugin/skills/crate-product-metrics/` | skill | Define a privacy-first beta/public measurement plan | plan-only | high | external | No analytics implementation or private/local identifiers without separate approval. |
+| Crate Dependency Watch | `crate-ops-plugin/skills/crate-dependency-watch/` | skill/tool | Triage saved audit/outdated evidence | read-only | high | Never installs, updates, fixes, dedupes, or mutates lockfiles. |
+| Crate Launch Incident Rehearsal | `crate-ops-plugin/skills/crate-launch-incident-rehearsal/` | skill | Rehearse public-launch failure and rollback paths | tabletop-only | high | No live release, deploy, DNS, mailbox, credential, or customer-message mutation. |
 
 ## Pinning Rules
 

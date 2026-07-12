@@ -53,6 +53,13 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Build screenshot/appshot proof" | `.codex/ops/proof-bundle-template.md` | QA evidence normalizer, visual-evidence pack | evidence-only |
 | "Review automations / heartbeats" | `.codex/ops/crate-automations.json` | Crate Ops `crate-automation-hygiene` | report-only |
 | "Choose model tier / control usage" | `.codex/ops/crate-model-routing.md` | Crate Ops `crate-model-cost-routing` | advisory-only |
+| "Review the app/site design quality" | Crate Ops `crate-design-review` | visual evidence, accessibility, supported-app claims | report/brief only |
+| "Record this recurring workflow" | Crate Ops `crate-workflow-recorder` | Record & Replay, then skill workshop | proposal-only |
+| "What are testers collectively telling us?" | Crate Ops `crate-tester-insights` | normalized feedback archive | read-only synthesis |
+| "Are we ready for public launch?" | Crate Ops `crate-launch-readiness` | customer journey and public assets, then `crate-ship` | evidence-only |
+| "Define beta or launch metrics" | Crate Ops `crate-product-metrics` | memory/decision model | plan-only |
+| "Review dependency risk" | Crate Ops `crate-dependency-watch` | security scan and release diff when relevant | read-only |
+| "Rehearse a launch incident" | Crate Ops `crate-launch-incident-rehearsal` | release, post-deploy, and support playbooks | tabletop-only |
 
 ## Common Loop Modes
 

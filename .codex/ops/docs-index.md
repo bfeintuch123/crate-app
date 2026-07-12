@@ -23,6 +23,7 @@ This index gives Crate docs lightweight routing metadata so Codex can select the
 | `.codex/ops/crate-loop-catalog.json` | Review-first inventory of Crate loops, owners, modes, stop gates, and evidence. | Discovering or auditing recurring loops. |
 | `.codex/ops/crate-automations.json` | Privacy-safe automation metadata; live automation tool remains authoritative. | Reviewing heartbeats, monitors, or scheduled work. |
 | `.codex/ops/crate-model-routing.md` | Advisory capability tiers, escalation signals, and usage controls. | Selecting a model tier or cost/context budget. |
+| `.codex/taskflows/2026-07-12-ops-design-launch-readiness.md` | Batch 17-23 design, workflow capture, tester learning, launch, metrics, dependency, and incident-rehearsal scope. | Reviewing or resuming the third X-research implementation batch. |
 | `.codex/playbooks/crate-codex-loops.md` | Autonomous loop modes, stop gates, and loop lifecycle. | Bryant asks for an autonomous loop or failure loop. |
 | `.codex/playbooks/crate-runner-loop.md` | Runner tiers, command suites, and evidence format. | Work needs command-backed proof. |
 | `.codex/playbooks/crate-external-control-layer.md` | Native/thread bridge/subagent coordination. | Codex should spawn/message side threads or agents. |
