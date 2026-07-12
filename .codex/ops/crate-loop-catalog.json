@@ -117,6 +117,42 @@
       "modes": ["collect read-only reports", "classify", "recommend"],
       "stop_gates": ["do not install, update, fix, dedupe, or mutate lockfiles", "network collection requires approval"],
       "evidence_outputs": ["runtime findings", "development findings", "upgrade proposal or monitor recommendation"]
+    },
+    {
+      "id": "chief-of-staff-attention-loop",
+      "owner": "crate-attention-queue",
+      "playbook": ".codex/playbooks/crate-attention-queue.md",
+      "standing_order": "SO-011",
+      "modes": ["collect", "triage", "route", "supervise", "integrate", "archive"],
+      "stop_gates": ["queue placement grants no authority", "live snapshots stay private and uncommitted", "stale or partial source state remains visible", "consequential actions require existing authority"],
+      "evidence_outputs": ["source refresh coverage", "four-bucket queue counts", "routes and owners", "integrated evidence", "next refresh trigger"]
+    },
+    {
+      "id": "support-business-communications-loop",
+      "owner": "crate-support-inbox",
+      "playbook": ".codex/playbooks/crate-chief-business-operations.md",
+      "standing_order": "SO-012",
+      "modes": ["read", "triage", "draft", "approved-send"],
+      "stop_gates": ["exact recipients and message authority required", "no raw private content in queue state", "stop before legal or credential changes"],
+      "evidence_outputs": ["mailbox scope", "message category", "draft or send result", "privacy outcome"]
+    },
+    {
+      "id": "calendar-coordination-loop",
+      "owner": "crate-calendar-coordination",
+      "playbook": ".codex/playbooks/crate-chief-business-operations.md",
+      "standing_order": "SO-013",
+      "modes": ["availability", "draft-event", "approved-create", "approved-update", "approved-delete"],
+      "stop_gates": ["exact event and attendees required", "no unrelated calendar mutation", "no private calendar disclosure"],
+      "evidence_outputs": ["calendar scope", "event action", "attendee confirmation", "resulting event state"]
+    },
+    {
+      "id": "business-operations-loop",
+      "owner": "crate-business-operations",
+      "playbook": ".codex/playbooks/crate-chief-business-operations.md",
+      "standing_order": "SO-014",
+      "modes": ["research", "approved-decision", "approved-remote-mutation", "approved-money", "approved-legal", "approved-private-access"],
+      "stop_gates": ["exact Bryant authority required", "stop on ambiguous amount counterparty document target or scope", "engineering and release actions route elsewhere"],
+      "evidence_outputs": ["action class", "authority source", "bounded target", "external state result"]
     }
   ]
 }
