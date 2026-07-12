@@ -1440,3 +1440,19 @@ Secondary:
 - Validation proof: 47 plugin tests, both plugin validators, independent Ajv Draft 2020-12 compilation and privacy probes, Crate Doctor with zero failures, loop-catalog JSON validation, clean diffs, and independent security/product rereviews.
 - Merge dependency: plugin PR first, then app catalog PR. Stop before merge without Bryant's approval.
 - PRs opened and merge-readiness passed: Crate Ops PR #8 is mergeable with CI passing; Crate app PR #125 is mergeable with local docs/doctor validation passing and no configured PR checks.
+- Bryant approved merge; Crate Ops PR #8 merged first as `823b860`, then dependent Crate app PR #125 merged to `v2.4.x` as `ad3716b`.
+
+### 2026-07-12 Chief-Of-Staff Attention Queue
+
+- Every newsletter review identified a useful `Tend` pattern: one source-of-truth chief task gathers signals, proposes decisions, routes execution, and learns from outcomes.
+- Duplication review confirmed Crate already has routers, loops, taskflows, context packs, model tiers, retrospectives, and thread/subagent control. The missing layer is one freshness-aware active attention index.
+- Bryant approved implementing item 1 before preference learning, workflow evaluations, efficiency receipts, and evidence-based model routing.
+- Selected architecture: the current Codex task remains chief of staff; the queue is a private local control index; existing authoritative sources and loop owners remain unchanged.
+- Two read-only agents reviewed privacy, freshness, authority, deduplication, phase ownership, and anti-duplication requirements. Their findings are being treated as implementation acceptance criteria.
+- Active branches: Crate Ops `codex/chief-of-staff-attention-queue`; app catalog `codex/chief-of-staff-attention-queue-catalog`.
+- No app runtime, site, Figma, live inbox/calendar/tester data, dependencies, release, deploy, credentials, or live queue snapshots are in scope.
+- Implemented a closed privacy-safe queue schema, synthetic example, stable matter/dedupe identities, current-date freshness, expected source inventory, per-source refresh accounting, prior-snapshot reconciliation, accountable privacy review, and owner-only atomic output.
+- Added exact route/action/standing-order authority, source-bound approval revisions and expiry, dual-source Bryant-and-Jenna approval, and Bryant-only gates for code, support sends, and business mutations.
+- Added dedicated attention, support/email, calendar, and business-operation routes under SO-011 through SO-014; existing engineering, QA, release, design, tester, and deploy loops remain owners of their current scopes.
+- Full verification: 83 plugin tests, both plugin validators, strict Ajv probes, plugin/app route-catalog consistency, standing-order contract audit, app JSON/diff checks, and Crate Doctor with zero failures.
+- Independent product and security rereviews found no P0/P1/P2 blockers and recommended coordinated PRs in plugin-first order.

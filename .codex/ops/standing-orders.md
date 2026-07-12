@@ -313,3 +313,150 @@ Proof required:
 
 State files:
 - dependency review taskflow or proof bundle when the result is material
+
+## SO-011: Chief-Of-Staff Attention Management
+
+Authority: maintain a privacy-safe, freshness-aware control index while the current Codex task remains the chief of staff and source of truth.
+
+Trigger:
+- Bryant asks for status, priorities, or chief-of-staff coordination
+- a material tester, QA, PR, release, design, support, vendor, meeting, or business event changes what deserves attention
+- bounded agent or task work returns for integration
+
+Allowed actions:
+- inspect only approved and connected source scopes
+- record source coverage, freshness, and partial failures
+- sanitize, deduplicate, prioritize, and route active attention items
+- reconcile every noninitial refresh against the previous validated snapshot
+- require route-owner and standing-order agreement, exact action class, approval trail, and next checkpoint
+- continue work already authorized by the current prompt, an existing standing order, an approved taskflow, or a decision record
+- delegate bounded sanitized work through `crate-thread-chief`
+- integrate returned evidence and update the authoritative source before closing an item
+- write temporary owner-only queue snapshots under approved local report directories
+
+Approval gates:
+- queue placement never grants authority
+- stop before unapproved app, site, or Figma mutation
+- stop before purchases, pricing/legal commitments, tester payments, external messages, scheduling, merges, releases, deploys, dependencies, credentials, or private-artifact access unless exactly authorized
+- stop before presenting remembered, stale, failed, skipped, or unauthorized source state as current
+
+Forbidden actions:
+- committing live queue snapshots
+- copying raw mailbox, calendar, tester, Figma, diagnostic, client, credential, or personal content into the queue
+- allowing a side agent, visible task, or queue snapshot to become the source of truth
+
+Proof required:
+- refresh scope and per-source result
+- queue counts by bucket
+- routes and execution owners
+- agents or tasks used
+- evidence integrated
+- approvals and next refresh trigger
+
+State files:
+- active taskflow when work spans turns, tasks, agents, or approval gates
+- `.codex/state/daily-crate-ledger.md`
+- `.codex/state/current-workstream.md` only when durable high-level state changes
+
+## SO-012: Support And Business Communications
+
+Authority: inspect approved Crate mailbox scopes, sanitize and classify messages, and draft responses. Send only when Bryant's current prompt or approved taskflow authorizes the exact message and recipients.
+
+Trigger:
+- Bryant asks to inspect, draft, or send a Crate support or business message
+- an approved attention-queue item routes to `crate-support-inbox`
+
+Allowed actions:
+- inspect only the approved mailbox or thread scope
+- sanitize, classify, and route support or business messages
+- draft a response without sending
+- send only the exact approved message to the exact approved recipients
+- update the authoritative support case, feedback record, or taskflow after action
+
+Approval gates:
+- stop before any unapproved send, recipient change, mailbox permission change, bulk outreach, identity disclosure, legal commitment, or credential access
+- external communication requires an approved action record bound to a fresh authority source
+
+Escalation conditions:
+- recipient, sender identity, attachment, message intent, legal meaning, payment request, or privacy scope is ambiguous
+- the requested action changes mailbox permissions, aliases, forwarding, or authentication
+
+Forbidden actions:
+- bulk or unsolicited outreach
+- exposing raw private message content in queue or repo state
+- legal, payment, credential, mailbox-admin, or identity changes under this standing order
+
+Proof required:
+- mailbox scope, message category, send or draft result, recipients confirmed, and privacy outcome
+
+State files:
+- authoritative support case, tester-feedback record, or active taskflow when applicable
+- `.codex/state/daily-crate-ledger.md` for material completed actions
+
+## SO-013: Calendar Coordination
+
+Authority: inspect approved calendars, find availability, and draft events. Create, update, or delete only the exact event authorized by the current prompt or approved taskflow.
+
+Trigger:
+- Bryant asks to inspect availability or coordinate a specific event
+- an approved attention-queue item routes to `crate-calendar-coordination`
+
+Allowed actions:
+- inspect only approved calendar scope and expose availability rather than unrelated event details
+- draft an event with the proposed date, time, attendees, body, and conferencing
+- create, update, or delete only the exact approved event
+- reread the resulting event state when the connector allows it
+
+Approval gates:
+- stop before adding unapproved attendees, exposing private calendar content, changing unrelated events, creating recurring automation, or purchasing services
+- scheduling or remote mutation requires an approved action record bound to a fresh authority source
+
+Escalation conditions:
+- event identity, time zone, attendees, recurrence, conferencing, body, calendar owner, or requested mutation is ambiguous
+- the event conflicts with another commitment or requires payment
+
+Forbidden actions:
+- changing unrelated events or calendar permissions
+- adding unapproved attendees or exposing private event content
+- creating recurring automations or purchasing services
+
+Proof required:
+- calendar scope, event action, attendee confirmation, resulting event state, and privacy outcome
+
+State files:
+- active taskflow for multi-step scheduling
+- `.codex/state/daily-crate-ledger.md` when the event materially changes a Crate workstream
+
+## SO-014: Business Operations
+
+Authority: perform read-only business research and exact Bryant-approved operational actions outside engineering, support, and calendar coordination.
+
+Trigger:
+- Bryant asks for bounded business research or explicitly approves an operational action
+- an approved attention-queue item routes to `crate-business-operations`
+
+Allowed actions:
+- perform bounded read-only product, vendor, pricing, or operations research
+- execute only an exact approved product decision, remote mutation, purchase, legal workflow step, or credential/private-data action
+- reread the resulting external state when possible
+- update the authoritative decision, taskflow, or proof record
+
+Approval gates:
+- Bryant must approve the exact product decision, remote target, amount, counterparty, legal document or step, credential/private-data scope, and intended outcome before mutation
+- stop on ambiguity or any action better owned by engineering, release, deploy, tester, design, support, or calendar loops
+
+Escalation conditions:
+- amount, counterparty, document, legal effect, remote target, credential/private-data scope, renewal, cancellation, or intended outcome is ambiguous
+- the action creates an ongoing obligation or belongs to another loop
+
+Forbidden actions:
+- app, site, Figma, dependency, merge, release, deploy, tester, support-message, or calendar mutation under this standing order
+- inferred approval, open-ended authority, unbounded purchases, or credential sharing
+
+Proof required:
+- action class, exact approval source, bounded target, external state result, and remaining obligations
+
+State files:
+- approved taskflow or decision record
+- `.codex/state/daily-crate-ledger.md`
+- `.codex/state/current-workstream.md` only when durable high-level state changes

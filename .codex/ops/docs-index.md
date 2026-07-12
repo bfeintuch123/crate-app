@@ -18,6 +18,9 @@ This index gives Crate docs lightweight routing metadata so Codex can select the
 | `.codex/ops/crate-memory-model.md` | Memory tiers and action-sensitive memory rules. | Source-of-truth, handoff, vault, or long loop work. |
 | `.codex/ops/proof-bundle-template.md` | Evidence closeout template for loops and releases. | Finishing a major loop, QA, release, deploy, or review. |
 | `.codex/ops/tester-feedback-archive.md` | Tester feedback schema and routing. | Bryant provides tester/support/Jenna feedback. |
+| `.codex/ops/chief-of-staff-attention-queue.md` | Source-of-truth hierarchy, four queue buckets, freshness, privacy, and delegation rules. | Bryant asks Codex to act as chief of staff or coordinate active work. |
+| `.codex/playbooks/crate-attention-queue.md` | Operational workflow for refresh, reconciliation, routing, authority, delegation, and closeout. | Running or refreshing the chief-of-staff attention queue. |
+| `.codex/playbooks/crate-chief-business-operations.md` | Bounded support/email, calendar, and approved business-operation execution routes. | Chief-of-staff work moves from approval into nonengineering execution. |
 | `.codex/taskflows/2026-07-12-canonical-tester-feedback-schema.md` | Canonical tester-feedback JSON 1.0 implementation and validation state. | Creating, reviewing, or revising normalized tester records. |
 | `.codex/ops/skill-registry.md` | Registry for Crate playbooks, skills, tools, pins, and security notes. | Adding or selecting skills/tools/playbooks. |
 | `.codex/ops/crate-feature-inventory.json` | Canonical feature, risk, coverage-state, suite, manual-lane, and proof catalog. | Auditing product/test coverage. |

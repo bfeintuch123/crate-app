@@ -10,9 +10,9 @@ Last updated: 2026-07-12
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops batches 1-16 are merged; batch 17-23 is scoped to review-first design, workflow capture, tester learning, launch readiness, product metrics, dependency posture, and incident rehearsal with no app runtime or release mutation.
-- Active ops branches: `codex/tester-feedback-schema-catalog` and Crate Ops `codex/canonical-tester-feedback-schema`
-- Current ops work: Crate Ops PR #7 and Crate app PR #124 are merged. Canonical tester-feedback JSON 1.0 is implemented and adversarially validated before Olivia's first session. Crate Ops PR #8 and dependent Crate app PR #125 are mergeable; plugin CI passed. Merge plugin first, then app catalog after Bryant approval. No real tester ingestion or app/runtime mutation occurred.
+- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops PRs #7 and #8 and Crate app PRs #124 and #125 are merged. Canonical tester-feedback JSON 1.0 is available before Olivia's first session. Chief-of-staff attention management is now the active ops-only improvement.
+- Active ops branches: `codex/chief-of-staff-attention-queue-catalog` and Crate Ops `codex/chief-of-staff-attention-queue`
+- Current ops work: the privacy-safe freshness-aware attention queue and bounded support, calendar, and business routes are implementation-complete and independently cleared for coordinated PRs. Existing engineering loops, taskflows, tester records, GitHub, decisions, and proof remain authoritative. No live queue, tester data, app/runtime, release, or site mutation is in scope.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

@@ -43,6 +43,10 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Run Jenna GUI QA" | `.codex/playbooks/crate-computer-use-qa.md` | `crate-gui-repro-flow.md` for repros | explicit app/file approval required |
 | "Create a handoff" | `.codex/playbooks/crate-handoff.md` | `.agents/skills/crate-handoff/SKILL.md` | read-only |
 | "Use external controls / spawn Crate side threads / coordinate agents" | `.codex/playbooks/crate-external-control-layer.md` | `.codex/playbooks/crate-handoff.md` when a portable handoff prompt is needed | source-of-truth thread coordinates; sidecars read-only by default |
+| "What needs my attention? / act as chief of staff / coordinate everything" | Crate Ops `crate-attention-queue` under `SO-011` | `crate-router`, then `crate-thread-chief` for bounded execution | freshness-aware control index; existing authority gates remain |
+| "Handle Crate support/business email" | Crate Ops `crate-support-inbox` under `SO-012` | `.codex/playbooks/crate-chief-business-operations.md` | read/draft by default; exact send approval required |
+| "Coordinate a meeting or calendar event" | `crate-calendar-coordination` under `SO-013` | `.codex/playbooks/crate-chief-business-operations.md` | exact event and attendee approval required before mutation |
+| "Handle approved business operations" | `crate-business-operations` under `SO-014` | `.codex/playbooks/crate-chief-business-operations.md` | exact Bryant approval required for money, legal, remote, credential, or private-data actions |
 | "Import Crate ChatGPT export" | future import plan | `crate-decision-log.md`, `crate-qa-results-synthesizer.md`, `crate-handoff.md` | read-only first pass |
 | "Deploy get-crate.com / Cloudflare" | `.codex/playbooks/crate-cloudflare-deploy.md` | `SO-004`, `crate-doctor`, proof bundle | deploy only when explicitly approved |
 | "Run Crate doctor / preflight" | `.agents/skills/crate-doctor/SKILL.md` | `.codex/tools/crate_doctor.py` | read-only |
