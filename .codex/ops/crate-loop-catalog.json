@@ -42,9 +42,18 @@
       "owner": "crate-tester-intake",
       "playbook": ".codex/playbooks/crate-tester-intake.md",
       "standing_order": "SO-005",
-      "modes": ["intake", "normalize", "triage"],
-      "stop_gates": ["do not expose private tester assets", "code fixes require failure-loop routing"],
-      "evidence_outputs": ["privacy-safe feedback record", "severity", "next route"]
+      "modes": ["intake", "evidence-custody"],
+      "stop_gates": ["do not expose private tester assets", "keep identity and recruiting context outside canonical records"],
+      "evidence_outputs": ["private evidence custody status", "intake summary", "canonicalization handoff"]
+    },
+    {
+      "id": "tester-canonicalization-loop",
+      "owner": "crate-feedback-automation",
+      "playbook": ".codex/playbooks/crate-tester-intake.md",
+      "standing_order": "SO-005",
+      "modes": ["normalize", "privacy-validate"],
+      "stop_gates": ["canonical schema only", "human privacy review required", "do not expose identities or private tester assets", "bugs route to QA synthesis and bug triage"],
+      "evidence_outputs": ["schema-valid records", "privacy-safe validation summary", "next route"]
     },
     {
       "id": "thread-coordination-loop",

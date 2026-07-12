@@ -39,7 +39,7 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Run the internal QA release gate" | `.codex/playbooks/crate-release-gate.md` | `crate-autoreview.md`, `crate-security-scan.md`, `crate-regression-detector.md`, `crate-provenance-review.md`, `crate-handoff.md` | release-gate only when explicitly approved |
 | "Review this PR for merge" | `.codex/playbooks/review-crate-pr.md` | `crate-autoreview.md`, `crate-regression-detector.md`, `crate-security-scan.md`, `crate-provenance-review.md` as scope requires | read-only until merge approved |
 | "Make a small bug fix" | `.codex/playbooks/clawpatch-fix.md` | relevant check suite from `.codex/checks/crate-check-suites.md` | no-autonomy unless Bryant grants loop mode |
-| "Triage tester feedback" | `.codex/playbooks/crate-tester-intake.md` | `crate-qa-results-synthesizer.md`, `crate-bug-triage.md` | read-only |
+| "Triage tester feedback" | `tester-feedback-loop` for intake and private evidence custody | `tester-canonicalization-loop`, then `crate-qa-results-synthesizer.md` and `crate-bug-triage.md` when action is needed | read-only |
 | "Run Jenna GUI QA" | `.codex/playbooks/crate-computer-use-qa.md` | `crate-gui-repro-flow.md` for repros | explicit app/file approval required |
 | "Create a handoff" | `.codex/playbooks/crate-handoff.md` | `.agents/skills/crate-handoff/SKILL.md` | read-only |
 | "Use external controls / spawn Crate side threads / coordinate agents" | `.codex/playbooks/crate-external-control-layer.md` | `.codex/playbooks/crate-handoff.md` when a portable handoff prompt is needed | source-of-truth thread coordinates; sidecars read-only by default |
@@ -56,6 +56,7 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | "Review the app/site design quality" | Crate Ops `crate-design-review` | visual evidence, accessibility, supported-app claims | report/brief only |
 | "Record this recurring workflow" | Crate Ops `crate-workflow-recorder` | Record & Replay, then skill workshop | proposal-only |
 | "What are testers collectively telling us?" | Crate Ops `crate-tester-insights` | normalized feedback archive | read-only synthesis |
+| "Validate or normalize tester feedback JSON" | Crate Ops `crate-feedback-automation` | canonical schema `1.0` and `validate_tester_feedback.py` | read-only normalization |
 | "Are we ready for public launch?" | Crate Ops `crate-launch-readiness` | customer journey and public assets, then `crate-ship` | evidence-only |
 | "Define beta or launch metrics" | Crate Ops `crate-product-metrics` | memory/decision model | plan-only |
 | "Review dependency risk" | Crate Ops `crate-dependency-watch` | security scan and release diff when relevant | read-only |

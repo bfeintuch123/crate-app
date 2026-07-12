@@ -1426,3 +1426,16 @@ Secondary:
 - Validation completed after adversarial hardening: target-specific launch assets, plain-text tester/launch evidence, symlink-safe report roots, canonical tester source IDs, real full-vs-production npm audit comparison, strict npm schema/count consistency, and escaped dependency output.
 - Proof: 31 plugin tests, both plugin validators, loop catalog validation, Crate Doctor with zero failures, 214 existing app tests, and clean independent security/ownership rereviews.
 - PRs: Crate Ops #7 and Crate app #124 are clean and mergeable; plugin CI passed. Merge order is plugin first, then app catalog. Stop before either merge without Bryant's separate approval.
+
+### 2026-07-12 Canonical Tester Feedback JSON
+
+- Bryant approved creating the canonical tester-feedback format before Olivia's first session.
+- Selected one finding per record, with shared pseudonymous `source_id` and `session_id` values across findings from one tester session.
+- Schema version `1.0` excludes identities, demographics, profile/portfolio links, URLs, raw paths, screenshots, recordings, and private assets.
+- Real tester use will validate the field set; missing optional concepts should become a reviewed backward-compatible `1.1` proposal.
+- Active branches: `codex/canonical-tester-feedback-schema` and `codex/tester-feedback-schema-catalog`.
+- Implemented a closed Draft 2020-12 record schema and versioned collection envelope with one finding per record, semantic build versions, generated opaque IDs, stable source-ID reuse for returning testers, session integrity, and accountable privacy/product decisions.
+- Added strict validation for duplicate JSON keys, unsafe paths/URLs/emails/filenames/IPs/active content, exact canonical schema parity, chronology, and sanitized error output.
+- Split loop ownership: private intake/evidence custody, canonicalization/privacy validation, downstream bug triage, and cross-tester synthesis. Cross-tester synthesis now requires at least two independent sources.
+- Validation proof: 47 plugin tests, both plugin validators, independent Ajv Draft 2020-12 compilation and privacy probes, Crate Doctor with zero failures, loop-catalog JSON validation, clean diffs, and independent security/product rereviews.
+- Merge dependency: plugin PR first, then app catalog PR. Stop before merge without Bryant's approval.

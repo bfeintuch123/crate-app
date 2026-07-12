@@ -18,6 +18,7 @@ This index gives Crate docs lightweight routing metadata so Codex can select the
 | `.codex/ops/crate-memory-model.md` | Memory tiers and action-sensitive memory rules. | Source-of-truth, handoff, vault, or long loop work. |
 | `.codex/ops/proof-bundle-template.md` | Evidence closeout template for loops and releases. | Finishing a major loop, QA, release, deploy, or review. |
 | `.codex/ops/tester-feedback-archive.md` | Tester feedback schema and routing. | Bryant provides tester/support/Jenna feedback. |
+| `.codex/taskflows/2026-07-12-canonical-tester-feedback-schema.md` | Canonical tester-feedback JSON 1.0 implementation and validation state. | Creating, reviewing, or revising normalized tester records. |
 | `.codex/ops/skill-registry.md` | Registry for Crate playbooks, skills, tools, pins, and security notes. | Adding or selecting skills/tools/playbooks. |
 | `.codex/ops/crate-feature-inventory.json` | Canonical feature, risk, coverage-state, suite, manual-lane, and proof catalog. | Auditing product/test coverage. |
 | `.codex/ops/crate-loop-catalog.json` | Review-first inventory of Crate loops, owners, modes, stop gates, and evidence. | Discovering or auditing recurring loops. |
