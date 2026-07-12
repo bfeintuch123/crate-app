@@ -43,6 +43,17 @@ node --check parsers/figma.js
 node --check parsers/package-safety.js
 ```
 
+## ops-product-learning
+
+Use for design-review, workflow-recording, tester-insight, launch-readiness, product-metric, dependency-watch, or incident-rehearsal workflow changes.
+
+```sh
+python3 .codex/tools/crate_doctor.py
+python3 -m json.tool .codex/ops/crate-loop-catalog.json >/dev/null
+rg -n "crate-design-review|crate-workflow-recorder|crate-tester-insights|crate-launch-readiness|crate-product-metrics|crate-dependency-watch|crate-launch-incident-rehearsal" .codex/ROUTER.md .codex/ops .codex/taskflows
+git diff --check
+```
+
 ## focused-qa-suite
 
 Use for current v2.8 QA bug fixes unless the prompt narrows or expands scope.

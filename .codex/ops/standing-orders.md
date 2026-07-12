@@ -227,3 +227,84 @@ State files:
 - active taskflow
 - `.codex/state/daily-crate-ledger.md`
 - `.codex/state/current-workstream.md` when the durable next action changes
+
+## SO-008: Design And Product Learning Review
+
+Authority: produce read-only design, cross-tester, workflow-capture proposal, and product-measurement evidence.
+
+Trigger:
+- Bryant asks for design-quality review or a design implementation brief
+- Bryant asks what multiple normalized tester records collectively show
+- Bryant explicitly asks to record a recurring workflow
+- Bryant asks for a beta or launch measurement plan
+
+Allowed actions:
+- inspect approved/public UI evidence and normalized tester records
+- create design findings, cross-tester synthesis, measurement plans, and skill proposals
+- start Record & Replay only after Bryant explicitly requests recording and confirms capture
+
+Approval gates:
+- stop before app/site/Figma mutation, analytics implementation, live-skill promotion, or external communication
+- stop processing a recording that contains credentials, private client work, payments, signing, or other sensitive content
+- raw recordings, screenshots, tester identities, and private assets remain private by default
+
+Proof required:
+- evidence sources and privacy status
+- findings, disagreement, and confidence
+- proposed owner and next route
+
+State files:
+- relevant taskflow or feedback archive
+- `.codex/state/daily-crate-ledger.md` when a durable decision changes
+
+## SO-009: Launch Experience Review And Rehearsal
+
+Authority: audit the customer journey and public asset truth, or run a non-mutating launch incident tabletop.
+
+Trigger:
+- Bryant asks whether Crate's customer journey or public assets are launch-ready
+- Bryant asks to rehearse a launch, support, privacy, download, Gatekeeper, or rollback incident
+
+Allowed actions:
+- inspect approved launch evidence
+- produce readiness and tabletop reports
+- route complete readiness evidence to `crate-ship`
+
+Approval gates:
+- stop before build, release, tag, deploy, DNS, download, mailbox, legal, billing, credential, rollback, or customer-message mutation
+- readiness does not authorize release; rehearsal does not authorize live recovery actions
+
+Proof required:
+- target build and required asset inventory
+- customer journey results or incident scenario
+- blockers, owners, stop authority, and evidence gaps
+
+State files:
+- launch taskflow or proof bundle
+- `.codex/state/current-workstream.md` only when the durable launch state changes
+
+## SO-010: Dependency Watch
+
+Authority: collect and classify read-only dependency evidence.
+
+Trigger:
+- Bryant asks for dependency posture, audit triage, outdated-package review, or supply-chain follow-up
+- a release/security review requests dependency evidence
+
+Allowed actions:
+- collect approved read-only audit/outdated reports
+- compare full and production-only audit results
+- recommend monitor, security review, or a separately scoped upgrade proposal
+
+Approval gates:
+- network collection requires approval when not already authorized
+- stop before install, update, fix, dedupe, package or lockfile mutation, build, release, or deploy
+- do not infer a clean supply chain from audit/outdated reports alone
+
+Proof required:
+- report sources and collection mode
+- runtime, development, and unknown-scope findings
+- limitations and recommended next route
+
+State files:
+- dependency review taskflow or proof bundle when the result is material

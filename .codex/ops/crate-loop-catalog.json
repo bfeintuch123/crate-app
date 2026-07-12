@@ -63,6 +63,51 @@
       "modes": ["research", "proposal", "prototype", "review"],
       "stop_gates": ["external research is not proof", "do not install or merge without approval"],
       "evidence_outputs": ["duplication assessment", "validation", "PR state"]
+    },
+    {
+      "id": "design-review-loop",
+      "owner": "crate-design-review",
+      "playbook": ".codex/playbooks/crate-codex-loops.md",
+      "standing_order": "SO-008",
+      "modes": ["evidence", "critique", "implementation-brief"],
+      "stop_gates": ["do not mutate Figma or code without separate approval", "generated concepts are not approved specifications"],
+      "evidence_outputs": ["workflow-specific findings", "visual evidence manifest", "acceptance criteria"]
+    },
+    {
+      "id": "tester-learning-loop",
+      "owner": "crate-tester-insights",
+      "playbook": ".codex/playbooks/crate-tester-intake.md",
+      "standing_order": "SO-008",
+      "modes": ["cross-tester synthesis", "product review"],
+      "stop_gates": ["normalized records only", "do not expose identities or raw tester assets"],
+      "evidence_outputs": ["recurring themes", "disagreement", "confidence", "next route"]
+    },
+    {
+      "id": "launch-readiness-loop",
+      "owner": "crate-launch-readiness",
+      "playbook": ".codex/playbooks/crate-codex-loops.md",
+      "standing_order": "SO-009",
+      "modes": ["customer journey", "asset truth", "handoff to crate-ship"],
+      "stop_gates": ["readiness does not authorize release", "crate-ship owns go/no-go synthesis"],
+      "evidence_outputs": ["journey results", "asset/build mapping", "blockers", "owner"]
+    },
+    {
+      "id": "launch-incident-rehearsal-loop",
+      "owner": "crate-launch-incident-rehearsal",
+      "playbook": ".codex/playbooks/crate-release-gate.md",
+      "standing_order": "SO-009",
+      "modes": ["tabletop", "gap report", "handoff"],
+      "stop_gates": ["do not mutate live systems", "external communication requires separate approval"],
+      "evidence_outputs": ["scenario", "detection path", "owner", "recovery gaps"]
+    },
+    {
+      "id": "dependency-watch-loop",
+      "owner": "crate-dependency-watch",
+      "playbook": ".codex/playbooks/security-audit.md",
+      "standing_order": "SO-010",
+      "modes": ["collect read-only reports", "classify", "recommend"],
+      "stop_gates": ["do not install, update, fix, dedupe, or mutate lockfiles", "network collection requires approval"],
+      "evidence_outputs": ["runtime findings", "development findings", "upgrade proposal or monitor recommendation"]
     }
   ]
 }
