@@ -53,6 +53,8 @@ Use for:
 - release policy
 - architecture commitments
 
+Explicit reusable preferences follow `.codex/ops/crate-preferences.md`. They remain source-linked, expiring guidance and never replace decisions or action authority.
+
 ### Tier 4: Workflow Knowledge
 
 Home:
@@ -116,7 +118,8 @@ Before a Crate loop acts, read only the smallest relevant set:
 4. active taskflow, if present
 5. `.codex/state/current-workstream.md`
 6. relevant decision files
-7. selected playbook/check suite
+7. relevant active explicit preferences, when applicable
+8. selected playbook/check suite
 
 Avoid loading every Crate doc by default. Use `.codex/ops/docs-index.md` to route.
 

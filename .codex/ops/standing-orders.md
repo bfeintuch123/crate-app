@@ -213,7 +213,7 @@ Trigger:
 
 Allowed actions:
 - compare proposals against the skill registry and existing playbooks
-- create reviewable skill proposals, hooks, scripts, tests, inventory updates, and doctor checks on scoped branches
+- create reviewable skill proposals, hooks, scripts, tests, inventory updates, synthetic workflow evaluations, aggregate outcome receipts, and doctor checks on scoped branches
 - run read-only validation and open PRs when the active mode permits it
 
 Approval gates:
@@ -225,6 +225,7 @@ Proof required:
 - duplication assessment
 - files and ownership boundaries
 - validation and adversarial review
+- workflow eval summary and outcome receipt when the change affects routing, approvals, privacy, stop gates, or model tiers
 - privacy/security impact
 - PR and merge state
 

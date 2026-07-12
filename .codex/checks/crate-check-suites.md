@@ -54,6 +54,19 @@ rg -n "crate-design-review|crate-workflow-recorder|crate-tester-insights|crate-l
 git diff --check
 ```
 
+## ops-workflow-eval
+
+Use for explicit-preference, workflow-evaluation, outcome-receipt, or evidence-based routing changes.
+
+```sh
+python3 .codex/tools/crate_doctor.py
+python3 -m json.tool .codex/ops/crate-loop-catalog.json >/dev/null
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/scripts/evaluate_workflow_suite.py /Users/bryantfeintuchclaw/plugins/crate-ops/examples/crate-workflow-eval-suite.example.json
+python3 -m unittest discover -s /Users/bryantfeintuchclaw/plugins/crate-ops/tests -p 'test_chief_learning.py'
+rg -n "crate-preference-ledger|crate-workflow-evals|Outcome Receipt|Evidence-Based Routing" .codex/ROUTER.md .codex/ops .codex/playbooks .codex/taskflows
+git diff --check
+```
+
 ## focused-qa-suite
 
 Use for current v2.8 QA bug fixes unless the prompt narrows or expands scope.

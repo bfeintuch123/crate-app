@@ -70,6 +70,10 @@ Forbidden:
 - next action:
 - blocker:
 - approval state:
+- preferences applied:
+- routing decision:
+- workflow eval suite/result:
+- outcome receipt:
 
 ## Checkpoints
 
