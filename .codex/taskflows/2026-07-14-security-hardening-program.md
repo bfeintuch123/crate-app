@@ -10,7 +10,7 @@
 - branch: `codex/security-build-containment`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 implementation and non-release packaged-app proof complete; commit and PR approval pending
+- status: phase 1 implementation and non-release packaged-app proof complete; PR #128 open and merge approval pending
 
 ## Goal
 
@@ -51,7 +51,8 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] focused tests and configuration validation
 - [x] non-release packaged-app verification after separate build approval
 - [x] autoreview, regression, security, provenance, and merge-readiness review
-- [ ] Bryant approval for commit, push, PR, merge, or next security phase
+- [x] Bryant approval for commit, push, and PR creation
+- [ ] Bryant approval for merge or next security phase
 
 ## Stop Gates
 
@@ -62,7 +63,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Request Bryant approval to commit, push, and open a PR for phase 1. Do not begin the Figma credential-storage phase until phase 1 is merged and separately approved.
+Request Bryant approval to merge PR #128. Do not begin the Figma credential-storage phase until phase 1 is merged and separately approved.
 
 ## Phase 1 Evidence
 
