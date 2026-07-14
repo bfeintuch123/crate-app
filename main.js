@@ -2752,6 +2752,34 @@ function migrateSettings() {
 }
 migrateSettings();
 
+function configureFigmaCredentialStorage() {
+  try {
+    const { safeStorage } = require('electron');
+    const { FigmaParser } = require('./parsers/figma');
+    const { FigmaCredentialStore } = require('./parsers/figma-credential-store');
+    FigmaParser.configureCredentialStore(new FigmaCredentialStore({
+      safeStorage,
+      userDataPath: app.getPath('userData'),
+      legacyTokenPath: path.join(os.homedir(), '.crate', 'figma-token'),
+    }));
+    return true;
+  } catch (_) {
+    console.warn('[crate][figma] secure credential storage could not be initialized');
+    return false;
+  }
+}
+
+function migrateFigmaCredentialStorageInBackground() {
+  queueMicrotask(async () => {
+    try {
+      const { FigmaParser } = require('./parsers/figma');
+      await new FigmaParser().getStoredToken();
+    } catch (_) {
+      console.warn('[crate][figma] secure credential migration deferred');
+    }
+  });
+}
+
 function formatLocalDateForUsage(date = new Date()) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -10259,21 +10287,30 @@ ipcMain.handle('figma:connect', async (event, token) => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
 
-  // Store token first, then verify on first poll (verifyToken reads from storage)
+  const verification = await parser.verifyTokenCandidate(token);
+  if (!verification.valid) {
+    const error = verification.reason === 'invalid-token' || verification.reason === 'access-denied'
+      ? 'invalid_token'
+      : (verification.reason === 'rate-limited' ? 'rate_limited' : 'verification_failed');
+    return { success: false, error };
+  }
+
   const stored = await parser.storeToken(token);
 
-  if (stored) {
-    figmaRateLimitBackoffs.clear();
-    // Start Figma polling for any currently watching projects
-    const projects = getProjects();
-    for (const project of projects) {
-      if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
-        startFigmaPolling(project.id);
-      }
+  if (!stored) {
+    return { success: false, error: 'secure_storage_unavailable' };
+  }
+
+  figmaRateLimitBackoffs.clear();
+  // Start Figma polling for any currently watching projects
+  const projects = getProjects();
+  for (const project of projects) {
+    if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
+      startFigmaPolling(project.id);
     }
   }
 
-  return { success: stored };
+  return { success: true };
 });
 
 ipcMain.handle('figma:disconnect', async () => {
@@ -10423,6 +10460,8 @@ ipcMain.handle('inactivity:pause', (event, projectId) => {
 
 app.whenReady().then(async () => {
   try {
+    configureFigmaCredentialStorage();
+
     // Show in Dock so users can right-click → Quit
     // NOTE: Do NOT manually set dock icon — let Electron use the .icns from the packager
     // which macOS renders with proper squircle mask (no white corners)
@@ -10440,6 +10479,7 @@ app.whenReady().then(async () => {
     createMainWindow();
     showMainWindow({ reason: 'startup' });
     createTray();
+    migrateFigmaCredentialStorageInBackground();
 
     // Resume watching for any active projects without letting watcher recovery block the UI.
     const projects = getProjects();

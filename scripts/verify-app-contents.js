@@ -7,6 +7,7 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'aftereffects.js',
   'ai.js',
   'base.js',
+  'figma-credential-store.js',
   'figma.js',
   'indesign.js',
   'index.js',

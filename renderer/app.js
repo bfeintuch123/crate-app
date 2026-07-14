@@ -1305,17 +1305,36 @@ function setupEventListeners() {
   // Figma connect
   $('#btn-figma-connect').addEventListener('click', async () => {
     const token = $('#input-figma-token').value.trim();
+    const connectButton = $('#btn-figma-connect');
     if (!token) {
       showToast('Please enter your Figma token');
       return;
     }
-    const result = await window.crate.connectFigma(token);
-    if (result.success) {
-      $('#input-figma-token').value = '';
-      renderFigmaSettings();
-      showToast('Figma connected successfully');
-    } else {
-      showToast('Failed to save token');
+
+    connectButton.disabled = true;
+    const previousLabel = connectButton.textContent;
+    connectButton.textContent = 'Connecting...';
+    try {
+      const result = await window.crate.connectFigma(token);
+      if (result.success) {
+        $('#input-figma-token').value = '';
+        renderFigmaSettings();
+        showToast('Figma connected successfully');
+      } else if (result.error === 'invalid_token') {
+        showToast('Figma could not verify that connection. Check it and try again.');
+      } else if (result.error === 'rate_limited') {
+        showToast('Figma is temporarily limiting connection checks. Try again shortly.');
+      } else if (result.error === 'secure_storage_unavailable') {
+        showToast('Crate could not protect that connection on this Mac. Unlock your Mac and try again.');
+      } else {
+        showToast('Crate could not reach Figma. Nothing was saved.');
+      }
+    } catch (error) {
+      logRendererError('Figma connection failed', error);
+      showToast('Crate could not reach Figma. Nothing was saved.');
+    } finally {
+      connectButton.disabled = false;
+      connectButton.textContent = previousLabel;
     }
   });
 

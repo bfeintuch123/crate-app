@@ -21,6 +21,7 @@ test('main window uses normal macOS app lifecycle', async () => {
   const intervals = new Set();
   const timeouts = new Set();
   const errorLogs = [];
+  const isolatedHome = path.join(os.tmpdir(), `crate-main-window-test-home-${process.pid}-${Date.now()}`);
   let appReady = false;
   let readyCallback = null;
   let appFocusCount = 0;
@@ -189,6 +190,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     Menu: { buildFromTemplate: () => ({}) },
   }));
   setStub('electron-store', () => FakeStore);
+  setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
   setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
   setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
 

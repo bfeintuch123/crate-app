@@ -5,18 +5,12 @@ const os = require('os');
 const path = require('path');
 const Module = require('module');
 
-function loadFigmaParserWithHome(homeDir, options = {}) {
+function loadFigmaParser(options = {}) {
   const parserPath = require.resolve('../parsers/figma');
   const originalLoad = Module._load;
   delete require.cache[parserPath];
 
   Module._load = function loadWithStubs(request, parent, isMain) {
-    if (request === 'os') {
-      return { homedir: () => homeDir };
-    }
-    if (request === 'keytar') {
-      throw new Error('keytar unavailable in fallback token test');
-    }
     if (request === 'node-fetch' && options.fetchImpl) {
       return options.fetchImpl;
     }
@@ -75,42 +69,16 @@ function assertNoFigmaSecrets(text) {
 
 test('renderer Figma token privacy hint accurately describes local storage and API usage', () => {
   const rendererHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const parserSource = fs.readFileSync(path.join(__dirname, '..', 'parsers', 'figma.js'), 'utf8');
   const normalizedHtml = rendererHtml.replace(/\s+/g, ' ');
-  const expectedHint = 'Stored locally on this Mac, using Keychain when available or ~/.crate/figma-token with owner-only permissions. Crate uses it only to request your Figma files and assets from Figma.';
+  const expectedHint = 'Saved Figma connections are protected by macOS Keychain and stay on this Mac. Crate uses them only to request the Figma files and assets you link.';
   const staleClaim = /never leaves\s+your computer/i;
 
   assert.equal(normalizedHtml.includes(expectedHint), true);
   assert.equal(staleClaim.test(rendererHtml), false);
-});
-
-test('storeToken hardens existing fallback token file permissions without logging token contents', async () => {
-  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-token-privacy-'));
-  const crateDir = path.join(tempHome, '.crate');
-  const tokenPath = path.join(crateDir, 'figma-token');
-  const oldToken = 'OLD_PUBLIC_TEST_TOKEN';
-  const newToken = 'NEW_PRIVATE_TEST_TOKEN';
-
-  try {
-    fs.mkdirSync(crateDir, { recursive: true, mode: 0o755 });
-    fs.chmodSync(crateDir, 0o755);
-    fs.writeFileSync(tokenPath, oldToken, { mode: 0o644 });
-    fs.chmodSync(tokenPath, 0o644);
-
-    const FigmaParser = loadFigmaParserWithHome(tempHome);
-    const parser = new FigmaParser();
-    const { result, output } = await captureConsole(() => parser.storeToken(newToken));
-
-    assert.equal(result, true);
-    assert.equal(fs.readFileSync(tokenPath, 'utf8'), newToken);
-    if (process.platform !== 'win32') {
-      assert.equal(fs.statSync(crateDir).mode & 0o777, 0o700);
-      assert.equal(fs.statSync(tokenPath).mode & 0o777, 0o600);
-    }
-    assert.equal(output.includes(oldToken), false);
-    assert.equal(output.includes(newToken), false);
-  } finally {
-    fs.rmSync(tempHome, { recursive: true, force: true });
-  }
+  assert.equal(normalizedHtml.includes('~/.crate/figma-token'), false);
+  assert.equal(parserSource.includes('~/.crate/figma-token'), false);
+  assert.equal(parserSource.includes('Or save to:'), false);
 });
 
 test('_fetchAPI redacts network and status failures before throwing', async () => {
@@ -128,7 +96,7 @@ test('_fetchAPI redacts network and status failures before throwing', async () =
         statusText: FIGMA_SENSITIVE_ERROR
       };
     };
-    const FigmaParser = loadFigmaParserWithHome(tempHome, { fetchImpl });
+    const FigmaParser = loadFigmaParser({ fetchImpl });
     const parser = new FigmaParser();
 
     await assert.rejects(
@@ -152,6 +120,56 @@ test('_fetchAPI redacts network and status failures before throwing', async () =
         return true;
       }
     );
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('verifyTokenCandidate validates before storage and returns only privacy-safe status', async () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-candidate-token-'));
+  const candidateToken = 'CANDIDATE_TOKEN_SHOULD_NOT_LEAK';
+
+  try {
+    let status = 200;
+    const fetchImpl = async () => ({
+      ok: status === 200,
+      status,
+      json: async () => ({ id: 'user-id', email: 'private@example.test' }),
+    });
+    const FigmaParser = loadFigmaParser({ fetchImpl });
+    const parser = new FigmaParser();
+
+    assert.deepEqual(await parser.verifyTokenCandidate(candidateToken), { valid: true });
+
+    status = 401;
+    const { result, output } = await captureConsole(() => parser.verifyTokenCandidate(candidateToken));
+    assert.deepEqual(result, { valid: false, reason: 'invalid-token' });
+    assert.equal(output.includes(candidateToken), false);
+    assert.equal(JSON.stringify(result).includes(candidateToken), false);
+    assert.equal(JSON.stringify(result).includes('private@example.test'), false);
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('verifyTokenCandidate rejects oversized input before a network request', async () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-candidate-limit-'));
+  let requestCount = 0;
+
+  try {
+    const FigmaParser = loadFigmaParser({
+      fetchImpl: async () => {
+        requestCount += 1;
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    const parser = new FigmaParser();
+
+    assert.deepEqual(
+      await parser.verifyTokenCandidate('x'.repeat(8193)),
+      { valid: false, reason: 'invalid-token' }
+    );
+    assert.equal(requestCount, 0);
   } finally {
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

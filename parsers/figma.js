@@ -12,20 +12,19 @@
  *
  * AUTHENTICATION:
  * Figma API requires a Personal Access Token (PAT).
- * Token is stored using keytar (macOS Keychain) if available,
- * or falls back to ~/.crate/figma-token file or FIGMA_PAT env var.
+ * The Electron app supplies a macOS Keychain-backed credential store.
+ * FIGMA_PAT remains available as a non-persisted development override.
  */
 
 'use strict';
 
 const { BaseParser } = require('./base');
+const { normalizeToken } = require('./figma-credential-store');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 
-// Try to load optional dependencies
+// Try to load the optional fetch implementation.
 let fetch = null;
-let keytar = null;
 
 try {
   fetch = require('node-fetch');
@@ -36,14 +35,8 @@ if (!fetch && typeof globalThis.fetch === 'function') {
   fetch = globalThis.fetch.bind(globalThis);
 }
 
-try {
-  keytar = require('keytar');
-} catch (e) {
-  // keytar not installed — will use file-based fallback
-}
-
 const FIGMA_API_BASE = 'https://api.figma.com/v1';
-const TOKEN_FILE_PATH = path.join(os.homedir(), '.crate', 'figma-token');
+let configuredCredentialStore = null;
 
 function figmaParserText(value) {
   if (value instanceof Error) return value.message || '';
@@ -276,6 +269,15 @@ function summarizeFigmaCandidateDiagnostics({
 }
 
 class FigmaParser extends BaseParser {
+  constructor(options = {}) {
+    super();
+    this.credentialStore = options.credentialStore || configuredCredentialStore;
+  }
+
+  static configureCredentialStore(credentialStore) {
+    configuredCredentialStore = credentialStore || null;
+  }
+
   /**
    * Figma-specific dedupe.
    * Base parser dedupe is path-based, but Figma assets are URL/imageRef objects.
@@ -311,80 +313,25 @@ class FigmaParser extends BaseParser {
 
   /**
    * Get stored Figma Personal Access Token.
-   * Tries multiple sources in order:
-   *   1. macOS Keychain (via keytar)
-   *   2. FIGMA_PAT environment variable
-   *   3. ~/.crate/figma-token file
-   *
    * @returns {Promise<string|null>}
    */
   async getStoredToken() {
-    // Try keytar first (secure storage)
-    if (keytar) {
-      try {
-        const token = await keytar.getPassword('crate-app', 'figma-pat');
-        if (token) return token;
-      } catch (e) {
-        // Keytar failed — continue to fallbacks
-      }
+    if (this.credentialStore && typeof this.credentialStore.getToken === 'function') {
+      return this.credentialStore.getToken();
     }
-
-    // Try environment variable
-    if (process.env.FIGMA_PAT) {
-      return process.env.FIGMA_PAT;
-    }
-
-    // Try file-based storage
-    try {
-      if (fs.existsSync(TOKEN_FILE_PATH)) {
-        const token = fs.readFileSync(TOKEN_FILE_PATH, 'utf8').trim();
-        if (token) return token;
-      }
-    } catch (e) {
-      // File read failed
-    }
-
-    return null;
+    return typeof process.env.FIGMA_PAT === 'string' && process.env.FIGMA_PAT.trim()
+      ? process.env.FIGMA_PAT.trim()
+      : null;
   }
 
   /**
    * Store Figma Personal Access Token.
-   * Tries keytar first, falls back to file storage.
-   *
    * @param {string} token - Figma PAT to store
    * @returns {Promise<boolean>} - true if stored successfully
    */
   async storeToken(token) {
-    if (!token || typeof token !== 'string') return false;
-
-    // Try keytar first (secure storage)
-    if (keytar) {
-      try {
-        await keytar.setPassword('crate-app', 'figma-pat', token);
-        return true;
-      } catch (e) {
-        // Keytar failed — fall back to file storage
-      }
-    }
-
-    // Fall back to file storage
-    try {
-      const dir = path.dirname(TOKEN_FILE_PATH);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      }
-      try {
-        fs.chmodSync(dir, 0o700);
-      } catch (chmodDirError) {
-        console.warn(`[crate][figma] could not harden token directory permissions: ${redactFigmaParserText(chmodDirError.message)}`);
-      }
-      fs.writeFileSync(TOKEN_FILE_PATH, token, { mode: 0o600 });
-      fs.chmodSync(TOKEN_FILE_PATH, 0o600);
-      return true;
-    } catch (e) {
-      console.warn(`[crate][figma] could not store token securely: ${redactFigmaParserText(e.message)}`);
-      return false;
-    }
+    if (!this.credentialStore || typeof this.credentialStore.storeToken !== 'function') return false;
+    return this.credentialStore.storeToken(token);
   }
 
   /**
@@ -393,29 +340,8 @@ class FigmaParser extends BaseParser {
    * @returns {Promise<boolean>} - true if deleted successfully
    */
   async deleteToken() {
-    let deleted = false;
-
-    // Try keytar
-    if (keytar) {
-      try {
-        await keytar.deletePassword('crate-app', 'figma-pat');
-        deleted = true;
-      } catch (e) {
-        // Ignore
-      }
-    }
-
-    // Also try file
-    try {
-      if (fs.existsSync(TOKEN_FILE_PATH)) {
-        fs.unlinkSync(TOKEN_FILE_PATH);
-        deleted = true;
-      }
-    } catch (e) {
-      // Ignore
-    }
-
-    return deleted;
+    if (!this.credentialStore || typeof this.credentialStore.deleteToken !== 'function') return false;
+    return this.credentialStore.deleteToken();
   }
 
   /**
@@ -440,8 +366,7 @@ class FigmaParser extends BaseParser {
         'Example URL: https://www.figma.com/file/ABC123/My-File\n\n' +
         'To use the Figma API:\n' +
         '  1. Generate a Personal Access Token at https://www.figma.com/developers/api#access-tokens\n' +
-        '  2. Store it with: export FIGMA_PAT="your-token-here"\n' +
-        '     Or save to: ~/.crate/figma-token'
+        '  2. Connect Figma from Crate Settings.'
       );
     }
 
@@ -464,10 +389,7 @@ class FigmaParser extends BaseParser {
         'Setup instructions:\n' +
         '  1. Generate a Personal Access Token at:\n' +
         '     https://www.figma.com/developers/api#access-tokens\n\n' +
-        '  2. Store your token using one of these methods:\n' +
-        '     • Environment variable: export FIGMA_PAT="your-token-here"\n' +
-        '     • Token file: echo "your-token" > ~/.crate/figma-token\n' +
-        '     • Programmatic: const parser = new FigmaParser(); await parser.storeToken("your-token");'
+        '  2. Connect Figma from Crate Settings.'
       );
     }
 
@@ -1166,6 +1088,28 @@ class FigmaParser extends BaseParser {
       };
     } catch (e) {
       return { valid: false, error: redactFigmaParserText(e.message) };
+    }
+  }
+
+  /**
+   * Verify a candidate token before replacing the stored credential.
+   * Returns only a privacy-safe result category.
+   */
+  async verifyTokenCandidate(token) {
+    const candidate = normalizeToken(token);
+    if (!candidate) {
+      return { valid: false, reason: 'invalid-token' };
+    }
+    if (!fetch) return { valid: false, reason: 'request-failed' };
+
+    try {
+      await this._fetchAPI('/me', candidate);
+      return { valid: true };
+    } catch (error) {
+      const reason = Number.isInteger(error && error._crateFigmaApiStatus)
+        ? figmaApiFailureReasonFromStatus(error._crateFigmaApiStatus)
+        : classifyFigmaParserFailure(error);
+      return { valid: false, reason };
     }
   }
 
