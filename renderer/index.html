@@ -444,12 +444,13 @@
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title">Edit Figma Link</div>
-          <div class="modal-subtitle">Paste a Figma file URL for this project, or clear it to remove the link.</div>
+          <div class="modal-subtitle">Adjust the scope, or paste a new Figma URL to replace the current link.</div>
         </div>
         <div class="modal-body">
           <div class="form-field">
-            <div class="app-label">Figma URL</div>
+            <div class="app-label">Replace Figma URL (optional)</div>
             <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
+            <div class="form-subtitle" style="margin-top:6px;">Leave blank to keep the current link.</div>
           </div>
           <div class="form-field">
             <div class="app-label">Scope</div>
@@ -460,6 +461,7 @@
           </div>
           <div id="edit-figma-error" style="font-size:12px;color:#f87171;margin-bottom:8px;display:none;"></div>
           <div class="modal-actions">
+            <button class="modal-btn-danger" id="btn-edit-figma-remove">Remove Link</button>
             <button class="modal-btn-secondary" id="btn-edit-figma-cancel">Cancel</button>
             <button class="modal-btn-primary" id="btn-edit-figma-save">Save</button>
           </div>

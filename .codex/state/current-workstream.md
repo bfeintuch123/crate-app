@@ -1,6 +1,6 @@
 # Crate Current Workstream
 
-Last updated: 2026-07-12
+Last updated: 2026-07-14
 
 ## Current Status
 
@@ -10,9 +10,10 @@ Last updated: 2026-07-12
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: `v3.0.0-beta.1` remains the tester beta. Crate Ops PR #9 and Crate app PR #126 are merged. The privacy-safe attention queue and bounded support, calendar, and business routes are canonical. Chief-of-staff learning and workflow evaluation are the active ops-only improvement.
-- Active ops branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app catalog `codex/chief-of-staff-learning-evals-catalog`
-- Current ops work: explicit decision-backed preferences, pinned synthetic workflow evaluations, evidence-bound locally signed aggregate outcome receipts, and advisory model/agent routing. Crate Ops PR #10 and dependent Crate app PR #127 are clean and mergeable; plugin CI and the 103-test local suite pass. Merge #10 before #127 only after Bryant approval. No live inbox/calendar/tester data, app runtime, release, deploy, model switching, paid usage, or automatic agent creation is in scope.
+- Current phase: user-data security hardening. Phase 1 PR #128 and Phase 2A PR #129 are merged; the Phase 2A Mac mini credential smoke passed. Phase 2B Figma link and identifier privacy is committed in `64b4263`, pushed, and open as PR #130. Merge-readiness is clean and merge approval is pending.
+- Active app branch: `codex/security-figma-link-privacy`
+- Current security work: complete Figma URLs are transient input only; persisted project state keeps the minimal locator needed for existing API and scope behavior. Legacy links migrate automatically, renderer editing does not expose saved URLs, removal is explicit, and logs and optional diagnostics minimize Figma identifiers. Current Page Only, Entire File opt-in, package selection, watcher scope, parser result shape, provenance relationships, quota, dependencies, and release state remain unchanged.
+- Phase 2B final local proof: 251/251 dependency-complete tests, 107/107 focused tests, and 107/107 tests in a fresh exact-base Reprobox passed. Independent functional review and final adversarial security re-review returned no findings. Syntax, whitespace, frozen-file, audit, runtime-allowlist, and complete-patch application checks passed; no dependency, build, release, or deploy mutation occurred.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

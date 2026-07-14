@@ -45,6 +45,17 @@ async function captureConsole(fn) {
   }
 }
 
+const COMPOUND_COOKIE_VALUE = 'opaqueRefreshValue123';
+const JSON_COOKIE_VALUE = 'opaqueJsonValue456';
+const JSON_AUTH_VALUE = 'opaqueAuthValue789';
+const JSON_ACCESS_TOKEN_VALUE = 'opaqueAccessValue123';
+const JSON_REFRESH_TOKEN_VALUE = 'opaqueRefreshToken456';
+const JSON_CLIENT_SECRET_VALUE = 'opaqueClientSecret789';
+const JSON_API_KEY_VALUE = 'opaqueApiKey246';
+const JSON_AUTH_HEADER_VALUE = 'opaqueAuthHeader135';
+const JSON_AUTHORIZATION_HEADER_VALUE = 'neutralOpaqueValue864';
+const SPACED_PRIVATE_PATH = '/private/tmp/neutral client/file.fig';
+
 const FIGMA_SENSITIVE_ERROR = [
   'request failed',
   'https://api.figma.com/v1/files/FILEKEY?token=SHOULD_NOT_LEAK',
@@ -52,7 +63,11 @@ const FIGMA_SENSITIVE_ERROR = [
   'Authorization: Bearer SHOULD_NOT_LEAK',
   'cookie=SHOULD_NOT_LEAK',
   'X-Figma-Token SHOULD_NOT_LEAK',
-  '/Users/designer/private/client/file.fig'
+  `Cookie: sid=one; refresh=${COMPOUND_COOKIE_VALUE}; region=us-east`,
+  `{"cookie":"${JSON_COOKIE_VALUE}","Authorization":"Bearer ${JSON_AUTH_VALUE}"}`,
+  `{"accessToken":"${JSON_ACCESS_TOKEN_VALUE}","refresh_token":"${JSON_REFRESH_TOKEN_VALUE}","clientSecret":"${JSON_CLIENT_SECRET_VALUE}","apiKey":"${JSON_API_KEY_VALUE}","authHeader":"${JSON_AUTH_HEADER_VALUE}","authorizationHeader":"${JSON_AUTHORIZATION_HEADER_VALUE}"}`,
+  '/Users/designer/private/client/file.fig',
+  `"${SPACED_PRIVATE_PATH}"`,
 ].join(' ');
 
 function assertNoFigmaSecrets(text) {
@@ -64,8 +79,45 @@ function assertNoFigmaSecrets(text) {
   assert.equal(/\bBearer\b/i.test(text), false);
   assert.equal(/\bcookie\b/i.test(text), false);
   assert.equal(/\bX-Figma-Token\b/i.test(text), false);
+  assert.equal(text.includes(COMPOUND_COOKIE_VALUE), false);
+  assert.equal(text.includes(JSON_COOKIE_VALUE), false);
+  assert.equal(text.includes(JSON_AUTH_VALUE), false);
+  assert.equal(text.includes(JSON_ACCESS_TOKEN_VALUE), false);
+  assert.equal(text.includes(JSON_REFRESH_TOKEN_VALUE), false);
+  assert.equal(text.includes(JSON_CLIENT_SECRET_VALUE), false);
+  assert.equal(text.includes(JSON_API_KEY_VALUE), false);
+  assert.equal(text.includes(JSON_AUTH_HEADER_VALUE), false);
+  assert.equal(text.includes(JSON_AUTHORIZATION_HEADER_VALUE), false);
   assert.equal(text.includes('/Users/designer/private/client/file.fig'), false);
+  assert.equal(text.includes(SPACED_PRIVATE_PATH), false);
+  assert.equal(text.includes('neutral client/file.fig'), false);
+  assert.equal(text.includes('client/file.fig'), false);
 }
+
+test('shared Figma redactor removes compound JSON credential values', () => {
+  const { redactUrlAndCredentialText } = require('../parsers/figma-redaction');
+  const input = JSON.stringify({
+    accessToken: JSON_ACCESS_TOKEN_VALUE,
+    refresh_token: JSON_REFRESH_TOKEN_VALUE,
+    clientSecret: JSON_CLIENT_SECRET_VALUE,
+    apiKey: JSON_API_KEY_VALUE,
+    authHeader: JSON_AUTH_HEADER_VALUE,
+    authorizationHeader: JSON_AUTHORIZATION_HEADER_VALUE,
+  });
+  const output = redactUrlAndCredentialText(input);
+
+  for (const forbidden of [
+    JSON_ACCESS_TOKEN_VALUE,
+    JSON_REFRESH_TOKEN_VALUE,
+    JSON_CLIENT_SECRET_VALUE,
+    JSON_API_KEY_VALUE,
+    JSON_AUTH_HEADER_VALUE,
+    JSON_AUTHORIZATION_HEADER_VALUE,
+  ]) {
+    assert.equal(output.includes(forbidden), false);
+  }
+  assert.match(output, /redacted-credential/);
+});
 
 test('renderer Figma token privacy hint accurately describes local storage and API usage', () => {
   const rendererHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
@@ -220,9 +272,11 @@ test('parser-level Figma logs and returned errors redact request details', async
   assertNoFigmaSecrets(metadata.output);
 
   const discovery = await captureConsole(() => parser.discoverRecentFiles({ teamIds: ['TEAM123'] }));
-  assert.match(discovery.output, /Cannot access team TEAM123/);
+  assert.match(discovery.output, /Cannot access the configured Figma team/);
+  assert.equal(discovery.output.includes('TEAM123'), false);
   assertNoFigmaSecrets(discovery.output);
   assertNoFigmaSecrets(JSON.stringify(discovery.result.errors));
+  assert.equal(JSON.stringify(discovery.result.errors).includes('TEAM123'), false);
   assert.match(JSON.stringify(discovery.result.errors), /Figma API request failed|redacted/);
 
   const extraction = await captureConsole(() => parser.extractAssetsFromFileKey('FILEKEY'));
@@ -242,7 +296,10 @@ test('autoTrackScan redacts aggregated parser extraction errors and warnings', a
     async discoverRecentFiles() {
       return {
         recentFiles: [{ key: 'FILEKEY', name: 'Tracked File', isTracked: true }],
-        errors: [`Discovery warning ${FIGMA_SENSITIVE_ERROR}`]
+        errors: [
+          `Discovery warning ${FIGMA_SENSITIVE_ERROR}`,
+          `Private path warning "${SPACED_PRIVATE_PATH}"`,
+        ]
       };
     }
 

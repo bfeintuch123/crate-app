@@ -329,9 +329,13 @@ test('metadata failure does not block direct tracked current-page extraction', a
   assert.equal(result.scopeEntries.length, 1);
   assert.equal(result.scopeEntries[0].lockStatus, 'locked');
   assert.equal(result.scopeEntries[0].lockedPageName, 'Page One');
-  assert.ok(result.errors.some(error => String(error).includes('Metadata fetch failed for tracked file Petra_logo-File_123')));
+  assert.ok(result.errors.some(error => String(error).includes(
+    'Metadata fetch failed for a tracked Figma file; proceeding to extraction anyway.'
+  )));
 
   const serialized = `${JSON.stringify(result)}\n${output}`;
+  const diagnosticText = `${JSON.stringify(result.errors)}\n${output}`;
+  assert.equal(diagnosticText.includes(MODERN_FILE_KEY), false);
   assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
   assert.equal(serialized.includes('https://figma.example'), false);
 });
@@ -484,8 +488,9 @@ test('figma image resolution logs omit raw CDN URLs and signed query material', 
 
   assert.equal(result.assets.length, 1);
   assert.match(result.assets[0].url, /^https:\/\/cdn\.figma\.example\//);
-  assert.match(output, /imageRefs found \(1\): img-ref-page-one/);
-  assert.match(output, /image URLs resolved \(1\) for imageRefs: img-ref-page-one/);
+  assert.match(output, /imageRefs found \(1\)/);
+  assert.match(output, /image URLs resolved \(1\)/);
+  assert.equal(output.includes('img-ref-page-one'), false);
   assert.equal(output.includes(result.assets[0].url), false);
   assert.equal(output.includes('https://'), false);
   assert.equal(/cdn\.figma\.example/i.test(output), false);
