@@ -35,6 +35,7 @@ test('electron-builder uses the explicit Crate runtime allowlist', () => {
 });
 
 test('packaged-content policy accepts the required runtime and dependencies', () => {
+  assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-credential-store.js'), true);
   const result = inspectAsarEntries([
     '/assets',
     '/renderer',

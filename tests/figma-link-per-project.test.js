@@ -197,6 +197,8 @@ setStub('node-fetch', () => (...args) => fetchHandler(...args));
 // polling deterministic instead of depending on the developer machine.
 const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
 let storedFigmaToken = null;
+let nextFigmaTokenVerification = { valid: true };
+let nextFigmaStoreResult = true;
 let nextFigmaScanResult = null;
 let lastFigmaScanOptions = null;
 let figmaScanInvocationCount = 0;
@@ -208,8 +210,13 @@ class TestFigmaParser extends RealFigmaParser {
 
   async storeToken(token) {
     if (!token || typeof token !== 'string') return false;
+    if (!nextFigmaStoreResult) return false;
     storedFigmaToken = token;
     return true;
+  }
+
+  async verifyTokenCandidate() {
+    return { ...nextFigmaTokenVerification };
   }
 
   async deleteToken() {
@@ -284,6 +291,8 @@ async function resetProjects() {
 
 async function cleanupProjectsAndTimers() {
   storedFigmaToken = null;
+  nextFigmaTokenVerification = { valid: true };
+  nextFigmaStoreResult = true;
   nextFigmaScanResult = null;
   lastFigmaScanOptions = null;
   figmaScanInvocationCount = 0;
@@ -754,6 +763,27 @@ test('figma:connect starts polling for linked watching projects', async () => {
   const disconnected = await callIpc('figma:disconnect');
   assert.equal(disconnected.success, true);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('figma:connect keeps the working token when a replacement is invalid', async () => {
+  storedFigmaToken = 'WORKING_TOKEN_VALUE';
+  nextFigmaTokenVerification = { valid: false, reason: 'invalid-token' };
+
+  const connected = await callIpc('figma:connect', 'INVALID_REPLACEMENT_VALUE');
+
+  assert.deepEqual(connected, { success: false, error: 'invalid_token' });
+  assert.equal(storedFigmaToken, 'WORKING_TOKEN_VALUE');
+});
+
+test('figma:connect keeps the working token when secure storage is unavailable', async () => {
+  storedFigmaToken = 'WORKING_TOKEN_VALUE';
+  nextFigmaTokenVerification = { valid: true };
+  nextFigmaStoreResult = false;
+
+  const connected = await callIpc('figma:connect', 'VALID_REPLACEMENT_VALUE');
+
+  assert.deepEqual(connected, { success: false, error: 'secure_storage_unavailable' });
+  assert.equal(storedFigmaToken, 'WORKING_TOKEN_VALUE');
 });
 
 test('figma:status counts linked watching projects separately from active pollers', async () => {

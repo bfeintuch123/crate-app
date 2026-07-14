@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-build-containment`
+- branch: `codex/security-figma-credentials`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 implementation and non-release packaged-app proof complete; PR #128 open and merge approval pending
+- status: phase 1 merged; phase 2A PR #129 open, clean, and mergeable; merge approval pending
 
 ## Goal
 
@@ -29,12 +29,13 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: 1, build containment
-- baseline artifact: 538 MiB app, 252 MiB ASAR, 3,413 ASAR entries
-- baseline finding: 556 entries were outside Crate's runtime roots, including `.env`, internal operations documents, tests, and website or mission-control sources
-- intended runtime roots: `main.js`, `preload.js`, `provenance.js`, `renderer/`, runtime parser JavaScript, tray icon, `package.json`, and production dependencies
+- phase: 2A, Figma credential storage
+- credential target: Electron `safeStorage`, backed by macOS Keychain protection
+- legacy source: `~/.crate/figma-token`, migrated silently only after the main window is visible
+- failure behavior: fail closed without deleting the legacy credential when encryption, verification, or migration cannot complete safely
 - package-engine impact: none
-- user-workflow impact: none
+- Figma scope impact: none; Current Page Only remains default and Entire File remains opt-in
+- normal user-workflow impact: none; valid existing connections migrate automatically and replacement credentials are verified before storage
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -52,7 +53,12 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] non-release packaged-app verification after separate build approval
 - [x] autoreview, regression, security, provenance, and merge-readiness review
 - [x] Bryant approval for commit, push, and PR creation
-- [ ] Bryant approval for merge or next security phase
+- [x] Bryant approval and merge of phase 1 PR #128
+- [x] phase 2A failure-first tests and narrow implementation
+- [x] phase 2A autoreview, regression, security, provenance, runner, and isolated Reprobox validation
+- [x] Bryant approval for phase 2A commit, push, and PR creation
+- [x] phase 2A committed, pushed, and opened as PR #129 against `v2.4.x`
+- [ ] Bryant approval to merge PR #129
 
 ## Stop Gates
 
@@ -63,7 +69,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Request Bryant approval to merge PR #128. Do not begin the Figma credential-storage phase until phase 1 is merged and separately approved.
+Request Bryant approval to merge PR #129 after final GitHub review. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase.
 
 ## Phase 1 Evidence
 
@@ -81,3 +87,17 @@ Request Bryant approval to merge PR #128. Do not begin the Figma credential-stor
 - isolated-profile launch created one visible Crate window and exited cleanly; no load, renderer, or crash errors were emitted
 - the only launch log was Electron's existing `punycode` deprecation warning
 - temporary proof artifact: `/private/tmp/crate-security-build-output-20260714/mac-arm64/Crate.app`
+
+## Phase 2A Evidence
+
+- new credential store encrypts the Figma credential with Electron `safeStorage` and keeps only the encrypted blob under the app's user-data directory
+- the legacy plaintext credential migrates silently after visible-window startup; it is deleted only after encrypted round-trip verification and unchanged-file checks
+- unavailable encryption, corrupt encrypted data, symlinked paths, changed legacy content, failed storage, and failed token verification all fail closed without exposing or overwriting the working credential
+- a replacement credential is validated against Figma `/v1/me` before it replaces the stored connection
+- renderer copy and errors remain nontechnical and privacy-safe; no extra normal connection step was added
+- full deterministic suite: 239 passed, 0 failed with `--test-concurrency=1`
+- focused credential, Figma-link, and privacy suite: 51 passed, 0 failed
+- isolated Reprobox credential, Figma-link, lifecycle, and packaged-content suite: 61 passed, 0 failed
+- package, provenance, watcher, parser-result, quota, dependencies, and lockfiles were not changed
+- `npm audit --audit-level=high`: exit 0 with the pre-existing moderate `uuid` advisory only
+- no build, signing, notarization, release, or deployment was run
