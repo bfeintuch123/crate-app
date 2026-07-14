@@ -10,7 +10,7 @@
 - branch: `codex/security-figma-link-privacy`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 and phase 2A merged; phase 2A Mac mini QA passed; phase 2B implementation and validation complete; commit, push, and PR approval pending
+- status: phase 1 and phase 2A merged; phase 2A Mac mini QA passed; phase 2B PR #130 is open and merge-readiness is clean; merge approval pending
 
 ## Goal
 
@@ -64,7 +64,7 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 2A Mac mini credential migration and connection smoke
 - [x] phase 2B failure-first tests and narrow implementation
 - [x] phase 2B autoreview, regression, security, provenance, runner, and isolated Reprobox validation
-- [ ] Bryant approval for phase 2B commit, push, and PR creation
+- [x] Bryant approval for phase 2B commit, push, and PR creation
 
 ## Stop Gates
 
@@ -75,7 +75,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Request Bryant approval to commit, push, and open the phase 2B PR against `v2.4.x`. Stop before commit, push, PR creation, merge, build, signing, notarization, release mutation, site deployment, or the next security phase without the applicable approval.
+Request Bryant approval to merge Phase 2B PR #130 into `v2.4.x`. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase without the applicable approval.
 
 ## Phase 1 Evidence
 
