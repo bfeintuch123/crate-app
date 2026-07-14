@@ -5,7 +5,9 @@
   "description": "Universal project file packager for graphic designers — macOS desktop app",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test:app-contents": "node --test tests/app-content-policy.test.js",
+    "verify:app-contents": "node scripts/verify-app-contents.js"
   },
   "dependencies": {
     "ag-psd": "^30.1.0",
@@ -24,6 +26,14 @@
   },
   "build": {
     "appId": "com.crate.app",
+    "files": [
+      "main.js",
+      "preload.js",
+      "provenance.js",
+      "renderer/**/*",
+      "parsers/*.js",
+      "assets/tray-icon.png"
+    ],
     "afterPack": "scripts/patch-helper-info-plists.js",
     "afterSign": "scripts/notarize.js",
     "mac": {

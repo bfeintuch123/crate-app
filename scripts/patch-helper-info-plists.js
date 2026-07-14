@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { verifyPackagedAppContents } = require('./verify-app-contents');
 
 const APPLE_EVENTS_USAGE_DESCRIPTION = 'Crate uses Automation to read open design documents and linked assets from apps like Adobe Illustrator while you are actively watching a project.';
 const APPLE_EVENTS_USAGE_KEY = 'NSAppleEventsUsageDescription';
@@ -87,6 +88,10 @@ async function afterPack(context) {
   const appBundlePath = resolveAppBundlePath(context);
   if (!appBundlePath) return;
   patchHelperInfoPlists(appBundlePath);
+  const verifyContents = typeof context.verifyPackagedContents === 'function'
+    ? context.verifyPackagedContents
+    : verifyPackagedAppContents;
+  verifyContents(appBundlePath);
 }
 
 module.exports = afterPack;
