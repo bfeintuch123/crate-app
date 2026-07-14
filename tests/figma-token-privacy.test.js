@@ -119,6 +119,110 @@ test('shared Figma redactor removes compound JSON credential values', () => {
   assert.match(output, /redacted-credential/);
 });
 
+test('shared Figma redactor removes complete private paths containing spaces or delimiters', () => {
+  const { redactPrivatePathText } = require('../parsers/figma-redaction');
+  const cases = [
+    {
+      input: 'Could not read /Users/synthetic/Private Project/file.fig while scanning project.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /Volumes/Client Drive/Assets/hero image.psd; retry later.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /private/tmp/QA Folder/file.ai (permission denied).',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /var/folders/qa/Client.v2 Assets/slide 1.pptx after extraction.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: "Could not read /Users/synthetic/Designer's Work/Client (Final)/hero.v2 final.fig after scanning.",
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read `/tmp/QA Folder/file name.fig` during scan.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /private/var/QA Folder/file name.indd before packaging.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /Users/synthetic/Private Project/Extensionless File while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Paths /Users/synthetic/First Project/file.fig and /Volumes/Client Drive/second file.psd failed.',
+      expected: 'Paths [redacted-path]',
+    },
+    {
+      input: "ENOENT: open '/tmp/synthetic/Designer's Work/file.fig'",
+      expected: 'ENOENT: open [redacted-path]',
+    },
+    {
+      input: 'Could not read "/tmp/synthetic/Client "Final"/file.fig" while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read `/tmp/synthetic/Client `Final/file.fig` while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /tmp/synthetic/Private\nProject/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /tmp/synthetic/Private\r\nProject/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /users/synthetic/Private Project/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /VOLUMES/Client Drive/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /PRIVATE/TMP/QA Folder/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+    {
+      input: 'Could not read /VAR/folders/qa/file.fig while scanning.',
+      expected: 'Could not read [redacted-path]',
+    },
+  ];
+
+  for (const { input, expected } of cases) {
+    const output = redactPrivatePathText(input);
+    assert.equal(output, expected);
+    assert.equal(output.includes('Project/file.fig'), false);
+    assert.equal(output.includes('Drive/Assets'), false);
+    assert.equal(output.includes('QA Folder'), false);
+    assert.equal(output.includes('Client.v2 Assets'), false);
+    assert.equal(output.includes("Designer's Work"), false);
+    assert.equal(output.includes('file name'), false);
+    assert.equal(output.includes('Extensionless File'), false);
+    assert.equal(output.includes('second file.psd'), false);
+    assert.equal(output.includes("s Work/file.fig"), false);
+    assert.equal(output.includes('Final/file.fig'), false);
+  }
+});
+
+test('shared Figma redactor handles long ambiguous input without exposing a private suffix', () => {
+  const { redactPrivatePathText } = require('../parsers/figma-redaction');
+  const input = `${'prefix /UsersSynthetic segment '.repeat(5000)}`
+    + 'Could not read /Users/synthetic/Private Project/hero.v2 final.fig after scanning.';
+  const output = redactPrivatePathText(input);
+
+  assert.equal(output.endsWith('Could not read [redacted-path]'), true);
+  assert.equal(output.includes('Private Project'), false);
+  assert.equal(output.includes('final.fig'), false);
+});
+
 test('renderer Figma token privacy hint accurately describes local storage and API usage', () => {
   const rendererHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const parserSource = fs.readFileSync(path.join(__dirname, '..', 'parsers', 'figma.js'), 'utf8');

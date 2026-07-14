@@ -19,7 +19,6 @@ const CREDENTIAL_KEYS = [
 const HEADER_KEYS = 'Authorization|X-Figma-Token|Cookie|Set-Cookie';
 const SENSITIVE_KEY_FRAGMENT =
   'token|secret|authorization|authentication|bearer|cookie|auth|password|credential|signature|api[_-]?key';
-const PRIVATE_PATH_ROOT = String.raw`(?:/Users|/Volumes|/private/(?:tmp|var)|/tmp|/var)`;
 
 const compoundQuotedCredential = new RegExp(
   String.raw`(["'])[^"'\\\r\n]*(?:${SENSITIVE_KEY_FRAGMENT})[^"'\\\r\n]*\1\s*:\s*(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*')`,
@@ -29,9 +28,8 @@ const compoundUnquotedCredential = new RegExp(
   String.raw`\b[A-Za-z0-9._-]*(?:${SENSITIVE_KEY_FRAGMENT})[A-Za-z0-9._-]*\b\s*[:=]\s*[^,;)}\]\r\n]+`,
   'gi'
 );
-const doubleQuotedPrivatePath = new RegExp(String.raw`"${PRIVATE_PATH_ROOT}/[^"\r\n]*"`, 'g');
-const singleQuotedPrivatePath = new RegExp(String.raw`'${PRIVATE_PATH_ROOT}/[^'\r\n]*'`, 'g');
-const unquotedPrivatePath = new RegExp(String.raw`${PRIVATE_PATH_ROOT}/[^\s"'<>),]+`, 'g');
+// Delimiters and line breaks may appear in filenames, so redact the value tail.
+const privatePathTail = /["'`]?(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[\s\S]*/i;
 
 const quotedCredential = new RegExp(
   `(["']?)(?:${CREDENTIAL_KEYS})\\1\\s*:\\s*(?:"(?:\\\\.|[^"\\\\\\r\\n])*"|'(?:\\\\.|[^'\\\\\\r\\n])*')`,
@@ -62,10 +60,7 @@ function redactUrlAndCredentialText(value) {
 }
 
 function redactPrivatePathText(value) {
-  return String(value)
-    .replace(doubleQuotedPrivatePath, '"[redacted-path]"')
-    .replace(singleQuotedPrivatePath, "'[redacted-path]'")
-    .replace(unquotedPrivatePath, '[redacted-path]');
+  return String(value).replace(privatePathTail, '[redacted-path]');
 }
 
 module.exports = { redactUrlAndCredentialText, redactPrivatePathText };

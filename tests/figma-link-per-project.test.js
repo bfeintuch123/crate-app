@@ -143,6 +143,7 @@ const electronStub = {
 setStub('electron', () => electronStub);
 
 // In-memory electron-store double.
+const fakeStoreSetHistory = [];
 class FakeStore {
   constructor(opts = {}) { this.data = JSON.parse(JSON.stringify(opts.defaults || {})); }
   get(key, fallback) {
@@ -156,7 +157,11 @@ class FakeStore {
     return cur === undefined ? fallback : cur;
   }
   set(key, value) {
-    if (typeof key === 'object') { Object.assign(this.data, key); return; }
+    if (typeof key === 'object') {
+      Object.assign(this.data, key);
+      fakeStoreSetHistory.push({ key: null, value: JSON.parse(JSON.stringify(key)) });
+      return;
+    }
     const parts = key.split('.');
     let cur = this.data;
     for (let i = 0; i < parts.length - 1; i++) {
@@ -164,6 +169,7 @@ class FakeStore {
       cur = cur[parts[i]];
     }
     cur[parts[parts.length - 1]] = value;
+    fakeStoreSetHistory.push({ key, value: JSON.parse(JSON.stringify(value)) });
   }
   delete(key) {
     const parts = key.split('.');
@@ -335,6 +341,7 @@ async function cleanupProjectsAndTimers() {
   clearTrackedTimers();
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
   fs.mkdirSync(TEST_HOME, { recursive: true });
+  fakeStoreSetHistory.length = 0;
 }
 
 test.afterEach(cleanupProjectsAndTimers);
@@ -839,6 +846,7 @@ test('legacy migration drops malformed keys and untrusted scope identifiers', as
   );
   const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   const opaqueValue = 'OPAQUE_LEGACY_SCOPE_VALUE';
+  const privatePath = '/uSeRs/synthetic/Private\r\nProject/file.fig';
   legacy.figmaTrackedFiles = [
     `https://attacker.example/${opaqueValue}`,
     { key: `Authorization:Bearer-${opaqueValue}` },
@@ -848,7 +856,10 @@ test('legacy migration drops malformed keys and untrusted scope identifiers', as
     scopeMode: 'current-page',
     startedAt: legacy.watchStartedAt,
     teamIds: [],
-    sessionWarnings: [`Authorization: Bearer ${opaqueValue}`],
+    sessionWarnings: [
+      `Authorization: Bearer ${opaqueValue}`,
+      `Could not read ${privatePath} while scanning project.`,
+    ],
     trackedFiles: [{
       key: 'VALIDLOCATOR',
       requestedPageId: `Bearer ${opaqueValue}`,
@@ -866,12 +877,34 @@ test('legacy migration drops malformed keys and untrusted scope identifiers', as
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].scopeMode, 'current-page');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
-  assert.deepEqual(fresh.figmaSession.sessionWarnings, ['[redacted-credential]']);
+  assert.deepEqual(fresh.figmaSession.sessionWarnings, [
+    '[redacted-credential]',
+    'Could not read [redacted-path]',
+  ]);
   assert.equal(JSON.stringify(fresh).includes(opaqueValue), false);
   assert.equal(JSON.stringify(fresh).includes('attacker.example'), false);
+  assert.equal(JSON.stringify(fresh).includes(privatePath), false);
+  assert.equal(JSON.stringify(fresh).includes('Project/file.fig'), false);
+
+  const persistedProjectsWrite = [...fakeStoreSetHistory]
+    .reverse()
+    .find(entry => entry.key === 'projects');
+  assert.ok(persistedProjectsWrite, 'migration should persist the sanitized projects payload');
+  const persistedProject = JSON.parse(JSON.stringify(persistedProjectsWrite.value))
+    .find(item => item.id === project.id);
+  assert.ok(persistedProject);
+  assert.deepEqual(persistedProject.figmaSession.sessionWarnings, [
+    '[redacted-credential]',
+    'Could not read [redacted-path]',
+  ]);
+  assert.equal(JSON.stringify(persistedProject).includes(privatePath), false);
+  assert.equal(JSON.stringify(persistedProject).includes('Project/file.fig'), false);
 
   const migratedAgain = (await callIpc('projects:get-all')).find(item => item.id === project.id);
-  assert.deepEqual(migratedAgain.figmaSession.sessionWarnings, ['[redacted-credential]']);
+  assert.deepEqual(migratedAgain.figmaSession.sessionWarnings, [
+    '[redacted-credential]',
+    'Could not read [redacted-path]',
+  ]);
 });
 
 test('projects:set-figma-link starts a scan for a watching project with a connected token', async () => {
@@ -1764,10 +1797,10 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
 test('Figma scan failures are sanitized before renderer IPC', async () => {
   const sensitiveUrl = 'https://api.figma.com/v1/files/PRIVATEFILE?token=SHOULD_NOT_REACH_RENDERER';
   const opaqueCredential = 'OPAQUE_RENDERER_ACCESS_VALUE';
-  const privatePath = '/Users/designer/private/client/file.fig';
-  const temporaryPath = '/tmp/crate-private/client/file.fig';
-  const privateTemporaryPath = '/private/tmp/crate-private/client/file.fig';
-  const spacedPrivateTemporaryPath = '/private/tmp/neutral client/file.fig';
+  const privatePath = '/users/designer/private/client/file.fig';
+  const temporaryPath = '/TMP/crate-private/client/file.fig';
+  const privateTemporaryPath = '/PRIVATE/TMP/crate-private/client/file.fig';
+  const spacedPrivateTemporaryPath = '/private/TmP/neutral client/file.fig';
   const project = await callIpc(
     'projects:create',
     'Figma Renderer Error Privacy',
@@ -1777,7 +1810,7 @@ test('Figma scan failures are sanitized before renderer IPC', async () => {
   );
   storedFigmaToken = 'test-token';
   nextFigmaScanError = new Error(
-    `request failed ${sensitiveUrl} {"accessToken":"${opaqueCredential}"} ${privatePath} ${temporaryPath} ${privateTemporaryPath} "${spacedPrivateTemporaryPath}"`
+    `request failed ${sensitiveUrl} {"accessToken":"${opaqueCredential}"} ${privatePath} ${temporaryPath} ${privateTemporaryPath} ${spacedPrivateTemporaryPath} while scanning project.`
   );
 
   const activate = electronAppHandlers.get('activate');
