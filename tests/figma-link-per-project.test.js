@@ -92,16 +92,44 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 
 // ---------- IPC + Store + Electron stubs ----------
 const ipcHandlers = new Map();
+const electronAppHandlers = new Map();
+const rendererMessages = [];
+const existingRendererWindow = {
+  isDestroyed: () => false,
+  show: () => {},
+  focus: () => {},
+  webContents: {
+    send(channel, data) {
+      rendererMessages.push({ channel, data });
+    },
+  },
+};
+
+class BrowserWindowStub {
+  static getAllWindows() {
+    return [existingRendererWindow];
+  }
+
+  constructor() {}
+  on() {}
+  loadFile() {}
+  setPosition() {}
+  show() {}
+  focus() {}
+  isDestroyed() { return true; }
+  webContents = { send: () => {} };
+}
+
 const electronStub = {
   app: {
     requestSingleInstanceLock: () => true,
     quit: () => {},
     whenReady: () => ({ then: () => {} }),
-    on: () => {},
+    on(eventName, handler) { electronAppHandlers.set(eventName, handler); },
     getPath: () => path.join(__dirname, '..', '.test-userdata'),
     dock: { setMenu: () => {} },
   },
-  BrowserWindow: class { constructor() {} on() {} loadFile() {} setPosition() {} show() {} focus() {} isDestroyed() { return true; } webContents = { send: () => {} } },
+  BrowserWindow: BrowserWindowStub,
   Tray: class { constructor() {} on() {} setToolTip() {} isDestroyed() { return true; } destroy() {} },
   ipcMain: {
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
@@ -200,6 +228,7 @@ let storedFigmaToken = null;
 let nextFigmaTokenVerification = { valid: true };
 let nextFigmaStoreResult = true;
 let nextFigmaScanResult = null;
+let nextFigmaScanError = null;
 let lastFigmaScanOptions = null;
 let figmaScanInvocationCount = 0;
 let figmaScanDelayMs = 0;
@@ -228,6 +257,7 @@ class TestFigmaParser extends RealFigmaParser {
   async autoTrackScan(options = {}) {
     figmaScanInvocationCount += 1;
     lastFigmaScanOptions = JSON.parse(JSON.stringify(options));
+    if (nextFigmaScanError) throw nextFigmaScanError;
     if (figmaScanDelayMs > 0) {
       await new Promise(resolve => originalSetTimeout(resolve, figmaScanDelayMs));
     }
@@ -294,9 +324,11 @@ async function cleanupProjectsAndTimers() {
   nextFigmaTokenVerification = { valid: true };
   nextFigmaStoreResult = true;
   nextFigmaScanResult = null;
+  nextFigmaScanError = null;
   lastFigmaScanOptions = null;
   figmaScanInvocationCount = 0;
   figmaScanDelayMs = 0;
+  rendererMessages.length = 0;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
   await callIpc('projects:delete-all');
@@ -497,7 +529,7 @@ async function captureConsole(fn) {
 
 // ---------- Tests ----------
 
-test('projects:create with a Figma URL stores per-project tracked file', async () => {
+test('projects:create keeps only a minimal per-project Figma locator', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
   const url = 'https://www.figma.com/file/ABC123/My-File?page-id=1%3A1';
   const project = await callIpc(
@@ -512,7 +544,9 @@ test('projects:create with a Figma URL stores per-project tracked file', async (
   assert.ok(Array.isArray(project.figmaTrackedFiles), 'figmaTrackedFiles should be an array');
   assert.equal(project.figmaTrackedFiles.length, 1);
   assert.equal(project.figmaTrackedFiles[0].key, 'ABC123');
-  assert.equal(project.figmaTrackedFiles[0].url, url);
+  assert.equal(project.figmaTrackedFiles[0].url, undefined);
+  assert.equal(project.figmaTrackedFiles[0].requestedPageId, '1:1');
+  assert.equal(project.figmaTrackedFiles[0].requestedNodeId, null);
   assert.equal(project.figmaScopeMode, 'current-page');
   assert.equal(project.provenance.schemaVersion, PROVENANCE_SCHEMA_VERSION);
   assert.deepEqual(project.provenance.observations, []);
@@ -523,6 +557,9 @@ test('projects:create with a Figma URL stores per-project tracked file', async (
   assert.equal(fresh.provenance.schemaVersion, PROVENANCE_SCHEMA_VERSION);
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, 'ABC123');
+  assert.equal(fresh.figmaSession.trackedFiles[0].url, undefined);
+  assert.equal(fresh.figmaSession.trackedFiles[0].requestedPageId, '1:1');
+  assert.equal(JSON.stringify(fresh).includes(url), false);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 });
 
@@ -560,7 +597,7 @@ test('projects:create rejects an invalid Figma URL', async () => {
   assert.ok(!projects.some(p => p.name === 'Phase2-create-invalid-url'));
 });
 
-test('projects:set-figma-link clears the link when url is empty', async () => {
+test('projects:set-figma-link preserves the link when replacement URL is empty', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(
     'projects:create',
@@ -572,8 +609,38 @@ test('projects:set-figma-link clears the link when url is empty', async () => {
   assert.equal(project.figmaTrackedFiles.length, 1);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 
-  const cleared = await callIpc('projects:set-figma-link', project.id, { url: '', scopeMode: 'current-page' });
-  assert.equal(cleared.success, true);
+  const preserved = await callIpc('projects:set-figma-link', project.id, {
+    action: 'preserve',
+    url: '',
+    scopeMode: 'entire-file'
+  });
+  assert.equal(preserved.success, true);
+
+  const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'CLEARME');
+  assert.equal(fresh.figmaTrackedFiles[0].url, undefined);
+  assert.equal(fresh.figmaScopeMode, 'entire-file');
+  assert.equal(fresh.figmaSession.trackedFiles.length, 1);
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'entire-file');
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('projects:set-figma-link removes the link only through an explicit action', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
+  const project = await callIpc(
+    'projects:create',
+    'Phase2-remove-link',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/REMOVEME/My-File?page-id=1%3A1'
+  );
+
+  const removed = await callIpc('projects:set-figma-link', project.id, {
+    action: 'remove',
+    scopeMode: 'current-page'
+  });
+  assert.equal(removed.success, true);
 
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
   assert.deepEqual(fresh.figmaTrackedFiles, []);
@@ -595,6 +662,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
 
   const newUrl = 'https://www.figma.com/file/REBUILD9/Rebuilt-File?page-id=2%3A2';
   const result = await callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
     url: newUrl,
     scopeMode: 'current-page'
   });
@@ -603,14 +671,207 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
   assert.equal(fresh.figmaTrackedFiles.length, 1);
   assert.equal(fresh.figmaTrackedFiles[0].key, 'REBUILD9');
+  assert.equal(fresh.figmaTrackedFiles[0].url, undefined);
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '2:2');
   assert.equal(fresh.figmaScopeMode, 'current-page');
   assert.ok(fresh.figmaSession, 'figmaSession should exist');
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].key, 'REBUILD9');
+  assert.equal(fresh.figmaSession.trackedFiles[0].url, undefined);
   // Phase 1 page-lock behavior must still be applied to the per-project URL.
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '2:2');
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('legacy persisted Figma URLs migrate without reconnecting or losing page scope', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Figma URL Migration',
+    'branding',
+    'current-page',
+    null
+  );
+  const legacyUrl = 'https://www.figma.com/design/LEGACY22/Private-Project?page-id=7%3A9';
+  const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  legacy.figmaTrackedFiles = [{ key: 'LEGACY22', url: legacyUrl }];
+  legacy.figmaSession = {
+    scopeMode: 'current-page',
+    startedAt: legacy.watchStartedAt,
+    teamIds: ['LEGACY_PRIVATE_TEAM'],
+    trackedFiles: [{
+      key: 'LEGACY22',
+      url: legacyUrl,
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '7:9',
+      lockedPageName: 'Private Page',
+    }],
+    warnings: [],
+  };
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'LEGACY22');
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '7:9');
+  assert.equal(fresh.figmaTrackedFiles[0].url, undefined);
+  assert.equal(fresh.figmaSession.trackedFiles[0].requestedPageId, '7:9');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '7:9');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Private Page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].url, undefined);
+  assert.deepEqual(fresh.figmaSession.teamIds, []);
+  assert.equal(JSON.stringify(fresh).includes(legacyUrl), false);
+  assert.equal(JSON.stringify(fresh).includes('LEGACY_PRIVATE_TEAM'), false);
+});
+
+test('legacy session-only locator migration preserves the connection and valid URL scope', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Session-Only Figma Migration',
+    'branding',
+    'current-page',
+    null
+  );
+  const legacyUrl = 'https://www.figma.com/design/SESSION44/Private-Project?page-id=8%3A4';
+  const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  legacy.figmaTrackedFiles = [];
+  legacy.figmaSession = {
+    scopeMode: 'current-page',
+    startedAt: legacy.watchStartedAt,
+    teamIds: [],
+    trackedFiles: [{
+      key: 'SESSION44',
+      url: legacyUrl,
+      requestedPageId: '   ',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '8:4',
+      lockedPageName: 'Private Page',
+    }],
+    warnings: [],
+  };
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'SESSION44');
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '8:4');
+  assert.equal(fresh.figmaSession.trackedFiles[0].requestedPageId, '8:4');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Private Page');
+  assert.equal(JSON.stringify(fresh).includes(legacyUrl), false);
+});
+
+test('legacy migration keeps page and node scope as one atomic locator tuple', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Atomic Figma Scope Migration',
+    'branding',
+    'current-page',
+    null
+  );
+  const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  legacy.figmaTrackedFiles = [{ key: 'ATOMIC44', requestedNodeId: '2:1' }];
+  legacy.figmaSession = {
+    scopeMode: 'current-page',
+    startedAt: legacy.watchStartedAt,
+    teamIds: [],
+    trackedFiles: [{
+      key: 'ATOMIC44',
+      requestedPageId: '7:9',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '7:9',
+      lockedPageName: 'Stale Legacy Page',
+    }],
+    warnings: [],
+  };
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, null);
+  assert.equal(fresh.figmaTrackedFiles[0].requestedNodeId, '2:1');
+  assert.equal(fresh.figmaSession.trackedFiles[0].requestedPageId, null);
+  assert.equal(fresh.figmaSession.trackedFiles[0].requestedNodeId, '2:1');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'pending');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, null);
+  assert.equal(JSON.stringify(fresh).includes('Stale Legacy Page'), false);
+});
+
+test('legacy migration rebuilds unmatched Current Page Only session entries fail closed', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Unmatched Session Migration',
+    'branding',
+    'current-page',
+    null
+  );
+  const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  legacy.figmaTrackedFiles = [{ key: 'SAFELOCATOR' }];
+  legacy.figmaSession = {
+    scopeMode: 'current-page',
+    startedAt: legacy.watchStartedAt,
+    teamIds: [],
+    trackedFiles: [{
+      key: 'DIFFERENTKEY',
+      scopeMode: 'entire-file',
+      lockStatus: 'entire-file',
+    }],
+    warnings: [],
+  };
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaSession.scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles.length, 1);
+  assert.equal(fresh.figmaSession.trackedFiles[0].key, 'SAFELOCATOR');
+  assert.equal(fresh.figmaSession.trackedFiles[0].scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
+  assert.equal(fresh.figmaSession.trackedFiles[0].statusReason, 'figma-current-page-no-page-or-node-param');
+  assert.match(fresh.figmaSession.trackedFiles[0].warning, /No Figma assets will be captured/i);
+  assert.equal(JSON.stringify(fresh).includes('DIFFERENTKEY'), false);
+});
+
+test('legacy migration drops malformed keys and untrusted scope identifiers', async () => {
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Malformed Locator Migration',
+    'branding',
+    'current-page',
+    null
+  );
+  const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const opaqueValue = 'OPAQUE_LEGACY_SCOPE_VALUE';
+  legacy.figmaTrackedFiles = [
+    `https://attacker.example/${opaqueValue}`,
+    { key: `Authorization:Bearer-${opaqueValue}` },
+    { key: 'VALIDLOCATOR', requestedPageId: `https://attacker.example/?token=${opaqueValue}` },
+  ];
+  legacy.figmaSession = {
+    scopeMode: 'current-page',
+    startedAt: legacy.watchStartedAt,
+    teamIds: [],
+    sessionWarnings: [`Authorization: Bearer ${opaqueValue}`],
+    trackedFiles: [{
+      key: 'VALIDLOCATOR',
+      requestedPageId: `Bearer ${opaqueValue}`,
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: `https://attacker.example/${opaqueValue}`,
+    }],
+    warnings: [],
+  };
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'VALIDLOCATOR');
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, null);
+  assert.equal(fresh.figmaSession.trackedFiles.length, 1);
+  assert.equal(fresh.figmaSession.trackedFiles[0].scopeMode, 'current-page');
+  assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
+  assert.deepEqual(fresh.figmaSession.sessionWarnings, ['[redacted-credential]']);
+  assert.equal(JSON.stringify(fresh).includes(opaqueValue), false);
+  assert.equal(JSON.stringify(fresh).includes('attacker.example'), false);
+
+  const migratedAgain = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(migratedAgain.figmaSession.sessionWarnings, ['[redacted-credential]']);
 });
 
 test('projects:set-figma-link starts a scan for a watching project with a connected token', async () => {
@@ -1400,6 +1661,9 @@ test('Figma asset format extensions are allowlisted and stay inside the cache di
 test('main-process Figma logs redact tracked URLs, signed URLs, and local asset paths', async () => {
   const sensitiveFigmaUrl = 'https://www.figma.com/file/FIGLOG/Secret-File?page-id=1%3A1&token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
   const sensitiveCdnUrl = 'https://cdn.figma.example/signed/SHOULD_NOT_APPEAR_URL?token=SHOULD_NOT_APPEAR_TOKEN&Authorization=Bearer%20SHOULD_NOT_APPEAR_AUTH&cookie=session%3DSHOULD_NOT_APPEAR_COOKIE';
+  const compoundCookieValue = 'opaqueRefreshValue123';
+  const jsonCookieValue = 'opaqueJsonValue456';
+  const jsonAuthorizationValue = 'opaqueAuthValue789';
   const project = await callIpc(
     'projects:create',
     'Figma Main Log Privacy',
@@ -1430,7 +1694,10 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
     warning: null,
   }]);
   nextFigmaScanResult.errors = [
-    `scan failed ${sensitiveFigmaUrl} ${sensitiveCdnUrl} Authorization=Bearer SHOULD_NOT_APPEAR_AUTH cookie=SHOULD_NOT_APPEAR_COOKIE /Users/designer/private/log-asset.png`,
+    `scan failed ${sensitiveFigmaUrl} ${sensitiveCdnUrl} Authorization: Bearer OPAQUE_CREDENTIAL_VALUE cookie=SHOULD_NOT_APPEAR_COOKIE /Users/designer/private/log-asset.png`,
+    '{"Authorization":"Bearer OPAQUE_JSON_CREDENTIAL","cookie":"OPAQUE_JSON_COOKIE"}',
+    `Cookie: sid=one; refresh=${compoundCookieValue}; region=us-east`,
+    `{"cookie":"${jsonCookieValue}","Authorization":"Bearer ${jsonAuthorizationValue}"}`,
   ];
 
   const { output } = await captureConsole(async () => {
@@ -1452,10 +1719,11 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
   assert.match(output, /scan config \(live-initial\)/);
   assert.match(output, /scan config \(pre-package\)/);
   assert.match(output, /trackedFileCount=1/);
-  assert.match(output, /"hasUrl":true/);
-  assert.match(output, /fileKey=FIGLOG/);
+  assert.match(output, /"keyPresent":true/);
+  assert.match(output, /fileKeyPresent=true/);
   assert.match(output, /localName=Brand_Cloud_Log_Privacy_Asset\.png/);
   assert.match(output, /\[redacted-url\]/);
+  assert.doesNotMatch(output, /FIGLOG/);
   assert.doesNotMatch(
     output,
     /(?:page-id|pageId|page_id|node-id|nodeId|node_id|lockedPageId|requestedPageId|figmaPageId)[^\n]{0,120}1:1/,
@@ -1473,6 +1741,12 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
     '1%3A1',
     '"1:1"',
     'SHOULD_NOT_APPEAR',
+    'OPAQUE_CREDENTIAL_VALUE',
+    'OPAQUE_JSON_CREDENTIAL',
+    'OPAQUE_JSON_COOKIE',
+    compoundCookieValue,
+    jsonCookieValue,
+    jsonAuthorizationValue,
     'Authorization',
     'Bearer',
     'cookie',
@@ -1485,6 +1759,49 @@ test('main-process Figma logs redact tracked URLs, signed URLs, and local asset 
   ]) {
     assert.equal(output.includes(forbidden), false, `log output should not include ${forbidden}`);
   }
+});
+
+test('Figma scan failures are sanitized before renderer IPC', async () => {
+  const sensitiveUrl = 'https://api.figma.com/v1/files/PRIVATEFILE?token=SHOULD_NOT_REACH_RENDERER';
+  const opaqueCredential = 'OPAQUE_RENDERER_ACCESS_VALUE';
+  const privatePath = '/Users/designer/private/client/file.fig';
+  const temporaryPath = '/tmp/crate-private/client/file.fig';
+  const privateTemporaryPath = '/private/tmp/crate-private/client/file.fig';
+  const spacedPrivateTemporaryPath = '/private/tmp/neutral client/file.fig';
+  const project = await callIpc(
+    'projects:create',
+    'Figma Renderer Error Privacy',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/RENDER44/Renderer-Privacy?page-id=1%3A1'
+  );
+  storedFigmaToken = 'test-token';
+  nextFigmaScanError = new Error(
+    `request failed ${sensitiveUrl} {"accessToken":"${opaqueCredential}"} ${privatePath} ${temporaryPath} ${privateTemporaryPath} "${spacedPrivateTemporaryPath}"`
+  );
+
+  const activate = electronAppHandlers.get('activate');
+  assert.equal(typeof activate, 'function');
+  activate();
+  rendererMessages.length = 0;
+
+  const scan = await callIpc('figma:scan-project', project.id);
+  assert.equal(scan.success, true);
+  const scanError = rendererMessages.find(message => message.channel === 'figma:scan-error');
+  assert.ok(scanError, 'renderer should receive a sanitized scan-error event');
+
+  const rendererText = JSON.stringify(scanError.data);
+  assert.match(rendererText, /redacted/);
+  assert.equal(rendererText.includes(sensitiveUrl), false);
+  assert.equal(rendererText.includes('api.figma.com'), false);
+  assert.equal(rendererText.includes(opaqueCredential), false);
+  assert.equal(rendererText.includes('accessToken'), false);
+  assert.equal(rendererText.includes(privatePath), false);
+  assert.equal(rendererText.includes(temporaryPath), false);
+  assert.equal(rendererText.includes(privateTemporaryPath), false);
+  assert.equal(rendererText.includes(spacedPrivateTemporaryPath), false);
+  assert.equal(rendererText.includes('neutral client/file.fig'), false);
+  assert.equal(rendererText.includes('client/file.fig'), false);
 });
 
 test('Duplicate Figma asset scans do not duplicate files or provenance edges', async () => {
@@ -1620,7 +1937,9 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
     assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.EMBEDDED_RESOURCE && node.provider === 'figma').length, 1);
 
     const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('img-in-scope'), true);
+    assert.equal(manifestText.includes('FIG22'), false);
+    assert.equal(manifestText.includes('1:1'), false);
+    assert.equal(manifestText.includes('img-in-scope'), false);
     assert.equal(manifestText.includes('img-out-of-scope'), false);
     assert.equal(manifestText.includes('Out Of Scope'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);

@@ -20,6 +20,7 @@
 
 const { BaseParser } = require('./base');
 const { normalizeToken } = require('./figma-credential-store');
+const { redactUrlAndCredentialText, redactPrivatePathText } = require('./figma-redaction');
 const fs = require('fs');
 const path = require('path');
 
@@ -49,15 +50,10 @@ function figmaParserText(value) {
 }
 
 function redactFigmaParserText(value) {
-  return figmaParserText(value)
-    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
-    .replace(/\b(?:Authorization|X-Figma-Token)\b\s*[:=]?\s*(?:Bearer\s+)?[^\s,;)]+/gi, '[redacted-credential]')
-    .replace(/\b(?:Cookie|Set-Cookie)\b\s*[:=]?\s*[^\s,;)]+/gi, '[redacted-credential]')
-    .replace(/\bBearer\s+[^\s,;)]+/gi, '[redacted-credential]')
-    .replace(/\b(?:token|access_token|auth|sig|signature|client_secret|secret|key|cookie)\b\s*[:=]\s*[^\s,;)]+/gi, '[redacted-credential]')
-    .replace(/[A-Za-z0-9._-]*(?:token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
-    .replace(/\b\d+:\d+\b/g, '[redacted-figma-scope-id]')
-    .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var|\/tmp)\/[^\s"'<>),]+/g, '[redacted-path]');
+  return redactPrivatePathText(
+    redactUrlAndCredentialText(figmaParserText(value))
+      .replace(/\b\d+:\d+\b/g, '[redacted-figma-scope-id]')
+  );
 }
 
 function formatFigmaParserScalar(value, fallback = 'unknown') {
@@ -1216,7 +1212,7 @@ class FigmaParser extends BaseParser {
           diagnostic.metadataFailureReason = classifyFigmaParserFailure(e);
         }
         console.error(
-          `[crate][figma] getFileMetadata error for ${formatFigmaParserScalar(fileKey)}:`,
+          `[crate][figma] getFileMetadata error identifierPresent=${!!fileKey}:`,
           redactFigmaParserText(e.message)
         );
         return null;
@@ -1308,7 +1304,7 @@ class FigmaParser extends BaseParser {
           const hint = figmaParserText(e).toLowerCase().includes('not found')
             ? 'Team not found or not accessible via API. If this is a personal workspace, paste a direct Figma file URL instead.'
             : safeMessage;
-          const msg = `Cannot access team ${formatFigmaParserScalar(teamId)}: ${hint}`;
+          const msg = `Cannot access the configured Figma team: ${hint}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
           continue;
@@ -1319,7 +1315,7 @@ class FigmaParser extends BaseParser {
           const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
           projects = projectsData.projects || [];
         } catch (e) {
-          const msg = `Cannot list projects for team ${formatFigmaParserScalar(teamId)} (${redactFigmaParserText(teamName)}): ${redactFigmaParserText(e.message)}`;
+          const msg = `Cannot list projects for the configured Figma team: ${redactFigmaParserText(e.message)}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
           continue;
@@ -1351,7 +1347,7 @@ class FigmaParser extends BaseParser {
               }
             }
           } catch (e) {
-            errors.push(`Error listing files in project ${redactFigmaParserText(project.name)}: ${redactFigmaParserText(e.message)}`);
+            errors.push(`Error listing files in a Figma project: ${redactFigmaParserText(e.message)}`);
           }
         }
       }
@@ -1373,7 +1369,7 @@ class FigmaParser extends BaseParser {
             discoverySource: 'tracked'
           });
           console.log(
-            `[crate][figma] tracked file ${formatFigmaParserScalar(fileKey)}: lastModifiedMs=${meta.lastModifiedMs} included=yes reason=direct-tracked authoritative`
+            `[crate][figma] tracked file identifierPresent=${!!fileKey}: lastModifiedMs=${meta.lastModifiedMs} included=yes reason=direct-tracked authoritative`
           );
           continue;
         }
@@ -1393,9 +1389,9 @@ class FigmaParser extends BaseParser {
           isTracked: true,
           discoverySource: 'tracked'
         });
-        errors.push(`Metadata fetch failed for tracked file ${formatFigmaParserScalar(fileKey)}; proceeding to extraction anyway.`);
+        errors.push('Metadata fetch failed for a tracked Figma file; proceeding to extraction anyway.');
         console.log(
-          `[crate][figma] tracked file ${formatFigmaParserScalar(fileKey)}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
+          `[crate][figma] tracked file identifierPresent=${!!fileKey}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
         );
       }
 
@@ -1485,8 +1481,7 @@ class FigmaParser extends BaseParser {
       }
       const imageRefList = Array.from(imageRefs);
       console.log(
-        `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: imageRefs found (${imageRefList.length})` +
-        `${imageRefList.length > 0 ? `: ${imageRefList.map(ref => formatFigmaParserScalar(ref)).join(', ')}` : ''}`
+        `[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: imageRefs found (${imageRefList.length})`
       );
 
       if (imageRefs.size > 0) {
@@ -1524,21 +1519,20 @@ class FigmaParser extends BaseParser {
             });
           }
           console.log(
-            `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: image URLs resolved (${resolvedImageRefs.length})` +
-            `${resolvedImageRefs.length > 0 ? ` for imageRefs: ${resolvedImageRefs.map(ref => formatFigmaParserScalar(ref)).join(', ')}` : ''}`
+            `[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: image URLs resolved (${resolvedImageRefs.length})`
           );
         } catch (err) {
-          errors.push(`Image-fill recovery failed for ${formatFigmaParserScalar(fileKey)}: ${redactFigmaParserText(err.message)}`);
+          errors.push(`Image-fill recovery failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
 
       if (assets.length > 0) {
         const dedupedAssets = this.deduplicateFigmaAssets(assets);
         console.log(
-          `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: image-fill pipeline counts ` +
+          `[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: image-fill pipeline counts ` +
           `resolved=${assets.length} deduped=${dedupedAssets.length} passed_to_ingestion=${dedupedAssets.length}`
         );
-        console.log(`[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback rendered-node path used=no`);
+        console.log(`[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: fallback rendered-node path used=no`);
         return this._figmaExtractionResult({
           assets: dedupedAssets,
           errors,
@@ -1581,7 +1575,7 @@ class FigmaParser extends BaseParser {
         });
       }
 
-      console.log(`[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback rendered-node path used=yes`);
+      console.log(`[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: fallback rendered-node path used=yes`);
 
       // Request image exports (batch, max 500 per request)
       const batches = this._chunkArray(imageNodeIds, 500);
@@ -1610,13 +1604,13 @@ class FigmaParser extends BaseParser {
             }
           }
         } catch (err) {
-          errors.push(`Batch image export failed for ${formatFigmaParserScalar(fileKey)}: ${redactFigmaParserText(err.message)}`);
+          errors.push(`Batch image export failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
 
       const dedupedFallbackAssets = this.deduplicateFigmaAssets(assets);
       console.log(
-        `[crate][figma] extractAssetsFromFileKey ${formatFigmaParserScalar(fileKey)}: fallback pipeline counts ` +
+        `[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: fallback pipeline counts ` +
         `resolved=${assets.length} deduped=${dedupedFallbackAssets.length} passed_to_ingestion=${dedupedFallbackAssets.length}`
       );
       return this._figmaExtractionResult({
@@ -1718,8 +1712,7 @@ class FigmaParser extends BaseParser {
     const cappedNonTrackedFiles = nonTrackedFiles.slice(0, options.maxFiles || 20);
     result.files = [...trackedFiles, ...cappedNonTrackedFiles];
     console.log(
-      `[crate][figma] autoTrackScan final file keys scanned (${result.files.length}): ` +
-      `${result.files.map(file => formatFigmaParserScalar(file.key)).join(', ')}`
+      `[crate][figma] autoTrackScan final file count=${result.files.length}`
     );
 
     // Extract assets from each file

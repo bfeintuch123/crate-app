@@ -152,6 +152,31 @@ function loadRendererHelpers(document = createDocumentStub(), windowOverrides = 
   return context;
 }
 
+test('renderer log sanitizer removes complete quoted private paths containing spaces', () => {
+  const renderer = loadRendererHelpers();
+  const privatePath = '/private/tmp/neutral client/file.fig';
+  const output = renderer.sanitizeRendererLogText(`scan failed "${privatePath}"`);
+
+  assert.match(output, /redacted-path/);
+  assert.equal(output.includes(privatePath), false);
+  assert.equal(output.includes('neutral client/file.fig'), false);
+});
+
+test('renderer log sanitizer removes quoted and unquoted compound credential values', () => {
+  const renderer = loadRendererHelpers();
+  const credential = 'neutralOpaqueValue864';
+
+  for (const input of [
+    `scan failed {"authorizationHeader":"${credential}"}`,
+    `scan failed authorizationHeader=Basic ${credential}`,
+    `scan failed {"cookieHeader":"${credential}"}`,
+  ]) {
+    const output = renderer.sanitizeRendererLogText(input);
+    assert.match(output, /redacted/);
+    assert.equal(output.includes(credential), false);
+  }
+});
+
 test('renderer Figma scope helper defaults missing or invalid scope to Current Page Only', () => {
   const renderer = loadRendererHelpers();
 
@@ -221,6 +246,54 @@ test('renderer accepts modern Figma URL shapes that the main process parses', ()
   assert.equal(renderer.isValidFigmaUrl('figma://open?url=https%3A%2F%2Fwww.figma.com%2Fproto%2FPrototype-Route_123%2FPetra%3Fnode-id%3D2-1%26file-key%3DPetra_logo-File_123'), true);
   assert.equal(renderer.isValidFigmaUrl('figma://open?file-id=Petra_logo-File_123&node-id=2-1'), true);
   assert.equal(renderer.isValidFigmaUrl('https://example.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), false);
+});
+
+test('Edit Figma Link keeps the saved URL out of the renderer and preserves it when blank', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const calls = [];
+  const project = {
+    id: 'project-private-link',
+    name: 'Private Link',
+    status: 'watching',
+    files: [],
+    pendingFiles: [],
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [{ key: 'PRIVATE22', url: 'https://www.figma.com/file/PRIVATE22/Should-Never-Render' }],
+    figmaSession: { trackedFiles: [] },
+  };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      setProjectFigmaLink: async (projectId, payload) => {
+        calls.push({ projectId, payload });
+        return { success: true };
+      },
+      getProjects: async () => [],
+    },
+  });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]', renderer);
+
+  renderer.openEditFigmaLinkModal(project.id);
+  assert.equal(elements['edit-figma-url'].value, '');
+  assert.equal(elements['edit-figma-url'].focused, true);
+
+  elements['edit-figma-scope'].value = 'entire-file';
+  await renderer.saveEditFigmaLinkModal();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{
+    projectId: project.id,
+    payload: {
+      action: 'preserve',
+      scopeMode: 'entire-file',
+    },
+  }]);
+});
+
+test('Edit Figma Link markup offers explicit replacement and removal controls', () => {
+  const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+
+  assert.match(indexHtml, /Leave blank to keep the current link/);
+  assert.match(indexHtml, /id="btn-edit-figma-remove"/);
+  assert.match(indexHtml, /Replace Figma URL \(optional\)/);
 });
 
 test('renderer Figma scope helper does not call pending or unresolved locks locked', () => {

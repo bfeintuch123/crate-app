@@ -470,6 +470,13 @@ test('package provenance records copied files and skips missing files', async ()
             token: 'SHOULD_NOT_APPEAR_INCLUDED_TOKEN',
             command: ['/usr/sbin/lsof SHOULD_NOT_APPEAR_INCLUDED_COMMAND'],
             rawFigmaApiResponse: { body: 'SHOULD_NOT_APPEAR_INCLUDED_FIGMA_API' },
+            note: 'Review https://www.figma.com/design/SHOULD_NOT_APPEAR_FILE_KEY/Private-File?node-id=1-2 and figma://open?file-id=SHOULD_NOT_APPEAR_DESKTOP_KEY',
+            authNote: 'Authorization: Bearer SHOULD_NOT_APPEAR_BEARER_VALUE',
+            jsonAuthNote: '{"Authorization":"Bearer SHOULD_NOT_APPEAR_JSON_BEARER","cookie":"SHOULD_NOT_APPEAR_JSON_COOKIE"}',
+            authorization: 'SHOULD_NOT_APPEAR_AUTHORIZATION_VALUE',
+            cookie: 'SHOULD_NOT_APPEAR_COOKIE_VALUE',
+            password: 'SHOULD_NOT_APPEAR_PASSWORD_VALUE',
+            credential: 'SHOULD_NOT_APPEAR_CREDENTIAL_VALUE',
           },
         },
         ev_unrelated_raw: {
@@ -533,6 +540,13 @@ test('package provenance records copied files and skips missing files', async ()
     assert.equal(manifest.evidence[0].payload.token, '[redacted]');
     assert.equal(manifest.evidence[0].payload.command, '[redacted]');
     assert.equal(manifest.evidence[0].payload.rawFigmaApiResponse, '[redacted]');
+    assert.equal(manifest.evidence[0].payload.note, 'Review [redacted-url] and [redacted-url]');
+    assert.equal(manifest.evidence[0].payload.authNote, '[redacted-credential]');
+    assert.match(manifest.evidence[0].payload.jsonAuthNote, /\[redacted-credential\]/);
+    assert.equal(manifest.evidence[0].payload.authorization, '[redacted]');
+    assert.equal(manifest.evidence[0].payload.cookie, '[redacted]');
+    assert.equal(manifest.evidence[0].payload.password, '[redacted]');
+    assert.equal(manifest.evidence[0].payload.credential, '[redacted]');
     assert.equal(manifest.edges.some(edge => JSON.stringify(edge).includes(missingPath)), false);
     assert.equal(manifest.warnings.some(warning => warning.includes('Partial package-relevant')), true);
 
@@ -544,6 +558,12 @@ test('package provenance records copied files and skips missing files', async ()
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_COMMAND'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_FIGMA_API'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_JSON_BEARER'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_JSON_COOKIE'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_AUTHORIZATION_VALUE'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_COOKIE_VALUE'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_PASSWORD_VALUE'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_CREDENTIAL_VALUE'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

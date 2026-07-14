@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-figma-credentials`
+- branch: `codex/security-figma-link-privacy`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 merged; phase 2A PR #129 open, clean, and mergeable; merge approval pending
+- status: phase 1 and phase 2A merged; phase 2A Mac mini QA passed; phase 2B implementation and validation complete; commit, push, and PR approval pending
 
 ## Goal
 
@@ -20,22 +20,24 @@ Strengthen protection of users' project files, Figma credentials, local metadata
 
 1. Build containment: explicit runtime allowlist and packaged-content verification.
 2. Figma credential storage: automatic Keychain-backed migration with no normal user steps.
-3. Electron boundary: trusted IPC registration, sender validation, navigation restrictions, and renderer sandboxing.
-4. Parser and download limits: shared admission budgets around existing parsers and Figma downloads.
-5. Local-data lifecycle: permissions, atomic config writes, cache cleanup, and diagnostics minimization.
-6. Release hardening: least-privilege entitlements, Electron fuses, CI security checks, and signed-artifact proof.
+3. Figma link privacy: store only the minimal locator needed for API and scope behavior, migrate legacy URLs automatically, and redact identifiers from logs and diagnostics.
+4. Electron boundary: trusted IPC registration, sender validation, navigation restrictions, and renderer sandboxing.
+5. Parser and download limits: shared admission budgets around existing parsers and Figma downloads.
+6. Local-data lifecycle: permissions, atomic config writes, cache cleanup, and diagnostics minimization.
+7. Release hardening: least-privilege entitlements, Electron fuses, CI security checks, and signed-artifact proof.
 
 Each phase must remain independently reviewable and revertible. Existing functional behavior is frozen unless the input is specifically unsafe or malicious.
 
 ## Current Phase
 
-- phase: 2A, Figma credential storage
-- credential target: Electron `safeStorage`, backed by macOS Keychain protection
-- legacy source: `~/.crate/figma-token`, migrated silently only after the main window is visible
-- failure behavior: fail closed without deleting the legacy credential when encryption, verification, or migration cannot complete safely
+- phase: 2B, Figma link and identifier privacy
+- storage target: parse a user-provided Figma URL once and persist only the file-key candidates and requested page or node locator required for existing Figma behavior
+- legacy source: complete URLs in project or session records, migrated automatically when projects load without asking the user to reconnect
+- edit behavior: blank input preserves the current link and can update scope; replacement and removal are explicit actions
+- privacy behavior: logs and optional diagnostics redact complete URLs, credentials, signed-link material, file keys, page or node IDs, image refs, and related Figma identifiers
 - package-engine impact: none
 - Figma scope impact: none; Current Page Only remains default and Entire File remains opt-in
-- normal user-workflow impact: none; valid existing connections migrate automatically and replacement credentials are verified before storage
+- normal user-workflow impact: no added setup steps; valid existing project links migrate automatically and remain connected
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -58,7 +60,11 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 2A autoreview, regression, security, provenance, runner, and isolated Reprobox validation
 - [x] Bryant approval for phase 2A commit, push, and PR creation
 - [x] phase 2A committed, pushed, and opened as PR #129 against `v2.4.x`
-- [ ] Bryant approval to merge PR #129
+- [x] Bryant approval and merge of phase 2A PR #129
+- [x] phase 2A Mac mini credential migration and connection smoke
+- [x] phase 2B failure-first tests and narrow implementation
+- [x] phase 2B autoreview, regression, security, provenance, runner, and isolated Reprobox validation
+- [ ] Bryant approval for phase 2B commit, push, and PR creation
 
 ## Stop Gates
 
@@ -69,7 +75,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Request Bryant approval to merge PR #129 after final GitHub review. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase.
+Request Bryant approval to commit, push, and open the phase 2B PR against `v2.4.x`. Stop before commit, push, PR creation, merge, build, signing, notarization, release mutation, site deployment, or the next security phase without the applicable approval.
 
 ## Phase 1 Evidence
 
@@ -101,3 +107,21 @@ Request Bryant approval to merge PR #129 after final GitHub review. Stop before 
 - package, provenance, watcher, parser-result, quota, dependencies, and lockfiles were not changed
 - `npm audit --audit-level=high`: exit 0 with the pre-existing moderate `uuid` advisory only
 - no build, signing, notarization, release, or deployment was run
+
+## Phase 2B Evidence
+
+- new and replacement project links persist a minimal Figma locator rather than the complete user-provided URL
+- legacy project and session URLs migrate automatically while preserving valid connections, candidate fallback, and requested page or node scope
+- editing a Figma project never sends the saved URL back to the renderer; blank input preserves the link, replacement requires a new URL, and removal is explicit
+- Current Page Only remains the default and fails closed when a page or node cannot be resolved; Entire File remains opt-in
+- main-process, parser, and optional diagnostic output redact complete Figma and signed URLs, credentials, file keys, page and node IDs, image refs, team identifiers, and related free-text material
+- dependency-complete full suite: 251 passed, 0 failed using the canonical checkout's existing dependencies through `NODE_PATH`; no dependency installation or mutation occurred
+- focused Figma link, scope, privacy, renderer, app-content, PSD, package, and provenance suite: 107 passed, 0 failed
+- isolated Reprobox applied the complete tracked and new-file patch to exact base `4be0d5fba8d1d22696f067da90950de1b35a85de`, then passed the same 107 tests, syntax checks, and `git diff --check`
+- final failure-first coverage confirms atomic page/node locator migration, stale session-lock rejection, renderer IPC error sanitization, compound credential-field redaction including renderer-originated logs, and complete redaction of quoted private paths containing spaces
+- independent functional review and final adversarial security re-review returned no findings; the security reviewer directly probed neutral compound credentials and quoted private paths containing spaces across the shared, main-process IPC, parser, and renderer boundaries
+- syntax checks, `git diff --check`, frozen-file checks, patch application against the latest base, and focused privacy searches passed
+- `npm audit --audit-level=high`: exit 0 with the pre-existing moderate `uuid` advisory only
+- package selection, watcher scope, parser result shape, provenance relationships, quota, dependencies, lockfiles, preload behavior, and release state were not changed
+- no app launch, build, signing, notarization, release, or deployment was run
+- reproducibility proof remains at `/private/tmp/crate-reprobox-figma-link-privacy-finalv8.kocFfh`; earlier proof directories remain untouched

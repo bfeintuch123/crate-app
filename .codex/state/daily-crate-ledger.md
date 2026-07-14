@@ -1471,3 +1471,16 @@ Secondary:
 - Active branches: Crate Ops `codex/chief-of-staff-learning-evals`; Crate app `codex/chief-of-staff-learning-evals-catalog`.
 - Independent product and security rereviews found no P0/P1/P2 blockers. The only residual P3 limits are that evidence hashes do not prove every semantic claim and repo decision provenance is not cryptographic identity; both remain non-authoritative and advisory.
 - Coordinated PRs: Crate Ops #10 and dependent Crate app #127 are clean and mergeable; plugin CI passes. Merge #10 before #127 only after Bryant approval.
+
+### 2026-07-14 Figma Link And Identifier Privacy
+
+- Phase 2A PR #129 is merged and its Mac mini credential migration and connection smoke passed.
+- Implemented Phase 2B on `codex/security-figma-link-privacy`: full Figma URLs are parsed transiently and replaced in persisted state by the minimal file, candidate, and page or node locator needed for existing behavior.
+- Legacy project and session URLs migrate automatically without reconnecting; blank edits preserve the current link, replacement requires a new URL, and removal is explicit.
+- Main-process, parser, and optional diagnostic output now minimize complete URLs, credentials, signed-link material, and Figma identifiers.
+- Current Page Only remains default and fail closed; Entire File remains opt-in. Package, watcher, parser-result, provenance, quota, dependency, preload, build, release, and deploy behavior were not changed.
+- Final validation: 251 dependency-complete full-suite tests passed; 107 focused Figma/privacy/package tests passed; the complete patch applied to exact base `4be0d5fba8d1d22696f067da90950de1b35a85de` in a fresh Reprobox and passed the same 107 tests plus syntax and whitespace checks.
+- Failure-first coverage now proves atomic page/node locator migration, rejection of stale mismatched session locks, renderer IPC error sanitization, compound credential-field redaction including renderer-originated logs, and complete redaction of quoted private paths containing spaces.
+- Independent functional review and final adversarial security re-review returned no findings; the security reviewer directly probed neutral compound credentials and quoted private paths containing spaces across shared, main-process IPC, parser, and renderer boundaries.
+- Reprobox proof: `/private/tmp/crate-reprobox-figma-link-privacy-finalv8.kocFfh`; no dependency installation, app launch, build, signing, release, or deployment occurred.
+- Next gate: Bryant approval to commit, push, and open the Phase 2B PR against `v2.4.x`. Stop before commit, push, PR creation, merge, build, signing, notarization, release, or deploy without the applicable approval.

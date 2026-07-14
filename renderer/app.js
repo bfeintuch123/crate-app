@@ -27,6 +27,22 @@ let state = {
 let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 
+function redactRendererPrivatePaths(value) {
+  return String(value)
+    .replace(/"(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^"\r\n]*"/g, '"[redacted-path]"')
+    .replace(/'(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^'\r\n]*'/g, "'[redacted-path]'")
+    .replace(/(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^\s"'<>),]+/g, '[redacted-path]');
+}
+
+function redactRendererCredentialText(value) {
+  return String(value)
+    .replace(/(["'])[^"'\\\r\n]*(?:token|secret|authorization|authentication|bearer|cookie|auth|password|credential|signature|api[_-]?key)[^"'\\\r\n]*\1\s*:\s*(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*')/gi, '[redacted-credential]')
+    .replace(/\b(?:Authorization|X-Figma-Token|Cookie|Set-Cookie)\b(?:\s*[:=]\s*|\s+)[^\r\n]*/gi, '[redacted-credential]')
+    .replace(/\b[A-Za-z0-9._-]*(?:token|secret|authorization|authentication|bearer|cookie|auth|password|credential|signature|api[_-]?key)[A-Za-z0-9._-]*\b\s*[:=]\s*[^,;)}\]\r\n]+/gi, '[redacted-credential]')
+    .replace(/\bBearer\s+[^\r\n]*/gi, '[redacted-credential]')
+    .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth|password|credential|signature)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]');
+}
+
 // Lightweight Figma URL validator — must match the patterns the main process accepts.
 const FIGMA_URL_PATTERN = /(?:(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design|proto)\/|figma:\/\/(?:file|design|proto)\/)([a-zA-Z0-9_-]+)/i;
 const FIGMA_OPEN_URL_PATTERN = /figma:\/\/open\?/i;
@@ -62,14 +78,11 @@ function sanitizeRendererLogText(value) {
     }
   }
 
-  return text
-    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
-    .replace(/\bAuthorization\b\s*[:=]\s*[^,\s)]+/gi, 'Authorization=[redacted]')
-    .replace(/\bBearer\s+[^\s,)]+/gi, 'Bearer [redacted]')
-    .replace(/\bcookie\b\s*[:=]\s*[^,\s)]+/gi, 'cookie=[redacted]')
-    .replace(/\btoken\b\s*[:=]\s*[^,\s)]+/gi, 'token=[redacted]')
-    .replace(/[A-Za-z0-9._-]*(token|secret|authorization|bearer|cookie|auth)[A-Za-z0-9._-]*/gi, '[redacted-sensitive]')
-    .replace(/(?:\/Users|\/Volumes|\/private\/var|\/var)\/[^\s"'<>]+/g, '[redacted-path]');
+  return redactRendererPrivatePaths(
+    redactRendererCredentialText(
+      text.replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    )
+  );
 }
 
 function logRendererError(scope, error) {
@@ -1364,6 +1377,10 @@ function setupEventListeners() {
   if (editSave) {
     editSave.addEventListener('click', saveEditFigmaLinkModal);
   }
+  const editRemove = $('#btn-edit-figma-remove');
+  if (editRemove) {
+    editRemove.addEventListener('click', removeEditFigmaLinkModal);
+  }
 
   // Figma scan now
   $('#btn-figma-scan-now').addEventListener('click', async () => {
@@ -1382,7 +1399,7 @@ function setupEventListeners() {
         }
       }
     } catch (e) {
-      showToast('Scan failed: ' + (e.message || 'Unknown error'));
+      showToast('Figma scan could not finish. Try again.');
     } finally {
       setFigmaScanButtonLoading(false);
     }
@@ -1396,15 +1413,19 @@ function openEditFigmaLinkModal(projectId) {
   if (!project) return;
   state.editFigmaProjectId = projectId;
 
-  const tracked = (project.figmaTrackedFiles || [])[0];
   const urlInput = $('#edit-figma-url');
   const scopeInput = $('#edit-figma-scope');
   const errorEl = $('#edit-figma-error');
+  const removeButton = $('#btn-edit-figma-remove');
 
-  if (urlInput) urlInput.value = tracked && tracked.url ? tracked.url : '';
+  if (urlInput) urlInput.value = '';
   if (scopeInput) {
     const scope = project.figmaScopeMode === 'entire-file' ? 'entire-file' : 'current-page';
     scopeInput.value = scope;
+  }
+  if (removeButton) {
+    const hasLink = Array.isArray(project.figmaTrackedFiles) && project.figmaTrackedFiles.length > 0;
+    removeButton.classList.toggle('hidden', !hasLink);
   }
   if (errorEl) {
     errorEl.style.display = 'none';
@@ -1418,6 +1439,31 @@ function openEditFigmaLinkModal(projectId) {
 function closeEditFigmaLinkModal() {
   state.editFigmaProjectId = null;
   $('#modal-edit-figma-link').classList.add('hidden');
+}
+
+async function persistFigmaLinkEdit(payload, successMessage) {
+  const projectId = state.editFigmaProjectId;
+  if (!projectId) return false;
+
+  const errorEl = $('#edit-figma-error');
+  const result = await window.crate.setProjectFigmaLink(projectId, payload);
+
+  if (!result || !result.success) {
+    if (errorEl) {
+      errorEl.textContent = result && result.error === 'invalid_figma_url'
+        ? 'Crate could not read that Figma URL. Please double-check and try again.'
+        : 'Failed to save Figma link.';
+      errorEl.style.display = 'block';
+    }
+    return false;
+  }
+
+  state.projects = await window.crate.getProjects();
+  closeEditFigmaLinkModal();
+  renderFiles();
+  renderProjects();
+  showToast(successMessage);
+  return true;
 }
 
 async function saveEditFigmaLinkModal() {
@@ -1439,26 +1485,16 @@ async function saveEditFigmaLinkModal() {
     return;
   }
 
-  const result = await window.crate.setProjectFigmaLink(projectId, {
-    url: rawUrl || null,
-    scopeMode
-  });
+  const payload = rawUrl
+    ? { action: 'replace', url: rawUrl, scopeMode }
+    : { action: 'preserve', scopeMode };
+  await persistFigmaLinkEdit(payload, rawUrl ? 'Figma link updated' : 'Figma settings updated');
+}
 
-  if (!result || !result.success) {
-    if (errorEl) {
-      errorEl.textContent = result && result.error === 'invalid_figma_url'
-        ? 'Crate could not read that Figma URL. Please double-check and try again.'
-        : 'Failed to save Figma link.';
-      errorEl.style.display = 'block';
-    }
-    return;
-  }
-
-  state.projects = await window.crate.getProjects();
-  closeEditFigmaLinkModal();
-  renderFiles();
-  renderProjects();
-  showToast(rawUrl ? 'Figma link updated' : 'Figma link removed');
+async function removeEditFigmaLinkModal() {
+  const scopeInput = $('#edit-figma-scope');
+  const scopeMode = scopeInput ? scopeInput.value : 'current-page';
+  await persistFigmaLinkEdit({ action: 'remove', scopeMode }, 'Figma link removed');
 }
 
 // ===== Tab State Helper =====

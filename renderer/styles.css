@@ -1183,6 +1183,10 @@ body {
   gap: 10px;
 }
 
+#btn-edit-figma-remove {
+  margin-right: auto;
+}
+
 .modal-actions-vertical {
   flex-direction: column;
   gap: 8px;
