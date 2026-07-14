@@ -28,10 +28,11 @@ let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 
 function redactRendererPrivatePaths(value) {
-  return String(value)
-    .replace(/"(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^"\r\n]*"/g, '"[redacted-path]"')
-    .replace(/'(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^'\r\n]*'/g, "'[redacted-path]'")
-    .replace(/(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[^\s"'<>),]+/g, '[redacted-path]');
+  // Delimiters and line breaks may appear in filenames, so redact the value tail.
+  return String(value).replace(
+    /["'`]?(?:\/Users|\/Volumes|\/private\/(?:tmp|var)|\/tmp|\/var)\/[\s\S]*/i,
+    '[redacted-path]'
+  );
 }
 
 function redactRendererCredentialText(value) {

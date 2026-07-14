@@ -162,6 +162,37 @@ test('renderer log sanitizer removes complete quoted private paths containing sp
   assert.equal(output.includes('neutral client/file.fig'), false);
 });
 
+test('renderer log sanitizer removes complete unquoted private paths containing spaces', () => {
+  const renderer = loadRendererHelpers();
+  const privatePath = '/Users/synthetic/Private Project/hero.v2 final.fig';
+  const output = renderer.sanitizeRendererLogText(`scan failed ${privatePath} while scanning project.`);
+
+  assert.equal(output, 'scan failed [redacted-path]');
+  assert.equal(output.includes(privatePath), false);
+  assert.equal(output.includes('Project/hero.v2'), false);
+  assert.equal(output.includes('final.fig'), false);
+});
+
+test('renderer log sanitizer removes quoted private paths containing delimiter characters', () => {
+  const renderer = loadRendererHelpers();
+  const cases = [
+    "ENOENT: open '/tmp/synthetic/Designer's Work/hero.v2 final.fig'",
+    'ENOENT: open "/tmp/synthetic/Client "Final"/file.fig"',
+    'ENOENT: open `/tmp/synthetic/Client `Final/file.fig`',
+    "ENOENT: open '/tmp/synthetic/Private\nProject/file.fig'",
+    "ENOENT: open '/TMP/synthetic/Private\r\nProject/file.fig'",
+    "ENOENT: open '/uSeRs/synthetic/Private Project/file.fig'",
+  ];
+
+  for (const input of cases) {
+    const output = renderer.sanitizeRendererLogText(input);
+    assert.equal(output, 'ENOENT: open [redacted-path]');
+    assert.equal(output.includes("s Work"), false);
+    assert.equal(output.includes('final.fig'), false);
+    assert.equal(output.includes('Project/file.fig'), false);
+  }
+});
+
 test('renderer log sanitizer removes quoted and unquoted compound credential values', () => {
   const renderer = loadRendererHelpers();
   const credential = 'neutralOpaqueValue864';
