@@ -4597,7 +4597,11 @@ test('Illustrator running detection recognizes realistic command paths without r
   const project = await createProject('Illustrator process command detection');
   const fresh = await waitForProject(
     project.id,
-    item => getLiveAppStatusEntries(item).some(entry => entry.scriptAttempted === true),
+    item => getLiveAppStatusEntries(item).some(entry => (
+      entry.scriptAttempted === true &&
+      entry.scriptSuccess === true &&
+      entry.errorCategory === 'no-documents'
+    )),
     5000
   );
 
