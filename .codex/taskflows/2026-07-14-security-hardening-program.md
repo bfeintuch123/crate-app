@@ -10,7 +10,7 @@
 - branch: `codex/security-figma-credentials`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 merged; phase 2A implementation and merge-readiness review complete; commit, push, and PR creation approved
+- status: phase 1 merged; phase 2A PR #129 open, clean, and mergeable; merge approval pending
 
 ## Goal
 
@@ -57,6 +57,8 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 2A failure-first tests and narrow implementation
 - [x] phase 2A autoreview, regression, security, provenance, runner, and isolated Reprobox validation
 - [x] Bryant approval for phase 2A commit, push, and PR creation
+- [x] phase 2A committed, pushed, and opened as PR #129 against `v2.4.x`
+- [ ] Bryant approval to merge PR #129
 
 ## Stop Gates
 
@@ -67,7 +69,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Commit and push the reviewed phase 2A branch, then open a PR targeting `v2.4.x`. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase.
+Request Bryant approval to merge PR #129 after final GitHub review. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase.
 
 ## Phase 1 Evidence
 
