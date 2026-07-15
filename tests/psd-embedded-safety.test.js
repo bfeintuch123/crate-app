@@ -4,6 +4,7 @@ const Module = require('module');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
 const {
   EDGE_TYPES,
@@ -14,7 +15,21 @@ const {
 
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
+const originalSetInterval = global.setInterval;
+const originalClearInterval = global.clearInterval;
 const activeTimeouts = new Set();
+const activeIntervals = new Set();
+
+global.setInterval = function trackedSetInterval(fn, delay, ...args) {
+  const timer = originalSetInterval(fn, delay, ...args);
+  activeIntervals.add(timer);
+  return timer;
+};
+
+global.clearInterval = function trackedClearInterval(timer) {
+  activeIntervals.delete(timer);
+  return originalClearInterval(timer);
+};
 
 global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
   let timer;
@@ -35,6 +50,12 @@ global.clearTimeout = function trackedClearTimeout(timer) {
 function clearTrackedTimeouts() {
   for (const timer of [...activeTimeouts]) {
     global.clearTimeout(timer);
+  }
+}
+
+function clearTrackedIntervals() {
+  for (const timer of [...activeIntervals]) {
+    global.clearInterval(timer);
   }
 }
 
@@ -61,11 +82,38 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 };
 
 const ipcHandlers = new Map();
+const trustedRendererMainFrame = {
+  url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
+};
+const trustedRendererWindow = {
+  handlers: new Map(),
+  isDestroyed: () => false,
+  isVisible: () => true,
+  isMinimized: () => false,
+  restore: () => {},
+  show: () => {},
+  focus: () => {},
+  moveTop: () => {},
+  setFocusable: () => {},
+  setIgnoreMouseEvents: () => {},
+  on(channel, fn) { this.handlers.set(channel, fn); },
+  once(channel, fn) { this.handlers.set(channel, fn); },
+  loadFile: () => Promise.resolve(),
+  webContents: {
+    handlers: new Map(),
+    mainFrame: trustedRendererMainFrame,
+    send: () => {},
+    on(channel, fn) { this.handlers.set(channel, fn); },
+    once(channel, fn) { this.handlers.set(channel, fn); },
+    setWindowOpenHandler(fn) { this.windowOpenHandler = fn; },
+  },
+};
 
 class TestBrowserWindow {
-  constructor() {
-    this.webContents = { send: () => {} };
+  static fromWebContents(webContents) {
+    return webContents === trustedRendererWindow.webContents ? trustedRendererWindow : null;
   }
+  constructor() { return trustedRendererWindow; }
   loadFile() {}
   on() {}
   isDestroyed() { return true; }
@@ -88,8 +136,11 @@ setStub('electron', () => ({
   app: {
     requestSingleInstanceLock: () => true,
     quit: () => {},
-    whenReady: () => ({ then: () => {} }),
+    whenReady: () => ({ then: (fn) => { fn(); } }),
     on: () => {},
+    isReady: () => true,
+    show: () => {},
+    focus: () => {},
     getPath: () => path.join(os.tmpdir(), 'crate-test-userdata'),
     dock: { setMenu: () => {} },
   },
@@ -201,7 +252,7 @@ require(path.resolve(__dirname, '..', 'main.js'));
 function callIpc(channel, ...args) {
   const handler = ipcHandlers.get(channel);
   if (!handler) throw new Error(`No IPC handler registered for ${channel}`);
-  return handler({}, ...args);
+  return handler({ sender: trustedRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
 
 function makeTempDir() {
@@ -352,12 +403,16 @@ test.afterEach(() => {
   if (storeInstance) storeInstance.set('settings.namingTemplate', '{Project}_{Date}');
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   clearTrackedTimeouts();
+  clearTrackedIntervals();
 });
 
 test.after(() => {
   clearTrackedTimeouts();
+  clearTrackedIntervals();
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
+  global.setInterval = originalSetInterval;
+  global.clearInterval = originalClearInterval;
 });
 
 test('default package omits diagnostic report files but keeps package provenance records', async () => {

@@ -1485,3 +1485,15 @@ Secondary:
 - Reprobox proof: `/private/tmp/crate-reprobox-figma-link-privacy-finalv8.kocFfh`; no dependency installation, app launch, build, signing, release, or deployment occurred.
 - Phase 2B commit `64b4263` was pushed and opened as PR #130 against `v2.4.x`. GitHub reports the PR mergeable and clean; the committed-tree focused suite passed 107/107, while GitHub reports no configured branch checks.
 - Next gate: Bryant approval to merge PR #130. Stop before merge, build, signing, notarization, release, deploy, or the next security phase without the applicable approval.
+
+### 2026-07-14 Electron Boundary Hardening
+
+- Phase 2B ultimately merged as PR #131 at `29aa8646a51e5e241326cef420ed450465bd33b4`; its post-merge deterministic suite and contained Mac mini Figma migration, link-minimization, scope, editing, restart, and privacy validation passed.
+- Implemented Phase 3 on `codex/security-electron-boundary`: all 30 privileged IPC handlers now share a fail-closed sender boundary tied to Crate's current live main window, exact top frame, and canonical local renderer document.
+- Explicit BrowserWindow settings preserve context isolation, keep Node integration off, enable Chromium renderer sandboxing and web security, and deny insecure mixed content. Navigation, redirects, and child-window creation are restricted to the canonical local renderer entry.
+- Closed adversarial bypasses for stale or secondary senders, destroyed or detached windows, arbitrary existing-window adoption, and renderer URLs with populated or bare queries.
+- Validation passed: 255 deterministic tests, 165 focused exact-base Reprobox tests, syntax and whitespace checks, packaged-content verification, source-to-ASAR hash comparison, and Mac mini Computer Use startup/navigation/IPC/window-recovery checks.
+- The contained unsigned QA app used a synthetic Figma token, isolated profile, and mock Keychain. No real credential, Keychain item, Crate config, installed app, dependency, signing, release, or deploy state was changed.
+- Independent functional and adversarial reviews found no P0, P1, P2, or actionable P3 issue. The pre-existing moderate `uuid` advisory remains; no dependency mutation was authorized.
+- Bryant approved Phase 3 commit, push, PR creation, and merge if final merge readiness remains clean.
+- Next gate: commit and open the Phase 3 PR against `v2.4.x`, run final merge readiness, merge only if clean, then stop before signed build, notarization, release mutation, site deployment, or Phase 4 implementation and discuss Phase 4 plus the deferred Electron 39 Quick Package drag-and-drop issue.

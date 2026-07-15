@@ -109,12 +109,42 @@ let nextOpenDialogResult = { canceled: true };
 let testNotificationSupported = false;
 let testAppActive = true;
 let testBrowserWindowCreateCount = 0;
+let testMainWindowShowCount = 0;
 const testNotifications = [];
+const trustedRendererMainFrame = {
+  url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
+};
+const trustedRendererWindow = {
+  handlers: new Map(),
+  isDestroyed: () => false,
+  isVisible: () => true,
+  isMinimized: () => false,
+  restore: () => {},
+  show: () => { testMainWindowShowCount += 1; },
+  focus: () => {},
+  moveTop: () => {},
+  setFocusable: () => {},
+  setIgnoreMouseEvents: () => {},
+  on(channel, fn) { this.handlers.set(channel, fn); },
+  once(channel, fn) { this.handlers.set(channel, fn); },
+  loadFile: () => Promise.resolve(),
+  webContents: {
+    handlers: new Map(),
+    mainFrame: trustedRendererMainFrame,
+    send: () => {},
+    on(channel, fn) { this.handlers.set(channel, fn); },
+    once(channel, fn) { this.handlers.set(channel, fn); },
+    setWindowOpenHandler(fn) { this.windowOpenHandler = fn; },
+  },
+};
 
 class TestBrowserWindow {
+  static fromWebContents(webContents) {
+    return webContents === trustedRendererWindow.webContents ? trustedRendererWindow : null;
+  }
   constructor() {
     testBrowserWindowCreateCount += 1;
-    this.webContents = { send: () => {} };
+    return trustedRendererWindow;
   }
   loadFile() {}
   on() {}
@@ -144,8 +174,11 @@ setStub('electron', () => ({
   app: {
     requestSingleInstanceLock: () => true,
     quit: () => {},
-    whenReady: () => ({ then: () => {} }),
+    whenReady: () => ({ then: (fn) => { fn(); } }),
     on: () => {},
+    isReady: () => true,
+    show: () => {},
+    focus: () => {},
     isActive: () => testAppActive,
     getPath: () => path.join(os.tmpdir(), 'crate-provenance-dual-write-userdata'),
     dock: { setMenu: () => {} },
@@ -390,7 +423,7 @@ require(path.resolve(__dirname, '..', 'main.js'));
 async function callIpc(channel, ...args) {
   const handler = ipcHandlers.get(channel);
   if (!handler) throw new Error(`No IPC handler registered for ${channel}`);
-  return handler({}, ...args);
+  return handler({ sender: trustedRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
 
 async function createProject(name = 'Provenance Dual Write') {
@@ -866,6 +899,7 @@ test.afterEach(async () => {
   testNotificationSupported = false;
   testAppActive = true;
   testBrowserWindowCreateCount = 0;
+  testMainWindowShowCount = 0;
   testNotifications.length = 0;
   watcherRecords.length = 0;
   clearTrackedTimers();
@@ -1371,6 +1405,7 @@ test('background project package leaves app hidden when native notification is s
     testNotificationSupported = true;
     testAppActive = false;
     testBrowserWindowCreateCount = 0;
+    testMainWindowShowCount = 0;
     testNotifications.length = 0;
     await callIpc('settings:update', 'notifications', true);
 
@@ -1387,8 +1422,10 @@ test('background project package leaves app hidden when native notification is s
     assert.equal(typeof testNotifications[0].handlers.get('click'), 'function');
     assert.equal(typeof testNotifications[0].handlers.get('failed'), 'function');
     assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 0);
     testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));
-    assert.equal(testBrowserWindowCreateCount, 1);
+    assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1419,6 +1456,7 @@ test('background package after destination picker stays hidden despite stale act
     testNotificationSupported = true;
     testAppActive = true;
     testBrowserWindowCreateCount = 0;
+    testMainWindowShowCount = 0;
     testNotifications.length = 0;
     await callIpc('settings:update', 'notifications', true);
 
@@ -1434,15 +1472,19 @@ test('background package after destination picker stays hidden despite stale act
     assert.equal(testNotifications[0].options.silent, false);
     assert.equal(testNotifications[0].options.icon, path.resolve(__dirname, '..', 'assets', 'icon.png'));
     assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 0);
 
     await waitForNotificationShown(0);
     assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 0);
 
     testNotifications[0].handlers.get('failed')({}, new Error('blocked by macOS'));
     assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 0);
 
     testNotifications[0].handlers.get('click')();
-    assert.equal(testBrowserWindowCreateCount, 1);
+    assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1469,6 +1511,7 @@ test('background project package reveals app when native notification is unavail
     testNotificationSupported = false;
     testAppActive = false;
     testBrowserWindowCreateCount = 0;
+    testMainWindowShowCount = 0;
     testNotifications.length = 0;
     await callIpc('settings:update', 'notifications', true);
 
@@ -1477,7 +1520,8 @@ test('background project package reveals app when native notification is unavail
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(testNotifications.length, 0);
-    assert.equal(testBrowserWindowCreateCount, 1);
+    assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1493,11 +1537,13 @@ test('package destination selection does not foreground Crate after confirmed ou
       filePaths: [outputDir],
     };
     testBrowserWindowCreateCount = 0;
+    testMainWindowShowCount = 0;
 
     const selectedPath = await callIpc('projects:select-output');
 
     assert.equal(selectedPath, outputDir);
     assert.equal(testBrowserWindowCreateCount, 0);
+    assert.equal(testMainWindowShowCount, 0);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

@@ -10,7 +10,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
 const os = require('os');
-const { fileURLToPath } = require('url');
+const { fileURLToPath, pathToFileURL } = require('url');
 const { readPsd } = require('ag-psd');
 const fetch = require('node-fetch');
 const {
@@ -49,6 +49,55 @@ const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
 const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
+const RENDERER_ENTRY_PATH = path.join(__dirname, 'renderer', 'index.html');
+const RENDERER_ENTRY_URL = pathToFileURL(RENDERER_ENTRY_PATH).href;
+const mainWindowIdentities = new WeakSet();
+
+function isTrustedRendererUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'file:') return false;
+    parsed.hash = '';
+    return parsed.href === RENDERER_ENTRY_URL;
+  } catch (_) {
+    return false;
+  }
+}
+
+function assertTrustedRendererIpc(event) {
+  const sender = event && event.sender;
+  const senderFrame = event && event.senderFrame;
+  const mainFrame = sender && sender.mainFrame;
+  const senderWindow = sender && typeof BrowserWindow.fromWebContents === 'function'
+    ? BrowserWindow.fromWebContents(sender)
+    : null;
+  const mainWindow = trayWindow;
+  const liveWindows = getLiveBrowserWindows();
+  if (
+    !senderWindow ||
+    !mainWindow ||
+    typeof mainWindow.isDestroyed !== 'function' ||
+    mainWindow.isDestroyed() ||
+    !mainWindowIdentities.has(mainWindow) ||
+    (liveWindows && !liveWindows.includes(mainWindow)) ||
+    senderWindow !== mainWindow ||
+    sender !== mainWindow.webContents ||
+    !senderFrame ||
+    !mainFrame ||
+    senderFrame !== mainFrame ||
+    !isTrustedRendererUrl(senderFrame.url)
+  ) {
+    throw new Error('Crate blocked an untrusted renderer request.');
+  }
+}
+
+function registerTrustedIpcHandler(channel, handler) {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedRendererIpc(event);
+    return handler(event, ...args);
+  });
+}
 
 function realpathSync(targetPath) {
   return (fs.realpathSync.native || fs.realpathSync)(targetPath);
@@ -8019,14 +8068,19 @@ function getLiveBrowserWindows() {
 
 function adoptExistingMainWindow() {
   const liveWindows = getLiveBrowserWindows();
-  if (trayWindow && !trayWindow.isDestroyed()) {
+  if (trayWindow && !trayWindow.isDestroyed() && mainWindowIdentities.has(trayWindow)) {
     if (!liveWindows || liveWindows.includes(trayWindow)) return trayWindow;
     console.warn('[main-window] cached window missing from live window list; recreating');
     trayWindow = null;
   }
   if (!liveWindows) return null;
   const existingWindow = liveWindows
-    .find((win) => win && typeof win.isDestroyed === 'function' && !win.isDestroyed());
+    .find((win) => (
+      win &&
+      typeof win.isDestroyed === 'function' &&
+      !win.isDestroyed() &&
+      mainWindowIdentities.has(win)
+    ));
   if (existingWindow) {
     trayWindow = existingWindow;
   }
@@ -8072,7 +8126,7 @@ function createMainWindow() {
   adoptExistingMainWindow();
   if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
 
-  trayWindow = new BrowserWindow({
+  const nextWindow = new BrowserWindow({
     width: 960,
     height: 760,
     minWidth: 720,
@@ -8093,11 +8147,14 @@ function createMainWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
-      contextIsolation: true
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     }
   });
-
-  const rendererEntry = path.join(__dirname, 'renderer', 'index.html');
+  mainWindowIdentities.add(nextWindow);
+  trayWindow = nextWindow;
 
   const revealLoadedMainWindow = () => {
     clearMainWindowShowFallback();
@@ -8113,6 +8170,14 @@ function createMainWindow() {
   }
 
   if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
+    const blockUntrustedNavigation = (event, targetUrl) => {
+      const requestedUrl = event && typeof event.url === 'string' ? event.url : targetUrl;
+      if (!isTrustedRendererUrl(requestedUrl) && event && typeof event.preventDefault === 'function') {
+        event.preventDefault();
+      }
+    };
+    trayWindow.webContents.on('will-navigate', blockUntrustedNavigation);
+    trayWindow.webContents.on('will-redirect', blockUntrustedNavigation);
     trayWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
       console.error('[main-window] renderer failed to load:', redactFigmaLogText(`${errorCode || ''} ${errorDescription || ''}`));
       showMainWindow({ reason: 'renderer-failed-load' });
@@ -8123,7 +8188,11 @@ function createMainWindow() {
     });
   }
 
-  const loadResult = trayWindow.loadFile(rendererEntry);
+  if (trayWindow.webContents && typeof trayWindow.webContents.setWindowOpenHandler === 'function') {
+    trayWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  }
+
+  const loadResult = trayWindow.loadFile(RENDERER_ENTRY_PATH);
   if (loadResult && typeof loadResult.catch === 'function') {
     loadResult.catch((error) => {
       console.error('[main-window] renderer load failed:', redactFigmaLogText(error && error.message));
@@ -8143,6 +8212,7 @@ function createMainWindow() {
   const createdWindow = trayWindow;
   trayWindow.on('closed', () => {
     if (trayWindow !== createdWindow) return;
+    mainWindowIdentities.delete(createdWindow);
     clearMainWindowShowFallback();
     if (mainWindowVisibleSinceStartup) {
       clearMainWindowStartupRetries();
@@ -8821,7 +8891,7 @@ function startInactivityChecker() {
 
 // --- IPC Handlers ---
 
-ipcMain.handle('projects:get-all', () => {
+registerTrustedIpcHandler('projects:get-all', () => {
   const projects = getProjects();
   let changed = false;
   for (const project of projects) {
@@ -8831,7 +8901,7 @@ ipcMain.handle('projects:get-all', () => {
   return projects;
 });
 
-ipcMain.handle('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
+registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
   const projects = getProjects();
 
   // Enforce project cap
@@ -8873,7 +8943,7 @@ ipcMain.handle('projects:create', async (event, name, projectType = 'branding', 
 // Phase 2: per-project Figma link.
 // payload: { action: 'preserve'|'replace'|'remove', url?: string, scopeMode }
 // A blank replacement preserves the current link; removal must be explicit.
-ipcMain.handle('projects:set-figma-link', async (event, projectId, payload = {}) => {
+registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, payload = {}) => {
   const project = getProjects().find(p => p.id === projectId);
   if (!project) return { success: false, error: 'project_not_found' };
 
@@ -8919,7 +8989,7 @@ ipcMain.handle('projects:set-figma-link', async (event, projectId, payload = {})
   return { success: true, project: updated };
 });
 
-ipcMain.handle('projects:start-watching', async (event, id) => {
+registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
   const project = mutateProject(id, (proj) => {
     proj.status = 'watching';
   });
@@ -8929,7 +8999,7 @@ ipcMain.handle('projects:start-watching', async (event, id) => {
   return project;
 });
 
-ipcMain.handle('projects:pause', (event, id) => {
+registerTrustedIpcHandler('projects:pause', (event, id) => {
   const project = mutateProject(id, (proj) => {
     proj.status = 'paused';
   });
@@ -8939,13 +9009,13 @@ ipcMain.handle('projects:pause', (event, id) => {
   return project;
 });
 
-ipcMain.handle('projects:get-files', (event, id) => {
+registerTrustedIpcHandler('projects:get-files', (event, id) => {
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
   return project ? project.files : [];
 });
 
-ipcMain.handle('projects:remove-file', (event, projectId, fileIdOrPath) => {
+registerTrustedIpcHandler('projects:remove-file', (event, projectId, fileIdOrPath) => {
   const result = mutateProject(projectId, (project) => {
     // C2: Use fileId for removal when available (embedded files share the parent PSD path).
     // Fall back to path match for non-embedded files.
@@ -8961,7 +9031,7 @@ ipcMain.handle('projects:remove-file', (event, projectId, fileIdOrPath) => {
 
 // --- Tier 2: Accept / reject pending files ---
 
-ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
+registerTrustedIpcHandler('projects:accept-pending', (event, projectId, filePath) => {
   let acceptedSourceForScan = null;
   const result = mutateProject(projectId, (project) => {
     const idx = (project.pendingFiles || []).findIndex(f => f.path === filePath);
@@ -9004,7 +9074,7 @@ ipcMain.handle('projects:accept-pending', (event, projectId, filePath) => {
   return result;
 });
 
-ipcMain.handle('projects:reject-pending', (event, projectId, filePath) => {
+registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath) => {
   const result = mutateProject(projectId, (project) => {
     const file = (project.pendingFiles || []).find(f => f.path === filePath);
     project.pendingFiles = (project.pendingFiles || []).filter(f => f.path !== filePath);
@@ -9023,7 +9093,7 @@ ipcMain.handle('projects:reject-pending', (event, projectId, filePath) => {
   return result.pendingFiles;
 });
 
-ipcMain.handle('projects:add-files', async (event, projectId) => {
+registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   // M6: Filter to supported design + image file types
   const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
     .map(e => e.slice(1)); // strip leading dot
@@ -9088,7 +9158,7 @@ ipcMain.handle('projects:add-files', async (event, projectId) => {
 // file handle. Scan Desktop/Documents/Downloads for .fig files modified during the
 // session (mtime >= watchStartedAt) to catch locally-saved Figma files.
 // For .fig files saved BEFORE the session, users should use "+ Add files".
-ipcMain.handle('projects:pre-package-scan', async (event, projectId) => {
+registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) => {
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
   try {
@@ -10187,7 +10257,7 @@ async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
   await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data), { flag: 'wx' });
 }
 
-ipcMain.handle('projects:package', async (event, id, outputPath) => {
+registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
   // C1: Prevent double-click / concurrent packaging
   if (packageInFlight) return { error: 'package_in_flight' };
   packageInFlight = true;
@@ -10383,7 +10453,7 @@ ipcMain.handle('projects:package', async (event, id, outputPath) => {
   }
 });
 
-ipcMain.handle('projects:select-output', async () => {
+registerTrustedIpcHandler('projects:select-output', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openDirectory', 'createDirectory'],
     title: 'Choose Package Destination',
@@ -10400,7 +10470,7 @@ ipcMain.handle('projects:select-output', async () => {
   return result.filePaths[0];
 });
 
-ipcMain.handle('projects:delete', (event, id) => {
+registerTrustedIpcHandler('projects:delete', (event, id) => {
   stopWatching(id);
   const result = mutateProject(id, (project, projects) => {
     const idx = projects.indexOf(project);
@@ -10411,7 +10481,7 @@ ipcMain.handle('projects:delete', (event, id) => {
   return result || getProjects();
 });
 
-ipcMain.handle('projects:delete-all', () => {
+registerTrustedIpcHandler('projects:delete-all', () => {
   // Stop all active watchers and lsof pollers
   for (const [id, watcher] of watchers) {
     watcher.close();
@@ -10457,7 +10527,7 @@ ipcMain.handle('projects:delete-all', () => {
 
 // --- V2 Quick Package ---
 
-ipcMain.handle('v2:browse-file', async () => {
+registerTrustedIpcHandler('v2:browse-file', async () => {
   const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
   const result = await dialog.showOpenDialog({
     properties: ['openFile'],
@@ -10471,7 +10541,7 @@ ipcMain.handle('v2:browse-file', async () => {
   return result.filePaths[0];
 });
 
-ipcMain.handle('v2:package-file', async (event, filePath) => {
+registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
   const limitResult = getPackageLimitResult();
@@ -10506,14 +10576,14 @@ ipcMain.handle('v2:package-file', async (event, filePath) => {
   }
 });
 
-ipcMain.handle('v2:supported-extensions', () => {
+registerTrustedIpcHandler('v2:supported-extensions', () => {
   const { SUPPORTED_EXTENSIONS } = require('./parsers/index.js');
   return SUPPORTED_EXTENSIONS;
 });
 
 // --- Figma Integration ---
 
-ipcMain.handle('figma:status', async () => {
+registerTrustedIpcHandler('figma:status', async () => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
@@ -10538,7 +10608,7 @@ ipcMain.handle('figma:status', async () => {
   };
 });
 
-ipcMain.handle('figma:connect', async (event, token) => {
+registerTrustedIpcHandler('figma:connect', async (event, token) => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
 
@@ -10568,7 +10638,7 @@ ipcMain.handle('figma:connect', async (event, token) => {
   return { success: true };
 });
 
-ipcMain.handle('figma:disconnect', async () => {
+registerTrustedIpcHandler('figma:disconnect', async () => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const deleted = await parser.deleteToken();
@@ -10588,7 +10658,7 @@ ipcMain.handle('figma:disconnect', async () => {
 });
 
 // Trigger a manual Figma scan for a specific project
-ipcMain.handle('figma:scan-project', async (event, projectId) => {
+registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
@@ -10611,7 +10681,7 @@ ipcMain.handle('figma:scan-project', async (event, projectId) => {
 });
 
 // Get Figma assets count for a specific project
-ipcMain.handle('figma:project-assets', async (event, projectId) => {
+registerTrustedIpcHandler('figma:project-assets', async (event, projectId) => {
   const project = getProjects().find(p => p.id === projectId);
   if (!project) {
     return { count: 0, assets: [] };
@@ -10629,7 +10699,7 @@ ipcMain.handle('figma:project-assets', async (event, projectId) => {
   };
 });
 
-ipcMain.handle('figma:scan-now', async (event) => {
+registerTrustedIpcHandler('figma:scan-now', async (event) => {
   // Phase 2: only scan watching projects that have a per-project Figma link.
   const projects = getProjects().filter(p =>
     p.status === 'watching' &&
@@ -10670,11 +10740,11 @@ ipcMain.handle('figma:scan-now', async (event) => {
   return { triggered: scannableProjects.length, skipped, totalAddedCount };
 });
 
-ipcMain.handle('settings:get', () => {
+registerTrustedIpcHandler('settings:get', () => {
   return store.get('settings');
 });
 
-ipcMain.handle('settings:update', (event, key, value) => {
+registerTrustedIpcHandler('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
   const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
@@ -10686,22 +10756,22 @@ ipcMain.handle('settings:update', (event, key, value) => {
   return store.get('settings');
 });
 
-ipcMain.handle('usage:get', () => {
+registerTrustedIpcHandler('usage:get', () => {
   checkAndResetUsage();
   return store.get('usage');
 });
 
-ipcMain.handle('shell:open-folder', (event, folderPath) => {
+registerTrustedIpcHandler('shell:open-folder', (event, folderPath) => {
   shell.openPath(folderPath);
 });
 
 // Inactivity responses
-ipcMain.handle('inactivity:keep-watching', (event, projectId) => {
+registerTrustedIpcHandler('inactivity:keep-watching', (event, projectId) => {
   lastFileActivity.set(projectId, Date.now());
   inactivityNotified.delete(projectId);
 });
 
-ipcMain.handle('inactivity:pause', (event, projectId) => {
+registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
   const project = mutateProject(projectId, (proj) => {
     proj.status = 'paused';
   });
