@@ -287,10 +287,11 @@ test('verifyTokenCandidate validates before storage and returns only privacy-saf
 
   try {
     let status = 200;
+    const responseBody = Buffer.from(JSON.stringify({ id: 'user-id', email: 'private@example.test' }));
     const fetchImpl = async () => ({
       ok: status === 200,
       status,
-      json: async () => ({ id: 'user-id', email: 'private@example.test' }),
+      buffer: async () => responseBody,
     });
     const FigmaParser = loadFigmaParser({ fetchImpl });
     const parser = new FigmaParser();

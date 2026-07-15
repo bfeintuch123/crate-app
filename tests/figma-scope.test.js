@@ -114,6 +114,15 @@ class SensitiveUrlFigmaParser extends StubFigmaParser {
   }
 }
 
+class AssetDiscoveryFailureFigmaParser extends StubFigmaParser {
+  async _fetchAPI(endpoint) {
+    if (endpoint === `/files/${FILE_KEY}/images` || endpoint.startsWith(`/images/${FILE_KEY}?`)) {
+      throw new Error('Figma asset request failed.');
+    }
+    return super._fetchAPI(endpoint);
+  }
+}
+
 const MODERN_FILE_KEY = 'Petra_logo-File_123';
 
 class MetadataFailureFigmaParser extends FigmaParser {
@@ -495,6 +504,20 @@ test('figma image resolution logs omit raw CDN URLs and signed query material', 
   assert.equal(output.includes('https://'), false);
   assert.equal(/cdn\.figma\.example/i.test(output), false);
   assert.equal(/SIGNED_QUERY_TOKEN|Authorization|Bearer|cookie=/i.test(output), false);
+});
+
+test('asset-discovery API failures remain distinct from a successful file read', async () => {
+  const parser = new AssetDiscoveryFailureFigmaParser();
+  const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  });
+
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.fileFetchStatus, 'success');
+  assert.equal(result.scope.assetFetchStatus, 'failed');
+  assert.match(result.errors.join(' '), /asset request failed/i);
 });
 
 const DEPS_FILE_KEY = 'FILE_DEPS';

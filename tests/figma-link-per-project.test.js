@@ -16,6 +16,7 @@ const {
   NODE_TYPES,
   PROVENANCE_SCHEMA_VERSION,
 } = require('../provenance');
+const { FIGMA_NETWORK_LIMITS } = require('../parsers/figma-network');
 
 // Track timers created by main.js so each test can prove it exits cleanly.
 const originalSetInterval = global.setInterval;
@@ -170,8 +171,12 @@ setStub('electron', () => electronStub);
 
 // In-memory electron-store double.
 const fakeStoreSetHistory = [];
+let fakeStoreInstance = null;
 class FakeStore {
-  constructor(opts = {}) { this.data = JSON.parse(JSON.stringify(opts.defaults || {})); }
+  constructor(opts = {}) {
+    this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
+    fakeStoreInstance = this;
+  }
   get(key, fallback) {
     if (!key) return this.data;
     const parts = key.split('.');
@@ -453,6 +458,7 @@ function figmaRateLimitedScanResult() {
     warnings: [],
     scopeEntries: [{
       fileKey: 'FIG22',
+      primaryKey: 'FIG22',
       fileName: 'Brand Cloud',
       scopeMode: 'current-page',
       lockStatus: 'unresolved',
@@ -1050,6 +1056,35 @@ test('Figma link candidate fallback can lock and stage assets without widening s
   assert.equal(fresh.files[0].figmaPageId, '1:1');
   await waitForActiveFigmaPollerCount(activePollersBefore + 1);
 
+  nextFigmaScanResult = figmaScanResult([], [{
+    fileKey: primaryKey,
+    primaryKey,
+    fileName: 'Petra Logo',
+    scopeMode: 'current-page',
+    lockStatus: 'unresolved',
+    lockedPageId: null,
+    lockedPageName: null,
+      warning: 'Primary candidate could not be read.',
+      fileFetchStatus: 'failed',
+      fileFetchFailureReason: 'not-found',
+      assetFetchStatus: 'not-attempted',
+  }, {
+    fileKey: fallbackKey,
+    primaryKey,
+    fileName: 'Petra Logo',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  nextFigmaScanResult.errors = ['Primary candidate metadata was unavailable.'];
+  const prePackage = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(prePackage.error, undefined);
+
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-fallback-package-'));
   try {
     const packageResult = await callIpc('projects:package', project.id, outputDir);
@@ -1520,6 +1555,175 @@ test('Figma asset scan records cloud resource materialization provenance after l
   const provenanceText = JSON.stringify(fresh.provenance);
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_URL'), false);
   assert.equal(provenanceText.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+});
+
+test('oversized Figma asset is rejected before cache or provenance mutation', async () => {
+  const project = await createLinkedFigmaProject('Figma Oversized Asset');
+  let bodyRead = false;
+  fetchHandler = async () => ({
+    ok: true,
+    status: 200,
+    headers: {
+      get(name) {
+        return String(name).toLowerCase() === 'content-length'
+          ? String(FIGMA_NETWORK_LIMITS.assetResponseBytes + 1)
+          : null;
+      },
+    },
+    buffer: async () => {
+      bodyRead = true;
+      return Buffer.from('must not be read');
+    },
+  });
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/oversized.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-oversized',
+    imageRef: 'img-oversized',
+    name: 'Oversized',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const { output } = await captureConsole(async () => {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(bodyRead, false);
+  assert.equal(fresh.files.length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.CLOUD_DOCUMENT).length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE).length, 0);
+  assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
+  assert.equal(output.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+  assert.equal(output.includes('cdn.figma.example'), false);
+});
+
+test('pre-package Figma download failure blocks output until a clean retry succeeds', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-download-block-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Download Block');
+    const asset = {
+      url: 'https://cdn.figma.example/oversized.png?token=SHOULD_NOT_APPEAR_TOKEN',
+      nodeId: 'node-oversized',
+      imageRef: 'img-oversized',
+      name: 'Oversized',
+      format: 'png',
+      figmaFileKey: 'FIG22',
+      figmaFileName: 'Brand Cloud',
+      figmaPageId: '1:1',
+      figmaPageName: 'Page One',
+    };
+    const successfulScopeEntries = [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      warning: null,
+      fileFetchStatus: 'success',
+      fileFetchFailureReason: null,
+      assetFetchStatus: 'success',
+    }];
+    nextFigmaScanResult = figmaScanResult([asset], successfulScopeEntries);
+    fetchHandler = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          return String(name).toLowerCase() === 'content-length'
+            ? String(FIGMA_NETWORK_LIMITS.assetResponseBytes + 1)
+            : null;
+        },
+      },
+      buffer: async () => Buffer.from('must not be read'),
+    });
+
+    const scan = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+
+    const outputDir = path.join(tmpRoot, 'blocked-output');
+    const blocked = await callIpc('projects:package', project.id, outputDir);
+    assert.match(blocked.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(fs.existsSync(outputDir), false);
+
+    nextFigmaScanResult = figmaRateLimitedScanResult();
+    const rateLimitedRetry = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(rateLimitedRetry.error, /could not securely retrieve all Figma assets/i);
+    const stillBlocked = await callIpc('projects:package', project.id, outputDir);
+    assert.match(stillBlocked.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(fs.existsSync(outputDir), false);
+
+    nextFigmaScanResult = figmaScanResult([], [{
+      ...successfulScopeEntries[0],
+      assetFetchStatus: 'failed',
+    }]);
+    nextFigmaScanResult.errors = ['Figma asset recovery failed.'];
+    const assetRecoveryRetry = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(assetRecoveryRetry.error, /could not securely retrieve all Figma assets/i);
+    const assetRecoveryBlocked = await callIpc('projects:package', project.id, outputDir);
+    assert.match(assetRecoveryBlocked.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(fs.existsSync(outputDir), false);
+
+    nextFigmaScanResult = figmaScanResult([asset], successfulScopeEntries);
+    setFigmaDownloadResponse('recovered asset');
+    const retryScan = await callIpc('projects:pre-package-scan', project.id);
+    assert.equal(retryScan.error, undefined);
+
+    const packaged = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(packaged.success, true);
+    assert.equal(packaged.copiedCount, 1);
+    assert.equal(
+      fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Download Block'), 'Brand_Cloud_Oversized.png'), 'utf8'),
+      'recovered asset'
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package recovery requires one successful candidate for every tracked Figma link', async () => {
+  const project = await createLinkedFigmaProject('Figma Multi-Link Recovery');
+  const projects = fakeStoreInstance.get('projects');
+  const storedProject = projects.find(item => item.id === project.id);
+  const secondLocator = JSON.parse(JSON.stringify(storedProject.figmaTrackedFiles[0]));
+  secondLocator.key = 'FIG33';
+  secondLocator.candidateKeys = ['FIG33'];
+  secondLocator.candidateKeyDetails = [{ key: 'FIG33', source: 'direct-route' }];
+  secondLocator.requestedPageId = '2:2';
+  secondLocator.requestedNodeId = null;
+  storedProject.figmaTrackedFiles.push(secondLocator);
+  storedProject.figmaSession = null;
+  fakeStoreInstance.set('projects', projects);
+
+  const successfulScope = (fileKey, pageId) => ({
+    fileKey,
+    primaryKey: fileKey,
+    fileName: `Tracked ${fileKey}`,
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: pageId,
+    lockedPageName: `Page ${pageId}`,
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  });
+
+  nextFigmaScanResult = figmaScanResult([], [successfulScope('FIG22', '1:1')]);
+  const incompleteScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.match(incompleteScan.error, /could not securely retrieve all Figma assets/i);
+
+  nextFigmaScanResult = figmaScanResult([], [
+    successfulScope('FIG22', '1:1'),
+    successfulScope('FIG33', '2:2'),
+  ]);
+  const completeScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(completeScan.error, undefined);
 });
 
 test('Figma asset cache directories and downloaded files are owner-only where supported', async () => {
@@ -1996,7 +2200,7 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
 
     const manifestText = JSON.stringify(manifest);
     assert.equal(manifestText.includes('FIG22'), false);
-    assert.equal(manifestText.includes('1:1'), false);
+    assert.doesNotMatch(manifestText, /(?:^|[^0-9])1:1(?:[^0-9]|$)/);
     assert.equal(manifestText.includes('img-in-scope'), false);
     assert.equal(manifestText.includes('img-out-of-scope'), false);
     assert.equal(manifestText.includes('Out Of Scope'), false);

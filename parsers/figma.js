@@ -21,6 +21,11 @@
 const { BaseParser } = require('./base');
 const { normalizeToken } = require('./figma-credential-store');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./figma-redaction');
+const {
+  FIGMA_NETWORK_LIMITS,
+  createByteBudget,
+  fetchBufferWithLimits,
+} = require('./figma-network');
 const fs = require('fs');
 const path = require('path');
 
@@ -390,9 +395,13 @@ class FigmaParser extends BaseParser {
     }
 
     const assets = [];
+    const apiBudget = createByteBudget(
+      FIGMA_NETWORK_LIMITS.apiOperationBytes,
+      FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+    );
 
     // Fetch file structure
-    const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
+    const fileData = await this._fetchAPI(`/files/${fileKey}`, token, apiBudget);
 
     // Find all nodes with image fills or that are exportable
     const imageNodeIds = [];
@@ -412,7 +421,8 @@ class FigmaParser extends BaseParser {
       try {
         const imagesData = await this._fetchAPI(
           `/images/${fileKey}?ids=${batch.join(',')}&format=png&scale=2`,
-          token
+          token,
+          apiBudget
         );
 
         if (imagesData.images) {
@@ -454,10 +464,21 @@ class FigmaParser extends BaseParser {
     }
 
     const downloadedPaths = [];
+    const assetBudget = createByteBudget(
+      FIGMA_NETWORK_LIMITS.assetOperationBytes,
+      FIGMA_NETWORK_LIMITS.assetOperationTimeoutMs
+    );
 
     for (const asset of assets) {
       try {
-        const response = await fetch(asset.path);
+        const { response, buffer } = await fetchBufferWithLimits({
+          fetchImpl: fetch,
+          url: asset.path,
+          timeoutMs: FIGMA_NETWORK_LIMITS.requestTimeoutMs,
+          maxBytes: FIGMA_NETWORK_LIMITS.assetResponseBytes,
+          budget: assetBudget,
+          maxRedirects: FIGMA_NETWORK_LIMITS.assetRedirects,
+        });
         if (!response.ok) {
           continue;
         }
@@ -470,7 +491,6 @@ class FigmaParser extends BaseParser {
         const localPath = path.join(destDir, filename);
 
         // Write file
-        const buffer = await response.buffer();
         fs.writeFileSync(localPath, buffer);
         downloadedPaths.push(localPath);
       } catch (err) {
@@ -485,16 +505,21 @@ class FigmaParser extends BaseParser {
    * Make an authenticated request to the Figma API.
    * @private
    */
-  async _fetchAPI(endpoint, token) {
+  async _fetchAPI(endpoint, token, apiBudget = null) {
     const url = `${FIGMA_API_BASE}${endpoint}`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
     try {
-      const response = await fetch(url, {
+      const { response, buffer } = await fetchBufferWithLimits({
+        fetchImpl: fetch,
+        url,
         headers: { 'X-Figma-Token': token },
-        signal: controller.signal
+        timeoutMs: FIGMA_NETWORK_LIMITS.requestTimeoutMs,
+        maxBytes: FIGMA_NETWORK_LIMITS.apiResponseBytes,
+        budget: apiBudget || createByteBudget(
+          FIGMA_NETWORK_LIMITS.apiOperationBytes,
+          FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+        ),
+        maxRedirects: FIGMA_NETWORK_LIMITS.apiRedirects,
       });
-      clearTimeout(timeoutId);
 
       if (!response.ok) {
         const status = response.status;
@@ -514,7 +539,7 @@ class FigmaParser extends BaseParser {
       }
 
       try {
-        return await response.json();
+        return JSON.parse(buffer.toString('utf8'));
       } catch (e) {
         throw safeFigmaParserError(figmaApiFailureMessage(endpoint), {
           reason: 'invalid-json',
@@ -522,7 +547,12 @@ class FigmaParser extends BaseParser {
         });
       }
     } catch (e) {
-      clearTimeout(timeoutId);
+      if (e && e._crateFigmaNetworkSafe) {
+        throw safeFigmaParserError(figmaApiFailureMessage(endpoint), {
+          reason: e.reason,
+          endpointCategory: figmaEndpointCategory(endpoint)
+        });
+      }
       if (e && e.name === 'AbortError') {
         throw safeFigmaParserError(figmaApiFailureMessage(endpoint, null, 'timed out after 30s'), {
           reason: 'timeout',
@@ -1066,14 +1096,14 @@ class FigmaParser extends BaseParser {
    * Verify the stored token is valid and get user info.
    * @returns {Promise<{valid: boolean, user?: {id: string, handle: string, email: string}}>}
    */
-  async verifyToken() {
+  async verifyToken(apiBudget = null) {
     const token = await this.getStoredToken();
     if (!token) return { valid: false };
 
     if (!fetch) return { valid: false, error: 'node-fetch not installed' };
 
     try {
-      const userData = await this._fetchAPI('/me', token);
+      const userData = await this._fetchAPI('/me', token, apiBudget);
       return {
         valid: true,
         user: {
@@ -1178,13 +1208,13 @@ class FigmaParser extends BaseParser {
    * @param {string} fileKey - Figma file key
    * @returns {Promise<{key: string, name: string, lastModified: string, lastModifiedMs: number}|null>}
    */
-  async getFileMetadata(fileKey, diagnostic = null) {
+  async getFileMetadata(fileKey, diagnostic = null, apiBudget = null) {
     const token = await this.getStoredToken();
     if (!token || !fetch) return null;
 
     try {
       // Use the lightweight metadata endpoint (doesn't download full file tree)
-      const data = await this._fetchAPI(`/files/${fileKey}/metadata`, token);
+      const data = await this._fetchAPI(`/files/${fileKey}/metadata`, token, apiBudget);
       return {
         key: fileKey,
         name: data.name,
@@ -1197,7 +1227,7 @@ class FigmaParser extends BaseParser {
     } catch (metaErr) {
       // Fallback: /files/{key} with minimal depth (metadata endpoint may not exist on older API)
       try {
-        const data = await this._fetchAPI(`/files/${fileKey}?depth=1`, token);
+        const data = await this._fetchAPI(`/files/${fileKey}?depth=1`, token, apiBudget);
         return {
           key: fileKey,
           name: data.name,
@@ -1246,6 +1276,10 @@ class FigmaParser extends BaseParser {
     const teamIds = options.teamIds || [];
     const fileKeys = Array.from(new Set((options.fileKeys || []).filter(key => typeof key === 'string' && key.trim())));
     const recentFiles = [];
+    const apiBudget = options.apiBudget || createByteBudget(
+      FIGMA_NETWORK_LIMITS.apiOperationBytes,
+      FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+    );
     const errors = [];
     const candidateDiagnostics = [];
     const seenKeys = new Set();
@@ -1297,7 +1331,7 @@ class FigmaParser extends BaseParser {
       for (const teamId of teamIds) {
         let teamName = 'Team';
         try {
-          const teamData = await this._fetchAPI(`/teams/${teamId}`, token);
+          const teamData = await this._fetchAPI(`/teams/${teamId}`, token, apiBudget);
           teamName = teamData.name || teamName;
         } catch (e) {
           const safeMessage = redactFigmaParserText(e.message);
@@ -1312,7 +1346,7 @@ class FigmaParser extends BaseParser {
 
         let projects = [];
         try {
-          const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token);
+          const projectsData = await this._fetchAPI(`/teams/${teamId}/projects`, token, apiBudget);
           projects = projectsData.projects || [];
         } catch (e) {
           const msg = `Cannot list projects for the configured Figma team: ${redactFigmaParserText(e.message)}`;
@@ -1323,7 +1357,7 @@ class FigmaParser extends BaseParser {
 
         for (const project of projects) {
           try {
-            const filesData = await this._fetchAPI(`/projects/${project.id}/files`, token);
+            const filesData = await this._fetchAPI(`/projects/${project.id}/files`, token, apiBudget);
             const files = filesData.files || [];
 
             for (const file of files) {
@@ -1357,7 +1391,7 @@ class FigmaParser extends BaseParser {
         const candidateDiagnostic = {
           metadataStatus: 'not-attempted'
         };
-        const meta = await this.getFileMetadata(fileKey, candidateDiagnostic);
+        const meta = await this.getFileMetadata(fileKey, candidateDiagnostic, apiBudget);
         if (meta) {
           candidateDiagnostic.metadataStatus = 'success';
           candidateDiagnostics.push(candidateDiagnostic);
@@ -1421,7 +1455,7 @@ class FigmaParser extends BaseParser {
    * @param {string} fileKey - Figma file key
    * @returns {Promise<Array<{url: string, nodeId: string, name: string}>>}
    */
-  async extractAssetsFromFileKey(fileKey, scopeEntry = null) {
+  async extractAssetsFromFileKey(fileKey, scopeEntry = null, apiBudget = null) {
     const token = await this.getStoredToken();
     if (!token || !fetch) {
       return this._figmaExtractionResult({
@@ -1436,18 +1470,20 @@ class FigmaParser extends BaseParser {
           statusReason: scopeEntry && scopeEntry.scopeMode === 'current-page' ? FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED : null,
           warning: null,
           fileFetchStatus: 'not-attempted',
-          fileFetchFailureReason: 'not-connected'
+          fileFetchFailureReason: 'not-connected',
+          assetFetchStatus: 'not-attempted'
         }
       });
     }
 
     try {
       // Fetch file structure
-      const fileData = await this._fetchAPI(`/files/${fileKey}`, token);
+      const fileData = await this._fetchAPI(`/files/${fileKey}`, token, apiBudget);
 
       const assets = [];
       const errors = [];
       const warnings = [];
+      let assetFetchFailed = false;
       const scope = this._resolveScopeRoot(fileData.document, scopeEntry);
       const scopedRoot = scope.rootNode || fileData.document;
 
@@ -1466,7 +1502,8 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
             warning: scope.warning,
-            fileFetchStatus: 'success'
+            fileFetchStatus: 'success',
+            assetFetchStatus: 'not-attempted'
           }
         });
       }
@@ -1486,7 +1523,7 @@ class FigmaParser extends BaseParser {
 
       if (imageRefs.size > 0) {
         try {
-          const imageMapData = await this._fetchAPI(`/files/${fileKey}/images`, token);
+          const imageMapData = await this._fetchAPI(`/files/${fileKey}/images`, token, apiBudget);
           const imageMap = (imageMapData && imageMapData.meta && imageMapData.meta.images)
             || imageMapData.images
             || {};
@@ -1521,7 +1558,12 @@ class FigmaParser extends BaseParser {
           console.log(
             `[crate][figma] extractAssetsFromFileKey identifierPresent=${!!fileKey}: image URLs resolved (${resolvedImageRefs.length})`
           );
+          if (resolvedImageRefs.length < imageRefs.size) {
+            assetFetchFailed = true;
+            errors.push('Image-fill recovery did not return every tracked Figma asset.');
+          }
         } catch (err) {
+          assetFetchFailed = true;
           errors.push(`Image-fill recovery failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
@@ -1544,7 +1586,8 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
             warning: scope.warning,
-            fileFetchStatus: 'success'
+            fileFetchStatus: 'success',
+            assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
           }
         });
       }
@@ -1570,7 +1613,8 @@ class FigmaParser extends BaseParser {
             lockedPageName: scope.lockedPageName,
             statusReason: scope.statusReason,
             warning: scope.warning,
-            fileFetchStatus: 'success'
+            fileFetchStatus: 'success',
+            assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
           }
         });
       }
@@ -1584,12 +1628,15 @@ class FigmaParser extends BaseParser {
         try {
           const imagesData = await this._fetchAPI(
             `/images/${fileKey}?ids=${batch.join(',')}&format=png&scale=2`,
-            token
+            token,
+            apiBudget
           );
 
+          const resolvedBatchNodeIds = new Set();
           if (imagesData.images) {
             for (const [nodeId, url] of Object.entries(imagesData.images)) {
               if (url) {
+                resolvedBatchNodeIds.add(nodeId);
                 assets.push({
                   url,
                   nodeId,
@@ -1603,7 +1650,12 @@ class FigmaParser extends BaseParser {
               }
             }
           }
+          if (resolvedBatchNodeIds.size < batch.length) {
+            assetFetchFailed = true;
+            errors.push('Rendered asset recovery did not return every tracked Figma asset.');
+          }
         } catch (err) {
+          assetFetchFailed = true;
           errors.push(`Batch image export failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
@@ -1624,7 +1676,8 @@ class FigmaParser extends BaseParser {
           lockedPageName: scope.lockedPageName,
           statusReason: scope.statusReason,
           warning: scope.warning,
-          fileFetchStatus: 'success'
+          fileFetchStatus: 'success',
+          assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
         }
       });
     } catch (e) {
@@ -1647,7 +1700,8 @@ class FigmaParser extends BaseParser {
           statusReason: isCurrentPage ? statusReason : null,
           warning,
           fileFetchStatus: 'failed',
-          fileFetchFailureReason
+          fileFetchFailureReason,
+          assetFetchStatus: 'not-attempted'
         }
       });
     }
@@ -1667,9 +1721,13 @@ class FigmaParser extends BaseParser {
    */
   async autoTrackScan(options = {}) {
     const result = { files: [], assets: [], errors: [], warnings: [], scopeEntries: [], candidateDiagnostics: null };
+    const apiBudget = createByteBudget(
+      FIGMA_NETWORK_LIMITS.apiOperationBytes,
+      FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+    );
 
     // Verify token first
-    const tokenStatus = await this.verifyToken();
+    const tokenStatus = await this.verifyToken(apiBudget);
     if (!tokenStatus.valid) {
       result.errors.push({ type: 'auth', message: 'Figma token invalid or not set' });
       return result;
@@ -1694,7 +1752,8 @@ class FigmaParser extends BaseParser {
       sinceMs: options.sinceMs,
       maxAgeDays: options.maxAgeDays || 7,
       teamIds,
-      fileKeys
+      fileKeys,
+      apiBudget
     });
 
     // Handle both old array format and new {recentFiles, errors} format
@@ -1719,7 +1778,7 @@ class FigmaParser extends BaseParser {
     for (const file of result.files) {
       try {
         const scopeEntry = scopeEntriesByKey.get(file.key) || null;
-        const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntry);
+        const extractResult = await this.extractAssetsFromFileKey(file.key, scopeEntry, apiBudget);
         if (extractResult.errors && extractResult.errors.length > 0) { result.errors.push(...redactFigmaParserIssues(extractResult.errors)); }
         if (extractResult.warnings && extractResult.warnings.length > 0) { result.warnings.push(...redactFigmaParserIssues(extractResult.warnings)); }
         if (extractResult.scope) {
@@ -1729,10 +1788,14 @@ class FigmaParser extends BaseParser {
             lockStatus: extractResult.scope.lockStatus || 'unknown',
             statusReason: extractResult.scope.statusReason || null,
             candidateSource: scopeEntry && scopeEntry.candidateSource,
+            assetFetchStatus: extractResult.scope.assetFetchStatus || 'unknown',
             assetCount: Array.isArray(extractResult.assets) ? extractResult.assets.length : 0
           });
           result.scopeEntries.push({
             fileKey: file.key,
+            primaryKey: scopeEntry && typeof scopeEntry.primaryKey === 'string'
+              ? scopeEntry.primaryKey
+              : null,
             fileName: file.name,
             candidateSource: scopeEntry && scopeEntry.candidateSource,
             scopeMode: extractResult.scope.scopeMode,
@@ -1742,7 +1805,8 @@ class FigmaParser extends BaseParser {
             statusReason: extractResult.scope.statusReason || null,
             warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null,
             fileFetchStatus: extractResult.scope.fileFetchStatus || null,
-            fileFetchFailureReason: extractResult.scope.fileFetchFailureReason || null
+            fileFetchFailureReason: extractResult.scope.fileFetchFailureReason || null,
+            assetFetchStatus: extractResult.scope.assetFetchStatus || null
           });
         }
         for (const asset of extractResult.assets) {
