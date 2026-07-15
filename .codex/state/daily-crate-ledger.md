@@ -1525,3 +1525,16 @@ Secondary:
 - Two independent adversarial rereviews approved the final patch after verifying timeout handling, same-descriptor bounded reads, reference limits, late-failure output cleanup, and separate plain or gzip Premiere input budgets.
 - `npm audit --audit-level=high` passed with only the pre-existing moderate `uuid` advisory. No dependency or lockfile mutation occurred.
 - Bryant approved committing and pushing Phase 4A, opening its PR against `v2.4.x`, running merge readiness, and merging if clean. Phase 4B network and Figma download limits remain separate and start only after that merge.
+
+### 2026-07-15 Figma Network Admission Limits
+
+- Phase 4A PR #134 merged into `v2.4.x` as `84a7fd3affdf15d855313d339392de6fe9b7a807`.
+- Began independently reviewable Phase 4B on `codex/security-network-download-limits`, based exactly on that merged commit.
+- Added one shared privacy-safe guard for Figma API and asset transfers with HTTPS-only URLs, no authenticated redirects, bounded unauthenticated asset redirects, 30-second request timeouts, 120-second operation deadlines, per-response limits, and shared operation byte budgets.
+- Response bytes are counted before buffering; exhausted byte or time budgets reject before another request; rejected, redirected, oversized, timed-out, and non-success bodies are destroyed.
+- A known pre-package Figma asset-transfer failure now blocks output with fixed nontechnical copy until a clean retry succeeds. Unreadable, rate-limited, partial, or failed asset-discovery retries remain blocked; the blocked attempts create no package folder and do not increment quota.
+- Oversized assets create no cache file, file-ledger record, provenance node, or provenance edge. Current Page Only remains default and fail closed; Entire File remains opt-in.
+- Validation passed: 80 focused Figma network, link, scope, privacy, package, and provenance tests; 297 dependency-complete full-suite tests; and 80 tests plus syntax and whitespace checks in exact-base Reprobox `/private/tmp/crate-reprobox-phase4b-final5.d5YbfM/repo`.
+- One unchanged timing-sensitive provenance poll test failed in the first final full run, then passed in isolation and in the clean 297-test rerun.
+- `npm audit --audit-level=high` passed with only the pre-existing moderate `uuid` advisory. No dependency, build, installed-app, signing, release, deploy, external-tester, Phase 5, or updater mutation occurred.
+- Bryant authorized the Phase 4B commit, push, PR against `v2.4.x`, merge-readiness review, and merge if clean.

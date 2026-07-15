@@ -1,6 +1,6 @@
 # Crate Current Workstream
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Current Status
 
@@ -10,12 +10,12 @@ Last updated: 2026-07-14
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, Phase 2B PR #131, Phase 3 PR #132, and Phase 3.5 PR #133 are merged. Phase 4A local parser and archive admission limits are implemented and validated before the separate Phase 4B network-download slice.
-- Active app branch: `codex/security-parser-admission-limits`
-- Current security work: one shared parser budget module bounds raw design-file reads, Premiere decompression, archive listing and declared expansion, presentation media extraction, and IDML XML inspection. Oversized inputs stop with fixed privacy-safe copy; normal parser and package result shapes remain unchanged.
-- Phase 3.5 merge: PR #133 merged into `v2.4.x` as `5cbe421086095ef4201ff5e740ac7bf413aca65a`.
-- Phase 4A proof: exact base `5cbe421086095ef4201ff5e740ac7bf413aca65a`; focused tests 57/57; Electron 39 embedded-Node tests 20/20; full dependency-complete suite 280/280; real PowerPoint archive smoke passed; exact-base Reprobox 57/57 plus syntax and whitespace checks; two independent rereviews approved; no dependency mutation.
-- Phase 4A next action: commit, push, open the PR against `v2.4.x`, run merge readiness, and merge if clean under Bryant's approval. Phase 4B begins only after Phase 4A merges. No release, deploy, dependency mutation, or Phase 4B implementation has occurred.
+- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, Phase 2B PR #131, Phase 3 PR #132, Phase 3.5 PR #133, and Phase 4A PR #134 are merged. Phase 4B bounded Figma API and asset transfers are implemented, validated, and approved for commit, PR, merge-readiness review, and clean merge.
+- Active app branch: `codex/security-network-download-limits`
+- Current security work: one shared Figma network guard bounds request and operation time, response and aggregate bytes, redirects, and protocol handling. Authenticated API requests never redirect, asset redirects carry no token, and known pre-package transfer, document-read, or asset-discovery failures stop output until a clean retry succeeds.
+- Phase 4A merge: PR #134 merged into `v2.4.x` as `84a7fd3affdf15d855313d339392de6fe9b7a807`.
+- Phase 4B proof: exact base `84a7fd3affdf15d855313d339392de6fe9b7a807`; focused tests 80/80; full dependency-complete suite 297/297; exact-base Reprobox 80/80 plus syntax and whitespace checks; exhausted byte or time budgets reject before another request; known incomplete Figma recovery creates no package output or quota mutation; no dependency mutation.
+- Phase 4B next action: commit, push, open the PR against `v2.4.x`, run merge readiness, and merge only if clean under Bryant's explicit authorization. No build, installed-app QA, release, deploy, Phase 5 implementation, updater work, or dependency mutation has occurred.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

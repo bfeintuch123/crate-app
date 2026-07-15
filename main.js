@@ -37,6 +37,11 @@ const {
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./parsers/figma-redaction');
+const {
+  FIGMA_NETWORK_LIMITS,
+  createByteBudget,
+  fetchBufferWithLimits,
+} = require('./parsers/figma-network');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
@@ -4462,6 +4467,27 @@ function mutateProject(projectId, fn) {
 
 // FIX 2 (C2): Track in-flight pre-package scans
 const scanInFlight = new Set();
+const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
+const figmaPackageTransferBlocks = new Map();
+
+function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
+  const errors = Array.isArray(scanResult && scanResult.errors) ? scanResult.errors : [];
+  const scopeEntries = Array.isArray(scanResult && scanResult.scopeEntries) ? scanResult.scopeEntries : [];
+  const trackedFiles = Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [];
+
+  if (trackedFiles.length === 0) return errors.length === 0;
+
+  return trackedFiles.every((trackedFile) => {
+    const primaryKey = typeof trackedFile.key === 'string' ? trackedFile.key.trim() : '';
+    const candidateKeys = new Set(figmaTrackedFileKeys(trackedFile));
+    return scopeEntries.some((entry) => {
+      if (!entry || entry.fileFetchStatus !== 'success' || entry.assetFetchStatus === 'failed') return false;
+      const entryPrimaryKey = typeof entry.primaryKey === 'string' ? entry.primaryKey.trim() : '';
+      if (entryPrimaryKey && primaryKey) return entryPrimaryKey === primaryKey;
+      return typeof entry.fileKey === 'string' && candidateKeys.has(entry.fileKey.trim());
+    });
+  });
+}
 
 // C1: In-flight lock for confirmPackage / projects:package
 let packageInFlight = false;
@@ -5146,12 +5172,21 @@ function sanitizeFigmaAssetFormat(format) {
  * Download a Figma asset from CDN URL to local disk.
  * @returns {Promise<string|null>} Local file path or null on failure
  */
-async function downloadFigmaAsset(url, fileName, projectId, format = 'png') {
+async function downloadFigmaAsset(url, fileName, projectId, format = 'png', assetBudget = null) {
   try {
-    const response = await fetch(url, { timeout: 30000 });
+    const { response, buffer } = await fetchBufferWithLimits({
+      fetchImpl: fetch,
+      url,
+      timeoutMs: FIGMA_NETWORK_LIMITS.requestTimeoutMs,
+      maxBytes: FIGMA_NETWORK_LIMITS.assetResponseBytes,
+      budget: assetBudget || createByteBudget(
+        FIGMA_NETWORK_LIMITS.assetOperationBytes,
+        FIGMA_NETWORK_LIMITS.assetOperationTimeoutMs
+      ),
+      maxRedirects: FIGMA_NETWORK_LIMITS.assetRedirects,
+    });
     if (!response.ok) return null;
 
-    const buffer = await response.buffer();
     if (buffer.length === 0) return null;
 
     const projectDir = ensureFigmaProjectAssetsDir(projectId);
@@ -5189,6 +5224,10 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
 
   const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
   const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
+  const assetBudget = createByteBudget(
+    FIGMA_NETWORK_LIMITS.assetOperationBytes,
+    FIGMA_NETWORK_LIMITS.assetOperationTimeoutMs
+  );
   let addedCount = 0;
 
   for (const asset of assets) {
@@ -5213,13 +5252,18 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
 
     const fileName = `${asset.figmaFileName}_${asset.name}`;
     const assetFormat = sanitizeFigmaAssetFormat(asset.format);
-    const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat);
+    const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat, assetBudget);
 
     if (!localPath) {
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `name=${formatFigmaLogScalar(asset.name)} reason=download_failed`
       );
+      if (contextLabel === 'pre-package') {
+        const error = new Error(FIGMA_PACKAGE_TRANSFER_ERROR);
+        error._crateFigmaPackageTransferBlocked = true;
+        throw error;
+      }
       continue;
     }
     const normalizedLocalPath = normalizeTrackedFilePath(localPath);
@@ -8973,6 +9017,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     proj.figmaSession = buildFigmaSessionSnapshot(proj, settings);
     return proj;
   });
+  figmaPackageTransferBlocks.delete(projectId);
 
   if (updated && trayWindow && !trayWindow.isDestroyed()) {
     trayWindow.webContents.send('project:updated', { projectId });
@@ -9165,6 +9210,8 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
+  figmaPackageTransferBlocks.delete(projectId);
+  let figmaPackageError = null;
 
   let newCount = 0;
 
@@ -9742,6 +9789,7 @@ end tell`;
     const safeTrackedFileSummaries = summarizeTrackedFigmaFilesForLog(rawTrackedFiles);
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
+      figmaPackageTransferBlocks.set(projectId, FIGMA_PACKAGE_TRANSFER_ERROR);
       const { FigmaParser } = require('./parsers/figma');
       const parser = new FigmaParser();
       console.log(
@@ -9775,14 +9823,28 @@ end tell`;
         const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'pre-package');
         newCount += figmaAdded;
       }
+      if (didFigmaPrePackageScanSucceed(figmaScanResult, rawTrackedFiles)) {
+        figmaPackageTransferBlocks.delete(projectId);
+      } else {
+        figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
+        figmaPackageTransferBlocks.set(projectId, figmaPackageError);
+      }
     }
   } catch (e) {
     console.warn('[crate][figma] pre-package recovery failed:', redactFigmaLogText(e.message));
+    if (figmaPackageTransferBlocks.has(projectId)) {
+      figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
+      figmaPackageTransferBlocks.set(projectId, figmaPackageError);
+    }
   }
 
   project.files = deduplicateFiles(project.files);
 
-  return { files: project.files, newCount };
+  return {
+    files: project.files,
+    newCount,
+    ...(figmaPackageError ? { error: figmaPackageError } : {}),
+  };
   } finally {
     // FIX 2 (C2): Always clear scan-in-flight flag
     scanInFlight.delete(projectId);
@@ -10268,6 +10330,9 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
   // clicks Package, and selecting too early yields a zero-file package.
   await waitForPackageInputScans(id);
 
+  const figmaPackageError = figmaPackageTransferBlocks.get(id);
+  if (figmaPackageError) return { error: figmaPackageError };
+
   // Check freemium limit
   const limitResult = getPackageLimitResult();
   if (limitResult) return limitResult;
@@ -10472,6 +10537,7 @@ registerTrustedIpcHandler('projects:select-output', async () => {
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
   stopWatching(id);
+  figmaPackageTransferBlocks.delete(id);
   const result = mutateProject(id, (project, projects) => {
     const idx = projects.indexOf(project);
     if (idx !== -1) projects.splice(idx, 1);
@@ -10499,6 +10565,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   figmaPollerStarting.clear();
   figmaInProgress.clear();
   figmaManualScanInFlight.clear();
+  figmaPackageTransferBlocks.clear();
   figmaScanTimestamps.clear();
   figmaRateLimitBackoffs.clear();
   // Clean up PS/InDesign pollers (v2.3.0)

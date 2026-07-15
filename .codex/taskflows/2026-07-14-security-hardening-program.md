@@ -3,14 +3,14 @@
 ## Metadata
 
 - created: 2026-07-14
-- updated: 2026-07-14
+- updated: 2026-07-15
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-parser-admission-limits`
+- branch: `codex/security-network-download-limits`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1, 2A, 2B, 3, and 3.5 merged; Phase 4A local parser and archive admission limits implemented and validated, with commit, PR, and clean-merge approval granted
+- status: phases 1, 2A, 2B, 3, 3.5, and 4A merged; Phase 4B bounded Figma network transfers implemented, validated, and approved for commit, PR, merge-readiness review, and clean merge
 
 ## Goal
 
@@ -30,12 +30,12 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: 4A, local parser and archive admission limits
-- security target: bound whole-file parser reads, Premiere decompression, archive listing, IDML XML inspection, and PowerPoint or Keynote embedded-media extraction before hostile or malformed inputs can consume unbounded memory
-- implementation target: centralize limits and privacy-safe admission errors in one shared parser module, then wrap existing parser behavior without changing normal result shapes
-- workflow target: normal design files package as before; only inputs beyond explicit safety budgets are stopped with fixed nontechnical copy
-- package-engine impact: no selection, naming, copy, quota, or output-format behavior change; admission errors propagate before unsafe parser work continues
-- Figma scope impact: none; Phase 4B network and Figma download limits remain separate and have not started
+- phase: 4B, bounded Figma API and asset transfers
+- security target: bound request time, whole-operation time, response bytes, aggregate bytes, redirects, and protocol handling before Figma API or asset data can consume unbounded resources or forward credentials unsafely
+- implementation target: use one shared privacy-safe network guard for authenticated API reads and unauthenticated asset downloads while preserving existing parser results and Figma scope behavior
+- workflow target: normal Figma use remains unchanged; a known pre-package asset-transfer failure blocks output with fixed nontechnical copy until a clean retry succeeds
+- package-engine impact: no selection, naming, copy, quota, or output-format change; only a known incomplete Figma asset recovery stops package creation before output or quota mutation
+- Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, permission, setting, or credential action
 
 ## Deferred Pre-Public-Release Requirement
@@ -80,6 +80,12 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 4A failure-first tests and narrow shared-budget implementation
 - [x] phase 4A focused, full-suite, Electron-runtime, real-archive, security, provenance, runner, and isolated Reprobox validation
 - [x] Bryant approval for phase 4A commit, push, PR creation, and clean merge
+- [x] phase 4A PR #134 merged into `v2.4.x`
+- [x] phase 4B read-only Figma API and asset-transfer inventory
+- [x] phase 4B failure-first tests and narrow shared network-limit implementation
+- [x] phase 4B focused, full-suite, security, provenance, runner, and isolated Reprobox validation
+- [x] phase 4B adversarial review findings fixed with fail-closed package and hard operation-budget regression coverage
+- [x] Bryant approval for phase 4B commit, push, PR creation, merge-readiness review, and clean merge
 
 ## Stop Gates
 
@@ -90,7 +96,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Commit Phase 4A, push the branch, open a PR against `v2.4.x`, run merge readiness, and merge only if clean under Bryant's approval. After the independently reviewable Phase 4A PR merges, begin Phase 4B for bounded Figma and API downloads. Stop before signed build, notarization, release mutation, site deployment, or any dependency change without separate approval.
+Commit and push Phase 4B, open a PR against `v2.4.x`, run merge readiness, and merge only if clean under Bryant's explicit authorization. Stop before any build, installed-app QA, signing, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without separate approval.
 
 ## Phase 1 Evidence
 
@@ -195,3 +201,20 @@ Commit Phase 4A, push the branch, open a PR against `v2.4.x`, run merge readines
 - `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; no dependency or lockfile mutation occurred
 - no new credential, URL, token, private-path, Figma, network, watcher, provenance, quota, release, or deployment behavior was introduced
 - Bryant approved Phase 4A commit, push, PR creation, and merge if merge readiness remains clean; no signed build, notarization, release mutation, site deployment, external tester update, or Phase 4B implementation occurred before that gate
+- PR #134 merged into `v2.4.x` as `84a7fd3affdf15d855313d339392de6fe9b7a807`
+
+## Phase 4B Evidence
+
+- exact base is merged Phase 4A commit `84a7fd3affdf15d855313d339392de6fe9b7a807`; implementation remains uncommitted on `codex/security-network-download-limits`
+- one shared Figma network guard enforces a 30-second request timeout, 120-second operation deadline, 128 MiB API response cap, 512 MiB API operation cap, 100 MiB asset response cap, 1 GiB asset operation cap, zero authenticated API redirects, and at most five unauthenticated asset redirects
+- every URL must remain HTTPS without embedded credentials; authenticated API requests never redirect or forward the Figma token, while asset redirects carry no authentication header
+- response bytes are counted before buffering, exhausted byte or time budgets reject before another request, rejected and invalid-redirect bodies are destroyed, and timeout, redirect, status, protocol, size, and unknown-network errors use fixed privacy-safe text
+- a known pre-package Figma asset-transfer failure creates no package output and does not increment quota; unreadable, rate-limited, partial, or failed asset-discovery retries remain blocked, while a clean retry clears the transient block and packages the recovered asset normally
+- oversized assets create no cache file, file-ledger record, provenance node, or provenance edge
+- focused Figma network, link, scope, privacy, package, and provenance suite passed 80 tests with zero failures
+- dependency-complete full suite passed 297 tests with zero failures using the canonical checkout's existing dependencies through `NODE_PATH`; no dependency installation or mutation occurred
+- one unchanged timing-sensitive provenance poll test failed in the first final full run, passed when isolated, and passed in the clean 297-test rerun
+- fresh exact-base Reprobox at `/private/tmp/crate-reprobox-phase4b-final5.d5YbfM/repo` passed the same 80 tests, syntax checks, and `git diff --check`
+- `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory
+- normal parser results, watcher behavior, Figma scope, package selection and naming, provenance relationships, quota behavior, renderer UI, release state, and website remain unchanged outside the explicit fail-closed incomplete-Figma-transfer boundary
+- no app launch, build, signing, notarization, release mutation, deployment, external tester update, Phase 5 implementation, updater work, or dependency mutation occurred
