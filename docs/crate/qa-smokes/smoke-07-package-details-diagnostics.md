@@ -29,7 +29,9 @@ Expected:
 - Provenance remains internal language.
 - Designer-facing UI uses Package Details, Included Files, File Sources, Needs Review, Why included, Extracted from, Linked from, and Used in.
 - Diagnostics are optional.
-- No raw paths, tokens, signed URLs, broad private file lists, or raw AppleScript/JXA output leak into reports.
+- The report declares schema version 2, minimized package-relevant scope, metadata-only content, and report-local identifiers.
+- Aggregate package counts, fixed error categories, allowlisted graph types, and confidence bands remain available for support.
+- No project identity, filenames, resource names, raw errors, timestamps, persistent graph IDs, paths, tokens, signed URLs, broad private file lists, payloads, or raw AppleScript/JXA output leak into reports.
 
 Return a structured Crate QA Smoke Report.
 ```

@@ -110,7 +110,7 @@ Inspect approved package outputs:
 find <approved-package-output> -maxdepth 4 -type f | sort
 diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
 test -f "$diagnostic_manifest"
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; const count=(items,key)=>(items||[]).reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},nodesByType:count(m.nodes,'type'),edgesByType:count(m.edges,'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
 rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
 
@@ -693,7 +693,7 @@ Pass/fail:
 - Fail if manifest exposes secrets, overclaims certainty, omits material warnings, or contradicts package output.
 
 Known limitations:
-- Partial manifests are expected and should be reported as partial rather than failed when the product intentionally lacks evidence.
+- Schema v2 manifests are intentionally minimized; omitted private fields are expected and should not be reported as failures.
 
 ## Required Checks
 - Each selected workflow has setup, action, expected package contents, expected provenance signals, expected exclusions, screenshots/recordings, pass/fail criteria, and known limitations.
@@ -701,7 +701,7 @@ Known limitations:
 - Optional `Crate Diagnostics/crate-provenance.json` is inspected or marked unavailable.
 - Expected inclusions and exclusions are both reviewed.
 - Privacy checks are run before any artifact is shared.
-- Partial provenance is described accurately.
+- Minimized or partial provenance is described accurately.
 - Automated test gaps are stated; manual QA does not replace them.
 
 ## Approval Gates

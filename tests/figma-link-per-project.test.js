@@ -2968,7 +2968,8 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
     assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.CLOUD_DOCUMENT).length, 1);
-    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.EMBEDDED_RESOURCE && node.provider === 'figma').length, 1);
+    assert.equal(manifest.nodes.filter(node => node.type === NODE_TYPES.EMBEDDED_RESOURCE).length, 1);
+    assert.equal(manifest.nodes.every(node => Object.keys(node).sort().join(',') === 'id,type'), true);
 
     const manifestText = JSON.stringify(manifest);
     assert.equal(manifestText.includes('FIG22'), false);

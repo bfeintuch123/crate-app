@@ -15,7 +15,6 @@ const {
   EDGE_TYPES,
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
-  PROVENANCE_SCHEMA_VERSION,
 } = require('../provenance');
 
 const originalSetInterval = global.setInterval;
@@ -1837,7 +1836,8 @@ test('PowerPoint package extraction records deterministic media provenance and d
 
     const manifest = readManifest(outputDir, 'PowerPoint Media Provenance');
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'PowerPoint Media Provenance')), false);
-    assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
+    assert.equal(manifest.schemaVersion, 2);
+    assert.equal(manifest.scope, 'minimized_package_relevant');
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 2);
     assert.equal(manifest.package.totalFiles, 1);
@@ -1846,8 +1846,8 @@ test('PowerPoint package extraction records deterministic media provenance and d
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
     const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('ppt/media/image1.jpeg'), true);
-    assert.equal(manifestText.includes('Deck — image1.jpeg'), true);
+    assert.equal(manifestText.includes('ppt/media/image1.jpeg'), false);
+    assert.equal(manifestText.includes('Deck — image1.jpeg'), false);
     assert.equal(manifestText.includes('JPEG_BINARY_SHOULD_NOT_LEAK'), false);
     assert.equal(manifestText.includes('PNG_BINARY_SHOULD_NOT_LEAK'), false);
 
@@ -2286,9 +2286,10 @@ test('PowerPoint package extraction surfaces per-entry media failures without bl
     );
     const manifest = readManifest(outputDir, 'PowerPoint Partial Failure');
     assert.equal(manifest.package.embeddedCount, 1);
-    assert.deepEqual(manifest.package.errors, [
-      'Could not extract embedded media image2.png from Presentation1.pptx.'
-    ]);
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 1 });
+    assert.equal('errors' in manifest.package, false);
+    assert.equal(JSON.stringify(manifest).includes('Presentation1.pptx'), false);
     assert.equal(JSON.stringify(manifest).includes('ppt/media/image2.png'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -2346,10 +2347,11 @@ test('PowerPoint package extraction surfaces archive inspection failures without
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 0);
     assert.equal(manifest.package.totalFiles, 1);
-    assert.deepEqual(manifest.package.errors, [
-      'Could not inspect embedded media in Presentation1.pptx.'
-    ]);
-    const manifestErrorText = JSON.stringify(manifest.package.errors);
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { embedded_media_inspection_failed: 1 });
+    assert.equal('errors' in manifest.package, false);
+    const manifestErrorText = JSON.stringify(manifest);
+    assert.equal(manifestErrorText.includes('Presentation1.pptx'), false);
     assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
     assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
     assert.equal(manifestErrorText.includes('/private/tmp'), false);
@@ -2691,7 +2693,8 @@ test('Keynote package extraction records deterministic Data media provenance and
 
     const manifest = readManifest(outputDir, 'Keynote Media Provenance');
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Keynote Media Provenance')), false);
-    assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
+    assert.equal(manifest.schemaVersion, 2);
+    assert.equal(manifest.scope, 'minimized_package_relevant');
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 2);
     assert.equal(manifest.package.totalFiles, 1);
@@ -2700,8 +2703,8 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 2);
     const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('Data/photo-1234.jpeg'), true);
-    assert.equal(manifestText.includes('Deck — photo.jpeg'), true);
+    assert.equal(manifestText.includes('Data/photo-1234.jpeg'), false);
+    assert.equal(manifestText.includes('Deck — photo.jpeg'), false);
     assert.equal(manifestText.includes('KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'), false);
     assert.equal(manifestText.includes('KEYNOTE_MOV_BINARY_SHOULD_NOT_LEAK'), false);
 
@@ -2861,9 +2864,10 @@ test('Keynote package extraction falls back to a unique safe tail for mojibake-l
 
     const manifest = readManifest(outputDir, 'Keynote Mojibake Media');
     assert.equal(manifest.package.embeddedCount, 1);
-    assert.deepEqual(manifest.package.errors, []);
+    assert.equal(manifest.package.errorCount, 0);
+    assert.deepEqual(manifest.package.errorCategories, {});
     const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('Keynote Deck — image2.png'), true);
+    assert.equal(manifestText.includes('Keynote Deck — image2.png'), false);
     assert.equal(manifestText.includes('KEYNOTE_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -2939,9 +2943,10 @@ test('Keynote package extraction recovers mixed mojibake tails without collapsin
 
     const manifest = readManifest(outputDir, 'Keynote Mixed Mojibake Media');
     assert.equal(manifest.package.embeddedCount, 2);
-    assert.deepEqual(manifest.package.errors, []);
+    assert.equal(manifest.package.errorCount, 0);
+    assert.deepEqual(manifest.package.errorCategories, {});
     const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), true);
+    assert.equal(manifestText.includes('Keynote Deck — Screenshot 2026-03-10 at 9.07.43 PM.png'), false);
     assert.equal(manifestText.includes('KEYNOTE_EXACT_SCREENSHOT_BINARY_SHOULD_NOT_LEAK'), false);
     assert.equal(manifestText.includes('KEYNOTE_MIXED_MOJIBAKE_BINARY_SHOULD_NOT_LEAK'), false);
   } finally {
@@ -3010,8 +3015,12 @@ test('Keynote package extraction fails closed for ambiguous mojibake wildcard ta
 
     const manifest = readManifest(outputDir, 'Keynote Ambiguous Mojibake');
     assert.equal(manifest.package.embeddedCount, 0);
-    assert.deepEqual(manifest.package.errors, result.errors);
+    assert.equal(manifest.package.errorCount, 2);
+    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 2 });
+    assert.equal('errors' in manifest.package, false);
     const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('PM-9089.png'), false);
+    assert.equal(manifestText.includes('Keynote Deck.key'), false);
     assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
     assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
     assert.equal(manifestText.includes('/private/tmp'), false);
@@ -3088,9 +3097,10 @@ test('Keynote package extraction surfaces per-entry media failures without block
     );
     const manifest = readManifest(outputDir, 'Keynote Partial Failure');
     assert.equal(manifest.package.embeddedCount, 1);
-    assert.deepEqual(manifest.package.errors, [
-      'Could not extract embedded media clip-5678.mov from Presentation1.key.'
-    ]);
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 1 });
+    assert.equal('errors' in manifest.package, false);
+    assert.equal(JSON.stringify(manifest).includes('Presentation1.key'), false);
     assert.equal(JSON.stringify(manifest).includes('Data/clip-5678.mov'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -3148,10 +3158,11 @@ test('Keynote package extraction surfaces archive inspection failures without bl
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 0);
     assert.equal(manifest.package.totalFiles, 1);
-    assert.deepEqual(manifest.package.errors, [
-      'Could not inspect embedded media in Presentation1.key.'
-    ]);
-    const manifestErrorText = JSON.stringify(manifest.package.errors);
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { embedded_media_inspection_failed: 1 });
+    assert.equal('errors' in manifest.package, false);
+    const manifestErrorText = JSON.stringify(manifest);
+    assert.equal(manifestErrorText.includes('Presentation1.key'), false);
     assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
     assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
     assert.equal(manifestErrorText.includes('/private/tmp'), false);

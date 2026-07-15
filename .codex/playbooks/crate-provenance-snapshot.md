@@ -3,7 +3,7 @@
 ## Purpose
 Snapshot and compare Crate provenance graph output across PRs so provenance regressions are visible before merge or release.
 
-Provenance snapshots are regression tools. They do not prove product truth by themselves, and partial manifests are expected while Crate's provenance architecture is still layered and incremental.
+Provenance snapshots are regression tools. They do not prove product truth by themselves, and minimized or partial manifests are expected while Crate's provenance architecture is still layered and incremental.
 
 ## When To Use
 - Before merging PRs that touch provenance helpers, package manifests, parser relationships, pending decisions, Figma asset provenance, PSD provenance, or package provenance.
@@ -16,7 +16,7 @@ Provenance snapshots are regression tools. They do not prove product truth by th
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-provenance-snapshot.md to snapshot and compare Crate provenance graph output for this PR. Summarize nodes, edges, evidence, confidence bands, warnings, privacy redaction, expected partial-manifest limitations, and do not overclaim provenance certainty.
+Use .codex/playbooks/crate-provenance-snapshot.md to snapshot and compare Crate provenance graph output for this PR. Summarize nodes, edges, evidence, confidence bands, warnings, privacy minimization, expected minimized or partial-manifest limitations, and do not overclaim provenance certainty.
 ```
 
 ## Inspect
@@ -25,14 +25,14 @@ Use .codex/playbooks/crate-provenance-snapshot.md to snapshot and compare Crate 
 - Before and after optional `Crate Diagnostics/crate-provenance.json` files when diagnostic reports were enabled.
 - Nodes by type.
 - Edges by relation type.
-- Evidence by kind and observer.
+- Evidence by kind. Schema v2 diagnostic exports intentionally omit observer details.
 - Confidence bands:
   - `confirmed`
   - `likely`
   - `candidate`
   - `weak`
 - Warnings and omitted graph explanations.
-- Privacy redaction and whether raw sensitive data appears.
+- Privacy minimization and whether raw sensitive data appears.
 - Expected partial-manifest limitations.
 - Whether absent edges are expected because their source files or resources are out of scope.
 
@@ -100,18 +100,18 @@ mkdir -p /private/tmp/crate-provenance-snapshot-<id>/reports
 Summarize manifests:
 
 ```sh
-node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); const nodes=m.nodes||[]; const edges=m.edges||[]; const evidence=m.evidence||[]; const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,nodesByType:count(nodes,'type'),edgesByType:count(edges,'relationType'),evidenceByKind:count(evidence,'kind'),confidenceBands:edges.reduce((a,e)=>{const k=e&&e.confidence&&e.confidence.band||'unknown'; a[k]=(a[k]||0)+1; return a;},{}),warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
+node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); const nodes=m.nodes||[]; const edges=m.edges||[]; const evidence=m.evidence||[]; const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,schemaVersion:m.schemaVersion,scope:m.scope||'legacy',nodesByType:count(nodes,'type'),edgesByType:count(edges,'relationType'),evidenceByKind:count(evidence,'kind'),confidenceBands:edges.reduce((a,e)=>{const k=e&&e.confidenceBand||e&&e.confidence&&e.confidence.band||'unknown'; a[k]=(a[k]||0)+1; return a;},{}),warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
 ```
 
 Use explicit manifest paths, typically `<package-output>/Crate Diagnostics/crate-provenance.json`, only when `Include diagnostic report in packages` was enabled for the snapshot package runs. Diagnostics are optional and off by default; do not expect a package-root manifest.
 
-Extract stable edge summaries:
+Extract privacy-safe edge summaries. Schema v2 identifiers are randomized per report and must not be compared as stable identities:
 
 ```sh
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); for (const e of (m.edges||[])) console.log([e.relationType,e.subjectNodeId,e.objectNodeId,e.confidence&&e.confidence.band].join('\\t'));" <manifest> | sort
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const typeById=new Map((m.nodes||[]).map(n=>[n.id,n.type||'unknown'])); for (const e of (m.edges||[])) console.log([e.relationType,typeById.get(e.subjectNodeId)||'unknown',typeById.get(e.objectNodeId)||'unknown',e.confidenceBand||e.confidence&&e.confidence.band||'unknown'].join('\\t'));" <manifest> | sort
 ```
 
-Check privacy redaction:
+Check privacy minimization:
 
 ```sh
 rg -n "token|secret|credential|cdn\\.figma|SHOULD_NOT_APPEAR|/usr/sbin/lsof|rawTrackedFiles|Authorization|Bearer|cookie|notary" <before-manifest> <after-manifest>
@@ -127,7 +127,7 @@ diff -u /private/tmp/crate-provenance-snapshot-<id>/reports/before-edges.txt /pr
 ## Required Checks
 - Node counts and node types.
 - Edge counts and relation types.
-- Evidence count and observer kinds.
+- Evidence kind counts. Observer details are available only in legacy manifests that contain them.
 - Confidence band distribution.
 - Warnings and omitted graph explanations.
 - `package_includes_file` edges.
@@ -136,12 +136,12 @@ diff -u /private/tmp/crate-provenance-snapshot-<id>/reports/before-edges.txt /pr
 - `container_embeds_resource` edges.
 - `resource_materialized_as_file` edges.
 - `pending_file_rejected` evidence or edge representation, as implemented.
-- Privacy redaction.
-- Partial-manifest limitations.
+- Privacy minimization.
+- Minimized or partial-manifest limitations.
 - Expected versus unexpected graph diffs.
 
 ## Snapshot Interpretation Rules
-- Partial manifests are expected.
+- Schema v2 diagnostic manifests are intentionally minimized; legacy partial manifests may also appear in comparisons.
 - Absence of an edge may be normal if the source file, embedded resource, Figma asset, pending file, or package output is out of scope.
 - Do not overclaim provenance certainty.
 - Confirmed, likely, candidate, and weak evidence must remain distinct.
@@ -185,13 +185,13 @@ rm -rf /private/tmp/crate-provenance-snapshot-<id>
 ## Quality Impact
 - Makes provenance regressions visible as graph diffs rather than opaque JSON changes.
 - Prevents confidence-band drift and accidental overclaiming.
-- Validates privacy redaction alongside graph correctness.
-- Speeds review by summarizing nodes, edges, evidence, warnings, and expected partial gaps.
+- Validates privacy minimization alongside graph correctness.
+- Speeds review by summarizing nodes, edges, evidence, warnings, and expected minimized or partial gaps.
 - Pairs with benchmark fixtures and package diffs to make package/provenance behavior repeatable.
 
 ## Definition Of Done
 - Before and after manifest sources are identified.
-- Nodes, edges, evidence, confidence bands, warnings, privacy checks, and partial limitations are summarized.
+- Nodes, edges, evidence, confidence bands, warnings, privacy checks, and minimized or partial limitations are summarized.
 - Expected and unexpected graph changes are separated.
 - No repo app code, tests, package files, release files, builds, tags, deploys, or dependencies are changed.
 - Bryant receives residual risks and whether the snapshot supports merge readiness.
@@ -206,7 +206,7 @@ rm -rf /private/tmp/crate-provenance-snapshot-<id>
 - Evidence summary.
 - Confidence band summary.
 - Warnings and omitted graph notes.
-- Privacy redaction result.
+- Privacy minimization result.
 - Expected graph changes.
 - Unexpected graph changes and risks.
 - Commands run and report files written.

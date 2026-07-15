@@ -9,7 +9,6 @@ const { promisify: nodePromisify } = require('util');
 const {
   EDGE_TYPES,
   NODE_TYPES,
-  PROVENANCE_SCHEMA_VERSION,
   createNodeId,
 } = require('../provenance');
 
@@ -499,6 +498,7 @@ test('package provenance records copied files and skips missing files', async ()
           type: NODE_TYPES.FILE,
           path: sourcePath,
           name: 'logo.ai',
+          privateLabel: 'SHOULD_NOT_APPEAR_NODE_FIELD',
         },
         [containerFileNodeId]: {
           id: containerFileNodeId,
@@ -508,7 +508,7 @@ test('package provenance records copied files and skips missing files', async ()
         },
         [containerNodeId]: {
           id: containerNodeId,
-          type: NODE_TYPES.CONTAINER,
+          type: 'SHOULD_NOT_APPEAR_NODE_TYPE',
           fileNodeId: containerFileNodeId,
           path: containerPath,
         },
@@ -523,13 +523,21 @@ test('package provenance records copied files and skips missing files', async ()
           payload: {
             command: ['/usr/sbin/lsof SHOULD_NOT_APPEAR_INCLUDED_COMMAND'],
           },
+          privateLabel: 'SHOULD_NOT_APPEAR_EDGE_FIELD',
+        },
+        edge_malformed_sensitive_fixture: {
+          id: 'edge_malformed_sensitive_fixture',
+          relationType: EDGE_TYPES.CONTAINER_REFERENCES_FILE,
+          subjectNodeId: 'SHOULD_NOT_APPEAR_MISSING_NODE_ID',
+          objectNodeId: sourceNodeId,
+          evidenceIds: [],
         },
       },
       observations: [],
       evidence: {
         ev_sensitive_parser_fixture: {
           id: 'ev_sensitive_parser_fixture',
-          kind: 'parser_fixture',
+          kind: 'SHOULD_NOT_APPEAR_EVIDENCE_KIND',
           observer: { kind: 'parser' },
           summary: 'safe parser fixture',
           payload: {
@@ -584,39 +592,92 @@ test('package provenance records copied files and skips missing files', async ()
     assert.equal(includeEdges[0].confidence.band, 'confirmed');
     assert.ok(project.provenance.nodes[includeEdges[0].subjectNodeId]);
     assert.ok(project.provenance.nodes[includeEdges[0].objectNodeId]);
+    assert.equal(
+      project.provenance.evidence.ev_sensitive_parser_fixture.payload.token,
+      'SHOULD_NOT_APPEAR_INCLUDED_TOKEN'
+    );
+    assert.deepEqual(
+      project.provenance.edges.edge_parser_sensitive_fixture.payload.command,
+      ['/usr/sbin/lsof SHOULD_NOT_APPEAR_INCLUDED_COMMAND']
+    );
+    assert.equal(
+      project.provenance.nodes[containerNodeId].type,
+      'SHOULD_NOT_APPEAR_NODE_TYPE'
+    );
 
     const manifest = readManifest(outputDir, 'Package Provenance Copy');
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Package Provenance Copy')), false);
-    assert.equal(manifest.schemaVersion, PROVENANCE_SCHEMA_VERSION);
-    assert.equal(manifest.scope, 'partial_package_relevant');
+    assert.equal(manifest.schemaVersion, 2);
+    assert.equal(manifest.scope, 'minimized_package_relevant');
+    assert.equal(
+      Object.keys(manifest).sort().join(','),
+      'edges,evidence,generatedBy,nodes,package,privacy,schemaVersion,scope,warnings'
+    );
     assert.equal(manifest.generatedBy.app, 'Crate');
     assert.equal(typeof manifest.generatedBy.version, 'string');
-    assert.equal(manifest.project.id, 'package-provenance-copy');
-    assert.equal(manifest.project.name, 'Package Provenance Copy');
-    assert.equal(manifest.project.sessionId, project.provenance.sessionId);
-    assert.equal(manifest.package.path, destFolder);
+    assert.equal(Object.keys(manifest.generatedBy).sort().join(','), 'app,version');
+    assert.deepEqual(manifest.privacy, {
+      mode: 'minimized',
+      identifiers: 'report-local',
+      content: 'metadata-only',
+    });
+    assert.equal('generatedAt' in manifest, false);
+    assert.equal('project' in manifest, false);
+    assert.equal(Object.keys(manifest.privacy).sort().join(','), 'content,identifiers,mode');
+    assert.equal('path' in manifest.package, false);
+    assert.equal('createdAt' in manifest.package, false);
+    assert.equal(
+      Object.keys(manifest.package).sort().join(','),
+      'copiedCount,embeddedCount,errorCategories,errorCount,totalFiles'
+    );
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 0);
     assert.equal(manifest.package.totalFiles, 2);
-    assert.deepEqual(manifest.package.errors, ['File not found: missing.ai']);
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { file_not_found: 1 });
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 1);
     assert.equal(manifest.evidence.length, 1);
-    assert.equal(manifest.evidence[0].payload.token, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.command, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.rawFigmaApiResponse, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.note, 'Review [redacted-url] and [redacted-url]');
-    assert.equal(manifest.evidence[0].payload.authNote, '[redacted-credential]');
-    assert.match(manifest.evidence[0].payload.jsonAuthNote, /\[redacted-credential\]/);
-    assert.equal(manifest.evidence[0].payload.authorization, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.cookie, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.password, '[redacted]');
-    assert.equal(manifest.evidence[0].payload.credential, '[redacted]');
-    assert.equal(manifest.edges.some(edge => JSON.stringify(edge).includes(missingPath)), false);
-    assert.equal(manifest.warnings.some(warning => warning.includes('Partial package-relevant')), true);
+    assert.equal(manifest.evidence[0].kind, 'other');
+    assert.equal(manifest.nodes.some(node => node.type === 'other'), true);
+    assert.equal(
+      manifest.edges.find(edge => edge.relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE).confidenceBand,
+      'weak'
+    );
+    assert.equal(manifest.nodes.every(node => /^node_[a-f0-9]{16}_\d+$/.test(node.id)), true);
+    assert.equal(manifest.edges.every(edge => /^edge_[a-f0-9]{16}_\d+$/.test(edge.id)), true);
+    assert.equal(manifest.evidence.every(evidence => /^evidence_[a-f0-9]{16}_\d+$/.test(evidence.id)), true);
+    assert.equal(manifest.nodes.every(node => Object.keys(node).sort().join(',') === 'id,type'), true);
+    assert.equal(manifest.edges.every(edge => (
+      Object.keys(edge).sort().join(',') === 'confidenceBand,evidenceIds,id,objectNodeId,relationType,subjectNodeId'
+    )), true);
+    assert.equal(manifest.evidence.every(evidence => Object.keys(evidence).sort().join(',') === 'id,kind'), true);
+    assert.equal(manifest.warnings.some(warning => warning.includes('Minimized package-relevant')), true);
+    assert.equal(
+      manifest.warnings.includes('Malformed or unrecognized diagnostic graph records were omitted.'),
+      true
+    );
 
     const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('package-provenance-copy'), false);
+    assert.equal(manifestText.includes('Package Provenance Copy'), false);
+    assert.equal(manifestText.includes(project.provenance.sessionId), false);
+    assert.equal(manifestText.includes(destFolder), false);
+    assert.equal(manifestText.includes(missingPath), false);
+    assert.equal(manifestText.includes('missing.ai'), false);
+    assert.equal(manifestText.includes('logo.ai'), false);
+    assert.equal(manifestText.includes(sourceNodeId), false);
+    assert.equal(manifestText.includes(containerFileNodeId), false);
+    assert.equal(manifestText.includes(containerNodeId), false);
+    assert.equal(manifestText.includes(includeEdges[0].id), false);
+    assert.equal(manifestText.includes('ev_sensitive_parser_fixture'), false);
+    assert.equal(manifestText.includes('edge_malformed_sensitive_fixture'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_MISSING_NODE_ID'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_NODE_TYPE'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_NODE_FIELD'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_EDGE_FIELD'), false);
+    assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_EVIDENCE_KIND'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_INCLUDED_TOKEN'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_INCLUDED_COMMAND'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_INCLUDED_FIGMA_API'), false);
@@ -630,6 +691,24 @@ test('package provenance records copied files and skips missing files', async ()
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_COOKIE_VALUE'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_PASSWORD_VALUE'), false);
     assert.equal(manifestText.includes('SHOULD_NOT_APPEAR_CREDENTIAL_VALUE'), false);
+
+    const secondOutputDir = path.join(tmpRoot, 'out-second');
+    fs.mkdirSync(secondOutputDir);
+    const secondResult = await callIpc('projects:package', 'package-provenance-copy', secondOutputDir);
+    assert.equal(secondResult.success, true);
+    const secondManifest = readManifest(secondOutputDir, 'Package Provenance Copy');
+    assert.notDeepEqual(
+      secondManifest.nodes.map(node => node.id),
+      manifest.nodes.map(node => node.id)
+    );
+    assert.notDeepEqual(
+      secondManifest.edges.map(edge => edge.id),
+      manifest.edges.map(edge => edge.id)
+    );
+    assert.notDeepEqual(
+      secondManifest.evidence.map(evidence => evidence.id),
+      manifest.evidence.map(evidence => evidence.id)
+    );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1021,7 +1100,12 @@ test('package copy rejects symlink sources without copying target contents', asy
 
     const destFolder = packageFolder(outputDir, 'Package Copy Symlink');
     assert.equal(fs.existsSync(path.join(destFolder, 'linked-secret.ai')), false);
-    const manifestText = JSON.stringify(readManifest(outputDir, 'Package Copy Symlink'));
+    const manifest = readManifest(outputDir, 'Package Copy Symlink');
+    assert.equal(manifest.package.errorCount, 1);
+    assert.deepEqual(manifest.package.errorCategories, { copy_failed: 1 });
+    assert.equal('errors' in manifest.package, false);
+    const manifestText = JSON.stringify(manifest);
+    assert.equal(manifestText.includes('linked-secret.ai'), false);
     assert.equal(manifestText.includes(targetPath), false);
     assert.equal(manifestText.includes('secret target bytes'), false);
   } finally {
@@ -1104,14 +1188,17 @@ test('empty provenance writes minimal package manifest with warnings', async () 
     assert.deepEqual(result.errors, []);
 
     const manifest = readManifest(outputDir, 'Empty Provenance Manifest');
-    assert.equal(manifest.project.sessionId, 'session_empty');
+    assert.equal('project' in manifest, false);
     assert.equal(manifest.package.copiedCount, 0);
     assert.equal(manifest.package.embeddedCount, 0);
     assert.equal(manifest.package.totalFiles, 0);
+    assert.equal(manifest.package.errorCount, 0);
+    assert.deepEqual(manifest.package.errorCategories, {});
     assert.deepEqual(manifest.nodes, []);
     assert.deepEqual(manifest.edges, []);
     assert.deepEqual(manifest.evidence, []);
     assert.equal(manifest.warnings.includes('No package provenance edges were available for this package.'), true);
+    assert.equal(JSON.stringify(manifest).includes('session_empty'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1316,10 +1403,11 @@ test('package writes scan-on-save PSD embedded asset bytes with safe unique name
     const manifestExtractEdges = manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
     assert.equal(manifestExtractEdges.length, 4);
-    assert.deepEqual(
-      manifestExtractEdges.map(edge => path.basename(edge.payload.outputPath)).sort(),
-      ['absolute-path-like.png', 'duplicate.png', 'duplicate_1.png', 'escape.png']
-    );
+    assert.equal(manifestExtractEdges.every(edge => edge.confidenceBand === 'confirmed'), true);
+    const manifestText = JSON.stringify(manifest);
+    for (const fileName of ['absolute-path-like.png', 'duplicate.png', 'duplicate_1.png', 'escape.png']) {
+      assert.equal(manifestText.includes(fileName), false);
+    }
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

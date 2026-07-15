@@ -25,13 +25,13 @@ Use .codex/playbooks/crate-package-diff.md to compare package outputs before and
 - Fixture or project used for the package comparison.
 - Before and after source revisions.
 - Package output directories.
-- `copiedCount`, `embeddedCount`, `totalFiles`, and `errors`.
+- Schema-aware package counts: `copiedCount`, `embeddedCount`, and `totalFiles`; schema v2 `errorCount` and fixed `errorCategories`; or a schema v1 derived error count without raw legacy error strings.
 - Copied file list.
 - Embedded extracted asset list.
 - Missing and extra files.
 - Path normalization and case differences.
 - File hashes when safe and practical.
-- Optional `Crate Diagnostics/crate-provenance.json` contents, warnings, graph shape, and privacy redaction when diagnostic reports were enabled.
+- Optional `Crate Diagnostics/crate-provenance.json` contents, warnings, graph shape, and privacy minimization when diagnostic reports were enabled.
 - Package output containment: all package files remain inside the intended output folder.
 
 ## Files Codex May Read
@@ -102,7 +102,7 @@ diff -u /private/tmp/crate-package-diff-<id>/reports/before-sha256.txt /private/
 Summarize package manifests:
 
 ```sh
-node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({file:p,copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
+node -e "const fs=require('fs'); for (const p of process.argv.slice(1)) { const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; console.log(JSON.stringify({file:p,schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},nodes:(m.nodes||[]).length,edges:(m.edges||[]).length,warnings:m.warnings||[]}, null, 2)); }" <before-manifest> <after-manifest>
 ```
 
 Use explicit manifest paths, typically `<package-output>/Crate Diagnostics/crate-provenance.json`, only when `Include diagnostic report in packages` was enabled for both package runs. Diagnostics are optional and off by default; do not expect a package-root manifest.
@@ -124,10 +124,10 @@ node -e "const path=require('path'); const root=path.resolve(process.argv[1]); f
   - `copiedCount`
   - `embeddedCount`
   - `totalFiles`
-  - `errors`
+  - schema v2 diagnostic `errorCount` / fixed `errorCategories`, or a schema v1 derived error count without raw legacy error strings
 - Path normalization review.
 - Hash comparison when safe/practical.
-- Manifest privacy redaction check.
+- Manifest privacy minimization check.
 - Package output containment check.
 - Expected versus unexpected diff classification.
 
@@ -187,7 +187,7 @@ rm -rf /private/tmp/crate-package-diff-<id>
 - Package output paths.
 - File count and copied-file diff.
 - Embedded extracted asset diff.
-- Package count diff: `copiedCount`, `embeddedCount`, `totalFiles`, `errors`.
+- Package count diff: `copiedCount`, `embeddedCount`, and `totalFiles`, plus schema v2 `errorCount` / fixed `errorCategories` or a schema v1 derived error count without raw legacy error strings.
 - Manifest graph diff.
 - Privacy and containment results.
 - Expected changes.

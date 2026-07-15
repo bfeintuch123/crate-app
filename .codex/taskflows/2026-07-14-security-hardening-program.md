@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-local-data-lifecycle-phase5a`
+- branch: `codex/security-diagnostics-minimization-phase5b`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1, 2A, 2B, 3, 3.5, 4A, 4B, and the Phase 4 installed-app follow-up are merged; Phase 5A local configuration and cache lifecycle implementation is uncommitted and under the required pre-commit review stack
+- status: phases 1 through 5A are merged and the Phase 5A installed-app gate is complete; Phase 5B optional diagnostics minimization is implemented, fully reviewed, and awaiting Bryant's commit/push/PR approval
 
 ## Goal
 
@@ -37,13 +37,13 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: Phase 5A local configuration and project-cache lifecycle
-- security target: keep Crate's local project metadata owner-only and remove stale Crate-owned Figma and presentation caches without touching active projects, source files, package outputs, symlink targets, or unrelated local data
-- implementation target: retain electron-store's existing atomic writes, set owner-only config mode, harden an existing regular config file and user-data directory, and quarantine validated project cache directories before asynchronous removal
-- workflow target: startup, project deletion, delete-all, package behavior, Figma scope, and normal user setup remain unchanged; cleanup is automatic and adds no prompt or user step
-- package-engine impact: none
+- phase: Phase 5B optional diagnostics minimization
+- security target: keep optional support diagnostics useful without exporting project identity, filenames, resource names, paths, timestamps, raw errors, payloads, credentials, URLs, Figma identifiers, or persistent graph IDs
+- implementation target: emit schema v2 fixed counts and error categories plus allowlisted package-relevant graph metadata with randomized report-local identifiers; preserve the complete internal provenance graph
+- workflow target: diagnostics remain off by default and under `Crate Diagnostics/crate-provenance.json`; Package Details and normal package behavior remain unchanged
+- package-engine impact: no package selection, copied or extracted file, naming, output, quota, or Package Details behavior change
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
-- normal user-workflow impact: no new step, permission, setting, or credential action
+- normal user-workflow impact: no new step, prompt, permission, setting, or credential action
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -107,9 +107,16 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] add failure-first tests for owner-only config storage, orphan and deleted-project cache cleanup, active-project preservation, symlink-root rejection, corrupt-store fail-closed behavior, and late in-flight Figma cache writes
 - [x] implement narrow Phase 5A config permission and cache lifecycle changes without dependency, package, watcher, parser-result, provenance, renderer, quota, or Figma-scope changes
 - [x] complete Phase 5A autoreview, regression, security, provenance, and runner checks before any commit, push, or PR
-- [ ] obtain Bryant approval before Phase 5A commit, push, and PR creation
-- [ ] merge Phase 5A only after separate approval and clean merge readiness
-- [ ] complete installed-app Phase 5A validation before Phase 5B implementation
+- [x] obtain Bryant approval before Phase 5A commit, push, and PR creation
+- [x] merge Phase 5A PR #137 into `v2.4.x` as `2b75f38c7cc95e34117ea40c6481370569eedd6d`
+- [x] complete installed-app Phase 5A validation before Phase 5B implementation
+- [x] create a clean Phase 5B branch from merged `origin/v2.4.x`
+- [x] add failure-first and defensive tests for schema minimization, fixed error categories, unknown and malformed graph records, and unlinkable report-local identifiers
+- [x] implement schema v2 diagnostics minimization without changing internal provenance or package behavior
+- [x] pass the 191-test focused lane, 330-test full suite, syntax, whitespace, diagnostic-reader compatibility, and high-severity dependency gates
+- [x] complete final exact-base Reprobox
+- [x] complete independent no-finding Autoreview
+- [ ] obtain Bryant approval before Phase 5B commit, push, and PR creation
 
 ## Stop Gates
 
@@ -120,10 +127,11 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Phase 5A implementation and the complete pre-commit review stack are clean against exact base `0c99cb2b897fbb3c1997a0590609ef33a24985d8`. Obtain Bryant approval before commit, push, and PR creation. Stop before merge, build, signing, installed-app mutation, Phase 5B diagnostics minimization, release, site deployment, updater work, or dependency change without the applicable approval. Olivia remains paused.
+Obtain Bryant approval before the reviewed Phase 5B commit, push, and PR creation. Stop before those actions, merge, build, signing, installed-app mutation, Phase 6, release, site deployment, updater work, or dependency change without the applicable approval. Olivia remains paused.
 
 ## Phase 5A Evidence
 
+- PR #137 merged into `v2.4.x` as `2b75f38c7cc95e34117ea40c6481370569eedd6d`; the required post-merge installed-app gate completed before Phase 5B began
 - failure-first local-data checks failed 4/4 before implementation
 - five adversarial fix rounds closed startup visibility, strict store-path, corrupt-store, transient cleanup, overbroad orphan discovery, stale active-project snapshot, late-writer test gaps, intermediate-directory symlink traversal, unsafe-entry batching, and cache-directory replacement during file I/O
 - fixed native startup-error copy exposes no config path or project data and requests a clean quit when local storage cannot be secured
@@ -134,6 +142,22 @@ Phase 5A implementation and the complete pre-commit review stack are clean again
 - full serial source suite and fresh exact-base isolated Reprobox pass 329/329 with matching source/applied patch hashes and empty isolated cache roots afterward
 - previously questioned Keynote ambiguous-mojibake case passes 10/10 isolated serial repetitions
 - final security, product/regression, and test-adequacy read-only Autoreview lanes report no remaining finding; frozen-surface, syntax, whitespace, static privacy, and high-severity dependency closeout checks pass without mutation
+
+## Phase 5B Evidence
+
+- exact base is merged Phase 5A commit `2b75f38c7cc95e34117ea40c6481370569eedd6d`; implementation remains uncommitted on `codex/security-diagnostics-minimization-phase5b`
+- optional diagnostics remain off by default and retain the existing `Crate Diagnostics/crate-provenance.json` placement
+- schema v2 exports only aggregate package counts, fixed error categories, allowlisted package-relevant node/edge/evidence types, confidence bands, and fixed warnings
+- project identity, filenames, resource names, local and output paths, timestamps, raw errors, payloads, credentials, URLs, Figma identifiers, and persistent graph IDs are omitted
+- every export uses a fresh randomized report prefix, while malformed graph records are omitted with a fixed warning and unknown values collapse to fixed `other` or `weak` categories
+- internal provenance remains complete for local app behavior; package contents, counts, naming, quota, Package Details, Quick Package, watchers, parsers, and Figma scope are unchanged
+- focused diagnostics, provenance, Figma, PowerPoint, Keynote, and PSD lane passes 191/191; full serial source suite passes 330/330
+- 20 legacy/schema-v2 playbook-reader cases pass without exposing raw legacy error text; syntax and `git diff --check` pass
+- `npm audit --audit-level=high` exits successfully with only the pre-existing moderate `uuid` advisory; no dependency mutation occurred
+- final exact-base closeout Reprobox `/private/tmp/crate-reprobox-phase5b-closeout.Himav1` applies the complete frozen tracked and untracked patch to `2b75f38c7cc95e34117ea40c6481370569eedd6d`; the final proof reports the matching source/applied patch hash and isolated suite result without changing this frozen taskflow
+- initial independent Autoreview findings about deterministic local IDs, schema-v2 reader compatibility, stale privacy guidance, malformed-record coverage, the `other` category, and an inaccurate architecture example were fixed and the affected checks rerun
+- a final packaged-runtime review caught the new `diagnostic-summary.js` helper missing from the Electron Builder allowlist; the helper is now explicitly included, required, permitted, and covered by packaged-content tests without dependency or lockfile mutation
+- final independent security and product/regression rereviews and the post-fix 330-test full source suite report no actionable P0-P3 finding
 
 ## Phase 1 Evidence
 

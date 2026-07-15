@@ -109,7 +109,7 @@ Diagnostic reports are optional and off by default. Enable `Include diagnostic r
 Summarize the diagnostic manifest when approved:
 
 ```sh
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; const count=(items,key)=>(items||[]).reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({file:p,schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},nodesByType:count(m.nodes,'type'),edgesByType:count(m.edges,'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
 ```
 
 Check manifest privacy before sharing:
@@ -211,7 +211,7 @@ Secondary tags may include:
 - Does the package folder exist?
 - Does it contain `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled?
 - Does the manifest parse as JSON?
-- Do `copiedCount`, `embeddedCount`, `totalFiles`, and `errors` align with the package contents?
+- Do `copiedCount`, `embeddedCount`, and `totalFiles` align with the package contents? For schema v2, do `errorCount` and fixed `errorCategories` align? For schema v1, compare only the derived legacy error count and do not print raw error strings.
 - Are expected assets present?
 - Are expected exclusions absent?
 - Are wrong, unrelated, other-page, private, or out-of-scope assets absent?
@@ -228,7 +228,7 @@ Secondary tags may include:
 - Use `.codex/playbooks/crate-bug-triage.md` when the finding is actionable and needs bug type, severity, issue draft, or fix scope.
 - Use `.codex/playbooks/crate-reprobox.md` when isolated reproduction is needed or private/local state makes the evidence ambiguous.
 - Use `.codex/playbooks/crate-package-diff.md` when before/after package contents, counts, copied files, embedded extracts, or expected exclusions need comparison.
-- Use `.codex/playbooks/crate-provenance-snapshot.md` when manifest graph shape, confidence bands, warnings, evidence, or privacy redaction need structured comparison.
+- Use `.codex/playbooks/crate-provenance-snapshot.md` when manifest graph shape, confidence bands, warnings, evidence, or privacy minimization need structured comparison.
 - Use `.codex/playbooks/crate-security-scan.md` when private data, secrets, paths, shell behavior, package containment, install warnings, or filesystem boundaries are implicated.
 - Use `.codex/playbooks/crate-release-gate.md` when QA results support considering a final release and Bryant wants strict release-readiness validation.
 

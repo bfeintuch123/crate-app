@@ -27,7 +27,7 @@ Use .codex/playbooks/crate-security-scan.md to scan this Crate PR for path trave
 - Any output path that could escape the package directory.
 - Raw token, API response, CDN URL, command output, local path, or credential handling.
 - Figma token, Figma API payload, Figma CDN URL, imageRef, file key, page ID, and downloaded asset handling.
-- `Crate Diagnostics/crate-provenance.json` privacy: compact evidence, redacted display paths, no raw lsof/mdls/ps/AppleScript output, no raw Figma API response, no secrets.
+- `Crate Diagnostics/crate-provenance.json` privacy: schema v2 includes minimized package counts, fixed error categories, allowlisted graph metadata, and randomized report-local identifiers; it omits project identity, filenames, paths, timestamps, payloads, persistent IDs, raw errors, and evidence payloads.
 - Shell execution and whether arguments are structured and constrained.
 - Filesystem write boundaries for temp directories, package output, extracted resources, generated manifests, and release/site files.
 
@@ -104,7 +104,7 @@ Do not print secret values. If a command shows a possible secret, redact the val
 - Symlink safety: package generation and extraction do not unexpectedly follow symlinks outside intended roots.
 - Raw leakage: logs, manifests, reports, and package files do not include raw tokens, raw Figma API responses, raw command output, cookies, credentials, unrelated open files, or private system scans.
 - Figma privacy: tokens are never written; API payloads and CDN URLs are minimized; file keys and page IDs are only included when needed and safe.
-- Manifest redaction: `Crate Diagnostics/crate-provenance.json` uses compact evidence and safe display paths rather than full raw system state.
+- Manifest minimization: `Crate Diagnostics/crate-provenance.json` omits project identity, filenames, paths, timestamps, payloads, persistent IDs, raw errors, and evidence payloads rather than attempting to preserve redacted versions.
 - Shell safety: shell commands avoid interpolated untrusted input and prefer structured arguments.
 - Parser filenames: filenames derived from PSD, archive, Figma, or parser metadata are sanitized before filesystem writes.
 - Write boundaries: temp, package, manifest, site, and release writes are explicit and constrained.

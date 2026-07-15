@@ -49,7 +49,7 @@ Required fixture categories:
   - expected package counts and manifest behavior
 - Package manifest fixture:
   - package output with `Crate Diagnostics/crate-provenance.json` when diagnostic reports were enabled
-  - expected package node, package copy/extract edges, warnings, and redacted paths
+  - expected package node, package copy/extract edges, warnings, omitted project/file/path fields, and report-local identifiers
 - Cross-app workflow fixture candidates:
   - Figma asset plus Photoshop or PowerPoint usage
   - PSD linked asset plus package-time manifest
@@ -68,7 +68,7 @@ Each fixture definition should document:
 - expected `copiedCount`
 - expected `embeddedCount`
 - expected `totalFiles`
-- expected `errors`
+- expected package-result errors and diagnostic `errorCount` / fixed `errorCategories`
 - expected `Crate Diagnostics/crate-provenance.json` node types when diagnostics were enabled
 - expected `Crate Diagnostics/crate-provenance.json` edge types when diagnostics were enabled
 - expected warnings
