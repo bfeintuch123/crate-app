@@ -33,12 +33,24 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const {
+  ADMISSION_LIMITS,
+  admissionError,
+  assertBufferWithinBudget,
+  assertEntriesWithinBudget,
+  assertFileWithinBudget,
+  isChildProcessAdmissionError,
+  isParserAdmissionError,
+  parseArchiveListing,
+} = require('./admission-budgets');
+const {
   ensureSafePackageDirectory,
+  removeCreatedPackageFiles,
   sanitizePackageFileName,
   writeFileIntoPackage,
 } = require('./package-safety');
 
 const execFileAsync = promisify(execFile);
+const PRESENTATION_ADMISSION_MESSAGE = 'This presentation contains too much embedded media for Crate to inspect safely.';
 
 function safeDisplayName(rawName, fallbackName) {
   return sanitizePackageFileName(path.basename(String(rawName || fallbackName || 'file')), fallbackName || 'file');
@@ -139,24 +151,34 @@ function getUniqueKeynoteWildcardFallback(zipPath, assets) {
 
 async function extractArchiveEntryData(archivePath, zipPath, ext, assets) {
   try {
-    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, zipPath], {
-      timeout: 30000,
-      maxBuffer: 100 * 1024 * 1024,
-      encoding: 'buffer'
-    });
+    const data = await readArchiveEntryData(archivePath, zipPath);
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
   } catch (exactError) {
-    if (ext !== '.key') throw exactError;
+    if (ext !== '.key' || isParserAdmissionError(exactError)) throw exactError;
 
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, assets);
     if (!fallback) throw exactError;
 
-    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, fallback.wildcardPath], {
+    const data = await readArchiveEntryData(archivePath, fallback.wildcardPath);
+    return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
+  }
+}
+
+async function readArchiveEntryData(archivePath, zipPath) {
+  try {
+    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', archivePath, zipPath], {
       timeout: 30000,
-      maxBuffer: 100 * 1024 * 1024,
+      maxBuffer: ADMISSION_LIMITS.presentationMediaEntryBytes,
       encoding: 'buffer'
     });
-    return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
+    return assertBufferWithinBudget(
+      data,
+      ADMISSION_LIMITS.presentationMediaEntryBytes,
+      PRESENTATION_ADMISSION_MESSAGE
+    );
+  } catch (error) {
+    if (isChildProcessAdmissionError(error)) throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+    throw error;
   }
 }
 
@@ -179,20 +201,24 @@ class PowerPointParser extends BaseParser {
     const mediaPrefix = (ext === '.pptx' || ext === '.ppt') ? 'ppt/media/' : 'Data/';
     const sourceType = (ext === '.pptx' || ext === '.ppt') ? 'pptx-embedded' : 'keynote-embedded';
 
+    assertFileWithinBudget(
+      filePath,
+      ADMISSION_LIMITS.archiveFileBytes,
+      PRESENTATION_ADMISSION_MESSAGE
+    );
+
     try {
       // List the ZIP contents
       const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
         timeout: 10000,
+        maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
         encoding: 'utf8'
       });
 
-      for (const line of listing.split('\n')) {
-        // Match: length, date (MM-DD-YYYY), time (HH:MM), filename
-        const m = line.match(/^\s+(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\s+(.+)$/);
-        if (!m) continue;
-
-        const fileSize = parseInt(m[1], 10);
-        const zipPath = m[4].trim();
+      const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
+      for (const entry of entries) {
+        const fileSize = entry.size;
+        const zipPath = entry.path;
 
         // Skip directory entries
         if (zipPath.endsWith('/')) continue;
@@ -225,15 +251,23 @@ class PowerPointParser extends BaseParser {
           if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) continue;
         }
 
-        assets.push({
+        this.appendAsset(assets, {
           path: path.basename(zipPath),  // Filename only (internal)
           source: sourceType,
           exists: true,  // Always true — file exists in archive
           zipPath: zipPath,  // Full path within ZIP for extraction
           size: fileSize
-        });
+        }, PRESENTATION_ADMISSION_MESSAGE);
       }
+      assertEntriesWithinBudget(assets, {
+        maxEntries: ADMISSION_LIMITS.presentationMediaEntries,
+        maxEntryBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+        maxTotalBytes: ADMISSION_LIMITS.presentationMediaBytes,
+        message: PRESENTATION_ADMISSION_MESSAGE,
+      });
     } catch (e) {
+      if (isParserAdmissionError(e)) throw e;
+      if (isChildProcessAdmissionError(e)) throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
       const message = formatEmbeddedMediaInspectionFailure(filePath);
       console.error(`[PowerPointParser] ${message}`);
       if (typeof options.onInspectionError === 'function') {
@@ -268,55 +302,82 @@ class PowerPointParser extends BaseParser {
     const baseName = path.basename(archivePath, ext);
     const extracted = [];
     const seenPowerPointMedia = new Set();
+    let extractedBytes = 0;
+
+    assertFileWithinBudget(
+      archivePath,
+      ADMISSION_LIMITS.archiveFileBytes,
+      PRESENTATION_ADMISSION_MESSAGE
+    );
+    assertEntriesWithinBudget(assets, {
+      predicate: asset => Boolean(asset && asset.zipPath),
+      maxEntries: ADMISSION_LIMITS.presentationMediaEntries,
+      maxEntryBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
+      maxTotalBytes: ADMISSION_LIMITS.presentationMediaBytes,
+      sizeOf: asset => Number.isSafeInteger(asset && asset.size) ? asset.size : 0,
+      message: PRESENTATION_ADMISSION_MESSAGE,
+    });
 
     const outputRoot = ensureSafePackageDirectory(destDir);
 
-    for (const asset of assets) {
-      if (!asset.zipPath) continue;
+    try {
+      for (const asset of assets) {
+        if (!asset.zipPath) continue;
 
-      try {
-        const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
-        if (ext === '.pptx' || ext === '.ppt') {
-          const hash = crypto.createHash('md5').update(data).digest('hex');
-          const fingerprint = `${data.length}:${hash}`;
-          if (seenPowerPointMedia.has(fingerprint)) continue;
-          seenPowerPointMedia.add(fingerprint);
-        }
+        try {
+          const { data, outputTail } = await extractArchiveEntryData(archivePath, asset.zipPath, ext, assets);
+          extractedBytes += data.length;
+          if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {
+            throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
+          }
+          if (ext === '.pptx' || ext === '.ppt') {
+            const hash = crypto.createHash('md5').update(data).digest('hex');
+            const fingerprint = `${data.length}:${hash}`;
+            if (seenPowerPointMedia.has(fingerprint)) continue;
+            seenPowerPointMedia.add(fingerprint);
+          }
 
-        // Generate output filename
-        let outputName = outputTail || path.basename(asset.zipPath);
+          // Generate output filename
+          let outputName = outputTail || path.basename(asset.zipPath);
 
-        // Strip Keynote's numeric suffix (e.g., "image-9073.jpg" → "image.jpg")
-        if (ext === '.key') {
-          outputName = outputName.replace(/-\d{3,6}(\.[a-z]+)$/i, '$1');
-        }
+          // Strip Keynote's numeric suffix (e.g., "image-9073.jpg" → "image.jpg")
+          if (ext === '.key') {
+            outputName = outputName.replace(/-\d{3,6}(\.[a-z]+)$/i, '$1');
+          }
 
-        // Prefix with presentation name to avoid collisions
-        outputName = `${baseName} — ${outputName}`;
+          // Prefix with presentation name to avoid collisions
+          outputName = `${baseName} — ${outputName}`;
 
-        const destPath = writeFileIntoPackage(outputRoot, outputName, data, {
-          fallbackName: 'embedded-media'
-        });
-        extracted.push({
-          originalZipPath: asset.zipPath,
-          extractedPath: destPath
-        });
-      } catch (e) {
-        const message = formatEmbeddedMediaExtractionFailure(archivePath, asset.zipPath);
-        console.error(`[PowerPointParser] ${message}`);
-        if (typeof options.onExtractionError === 'function') {
-          try {
-            options.onExtractionError({
-              archivePath,
-              zipPath: asset.zipPath,
-              asset,
-              message
-            });
-          } catch (callbackError) {
-            console.warn('[PowerPointParser] Embedded extraction error callback skipped');
+          const destPath = writeFileIntoPackage(outputRoot, outputName, data, {
+            fallbackName: 'embedded-media'
+          });
+          extracted.push({
+            originalZipPath: asset.zipPath,
+            extractedPath: destPath
+          });
+        } catch (e) {
+          if (isParserAdmissionError(e)) throw e;
+          const message = formatEmbeddedMediaExtractionFailure(archivePath, asset.zipPath);
+          console.error(`[PowerPointParser] ${message}`);
+          if (typeof options.onExtractionError === 'function') {
+            try {
+              options.onExtractionError({
+                archivePath,
+                zipPath: asset.zipPath,
+                asset,
+                message
+              });
+            } catch (callbackError) {
+              console.warn('[PowerPointParser] Embedded extraction error callback skipped');
+            }
           }
         }
       }
+    } catch (error) {
+      if (isParserAdmissionError(error)) {
+        removeCreatedPackageFiles(outputRoot, extracted.map(item => item.extractedPath));
+      }
+      throw error;
     }
 
     return extracted;

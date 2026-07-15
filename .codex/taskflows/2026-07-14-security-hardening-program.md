@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/fix-electron39-quick-package-drop`
+- branch: `codex/security-parser-admission-limits`
 - base: `v2.4.x`
-- mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phases 1, 2A, 2B, and 3 merged; Phase 3.5 Electron 39 Quick Package drag-and-drop compatibility implementation and validation complete, awaiting commit and PR approval
+- mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
+- status: phases 1, 2A, 2B, 3, and 3.5 merged; Phase 4A local parser and archive admission limits implemented and validated, with commit, PR, and clean-merge approval granted
 
 ## Goal
 
@@ -30,14 +30,13 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: 3.5, Electron 39 Quick Package drag-and-drop compatibility
-- root cause: the renderer reads Electron's removed nonstandard `File.path` property, so a dropped file can resolve to no filesystem path and Quick Package silently does nothing
-- compatibility target: resolve an operating-system-backed dropped `File` through Electron `webUtils.getPathForFile` inside the sandboxed preload bridge
-- privacy target: invoke the existing trusted `v2:package-file` IPC channel from preload without adding a new bridge API that returns the resolved filesystem path before packaging
-- workflow target: preserve the existing immediate Quick Package behavior, Browse fallback, supported formats, result screen, quota increment, and first-file-only behavior
-- package-engine impact: none
-- Figma scope impact: none; Current Page Only remains default and Entire File remains opt-in
-- normal user-workflow impact: drag-and-drop should work again on Electron 39; no new user step is added
+- phase: 4A, local parser and archive admission limits
+- security target: bound whole-file parser reads, Premiere decompression, archive listing, IDML XML inspection, and PowerPoint or Keynote embedded-media extraction before hostile or malformed inputs can consume unbounded memory
+- implementation target: centralize limits and privacy-safe admission errors in one shared parser module, then wrap existing parser behavior without changing normal result shapes
+- workflow target: normal design files package as before; only inputs beyond explicit safety budgets are stopped with fixed nontechnical copy
+- package-engine impact: no selection, naming, copy, quota, or output-format behavior change; admission errors propagate before unsafe parser work continues
+- Figma scope impact: none; Phase 4B network and Figma download limits remain separate and have not started
+- normal user-workflow impact: no new step, permission, setting, or credential action
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -75,7 +74,12 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 3.5 read-only root-cause confirmation
 - [x] phase 3.5 failure-first tests and narrow implementation
 - [x] phase 3.5 focused, regression, security, provenance, runner, isolated Reprobox, and contained Electron 39 validation
-- [ ] Bryant approval for phase 3.5 commit, push, and PR creation
+- [x] Bryant approval for phase 3.5 commit, push, and PR creation
+- [x] Bryant approval and merge of phase 3.5 PR #133
+- [x] phase 4A read-only parser and archive boundary inventory
+- [x] phase 4A failure-first tests and narrow shared-budget implementation
+- [x] phase 4A focused, full-suite, Electron-runtime, real-archive, security, provenance, runner, and isolated Reprobox validation
+- [x] Bryant approval for phase 4A commit, push, PR creation, and clean merge
 
 ## Stop Gates
 
@@ -86,7 +90,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Await Bryant approval to commit Phase 3.5, push the branch, and open a PR against `v2.4.x`. Stop before commit, push, PR creation, merge, signed build, notarization, release mutation, site deployment, or Phase 4 implementation without the applicable approval.
+Commit Phase 4A, push the branch, open a PR against `v2.4.x`, run merge readiness, and merge only if clean under Bryant's approval. After the independently reviewable Phase 4A PR merges, begin Phase 4B for bounded Figma and API downloads. Stop before signed build, notarization, release mutation, site deployment, or any dependency change without separate approval.
 
 ## Phase 1 Evidence
 
@@ -174,4 +178,20 @@ Await Bryant approval to commit Phase 3.5, push the branch, and open a PR agains
 - two independent final rereviews found no P0-P2 blocker and confirmed the prior progress-overlay and retry concerns are resolved
 - `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; no dependency or lockfile mutation occurred
 - `main.js`, package engine, parsers, provenance, Figma runtime and scope, watcher behavior, release state, and website remain unchanged
-- no commit, push, PR, merge, signed build, notarization, release mutation, site deployment, external tester update, or Phase 4 implementation occurred
+- PR #133 merged into `v2.4.x` as `5cbe421086095ef4201ff5e740ac7bf413aca65a`
+- no signed build, notarization, release mutation, site deployment, or external tester update occurred
+
+## Phase 4A Evidence
+
+- exact base is merged Phase 3.5 commit `5cbe421086095ef4201ff5e740ac7bf413aca65a`; implementation remains uncommitted on `codex/security-parser-admission-limits`
+- one shared admission module bounds raw whole-file reads, Premiere decompression, archive file and listing size, archive entry count and declared expansion, presentation media count and bytes, and IDML XML count and bytes
+- sparse oversized files, decompression expansion, oversized declared archive entries, child-process output overflow, and package-orchestrator propagation fail with fixed privacy-safe errors
+- normal Premiere, IDML, PowerPoint, Keynote, Quick Package, package, and parser result shapes remain covered; a real `/usr/bin/zip` and `/usr/bin/unzip` PowerPoint fixture listed and extracted one 600-byte asset successfully
+- focused parser, Quick Package, package-safety, PSD, and Electron 39 disk-drop lane passed 57 tests with zero failures
+- Electron `39.8.10` embedded Node passed all 20 new failure-first and compatibility tests
+- dependency-complete full suite passed 280 tests with zero failures, including Figma scope and privacy, provenance, watcher, package, renderer, and lifecycle coverage
+- fresh exact-base Reprobox at `/private/tmp/crate-reprobox-phase4a-final2.BdZL7d/repo` passed the same 57 focused tests, syntax checks, and `git diff --check`
+- two independent adversarial rereviews approved the final patch after timeout handling, same-descriptor bounded reads, reference limits, late-failure cleanup, and separate legacy Premiere input budgets were verified
+- `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; no dependency or lockfile mutation occurred
+- no new credential, URL, token, private-path, Figma, network, watcher, provenance, quota, release, or deployment behavior was introduced
+- Bryant approved Phase 4A commit, push, PR creation, and merge if merge readiness remains clean; no signed build, notarization, release mutation, site deployment, external tester update, or Phase 4B implementation occurred before that gate

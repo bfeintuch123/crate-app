@@ -1511,4 +1511,17 @@ Secondary:
 - Contained Electron 39.8.10 validation packaged a genuine disk-backed PowerPoint drop, showed Package Complete, copied identical source bytes, and incremented isolated quota from `0 of 10` to `1 of 10`.
 - One Keynote assertion failed only when the suite was deliberately forced under `/private/tmp`; the same test failed on exact base and passed when rerun under a normal macOS temporary root. This is test-environment sensitivity, not a Phase 3.5 regression.
 - No dependency, lockfile, main-process handler, package-engine, parser, provenance, Figma, watcher, signed-build, release, deploy, installed-app, or personal-config mutation occurred.
-- Next gate: Bryant approval to commit, push, and open the Phase 3.5 PR against `v2.4.x`. Stop before commit, push, PR, merge, release, deploy, dependency mutation, or Phase 4 work without the applicable approval.
+- Phase 3.5 PR #133 merged into `v2.4.x` as `5cbe421086095ef4201ff5e740ac7bf413aca65a` after merge readiness remained clean.
+- No signed build, notarization, release mutation, site deployment, dependency mutation, or external tester update occurred.
+
+### 2026-07-14 Parser And Archive Admission Limits
+
+- Began independently reviewable security Phase 4A on `codex/security-parser-admission-limits`, based exactly on merged `origin/v2.4.x` at `5cbe421086095ef4201ff5e740ac7bf413aca65a`.
+- Added one shared parser admission-budget module for raw file reads, Premiere decompression, archive listings and declared expansion, PowerPoint or Keynote embedded media, and IDML XML inspection.
+- Oversized files, decompression bombs, excessive archive entries, oversized declared or extracted content, and child-process output overflow now fail with fixed privacy-safe errors before unsafe parser work continues.
+- Preserved normal parser result shapes, Quick Package behavior, package selection, naming, output, quota, watcher, provenance, Figma scope, Current Page Only default, and Entire File opt-in.
+- Failure-first and compatibility proof passed: 57 focused parser, Quick Package, package-safety, PSD, and Electron 39 disk-drop tests; 20 Electron embedded-Node tests; one real PowerPoint archive list/extract smoke; and 280 dependency-complete full-suite tests.
+- Fresh exact-base Reprobox at `/private/tmp/crate-reprobox-phase4a-final2.BdZL7d/repo` passed the same 57 focused tests, syntax checks, and `git diff --check`.
+- Two independent adversarial rereviews approved the final patch after verifying timeout handling, same-descriptor bounded reads, reference limits, late-failure output cleanup, and separate plain or gzip Premiere input budgets.
+- `npm audit --audit-level=high` passed with only the pre-existing moderate `uuid` advisory. No dependency or lockfile mutation occurred.
+- Bryant approved committing and pushing Phase 4A, opening its PR against `v2.4.x`, running merge readiness, and merging if clean. Phase 4B network and Figma download limits remain separate and start only after that merge.

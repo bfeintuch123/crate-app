@@ -249,8 +249,10 @@ Use for package safety, PowerPoint/Keynote parser, PSD safety, and Quick Package
 
 ```sh
 node --check parsers/index.js
+node --check parsers/admission-budgets.js
 node --check parsers/powerpoint.js
 node --check parsers/package-safety.js
+node --test tests/parser-admission-limits.test.js
 node --test tests/psd-embedded-safety.test.js
 node --test tests/quick-package-parser.test.js
 git diff --check

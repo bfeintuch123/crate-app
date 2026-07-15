@@ -27,8 +27,18 @@ const { BaseParser } = require('./base');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
+const {
+  ADMISSION_LIMITS,
+  admissionError,
+  assertEntriesWithinBudget,
+  assertFileWithinBudget,
+  isChildProcessAdmissionError,
+  isParserAdmissionError,
+  parseArchiveListing,
+} = require('./admission-budgets');
 
 const execFileAsync = promisify(execFile);
+const IDML_ADMISSION_MESSAGE = 'This InDesign file contains too much document data for Crate to inspect safely.';
 
 // Regex to extract LinkResourceURI values from IDML XML
 // Matches: LinkResourceURI="file:///Users/path/to/file.ext"
@@ -60,31 +70,45 @@ class InDesignParser extends BaseParser {
    */
   async extractFromIDML(filePath) {
     const assets = [];
+    let extractedXmlBytes = 0;
+
+    assertFileWithinBudget(
+      filePath,
+      ADMISSION_LIMITS.archiveFileBytes,
+      IDML_ADMISSION_MESSAGE
+    );
 
     try {
       // List all files in the IDML archive
       const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
         timeout: 10000,
+        maxBuffer: ADMISSION_LIMITS.archiveListingBufferBytes,
         encoding: 'utf8'
       });
 
       // Find all XML files that might contain links
-      const xmlFiles = [];
-      for (const line of listing.split('\n')) {
-        const match = line.match(/^\s*\d+\s+[\d-]+\s+[\d:]+\s+(.+\.xml)$/i);
-        if (match) {
-          xmlFiles.push(match[1].trim());
-        }
-      }
+      const entries = parseArchiveListing(listing, { message: IDML_ADMISSION_MESSAGE });
+      const xmlFiles = entries.filter(entry => entry.path.toLowerCase().endsWith('.xml'));
+      assertEntriesWithinBudget(xmlFiles, {
+        maxEntries: ADMISSION_LIMITS.idmlXmlEntries,
+        maxEntryBytes: ADMISSION_LIMITS.idmlXmlEntryBytes,
+        maxTotalBytes: ADMISSION_LIMITS.idmlXmlBytes,
+        message: IDML_ADMISSION_MESSAGE,
+      });
 
       // Extract and scan each XML file for LinkResourceURI attributes
-      for (const xmlFile of xmlFiles) {
+      for (const xmlEntry of xmlFiles) {
         try {
+          const xmlFile = xmlEntry.path;
           const { stdout: xmlContent } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, xmlFile], {
             timeout: 10000,
             encoding: 'utf8',
-            maxBuffer: 50 * 1024 * 1024  // 50MB buffer for large files
+            maxBuffer: ADMISSION_LIMITS.idmlXmlEntryBytes
           });
+          extractedXmlBytes += Buffer.byteLength(xmlContent, 'utf8');
+          if (extractedXmlBytes > ADMISSION_LIMITS.idmlXmlBytes) {
+            throw admissionError(IDML_ADMISSION_MESSAGE);
+          }
 
           // Find all LinkResourceURI values
           LINK_URI_REGEX.lastIndex = 0;
@@ -95,20 +119,24 @@ class InDesignParser extends BaseParser {
 
             if (assetPath && this.isUserPath(assetPath)) {
               const exists = this.fileExists(assetPath);
-              assets.push({
+              this.appendAsset(assets, {
                 path: assetPath,
                 source: 'idml-link',
                 exists
-              });
+              }, IDML_ADMISSION_MESSAGE);
             }
           }
         } catch (e) {
+          if (isParserAdmissionError(e)) throw e;
+          if (isChildProcessAdmissionError(e)) throw admissionError(IDML_ADMISSION_MESSAGE);
           // Failed to extract this XML file — continue with others
         }
       }
     } catch (e) {
+      if (isParserAdmissionError(e)) throw e;
+      if (isChildProcessAdmissionError(e)) throw admissionError(IDML_ADMISSION_MESSAGE);
       // Failed to list IDML contents — return empty array
-      console.error(`[InDesignParser] Failed to read IDML: ${e.message}`);
+      console.error('[InDesignParser] Could not inspect IDML contents.');
     }
 
     return this.deduplicateAssets(assets);
@@ -132,7 +160,7 @@ class InDesignParser extends BaseParser {
       if (!this.isUserPath(linkedPath)) continue;
 
       const exists = this.fileExists(linkedPath);
-      assets.push({
+      this.appendAsset(assets, {
         path: linkedPath,
         source: 'indd-regex',
         exists
