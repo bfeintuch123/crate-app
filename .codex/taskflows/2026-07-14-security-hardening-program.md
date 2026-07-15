@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-figma-link-privacy`
+- branch: `codex/security-electron-boundary`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phase 1 and phase 2A merged; phase 2A Mac mini QA passed; phase 2B PR #130 is open and merge-readiness is clean; merge approval pending
+- status: phases 1, 2A, and 2B merged; Phase 2B post-merge Mac mini QA passed; Phase 3 Electron-boundary implementation and validation complete; Bryant approved commit, push, PR creation, and merge if final merge readiness remains clean
 
 ## Goal
 
@@ -30,14 +30,15 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: 2B, Figma link and identifier privacy
-- storage target: parse a user-provided Figma URL once and persist only the file-key candidates and requested page or node locator required for existing Figma behavior
-- legacy source: complete URLs in project or session records, migrated automatically when projects load without asking the user to reconnect
-- edit behavior: blank input preserves the current link and can update scope; replacement and removal are explicit actions
-- privacy behavior: logs and optional diagnostics redact complete URLs, credentials, signed-link material, file keys, page or node IDs, image refs, and related Figma identifiers
+- phase: 3, Electron boundary
+- IPC target: every privileged main-process handler accepts calls only from Crate's local renderer entry document in its top frame
+- window target: keep Node integration disabled, preserve context isolation, explicitly enable Chromium renderer sandboxing and web security, and disallow insecure mixed content
+- navigation target: allow Crate's own local entry document, including its existing fragment navigation, while denying other navigation, redirects, and child-window creation
+- lifecycle target: preserve the recovered visible-window behavior, activation, hidden-window recreation, and single-window app model
 - package-engine impact: none
 - Figma scope impact: none; Current Page Only remains default and Entire File remains opt-in
-- normal user-workflow impact: no added setup steps; valid existing project links migrate automatically and remain connected
+- normal user-workflow impact: none expected; existing renderer APIs and visible controls are unchanged
+- deferred observation: Quick Package drag-and-drop still reads Electron's removed `File.path` property; route that pre-existing issue through a separate bug-fix slice rather than broadening this security PR
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -65,6 +66,12 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 2B failure-first tests and narrow implementation
 - [x] phase 2B autoreview, regression, security, provenance, runner, and isolated Reprobox validation
 - [x] Bryant approval for phase 2B commit, push, and PR creation
+- [x] Bryant approval and merge of phase 2B PR #131
+- [x] phase 2B post-merge deterministic and Mac mini installed-app validation
+- [x] phase 3 read-only Electron boundary inventory and failure-first tests
+- [x] phase 3 implementation and focused workflow validation
+- [x] phase 3 autoreview, regression, security, provenance, runner, and isolated Reprobox validation
+- [x] Bryant approval for phase 3 commit, push, and PR creation
 
 ## Stop Gates
 
@@ -75,7 +82,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Request Bryant approval to merge Phase 2B PR #130 into `v2.4.x`. Stop before merge, build, signing, notarization, release mutation, site deployment, or the next security phase without the applicable approval.
+Commit and push Phase 3, open its PR against `v2.4.x`, run final merge readiness, and merge only if every gate remains clean under Bryant's explicit authorization. Then stop before any signed build, notarization, release mutation, site deployment, or Phase 4 implementation and discuss Phase 4 plus the deferred Electron 39 Quick Package drag-and-drop issue.
 
 ## Phase 1 Evidence
 
@@ -125,3 +132,23 @@ Request Bryant approval to merge Phase 2B PR #130 into `v2.4.x`. Stop before mer
 - package selection, watcher scope, parser result shape, provenance relationships, quota, dependencies, lockfiles, preload behavior, and release state were not changed
 - no app launch, build, signing, notarization, release, or deployment was run
 - reproducibility proof remains at `/private/tmp/crate-reprobox-figma-link-privacy-finalv8.kocFfh`; earlier proof directories remain untouched
+- PR #131 merged into `v2.4.x` as `29aa8646a51e5e241326cef420ed450465bd33b4`
+- fresh post-merge deterministic suite passed 255 tests with zero failures
+- contained non-release app content matched the merged source tree and passed packaged-content verification
+- Mac mini validation passed automatic encrypted credential migration, legacy URL minimization, link editing and explicit scope controls, privacy-safe error rendering, restart recovery, and zero raw marker leakage under a synthetic isolated profile
+
+## Phase 3 Evidence
+
+- all 30 privileged main-process IPC channels use one trusted registration boundary that requires Crate's current live main window, exact owning web contents, top frame, and canonical local renderer document
+- stale, destroyed, detached, replaced, and secondary-window senders fail closed; window recreation can adopt only a window identity previously created and marked by Crate
+- canonical renderer fragments remain supported, while populated or bare queries, sibling files, remote origins, protocol changes, redirects, navigation away, and child-window creation are rejected
+- BrowserWindow preferences explicitly keep Node integration off, context isolation on, Chromium renderer sandboxing on, web security on, and insecure mixed content off
+- deterministic full suite passed 255 tests with zero failures; syntax and whitespace checks passed
+- isolated Reprobox applied the complete patch to exact base `29aa8646a51e5e241326cef420ed450465bd33b4` and passed 165 focused tests with zero failures, plus syntax and whitespace checks
+- a contained unsigned QA app passed packaged-content verification; its packed `main.js` SHA-256 matched the reviewed worktree and its renderer helper ran with Chromium sandboxing enabled
+- Mac mini Computer Use validation passed visible Projects launch, sidebar and workspace navigation, Settings and Help rendering, Start Project dialog IPC, close-to-zero-window activation recovery, force-quit relaunch recovery, and privacy-safe synthetic Figma connection rendering
+- the contained app used a synthetic Figma token, isolated Chromium profile, and mock Keychain because temporary-HOME unsigned QA initially triggered a macOS test-harness Keychain prompt; no real credential, Keychain item, Crate config, or installed app was read or changed
+- independent functional and adversarial reviews found no P0, P1, P2, or actionable P3 issue after the sender-window, existing-window-adoption, and bare-query bypasses were closed
+- `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; dependencies and lockfiles were not changed
+- package selection, watcher behavior, parser results, provenance relationships, Figma scope, quota, renderer UI, preload API shape, and release state were not changed
+- no signed build, signing, notarization, release mutation, tag, GitHub release, site deployment, or external tester update occurred

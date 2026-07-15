@@ -9,6 +9,7 @@ const Module = require('module');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
 const {
   EDGE_TYPES,
@@ -94,14 +95,32 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 const ipcHandlers = new Map();
 const electronAppHandlers = new Map();
 const rendererMessages = [];
+const trustedRendererMainFrame = {
+  url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
+};
 const existingRendererWindow = {
+  handlers: new Map(),
   isDestroyed: () => false,
+  isVisible: () => true,
+  isMinimized: () => false,
+  restore: () => {},
   show: () => {},
   focus: () => {},
+  moveTop: () => {},
+  setFocusable: () => {},
+  setIgnoreMouseEvents: () => {},
+  on(channel, fn) { this.handlers.set(channel, fn); },
+  once(channel, fn) { this.handlers.set(channel, fn); },
+  loadFile: () => Promise.resolve(),
   webContents: {
+    handlers: new Map(),
+    mainFrame: trustedRendererMainFrame,
     send(channel, data) {
       rendererMessages.push({ channel, data });
     },
+    on(channel, fn) { this.handlers.set(channel, fn); },
+    once(channel, fn) { this.handlers.set(channel, fn); },
+    setWindowOpenHandler(fn) { this.windowOpenHandler = fn; },
   },
 };
 
@@ -110,7 +129,11 @@ class BrowserWindowStub {
     return [existingRendererWindow];
   }
 
-  constructor() {}
+  static fromWebContents(webContents) {
+    return webContents === existingRendererWindow.webContents ? existingRendererWindow : null;
+  }
+
+  constructor() { return existingRendererWindow; }
   on() {}
   loadFile() {}
   setPosition() {}
@@ -124,8 +147,11 @@ const electronStub = {
   app: {
     requestSingleInstanceLock: () => true,
     quit: () => {},
-    whenReady: () => ({ then: () => {} }),
+    whenReady: () => ({ then: (fn) => { fn(); } }),
     on(eventName, handler) { electronAppHandlers.set(eventName, handler); },
+    isReady: () => true,
+    show: () => {},
+    focus: () => {},
     getPath: () => path.join(__dirname, '..', '.test-userdata'),
     dock: { setMenu: () => {} },
   },
@@ -299,8 +325,7 @@ function getStore() {
 async function callIpc(channel, ...args) {
   const fn = ipcHandlers.get(channel);
   if (!fn) throw new Error(`No IPC handler registered for ${channel}`);
-  // mimic the shape Electron passes (event, ...args)
-  return fn({}, ...args);
+  return fn({ sender: existingRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
 
 async function getActiveFigmaPollerCount() {

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const Module = require('module');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 test('main window uses normal macOS app lifecycle', async () => {
   const originalResolve = Module._resolveFilename;
@@ -80,6 +81,7 @@ test('main window uses normal macOS app lifecycle', async () => {
         send: () => {},
         on(channel, fn) { this.handlers.set(channel, fn); },
         once(channel, fn) { this.handlers.set(channel, fn); },
+        setWindowOpenHandler(fn) { this.windowOpenHandler = fn; },
       };
       this.destroyed = false;
       this.minimized = false;
@@ -94,6 +96,10 @@ test('main window uses normal macOS app lifecycle', async () => {
 
     static getAllWindows() {
       return windows.filter(win => !win.destroyed && !win.detached);
+    }
+
+    static fromWebContents(webContents) {
+      return windows.find(win => win.webContents === webContents && !win.destroyed && !win.detached) || null;
     }
 
     loadFile(filePath) {
@@ -219,11 +225,129 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.options.skipTaskbar, false);
     assert.equal(win.options.transparent, false);
     assert.equal(win.options.backgroundColor, '#ffffff');
+    assert.equal(win.options.webPreferences.nodeIntegration, false);
+    assert.equal(win.options.webPreferences.contextIsolation, true);
+    assert.equal(win.options.webPreferences.sandbox, true);
+    assert.equal(win.options.webPreferences.webSecurity, true);
+    assert.equal(win.options.webPreferences.allowRunningInsecureContent, false);
     assert.ok(win.loadedFile.endsWith(path.join('renderer', 'index.html')));
     assert.equal(typeof win.handlers.get('ready-to-show'), 'function');
     assert.equal(typeof win.webContents.handlers.get('did-finish-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('did-fail-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('will-navigate'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('will-redirect'), 'function');
+    assert.equal(typeof win.webContents.windowOpenHandler, 'function');
+
+    const rendererUrl = pathToFileURL(win.loadedFile).href;
+    const mainFrame = { url: rendererUrl };
+    win.webContents.mainFrame = mainFrame;
+    const trustedEvent = { sender: win.webContents, senderFrame: mainFrame };
+    assert.deepEqual(ipcHandlers.get('projects:get-all')(trustedEvent), []);
+    assert.equal(ipcHandlers.size, 30);
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({}),
+      /blocked an untrusted renderer request/
+    );
+    const childFrame = { url: rendererUrl };
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({ sender: win.webContents, senderFrame: childFrame }),
+      /blocked an untrusted renderer request/
+    );
+    const otherWebContents = { mainFrame };
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({ sender: otherWebContents, senderFrame: mainFrame }),
+      /blocked an untrusted renderer request/
+    );
+    const remoteMainFrame = { url: 'https://example.com/' };
+    win.webContents.mainFrame = remoteMainFrame;
+    for (const handler of ipcHandlers.values()) {
+      assert.throws(
+        () => handler({ sender: win.webContents, senderFrame: remoteMainFrame }),
+        /blocked an untrusted renderer request/
+      );
+    }
+    const queryMainFrame = { url: `${rendererUrl}?untrusted=1` };
+    win.webContents.mainFrame = queryMainFrame;
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({ sender: win.webContents, senderFrame: queryMainFrame }),
+      /blocked an untrusted renderer request/
+    );
+    for (const bareQueryUrl of [`${rendererUrl}?`, `${rendererUrl}?#settings`]) {
+      const bareQueryFrame = { url: bareQueryUrl };
+      win.webContents.mainFrame = bareQueryFrame;
+      assert.throws(
+        () => ipcHandlers.get('projects:get-all')({ sender: win.webContents, senderFrame: bareQueryFrame }),
+        /blocked an untrusted renderer request/
+      );
+    }
+    win.webContents.mainFrame = mainFrame;
+
+    const auxiliaryWindow = new TestBrowserWindow(win.options);
+    const auxiliaryFrame = { url: rendererUrl };
+    auxiliaryWindow.webContents.mainFrame = auxiliaryFrame;
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({
+        sender: auxiliaryWindow.webContents,
+        senderFrame: auxiliaryFrame,
+      }),
+      /blocked an untrusted renderer request/
+    );
+    win.destroyed = true;
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')({
+        sender: auxiliaryWindow.webContents,
+        senderFrame: auxiliaryFrame,
+      }),
+      /blocked an untrusted renderer request/
+    );
+    win.destroyed = false;
+    win.detached = true;
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')(trustedEvent),
+      /blocked an untrusted renderer request/
+    );
+    win.detached = false;
+    windows.pop();
+
+    for (const allowedUrl of [rendererUrl, `${rendererUrl}#`, `${rendererUrl}#settings`]) {
+      let prevented = false;
+      win.webContents.handlers.get('will-navigate')({
+        url: allowedUrl,
+        preventDefault() { prevented = true; }
+      });
+      assert.equal(prevented, false, `expected navigation to remain allowed: ${allowedUrl}`);
+    }
+
+    const siblingRendererUrl = pathToFileURL(path.join(path.dirname(win.loadedFile), 'other.html')).href;
+    for (const blockedUrl of [
+      `${rendererUrl}?untrusted=1`,
+      `${rendererUrl}?`,
+      `${rendererUrl}?#settings`,
+      `${rendererUrl}.untrusted`,
+      siblingRendererUrl,
+      'https://example.com/',
+      'http://example.com/',
+      'javascript:alert(1)',
+      'data:text/html,untrusted',
+      'about:blank',
+      'not a url',
+    ]) {
+      let prevented = false;
+      win.webContents.handlers.get('will-navigate')({
+        url: blockedUrl,
+        preventDefault() { prevented = true; }
+      });
+      assert.equal(prevented, true, `expected navigation to be blocked: ${blockedUrl}`);
+    }
+
+    let redirectPrevented = false;
+    win.webContents.handlers.get('will-redirect')({
+      url: 'file:///tmp/untrusted.html',
+      preventDefault() { redirectPrevented = true; }
+    });
+    assert.equal(redirectPrevented, true);
+    assert.deepEqual(win.webContents.windowOpenHandler({ url: 'https://example.com/' }), { action: 'deny' });
     assert.equal(win.showCount, 1);
     assert.equal(win.focusCount, 1);
     assert.equal(win.moveTopCount, 1);
@@ -271,6 +395,20 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(appFocusCount, 9);
 
     const recreatedWin = windows[1];
+    const recreatedRendererUrl = pathToFileURL(recreatedWin.loadedFile).href;
+    const recreatedMainFrame = { url: recreatedRendererUrl };
+    recreatedWin.webContents.mainFrame = recreatedMainFrame;
+    assert.deepEqual(
+      ipcHandlers.get('projects:get-all')({
+        sender: recreatedWin.webContents,
+        senderFrame: recreatedMainFrame,
+      }),
+      []
+    );
+    assert.throws(
+      () => ipcHandlers.get('projects:get-all')(trustedEvent),
+      /blocked an untrusted renderer request/
+    );
     win.handlers.get('closed')();
     appHandlers.get('did-become-active')();
     assert.equal(windows.length, 2);
