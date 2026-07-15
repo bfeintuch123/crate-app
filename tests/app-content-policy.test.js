@@ -21,6 +21,7 @@ const EXPECTED_BUILD_FILES = Object.freeze([
   'main.js',
   'preload.js',
   'provenance.js',
+  'diagnostic-summary.js',
   'renderer/**/*',
   'parsers/*.js',
   'assets/tray-icon.png'
@@ -64,6 +65,7 @@ test('electron-builder uses the explicit Crate runtime allowlist', () => {
 });
 
 test('packaged-content policy accepts the required runtime and dependencies', () => {
+  assert.equal(REQUIRED_ASAR_ENTRIES.includes('/diagnostic-summary.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-credential-store.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-redaction.js'), true);
   const result = inspectAsarEntries([

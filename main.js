@@ -16,7 +16,6 @@ const fetch = require('node-fetch');
 const {
   NODE_TYPES,
   EDGE_TYPES,
-  PROVENANCE_SCHEMA_VERSION,
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
   createNodeId,
@@ -36,6 +35,7 @@ const {
   assertSafeCopySource,
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
+const { summarizeDiagnosticPackageErrors } = require('./diagnostic-summary');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./parsers/figma-redaction');
 const {
   FIGMA_NETWORK_LIMITS,
@@ -45,6 +45,7 @@ const {
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
+const DIAGNOSTIC_MANIFEST_SCHEMA_VERSION = 2;
 const TEMP_SCRIPT_DIR_PREFIX = 'crate-script-';
 const TEMP_SCRIPT_DIR_MODE = 0o700;
 const TEMP_SCRIPT_FILE_MODE = 0o600;
@@ -4240,107 +4241,6 @@ function getCrateVersion() {
   }
 }
 
-function normalizeManifestPathString(value) {
-  if (typeof value !== 'string' || value.length === 0) return value;
-
-  const homeDir = os.homedir().replace(/\/+$/, '');
-  if (!homeDir) return value;
-
-  const normalizedValue = value.replace(/\\/g, '/');
-  const normalizedHome = homeDir.replace(/\\/g, '/');
-  const lowerValue = normalizedValue.toLowerCase();
-  const lowerHome = normalizedHome.toLowerCase();
-
-  if (lowerValue === lowerHome) return '~';
-  if (lowerValue.startsWith(`${lowerHome}/`)) {
-    return `~/${normalizedValue.slice(normalizedHome.length + 1)}`;
-  }
-
-  return normalizedValue
-    .split(normalizedHome)
-    .join('~')
-    .split(lowerHome)
-    .join('~');
-}
-
-function isSensitiveManifestKey(key = '') {
-  const lowerKey = key.toLowerCase();
-  const figmaIdentifierKeys = new Set([
-    'candidatekeydetails',
-    'candidatekeys',
-    'dedupekey',
-    'figmaassetkey',
-    'figmafilekey',
-    'figmapageid',
-    'filekey',
-    'imageref',
-    'lockedpageid',
-    'nodeid',
-    'pageid',
-    'requestednodeid',
-    'requestedpageid',
-    'resolvedkey',
-    'resourcekey',
-  ]);
-  const credentialKeys = new Set([
-    'auth',
-    'authentication',
-    'authorization',
-    'cookie',
-    'credential',
-    'credentials',
-    'password',
-    'sig',
-    'signature',
-  ]);
-  return (
-    figmaIdentifierKeys.has(lowerKey) ||
-    credentialKeys.has(lowerKey) ||
-    lowerKey.endsWith('url') ||
-    lowerKey.includes('token') ||
-    lowerKey.includes('secret') ||
-    lowerKey.includes('authorization') ||
-    lowerKey.includes('cookie') ||
-    lowerKey.includes('password') ||
-    lowerKey.includes('credential') ||
-    lowerKey.includes('signature') ||
-    lowerKey.includes('apikey') ||
-    lowerKey.includes('api_key') ||
-    lowerKey.includes('command') ||
-    lowerKey.includes('raw') ||
-    lowerKey.includes('stdout') ||
-    lowerKey.includes('stderr') ||
-    lowerKey.includes('apiresponse') ||
-    lowerKey.includes('api_response')
-  );
-}
-
-function redactManifestText(value) {
-  return redactUrlAndCredentialText(value);
-}
-
-function sanitizeManifestValue(value, key = '') {
-  if (isSensitiveManifestKey(key)) {
-    return '[redacted]';
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(item => sanitizeManifestValue(item));
-  }
-
-  if (value && typeof value === 'object') {
-    const sanitized = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
-      sanitized[childKey] = sanitizeManifestValue(childValue, childKey);
-    }
-    return sanitized;
-  }
-
-  if (typeof value !== 'string') return value;
-
-  return redactManifestText(normalizeManifestPathString(value));
-}
-
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -4423,11 +4323,76 @@ function collectPackageManifestGraph(provenance, packageNodeId, warnings) {
   };
 }
 
+function normalizeDiagnosticCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function minimizePackageManifestGraph(graph, warnings) {
+  const allowedNodeTypes = new Set(Object.values(NODE_TYPES));
+  const allowedRelationTypes = new Set(Object.values(EDGE_TYPES));
+  const allowedEvidenceKinds = new Set(Object.values(OBSERVER_KINDS));
+  const allowedConfidenceBands = new Set(Object.values(CONFIDENCE_BANDS));
+  const rawNodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+  const rawEvidence = Array.isArray(graph && graph.evidence) ? graph.evidence : [];
+  const rawEdges = Array.isArray(graph && graph.edges) ? graph.edges : [];
+  const nodeIdMap = new Map();
+  const evidenceIdMap = new Map();
+  const reportPrefix = crypto.randomBytes(8).toString('hex');
+  let omittedRecord = false;
+
+  const nodes = rawNodes.map((node, index) => {
+    const id = `node_${reportPrefix}_${index + 1}`;
+    if (node && typeof node.id === 'string') nodeIdMap.set(node.id, id);
+    return {
+      id,
+      type: allowedNodeTypes.has(node && node.type) ? node.type : 'other',
+    };
+  });
+
+  const evidence = rawEvidence.map((record, index) => {
+    const id = `evidence_${reportPrefix}_${index + 1}`;
+    if (record && typeof record.id === 'string') evidenceIdMap.set(record.id, id);
+    return {
+      id,
+      kind: allowedEvidenceKinds.has(record && record.kind) ? record.kind : 'other',
+    };
+  });
+
+  const edges = [];
+  for (const edge of rawEdges) {
+    const subjectNodeId = nodeIdMap.get(edge && edge.subjectNodeId);
+    const objectNodeId = nodeIdMap.get(edge && edge.objectNodeId);
+    if (!subjectNodeId || !objectNodeId || !allowedRelationTypes.has(edge && edge.relationType)) {
+      omittedRecord = true;
+      continue;
+    }
+    const evidenceIds = (Array.isArray(edge.evidenceIds) ? edge.evidenceIds : [])
+      .map(evidenceId => evidenceIdMap.get(evidenceId))
+      .filter(Boolean);
+    edges.push({
+      id: `edge_${reportPrefix}_${edges.length + 1}`,
+      relationType: edge.relationType,
+      subjectNodeId,
+      objectNodeId,
+      evidenceIds,
+      confidenceBand: allowedConfidenceBands.has(edge.confidence && edge.confidence.band)
+        ? edge.confidence.band
+        : CONFIDENCE_BANDS.WEAK,
+    });
+  }
+
+  if (omittedRecord) {
+    warnings.push('Malformed or unrecognized diagnostic graph records were omitted.');
+  }
+
+  return { nodes, edges, evidence };
+}
+
 function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
   const provenance = isRecord(project && project.provenance) ? project.provenance : null;
   const warnings = [
-    'Partial package-relevant provenance manifest only; this is not a full project graph.',
-    'Non-package graph records and raw capture observations are intentionally omitted.',
+    'Minimized package-relevant diagnostics only; this is not a full project graph.',
+    'Project identity, filenames, paths, timestamps, payloads, and persistent identifiers are intentionally omitted.',
   ];
   if (!provenance) {
     warnings.push('Project provenance sidecar was missing or invalid when this manifest was written.');
@@ -4438,37 +4403,36 @@ function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
     path: packageInfo.destFolder,
     createdAt: packageInfo.createdAt,
   });
-  const graph = collectPackageManifestGraph(provenance, packageNodeId, warnings);
-  const createdAt = Number.isFinite(packageInfo.createdAt)
-    ? new Date(packageInfo.createdAt).toISOString()
-    : null;
+  const graph = minimizePackageManifestGraph(
+    collectPackageManifestGraph(provenance, packageNodeId, warnings),
+    warnings
+  );
+  const errors = Array.isArray(packageResult.errors) ? packageResult.errors : [];
 
-  return sanitizeManifestValue({
-    schemaVersion: PROVENANCE_SCHEMA_VERSION,
-    scope: 'partial_package_relevant',
-    generatedAt: new Date().toISOString(),
+  return {
+    schemaVersion: DIAGNOSTIC_MANIFEST_SCHEMA_VERSION,
+    scope: 'minimized_package_relevant',
     generatedBy: {
       app: 'Crate',
       version: getCrateVersion(),
     },
-    project: {
-      id: project && project.id ? project.id : null,
-      name: project && project.name ? project.name : null,
-      sessionId: provenance && typeof provenance.sessionId === 'string' ? provenance.sessionId : null,
+    privacy: {
+      mode: 'minimized',
+      identifiers: 'report-local',
+      content: 'metadata-only',
     },
     package: {
-      path: packageInfo.destFolder,
-      createdAt,
-      copiedCount: packageResult.copiedCount,
-      embeddedCount: packageResult.embeddedCount,
-      totalFiles: packageResult.totalFiles,
-      errors: Array.isArray(packageResult.errors) ? packageResult.errors : [],
+      copiedCount: normalizeDiagnosticCount(packageResult.copiedCount),
+      embeddedCount: normalizeDiagnosticCount(packageResult.embeddedCount),
+      totalFiles: normalizeDiagnosticCount(packageResult.totalFiles),
+      errorCount: normalizeDiagnosticCount(errors.length),
+      errorCategories: summarizeDiagnosticPackageErrors(errors),
     },
     nodes: graph.nodes,
     edges: graph.edges,
     evidence: graph.evidence,
     warnings,
-  });
+  };
 }
 
 function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {

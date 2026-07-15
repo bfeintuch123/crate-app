@@ -30,6 +30,7 @@
       "main.js",
       "preload.js",
       "provenance.js",
+      "diagnostic-summary.js",
       "renderer/**/*",
       "parsers/*.js",
       "assets/tray-icon.png"

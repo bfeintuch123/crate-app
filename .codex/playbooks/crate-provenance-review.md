@@ -102,7 +102,7 @@ node tests/figma-link-per-project.test.js
 - Confidence discipline: parser, package copy, package extraction, user accept, and Figma asset download can be confirmed when direct; lsof, Spotlight, basename, timing, and app-level evidence stay lower confidence.
 - Dedupe stability: observations and edges should not multiply across repeated watches or package runs.
 - Dual-write safety: provenance writes must not change `project.files`, package selection, pending-file decisions, or existing UI behavior unless Bryant explicitly scoped that change.
-- Manifest safety: optional `Crate Diagnostics/crate-provenance.json` must tolerate missing data, use compact evidence, and avoid secrets or raw local system state.
+- Manifest safety: optional schema v2 `Crate Diagnostics/crate-provenance.json` must tolerate missing data and contain only minimized counts, fixed error categories, allowlisted graph metadata, and randomized report-local identifiers. It must omit project identity, filenames, paths, timestamps, payloads, persistent IDs, raw errors, and evidence payloads.
 - Figma safety: Figma provenance must not widen capture scope or weaken page lock fail-closed behavior.
 - Package safety: package provenance must describe copied or extracted output without changing which files are packaged.
 

@@ -117,10 +117,10 @@ Package output checks:
 Manifest checks:
 
 - Does `Crate Diagnostics/crate-provenance.json` parse as JSON when a diagnostic manifest is provided?
-- Are `copiedCount`, `embeddedCount`, `totalFiles`, and `errors` present?
+- Are `copiedCount`, `embeddedCount`, and `totalFiles` present? For schema v2, are `errorCount` and fixed `errorCategories` present? For schema v1, derive only the error count from the legacy `errors` array and do not print its raw strings.
 - Do node and edge counts roughly match the package contents?
 - Are confidence bands appropriate, such as confirmed, likely, candidate, or weak?
-- Are warnings present for partial or omitted provenance?
+- Are warnings present for minimized or omitted provenance?
 - Does the manifest avoid tokens, credentials, signed URLs, raw command output, cookies, and private unrelated paths?
 - Does the manifest overclaim certainty for Figma, parser, package, or cross-app relationships?
 
@@ -284,7 +284,7 @@ Inspect approved artifacts:
 find <approved-package-output> -maxdepth 4 -type f | sort
 diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
 test -f "$diagnostic_manifest"
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const count=(items,key)=>items.reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],nodesByType:count(m.nodes||[],'type'),edgesByType:count(m.edges||[],'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; const count=(items,key)=>(items||[]).reduce((a,x)=>{const k=x&&x[key]||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},nodesByType:count(m.nodes,'type'),edgesByType:count(m.edges,'relationType'),warnings:m.warnings||[]}, null, 2));" "$diagnostic_manifest"
 rg -n "token|secret|credential|Authorization|Bearer|cookie|cdn\\.figma|password|passkey|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
 

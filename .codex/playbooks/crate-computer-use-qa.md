@@ -124,7 +124,7 @@ Inspect approved package output after a GUI run:
 find <approved-package-output> -maxdepth 4 -type f | sort
 diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
 test -f "$diagnostic_manifest"
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length}, null, 2));" "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; console.log(JSON.stringify({schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},warnings:m.warnings||[],nodes:(m.nodes||[]).length,edges:(m.edges||[]).length}, null, 2));" "$diagnostic_manifest"
 rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
 
@@ -396,7 +396,7 @@ Collect only approved and privacy-safe artifacts:
 - Package Details collapsed and expanded screenshots
 - Finder output screenshot
 - redacted package inventory
-- redacted `Crate Diagnostics/crate-provenance.json` summary when diagnostics were enabled
+- privacy-safe `Crate Diagnostics/crate-provenance.json` summary when diagnostics were enabled
 - screen recording path when one was approved
 
 For Jenna-machine real-file installed-app QA, redact private file names, client names, local usernames, cloud URLs, and source paths unless Bryant explicitly approves preserving them. Store temporary reports under `/private/tmp/crate-computer-use-qa-<id>` only after Bryant approves artifact writing. Do not store private client, tester, or Jenna-machine source assets in the report.

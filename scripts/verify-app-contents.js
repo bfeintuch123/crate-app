@@ -25,6 +25,7 @@ const REQUIRED_ASAR_ENTRIES = Object.freeze([
   '/main.js',
   '/preload.js',
   '/provenance.js',
+  '/diagnostic-summary.js',
   '/renderer/app.js',
   '/renderer/index.html',
   '/renderer/styles.css',
@@ -51,7 +52,13 @@ function isSensitiveEntry(entry) {
 
 function isAllowedAsarEntry(entry) {
   if (isSensitiveEntry(entry)) return false;
-  if (entry === '/package.json' || entry === '/main.js' || entry === '/preload.js' || entry === '/provenance.js') {
+  if (
+    entry === '/package.json' ||
+    entry === '/main.js' ||
+    entry === '/preload.js' ||
+    entry === '/provenance.js' ||
+    entry === '/diagnostic-summary.js'
+  ) {
     return true;
   }
   if (entry === '/assets' || entry === '/assets/tray-icon.png') return true;

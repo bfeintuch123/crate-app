@@ -46,11 +46,11 @@ These are Bryant-provided Crate process and product decisions that future sessio
 - Rationale: A process-level signal does not prove a creative asset relationship by itself.
 - Implications: Reports should not promote these signals to confirmed relationships without stronger package, parser, or materialization evidence.
 
-### crate-provenance.json Is Partial And Package-Relevant For Now
-- Decision: `crate-provenance.json` is partial and package-relevant for now.
-- Context: Crate writes provenance artifacts that summarize package-relevant evidence, warnings, counts, nodes, edges, and limitations.
-- Rationale: The manifest is useful even when the full creative history cannot be proven.
-- Implications: Snapshot, QA, and release reports should distinguish package-confirmed facts from omitted, unknown, likely, candidate, or weak relationships.
+### crate-provenance.json Is Minimized And Package-Relevant
+- Decision: `crate-provenance.json` is an optional minimized, package-relevant diagnostic report.
+- Context: When diagnostics are enabled, Crate exports fixed package counts and categories plus allowlisted graph metadata with randomized report-local identifiers.
+- Rationale: The report remains useful for QA and support without carrying project identity, filenames, paths, timestamps, payloads, persistent IDs, or raw errors.
+- Implications: Snapshot, QA, and release reports should compare safe aggregate graph shapes and confidence bands, not report-local identifiers or omitted private fields.
 
 ### get-crate.com Does Not Update For Internal QA Prereleases
 - Decision: `get-crate.com` should not update for internal QA prereleases.
@@ -97,7 +97,7 @@ Use this template for every new decision:
 ## How To Reference Decisions In Future PRs
 - Link or quote the decision title in the PR body or reviewer notes.
 - State whether the PR implements, preserves, tests, documents, or intentionally does not touch the decision.
-- Keep the reference factual: "Preserves the decision that `crate-provenance.json` is partial and package-relevant for now."
+- Keep the reference factual: "Preserves the decision that `crate-provenance.json` is minimized and package-relevant."
 - Do not claim the PR implements a decision unless the diff actually changes app behavior, tests, or documentation in that direction.
 - If a decision affects release notes, state whether the release is public, prerelease, internal QA, or unreleased.
 - If a decision affects QA, name the relevant QA playbook and the evidence needed to validate it.

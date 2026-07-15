@@ -121,7 +121,7 @@ Inspect package output after Bryant approves the package path:
 find <approved-package-output> -maxdepth 5 -type f | sort
 diagnostic_manifest="<approved-package-output>/Crate Diagnostics/crate-provenance.json"
 test -f "$diagnostic_manifest"
-node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const by=(items,key)=>(items||[]).reduce((a,x)=>{const k=(x&&x[key])||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({copiedCount:m.copiedCount,embeddedCount:m.embeddedCount,totalFiles:m.totalFiles,errors:m.errors||[],warnings:m.warnings||[],nodesByType:by(m.nodes,'type'),edgesByType:by(m.edges,'relationType')}, null, 2));" "$diagnostic_manifest"
+node -e "const fs=require('fs'); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p,'utf8')); const pkg=m.package||m; const legacyErrors=Array.isArray(pkg.errors)?pkg.errors:[]; const by=(items,key)=>(items||[]).reduce((a,x)=>{const k=(x&&x[key])||'unknown'; a[k]=(a[k]||0)+1; return a;},{}); console.log(JSON.stringify({schemaVersion:m.schemaVersion,scope:m.scope||'legacy',copiedCount:pkg.copiedCount,embeddedCount:pkg.embeddedCount,totalFiles:pkg.totalFiles,errorCount:Number.isSafeInteger(pkg.errorCount)?pkg.errorCount:legacyErrors.length,errorCategories:pkg.errorCategories||{},warnings:m.warnings||[],nodesByType:by(m.nodes,'type'),edgesByType:by(m.edges,'relationType')}, null, 2));" "$diagnostic_manifest"
 rg -n "token|secret|credential|Authorization|Bearer|cookie|password|passkey|cdn\\.figma|rawTrackedFiles|/usr/sbin/lsof" "$diagnostic_manifest"
 ```
 
