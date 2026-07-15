@@ -55,7 +55,7 @@ class AIParser extends BaseParser {
       // Check if the file exists and record result
       const exists = this.fileExists(linkedPath);
 
-      assets.push({
+      this.appendAsset(assets, {
         path: linkedPath,
         source: 'ai-regex',
         exists

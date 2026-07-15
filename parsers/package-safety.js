@@ -324,6 +324,31 @@ function writeFileIntoPackageExact(destFolder, rawName, data, options = {}) {
   return finalPath;
 }
 
+function removeCreatedPackageFiles(destFolder, filePaths) {
+  const root = path.resolve(destFolder);
+  const rootStat = lstatIfExists(root);
+  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) return 0;
+
+  const realRoot = realpathSync(root);
+  let removed = 0;
+  for (const filePath of filePaths || []) {
+    try {
+      const candidate = path.resolve(String(filePath || ''));
+      if (!isPathInsideDirectory(root, candidate)) continue;
+
+      const stat = lstatIfExists(candidate);
+      if (!stat || stat.isSymbolicLink() || !stat.isFile()) continue;
+      if (!isPathInsideDirectory(realRoot, realpathSync(path.dirname(candidate)))) continue;
+
+      fs.unlinkSync(candidate);
+      removed += 1;
+    } catch (error) {
+      // Preserve the original admission failure while cleanup remains best effort.
+    }
+  }
+  return removed;
+}
+
 module.exports = {
   sanitizePackageFileName,
   sanitizePackageRelativePath,
@@ -333,6 +358,7 @@ module.exports = {
   resolveExactPackagePath,
   assertSafeCopySource,
   copyFileIntoPackage,
+  removeCreatedPackageFiles,
   writeFileIntoPackage,
   writeFileIntoPackageExact,
 };

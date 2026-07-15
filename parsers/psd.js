@@ -13,6 +13,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
+const { isParserAdmissionError } = require('./admission-budgets');
 
 // Regex to find macOS absolute paths to image/design files in binary data.
 // Matches: /Users/name/path/to/file.jpg (and other extensions)
@@ -52,7 +53,7 @@ class PSDParser extends BaseParser {
         const linkedPath = match[0];
         if (!this.isUserPath(linkedPath)) continue;
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'psd-regex',
           exists: this.fileExists(linkedPath)
@@ -64,13 +65,14 @@ class PSDParser extends BaseParser {
       while ((match = VOLUMES_ASSET_REGEX.exec(content)) !== null) {
         const linkedPath = match[0];
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'psd-regex',
           exists: this.fileExists(linkedPath)
         });
       }
     } catch (err) {
+      if (isParserAdmissionError(err)) throw err;
       // If binary scanning fails, continue to try psd package
     }
 
@@ -82,6 +84,7 @@ class PSDParser extends BaseParser {
 
         this._walkLayers(tree, assets);
       } catch (err) {
+        if (isParserAdmissionError(err)) throw err;
         // psd package failed — fall back to binary scan results only
       }
     }
@@ -103,7 +106,7 @@ class PSDParser extends BaseParser {
         if (exported.smartObject && exported.smartObject.linked) {
           const linkedPath = exported.smartObject.linked;
           if (typeof linkedPath === 'string' && linkedPath.startsWith('/')) {
-            assets.push({
+            this.appendAsset(assets, {
               path: linkedPath,
               source: 'psd-smartobject',
               exists: this.fileExists(linkedPath)
@@ -115,7 +118,7 @@ class PSDParser extends BaseParser {
         if (exported.placedLayer && exported.placedLayer.filePath) {
           const linkedPath = exported.placedLayer.filePath;
           if (typeof linkedPath === 'string' && linkedPath.startsWith('/')) {
-            assets.push({
+            this.appendAsset(assets, {
               path: linkedPath,
               source: 'psd-placedlayer',
               exists: this.fileExists(linkedPath)
@@ -130,6 +133,7 @@ class PSDParser extends BaseParser {
         this._walkLayers(child, assets);
       }
     } catch (err) {
+      if (isParserAdmissionError(err)) throw err;
       // Skip problematic layers
     }
   }

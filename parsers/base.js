@@ -13,7 +13,11 @@
 'use strict';
 
 const fs = require('fs');
-const path = require('path');
+const {
+  ADMISSION_LIMITS,
+  appendReferenceWithinBudget,
+  readFileWithinBudget,
+} = require('./admission-budgets');
 
 class BaseParser {
   /**
@@ -63,8 +67,23 @@ class BaseParser {
    * @param {string} filePath
    * @returns {Buffer}
    */
-  readFileBuffer(filePath) {
-    return fs.readFileSync(filePath);
+  readFileBuffer(
+    filePath,
+    maxBytes = ADMISSION_LIMITS.localParserFileBytes,
+    message = 'This design file is too large for Crate to inspect safely.'
+  ) {
+    return readFileWithinBudget(
+      filePath,
+      maxBytes,
+      message
+    );
+  }
+
+  /**
+   * Helper: add one parser result without allowing unbounded reference growth.
+   */
+  appendAsset(assets, asset, message) {
+    return appendReferenceWithinBudget(assets, asset, { message });
   }
 
   /**

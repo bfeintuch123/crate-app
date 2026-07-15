@@ -16,6 +16,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
+const { isParserAdmissionError } = require('./admission-budgets');
 
 // Regex to find macOS absolute paths to media files in binary data.
 // Includes video, audio, image, and compositing formats common in AE projects.
@@ -50,7 +51,7 @@ class AfterEffectsParser extends BaseParser {
         const linkedPath = match[0];
         if (!this.isUserPath(linkedPath)) continue;
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'aep-regex',
           exists: this.fileExists(linkedPath)
@@ -62,7 +63,7 @@ class AfterEffectsParser extends BaseParser {
       while ((match = VOLUMES_ASSET_REGEX.exec(content)) !== null) {
         const linkedPath = match[0];
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'aep-regex',
           exists: this.fileExists(linkedPath)
@@ -77,7 +78,7 @@ class AfterEffectsParser extends BaseParser {
         // Skip self-reference
         if (linkedPath === filePath) continue;
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'aep-project-ref',
           exists: this.fileExists(linkedPath)
@@ -90,7 +91,7 @@ class AfterEffectsParser extends BaseParser {
         // Skip self-reference
         if (linkedPath === filePath) continue;
 
-        assets.push({
+        this.appendAsset(assets, {
           path: linkedPath,
           source: 'aep-project-ref',
           exists: this.fileExists(linkedPath)
@@ -98,6 +99,7 @@ class AfterEffectsParser extends BaseParser {
       }
 
     } catch (err) {
+      if (isParserAdmissionError(err)) throw err;
       // Graceful error handling — return what we have
       if (assets.length === 0) {
         // If we got nothing and had an error, report it

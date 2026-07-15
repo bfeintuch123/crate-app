@@ -23,10 +23,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isParserAdmissionError } = require('./admission-budgets');
 const {
   assertSafeCopySource,
   copyFileIntoPackage,
   ensureSafePackageDirectory,
+  removeCreatedPackageFiles,
 } = require('./package-safety');
 
 // Import all parsers
@@ -207,6 +209,7 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
       }
     });
   } catch (e) {
+    if (isParserAdmissionError(e)) throw e;
     // Parser threw an error (likely a stub)
     throw new Error(`Parser error for ${path.basename(filePath)}: ${e.message}`);
   }
@@ -315,6 +318,10 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
         });
       }
     } catch (e) {
+      if (isParserAdmissionError(e)) {
+        removeCreatedPackageFiles(outputRoot, result.files.map(file => file.copied));
+        throw e;
+      }
       console.warn(`[packageMasterFile] Could not extract embedded media from ${path.basename(filePath)}.`);
     }
   }

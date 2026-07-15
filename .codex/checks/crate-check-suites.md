@@ -130,9 +130,12 @@ Use when changes affect Quick Package, Add Files, package filtering, parser extr
 
 ```sh
 node --check parsers/index.js
+node --check parsers/admission-budgets.js
 node --check parsers/powerpoint.js
 node --check parsers/package-safety.js
+node --check tests/parser-admission-limits.test.js
 node --check tests/quick-package-parser.test.js
+node --test tests/parser-admission-limits.test.js
 node --test tests/quick-package-parser.test.js
 node --test tests/psd-embedded-safety.test.js
 git diff --check

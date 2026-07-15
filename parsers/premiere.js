@@ -17,7 +17,19 @@
 'use strict';
 
 const { BaseParser } = require('./base');
-const zlib = require('zlib');
+const {
+  ADMISSION_LIMITS,
+  decompressGzipWithinBudget,
+  isParserAdmissionError,
+} = require('./admission-budgets');
+
+const PREMIERE_ADMISSION_MESSAGE = 'This Premiere project expands beyond Crate\'s safe inspection limit.';
+
+function getPremiereInputBudget(header) {
+  return header[0] === 0x1f && header[1] === 0x8b
+    ? ADMISSION_LIMITS.premiereCompressedBytes
+    : ADMISSION_LIMITS.localParserFileBytes;
+}
 
 // Regex patterns for extracting media paths from Premiere XML
 // ActualMediaFilePath is the primary tag for linked footage
@@ -40,14 +52,27 @@ class PremiereParser extends BaseParser {
     const assets = [];
 
     // Read and decompress the gzip file
-    const compressed = this.readFileBuffer(filePath);
+    const compressed = this.readFileBuffer(
+      filePath,
+      getPremiereInputBudget,
+      PREMIERE_ADMISSION_MESSAGE
+    );
     let xmlContent;
 
-    try {
-      const decompressed = zlib.gunzipSync(compressed);
-      xmlContent = decompressed.toString('utf8');
-    } catch (e) {
-      // Not gzip compressed — try reading as plain text (older Premiere versions)
+    if (compressed[0] === 0x1f && compressed[1] === 0x8b) {
+      try {
+        const decompressed = decompressGzipWithinBudget(
+          compressed,
+          ADMISSION_LIMITS.premiereDecompressedBytes,
+          PREMIERE_ADMISSION_MESSAGE
+        );
+        xmlContent = decompressed.toString('utf8');
+      } catch (e) {
+        if (isParserAdmissionError(e)) throw e;
+        // Preserve legacy handling for malformed or older plain-text projects.
+        xmlContent = compressed.toString('utf8');
+      }
+    } else {
       xmlContent = compressed.toString('utf8');
     }
 
@@ -59,7 +84,7 @@ class PremiereParser extends BaseParser {
 
       if (this.isUserPath(mediaPath)) {
         const exists = this.fileExists(mediaPath);
-        assets.push({
+        this.appendAsset(assets, {
           path: mediaPath,
           source: 'prproj-mediapath',
           exists
@@ -74,7 +99,7 @@ class PremiereParser extends BaseParser {
 
       if (this.isUserPath(mediaPath)) {
         const exists = this.fileExists(mediaPath);
-        assets.push({
+        this.appendAsset(assets, {
           path: mediaPath,
           source: 'prproj-filepath',
           exists
@@ -90,7 +115,7 @@ class PremiereParser extends BaseParser {
 
       if (this.isUserPath(mediaPath)) {
         const exists = this.fileExists(mediaPath);
-        assets.push({
+        this.appendAsset(assets, {
           path: mediaPath,
           source: 'prproj-generic',
           exists
@@ -127,4 +152,4 @@ class PremiereParser extends BaseParser {
   }
 }
 
-module.exports = { PremiereParser };
+module.exports = { PremiereParser, getPremiereInputBudget };
