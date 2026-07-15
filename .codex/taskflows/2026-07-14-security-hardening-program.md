@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-electron-boundary`
+- branch: `codex/fix-electron39-quick-package-drop`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, dependency mutation, push, PR, or merge without the applicable approval gate
-- status: phases 1, 2A, and 2B merged; Phase 2B post-merge Mac mini QA passed; Phase 3 Electron-boundary implementation and validation complete; Bryant approved commit, push, PR creation, and merge if final merge readiness remains clean
+- status: phases 1, 2A, 2B, and 3 merged; Phase 3.5 Electron 39 Quick Package drag-and-drop compatibility implementation and validation complete, awaiting commit and PR approval
 
 ## Goal
 
@@ -30,15 +30,14 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: 3, Electron boundary
-- IPC target: every privileged main-process handler accepts calls only from Crate's local renderer entry document in its top frame
-- window target: keep Node integration disabled, preserve context isolation, explicitly enable Chromium renderer sandboxing and web security, and disallow insecure mixed content
-- navigation target: allow Crate's own local entry document, including its existing fragment navigation, while denying other navigation, redirects, and child-window creation
-- lifecycle target: preserve the recovered visible-window behavior, activation, hidden-window recreation, and single-window app model
+- phase: 3.5, Electron 39 Quick Package drag-and-drop compatibility
+- root cause: the renderer reads Electron's removed nonstandard `File.path` property, so a dropped file can resolve to no filesystem path and Quick Package silently does nothing
+- compatibility target: resolve an operating-system-backed dropped `File` through Electron `webUtils.getPathForFile` inside the sandboxed preload bridge
+- privacy target: invoke the existing trusted `v2:package-file` IPC channel from preload without adding a new bridge API that returns the resolved filesystem path before packaging
+- workflow target: preserve the existing immediate Quick Package behavior, Browse fallback, supported formats, result screen, quota increment, and first-file-only behavior
 - package-engine impact: none
 - Figma scope impact: none; Current Page Only remains default and Entire File remains opt-in
-- normal user-workflow impact: none expected; existing renderer APIs and visible controls are unchanged
-- deferred observation: Quick Package drag-and-drop still reads Electron's removed `File.path` property; route that pre-existing issue through a separate bug-fix slice rather than broadening this security PR
+- normal user-workflow impact: drag-and-drop should work again on Electron 39; no new user step is added
 
 ## Deferred Pre-Public-Release Requirement
 
@@ -72,6 +71,11 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 3 implementation and focused workflow validation
 - [x] phase 3 autoreview, regression, security, provenance, runner, and isolated Reprobox validation
 - [x] Bryant approval for phase 3 commit, push, and PR creation
+- [x] Bryant approval and merge of phase 3 PR #132
+- [x] phase 3.5 read-only root-cause confirmation
+- [x] phase 3.5 failure-first tests and narrow implementation
+- [x] phase 3.5 focused, regression, security, provenance, runner, isolated Reprobox, and contained Electron 39 validation
+- [ ] Bryant approval for phase 3.5 commit, push, and PR creation
 
 ## Stop Gates
 
@@ -82,7 +86,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Commit and push Phase 3, open its PR against `v2.4.x`, run final merge readiness, and merge only if every gate remains clean under Bryant's explicit authorization. Then stop before any signed build, notarization, release mutation, site deployment, or Phase 4 implementation and discuss Phase 4 plus the deferred Electron 39 Quick Package drag-and-drop issue.
+Await Bryant approval to commit Phase 3.5, push the branch, and open a PR against `v2.4.x`. Stop before commit, push, PR creation, merge, signed build, notarization, release mutation, site deployment, or Phase 4 implementation without the applicable approval.
 
 ## Phase 1 Evidence
 
@@ -152,3 +156,22 @@ Commit and push Phase 3, open its PR against `v2.4.x`, run final merge readiness
 - `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; dependencies and lockfiles were not changed
 - package selection, watcher behavior, parser results, provenance relationships, Figma scope, quota, renderer UI, preload API shape, and release state were not changed
 - no signed build, signing, notarization, release mutation, tag, GitHub release, site deployment, or external tester update occurred
+- PR #132 merged into `v2.4.x` as `c6c9354b37e89ba8daea84e545530296d3f0ab9b`
+
+## Phase 3.5 Evidence
+
+- exact base is merged Phase 3 commit `c6c9354b37e89ba8daea84e545530296d3f0ab9b`; implementation remains uncommitted on `codex/fix-electron39-quick-package-drop`
+- failure-first coverage produced four expected failures before the production patch: the preload bridge was absent and the renderer still touched the removed `File.path` property
+- sandboxed preload now resolves only an operating-system-backed dropped `File` with Electron `webUtils.getPathForFile` and invokes the existing trusted `v2:package-file` channel without returning the raw path to the renderer
+- Browse retains its existing main-process file-dialog path; first-file-only behavior, result rendering, quota refresh, package output, supported formats, and retry behavior are preserved
+- rejected drop or Browse packaging requests always hide the progress overlay, release the in-flight guard, show fixed privacy-safe copy, and permit a retry
+- focused lifecycle, preload, renderer, and Quick Package parser suite passed 43 tests with zero failures
+- full clean deterministic suite passed 260 tests with zero failures using a normal macOS temporary root; forcing the suite under `/private/tmp` reproduced one unchanged Keynote path-string assertion on both the patch and exact base
+- fresh exact-base Reprobox at `/private/tmp/crate-reprobox-phase35-final/repo` passed the same 43 focused tests, syntax checks, and `git diff --check`
+- contained Electron `39.8.10` arm64 app passed packaged-content verification with 2,859 ASAR and 1,767 unpacked entries; packed `preload.js` and `renderer/app.js` hashes matched the reviewed source
+- a genuine disk-backed PowerPoint `File` supplied to the packaged app's drop event reached Package Complete, copied identical source bytes, and incremented isolated quota from `0 of 10` to `1 of 10`
+- the contained app used unique bundle id `com.crate.app.phase35qa`, isolated HOME/profile, mock Keychain, synthetic non-secret Figma environment value, no signing identity, and no installed-app or personal-config access
+- two independent final rereviews found no P0-P2 blocker and confirmed the prior progress-overlay and retry concerns are resolved
+- `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; no dependency or lockfile mutation occurred
+- `main.js`, package engine, parsers, provenance, Figma runtime and scope, watcher behavior, release state, and website remain unchanged
+- no commit, push, PR, merge, signed build, notarization, release mutation, site deployment, external tester update, or Phase 4 implementation occurred

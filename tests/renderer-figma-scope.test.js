@@ -613,3 +613,157 @@ test('renderer binds primary controls before startup IPC resolves', () => {
   assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
   assert.equal(elements['input-project-name'].focused, true);
 });
+
+test('Quick Package drop uses preload File handling while Browse keeps its existing path flow', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const neverResolves = new Promise(() => {});
+  const droppedFile = { name: 'Synthetic Deck.pptx' };
+  const ignoredDroppedFile = { name: 'Ignored Second Deck.pptx' };
+  Object.defineProperty(droppedFile, 'path', {
+    get() { throw new Error('renderer must not read File.path'); },
+  });
+  const droppedFiles = [];
+  const browsedPaths = [];
+  let usageRequests = 0;
+  const browsePath = '/private/tmp/crate-synthetic/Browsed Deck.pptx';
+  const packageResult = {
+    success: true,
+    masterFile: '/private/tmp/crate-synthetic/Synthetic Deck.pptx',
+    assetsFound: 0,
+    assetsCopied: 0,
+    assetsMissing: [],
+    outputDir: '/private/tmp/crate-synthetic/Synthetic Deck_2026-07-14',
+    files: [],
+  };
+  const crateBridge = {
+    getProjects: () => neverResolves,
+    getSettings: async () => ({ namingTemplate: '{Project}_{Date}' }),
+    getUsage: async () => {
+      usageRequests += 1;
+      return { packagesThisMonth: usageRequests };
+    },
+    v2PackageDroppedFile: async file => {
+      droppedFiles.push(file);
+      return packageResult;
+    },
+    v2BrowseFile: async () => browsePath,
+    v2PackageFile: async filePath => {
+      browsedPaths.push(filePath);
+      return { ...packageResult, masterFile: browsePath };
+    },
+    onFilesUpdated: () => {},
+    onProjectUpdated: () => {},
+    onPackageTrigger: () => {},
+    onPendingFilesUpdated: () => {},
+    onFigmaAuthError: () => {},
+    onFigmaScanStarted: () => {},
+    onFigmaScanComplete: () => {},
+    onFigmaScanError: () => {},
+  };
+
+  loadRendererHelpers(document, { crate: crateBridge });
+  document.listeners.DOMContentLoaded();
+  const startupUsageRequests = usageRequests;
+
+  const dropHandlers = elements['v2-drop-zone'].listeners.drop;
+  assert.equal(dropHandlers.length, 1);
+  await dropHandlers[0]({
+    preventDefault() {},
+    stopPropagation() {},
+    dataTransfer: { files: [droppedFile, ignoredDroppedFile] },
+  });
+
+  assert.equal(droppedFiles.length, 1);
+  assert.equal(droppedFiles[0], droppedFile);
+  assert.deepEqual(browsedPaths, []);
+  assert.equal(usageRequests, startupUsageRequests + 1);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+
+  elements['modal-v2-results'].classList.add('hidden');
+
+  const browseHandlers = elements['btn-v2-browse'].listeners.click;
+  assert.equal(browseHandlers.length, 1);
+  await browseHandlers[0]();
+
+  assert.deepEqual(browsedPaths, [browsePath]);
+  assert.equal(usageRequests, startupUsageRequests + 2);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+});
+
+test('Quick Package clears progress and permits retry after rejected drop or Browse IPC', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const neverResolves = new Promise(() => {});
+  const droppedFile = { name: 'Synthetic Retry Deck.pptx' };
+  let dropAttempts = 0;
+  let browseAttempts = 0;
+  const browsePath = '/private/tmp/crate-synthetic/Browsed Retry Deck.pptx';
+  const packageResult = {
+    success: true,
+    masterFile: '/private/tmp/crate-synthetic/Synthetic Retry Deck.pptx',
+    assetsFound: 0,
+    assetsCopied: 0,
+    assetsMissing: [],
+    outputDir: '/private/tmp/crate-synthetic/Synthetic Retry Deck_2026-07-14',
+    files: [],
+  };
+  const crateBridge = {
+    getProjects: () => neverResolves,
+    getSettings: async () => ({ namingTemplate: '{Project}_{Date}' }),
+    getUsage: async () => ({ packagesThisMonth: 1 }),
+    v2PackageDroppedFile: async () => {
+      dropAttempts += 1;
+      if (dropAttempts === 1) throw new Error('synthetic drop IPC rejection');
+      return packageResult;
+    },
+    v2BrowseFile: async () => browsePath,
+    v2PackageFile: async () => {
+      browseAttempts += 1;
+      if (browseAttempts === 1) throw new Error('synthetic Browse IPC rejection');
+      return { ...packageResult, masterFile: browsePath };
+    },
+    onFilesUpdated: () => {},
+    onProjectUpdated: () => {},
+    onPackageTrigger: () => {},
+    onPendingFilesUpdated: () => {},
+    onFigmaAuthError: () => {},
+    onFigmaScanStarted: () => {},
+    onFigmaScanComplete: () => {},
+    onFigmaScanError: () => {},
+  };
+
+  loadRendererHelpers(document, { crate: crateBridge });
+  document.listeners.DOMContentLoaded();
+
+  const dropHandler = elements['v2-drop-zone'].listeners.drop[0];
+  const dropEvent = {
+    preventDefault() {},
+    stopPropagation() {},
+    dataTransfer: { files: [droppedFile] },
+  };
+
+  await dropHandler(dropEvent);
+
+  assert.equal(dropAttempts, 1);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+
+  await dropHandler(dropEvent);
+
+  assert.equal(dropAttempts, 2);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+
+  elements['modal-v2-results'].classList.add('hidden');
+  const browseHandler = elements['btn-v2-browse'].listeners.click[0];
+
+  await browseHandler();
+
+  assert.equal(browseAttempts, 1);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), true);
+
+  await browseHandler();
+
+  assert.equal(browseAttempts, 2);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+});

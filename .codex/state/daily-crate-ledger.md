@@ -1497,3 +1497,18 @@ Secondary:
 - Independent functional and adversarial reviews found no P0, P1, P2, or actionable P3 issue. The pre-existing moderate `uuid` advisory remains; no dependency mutation was authorized.
 - Bryant approved Phase 3 commit, push, PR creation, and merge if final merge readiness remains clean.
 - Next gate: commit and open the Phase 3 PR against `v2.4.x`, run final merge readiness, merge only if clean, then stop before signed build, notarization, release mutation, site deployment, or Phase 4 implementation and discuss Phase 4 plus the deferred Electron 39 Quick Package drag-and-drop issue.
+
+### 2026-07-14 Electron 39 Quick Package Drag And Drop
+
+- Phase 3 PR #132 merged into `v2.4.x` as `c6c9354b37e89ba8daea84e545530296d3f0ab9b` after GitHub mergeability, full 255-test, audit, scope, independent review, Reprobox, and contained Mac gates passed.
+- Bryant approved the recommended Phase 3.5 compatibility slice before Phase 4.
+- Root cause is confirmed in the renderer: Quick Package drag-and-drop reads Electron's removed nonstandard `File.path` property, while Browse continues to receive a path from the main-process file dialog.
+- Target fix: resolve the operating-system-backed dropped `File` through `webUtils.getPathForFile` inside sandboxed preload and invoke the existing trusted Quick Package IPC channel without adding a new bridge API that returns the resolved path before packaging.
+- Active branch: `codex/fix-electron39-quick-package-drop`, based exactly on merged `origin/v2.4.x` at `c6c9354b37e89ba8daea84e545530296d3f0ab9b`.
+- Implemented the narrow preload/renderer compatibility fix without changing the existing main-process Quick Package handler: disk-backed drops resolve through Electron `webUtils.getPathForFile`, while Browse retains its existing path flow.
+- Added failure-first and production-handler coverage for the removed `File.path` behavior, fail-safe unavailable files, first-file-only packaging, separate drop and Browse flows, quota refresh, progress cleanup, and retry after rejected requests.
+- Validation passed: 43 focused tests, 260 full-suite tests, 43 exact-base Reprobox tests, syntax and whitespace checks, packaged-content verification, source-to-ASAR hash comparison, and two independent no-blocker rereviews.
+- Contained Electron 39.8.10 validation packaged a genuine disk-backed PowerPoint drop, showed Package Complete, copied identical source bytes, and incremented isolated quota from `0 of 10` to `1 of 10`.
+- One Keynote assertion failed only when the suite was deliberately forced under `/private/tmp`; the same test failed on exact base and passed when rerun under a normal macOS temporary root. This is test-environment sensitivity, not a Phase 3.5 regression.
+- No dependency, lockfile, main-process handler, package-engine, parser, provenance, Figma, watcher, signed-build, release, deploy, installed-app, or personal-config mutation occurred.
+- Next gate: Bryant approval to commit, push, and open the Phase 3.5 PR against `v2.4.x`. Stop before commit, push, PR, merge, release, deploy, dependency mutation, or Phase 4 work without the applicable approval.

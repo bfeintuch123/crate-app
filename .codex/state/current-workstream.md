@@ -10,10 +10,11 @@ Last updated: 2026-07-14
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, and Phase 2B PR #131 are merged; Phase 2B post-merge deterministic and Mac mini validation passed. Phase 3 Electron-boundary implementation and validation are complete; Bryant approved commit, push, PR creation, and merge if final merge readiness remains clean.
-- Active app branch: `codex/security-electron-boundary`
-- Current security work: every privileged IPC channel now requires Crate's current live main window, exact top frame, and canonical local renderer document. Navigation, redirects, and child windows fail closed; explicit BrowserWindow preferences preserve context isolation and enable Chromium renderer sandboxing. Package selection, watcher scope, parser results, provenance relationships, Figma scope, quota, dependencies, preload API shape, visible renderer behavior, and release state remain unchanged.
-- Phase 3 final local proof: 255/255 deterministic tests and 165/165 focused exact-base Reprobox tests passed. The contained QA app matched the reviewed source, passed packaged-content verification, launched with Chromium sandboxing, and passed Mac mini Computer Use checks for visible startup, navigation, representative IPC, close/activation recovery, and force-quit/relaunch recovery. Independent functional and adversarial reviews found no P0-P2 or actionable P3 issue. Syntax, whitespace, audit, and scope checks passed; no real credential, installed app, dependency, signing, release, or deploy mutation occurred.
+- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, Phase 2B PR #131, and Phase 3 PR #132 are merged. Phase 3.5 Electron 39 Quick Package drag-and-drop compatibility implementation and validation are complete before Phase 4 parser and download limits.
+- Active app branch: `codex/fix-electron39-quick-package-drop`
+- Current security work: the renderer no longer reads the removed `File.path` property. Sandboxed preload resolves a disk-backed dropped `File` with Electron `webUtils.getPathForFile` and invokes the existing trusted Quick Package channel without returning the raw path to the renderer; Browse and package behavior remain unchanged.
+- Phase 3.5 proof: exact base `c6c9354b37e89ba8daea84e545530296d3f0ab9b`; focused tests 43/43; full clean suite 260/260; exact-base Reprobox 43/43; packaged-content verification passed; packed hashes matched source; contained Electron 39 disk-backed drop reached Package Complete and quota `0 -> 1`; two final independent rereviews found no P0-P2 blocker.
+- Phase 3.5 next gate: Bryant approval to commit, push, and open the PR against `v2.4.x`. No commit, push, PR, merge, release, deploy, dependency mutation, or Phase 4 implementation has occurred.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 

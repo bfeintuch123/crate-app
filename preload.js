@@ -1,4 +1,17 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+function packageDroppedFile(file) {
+  let filePath = '';
+  try {
+    filePath = webUtils.getPathForFile(file);
+  } catch (_) {
+    return Promise.resolve({ error: 'file_unavailable' });
+  }
+  if (typeof filePath !== 'string' || !filePath) {
+    return Promise.resolve({ error: 'file_unavailable' });
+  }
+  return ipcRenderer.invoke('v2:package-file', filePath);
+}
 
 contextBridge.exposeInMainWorld('crate', {
   // Projects
@@ -39,6 +52,7 @@ contextBridge.exposeInMainWorld('crate', {
   // V2 Quick Package
   v2BrowseFile: () => ipcRenderer.invoke('v2:browse-file'),
   v2PackageFile: (filePath) => ipcRenderer.invoke('v2:package-file', filePath),
+  v2PackageDroppedFile: packageDroppedFile,
 
   // Figma Integration (Auto-Tracking)
   getFigmaStatus: () => ipcRenderer.invoke('figma:status'),
