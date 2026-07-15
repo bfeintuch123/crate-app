@@ -10,7 +10,7 @@
 - branch: `codex/security-runtime-allowlist-phase4`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1, 2A, 2B, 3, 3.5, 4A, and 4B merged; post-merge Phase 4 installed-app and live Figma validation exposed two contained local fixes, which now pass final-source installed-app proof and await completion of the review stack before any PR gate
+- status: phases 1, 2A, 2B, 3, 3.5, 4A, and 4B merged; post-merge Phase 4 installed-app and live Figma validation exposed two contained fixes, which now pass final-source installed-app proof and are carried by follow-up PR #136 before Phase 5
 
 ## Goal
 
@@ -111,7 +111,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Stop for Bryant's approval before commit, push, or PR creation. Do not use the completed one-time rebuild approval again. Stop before any further build or signing, merge, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without the applicable approval.
+PR #136 carries the contained Phase 4 installed-app follow-up, and Bryant preauthorized merge only if merge readiness stays clean. Do not use the completed one-time rebuild approval again. After merge, stop at a Phase 5 scope outline; do not start further build or signing, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without the applicable approval.
 
 ## Phase 1 Evidence
 

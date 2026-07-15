@@ -10,7 +10,7 @@ Last updated: 2026-07-15
 - Latest tester beta release in this thread: `v3.0.0-beta.1`
 - Latest internal QA prerelease in this thread: `v2.8.0-qa.51`
 - Latest public-stable release: not updated in this workstream
-- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, Phase 2B PR #131, Phase 3 PR #132, Phase 3.5 PR #133, Phase 4A PR #134, and Phase 4B PR #135 are merged. Post-merge Phase 4 installed-app and live Figma validation exposed two contained fixes; the frozen final source now passes replacement isolated-app proof and the complete review stack before Phase 5.
+- Current phase: user-data security hardening. Phase 1 PR #128, Phase 2A PR #129, Phase 2B PR #131, Phase 3 PR #132, Phase 3.5 PR #133, Phase 4A PR #134, and Phase 4B PR #135 are merged. Post-merge Phase 4 installed-app and live Figma validation exposed two contained fixes; PR #136 carries the reviewed follow-up before Phase 5.
 - Active app branch: `codex/security-runtime-allowlist-phase4`
 - Current security work: keep the strict packaged-runtime inventory synchronized with Phase 4 modules and avoid contacting Keychain until an encrypted or legacy Figma credential actually exists or the user explicitly connects Figma.
 - Phase 4A merge: PR #134 merged into `v2.4.x` as `84a7fd3affdf15d855313d339392de6fe9b7a807`.
@@ -18,7 +18,7 @@ Last updated: 2026-07-15
 - Phase 4B merge: PR #135 merged into `v2.4.x` as `6d07022f4ae43287da79b0db95fce5bad6f34c87`.
 - Installed-app proof: the frozen final source was rebuilt once as a separately identified signed QA app and passes packaged-content policy, strict signature verification, source-to-ASAR comparison, clean launch, Settings, force quit/relaunch, and prompt-free disconnected Figma through the production Keychain path. In the earlier connected isolated lane, Current Page Only remained default, a four-asset fixture packaged exactly four files and incremented quota exactly once, a partial 46-asset render failed closed with no output or quota change, restart preserved connection, and privacy checks remained clean. The temporary read-only QA credential was revoked without changing the pre-existing production credential.
 - Required review cadence: run the complete Crate Fix Review Stack before every phase commit/push/PR. After the final security phase, rerun the integrated full suite, Reprobox, packaged-content, signed installed-app, privacy, and representative workflow gates before Olivia resumes testing.
-- Next action: stop for Bryant's approval before commit, push, or PR creation. Merge, Phase 5, release, deploy, updater, dependency mutation, and any further build/signing action remain separately gated.
+- Next action after PR #136 lands: lay out Phase 5 for Bryant without starting implementation. Phase 5, release, deploy, updater, dependency mutation, and any further build/signing action remain separately gated.
 - Command center: current Codex thread
 - Durable memory target: repo docs, daily ledger, and compiled vault
 
