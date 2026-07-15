@@ -1538,3 +1538,22 @@ Secondary:
 - One unchanged timing-sensitive provenance poll test failed in the first final full run, then passed in isolation and in the clean 297-test rerun.
 - `npm audit --audit-level=high` passed with only the pre-existing moderate `uuid` advisory. No dependency, build, installed-app, signing, release, deploy, external-tester, Phase 5, or updater mutation occurred.
 - Bryant authorized the Phase 4B commit, push, PR against `v2.4.x`, merge-readiness review, and merge if clean.
+
+### 2026-07-15 Phase 4 Installed-App Failure Loop
+
+- Phase 4B PR #135 merged into `v2.4.x` as `6d07022f4ae43287da79b0db95fce5bad6f34c87`.
+- Contained installed-app validation correctly failed before signing because the strict packaged-runtime allowlist omitted the new Phase 4 modules `parsers/admission-budgets.js` and `parsers/figma-network.js`.
+- Added a failure-first recursive inventory test covering every first-party parser module while excluding generated dependency trees, then added only the two missing runtime entries. Focused packaged-content and credential tests pass 30/30.
+- A production-identity temporary launch exposed an unnecessary macOS Keychain prompt on an empty disconnected profile. Root cause was checking encryption availability before checking whether an encrypted Figma credential existed.
+- Added a failure-first disconnected-startup test and reordered the read guard so empty users never contact Keychain. Encrypted reads, legacy migration, secure writes, corruption handling, symlink defenses, and disconnect cleanup remain covered.
+- A pre-review, separately identified QA build passed strict packaged-content verification, code-sign verification, source-to-ASAR hashes, clean launch, force quit/relaunch, Settings, and prompt-free disconnected Figma. Final credential preflight hardening followed that build; the completed replacement proof is recorded below.
+- Bryant required the complete Crate Fix Review Stack before every future phase commit, push, or PR. After the final security phase, rerun the integrated review, full suite, exact-base Reprobox, packaged-content, signed installed-app, privacy, and representative package/Figma gates before Olivia resumes testing.
+- Created a one-day, read-only QA credential in an approved Figma QA account and entered it only into the separately identified isolated Crate QA profile. Its value was never printed or persisted in repo evidence.
+- Current Page Only remained the selected default. A simple four-asset Figma fixture packaged exactly four PNGs, showed clean Package Complete and Package Details, and incremented quota exactly from `0/10` to `1/10`.
+- A complex 46-asset fixture failed closed when Figma did not return every requested render: no package directory was written, quota remained unchanged, and privacy-safe retry copy was shown.
+- Relaunch preserved the isolated Figma connection and visible window. The connected lane used an isolated test-only Keychain mode; the separate disconnected lane used the production Keychain path and remained prompt-free.
+- Targeted logs, evidence, and output contained no raw token, authorization header, complete Figma URL, signed URL, live file key, or unrelated private path. The isolated encrypted credential blob and profile directories retained restrictive permissions.
+- Revoked the temporary QA credential after validation and verified the pre-existing production credential remained present and untouched.
+- Under Bryant's one-time approval, rebuilt the frozen final source as the separately identified `Crate Phase 4 Final QA` app. It passed the strict package policy, strict Developer ID verification, source-to-ASAR comparison, cold launch, Settings, force quit/relaunch, and prompt-free disconnected Figma through the production Keychain path.
+- Retained a privacy-safe ordered manifest of the final screenshots, launch log, connected Figma lane, packaged output manifest, and packaged runtime using sanitized filenames and SHA-256 hashes only. Temporary raw evidence remains outside the repo.
+- Completed the full Crate Fix Review Stack: standard and quiet serial full suites passed 305/305, focused tests passed 30/30 in source and exact-base Reprobox, Crate Doctor reported zero failures, the high-severity dependency gate passed with only the pre-existing moderate advisory, and final specialist rereviews reported no remaining finding.

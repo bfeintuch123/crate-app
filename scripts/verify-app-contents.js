@@ -4,10 +4,12 @@ const fs = require('fs');
 const path = require('path');
 
 const RUNTIME_PARSER_FILES = Object.freeze([
+  'admission-budgets.js',
   'aftereffects.js',
   'ai.js',
   'base.js',
   'figma-credential-store.js',
+  'figma-network.js',
   'figma-redaction.js',
   'figma.js',
   'indesign.js',

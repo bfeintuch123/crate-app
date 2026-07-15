@@ -9,6 +9,7 @@ const test = require('node:test');
 const {
   FigmaCredentialStore,
   ENCRYPTED_CREDENTIAL_RELATIVE_PATH,
+  MAX_ENCRYPTED_BYTES,
 } = require('../parsers/figma-credential-store');
 
 function createSafeStorage(options = {}) {
@@ -55,6 +56,76 @@ function createFixture(options = {}) {
     },
   };
 }
+
+test('disconnected startup does not ask Keychain about encryption', async () => {
+  let encryptionChecks = 0;
+  const safeStorage = createSafeStorage();
+  safeStorage.isEncryptionAvailable = () => {
+    encryptionChecks += 1;
+    return true;
+  };
+  const fixture = createFixture({ safeStorage });
+
+  try {
+    assert.equal(await fixture.store.getToken(), null);
+    assert.equal(encryptionChecks, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('invalid encrypted credential entries do not ask Keychain about encryption', async t => {
+  const scenarios = [
+    {
+      name: 'symlink',
+      skip: process.platform === 'win32',
+      setup(fixture) {
+        const targetPath = path.join(fixture.root, 'unrelated-encrypted-target');
+        fs.writeFileSync(targetPath, 'UNCHANGED_TARGET_VALUE', { mode: 0o600 });
+        fs.symlinkSync(targetPath, fixture.encryptedTokenPath);
+      },
+    },
+    {
+      name: 'directory',
+      setup(fixture) {
+        fs.mkdirSync(fixture.encryptedTokenPath);
+      },
+    },
+    {
+      name: 'empty file',
+      setup(fixture) {
+        fs.writeFileSync(fixture.encryptedTokenPath, Buffer.alloc(0), { mode: 0o600 });
+      },
+    },
+    {
+      name: 'oversized file',
+      setup(fixture) {
+        fs.writeFileSync(fixture.encryptedTokenPath, Buffer.alloc(MAX_ENCRYPTED_BYTES + 1), { mode: 0o600 });
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, { skip: scenario.skip }, async () => {
+      let encryptionChecks = 0;
+      const safeStorage = createSafeStorage();
+      safeStorage.isEncryptionAvailable = () => {
+        encryptionChecks += 1;
+        return true;
+      };
+      const fixture = createFixture({ safeStorage });
+
+      try {
+        fs.mkdirSync(path.dirname(fixture.encryptedTokenPath), { recursive: true, mode: 0o700 });
+        scenario.setup(fixture);
+        assert.equal(await fixture.store.getToken(), null);
+        assert.equal(encryptionChecks, 0);
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
+});
 
 test('legacy plaintext token migrates silently to Keychain-backed encrypted storage', async () => {
   const fixture = createFixture();
