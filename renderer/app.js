@@ -1288,8 +1288,7 @@ function setupEventListeners() {
 
       const files = e.dataTransfer.files;
       if (files.length > 0) {
-        const filePath = files[0].path;
-        handleV2FileDrop(filePath);
+        await handleV2FileDrop(null, files[0]);
       }
     });
   }
@@ -1298,7 +1297,7 @@ function setupEventListeners() {
   $('#btn-v2-browse').addEventListener('click', async () => {
     const filePath = await window.crate.v2BrowseFile();
     if (filePath) {
-      handleV2FileDrop(filePath);
+      await handleV2FileDrop(filePath);
     }
   });
 
@@ -1775,20 +1774,33 @@ function showV2Results(result) {
 }
 
 let v2PackageInFlight = false;
-async function handleV2FileDrop(filePath) {
-  if (!filePath || v2PackageInFlight) return;
+async function handleV2FileDrop(filePath, droppedFile = null) {
+  if ((!filePath && !droppedFile) || v2PackageInFlight) return;
   v2PackageInFlight = true;
 
   try {
     $('#modal-progress').classList.remove('hidden');
 
-    const result = await window.crate.v2PackageFile(filePath);
-
-    $('#modal-progress').classList.add('hidden');
+    let result;
+    try {
+      result = droppedFile
+        ? await window.crate.v2PackageDroppedFile(droppedFile)
+        : await window.crate.v2PackageFile(filePath);
+    } catch (_) {
+      showToast('Crate could not package that file. Try again.');
+      return;
+    } finally {
+      $('#modal-progress').classList.add('hidden');
+    }
 
     if (result.error === 'limit_reached') {
       $('#upgrade-days-left').textContent = result.daysLeft;
       $('#modal-upgrade').classList.remove('hidden');
+      return;
+    }
+
+    if (result.error === 'file_unavailable') {
+      showToast('Crate could not read that dropped file. Use Browse and try again.');
       return;
     }
 
