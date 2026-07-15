@@ -6,6 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -24,12 +25,64 @@ const originalClearInterval = global.clearInterval;
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
 const originalHomedir = os.homedir;
-const TEST_HOME = path.join(os.tmpdir(), 'crate-figma-provenance-test-home');
+const LOCAL_STORE_PROBE_MODE = process.env.CRATE_LOCAL_STORE_PROBE || '';
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-provenance-test-home-'));
+const TEST_USER_DATA = path.join(TEST_HOME, 'user-data');
+const TEST_STORE_PATH = path.join(TEST_USER_DATA, 'config.json');
+const STARTUP_ORPHAN_CACHE_ID = '00000000-0000-4000-8000-000000000001';
+const STARTUP_ACTIVE_CACHE_ID = '00000000-0000-4000-8000-000000000002';
+const STARTUP_QUARANTINE_SHAPED_ACTIVE_ID = '.crate-cleanup-777-1234567890123-abcdef123456';
+const STARTUP_HARDLINK_TARGET_PATH = path.join(TEST_HOME, 'startup-hardlink-target.bin');
+const TEST_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const activeIntervals = new Set();
 const activeTimeouts = new Set();
 
-fs.rmSync(TEST_HOME, { recursive: true, force: true });
-fs.mkdirSync(TEST_HOME, { recursive: true });
+let localStoreProbeTargetPath = null;
+let localStoreProbeExpectedContent = null;
+let localStoreProbeExpectedMode = null;
+let originalFchmodSync = null;
+
+if (LOCAL_STORE_PROBE_MODE === 'config-symlink') {
+  fs.mkdirSync(TEST_USER_DATA, { recursive: true, mode: 0o700 });
+  localStoreProbeTargetPath = path.join(TEST_HOME, 'outside-config.json');
+  localStoreProbeExpectedContent = '{"sentinel":"config-target"}';
+  fs.writeFileSync(localStoreProbeTargetPath, localStoreProbeExpectedContent, { mode: 0o600 });
+  localStoreProbeExpectedMode = fs.statSync(localStoreProbeTargetPath).mode & 0o777;
+  fs.symlinkSync(localStoreProbeTargetPath, TEST_STORE_PATH);
+} else if (LOCAL_STORE_PROBE_MODE === 'config-hardlink') {
+  fs.mkdirSync(TEST_USER_DATA, { recursive: true, mode: 0o700 });
+  localStoreProbeTargetPath = path.join(TEST_HOME, 'outside-hardlinked-config.json');
+  localStoreProbeExpectedContent = '{"sentinel":"hardlink-target"}';
+  fs.writeFileSync(localStoreProbeTargetPath, localStoreProbeExpectedContent, { mode: 0o644 });
+  fs.chmodSync(localStoreProbeTargetPath, 0o644);
+  localStoreProbeExpectedMode = fs.statSync(localStoreProbeTargetPath).mode & 0o777;
+  fs.linkSync(localStoreProbeTargetPath, TEST_STORE_PATH);
+} else if (LOCAL_STORE_PROBE_MODE === 'userdata-symlink') {
+  const outsideUserData = path.join(TEST_HOME, 'outside-user-data');
+  fs.mkdirSync(outsideUserData, { recursive: true, mode: 0o700 });
+  localStoreProbeTargetPath = path.join(outsideUserData, 'config.json');
+  localStoreProbeExpectedContent = '{"sentinel":"userdata-target"}';
+  fs.writeFileSync(localStoreProbeTargetPath, localStoreProbeExpectedContent, { mode: 0o600 });
+  localStoreProbeExpectedMode = fs.statSync(localStoreProbeTargetPath).mode & 0o777;
+  fs.symlinkSync(outsideUserData, TEST_USER_DATA);
+} else if (LOCAL_STORE_PROBE_MODE === 'permission-failure') {
+  fs.mkdirSync(TEST_USER_DATA, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(TEST_STORE_PATH, '{}', { mode: 0o600 });
+  originalFchmodSync = fs.fchmodSync;
+  fs.fchmodSync = () => {
+    const error = new Error('permission denied');
+    error.code = 'EACCES';
+    throw error;
+  };
+} else {
+  fs.writeFileSync(STARTUP_HARDLINK_TARGET_PATH, 'startup hardlink target', { mode: 0o644 });
+  fs.chmodSync(STARTUP_HARDLINK_TARGET_PATH, 0o644);
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    const orphanDir = path.join(TEST_HOME, '.crate', category, STARTUP_ORPHAN_CACHE_ID);
+    fs.mkdirSync(orphanDir, { recursive: true });
+    fs.writeFileSync(path.join(orphanDir, 'stale-cache.bin'), 'stale cache');
+  }
+}
 os.homedir = () => TEST_HOME;
 
 global.setInterval = function trackedSetInterval(fn, delay, ...args) {
@@ -96,6 +149,8 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 const ipcHandlers = new Map();
 const electronAppHandlers = new Map();
 const rendererMessages = [];
+const storageErrorMessages = [];
+let appQuitRequested = false;
 const trustedRendererMainFrame = {
   url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
 };
@@ -147,13 +202,13 @@ class BrowserWindowStub {
 const electronStub = {
   app: {
     requestSingleInstanceLock: () => true,
-    quit: () => {},
+    quit: () => { appQuitRequested = true; },
     whenReady: () => ({ then: (fn) => { fn(); } }),
     on(eventName, handler) { electronAppHandlers.set(eventName, handler); },
     isReady: () => true,
     show: () => {},
     focus: () => {},
-    getPath: () => path.join(__dirname, '..', '.test-userdata'),
+    getPath: () => TEST_USER_DATA,
     dock: { setMenu: () => {} },
   },
   BrowserWindow: BrowserWindowStub,
@@ -161,7 +216,11 @@ const electronStub = {
   ipcMain: {
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
   },
-  dialog: { showOpenDialog: async () => ({ canceled: true }), showSaveDialog: async () => ({ canceled: true }) },
+  dialog: {
+    showOpenDialog: async () => ({ canceled: true }),
+    showSaveDialog: async () => ({ canceled: true }),
+    showErrorBox: (title, message) => { storageErrorMessages.push({ title, message }); },
+  },
   shell: { openPath: () => {} },
   nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
   Notification: class { static isSupported() { return false; } constructor() {} show() {} },
@@ -172,12 +231,34 @@ setStub('electron', () => electronStub);
 // In-memory electron-store double.
 const fakeStoreSetHistory = [];
 let fakeStoreInstance = null;
+let fakeStoreOptions = null;
+let fakeStoreConstructed = false;
+let armProjectsReadFailureAfterSet = false;
+let remainingProjectsReadFailures = 0;
+let initializedStoreFileMode = null;
+let initializedUserDataMode = null;
+let cleanupSentinelCounter = 0;
 class FakeStore {
   constructor(opts = {}) {
+    fakeStoreConstructed = true;
+    fakeStoreOptions = opts;
+    this.path = LOCAL_STORE_PROBE_MODE === 'store-path-mismatch'
+      ? path.join(TEST_HOME, 'unexpected-config.json')
+      : TEST_STORE_PATH;
+    fs.mkdirSync(TEST_USER_DATA, { recursive: true });
+    fs.writeFileSync(this.path, '{}', { mode: 0o666 });
+    fs.chmodSync(this.path, 0o666);
     this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
+    if (LOCAL_STORE_PROBE_MODE === 'malformed-settings') {
+      this.data.settings = null;
+    }
     fakeStoreInstance = this;
   }
   get(key, fallback) {
+    if (key === 'projects' && remainingProjectsReadFailures > 0) {
+      remainingProjectsReadFailures--;
+      throw new Error('simulated config read failure');
+    }
     if (!key) return this.data;
     const parts = key.split('.');
     let cur = this.data;
@@ -200,6 +281,10 @@ class FakeStore {
       cur = cur[parts[i]];
     }
     cur[parts[parts.length - 1]] = value;
+    if (key === 'projects' && armProjectsReadFailureAfterSet) {
+      armProjectsReadFailureAfterSet = false;
+      remainingProjectsReadFailures = 1;
+    }
     fakeStoreSetHistory.push({ key, value: JSON.parse(JSON.stringify(value)) });
   }
   delete(key) {
@@ -311,20 +396,85 @@ setStub('./parsers/figma', () => ({ FigmaParser: TestFigmaParser }));
 
 // Deterministic uuid.
 let uuidCounter = 0;
-setStub('uuid', () => ({ v4: () => `test-uuid-${++uuidCounter}` }));
+setStub('uuid', () => ({
+  v4: () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, '0')}`,
+}));
 
 // canvas/keytar are pulled by parsers but absent from node_modules. The figma
 // parser already wraps them in try/catch, so leave them un-stubbed.
 
 // ---------- Load main.js with stubs in place ----------
 const mainPath = path.resolve(__dirname, '..', 'main.js');
-require(mainPath);
+let mainLoadError = null;
+try {
+  require(mainPath);
+} catch (error) {
+  mainLoadError = error;
+}
+
+if (!LOCAL_STORE_PROBE_MODE && !mainLoadError && fakeStoreInstance) {
+  for (const activeId of [STARTUP_ACTIVE_CACHE_ID, STARTUP_QUARANTINE_SHAPED_ACTIVE_ID]) {
+    fakeStoreInstance.data.projects.push({ id: activeId });
+    for (const category of ['figma-assets', 'presentation-assets']) {
+      const projectDir = path.join(TEST_HOME, '.crate', category, activeId);
+      fs.mkdirSync(projectDir, { recursive: true, mode: 0o755 });
+      fs.chmodSync(projectDir, 0o755);
+      const cacheFile = path.join(projectDir, 'active-cache.bin');
+      fs.writeFileSync(cacheFile, 'active cache', { mode: 0o644 });
+      fs.chmodSync(cacheFile, 0o644);
+      if (activeId === STARTUP_ACTIVE_CACHE_ID && category === 'figma-assets' && process.platform !== 'win32') {
+        fs.linkSync(STARTUP_HARDLINK_TARGET_PATH, path.join(projectDir, 'hardlinked-cache.bin'));
+        fs.symlinkSync(STARTUP_HARDLINK_TARGET_PATH, path.join(projectDir, 'symlinked-cache.bin'));
+      }
+    }
+  }
+}
+
+if (LOCAL_STORE_PROBE_MODE) {
+  if (originalFchmodSync) fs.fchmodSync = originalFchmodSync;
+  const targetUntouched = localStoreProbeTargetPath
+    ? fs.readFileSync(localStoreProbeTargetPath, 'utf8') === localStoreProbeExpectedContent
+    : true;
+  const targetModeUnchanged = localStoreProbeTargetPath && localStoreProbeExpectedMode !== null
+    ? (fs.statSync(localStoreProbeTargetPath).mode & 0o777) === localStoreProbeExpectedMode
+    : true;
+  process.stdout.write(`CRATE_LOCAL_STORE_PROBE_RESULT=${JSON.stringify({
+    startupRejected: !!mainLoadError,
+    storeConstructed: fakeStoreConstructed,
+    storageErrorShown: storageErrorMessages.length === 1,
+    appQuitRequested,
+    errorText: storageErrorMessages.map(item => `${item.title} ${item.message}`).join(' '),
+    targetUntouched,
+    targetModeUnchanged,
+  })}\n`);
+  clearTrackedTimers();
+  fs.rmSync(TEST_HOME, { recursive: true, force: true });
+  process.exit(0);
+}
+
+if (mainLoadError) throw mainLoadError;
+initializedStoreFileMode = fs.statSync(TEST_STORE_PATH).mode & 0o777;
+initializedUserDataMode = fs.statSync(TEST_USER_DATA).mode & 0o777;
 
 // ---------- Helpers ----------
 function getStore() {
   // main.js calls `new Store({ defaults: {...} })` once at import time.
   // We don't have a direct handle, so route through the IPC handlers.
   return null;
+}
+
+function runLocalStoreStartupProbe(mode) {
+  const result = spawnSync(process.execPath, [__filename], {
+    env: { ...process.env, CRATE_LOCAL_STORE_PROBE: mode },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const marker = String(result.stdout || '')
+    .split('\n')
+    .find(line => line.startsWith('CRATE_LOCAL_STORE_PROBE_RESULT='));
+  assert.ok(marker, `missing local-store probe result for ${mode}`);
+  return JSON.parse(marker.slice('CRATE_LOCAL_STORE_PROBE_RESULT='.length));
 }
 
 async function callIpc(channel, ...args) {
@@ -356,6 +506,8 @@ async function resetProjects() {
 }
 
 async function cleanupProjectsAndTimers() {
+  armProjectsReadFailureAfterSet = false;
+  remainingProjectsReadFailures = 0;
   storedFigmaToken = null;
   nextFigmaTokenVerification = { valid: true };
   nextFigmaStoreResult = true;
@@ -368,6 +520,8 @@ async function cleanupProjectsAndTimers() {
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
   await callIpc('projects:delete-all');
+  removeUnsafeTestCacheEntries();
+  await waitForCacheCleanupSettled();
   clearTrackedTimers();
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
   fs.mkdirSync(TEST_HOME, { recursive: true });
@@ -436,8 +590,109 @@ function setDelayedFigmaDownloadResponse(body = 'figma asset bytes', delayMs = 5
   return started;
 }
 
+function setGatedFigmaDownloadResponse(body = 'figma asset bytes') {
+  let startedResolve;
+  let releaseResolve;
+  const started = new Promise(resolve => { startedResolve = resolve; });
+  const released = new Promise(resolve => { releaseResolve = resolve; });
+  fetchHandler = async () => {
+    if (startedResolve) {
+      startedResolve();
+      startedResolve = null;
+    }
+    await released;
+    return {
+      ok: true,
+      status: 200,
+      buffer: async () => Buffer.from(body),
+      json: async () => ({}),
+    };
+  };
+  return {
+    started,
+    release() {
+      if (!releaseResolve) return;
+      releaseResolve();
+      releaseResolve = null;
+    },
+  };
+}
+
 function modeOf(filePath) {
   return fs.statSync(filePath).mode & 0o777;
+}
+
+function projectCacheDir(category, projectId) {
+  return path.join(TEST_HOME, '.crate', category, projectId);
+}
+
+function seedProjectCache(category, projectId, filename = 'cache.bin') {
+  const cacheDir = projectCacheDir(category, projectId);
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, filename), 'cache data');
+  return cacheDir;
+}
+
+async function waitForPathMissing(targetPath, message) {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    if (!fs.existsSync(targetPath)) return;
+    await new Promise(resolve => originalSetTimeout(resolve, 10));
+  }
+  assert.equal(fs.existsSync(targetPath), false, message);
+}
+
+async function waitForCondition(predicate, message, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => originalSetTimeout(resolve, 10));
+  }
+  assert.equal(predicate(), true, message);
+}
+
+function removeUnsafeTestCacheEntries() {
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const paths = [crateDir, ...['figma-assets', 'presentation-assets'].map(category => path.join(crateDir, category))];
+  for (const targetPath of paths) {
+    try {
+      const stat = fs.lstatSync(targetPath);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        fs.rmSync(targetPath, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+async function drainProjectCacheCleanupQueue() {
+  removeUnsafeTestCacheEntries();
+  if (!Array.isArray(fakeStoreInstance.data.projects)) fakeStoreInstance.data.projects = [];
+  const sentinelId = `00000000-0000-4000-8001-${String(++cleanupSentinelCounter).padStart(12, '0')}`;
+  fakeStoreInstance.data.projects.push({ id: sentinelId });
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    seedProjectCache(category, sentinelId, 'cleanup-sentinel.bin');
+  }
+  await callIpc('projects:delete', sentinelId);
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    await waitForPathMissing(
+      projectCacheDir(category, sentinelId),
+      `${category} cleanup sentinel should drain the serialized cleanup queue`
+    );
+  }
+  await new Promise(resolve => setImmediate(resolve));
+}
+
+async function waitForPathMode(targetPath, expectedMode, message) {
+  await waitForCondition(
+    () => fs.existsSync(targetPath) && modeOf(targetPath) === expectedMode,
+    message
+  );
+}
+
+async function waitForCacheCleanupSettled() {
+  await drainProjectCacheCleanupQueue();
 }
 
 function figmaScanResult(assets, scopeEntries = []) {
@@ -566,6 +821,462 @@ async function captureConsole(fn) {
 }
 
 // ---------- Tests ----------
+
+test('local config is owner-only and startup hardens active caches while removing only orphans', async () => {
+  assert.equal(fakeStoreOptions.configFileMode, 0o600);
+  assert.equal(initializedStoreFileMode, 0o600);
+  assert.equal(initializedUserDataMode, 0o700);
+
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    await waitForPathMissing(
+      projectCacheDir(category, STARTUP_ORPHAN_CACHE_ID),
+      `${category} startup orphan should be removed`
+    );
+    for (const activeId of [STARTUP_ACTIVE_CACHE_ID, STARTUP_QUARANTINE_SHAPED_ACTIVE_ID]) {
+      const activeDir = projectCacheDir(category, activeId);
+      const activeFile = path.join(activeDir, 'active-cache.bin');
+      await waitForPathMode(activeDir, 0o700, `${category} active cache directory should be owner-only`);
+      await waitForPathMode(activeFile, 0o600, `${category} active cache file should be owner-only`);
+      assert.equal(fs.existsSync(activeDir), true, `${category} active cache should be retained`);
+    }
+  }
+  if (process.platform !== 'win32') {
+    assert.equal(fs.readFileSync(STARTUP_HARDLINK_TARGET_PATH, 'utf8'), 'startup hardlink target');
+    assert.equal(modeOf(STARTUP_HARDLINK_TARGET_PATH), 0o644, 'startup hard-link target mode must remain unchanged');
+    assert.equal(
+      fs.existsSync(path.join(projectCacheDir('figma-assets', STARTUP_ACTIVE_CACHE_ID), 'hardlinked-cache.bin')),
+      false,
+      'startup hardening should unlink an unsafe cache hard link without touching its target'
+    );
+    assert.equal(
+      fs.existsSync(path.join(projectCacheDir('figma-assets', STARTUP_ACTIVE_CACHE_ID), 'symlinked-cache.bin')),
+      false,
+      'startup hardening should unlink an unsafe cache symlink without touching its target'
+    );
+  }
+});
+
+test('local config preflight shows a privacy-safe native error before store access', () => {
+  for (const mode of ['config-symlink', 'config-hardlink', 'userdata-symlink', 'permission-failure']) {
+    const result = runLocalStoreStartupProbe(mode);
+    assert.equal(result.startupRejected, false, `${mode} should use the native startup-error path`);
+    assert.equal(result.storeConstructed, false, `${mode} should stop before electron-store reads config`);
+    assert.equal(result.storageErrorShown, true, `${mode} should show a native storage error`);
+    assert.equal(result.appQuitRequested, true, `${mode} should quit cleanly after the error`);
+    assert.equal(result.targetUntouched, true, `${mode} should not alter an unrelated target`);
+    assert.equal(result.targetModeUnchanged, true, `${mode} should not chmod an unrelated target`);
+    assert.equal(result.errorText.includes(TEST_HOME), false, `${mode} should not expose local paths`);
+  }
+});
+
+test('local config rejects an unexpected electron-store path with the same native error', () => {
+  for (const mode of ['store-path-mismatch', 'malformed-settings']) {
+    const result = runLocalStoreStartupProbe(mode);
+    assert.equal(result.startupRejected, false, `${mode} should use the native startup-error path`);
+    assert.equal(result.storeConstructed, true, `${mode} should be rejected after store construction`);
+    assert.equal(result.storageErrorShown, true, `${mode} should show a native storage error`);
+    assert.equal(result.appQuitRequested, true, `${mode} should quit cleanly after the error`);
+    assert.equal(result.errorText.includes(TEST_HOME), false, `${mode} should not expose local paths`);
+  }
+});
+
+test('deleting one project removes only its caches while preserving active and unrelated cache directories', async () => {
+  const deletedProject = await callIpc('projects:create', 'Delete cache project');
+  const activeProject = await callIpc('projects:create', 'Keep cache project');
+  const orphanId = '00000000-0000-4000-8000-000000999999';
+  const unrecognizedCacheId = 'not-a-crate-project-cache';
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-cache-outside-'));
+  const outsideFile = path.join(outsideDir, 'keep.txt');
+  fs.writeFileSync(outsideFile, 'keep');
+
+  try {
+    for (const category of ['figma-assets', 'presentation-assets']) {
+      seedProjectCache(category, deletedProject.id);
+      seedProjectCache(category, activeProject.id);
+      seedProjectCache(category, orphanId);
+      seedProjectCache(category, unrecognizedCacheId);
+    }
+    fs.symlinkSync(outsideDir, path.join(projectCacheDir('figma-assets', deletedProject.id), 'outside-link'));
+
+    await callIpc('projects:delete', deletedProject.id);
+
+    for (const category of ['figma-assets', 'presentation-assets']) {
+      await waitForPathMissing(
+        projectCacheDir(category, deletedProject.id),
+        `${category} deleted-project cache should be removed`
+      );
+      assert.equal(fs.existsSync(projectCacheDir(category, activeProject.id)), true);
+      assert.equal(fs.existsSync(projectCacheDir(category, orphanId)), true);
+      assert.equal(fs.existsSync(projectCacheDir(category, unrecognizedCacheId)), true);
+    }
+    assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'keep');
+
+    await callIpc('projects:delete-all');
+    for (const category of ['figma-assets', 'presentation-assets']) {
+      await waitForPathMissing(
+        projectCacheDir(category, orphanId),
+        `${category} startup/delete-all orphan sweep should remove stale project caches`
+      );
+    }
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('deferred project cache cleanup rechecks current projects immediately before quarantine', async () => {
+  const project = await callIpc('projects:create', 'Reused project cache id');
+  const restoredProject = JSON.parse(JSON.stringify(project));
+  const cacheDir = seedProjectCache('figma-assets', project.id);
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-cache-batch-outside-'));
+  const outsideFile = path.join(outsideDir, 'keep.txt');
+  fs.writeFileSync(outsideFile, 'keep', { mode: 0o644 });
+  if (process.platform !== 'win32') {
+    for (let index = 0; index < 50; index++) {
+      fs.symlinkSync(outsideFile, path.join(cacheDir, `unsafe-${index}.bin`));
+    }
+  }
+  const cacheRealPath = fs.realpathSync.native(cacheDir);
+  const originalRename = fs.promises.rename;
+  const originalSetImmediateForTest = global.setImmediate;
+  let cleanupYieldCount = 0;
+  let releaseRename;
+  const renameGate = new Promise(resolve => { releaseRename = resolve; });
+  let renameFinishedResolve;
+  const renameFinished = new Promise(resolve => { renameFinishedResolve = resolve; });
+
+  fs.promises.rename = async (sourcePath, destinationPath) => {
+    const result = await originalRename.call(fs.promises, sourcePath, destinationPath);
+    if (sourcePath === cacheRealPath && renameFinishedResolve) {
+      renameFinishedResolve();
+      renameFinishedResolve = null;
+      await renameGate;
+    }
+    return result;
+  };
+
+  try {
+    await callIpc('projects:delete', project.id);
+    await renameFinished;
+    fakeStoreInstance.data.projects.push(restoredProject);
+    global.setImmediate = (fn, ...args) => {
+      cleanupYieldCount += 1;
+      return originalSetImmediateForTest(fn, ...args);
+    };
+    releaseRename();
+    await waitForPathMode(cacheDir, 0o700, 'reactivated cache should be restored and hardened');
+
+    assert.equal(fs.existsSync(cacheDir), true);
+    const activeProjectIds = new Set((await callIpc('projects:get-all')).map(item => item.id));
+    assert.equal(activeProjectIds.has(project.id), true);
+    assert.equal(
+      fs.readdirSync(path.dirname(cacheDir)).some(
+        name => TEST_CACHE_QUARANTINE_PATTERN.test(name) && !activeProjectIds.has(name)
+      ),
+      false,
+      'reactivated cache should not remain quarantined'
+    );
+    if (process.platform !== 'win32') {
+      assert.ok(cleanupYieldCount >= 2, 'unsafe cache entries should still yield in bounded batches');
+      assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'keep');
+      assert.equal(modeOf(outsideFile), 0o644);
+    }
+  } finally {
+    releaseRename();
+    global.setImmediate = originalSetImmediateForTest;
+    fs.promises.rename = originalRename;
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('project cache cleanup fails closed when stored project state cannot be read', async () => {
+  const project = await callIpc('projects:create', 'Unreadable project state cache');
+  const cacheDir = seedProjectCache('figma-assets', project.id);
+
+  armProjectsReadFailureAfterSet = true;
+  await callIpc('projects:delete', project.id);
+  await waitForCondition(
+    () => remainingProjectsReadFailures === 0,
+    'cleanup should attempt the guarded project-state read'
+  );
+  assert.equal(fs.existsSync(cacheDir), true, 'cleanup should not guess when project state is unreadable');
+
+  await callIpc('projects:delete-all');
+  await waitForPathMissing(cacheDir, 'a later safe cleanup should remove the retained Crate cache');
+});
+
+test('project cache cleanup retries transient quarantine and removal failures', async () => {
+  const project = await callIpc('projects:create', 'Retry project cache cleanup');
+  const cacheDir = seedProjectCache('figma-assets', project.id);
+  const cacheRealPath = fs.realpathSync.native(cacheDir);
+  const originalRename = fs.promises.rename;
+  const originalRm = fs.promises.rm;
+  let renameAttempts = 0;
+  let removalAttempts = 0;
+
+  fs.promises.rename = async (sourcePath, destinationPath) => {
+    if (sourcePath === cacheRealPath && renameAttempts++ === 0) {
+      const error = new Error('cache busy');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return originalRename.call(fs.promises, sourcePath, destinationPath);
+  };
+  fs.promises.rm = async (targetPath, options) => {
+    if (path.basename(targetPath).startsWith('.crate-cleanup-') && removalAttempts++ === 0) {
+      const error = new Error('cache busy');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return originalRm.call(fs.promises, targetPath, options);
+  };
+
+  try {
+    await callIpc('projects:delete', project.id);
+    await waitForCondition(
+      () => renameAttempts >= 2 && removalAttempts >= 2,
+      'cache cleanup should retry transient quarantine and removal failures'
+    );
+    await waitForCacheCleanupSettled();
+    assert.equal(fs.existsSync(cacheDir), false);
+    assert.ok(renameAttempts >= 2, `quarantine should retry after a transient rename failure (attempts=${renameAttempts})`);
+    assert.ok(removalAttempts >= 2, `removal should retry after a transient filesystem failure (attempts=${removalAttempts})`);
+  } finally {
+    fs.promises.rename = originalRename;
+    fs.promises.rm = originalRm;
+  }
+});
+
+test('project deletion returns before cache cleanup and removes project state immediately', async () => {
+  const project = await callIpc('projects:create', 'Nonblocking cache cleanup');
+  const cacheDir = seedProjectCache('figma-assets', project.id);
+  const cacheRealPath = fs.realpathSync.native(cacheDir);
+  const originalRename = fs.promises.rename;
+  let releaseRename;
+  const renameGate = new Promise(resolve => { releaseRename = resolve; });
+  let renameStartedResolve;
+  const renameStarted = new Promise(resolve => { renameStartedResolve = resolve; });
+
+  fs.promises.rename = async (sourcePath, destinationPath) => {
+    if (sourcePath === cacheRealPath && renameStartedResolve) {
+      renameStartedResolve();
+      renameStartedResolve = null;
+      await renameGate;
+    }
+    return originalRename.call(fs.promises, sourcePath, destinationPath);
+  };
+
+  try {
+    const deletedProjects = await Promise.race([
+      callIpc('projects:delete', project.id),
+      new Promise((_, reject) => originalSetTimeout(() => reject(new Error('delete handler blocked on cache cleanup')), 100)),
+    ]);
+    assert.equal(deletedProjects.some(item => item.id === project.id), false);
+    assert.equal((await callIpc('projects:get-all')).some(item => item.id === project.id), false);
+    assert.equal(fs.existsSync(cacheDir), true);
+
+    await renameStarted;
+    releaseRename();
+    await waitForPathMissing(cacheDir, 'background cleanup should remove the deleted-project cache');
+  } finally {
+    releaseRename();
+    fs.promises.rename = originalRename;
+  }
+});
+
+test('permanent cache removal failure is reported and retained for a later retry', async () => {
+  const project = await callIpc('projects:create', 'Deferred cache retry');
+  const cacheDir = seedProjectCache('figma-assets', project.id);
+  const categoryDir = path.dirname(cacheDir);
+  const originalRm = fs.promises.rm;
+  let removalAttempts = 0;
+
+  fs.promises.rm = async (targetPath, options) => {
+    if (path.basename(targetPath).startsWith('.crate-cleanup-')) {
+      removalAttempts += 1;
+      const error = new Error('cache busy');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return originalRm.call(fs.promises, targetPath, options);
+  };
+
+  try {
+    const captured = await captureConsole(async () => {
+      await callIpc('projects:delete', project.id);
+      await waitForCondition(
+        () => removalAttempts >= 4,
+        'cache removal should exhaust its bounded retries'
+      );
+      await new Promise(resolve => setImmediate(resolve));
+    });
+
+    assert.match(captured.output, /deferred cache cleanup could not complete/);
+    assert.equal(fs.existsSync(cacheDir), false);
+    const quarantineName = fs.readdirSync(categoryDir).find(name => TEST_CACHE_QUARANTINE_PATTERN.test(name));
+    assert.ok(quarantineName, 'failed cleanup should retain a private quarantine for the next retry');
+  } finally {
+    fs.promises.rm = originalRm;
+  }
+
+  await callIpc('projects:delete-all');
+  await waitForCacheCleanupSettled();
+});
+
+test('project cache cleanup refuses a symlinked cache category without touching its target', async () => {
+  const project = await callIpc('projects:create', 'Symlink cache project');
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-cache-root-outside-'));
+  const outsideProjectDir = path.join(outsideDir, project.id);
+  const outsideFile = path.join(outsideProjectDir, 'keep.txt');
+
+  try {
+    fs.mkdirSync(outsideProjectDir, { recursive: true });
+    fs.writeFileSync(outsideFile, 'keep');
+    fs.mkdirSync(path.join(TEST_HOME, '.crate'), { recursive: true });
+    fs.symlinkSync(outsideDir, path.join(TEST_HOME, '.crate', 'figma-assets'));
+    const presentationDir = seedProjectCache('presentation-assets', project.id);
+
+    await callIpc('projects:delete', project.id);
+
+    await waitForPathMissing(presentationDir, 'safe presentation cache should be removed');
+    assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'keep');
+    assert.equal(fs.lstatSync(path.join(TEST_HOME, '.crate', 'figma-assets')).isSymbolicLink(), true);
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('deleting a project during an in-flight Figma download removes the late cache write', async () => {
+  const project = await createLinkedFigmaProject('Delete in-flight Figma cache');
+  const downloadGate = setGatedFigmaDownloadResponse('late figma cache');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/late.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-late',
+    imageRef: 'img-late',
+    name: 'Late Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const scanPromise = callIpc('figma:scan-project', project.id);
+  await downloadGate.started;
+  await callIpc('projects:delete', project.id);
+  downloadGate.release();
+  await scanPromise;
+
+  await waitForPathMissing(
+    projectCacheDir('figma-assets', project.id),
+    'late Figma cache should be removed after the deleted project scan settles'
+  );
+  assert.equal((await callIpc('projects:get-all')).some(item => item.id === project.id), false);
+});
+
+test('delete-all during an in-flight Figma download removes the late cache write', async () => {
+  const project = await createLinkedFigmaProject('Delete all in-flight Figma cache');
+  const downloadGate = setGatedFigmaDownloadResponse('late delete-all figma cache');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/delete-all-late.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-delete-all-late',
+    imageRef: 'img-delete-all-late',
+    name: 'Late Delete All Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const scanPromise = callIpc('figma:scan-project', project.id);
+  await downloadGate.started;
+  await callIpc('projects:delete-all');
+  downloadGate.release();
+  await scanPromise;
+
+  await waitForPathMissing(
+    projectCacheDir('figma-assets', project.id),
+    'late delete-all Figma cache should be removed after the scan settles'
+  );
+  assert.deepEqual(await callIpc('projects:get-all'), []);
+});
+
+test('deleting a project during pre-package Figma recovery removes the late cache write', async () => {
+  const project = await createLinkedFigmaProject('Delete pre-package Figma cache');
+  const downloadGate = setGatedFigmaDownloadResponse('late pre-package figma cache');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/pre-package-late.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-pre-package-late',
+    imageRef: 'img-pre-package-late',
+    name: 'Late Pre Package Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const scanPromise = callIpc('projects:pre-package-scan', project.id);
+  await downloadGate.started;
+  await callIpc('projects:delete', project.id);
+  downloadGate.release();
+  await scanPromise;
+
+  await waitForPathMissing(
+    projectCacheDir('figma-assets', project.id),
+    'late pre-package Figma cache should be removed after the deleted project scan settles'
+  );
+  assert.equal((await callIpc('projects:get-all')).some(item => item.id === project.id), false);
+});
+
+test('delete-all removes valid Crate project caches but skips cleanup when project state is corrupt', async () => {
+  const firstProject = await callIpc('projects:create', 'Delete all cache one');
+  const secondProject = await callIpc('projects:create', 'Delete all cache two');
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    seedProjectCache(category, firstProject.id);
+    seedProjectCache(category, secondProject.id);
+  }
+
+  await callIpc('projects:delete-all');
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    await waitForPathMissing(projectCacheDir(category, firstProject.id));
+    await waitForPathMissing(projectCacheDir(category, secondProject.id));
+  }
+  await drainProjectCacheCleanupQueue();
+
+  const corruptStateCacheId = '00000000-0000-4000-8000-000000777777';
+  const corruptStateCache = seedProjectCache('figma-assets', corruptStateCacheId);
+  fakeStoreInstance.data.projects = { invalid: true };
+  await callIpc('projects:delete-all');
+  assert.equal(fs.existsSync(corruptStateCache), true);
+
+  await callIpc('projects:delete-all');
+  await waitForPathMissing(corruptStateCache, 'a later valid orphan sweep should remove the retained cache');
+});
 
 test('projects:create keeps only a minimal per-project Figma locator', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
@@ -1772,6 +2483,66 @@ test('Figma asset cache directories and downloaded files are owner-only where su
   }
 });
 
+test('Figma asset caching fails closed when owner-only permissions cannot be verified', async () => {
+  if (process.platform === 'win32') return;
+
+  const project = await createLinkedFigmaProject('Figma Cache Permission Failure');
+  setFigmaDownloadResponse('permission failure figma bytes');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/permission-failure.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-permission-failure',
+    imageRef: 'img-permission-failure',
+    name: 'Permission Failure',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
+
+  const originalFchmod = fs.fchmodSync;
+  fs.fchmodSync = (fd, mode) => {
+    if (fs.fstatSync(fd).isFile() && mode === 0o600) {
+      const error = new Error('permission denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalFchmod.call(fs, fd, mode);
+  };
+  try {
+    const { output } = await captureConsole(() => callIpc('figma:scan-project', project.id));
+    const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(fresh.files.some(file => file.source === 'figma-auto'), false);
+    const cacheDir = projectCacheDir('figma-assets', project.id);
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], [], 'failed cache write must leave no asset bytes');
+    assert.equal(output.includes(TEST_HOME), false);
+    assert.equal(output.includes('SHOULD_NOT_APPEAR_TOKEN'), false);
+  } finally {
+    fs.fchmodSync = originalFchmod;
+  }
+});
+
+test('active Figma scan finalizer does not traverse project cache categories', async () => {
+  const project = await createLinkedFigmaProject('Active Figma Finalizer');
+  nextFigmaScanResult = figmaScanResult([]);
+  const originalOpendir = fs.promises.opendir;
+  const categoryPaths = new Set(
+    ['figma-assets', 'presentation-assets'].map(category => path.resolve(TEST_HOME, '.crate', category))
+  );
+  let categoryTraversals = 0;
+  fs.promises.opendir = async (targetPath, ...args) => {
+    if (categoryPaths.has(path.resolve(targetPath))) categoryTraversals += 1;
+    return originalOpendir.call(fs.promises, targetPath, ...args);
+  };
+  try {
+    assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(categoryTraversals, 0, 'an active-project finalizer should not schedule a cache sweep');
+  } finally {
+    fs.promises.opendir = originalOpendir;
+  }
+});
+
 test('Figma asset cache rejects symlinked cache root without leaking target path', async () => {
   if (process.platform === 'win32') return;
 
@@ -1873,6 +2644,7 @@ test('Figma asset cache rejects symlinked project directory without leaking targ
   assert.deepEqual(fs.readdirSync(symlinkTarget), []);
   assert.equal(output.includes(symlinkTarget), false);
   assert.equal(output.includes('SHOULD_NOT_APPEAR_FIGMA_PROJECT_TARGET'), false);
+  fs.unlinkSync(projectDir);
 });
 
 test('Figma asset format extensions are allowlisted and stay inside the cache directory', async () => {

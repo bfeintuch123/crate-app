@@ -23,13 +23,13 @@ const originalClearInterval = global.clearInterval;
 const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
 const originalHomedir = os.homedir;
-const TEST_HOME = path.join(os.tmpdir(), 'crate-provenance-dual-write-home');
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'));
 const EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP = 500;
 const activeIntervals = new Set();
 const activeIntervalCallbacks = new Map();
 const activeTimeouts = new Set();
+let cacheCleanupSentinelCounter = 0;
 
-fs.rmSync(TEST_HOME, { recursive: true, force: true });
 fs.mkdirSync(path.join(TEST_HOME, 'Desktop'), { recursive: true });
 fs.mkdirSync(path.join(TEST_HOME, 'Documents'), { recursive: true });
 fs.mkdirSync(path.join(TEST_HOME, 'Downloads'), { recursive: true });
@@ -180,7 +180,7 @@ setStub('electron', () => ({
     show: () => {},
     focus: () => {},
     isActive: () => testAppActive,
-    getPath: () => path.join(os.tmpdir(), 'crate-provenance-dual-write-userdata'),
+    getPath: () => path.join(TEST_HOME, 'user-data'),
     dock: { setMenu: () => {} },
   },
   BrowserWindow: TestBrowserWindow,
@@ -198,6 +198,7 @@ setStub('electron', () => ({
     showOpenDialog: async () => nextOpenDialogResult,
     showSaveDialog: async () => ({ canceled: true }),
     showMessageBox: async () => ({ response: 0 }),
+    showErrorBox: () => {},
   },
   shell: { openPath: () => {} },
   nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
@@ -208,6 +209,9 @@ setStub('electron', () => ({
 let storeInstance = null;
 class FakeStore {
   constructor(opts = {}) {
+    this.path = path.join(TEST_HOME, 'user-data', 'config.json');
+    fs.mkdirSync(path.dirname(this.path), { recursive: true });
+    fs.writeFileSync(this.path, '{}', { mode: 0o600 });
     this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
     storeInstance = this;
   }
@@ -402,7 +406,7 @@ function execFileStub(...args) {
   return createChildProcessStub();
 }
 execFileStub[nodePromisify.custom] = async (command, fileArgs = []) => {
-  const result = getChildProcessResult('execFile', command, fileArgs);
+  const result = await Promise.resolve(getChildProcessResult('execFile', command, fileArgs));
   if (result.error) throw result.error;
   return { stdout: result.stdout || '', stderr: result.stderr || '' };
 };
@@ -510,6 +514,97 @@ function presentationCachePaths(projectId) {
 
 function resetPresentationCacheRoot() {
   fs.rmSync(path.join(TEST_HOME, '.crate'), { recursive: true, force: true });
+}
+
+async function waitForPathMissing(targetPath, message, timeoutMs = 1500) {
+  const startedAt = Date.now();
+  while (fs.existsSync(targetPath)) {
+    if (Date.now() - startedAt > timeoutMs) {
+      assert.fail(message || `timed out waiting for ${path.basename(targetPath)} cleanup`);
+    }
+    await new Promise(resolve => originalSetTimeout(resolve, 20));
+  }
+}
+
+async function waitForProjectCacheCleanup(projectIds, timeoutMs = 2500) {
+  removeUnsafeTestCacheEntries();
+  if (!Array.isArray(storeInstance.data.projects)) storeInstance.data.projects = [];
+  const sentinelId = `00000000-0000-4000-8002-${String(++cacheCleanupSentinelCounter).padStart(12, '0')}`;
+  storeInstance.data.projects.push({ id: sentinelId });
+  for (const category of ['figma-assets', 'presentation-assets']) {
+    const sentinelDir = path.join(TEST_HOME, '.crate', category, sentinelId);
+    fs.mkdirSync(sentinelDir, { recursive: true });
+    fs.writeFileSync(path.join(sentinelDir, 'cleanup-sentinel.bin'), 'cleanup sentinel');
+  }
+  await callIpc('projects:delete', sentinelId);
+  await waitForPathMissing(
+    path.join(TEST_HOME, '.crate', 'figma-assets', sentinelId),
+    'Figma cleanup sentinel should drain the serialized cleanup queue',
+    timeoutMs
+  );
+  await waitForPathMissing(
+    path.join(TEST_HOME, '.crate', 'presentation-assets', sentinelId),
+    'presentation cleanup sentinel should drain the serialized cleanup queue',
+    timeoutMs
+  );
+
+  for (const projectId of projectIds) {
+    await waitForPathMissing(
+      presentationCachePaths(projectId).projectDir,
+      `presentation cache cleanup should finish for ${projectId}`,
+      timeoutMs
+    );
+    await waitForPathMissing(
+      path.join(TEST_HOME, '.crate', 'figma-assets', projectId),
+      `Figma cache cleanup should finish for ${projectId}`,
+      timeoutMs
+    );
+  }
+  const hasQuarantine = ['figma-assets', 'presentation-assets'].some((category) => {
+    const categoryDir = path.join(TEST_HOME, '.crate', category);
+    try {
+      return fs.readdirSync(categoryDir).some(name => /^\.crate-cleanup-/.test(name));
+    } catch (_) {
+      return false;
+    }
+  });
+  assert.equal(hasQuarantine, false, 'serialized cleanup queue should leave no pending quarantine');
+  await new Promise(resolve => setImmediate(resolve));
+}
+
+function removeUnsafeTestCacheEntries() {
+  const crateDir = path.join(TEST_HOME, '.crate');
+  const paths = [crateDir, ...['figma-assets', 'presentation-assets'].map(category => path.join(crateDir, category))];
+  for (const targetPath of paths) {
+    try {
+      const stat = fs.lstatSync(targetPath);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        fs.rmSync(targetPath, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function observeProjectCacheInspection(targetPath) {
+  const originalLstatSync = fs.lstatSync;
+  const resolvedCategory = path.resolve(path.dirname(targetPath));
+  let observedResolve;
+  const observed = new Promise(resolve => { observedResolve = resolve; });
+  fs.lstatSync = function observedLstatSync(candidatePath, ...args) {
+    if (observedResolve && path.resolve(candidatePath) === resolvedCategory) {
+      observedResolve();
+      observedResolve = null;
+    }
+    return originalLstatSync.call(fs, candidatePath, ...args);
+  };
+  return {
+    observed,
+    restore() {
+      fs.lstatSync = originalLstatSync;
+    },
+  };
 }
 
 function chmodIfSupported(filePath, mode) {
@@ -781,7 +876,7 @@ test('helper Info.plist patch adds Apple Events usage before signing and is idem
   }
 });
 
-function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
+function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx', options = {}) {
   const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
   const entryData = (entry) => Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data || '');
   const listedPath = (entry) => typeof entry.listedPath === 'string' ? entry.listedPath : entry.internalPath;
@@ -815,7 +910,9 @@ function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx') {
         if (entry && entry.error) throw entry.error;
         return entryData(entry);
       });
-      return { stdout: Buffer.concat(buffers), stderr: '' };
+      const result = { stdout: Buffer.concat(buffers), stderr: '' };
+      if (typeof options.onReadStart === 'function') options.onReadStart();
+      return options.readGate ? Promise.resolve(options.readGate).then(() => result) : result;
     }
     return { stdout: '', stderr: '' };
   });
@@ -829,8 +926,8 @@ function setPresentationUnzipListingFailure(error) {
   });
 }
 
-function setPowerPointUnzipFixture(mediaEntries) {
-  setPresentationUnzipFixture(mediaEntries, 'deck.pptx');
+function setPowerPointUnzipFixture(mediaEntries, options = {}) {
+  setPresentationUnzipFixture(mediaEntries, 'deck.pptx', options);
 }
 
 function setKeynoteUnzipFixture(mediaEntries) {
@@ -893,7 +990,15 @@ test.afterEach(async () => {
   childProcessHandler = null;
   nextOpenDialogResult = { canceled: true };
   currentPsdFixture = { children: [], linkedFiles: [] };
-  if (storeInstance) storeInstance.set('projects', []);
+  if (storeInstance) {
+    const projects = storeInstance.get('projects', []);
+    const projectIds = Array.isArray(projects)
+      ? projects.filter(project => project && typeof project.id === 'string').map(project => project.id)
+      : [];
+    await callIpc('projects:delete-all');
+    removeUnsafeTestCacheEntries();
+    await waitForProjectCacheCleanup(projectIds);
+  }
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   testNotificationSupported = false;
@@ -974,6 +1079,116 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
   }
 });
 
+test('deleting a project during presentation extraction leaves no late project cache', async () => {
+  const tmpRoot = makeTempDir();
+  let releaseRead = () => {};
+  let cacheInspection = null;
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Delete During Presentation Extraction');
+    const pptxPath = path.join(tmpRoot, 'Delete-During-Scan.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Delete-During-Scan.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('LATE_PRESENTATION_MEDIA'.repeat(40)),
+    }], {
+      readGate,
+      onReadStart: markReadStarted,
+    });
+
+    await emitWatcher('change', pptxPath);
+    await readStarted;
+    await callIpc('projects:delete', project.id);
+    await waitForPathMissing(
+      presentationCachePaths(project.id).projectDir,
+      'initial deletion cleanup should remove the in-flight presentation cache'
+    );
+    cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
+    releaseRead();
+    await cacheInspection.observed;
+    await new Promise(resolve => setImmediate(resolve));
+    await waitForPathMissing(
+      presentationCachePaths(project.id).projectDir,
+      'presentation finalizer should leave no late project cache'
+    );
+
+    assert.equal(fs.existsSync(presentationCachePaths(project.id).projectDir), false);
+    assert.equal(await getProject(project.id), undefined);
+  } finally {
+    releaseRead();
+    if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('delete-all during presentation extraction leaves no late project cache', async () => {
+  const tmpRoot = makeTempDir();
+  let releaseRead = () => {};
+  let cacheInspection = null;
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Delete All During Presentation Extraction');
+    const pptxPath = path.join(tmpRoot, 'Delete-All-During-Scan.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Delete-All-During-Scan.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('LATE_DELETE_ALL_PRESENTATION_MEDIA'.repeat(40)),
+    }], {
+      readGate,
+      onReadStart: markReadStarted,
+    });
+
+    await emitWatcher('change', pptxPath);
+    await readStarted;
+    await callIpc('projects:delete-all');
+    await waitForPathMissing(
+      presentationCachePaths(project.id).projectDir,
+      'initial delete-all cleanup should remove the in-flight presentation cache'
+    );
+    cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
+    releaseRead();
+    await cacheInspection.observed;
+    await new Promise(resolve => setImmediate(resolve));
+    await waitForPathMissing(
+      presentationCachePaths(project.id).projectDir,
+      'presentation finalizer should leave no late delete-all cache'
+    );
+
+    assert.equal(fs.existsSync(presentationCachePaths(project.id).projectDir), false);
+    assert.equal(await getProject(project.id), undefined);
+  } finally {
+    releaseRead();
+    if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('presentation scan-on-save hardens existing permissive cache directories and media files', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -1024,6 +1239,390 @@ test('presentation scan-on-save hardens existing permissive cache directories an
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation scan-on-save ignores stale cache metadata outside the current project cache', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Stale Cache Metadata');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_STALE_PRESENTATION.jpeg');
+    const mediaBytes = 'STALE_OUTSIDE_PRESENTATION_BYTES'.repeat(40);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.writeFileSync(outsidePath, mediaBytes, { mode: 0o644 });
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: outsidePath,
+          name: 'Stale Presentation Cache.jpeg',
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from(mediaBytes),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation' && file.path !== outsidePath),
+        5000
+      );
+    });
+    const extracted = captured.result.files.find(
+      file => file.source === 'scan-on-save-presentation' && file.path !== outsidePath
+    );
+    assert.ok(extracted, 'stale outside-root metadata must not suppress a new safe cache capture');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assert.equal(fs.readFileSync(outsidePath, 'utf8'), mediaBytes);
+    assert.equal(captured.output.includes(outsidePath), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_STALE_PRESENTATION'), false);
+    assert.equal(captured.output.includes(mediaBytes), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation scan-on-save ignores a nested cache symlink without reading its target', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Nested Cache Symlink');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = makePermissivePresentationCacheDirectories(project.id);
+    const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_NESTED_SYMLINK.jpeg');
+    const symlinkPath = path.join(paths.projectDir, 'Deck — linked.jpeg');
+    const mediaBytes = 'NESTED_SYMLINK_PRESENTATION_BYTES'.repeat(40);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.writeFileSync(outsidePath, mediaBytes, { mode: 0o644 });
+    fs.symlinkSync(outsidePath, symlinkPath);
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: symlinkPath,
+          name: path.basename(symlinkPath),
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from(mediaBytes),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation' && file.path !== symlinkPath),
+        5000
+      );
+    });
+    const extracted = captured.result.files.find(
+      file => file.source === 'scan-on-save-presentation' && file.path !== symlinkPath
+    );
+    assert.ok(extracted, 'nested symlink target must not suppress a new safe cache capture');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assert.equal(fs.readFileSync(outsidePath, 'utf8'), mediaBytes);
+    assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true);
+    assert.equal(captured.output.includes(outsidePath), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_NESTED_SYMLINK'), false);
+    assert.equal(captured.output.includes(mediaBytes), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation scan-on-save ignores an intermediate cache directory symlink', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Intermediate Cache Symlink');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = makePermissivePresentationCacheDirectories(project.id);
+    const outsideDir = path.join(tmpRoot, 'outside-cache');
+    const outsidePath = path.join(outsideDir, 'SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK.jpeg');
+    const nestedLink = path.join(paths.projectDir, 'nested-cache');
+    const storedPath = path.join(nestedLink, path.basename(outsidePath));
+    const mediaBytes = 'INTERMEDIATE_SYMLINK_PRESENTATION_BYTES'.repeat(40);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(outsidePath, mediaBytes, { mode: 0o644 });
+    fs.chmodSync(outsidePath, 0o644);
+    fs.symlinkSync(outsideDir, nestedLink);
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: storedPath,
+          name: path.basename(storedPath),
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from(mediaBytes),
+    }]);
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation' && file.path !== storedPath),
+        5000
+      );
+    });
+    const extracted = captured.result.files.find(
+      file => file.source === 'scan-on-save-presentation' && file.path !== storedPath
+    );
+    assert.ok(extracted, 'intermediate symlink target must not suppress a new safe cache capture');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assert.equal(fs.readFileSync(outsidePath, 'utf8'), mediaBytes);
+    assert.equal(fs.statSync(outsidePath).mode & 0o777, 0o644);
+    assert.equal(fs.lstatSync(nestedLink).isSymbolicLink(), true);
+    assert.equal(captured.output.includes(outsidePath), false);
+    assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK'), false);
+    assert.equal(captured.output.includes(mediaBytes), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation cache read rejects a project-directory swap before touching the outside file', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Cache Read Directory Swap');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const paths = makePermissivePresentationCacheDirectories(project.id);
+    const parkedProjectDir = `${paths.projectDir}.parked`;
+    const outsideDir = path.join(tmpRoot, 'outside-read-cache');
+    const storedName = 'Deck — swapped.jpeg';
+    const storedPath = path.join(paths.projectDir, storedName);
+    const outsidePath = path.join(outsideDir, storedName);
+    const mediaBytes = 'DIRECTORY_SWAP_READ_PRESENTATION_BYTES'.repeat(40);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.writeFileSync(storedPath, Buffer.from('inside stale cache bytes'), { mode: 0o600 });
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(outsidePath, mediaBytes, { mode: 0o644 });
+    fs.chmodSync(outsidePath, 0o644);
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: pptxPath,
+          name: 'Deck.pptx',
+          ext: '.pptx',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        },
+        {
+          path: storedPath,
+          name: storedName,
+          ext: '.jpeg',
+          addedAt: Date.now(),
+          source: 'scan-on-save-presentation',
+        },
+      ],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from(mediaBytes),
+    }]);
+
+    let swapped = false;
+    fs.openSync = (targetPath, flags, ...args) => {
+      if (!swapped && targetPath === storedPath) {
+        swapped = true;
+        fs.renameSync(paths.projectDir, parkedProjectDir);
+        fs.symlinkSync(outsideDir, paths.projectDir);
+        const fd = originalOpenSync.call(fs, targetPath, flags, ...args);
+        fs.unlinkSync(paths.projectDir);
+        fs.renameSync(parkedProjectDir, paths.projectDir);
+        return fd;
+      }
+      return originalOpenSync.call(fs, targetPath, flags, ...args);
+    };
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      return waitForProject(
+        project.id,
+        item => item.files.some(file => file.source === 'scan-on-save-presentation' && file.path !== storedPath),
+        5000
+      );
+    });
+    const extracted = captured.result.files.find(
+      file => file.source === 'scan-on-save-presentation' && file.path !== storedPath
+    );
+    assert.ok(swapped, 'test must replace the cache directory during the file open');
+    assert.ok(extracted, 'directory swap must not suppress a fresh safe cache capture');
+    assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
+    assert.equal(fs.readFileSync(outsidePath, 'utf8'), mediaBytes);
+    assert.equal(fs.statSync(outsidePath).mode & 0o777, 0o644);
+    assert.equal(captured.output.includes(outsidePath), false);
+    assert.equal(captured.output.includes(mediaBytes), false);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation cache write rejects a project-directory swap before writing outside bytes', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  let paths = null;
+  let parkedProjectDir = null;
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Cache Write Directory Swap');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    paths = makePermissivePresentationCacheDirectories(project.id);
+    parkedProjectDir = `${paths.projectDir}.parked`;
+    const outsideDir = path.join(tmpRoot, 'outside-write-cache');
+    const expectedDestPath = path.join(paths.projectDir, 'Deck — image1.jpeg');
+    const mediaBytes = 'DIRECTORY_SWAP_WRITE_PRESENTATION_BYTES'.repeat(40);
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    fs.mkdirSync(outsideDir);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from(mediaBytes),
+    }]);
+
+    let swapped = false;
+    fs.openSync = (targetPath, flags, ...args) => {
+      if (!swapped && targetPath === expectedDestPath && (flags & fs.constants.O_CREAT) !== 0) {
+        swapped = true;
+        fs.renameSync(paths.projectDir, parkedProjectDir);
+        fs.symlinkSync(outsideDir, paths.projectDir);
+      }
+      return originalOpenSync.call(fs, targetPath, flags, ...args);
+    };
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      await new Promise(resolve => originalSetTimeout(resolve, 2600));
+      return getProject(project.id);
+    });
+    assert.ok(swapped, 'test must replace the cache directory during the file create');
+    assert.equal(captured.result.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    assert.deepEqual(fs.readdirSync(outsideDir), []);
+    assert.equal(captured.output.includes(outsideDir), false);
+    assert.equal(captured.output.includes(mediaBytes), false);
+  } finally {
+    fs.openSync = originalOpenSync;
+    if (paths && fs.existsSync(paths.projectDir)) {
+      const stat = fs.lstatSync(paths.projectDir);
+      if (stat.isSymbolicLink()) fs.unlinkSync(paths.projectDir);
+    }
+    if (parkedProjectDir && fs.existsSync(parkedProjectDir) && paths) {
+      fs.renameSync(parkedProjectDir, paths.projectDir);
+    }
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation cache write failure leaves no unsecured media bytes or project entry', async () => {
+  if (process.platform === 'win32') return;
+
+  const tmpRoot = makeTempDir();
+  const originalFchmod = fs.fchmodSync;
+  let filePermissionFailures = 0;
+  try {
+    resetPresentationCacheRoot();
+    const project = await createProject('Presentation Cache Permission Failure');
+    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Deck.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('UNSECURED_PRESENTATION_BYTES'.repeat(40)),
+    }]);
+    fs.fchmodSync = (fd, mode) => {
+      if (fs.fstatSync(fd).isFile() && mode === 0o600) {
+        filePermissionFailures += 1;
+        const error = new Error('permission denied');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return originalFchmod.call(fs, fd, mode);
+    };
+
+    const captured = await captureConsoleDuring(async () => {
+      await emitWatcher('change', pptxPath);
+      const deadline = Date.now() + 5000;
+      while (filePermissionFailures === 0 && Date.now() < deadline) {
+        await new Promise(resolve => originalSetTimeout(resolve, 10));
+      }
+      assert.ok(filePermissionFailures > 0, 'presentation write should reach the file permission check');
+      await new Promise(resolve => setImmediate(resolve));
+      return getProject(project.id);
+    });
+    const cacheDir = presentationCachePaths(project.id).projectDir;
+    assert.equal(captured.result.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], [], 'failed write must remove unsecured bytes');
+    assert.equal(captured.output.includes(TEST_HOME), false);
+    assert.equal(captured.output.includes('UNSECURED_PRESENTATION_BYTES'), false);
+  } finally {
+    fs.fchmodSync = originalFchmod;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

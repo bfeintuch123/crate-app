@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -139,6 +140,9 @@ test('main window uses normal macOS app lifecycle', async () => {
 
   class FakeStore {
     constructor(opts = {}) {
+      this.path = path.join(isolatedHome, 'user-data', 'config.json');
+      fs.mkdirSync(path.dirname(this.path), { recursive: true });
+      fs.writeFileSync(this.path, '{}', { mode: 0o600 });
       this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
     }
 
@@ -177,7 +181,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       isReady: () => appReady,
       show: () => { appShowCount += 1; },
       focus: () => { appFocusCount += 1; },
-      getPath: () => path.join(os.tmpdir(), 'crate-main-window-test-userdata'),
+      getPath: () => path.join(isolatedHome, 'user-data'),
       dock: { setMenu: () => {} },
     },
     BrowserWindow: TestBrowserWindow,
@@ -189,6 +193,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       showOpenDialog: async () => ({ canceled: true }),
       showSaveDialog: async () => ({ canceled: true }),
       showMessageBox: async () => ({ response: 0 }),
+      showErrorBox: () => {},
     },
     shell: { openPath: () => {} },
     nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
@@ -197,8 +202,19 @@ test('main window uses normal macOS app lifecycle', async () => {
   }));
   setStub('electron-store', () => FakeStore);
   setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
+  setStub('uuid', () => ({ v4: () => '00000000-0000-4000-8000-000000000001' }));
+  setStub('ag-psd', () => ({ readPsd: () => ({}) }));
   setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
   setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+
+  const isolatedOrphanCache = path.join(
+    isolatedHome,
+    '.crate',
+    'figma-assets',
+    '00000000-0000-4000-8000-000000000099'
+  );
+  fs.mkdirSync(isolatedOrphanCache, { recursive: true });
+  fs.writeFileSync(path.join(isolatedOrphanCache, 'stale.bin'), 'isolated stale cache');
 
   try {
     require('../main');
@@ -206,6 +222,12 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(typeof readyCallback, 'function');
     appReady = true;
     await readyCallback();
+
+    const cleanupDeadline = Date.now() + 1000;
+    while (fs.existsSync(isolatedOrphanCache) && Date.now() < cleanupDeadline) {
+      await new Promise(resolve => originalSetTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(isolatedOrphanCache), false, 'startup cleanup must stay inside the isolated test home');
 
     assert.equal(windows.length, 1);
     const win = windows[0];
@@ -452,6 +474,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     console.warn = originalConsoleWarn;
     intervals.clear();
     timeouts.clear();
+    fs.rmSync(isolatedHome, { recursive: true, force: true });
   }
 });
 
@@ -469,6 +492,7 @@ test('startup recovery recreates window if first launch window closes before bec
   const ipcHandlers = new Map();
   const windows = [];
   const timeouts = new Set();
+  const isolatedHome = path.join(os.tmpdir(), `crate-main-window-hidden-startup-test-home-${process.pid}-${Date.now()}`);
   let appReady = false;
   let readyCallback = null;
 
@@ -551,6 +575,9 @@ test('startup recovery recreates window if first launch window closes before bec
 
   class FakeStore {
     constructor(opts = {}) {
+      this.path = path.join(isolatedHome, 'user-data', 'config.json');
+      fs.mkdirSync(path.dirname(this.path), { recursive: true });
+      fs.writeFileSync(this.path, '{}', { mode: 0o600 });
       this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
     }
     get(key, fallback) {
@@ -587,7 +614,7 @@ test('startup recovery recreates window if first launch window closes before bec
       isReady: () => appReady,
       show: () => {},
       focus: () => {},
-      getPath: () => path.join(os.tmpdir(), 'crate-main-window-hidden-startup-test-userdata'),
+      getPath: () => path.join(isolatedHome, 'user-data'),
       dock: { setMenu: () => {} },
     },
     BrowserWindow: TestBrowserWindow,
@@ -597,6 +624,7 @@ test('startup recovery recreates window if first launch window closes before bec
       showOpenDialog: async () => ({ canceled: true }),
       showSaveDialog: async () => ({ canceled: true }),
       showMessageBox: async () => ({ response: 0 }),
+      showErrorBox: () => {},
     },
     shell: { openPath: () => {} },
     nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
@@ -604,8 +632,20 @@ test('startup recovery recreates window if first launch window closes before bec
     Menu: { buildFromTemplate: () => ({}) },
   }));
   setStub('electron-store', () => FakeStore);
+  setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
+  setStub('uuid', () => ({ v4: () => '00000000-0000-4000-8000-000000000001' }));
+  setStub('ag-psd', () => ({ readPsd: () => ({}) }));
   setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
   setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+
+  const isolatedOrphanCache = path.join(
+    isolatedHome,
+    '.crate',
+    'figma-assets',
+    '00000000-0000-4000-8000-000000000099'
+  );
+  fs.mkdirSync(isolatedOrphanCache, { recursive: true });
+  fs.writeFileSync(path.join(isolatedOrphanCache, 'stale.bin'), 'isolated stale cache');
 
   try {
     delete require.cache[require.resolve('../main')];
@@ -614,6 +654,12 @@ test('startup recovery recreates window if first launch window closes before bec
     assert.equal(typeof readyCallback, 'function');
     appReady = true;
     await readyCallback();
+
+    const cleanupDeadline = Date.now() + 1000;
+    while (fs.existsSync(isolatedOrphanCache) && Date.now() < cleanupDeadline) {
+      await new Promise(resolve => originalSetTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(isolatedOrphanCache), false, 'startup cleanup must stay inside the isolated test home');
 
     assert.equal(windows.length, 1);
     assert.equal(windows[0].isVisible(), false);
@@ -650,5 +696,6 @@ test('startup recovery recreates window if first launch window closes before bec
     global.clearTimeout = originalClearTimeout;
     console.error = originalConsoleError;
     console.warn = originalConsoleWarn;
+    fs.rmSync(isolatedHome, { recursive: true, force: true });
   }
 });
