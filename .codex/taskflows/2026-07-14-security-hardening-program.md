@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-network-download-limits`
+- branch: `codex/security-runtime-allowlist-phase4`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1, 2A, 2B, 3, 3.5, and 4A merged; Phase 4B bounded Figma network transfers implemented, validated, and approved for commit, PR, merge-readiness review, and clean merge
+- status: phases 1, 2A, 2B, 3, 3.5, 4A, and 4B merged; post-merge Phase 4 installed-app and live Figma validation exposed two contained fixes, which now pass final-source installed-app proof and are carried by follow-up PR #136 before Phase 5
 
 ## Goal
 
@@ -28,13 +28,20 @@ Strengthen protection of users' project files, Figma credentials, local metadata
 
 Each phase must remain independently reviewable and revertible. Existing functional behavior is frozen unless the input is specifically unsafe or malicious.
 
+## Required Review Cadence
+
+- Before any security phase or subphase is committed, pushed, or opened as a PR, run the complete Crate Fix Review Stack: bug triage, narrow-fix review, autoreview, regression detection, security scan, provenance review, runner loop, merge-readiness review, and restartable handoff evidence.
+- A failing review or required check blocks commit, push, PR creation, and merge until the finding is fixed and the affected review lanes rerun.
+- After the final security phase, rerun an integrated review across the combined security program: full deterministic suite, exact-base Reprobox, packaged-content verification, signed installed-app launch and recovery, privacy checks, and representative package/Figma workflows.
+- Olivia remains paused until that final integrated gate passes and Bryant explicitly resumes external testing.
+
 ## Current Phase
 
-- phase: 4B, bounded Figma API and asset transfers
-- security target: bound request time, whole-operation time, response bytes, aggregate bytes, redirects, and protocol handling before Figma API or asset data can consume unbounded resources or forward credentials unsafely
-- implementation target: use one shared privacy-safe network guard for authenticated API reads and unauthenticated asset downloads while preserving existing parser results and Figma scope behavior
-- workflow target: normal Figma use remains unchanged; a known pre-package asset-transfer failure blocks output with fixed nontechnical copy until a clean retry succeeds
-- package-engine impact: no selection, naming, copy, quota, or output-format change; only a known incomplete Figma asset recovery stops package creation before output or quota mutation
+- phase: post-merge Phase 4 installed-app validation and contained failure loop before Phase 5
+- security target: prove the merged Phase 4 runtime is present in the packaged app and normal disconnected users are not prompted for Keychain access when no Figma credential exists
+- implementation target: keep the strict runtime allowlist synchronized with every first-party parser module and defer the Keychain availability check until an encrypted or legacy credential actually needs access
+- workflow target: clean launch, relaunch, Settings, and disconnected Figma remain prompt-free; explicit Figma connection remains the only normal path that can contact Keychain
+- package-engine impact: none
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, permission, setting, or credential action
 
@@ -86,17 +93,25 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] phase 4B focused, full-suite, security, provenance, runner, and isolated Reprobox validation
 - [x] phase 4B adversarial review findings fixed with fail-closed package and hard operation-budget regression coverage
 - [x] Bryant approval for phase 4B commit, push, PR creation, merge-readiness review, and clean merge
+- [x] phase 4B PR #135 merged into `v2.4.x` as `6d07022f4ae43287da79b0db95fce5bad6f34c87`
+- [x] contained installed-app build exposed missing runtime allowlist entries for `admission-budgets.js` and `figma-network.js`
+- [x] failure-first runtime inventory test and narrow allowlist repair
+- [x] disconnected-startup regression test proved and fixed unnecessary Keychain access
+- [x] pre-review signed QA app passes packaged-content verification, source-to-ASAR hashes, clean launch, relaunch, Settings, and prompt-free disconnected Figma state
+- [x] live Figma Current Page Only package validation with a one-day read-only QA credential
+- [x] complete Crate Fix Review Stack and exact-base Reprobox before any commit, push, or PR request
+- [x] use Bryant's one-time approval to rebuild the separately identified QA app from the frozen final source, then repeat packaged-content, signing, source-to-ASAR, and disconnected-launch checks
 
 ## Stop Gates
 
 - Stop if a patch requires package-engine, watcher, parser-result, provenance, Figma-scope, quota, or UI behavior changes.
-- Stop before dependency changes, builds, signing, notarization, release mutation, site deployment, or updater implementation without separate approval.
+- Stop before any build, signing, dependency change, notarization, release mutation, site deployment, or updater implementation without separate approval. Bryant's approval for the final-source isolated QA rebuild applies only to this validation run.
 - Stop if an existing connected Figma user would need to repeat normal setup after the credential-storage phase.
-- Do not update an external tester's installed build until the replacement passes installed-app QA.
+- Do not update an external tester's installed build or resume Olivia until the replacement and final integrated security gate pass.
 
 ## Next Action
 
-Commit and push Phase 4B, open a PR against `v2.4.x`, run merge readiness, and merge only if clean under Bryant's explicit authorization. Stop before any build, installed-app QA, signing, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without separate approval.
+PR #136 carries the contained Phase 4 installed-app follow-up, and Bryant preauthorized merge only if merge readiness stays clean. Do not use the completed one-time rebuild approval again. After merge, stop at a Phase 5 scope outline; do not start further build or signing, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without the applicable approval.
 
 ## Phase 1 Evidence
 
@@ -218,3 +233,47 @@ Commit and push Phase 4B, open a PR against `v2.4.x`, run merge readiness, and m
 - `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory
 - normal parser results, watcher behavior, Figma scope, package selection and naming, provenance relationships, quota behavior, renderer UI, release state, and website remain unchanged outside the explicit fail-closed incomplete-Figma-transfer boundary
 - no app launch, build, signing, notarization, release mutation, deployment, external tester update, Phase 5 implementation, updater work, or dependency mutation occurred
+
+## Phase 4 Post-Merge Installed-App Evidence
+
+- Phase 4B PR #135 merged as `6d07022f4ae43287da79b0db95fce5bad6f34c87`
+- the first contained build correctly failed the packaged-content policy because the Phase 4A and 4B runtime modules were absent from the explicit allowlist
+- a failure-first inventory test now compares every first-party `parsers/*.js` module with the packaged runtime allowlist; the allowlist adds only `admission-budgets.js` and `figma-network.js`
+- the first production-identity QA launch also exposed an unnecessary Keychain prompt for a disconnected profile; root cause was checking `safeStorage` before checking whether an encrypted credential file existed
+- a failure-first credential-store test proved the empty disconnected store made one encryption-availability call; the narrow fix makes zero calls while preserving encrypted reads, migration, secure writes, corruption handling, symlink defenses, and disconnect cleanup
+- the pre-review, separately identified `Crate Phase 4B QA` app passed packaged-content verification, strict code-sign verification, and source-to-ASAR hash checks before the final credential preflight hardening; the replacement final-source build is recorded below
+- clean launch, force quit/relaunch, Projects, Settings, zero quota, Diagnostics OFF, Package Details ON, and disconnected Figma all pass without a Keychain prompt or Keychain/log error when launched without a mock Keychain
+- a one-day read-only QA credential was created in an approved Figma QA account and entered only into the separately identified, isolated Crate QA profile; its value was never printed or persisted in repo evidence
+- the connected QA lane used an isolated test-only Keychain mode; the separate disconnected installed-app lane used the production Keychain path and proved prompt-free startup
+- Current Page Only remained the selected default; a simple four-asset Figma fixture packaged exactly four PNGs, showed clean Package Complete and Package Details, and incremented quota exactly from zero to one
+- a complex 46-asset fixture failed closed when Figma did not return every requested render: no package directory was written, quota remained unchanged, and privacy-safe retry copy was shown
+- relaunch preserved the isolated Figma connection and visible window; Entire File remains the explicit alternate scope and was not selected
+- targeted logs, evidence, and output contained no raw token, authorization header, complete Figma URL, signed URL, live file key, or unrelated private path; the isolated encrypted credential blob and profile directories retained restrictive permissions
+- the temporary QA credential was revoked after validation, and the pre-existing production credential remained untouched
+- the frozen final source was rebuilt once as the separately identified `Crate Phase 4 Final QA` app under Bryant's one-time approval; notarization, installation, release, upload, and deployment were not attempted
+- the final app passes the strict packaged-content policy with 2,861 ASAR entries and 1,767 unpacked entries, strict Developer ID signature verification, and byte-for-byte source comparison for `main.js`, `preload.js`, `figma.js`, `figma-credential-store.js`, `figma-network.js`, and `admission-budgets.js`
+- a new owner-only isolated profile opened one visible Projects window at zero usage without a Keychain prompt; Settings showed Figma disconnected, and force quit plus relaunch restored the same visible Projects state without a prompt
+- no live credential was recreated for the replacement build: the earlier connected lane remains the live Figma behavior proof, while final-source unit coverage verifies valid encrypted reads and fail-fast invalid-entry handling
+
+### Ordered Privacy-Safe Proof Manifest
+
+Only sanitized filenames and hashes are retained here. The temporary screenshots and logs were reviewed through Computer Use, contain approved QA UI only, and are not committed.
+
+| Order | Build / workflow / state | Viewport | Expected / observed | Sanitized artifact and SHA-256 | Privacy review | Redaction |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `Crate Phase 4 Final QA`; cold launch; new disconnected profile | 960 x 760 | Visible Projects window, zero usage, no Keychain prompt / pass | `01-projects-production-keychain.png` `c51f0ad267c87e4adb67b0c7d08493f669c46c7d32bfae7ae3c91389e0349832` | pass; approved QA UI only | none required; image not retained |
+| 2 | same build; Settings; disconnected Figma | 960 x 760 | Disconnected state and Keychain explanation, no Keychain access prompt / pass | `02-settings-production-keychain.png` `ea473beb591ac79af0179ebd8ca9e24aa1c16f3fea914bb4ce0ac29b2941f383` | pass; no credential value or link | none required; image not retained |
+| 3 | same build; force quit and relaunch; same isolated profile; window zoomed after default Projects was confirmed to distinguish the proof event | 1490 x 769 | Visible Projects window restored, no Keychain prompt / pass | `03-relaunch-production-keychain.png` `dd9770e32dc8826656fc69870dbd631c1ab52cc5721d6f6671ee8895c53da247` | pass; approved QA UI only | none required; image not retained |
+| 4 | same build; launch log; production Keychain path | not applicable | No Keychain, credential, renderer-load, process-exit, or uncaught-error marker / pass | `launch-production-keychain.log` `4298413fcb841c62b5737a2577438dfd47683221d6d3a6262892678cf7f7ea8d` | pass; targeted secret, URL, identifier, and private-path scan | log not retained |
+| 5 | pre-final connected QA build; Current Page Only package and incomplete-render fail-closed lanes | 960 x 760 | Four approved assets packaged once; partial 46-asset render wrote no output or quota / pass | `live-figma.log` `eeb2b7bd92342c63bbe9a1ef948f276ca5789bdebaf01f92226b7ad0ac3527c9`; four-file output manifest `a61083d80ae514eb8ab7f2227e00afd2f8b92025606e4920f1f5dfeb36b628fa` | pass; no credential, authorization header, complete URL, signed URL, opaque Figma identifier, or unrelated private path | raw artifacts not retained |
+
+Final packaged runtime hash: `app.asar` `24faf63ee751b7be8103bbc88e36f13dfb08d0ad7d5f1fd46bf4d36307d18b5f`.
+
+### Final Review Stack Result
+
+- standard full suite passed 305/305; a quiet serial full-suite run also passed 305/305
+- focused packaged-content and credential coverage passed 30/30 in both the source worktree and an exact-base Reprobox
+- an intentionally overlapping reviewer run reproduced pre-existing shared-test-home contamination; the affected unchanged cases passed alone and in the quiet serial full suite, so no unrelated provenance test or product code was changed
+- Crate Doctor reported zero failures; existing main-workspace hygiene warnings are outside this isolated patch
+- `npm audit --audit-level=high` exited successfully with only the pre-existing moderate `uuid` advisory; no dependency or lockfile changed
+- final specialist rereviews found no remaining credential, runtime allowlist, privacy, scope, build-proof, or evidence-manifest finding

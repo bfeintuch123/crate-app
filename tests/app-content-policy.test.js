@@ -10,6 +10,7 @@ const packageJson = require('../package.json');
 const afterPack = require('../scripts/patch-helper-info-plists');
 const {
   REQUIRED_ASAR_ENTRIES,
+  RUNTIME_PARSER_FILES,
   inspectAsarEntries,
   inspectUnpackedEntries,
   normalizeEntry,
@@ -24,6 +25,34 @@ const EXPECTED_BUILD_FILES = Object.freeze([
   'parsers/*.js',
   'assets/tray-icon.png'
 ]);
+
+function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {
+  return fs.readdirSync(currentDirectory, { withFileTypes: true }).flatMap(entry => {
+    const absolutePath = path.join(currentDirectory, entry.name);
+    if (entry.isDirectory() && entry.name === 'node_modules') return [];
+    if (entry.isDirectory()) return listJavaScriptFiles(rootDirectory, absolutePath);
+    if (!entry.isFile() || !entry.name.endsWith('.js')) return [];
+    return [path.relative(rootDirectory, absolutePath).split(path.sep).join('/')];
+  });
+}
+
+test('packaged-content policy declares every first-party parser module', () => {
+  const parserFiles = listJavaScriptFiles(path.join(__dirname, '..', 'parsers')).sort();
+
+  assert.deepEqual([...RUNTIME_PARSER_FILES].sort(), parserFiles);
+});
+
+test('parser inventory ignores generated dependency trees', t => {
+  const rootDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-parser-inventory-'));
+  t.after(() => fs.rmSync(rootDirectory, { recursive: true, force: true }));
+
+  fs.mkdirSync(path.join(rootDirectory, 'nested'), { recursive: true });
+  fs.mkdirSync(path.join(rootDirectory, 'node_modules', 'example'), { recursive: true });
+  fs.writeFileSync(path.join(rootDirectory, 'nested', 'first-party.js'), 'module.exports = true;');
+  fs.writeFileSync(path.join(rootDirectory, 'node_modules', 'example', 'index.js'), 'module.exports = true;');
+
+  assert.deepEqual(listJavaScriptFiles(rootDirectory), ['nested/first-party.js']);
+});
 
 test('electron-builder uses the explicit Crate runtime allowlist', () => {
   assert.deepEqual(packageJson.build.files, EXPECTED_BUILD_FILES);

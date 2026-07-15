@@ -27,6 +27,10 @@ function isSafeDirectory(directoryPath) {
   }
 }
 
+function isValidEncryptedFile(stat) {
+  return stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= MAX_ENCRYPTED_BYTES;
+}
+
 class FigmaCredentialStore {
   constructor({ safeStorage, userDataPath, legacyTokenPath, env = process.env, logger = console } = {}) {
     this.safeStorage = safeStorage || null;
@@ -82,16 +86,34 @@ class FigmaCredentialStore {
   }
 
   _readEncryptedToken() {
-    if (!this.encryptedTokenPath || !this._encryptionAvailable()) return null;
+    if (!this.encryptedTokenPath) return null;
+
+    let expectedStat;
+    try {
+      expectedStat = fs.lstatSync(this.encryptedTokenPath);
+      if (!isValidEncryptedFile(expectedStat)) {
+        this._warn('encrypted data rejected');
+        return null;
+      }
+      if (!isSafeDirectory(this.userDataPath) || !isSafeDirectory(path.dirname(this.encryptedTokenPath))) {
+        this._warn('encrypted directory rejected');
+        return null;
+      }
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null;
+      this._warn('encrypted data unreadable');
+      return null;
+    }
+
+    if (!this._encryptionAvailable()) return null;
 
     try {
-      if (!fs.existsSync(this.encryptedTokenPath)) return null;
       if (!isSafeDirectory(this.userDataPath) || !isSafeDirectory(path.dirname(this.encryptedTokenPath))) {
         this._warn('encrypted directory rejected');
         return null;
       }
       const stat = fs.lstatSync(this.encryptedTokenPath);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_ENCRYPTED_BYTES) {
+      if (!isValidEncryptedFile(stat) || stat.dev !== expectedStat.dev || stat.ino !== expectedStat.ino) {
         this._warn('encrypted data rejected');
         return null;
       }
