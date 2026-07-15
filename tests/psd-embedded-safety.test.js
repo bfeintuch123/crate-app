@@ -17,8 +17,14 @@ const originalSetTimeout = global.setTimeout;
 const originalClearTimeout = global.clearTimeout;
 const originalSetInterval = global.setInterval;
 const originalClearInterval = global.clearInterval;
+const originalHomedir = os.homedir;
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-safety-home-'));
+const TEST_USER_DATA = path.join(TEST_HOME, 'user-data');
 const activeTimeouts = new Set();
 const activeIntervals = new Set();
+
+fs.mkdirSync(TEST_USER_DATA, { recursive: true, mode: 0o700 });
+os.homedir = () => TEST_HOME;
 
 global.setInterval = function trackedSetInterval(fn, delay, ...args) {
   const timer = originalSetInterval(fn, delay, ...args);
@@ -141,7 +147,7 @@ setStub('electron', () => ({
     isReady: () => true,
     show: () => {},
     focus: () => {},
-    getPath: () => path.join(os.tmpdir(), 'crate-test-userdata'),
+    getPath: () => TEST_USER_DATA,
     dock: { setMenu: () => {} },
   },
   BrowserWindow: TestBrowserWindow,
@@ -159,6 +165,7 @@ setStub('electron', () => ({
     showOpenDialog: async () => ({ canceled: true }),
     showSaveDialog: async () => ({ canceled: true }),
     showMessageBox: async () => ({ response: 0 }),
+    showErrorBox: () => {},
   },
   shell: { openPath: () => {} },
   nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
@@ -169,6 +176,8 @@ setStub('electron', () => ({
 let storeInstance = null;
 class FakeStore {
   constructor(opts = {}) {
+    this.path = path.join(TEST_USER_DATA, 'config.json');
+    fs.writeFileSync(this.path, '{}', { mode: 0o600 });
     this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
     storeInstance = this;
   }
@@ -413,6 +422,8 @@ test.after(() => {
   global.clearTimeout = originalClearTimeout;
   global.setInterval = originalSetInterval;
   global.clearInterval = originalClearInterval;
+  os.homedir = originalHomedir;
+  fs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 test('default package omits diagnostic report files but keeps package provenance records', async () => {

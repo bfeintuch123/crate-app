@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-runtime-allowlist-phase4`
+- branch: `codex/security-local-data-lifecycle-phase5a`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1, 2A, 2B, 3, 3.5, 4A, and 4B merged; post-merge Phase 4 installed-app and live Figma validation exposed two contained fixes, which now pass final-source installed-app proof and are carried by follow-up PR #136 before Phase 5
+- status: phases 1, 2A, 2B, 3, 3.5, 4A, 4B, and the Phase 4 installed-app follow-up are merged; Phase 5A local configuration and cache lifecycle implementation is uncommitted and under the required pre-commit review stack
 
 ## Goal
 
@@ -37,10 +37,10 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: post-merge Phase 4 installed-app validation and contained failure loop before Phase 5
-- security target: prove the merged Phase 4 runtime is present in the packaged app and normal disconnected users are not prompted for Keychain access when no Figma credential exists
-- implementation target: keep the strict runtime allowlist synchronized with every first-party parser module and defer the Keychain availability check until an encrypted or legacy credential actually needs access
-- workflow target: clean launch, relaunch, Settings, and disconnected Figma remain prompt-free; explicit Figma connection remains the only normal path that can contact Keychain
+- phase: Phase 5A local configuration and project-cache lifecycle
+- security target: keep Crate's local project metadata owner-only and remove stale Crate-owned Figma and presentation caches without touching active projects, source files, package outputs, symlink targets, or unrelated local data
+- implementation target: retain electron-store's existing atomic writes, set owner-only config mode, harden an existing regular config file and user-data directory, and quarantine validated project cache directories before asynchronous removal
+- workflow target: startup, project deletion, delete-all, package behavior, Figma scope, and normal user setup remain unchanged; cleanup is automatic and adds no prompt or user step
 - package-engine impact: none
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, permission, setting, or credential action
@@ -101,6 +101,15 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] live Figma Current Page Only package validation with a one-day read-only QA credential
 - [x] complete Crate Fix Review Stack and exact-base Reprobox before any commit, push, or PR request
 - [x] use Bryant's one-time approval to rebuild the separately identified QA app from the frozen final source, then repeat packaged-content, signing, source-to-ASAR, and disconnected-launch checks
+- [x] merge Phase 4 installed-app follow-up PR #136 into `v2.4.x`
+- [x] split Phase 5 into independently reviewable Phase 5A local storage/cache lifecycle and Phase 5B optional diagnostics minimization
+- [x] create clean Phase 5A branch from merged `origin/v2.4.x`
+- [x] add failure-first tests for owner-only config storage, orphan and deleted-project cache cleanup, active-project preservation, symlink-root rejection, corrupt-store fail-closed behavior, and late in-flight Figma cache writes
+- [x] implement narrow Phase 5A config permission and cache lifecycle changes without dependency, package, watcher, parser-result, provenance, renderer, quota, or Figma-scope changes
+- [x] complete Phase 5A autoreview, regression, security, provenance, and runner checks before any commit, push, or PR
+- [ ] obtain Bryant approval before Phase 5A commit, push, and PR creation
+- [ ] merge Phase 5A only after separate approval and clean merge readiness
+- [ ] complete installed-app Phase 5A validation before Phase 5B implementation
 
 ## Stop Gates
 
@@ -111,7 +120,20 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-PR #136 carries the contained Phase 4 installed-app follow-up, and Bryant preauthorized merge only if merge readiness stays clean. Do not use the completed one-time rebuild approval again. After merge, stop at a Phase 5 scope outline; do not start further build or signing, notarization, release mutation, site deployment, Phase 5 implementation, updater work, or dependency change without the applicable approval.
+Phase 5A implementation and the complete pre-commit review stack are clean against exact base `0c99cb2b897fbb3c1997a0590609ef33a24985d8`. Obtain Bryant approval before commit, push, and PR creation. Stop before merge, build, signing, installed-app mutation, Phase 5B diagnostics minimization, release, site deployment, updater work, or dependency change without the applicable approval. Olivia remains paused.
+
+## Phase 5A Evidence
+
+- failure-first local-data checks failed 4/4 before implementation
+- five adversarial fix rounds closed startup visibility, strict store-path, corrupt-store, transient cleanup, overbroad orphan discovery, stale active-project snapshot, late-writer test gaps, intermediate-directory symlink traversal, unsafe-entry batching, and cache-directory replacement during file I/O
+- fixed native startup-error copy exposes no config path or project data and requests a clean quit when local storage cannot be secured
+- only recognized Crate project IDs and Crate quarantine names are eligible for startup orphan cleanup; explicit deletion still supports stored legacy IDs
+- cleanup runs in bounded event-loop batches, rechecks active projects immediately before quarantine, retries transient rename and removal failures, and leaves a safe next-launch retry path if the filesystem remains unavailable
+- complete Figma and presentation/provenance lifecycle lanes pass 171/171
+- startup and PSD safety lane passes 21/21
+- full serial source suite and fresh exact-base isolated Reprobox pass 329/329 with matching source/applied patch hashes and empty isolated cache roots afterward
+- previously questioned Keynote ambiguous-mojibake case passes 10/10 isolated serial repetitions
+- final security, product/regression, and test-adequacy read-only Autoreview lanes report no remaining finding; frozen-surface, syntax, whitespace, static privacy, and high-severity dependency closeout checks pass without mutation
 
 ## Phase 1 Evidence
 

@@ -50,6 +50,10 @@ const TEMP_SCRIPT_DIR_MODE = 0o700;
 const TEMP_SCRIPT_FILE_MODE = 0o600;
 const OWNER_ONLY_DIR_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
+const CACHE_CLEANUP_BATCH_SIZE = 25;
+const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
+const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CRATE_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
@@ -2960,23 +2964,61 @@ if (!gotLock) {
   app.quit();
 }
 
-const store = new Store({
-  defaults: {
-    projects: [],
-    settings: {
-      namingTemplate: DEFAULT_NAMING_TEMPLATE,
-      notifications: true,
-      includeDiagnosticReport: false,
-      showPackageDetails: true
-    },
-    usage: {
-      packagesThisMonth: 0,
-      resetDate: getNextMonthReset()
+let localStorePaths = null;
+let localStoreStartupError = null;
+let store = null;
+try {
+  localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
+  const candidateStore = new Store({
+    cwd: localStorePaths.userDataRealPath,
+    configFileMode: OWNER_ONLY_FILE_MODE,
+    defaults: {
+      projects: [],
+      settings: {
+        namingTemplate: DEFAULT_NAMING_TEMPLATE,
+        notifications: true,
+        includeDiagnosticReport: false,
+        showPackageDetails: true
+      },
+      usage: {
+        packagesThisMonth: 0,
+        resetDate: getNextMonthReset()
+      }
     }
+  });
+  if (
+    typeof candidateStore.path !== 'string' ||
+    fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
+    !hardenLocalStorePermissions(candidateStore.path, localStorePaths.userDataRealPath)
+  ) {
+    throw new Error('Crate could not secure local settings storage.');
   }
-});
+  validateLocalStoreShape(candidateStore);
+  store = candidateStore;
+  migrateSettings();
+} catch (_) {
+  store = null;
+  localStoreStartupError = new Error('Crate could not secure local settings storage.');
+}
 
 // One-time migration: update old naming template format to new one
+function validateLocalStoreShape(candidateStore) {
+  const projects = candidateStore.get('projects', null);
+  const settings = candidateStore.get('settings', null);
+  const usage = candidateStore.get('usage', null);
+  if (
+    !Array.isArray(projects) ||
+    !settings ||
+    typeof settings !== 'object' ||
+    Array.isArray(settings) ||
+    !usage ||
+    typeof usage !== 'object' ||
+    Array.isArray(usage)
+  ) {
+    throw new Error('Crate could not validate local settings storage.');
+  }
+}
+
 function migrateSettings() {
   const settings = store.get('settings');
   let namingTemplate = settings.namingTemplate;
@@ -3005,7 +3047,6 @@ function migrateSettings() {
     store.delete('settings.figmaTeamIds');
   }
 }
-migrateSettings();
 
 function configureFigmaCredentialStorage() {
   try {
@@ -4607,6 +4648,7 @@ const FIGMA_ASSET_FILE_MODE = OWNER_ONLY_FILE_MODE;
 const PRESENTATION_ASSETS_DIR = path.join(os.homedir(), '.crate', 'presentation-assets');
 const PRESENTATION_ASSET_DIR_MODE = OWNER_ONLY_DIR_MODE;
 const PRESENTATION_ASSET_FILE_MODE = OWNER_ONLY_FILE_MODE;
+const LOCAL_PROJECT_CACHE_CATEGORIES = Object.freeze(['figma-assets', 'presentation-assets']);
 const SAFE_FIGMA_ASSET_FORMATS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'tif', 'tiff', 'heic',
   'svg', 'pdf', 'bmp', 'avif',
@@ -4974,11 +5016,97 @@ function stopLsofPolling(projectId) {
  * Ensure Figma assets directory exists.
  */
 function hardenOwnerOnlyPermissions(targetPath, mode) {
-  if (process.platform === 'win32') return;
+  if (process.platform === 'win32') return true;
   try {
     fs.chmodSync(targetPath, mode);
+    return (fs.statSync(targetPath).mode & 0o777) === mode;
   } catch (_) {
-    // Best effort: chmod can be unsupported on unusual filesystems.
+    return false;
+  }
+}
+
+function hardenOwnerOnlyDirectory(dirPath, mode = OWNER_ONLY_DIR_MODE) {
+  if (process.platform === 'win32') return true;
+  let fd = null;
+  try {
+    const flags = fs.constants.O_RDONLY
+      | (fs.constants.O_DIRECTORY || 0)
+      | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(dirPath, flags);
+    if (!fs.fstatSync(fd).isDirectory()) return false;
+    fs.fchmodSync(fd, mode);
+    return (fs.fstatSync(fd).mode & 0o777) === mode;
+  } catch (_) {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function preflightLocalStorePaths(userDataPath) {
+  try {
+    if (typeof userDataPath !== 'string' || !userDataPath || !path.isAbsolute(userDataPath)) {
+      throw new Error('invalid user data path');
+    }
+
+    let userDataStat;
+    try {
+      userDataStat = fs.lstatSync(userDataPath);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+      fs.mkdirSync(userDataPath, { recursive: true, mode: OWNER_ONLY_DIR_MODE });
+      userDataStat = fs.lstatSync(userDataPath);
+    }
+    if (userDataStat.isSymbolicLink() || !userDataStat.isDirectory()) {
+      throw new Error('unsafe user data path');
+    }
+
+    const userDataRealPath = fs.realpathSync.native(userDataPath);
+    if (!hardenOwnerOnlyDirectory(userDataRealPath)) {
+      throw new Error('user data hardening failed');
+    }
+
+    const configPath = path.join(userDataRealPath, 'config.json');
+    try {
+      const configStat = fs.lstatSync(configPath);
+      if (configStat.isSymbolicLink() || !configStat.isFile()) {
+        throw new Error('unsafe config path');
+      }
+      const configRealPath = fs.realpathSync.native(configPath);
+      if (path.dirname(configRealPath) !== userDataRealPath || !hardenOwnerOnlyFile(configRealPath)) {
+        throw new Error('config hardening failed');
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+
+    return { userDataRealPath, configPath };
+  } catch (_) {
+    throw new Error('Crate could not secure local settings storage.');
+  }
+}
+
+function hardenLocalStorePermissions(storePath, userDataPath) {
+  if (process.platform === 'win32') return true;
+  if (typeof storePath !== 'string' || !storePath || typeof userDataPath !== 'string' || !userDataPath) {
+    return false;
+  }
+
+  try {
+    const userDataStat = fs.lstatSync(userDataPath);
+    const storeStat = fs.lstatSync(storePath);
+    if (userDataStat.isSymbolicLink() || !userDataStat.isDirectory()) return false;
+    if (storeStat.isSymbolicLink() || !storeStat.isFile()) return false;
+
+    const userDataRealPath = fs.realpathSync.native(userDataPath);
+    const storeRealPath = fs.realpathSync.native(storePath);
+    if (path.dirname(storeRealPath) !== userDataRealPath) return false;
+
+    return hardenOwnerOnlyDirectory(userDataRealPath) && hardenOwnerOnlyFile(storeRealPath);
+  } catch (_) {
+    return false;
   }
 }
 
@@ -4986,20 +5114,29 @@ function ensureOwnerOnlyDirectory(dirPath, mode = OWNER_ONLY_DIR_MODE) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true, mode });
   }
-  hardenOwnerOnlyPermissions(dirPath, mode);
+  if (!hardenOwnerOnlyDirectory(dirPath, mode)) {
+    throw new Error('Crate could not secure local storage.');
+  }
   return dirPath;
 }
 
 function hardenOwnerOnlyFile(filePath, mode = OWNER_ONLY_FILE_MODE) {
-  if (process.platform === 'win32') return;
+  if (process.platform === 'win32') return true;
   let fd = null;
   try {
     const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
     fd = fs.openSync(filePath, flags);
-    if (!fs.fstatSync(fd).isFile()) return;
+    const initialStat = fs.fstatSync(fd);
+    if (!initialStat.isFile() || initialStat.nlink !== 1) return false;
     fs.fchmodSync(fd, mode);
+    const finalStat = fs.fstatSync(fd);
+    return finalStat.isFile()
+      && finalStat.nlink === 1
+      && finalStat.dev === initialStat.dev
+      && finalStat.ino === initialStat.ino
+      && (finalStat.mode & 0o777) === mode;
   } catch (_) {
-    // Best effort: the file may have disappeared or the filesystem may not support fchmod.
+    return false;
   } finally {
     if (fd !== null) {
       try { fs.closeSync(fd); } catch (_) {}
@@ -5009,7 +5146,9 @@ function hardenOwnerOnlyFile(filePath, mode = OWNER_ONLY_FILE_MODE) {
 
 function writeOwnerOnlyFileSync(filePath, data, options = {}, mode = OWNER_ONLY_FILE_MODE) {
   fs.writeFileSync(filePath, data, { ...options, mode });
-  hardenOwnerOnlyFile(filePath, mode);
+  if (!hardenOwnerOnlyFile(filePath, mode)) {
+    throw new Error('Crate could not secure local storage.');
+  }
 }
 
 function cacheSafetyError(label, detail) {
@@ -5062,7 +5201,9 @@ function ensureSafeCacheDirectory(dirPath, label, mode = OWNER_ONLY_DIR_MODE, pa
     if (!stat.isDirectory()) throw cacheSafetyError(label, 'not_directory');
   }
 
-  hardenOwnerOnlyPermissions(dirPath, mode);
+  if (!hardenOwnerOnlyDirectory(dirPath, mode)) {
+    throw cacheSafetyError(label, 'permissions');
+  }
   const realPath = safeRealpath(dirPath, label);
   if (parentRealPath && !isPathInsideDirectory(parentRealPath, realPath)) {
     throw cacheSafetyError(label, 'outside_root');
@@ -5105,17 +5246,366 @@ function isPathInsideDirectory(parentDir, filePath) {
   return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
-function ensureRegularCacheFile(filePath, label) {
-  let stat;
+function safeStoredProjectCacheIds() {
+  let projects;
   try {
-    stat = fs.lstatSync(filePath);
-  } catch (e) {
-    if (e && e.code === 'ENOENT') return null;
-    throw cacheSafetyError(label, 'unavailable');
+    projects = store && store.get('projects', null);
+  } catch (_) {
+    return null;
   }
-  if (stat.isSymbolicLink()) throw cacheSafetyError(label, 'symlink');
-  if (!stat.isFile()) throw cacheSafetyError(label, 'not_file');
-  return stat;
+  if (!Array.isArray(projects)) return null;
+
+  const ids = new Set();
+  for (const project of projects) {
+    if (!project || typeof project.id !== 'string') return null;
+    try {
+      ids.add(ensureSafeCacheSegment(project.id, 'cache-project'));
+    } catch (_) {
+      return null;
+    }
+  }
+  return ids;
+}
+
+function normalizeProjectCacheIds(projectIds) {
+  const ids = new Set();
+  try {
+    for (const projectId of projectIds || []) {
+      ids.add(ensureSafeCacheSegment(projectId, 'cache-project'));
+    }
+  } catch (_) {
+    return null;
+  }
+  return ids;
+}
+
+function existingSafeCacheCategory(category) {
+  let safeCategory;
+  try {
+    safeCategory = ensureSafeCacheSegment(category, 'cache-category');
+  } catch (_) {
+    return { exists: true, categoryRealPath: null };
+  }
+
+  const crateDir = path.join(os.homedir(), '.crate');
+  const categoryDir = path.join(crateDir, safeCategory);
+  try {
+    const crateStat = fs.lstatSync(crateDir);
+    if (crateStat.isSymbolicLink() || !crateStat.isDirectory()) {
+      return { exists: true, categoryRealPath: null };
+    }
+
+    let categoryStat;
+    try {
+      categoryStat = fs.lstatSync(categoryDir);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return { exists: false, categoryRealPath: null };
+      return { exists: true, categoryRealPath: null };
+    }
+    if (categoryStat.isSymbolicLink() || !categoryStat.isDirectory()) {
+      return { exists: true, categoryRealPath: null };
+    }
+
+    const crateRealPath = fs.realpathSync.native(crateDir);
+    const categoryRealPath = fs.realpathSync.native(categoryDir);
+    if (!isPathInsideDirectory(crateRealPath, categoryRealPath)) {
+      return { exists: true, categoryRealPath: null };
+    }
+    if (!hardenOwnerOnlyDirectory(crateRealPath) || !hardenOwnerOnlyDirectory(categoryRealPath)) {
+      return { exists: true, categoryRealPath: null };
+    }
+    return { exists: true, categoryRealPath };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { exists: false, categoryRealPath: null };
+    return { exists: true, categoryRealPath: null };
+  }
+}
+
+function isCrateProjectCacheName(entryName) {
+  return typeof entryName === 'string' && CRATE_PROJECT_CACHE_ID_PATTERN.test(entryName);
+}
+
+function isCrateCacheQuarantineName(entryName) {
+  return typeof entryName === 'string' && CRATE_CACHE_QUARANTINE_PATTERN.test(entryName);
+}
+
+function waitForCacheCleanupRetry(attempt) {
+  const delay = CACHE_CLEANUP_RETRY_DELAYS_MS[Math.min(attempt, CACHE_CLEANUP_RETRY_DELAYS_MS.length - 1)];
+  return new Promise(resolve => setTimeout(resolve, delay));
+}
+
+function yieldCacheCleanupTurn() {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
+async function removeQuarantinedProjectCache(categoryRealPath, cleanupName) {
+  if (!isCrateCacheQuarantineName(cleanupName)) return false;
+  const cleanupPath = path.join(categoryRealPath, cleanupName);
+
+  for (let attempt = 0; attempt <= CACHE_CLEANUP_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const cleanupStat = await fs.promises.lstat(cleanupPath);
+      if (cleanupStat.isSymbolicLink() || !cleanupStat.isDirectory()) return false;
+      const cleanupRealPath = await fs.promises.realpath(cleanupPath);
+      if (!isPathInsideDirectory(categoryRealPath, cleanupRealPath)) return false;
+      await fs.promises.rm(cleanupPath, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return true;
+      if (attempt >= CACHE_CLEANUP_RETRY_DELAYS_MS.length) break;
+      await waitForCacheCleanupRetry(attempt);
+    }
+  }
+
+  return false;
+}
+
+async function hardenActiveProjectCache(categoryRealPath, projectId) {
+  let safeProjectId;
+  try {
+    safeProjectId = ensureSafeCacheSegment(projectId, 'cache-project');
+  } catch (_) {
+    return false;
+  }
+
+  const projectDir = path.join(categoryRealPath, safeProjectId);
+  let projectRealPath;
+  try {
+    const projectStat = await fs.promises.lstat(projectDir);
+    if (projectStat.isSymbolicLink() || !projectStat.isDirectory()) return false;
+    projectRealPath = await fs.promises.realpath(projectDir);
+    if (!isPathInsideDirectory(categoryRealPath, projectRealPath)) return false;
+    if (!hardenOwnerOnlyDirectory(projectRealPath)) return false;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return true;
+    return false;
+  }
+
+  let entries;
+  try {
+    entries = await fs.promises.opendir(projectRealPath);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return true;
+    return false;
+  }
+
+  let allSucceeded = true;
+  let processed = 0;
+  try {
+    for await (const entry of entries) {
+      const entryPath = path.join(projectRealPath, entry.name);
+      try {
+        const entryStat = await fs.promises.lstat(entryPath);
+        if (entryStat.isSymbolicLink() || (entryStat.isFile() && entryStat.nlink !== 1)) {
+          try {
+            await fs.promises.unlink(entryPath);
+          } catch (error) {
+            if (!error || error.code !== 'ENOENT') allSucceeded = false;
+          }
+        } else if (!entryStat.isFile()) {
+          allSucceeded = false;
+        } else {
+          const entryRealPath = await fs.promises.realpath(entryPath);
+          if (!isPathInsideDirectory(projectRealPath, entryRealPath) || !hardenOwnerOnlyFile(entryRealPath)) {
+            allSucceeded = false;
+          }
+        }
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') allSucceeded = false;
+      }
+
+      processed += 1;
+      if (processed % CACHE_CLEANUP_BATCH_SIZE === 0) {
+        await yieldCacheCleanupTurn();
+      }
+    }
+  } catch (_) {
+    allSucceeded = false;
+  }
+  return allSucceeded;
+}
+
+async function quarantineAndRemoveProjectCache(categoryRealPath, projectId) {
+  let safeProjectId;
+  try {
+    safeProjectId = ensureSafeCacheSegment(projectId, 'cache-project');
+  } catch (_) {
+    return false;
+  }
+
+  const projectDir = path.join(categoryRealPath, safeProjectId);
+  for (let attempt = 0; attempt <= CACHE_CLEANUP_RETRY_DELAYS_MS.length; attempt++) {
+    const currentActiveIds = safeStoredProjectCacheIds();
+    if (currentActiveIds === null) return false;
+    if (currentActiveIds.has(safeProjectId)) return true;
+
+    try {
+      const projectStat = await fs.promises.lstat(projectDir);
+      if (projectStat.isSymbolicLink() || !projectStat.isDirectory()) return false;
+      const projectRealPath = await fs.promises.realpath(projectDir);
+      if (!isPathInsideDirectory(categoryRealPath, projectRealPath)) return false;
+
+      const latestActiveIds = safeStoredProjectCacheIds();
+      if (latestActiveIds === null) return false;
+      if (latestActiveIds.has(safeProjectId)) {
+        return hardenActiveProjectCache(categoryRealPath, safeProjectId);
+      }
+
+      const cleanupName = `.crate-cleanup-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+      const cleanupPath = path.join(categoryRealPath, cleanupName);
+      await fs.promises.rename(projectDir, cleanupPath);
+
+      const postQuarantineActiveIds = safeStoredProjectCacheIds();
+      if (postQuarantineActiveIds === null) return false;
+      if (postQuarantineActiveIds.has(safeProjectId)) {
+        try {
+          const currentProjectStat = await fs.promises.lstat(projectDir);
+          if (currentProjectStat.isSymbolicLink() || !currentProjectStat.isDirectory()) return false;
+          const currentSafe = await hardenActiveProjectCache(categoryRealPath, safeProjectId);
+          const staleRemoved = await removeQuarantinedProjectCache(categoryRealPath, cleanupName);
+          return currentSafe && staleRemoved;
+        } catch (error) {
+          if (!error || error.code !== 'ENOENT') return false;
+        }
+
+        try {
+          await fs.promises.rename(cleanupPath, projectDir);
+        } catch (_) {
+          return false;
+        }
+        return hardenActiveProjectCache(categoryRealPath, safeProjectId);
+      }
+      return removeQuarantinedProjectCache(categoryRealPath, cleanupName);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return true;
+      if (attempt >= CACHE_CLEANUP_RETRY_DELAYS_MS.length) break;
+      await waitForCacheCleanupRetry(attempt);
+    }
+  }
+
+  return false;
+}
+
+async function processProjectCacheCandidate(categoryRealPath, candidate) {
+  const currentActiveIds = safeStoredProjectCacheIds();
+  if (currentActiveIds === null) return false;
+  if (currentActiveIds.has(candidate.name)) {
+    return hardenActiveProjectCache(categoryRealPath, candidate.name);
+  }
+  if (candidate.quarantined) {
+    return removeQuarantinedProjectCache(categoryRealPath, candidate.name);
+  }
+  return quarantineAndRemoveProjectCache(categoryRealPath, candidate.name);
+}
+
+async function processProjectCacheBatch(categoryRealPath, batch) {
+  let allSucceeded = true;
+  for (const candidate of batch) {
+    if (!await processProjectCacheCandidate(categoryRealPath, candidate)) {
+      allSucceeded = false;
+    }
+  }
+  return allSucceeded;
+}
+
+async function runProjectCacheCleanup(requestedIds, removeOrphans) {
+  const activeIds = safeStoredProjectCacheIds();
+  if (activeIds === null) return false;
+
+  let allSucceeded = true;
+
+  for (const category of LOCAL_PROJECT_CACHE_CATEGORIES) {
+    const cache = existingSafeCacheCategory(category);
+    if (!cache.exists) continue;
+    if (!cache.categoryRealPath) {
+      allSucceeded = false;
+      continue;
+    }
+
+    const requested = [...requestedIds].map(name => ({ name, quarantined: false }));
+    for (let offset = 0; offset < requested.length; offset += CACHE_CLEANUP_BATCH_SIZE) {
+      const batch = requested.slice(offset, offset + CACHE_CLEANUP_BATCH_SIZE);
+      if (!await processProjectCacheBatch(cache.categoryRealPath, batch)) {
+        allSucceeded = false;
+      }
+      if (offset + CACHE_CLEANUP_BATCH_SIZE < requested.length) {
+        await yieldCacheCleanupTurn();
+      }
+    }
+
+    if (!removeOrphans) continue;
+
+    let directory;
+    try {
+      directory = await fs.promises.opendir(cache.categoryRealPath);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') allSucceeded = false;
+      continue;
+    }
+
+    let batch = [];
+    try {
+      for await (const entry of directory) {
+        let candidate = null;
+        if (activeIds.has(entry.name)) {
+          candidate = { name: entry.name, quarantined: false };
+        } else if (isCrateCacheQuarantineName(entry.name)) {
+          candidate = { name: entry.name, quarantined: true };
+        } else if (isCrateProjectCacheName(entry.name)) {
+          candidate = { name: entry.name, quarantined: false };
+        }
+        if (!candidate) continue;
+
+        batch.push(candidate);
+        if (batch.length < CACHE_CLEANUP_BATCH_SIZE) continue;
+        if (!await processProjectCacheBatch(cache.categoryRealPath, batch)) {
+          allSucceeded = false;
+        }
+        batch = [];
+        await yieldCacheCleanupTurn();
+      }
+      if (batch.length > 0 && !await processProjectCacheBatch(cache.categoryRealPath, batch)) {
+        allSucceeded = false;
+      }
+    } catch (_) {
+      allSucceeded = false;
+    }
+  }
+  return allSucceeded;
+}
+
+let projectCacheCleanupQueue = Promise.resolve();
+
+function scheduleProjectCacheCleanup({ projectIds = [], removeOrphans = false } = {}) {
+  const requestedIds = normalizeProjectCacheIds(projectIds);
+  if (!requestedIds) {
+    console.warn('[crate][cache] deferred cache cleanup could not complete');
+    return Promise.resolve(false);
+  }
+
+  const cleanupTask = projectCacheCleanupQueue
+    .catch(() => {})
+    .then(() => runProjectCacheCleanup(requestedIds, removeOrphans))
+    .then((succeeded) => {
+      if (!succeeded) {
+        console.warn('[crate][cache] deferred cache cleanup could not complete');
+      }
+      return succeeded;
+    }, () => {
+      console.warn('[crate][cache] deferred cache cleanup could not complete');
+      return false;
+    });
+  projectCacheCleanupQueue = cleanupTask.then(() => undefined, () => undefined);
+  return cleanupTask;
+}
+
+function scheduleDeletedProjectCacheCleanup(projectId) {
+  const projectIds = normalizeProjectCacheIds([projectId]);
+  if (!projectIds) return Promise.resolve(false);
+  const activeIds = safeStoredProjectCacheIds();
+  if (activeIds === null) return Promise.resolve(false);
+  if (activeIds.has(projectId)) return Promise.resolve(true);
+  return scheduleProjectCacheCleanup({ projectIds });
 }
 
 function safeCacheTempPath(filePath) {
@@ -5125,37 +5615,230 @@ function safeCacheTempPath(filePath) {
   return path.join(dir, `.${base}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp${ext}`);
 }
 
+function isDirectCacheChild(cacheDir, filePath) {
+  if (typeof cacheDir !== 'string' || typeof filePath !== 'string') return false;
+  const resolvedCacheDir = path.resolve(cacheDir);
+  const resolvedFilePath = path.resolve(filePath);
+  return resolvedFilePath !== resolvedCacheDir && path.dirname(resolvedFilePath) === resolvedCacheDir;
+}
+
+function captureCacheDirectoryIdentity(cacheDir, label = 'cache-directory') {
+  if (typeof cacheDir !== 'string' || !cacheDir) throw cacheSafetyError(label, 'invalid');
+  const cachePath = path.resolve(cacheDir);
+  let fd = null;
+  try {
+    const initialPathStat = fs.lstatSync(cachePath);
+    if (initialPathStat.isSymbolicLink() || !initialPathStat.isDirectory()) {
+      throw cacheSafetyError(label, 'unsafe');
+    }
+    const realPath = safeRealpath(cachePath, label);
+    const flags = fs.constants.O_RDONLY
+      | (fs.constants.O_DIRECTORY || 0)
+      | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(cachePath, flags);
+    const openedStat = fs.fstatSync(fd);
+    const finalPathStat = fs.lstatSync(cachePath);
+    const finalRealPath = safeRealpath(cachePath, label);
+    if (!openedStat.isDirectory()
+      || finalPathStat.isSymbolicLink()
+      || !finalPathStat.isDirectory()
+      || initialPathStat.dev !== openedStat.dev
+      || initialPathStat.ino !== openedStat.ino
+      || finalPathStat.dev !== openedStat.dev
+      || finalPathStat.ino !== openedStat.ino
+      || finalRealPath !== realPath) {
+      throw cacheSafetyError(label, 'changed');
+    }
+    return {
+      path: cachePath,
+      realPath,
+      dev: openedStat.dev,
+      ino: openedStat.ino,
+    };
+  } catch (error) {
+    if (error && error.message && error.message.startsWith('Unsafe cache path:')) throw error;
+    throw cacheSafetyError(label, 'unavailable');
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function assertCacheDirectoryIdentity(identity, label = 'cache-directory') {
+  const current = captureCacheDirectoryIdentity(identity && identity.path, label);
+  if (!identity
+    || current.realPath !== identity.realPath
+    || current.dev !== identity.dev
+    || current.ino !== identity.ino) {
+    throw cacheSafetyError(label, 'changed');
+  }
+}
+
+function assertCacheFileDescriptorIdentity(fd, filePath, directoryIdentity, label) {
+  const openedStat = fs.fstatSync(fd);
+  if (!openedStat.isFile() || openedStat.nlink !== 1) {
+    throw cacheSafetyError(label, 'not_file');
+  }
+
+  assertCacheDirectoryIdentity(directoryIdentity, `${label}-directory`);
+  const pathStat = fs.lstatSync(filePath);
+  const realFilePath = safeRealpath(filePath, label);
+  if (pathStat.isSymbolicLink()
+    || !pathStat.isFile()
+    || pathStat.nlink !== 1
+    || pathStat.dev !== openedStat.dev
+    || pathStat.ino !== openedStat.ino
+    || path.dirname(realFilePath) !== directoryIdentity.realPath) {
+    throw cacheSafetyError(label, 'changed');
+  }
+  assertCacheDirectoryIdentity(directoryIdentity, `${label}-directory`);
+  return openedStat;
+}
+
+function openVerifiedCacheFileSync(filePath, cacheDir, label, flags = fs.constants.O_RDONLY) {
+  if (!isDirectCacheChild(cacheDir, filePath)) throw cacheSafetyError(label, 'outside_root');
+  const directoryIdentity = captureCacheDirectoryIdentity(cacheDir, `${label}-directory`);
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, flags | (fs.constants.O_NOFOLLOW || 0));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    throw cacheSafetyError(label, 'unavailable');
+  }
+
+  try {
+    const stat = assertCacheFileDescriptorIdentity(fd, filePath, directoryIdentity, label);
+    return { fd, stat, directoryIdentity };
+  } catch (error) {
+    try { fs.closeSync(fd); } catch (_) {}
+    throw error;
+  }
+}
+
+function getVerifiedCacheFileStatSync(filePath, cacheDir, label) {
+  const handle = openVerifiedCacheFileSync(filePath, cacheDir, label);
+  if (!handle) return null;
+  try {
+    return handle.stat;
+  } finally {
+    try { fs.closeSync(handle.fd); } catch (_) {}
+  }
+}
+
+function hardenOwnerOnlyCacheFileSync(filePath, cacheDir, label, mode = OWNER_ONLY_FILE_MODE) {
+  const handle = openVerifiedCacheFileSync(filePath, cacheDir, label);
+  if (!handle) return false;
+  try {
+    fs.fchmodSync(handle.fd, mode);
+    const finalStat = assertCacheFileDescriptorIdentity(
+      handle.fd,
+      filePath,
+      handle.directoryIdentity,
+      label
+    );
+    return (finalStat.mode & 0o777) === mode;
+  } catch (error) {
+    if (error && error.message && error.message.startsWith('Unsafe cache path:')) throw error;
+    throw cacheSafetyError(label, 'permissions');
+  } finally {
+    try { fs.closeSync(handle.fd); } catch (_) {}
+  }
+}
+
 function writeOwnerOnlyCacheFileSync(filePath, data, cacheDir, mode = OWNER_ONLY_FILE_MODE, options = {}) {
-  if (!isPathInsideDirectory(cacheDir, filePath)) throw cacheSafetyError('cache-file', 'outside_root');
-  const existing = ensureRegularCacheFile(filePath, 'cache-file');
+  if (!isDirectCacheChild(cacheDir, filePath)) throw cacheSafetyError('cache-file', 'outside_root');
+  const existing = getVerifiedCacheFileStatSync(filePath, cacheDir, 'cache-file');
   if (existing && !options.replace) throw cacheSafetyError('cache-file', 'exists');
 
   const tempPath = options.replace ? safeCacheTempPath(filePath) : filePath;
+  const directoryIdentity = captureCacheDirectoryIdentity(cacheDir, 'cache-file-directory');
+  let createdByThisWrite = false;
+  let installedAtFinalPath = false;
+  let writtenIdentity = null;
+  let fd = null;
   try {
-    fs.writeFileSync(tempPath, data, { flag: 'wx', mode });
-    hardenOwnerOnlyFile(tempPath, mode);
+    const flags = fs.constants.O_WRONLY
+      | fs.constants.O_CREAT
+      | fs.constants.O_EXCL
+      | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(tempPath, flags, mode);
+    createdByThisWrite = true;
+    writtenIdentity = fs.fstatSync(fd);
+    assertCacheFileDescriptorIdentity(fd, tempPath, directoryIdentity, 'cache-file');
+    fs.fchmodSync(fd, mode);
+    if ((assertCacheFileDescriptorIdentity(fd, tempPath, directoryIdentity, 'cache-file').mode & 0o777) !== mode) {
+      throw cacheSafetyError('cache-file', 'permissions');
+    }
+    fs.writeFileSync(fd, data);
     if (options.replace) {
-      ensureRegularCacheFile(filePath, 'cache-file');
+      getVerifiedCacheFileStatSync(filePath, cacheDir, 'cache-file');
+      assertCacheDirectoryIdentity(directoryIdentity, 'cache-file-directory');
       fs.renameSync(tempPath, filePath);
-      hardenOwnerOnlyFile(filePath, mode);
+      installedAtFinalPath = true;
+      assertCacheFileDescriptorIdentity(fd, filePath, directoryIdentity, 'cache-file');
     }
   } catch (e) {
-    if (tempPath !== filePath) {
-      try { fs.unlinkSync(tempPath); } catch (_) {}
+    if (createdByThisWrite && writtenIdentity) {
+      const cleanupPath = installedAtFinalPath ? filePath : tempPath;
+      try {
+        const cleanupStat = fs.lstatSync(cleanupPath);
+        if (!cleanupStat.isSymbolicLink()
+          && cleanupStat.isFile()
+          && cleanupStat.nlink === 1
+          && cleanupStat.dev === writtenIdentity.dev
+          && cleanupStat.ino === writtenIdentity.ino) {
+          fs.unlinkSync(cleanupPath);
+        }
+      } catch (_) {}
     }
     if (e && e.message && e.message.startsWith('Unsafe cache path:')) throw e;
     throw cacheSafetyError('cache-file', 'write_failed');
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
   }
 }
 
 function hardenPresentationCacheFileIfPresent(filePath, cacheDir) {
-  if (!isPathInsideDirectory(cacheDir, filePath)) return;
+  return hardenOwnerOnlyCacheFileSync(
+    filePath,
+    cacheDir,
+    'presentation-cache-file',
+    PRESENTATION_ASSET_FILE_MODE
+  );
+}
+
+function tryHardenPresentationCacheFile(filePath, cacheDir) {
   try {
-    ensureRegularCacheFile(filePath, 'presentation-cache-file');
+    return hardenPresentationCacheFileIfPresent(filePath, cacheDir);
   } catch (_) {
-    return;
+    return false;
   }
-  hardenOwnerOnlyFile(filePath, PRESENTATION_ASSET_FILE_MODE);
+}
+
+function readOwnerOnlyCacheFileSync(filePath, cacheDir, label, mode = OWNER_ONLY_FILE_MODE) {
+  const handle = openVerifiedCacheFileSync(filePath, cacheDir, label);
+  if (!handle) throw cacheSafetyError(label, 'unavailable');
+  try {
+    fs.fchmodSync(handle.fd, mode);
+    const finalStat = assertCacheFileDescriptorIdentity(
+      handle.fd,
+      filePath,
+      handle.directoryIdentity,
+      label
+    );
+    if ((finalStat.mode & 0o777) !== mode) {
+      throw cacheSafetyError(label, 'permissions');
+    }
+    return fs.readFileSync(handle.fd);
+  } catch (error) {
+    if (error && error.message && error.message.startsWith('Unsafe cache path:')) throw error;
+    throw cacheSafetyError(label, 'unavailable');
+  } finally {
+    try { fs.closeSync(handle.fd); } catch (_) {}
+  }
 }
 
 function sanitizeFigmaAssetFormat(format) {
@@ -5197,11 +5880,18 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png', asse
     const localPath = path.join(projectDir, `${safeName}.${ext}`);
 
     // Skip if already exists with same size
-    const existingStat = ensureRegularCacheFile(localPath, 'figma-cache-file');
+    const existingStat = getVerifiedCacheFileStatSync(localPath, projectDir, 'figma-cache-file');
     if (existingStat) {
       const existingSize = existingStat.size;
       if (existingSize === buffer.length) {
-        hardenOwnerOnlyFile(localPath, FIGMA_ASSET_FILE_MODE);
+        if (!hardenOwnerOnlyCacheFileSync(
+          localPath,
+          projectDir,
+          'figma-cache-file',
+          FIGMA_ASSET_FILE_MODE
+        )) {
+          throw cacheSafetyError('figma-cache-file', 'permissions');
+        }
         return localPath;
       }
     }
@@ -5567,6 +6257,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
     return { projectId, error: safeError };
   } finally {
     figmaInProgress.delete(projectId);
+    scheduleDeletedProjectCacheCleanup(projectId);
   }
 }
 
@@ -7877,9 +8568,12 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     // all to the same display base. Exact duplicate scan media is handled by
     // content fingerprints below.
     const alreadyCapturedBases = new Set();
+    const safePresentationCachePaths = new Set();
     for (const f of projectFiles) {
       if (f && f.source === 'scan-on-save-presentation') {
-        hardenPresentationCacheFileIfPresent(f.path, tempDir);
+        if (tryHardenPresentationCacheFile(f.path, tempDir) && typeof f.path === 'string') {
+          safePresentationCachePaths.add(path.resolve(f.path));
+        }
         continue;
       }
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
@@ -7896,7 +8590,19 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
         if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
         try {
-          const buf = fs.readFileSync(f.path);
+          const fromPresentationCache = f && f.source === 'scan-on-save-presentation';
+          if (fromPresentationCache
+            && (typeof f.path !== 'string' || !safePresentationCachePaths.has(path.resolve(f.path)))) {
+            continue;
+          }
+          const buf = fromPresentationCache
+            ? readOwnerOnlyCacheFileSync(
+              f.path,
+              tempDir,
+              'presentation-cache-file',
+              PRESENTATION_ASSET_FILE_MODE
+            )
+            : fs.readFileSync(f.path);
           const size = buf.length;
           capturedSizes.add(size);
           const hash = crypto.createHash('md5').update(buf).digest('hex');
@@ -7911,11 +8617,18 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
       try {
         for (const entryName of fs.readdirSync(tempDir)) {
           const candidatePath = path.join(tempDir, entryName);
-          const stat = fs.statSync(candidatePath);
-          if (!stat.isFile()) continue;
-          const buf = fs.readFileSync(candidatePath);
-          const hash = crypto.createHash('md5').update(buf).digest('hex');
-          if (`${buf.length}:${hash}` === fingerprint) return true;
+          try {
+            const buf = readOwnerOnlyCacheFileSync(
+              candidatePath,
+              tempDir,
+              'presentation-cache-file',
+              PRESENTATION_ASSET_FILE_MODE
+            );
+            const hash = crypto.createHash('md5').update(buf).digest('hex');
+            if (`${buf.length}:${hash}` === fingerprint) return true;
+          } catch (_) {
+            // Unsafe or unavailable cache entries are never followed.
+          }
         }
       } catch (e) {
         return false;
@@ -8001,7 +8714,12 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
           hardenPresentationCacheFileIfPresent(destPath, tempDir);
           if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
             try {
-              const existingBuf = fs.readFileSync(destPath);
+              const existingBuf = readOwnerOnlyCacheFileSync(
+                destPath,
+                tempDir,
+                'presentation-cache-file',
+                PRESENTATION_ASSET_FILE_MODE
+              );
               const existingHash = crypto.createHash('md5').update(existingBuf).digest('hex');
               if (`${existingBuf.length}:${existingHash}` === extractedFingerprint) {
                 destPath = null;
@@ -8073,6 +8791,8 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     }
   } catch (e) {
     console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
+  } finally {
+    scheduleDeletedProjectCacheCleanup(projectId);
   }
 }
 
@@ -9848,6 +10568,7 @@ end tell`;
   } finally {
     // FIX 2 (C2): Always clear scan-in-flight flag
     scanInFlight.delete(projectId);
+    scheduleDeletedProjectCacheCleanup(projectId);
   }
 });
 
@@ -10538,16 +11259,27 @@ registerTrustedIpcHandler('projects:select-output', async () => {
 registerTrustedIpcHandler('projects:delete', (event, id) => {
   stopWatching(id);
   figmaPackageTransferBlocks.delete(id);
+  let removed = false;
   const result = mutateProject(id, (project, projects) => {
     const idx = projects.indexOf(project);
-    if (idx !== -1) projects.splice(idx, 1);
+    if (idx !== -1) {
+      projects.splice(idx, 1);
+      removed = true;
+    }
     return projects;
   });
+  if (removed) {
+    scheduleProjectCacheCleanup({
+      projectIds: [id],
+      removeOrphans: false,
+    });
+  }
   // If project wasn't found, return current state
   return result || getProjects();
 });
 
 registerTrustedIpcHandler('projects:delete-all', () => {
+  const projectCacheIds = safeStoredProjectCacheIds();
   // Stop all active watchers and lsof pollers
   for (const [id, watcher] of watchers) {
     watcher.close();
@@ -10589,6 +11321,12 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   designFilePids.clear();
 
   store.set('projects', []);
+  if (projectCacheIds !== null) {
+    scheduleProjectCacheCleanup({
+      projectIds: projectCacheIds,
+      removeOrphans: true,
+    });
+  }
   return [];
 });
 
@@ -10851,6 +11589,15 @@ registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {
+  if (localStoreStartupError) {
+    dialog.showErrorBox(
+      'Crate could not open',
+      'Crate could not secure its local settings. No project data was opened. Please quit and reopen Crate. If this continues, contact support.'
+    );
+    app.quit();
+    return;
+  }
+
   try {
     configureFigmaCredentialStorage();
 
@@ -10872,6 +11619,13 @@ app.whenReady().then(async () => {
     showMainWindow({ reason: 'startup' });
     createTray();
     migrateFigmaCredentialStorageInBackground();
+
+    const activeProjectCacheIds = safeStoredProjectCacheIds();
+    if (activeProjectCacheIds !== null) {
+      scheduleProjectCacheCleanup({
+        removeOrphans: true,
+      });
+    }
 
     // Resume watching for any active projects without letting watcher recovery block the UI.
     const projects = getProjects();
