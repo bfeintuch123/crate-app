@@ -7,10 +7,10 @@
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-diagnostics-minimization-phase5b`
+- branch: `codex/security-release-runtime-phase6a`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1 through 5A are merged and the Phase 5A installed-app gate is complete; Phase 5B optional diagnostics minimization is implemented, fully reviewed, and awaiting Bryant's commit/push/PR approval
+- status: phases 1 through 5B are merged and their installed-app gates are complete; Phase 6A runtime artifact hardening, full pre-commit review, exact-base reproduction, and contained signed-app validation are complete; Bryant approved commit, push, PR creation, and merge if merge readiness remains clean
 
 ## Goal
 
@@ -37,11 +37,11 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: Phase 5B optional diagnostics minimization
-- security target: keep optional support diagnostics useful without exporting project identity, filenames, resource names, paths, timestamps, raw errors, payloads, credentials, URLs, Figma identifiers, or persistent graph IDs
-- implementation target: emit schema v2 fixed counts and error categories plus allowlisted package-relevant graph metadata with randomized report-local identifiers; preserve the complete internal provenance graph
-- workflow target: diagnostics remain off by default and under `Crate Diagnostics/crate-provenance.json`; Package Details and normal package behavior remain unchanged
-- package-engine impact: no package selection, copied or extracted file, naming, output, quota, or Package Details behavior change
+- phase: Phase 6A runtime artifact hardening
+- security target: constrain packaged Electron execution to the signed ASAR, remove unused permission declarations, and keep Automation authority out of helper processes
+- implementation target: disable RunAsNode, NODE_OPTIONS, and Node CLI inspection; require embedded ASAR integrity and ASAR-only application loading; audit and retain the file-protocol privilege required by Crate's local signed renderer; keep strict HTTPS transport metadata; and separate main and inherited entitlements
+- workflow target: preserve normal launch, renderer styling, project creation, Quick Package, Package Details, and Figma behavior without a new user prompt or setup step
+- package-engine impact: no package selection, copied or extracted file, naming, output, quota, Package Details, watcher, parser, or provenance behavior change
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, prompt, permission, setting, or credential action
 
@@ -50,6 +50,12 @@ Each phase must remain independently reviewable and revertible. Existing functio
 Before Crate's public release, specify and implement an in-app update or installation process so users do not need to repeatedly download and reinstall from the website.
 
 This is deliberately outside the security patches. The later updater work must require signed update metadata and artifacts, preserve user projects and settings, support staged internal QA and rollback, fail safely if verification fails, and receive its own threat model and release-gate review.
+
+## Deferred Dependency Cleanup Gate
+
+- After Phase 6B, remind Bryant that the direct `uuid@9.0.1` dependency still has a moderate advisory affecting buffer-writing UUID v3, v5, and v6 paths. Crate currently calls only UUID v4 without a caller-provided buffer, so this does not interrupt Phase 6A or 6B.
+- Prefer a narrow removal of the dependency in favor of Node's built-in `crypto.randomUUID()` rather than taking npm's SemVer-major `uuid@14` fix automatically.
+- Complete and review that dependency cleanup before the final integrated six-phase audit so the audit covers the shipped dependency graph. If Bryant explicitly defers it until after that audit, remind him again at audit close and require the affected dependency, source, signed-app, and integrated audit lanes to be rerun before Olivia or public-release rollout.
 
 ## Checkpoints
 
@@ -116,7 +122,16 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] pass the 191-test focused lane, 330-test full suite, syntax, whitespace, diagnostic-reader compatibility, and high-severity dependency gates
 - [x] complete final exact-base Reprobox
 - [x] complete independent no-finding Autoreview
-- [ ] obtain Bryant approval before Phase 5B commit, push, and PR creation
+- [x] obtain Bryant approval before Phase 5B commit, push, and PR creation
+- [x] merge Phase 5B PR #138 into `v2.4.x` as `4d426006b572c3b197760c634b885eab408e2007`
+- [x] complete installed-app Phase 5B schema-v2 diagnostics and unchanged-Figma validation
+- [x] create a clean Phase 6A branch from merged `origin/v2.4.x`
+- [x] add failure-first tests for the exact fuse policy, separate helper entitlements, strict transport metadata, and removal of unused permission declarations
+- [x] implement narrow Phase 6A build-metadata and entitlement hardening without dependency, package, watcher, parser, provenance, quota, renderer, or Figma changes
+- [x] pass the corrected 251-test focused regression lane and 334-test complete serial source suite
+- [x] complete Phase 6A Autoreview, regression, security, provenance, runner, exact-base Reprobox, and contained signed-app gates
+- [x] obtain Bryant approval before Phase 6A commit, push, and PR creation
+- [ ] after Phase 6B, remind Bryant and resolve or explicitly disposition the `uuid` cleanup before the final integrated six-phase audit closes
 
 ## Stop Gates
 
@@ -127,7 +142,21 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Obtain Bryant approval before the reviewed Phase 5B commit, push, and PR creation. Stop before those actions, merge, build, signing, installed-app mutation, Phase 6, release, site deployment, updater work, or dependency change without the applicable approval. Olivia remains paused.
+Commit and push Phase 6A, open its PR against `v2.4.x`, run merge readiness, and merge only if every required gate remains clean. Then begin Phase 6B from the merged canonical branch. Stop before release, site deployment, updater work, dependency change, installed-app mutation, or external tester rollout. Olivia remains paused.
+
+## Phase 6A Evidence
+
+- the clean branch is based exactly on merged `origin/v2.4.x` commit `4d426006b572c3b197760c634b885eab408e2007`; application source, package behavior, watchers, parsers, provenance, quota, renderer, and Figma behavior were not changed
+- Electron fuses disable RunAsNode, `NODE_OPTIONS`, and Node CLI inspection while enabling embedded ASAR integrity and ASAR-only application loading
+- the signed GUI proof showed that disabling Electron's file-protocol privilege breaks Crate's existing signed `file://` ASAR renderer with `ERR_FILE_NOT_FOUND`; the privilege is therefore retained as an explicit compatibility exception while exact renderer navigation, sandboxing, context isolation, web security, new-window denial, trusted-frame IPC checks, ASAR integrity, and ASAR-only loading remain enforced
+- the main application keeps the required Apple Events entitlement; the general, renderer, GPU, and plugin helpers retain only Electron runtime entitlements and do not inherit Automation authority
+- the final packaged `Info.plist` has `NSAllowsArbitraryLoads=false`, retains the required Apple Events usage description, and omits unused audio, Bluetooth, camera, and microphone permission declarations
+- Autoreview caught Electron Builder rewriting strict ATS metadata after source configuration and the initial file-protocol fuse breaking the renderer; the after-pack plist hardening and audited fuse exception were implemented, independently rereviewed, and verified in the final signed artifact
+- corrected focused regression lane passes 251/251; complete serial source suite passes 334/334; syntax, plist, whitespace, frozen lockfile, packaged-content, high-severity dependency, security, provenance, and runner checks pass
+- final exact-base Reprobox `/private/tmp/crate-reprobox-phase6a-closeout.LFHYEf` applies the complete tracked patch and new `entitlements.inherit.plist`, passes 334/334, and reports matching source/applied hashes without dependency installation or mutation
+- separately identified Developer ID QA app `/private/tmp/crate-phase6a.HaXCXN/output-final2/mac-arm64/Crate Phase 6A QA.app` passes deep strict code-sign verification, packaged-content verification with 2,862 ASAR and 1,767 unpacked entries, expected fuse inspection, final plist and entitlement checks, and source-to-ASAR hashes for the main, preload, provenance, diagnostics, Figma credential/parser, and renderer files
+- isolated signed-app validation passes Projects launch, force-stop and relaunch, activation, Quick Package file-picker IPC and cancellation, Current Project, Settings, Help, project creation and cancellation, disconnected Figma with no Keychain prompt, and Current Page Only as the visible default; no project or package output was written
+- the temporary QA app was not installed, notarized, released, tagged, deployed, or provided to an external tester; its expected Gatekeeper assessment is `Unnotarized Developer ID`, and Olivia remains paused
 
 ## Phase 5A Evidence
 
@@ -145,7 +174,7 @@ Obtain Bryant approval before the reviewed Phase 5B commit, push, and PR creatio
 
 ## Phase 5B Evidence
 
-- exact base is merged Phase 5A commit `2b75f38c7cc95e34117ea40c6481370569eedd6d`; implementation remains uncommitted on `codex/security-diagnostics-minimization-phase5b`
+- Phase 5B PR #138 merged into `v2.4.x` as `4d426006b572c3b197760c634b885eab408e2007`; its contained signed-app gate passed schema-v2 diagnostics and unchanged Figma behavior before Phase 6A began
 - optional diagnostics remain off by default and retain the existing `Crate Diagnostics/crate-provenance.json` placement
 - schema v2 exports only aggregate package counts, fixed error categories, allowlisted package-relevant node/edge/evidence types, confidence bands, and fixed warnings
 - project identity, filenames, resource names, local and output paths, timestamps, raw errors, payloads, credentials, URLs, Figma identifiers, and persistent graph IDs are omitted

@@ -1,9 +1,13 @@
+const { execFileSync } = require('node:child_process');
 const fs = require('fs');
 const path = require('path');
 const { verifyPackagedAppContents } = require('./verify-app-contents');
 
 const APPLE_EVENTS_USAGE_DESCRIPTION = 'Crate uses Automation to read open design documents and linked assets from apps like Adobe Illustrator while you are actively watching a project.';
 const APPLE_EVENTS_USAGE_KEY = 'NSAppleEventsUsageDescription';
+const STRICT_APP_TRANSPORT_SECURITY = Object.freeze({
+  NSAllowsArbitraryLoads: false,
+});
 
 function escapePlistString(value) {
   return String(value || '')
@@ -68,6 +72,23 @@ function patchHelperInfoPlists(appBundlePath, usageDescription = APPLE_EVENTS_US
   return patched;
 }
 
+function hardenMainInfoPlist(appBundlePath) {
+  const infoPlistPath = path.join(appBundlePath, 'Contents', 'Info.plist');
+  if (!fs.existsSync(infoPlistPath)) {
+    throw new Error('Cannot harden app transport security: main Info.plist is missing');
+  }
+  execFileSync('/usr/bin/plutil', [
+    '-replace',
+    'NSAppTransportSecurity',
+    '-json',
+    JSON.stringify(STRICT_APP_TRANSPORT_SECURITY),
+    infoPlistPath,
+  ], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return infoPlistPath;
+}
+
 function resolveAppBundlePath(context = {}) {
   const appOutDir = context.appOutDir;
   if (!appOutDir) return null;
@@ -88,6 +109,7 @@ async function afterPack(context) {
   const appBundlePath = resolveAppBundlePath(context);
   if (!appBundlePath) return;
   patchHelperInfoPlists(appBundlePath);
+  hardenMainInfoPlist(appBundlePath);
   const verifyContents = typeof context.verifyPackagedContents === 'function'
     ? context.verifyPackagedContents
     : verifyPackagedAppContents;
@@ -96,6 +118,8 @@ async function afterPack(context) {
 
 module.exports = afterPack;
 module.exports.APPLE_EVENTS_USAGE_DESCRIPTION = APPLE_EVENTS_USAGE_DESCRIPTION;
+module.exports.STRICT_APP_TRANSPORT_SECURITY = STRICT_APP_TRANSPORT_SECURITY;
+module.exports.hardenMainInfoPlist = hardenMainInfoPlist;
 module.exports.patchInfoPlistUsageDescription = patchInfoPlistUsageDescription;
 module.exports.patchHelperInfoPlists = patchHelperInfoPlists;
 module.exports.resolveAppBundlePath = resolveAppBundlePath;

@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -37,6 +38,26 @@ function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {
   });
 }
 
+function writePermissiveInfoPlist(infoPlistPath) {
+  fs.mkdirSync(path.dirname(infoPlistPath), { recursive: true });
+  fs.writeFileSync(infoPlistPath, [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '  <key>NSAppTransportSecurity</key>',
+    '  <dict>',
+    '    <key>NSAllowsArbitraryLoads</key>',
+    '    <true/>',
+    '    <key>NSAllowsLocalNetworking</key>',
+    '    <true/>',
+    '  </dict>',
+    '</dict>',
+    '</plist>',
+    ''
+  ].join('\n'));
+}
+
 test('packaged-content policy declares every first-party parser module', () => {
   const parserFiles = listJavaScriptFiles(path.join(__dirname, '..', 'parsers')).sort();
 
@@ -62,6 +83,57 @@ test('electron-builder uses the explicit Crate runtime allowlist', () => {
   assert.equal(packageJson.build.extraResources, undefined);
   assert.equal(packageJson.build.mac.extraFiles, undefined);
   assert.equal(packageJson.build.mac.extraResources, undefined);
+});
+
+test('electron-builder locks production execution to the signed ASAR', () => {
+  assert.deepEqual(packageJson.build.electronFuses, {
+    runAsNode: false,
+    enableNodeOptionsEnvironmentVariable: false,
+    enableNodeCliInspectArguments: false,
+    enableEmbeddedAsarIntegrityValidation: true,
+    onlyLoadAppFromAsar: true,
+    grantFileProtocolExtraPrivileges: true
+  });
+});
+
+test('mac build metadata separates main-process Automation from helper entitlements', () => {
+  const mainEntitlements = fs.readFileSync(path.join(__dirname, '..', 'entitlements.plist'), 'utf8');
+  const inheritedEntitlements = fs.readFileSync(
+    path.join(__dirname, '..', 'entitlements.inherit.plist'),
+    'utf8'
+  );
+
+  assert.equal(packageJson.build.mac.entitlements, 'entitlements.plist');
+  assert.equal(packageJson.build.mac.entitlementsInherit, 'entitlements.inherit.plist');
+  assert.match(mainEntitlements, /com\.apple\.security\.automation\.apple-events/);
+  assert.equal(
+    inheritedEntitlements.includes('com.apple.security.automation.apple-events'),
+    false
+  );
+  for (const entitlement of [
+    'com.apple.security.cs.allow-jit',
+    'com.apple.security.cs.allow-unsigned-executable-memory',
+    'com.apple.security.cs.disable-library-validation'
+  ]) {
+    assert.match(mainEntitlements, new RegExp(entitlement.replaceAll('.', '\\.'), 'u'));
+    assert.match(inheritedEntitlements, new RegExp(entitlement.replaceAll('.', '\\.'), 'u'));
+  }
+});
+
+test('mac build metadata requests strict transport and omits unused permissions', () => {
+  assert.equal(
+    packageJson.build.mac.extendInfo.NSAppTransportSecurity.NSAllowsArbitraryLoads,
+    false
+  );
+  for (const usageDescription of [
+    'NSAudioCaptureUsageDescription',
+    'NSBluetoothAlwaysUsageDescription',
+    'NSBluetoothPeripheralUsageDescription',
+    'NSCameraUsageDescription',
+    'NSMicrophoneUsageDescription'
+  ]) {
+    assert.equal(packageJson.build.mac.extendInfo[usageDescription], null);
+  }
 });
 
 test('packaged-content policy accepts the required runtime and dependencies', () => {
@@ -165,7 +237,7 @@ test('packaged app verification accepts an injected safe ASAR inventory', () => 
 test('existing afterPack hook invokes packaged-content verification', async () => {
   const appOutDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-after-pack-policy-'));
   const appBundle = path.join(appOutDir, 'Crate.app');
-  fs.mkdirSync(appBundle, { recursive: true });
+  writePermissiveInfoPlist(path.join(appBundle, 'Contents', 'Info.plist'));
   let verifiedPath = null;
 
   try {
@@ -178,7 +250,37 @@ test('existing afterPack hook invokes packaged-content verification', async () =
       }
     });
     assert.equal(verifiedPath, appBundle);
+    const transportPolicy = JSON.parse(execFileSync('/usr/bin/plutil', [
+      '-extract',
+      'NSAppTransportSecurity',
+      'json',
+      '-o',
+      '-',
+      path.join(appBundle, 'Contents', 'Info.plist'),
+    ], { encoding: 'utf8' }));
+    assert.deepEqual(transportPolicy, afterPack.STRICT_APP_TRANSPORT_SECURITY);
   } finally {
     fs.rmSync(appOutDir, { recursive: true, force: true });
+  }
+});
+
+test('afterPack hardens the final app transport policy before signing', () => {
+  const appBundle = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-after-pack-ats-'));
+  const infoPlistPath = path.join(appBundle, 'Contents', 'Info.plist');
+  writePermissiveInfoPlist(infoPlistPath);
+
+  try {
+    assert.equal(afterPack.hardenMainInfoPlist(appBundle), infoPlistPath);
+    const transportPolicy = JSON.parse(execFileSync('/usr/bin/plutil', [
+      '-extract',
+      'NSAppTransportSecurity',
+      'json',
+      '-o',
+      '-',
+      infoPlistPath,
+    ], { encoding: 'utf8' }));
+    assert.deepEqual(transportPolicy, afterPack.STRICT_APP_TRANSPORT_SECURITY);
+  } finally {
+    fs.rmSync(appBundle, { recursive: true, force: true });
   }
 });
