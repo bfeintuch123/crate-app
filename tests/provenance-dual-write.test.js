@@ -800,7 +800,7 @@ test('mac build metadata declares Apple Events usage and preserves Automation en
   assert.equal(packageJson.build.appId, 'com.crate.app');
   assert.equal(packageJson.build.afterPack, 'scripts/patch-helper-info-plists.js');
   assert.equal(packageJson.build.mac.entitlements, 'entitlements.plist');
-  assert.equal(packageJson.build.mac.entitlementsInherit, 'entitlements.plist');
+  assert.equal(packageJson.build.mac.entitlementsInherit, 'entitlements.inherit.plist');
   const usageDescription = packageJson.build.mac.extendInfo
     && packageJson.build.mac.extendInfo.NSAppleEventsUsageDescription;
   assert.match(
@@ -810,9 +810,17 @@ test('mac build metadata declares Apple Events usage and preserves Automation en
 
   const entitlementsPath = path.resolve(__dirname, '..', 'entitlements.plist');
   const entitlements = fs.readFileSync(entitlementsPath, 'utf8');
+  const inheritedEntitlementsPath = path.resolve(__dirname, '..', 'entitlements.inherit.plist');
+  const inheritedEntitlements = fs.readFileSync(inheritedEntitlementsPath, 'utf8');
   assert.match(entitlements, /com\.apple\.security\.automation\.apple-events/);
   assert.match(entitlements, /com\.apple\.security\.cs\.disable-library-validation/);
+  assert.equal(
+    inheritedEntitlements.includes('com.apple.security.automation.apple-events'),
+    false
+  );
+  assert.match(inheritedEntitlements, /com\.apple\.security\.cs\.disable-library-validation/);
   assert.equal(entitlements.includes('com.apple.security.app-sandbox'), false);
+  assert.equal(inheritedEntitlements.includes('com.apple.security.app-sandbox'), false);
 });
 
 test('helper Info.plist patch adds Apple Events usage before signing and is idempotent', () => {

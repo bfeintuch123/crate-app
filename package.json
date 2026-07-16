@@ -26,6 +26,14 @@
   },
   "build": {
     "appId": "com.crate.app",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": true
+    },
     "files": [
       "main.js",
       "preload.js",
@@ -44,9 +52,17 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "entitlements.plist",
-      "entitlementsInherit": "entitlements.plist",
+      "entitlementsInherit": "entitlements.inherit.plist",
       "extendInfo": {
-        "NSAppleEventsUsageDescription": "Crate uses Automation to read open design documents and linked assets from apps like Adobe Illustrator while you are actively watching a project."
+        "NSAppleEventsUsageDescription": "Crate uses Automation to read open design documents and linked assets from apps like Adobe Illustrator while you are actively watching a project.",
+        "NSAudioCaptureUsageDescription": null,
+        "NSBluetoothAlwaysUsageDescription": null,
+        "NSBluetoothPeripheralUsageDescription": null,
+        "NSCameraUsageDescription": null,
+        "NSMicrophoneUsageDescription": null,
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false
+        }
       },
       "target": [
         {
