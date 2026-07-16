@@ -145,17 +145,29 @@ git diff --check
 
 Use before any internal QA release mutation.
 
+Authenticate the fixed Git, Node, and npm paths first. Define `<sanitized-git-environment>`, `<sanitized-git-command>`, and `<sanitized-node-environment>` exactly as required by `.codex/playbooks/crate-release-gate.md`, including disabled global/system Git config, hooks and filesystem monitors plus the approved home and fresh mode-`0700` private temp/cache roots. Authenticate and hash the local Git config with includes disabled before using the repository. The audit registry is fixed explicitly so inherited npm, proxy, registry, script-shell, Node, and dynamic-loader settings cannot redirect the check.
+
 ```sh
-pwd
-git remote -v
-git fetch origin
-git branch --show-current
-git status --short --branch
-git rev-parse HEAD origin/v2.4.x
-node -p "require('./package.json').version"
-git log --oneline -12
-npm audit --audit-level=high
-git diff --check
+/bin/pwd
+<sanitized-git-command> remote -v
+<sanitized-git-command> fetch origin
+<sanitized-git-command> branch --show-current
+<sanitized-git-command> status --short --branch
+<sanitized-git-command> rev-parse HEAD origin/v2.4.x
+<sanitized-node-environment> "<canonical-node-executable>" -p "require('./package.json').version"
+<sanitized-git-command> log --oneline -12
+<sanitized-node-environment> "<canonical-node-executable>" "<canonical-npm-cli>" audit --audit-level=high --registry=https://registry.npmjs.org/
+<sanitized-git-command> diff --check
 ```
 
 Release execution adds version bump, build, signing, notarization, artifact metadata, hash, tag, push, and GitHub prerelease checks only when Bryant explicitly approves those release steps.
+
+## signed-macos-app-proof
+
+Use only after Bryant has approved the applicable macOS build and signing checks and an app artifact already exists. Public-release mode additionally requires the approved Gatekeeper and notarization checks; contained QA mode must be explicitly approved and remains non-release proof.
+
+```sh
+(cd <isolated-verifier-source-root> && <sanitized-node-environment> "<canonical-node-executable>" scripts/run-macos-release-proof.js <path-to-app> --electron-archive <electron-arm64-archive> --canvas-prebuild <canvas-arm64-prebuild> --expected-revision <approved-release-commit> --source-root <isolated-proof-source-root> --json)
+```
+
+For public-release mode, first create two detached clean worktrees at the approved release commit: `<isolated-verifier-source-root>` and a different `<isolated-proof-source-root>`. Assert both canonical paths differ, both worktrees are clean, and both resolve `HEAD` to the approved SHA. Independently run canonical npm `ci --ignore-scripts` plus the committed install-policy verifier in each worktree under separate fresh cache/temp roots; install the exact pinned official Canvas arm64 prebuild only in the proof worktree. Run the signed-app verifier from the verifier worktree only after its own reviewed dependencies exist and after the app is notarized, stapled, and ready for Gatekeeper assessment. The proof worktree supplies all package evidence. The verifier requires the original app fingerprint to remain stable while it collects evidence from one private metadata-preserving snapshot whose complete fingerprint also remains stable. The Electron ZIP must be the exact arm64 distribution named in the proof worktree's installed locked Electron package's authenticated `checksums.json`; the verifier checks its SHA-256 and binds the packaged Electron executable and framework payload to that archive. The default mode requires Apple-anchored Developer ID Application signing for the app and nested code, the approved arm64 architecture policy with only the exact allowlisted universal native module, hardened runtime, the canonical Crate team and bundle identifier, exact launch/security metadata plus internally consistent main/helper build metadata, exact main/helper/nested-bundle entitlements, an approved canonical bundle layout, strict final privacy and transport metadata, the actual ASAR header hash against embedded integrity metadata, the exact approved Electron fuse wire, first-party source-to-ASAR binding, package and build-version binding, and the complete production dependency closure from that isolated proof root. Dependency proof requires declared-version satisfaction, exact lock paths and package/version topology, registry-tarball source bytes authenticated against lockfile integrity, the complete exact approved Canvas prebuild inventory and bytes, Electron Builder-filtered file inventories, transformed package manifests, ordinary file bytes, and signature-normalized native binaries. It also requires packaged-content verification, Gatekeeper acceptance, and a valid notarization staple. Its proof includes only the code-directory fingerprint and source revision needed to identify the reviewed artifact; it omits local paths, signer names, timestamps, ASAR hashes, and package-content hashes. `--allow-unnotarized` is for explicitly approved contained QA only, waives only Gatekeeper and staple proof, and produces `releaseReady: false`; it cannot satisfy a public release gate.
