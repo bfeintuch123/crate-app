@@ -79,6 +79,7 @@
       ]
     },
     "dmg": {
+      "sign": true,
       "title": "Install Crate",
       "background": "build/dmg-background.png",
       "window": {

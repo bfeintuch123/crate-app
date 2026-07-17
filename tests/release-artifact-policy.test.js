@@ -3819,6 +3819,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.match(standardFlow, /--source-root <isolated-proof-source-root>/u);
   assert.match(standardFlow, /latest-mac\.yml/iu);
   assert.match(standardFlow, /blockmap/iu);
+  assert.match(standardFlow, /dist\/\.crate-release-metadata-incomplete.*hard stop.*clean rebuild/iu);
   assert.match(standardFlow, /Mount the final DMG read-only/iu);
   assert.match(standardFlow, /extract the final ZIP/iu);
   assert.match(standardFlow, /complete container inventories.*explicit allowlist/iu);
@@ -3869,6 +3870,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.doesNotMatch(standardFlow, /run `npm ci`(?:\s|from)/u);
 
   assert.equal(packageJson.build.afterSign, 'scripts/notarize.js');
+  assert.equal(packageJson.build.dmg.sign, true);
   assert.equal(packageJson.build.disableDefaultIgnoredFiles, undefined);
   assert.equal(packageJson.build.onNodeModuleFile, undefined);
   assert.equal(
@@ -3881,6 +3883,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   const canonicalToolIndex = standardFlow.indexOf('authenticate the dependency and build tools');
   const versionIndex = standardFlow.indexOf('version <version> --no-git-tag-version --ignore-scripts');
   const buildIndex = standardFlow.indexOf('build under');
+  const finalizerIndex = standardFlow.indexOf('immediately run `scripts/finalize-mac-release-metadata.js`');
   const proofRootIndex = standardFlow.indexOf('create two detached worktrees at the release commit');
   const proofIndex = standardFlow.indexOf('run-macos-release-proof.js');
   const containerProofIndex = standardFlow.indexOf('Mount the final DMG read-only');
@@ -3900,6 +3903,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
     canonicalToolIndex,
     versionIndex,
     buildIndex,
+    finalizerIndex,
     proofRootIndex,
     proofIndex,
     containerProofIndex,
@@ -3919,6 +3923,8 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.equal(repositoryToolIndex < governanceIndex, true);
   assert.equal(governanceIndex < canonicalToolIndex, true);
   assert.equal(canonicalToolIndex < versionIndex, true);
+  assert.equal(buildIndex < finalizerIndex, true);
+  assert.equal(finalizerIndex < proofRootIndex, true);
   assert.equal(buildIndex < proofRootIndex, true);
   assert.equal(proofRootIndex < proofIndex, true);
   assert.equal(proofIndex < containerProofIndex, true);
@@ -3953,6 +3959,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" release verify-asset <tag> <local-approved-artifact>/u);
   assert.match(approvalCommands, /\/usr\/bin\/hdiutil attach -readonly -nobrowse/u);
   assert.match(approvalCommands, /\/usr\/bin\/ditto -x -k/u);
+  assert.match(approvalCommands, /scripts\/finalize-mac-release-metadata\.js/u);
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" pr checks <pr-number> --watch/u);
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" pr merge <pr-number>/u);
   assert.doesNotMatch(approvalCommands, /(?:^|\n)(?!<sanitized-git-command>)\s*(?:\/usr\/bin\/)?git\s+/u);
