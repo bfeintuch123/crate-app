@@ -7,7 +7,7 @@
 - owner: Codex under Bryant approval
 - standing order: SO-002 and SO-003
 - repo: crate-app
-- branch: `codex/sign-finalize-beta2-dmg`
+- branch: `codex/correct-beta2-pre-notary-gate`
 - base: `v2.4.x`
 - mode: release-blocker failure loop
 - status: source-merge ready
@@ -31,8 +31,8 @@ Forbidden:
 
 ## State
 
-- current phase: publish and review narrow release-tooling correction
-- last completed checkpoint: final independent release-blocker Autoreview approved the complete diff with no actionable findings
+- current phase: publish and review the pre-notarization gate correction
+- last completed checkpoint: final Autoreview approved the four-file policy-only correction after exact order assertions were added
 - next action: commit, push, open the PR against `v2.4.x`, and run merge readiness
 - blocker: none inside the approved correction
 - approval state: Bryant approved proceeding with the correction and tester-beta release flow
@@ -59,11 +59,16 @@ Forbidden:
 | 2026-07-17 | Install-script and dependency gates | 6 approved lifecycle packages; `npm audit --audit-level=high` | passed; 0 vulnerabilities |
 | 2026-07-17 | Scope and source checks | syntax, `git diff --check`, protected runtime surface diff | passed; no runtime or package-lock changes |
 | 2026-07-17 | Final release-blocker Autoreview | independent read-only review of complete tracked and untracked diff | APPROVE; no actionable findings |
+| 2026-07-17 | Signed DMG pre-submit validation | `codesign --verify` and `spctl` against fresh exact-merge-SHA build | signature valid; Gatekeeper correctly withheld acceptance pending notarization |
+| 2026-07-17 | Apple workflow confirmation | Apple notarization documentation | sign first, notarize, staple, then require Gatekeeper acceptance |
+| 2026-07-17 | Corrected gate verification | 44 focused policy tests, full serialized suite, install-script policy, audit | passed; 0 vulnerabilities |
+| 2026-07-17 | Final correction Autoreview | independent read-only review after order assertions and command grouping | APPROVE; no actionable findings |
 
 ## Risks
 
 - Stapling mutates DMG bytes, so pre-staple blockmaps and updater metadata must never be published.
 - Release tooling must remain isolated from Crate product behavior.
+- Pre-notarization signature validity and post-notarization Gatekeeper acceptance must remain separate gates.
 
 ## Handoff
 

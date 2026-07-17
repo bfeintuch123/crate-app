@@ -3939,6 +3939,33 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.equal(siteBranchIndex < siteMergeIndex, true);
   assert.equal(siteMergeIndex < deployIndex, true);
 
+  const dmgEnvelopeFlow = standardFlow.slice(
+    standardFlow.indexOf('11. With separate approval'),
+    standardFlow.indexOf('12. With explicit approval')
+  );
+  const dmgCodesignIndex = dmgEnvelopeFlow.indexOf('/usr/bin/codesign --verify --strict --verbose=2 <dmg>');
+  const dmgSubmitIndex = dmgEnvelopeFlow.indexOf('/usr/bin/xcrun notarytool submit <dmg>');
+  const dmgStapleIndex = dmgEnvelopeFlow.indexOf('/usr/bin/xcrun stapler staple <dmg>');
+  const dmgStapleValidateIndex = dmgEnvelopeFlow.indexOf('/usr/bin/xcrun stapler validate <dmg>');
+  const dmgSpctlIndex = dmgEnvelopeFlow.indexOf('/usr/sbin/spctl -a -t open --context context:primary-signature -v <dmg>');
+  const dmgFinalizerIndex = dmgEnvelopeFlow.indexOf('scripts/finalize-mac-release-metadata.js');
+  for (const marker of [
+    dmgCodesignIndex,
+    dmgSubmitIndex,
+    dmgStapleIndex,
+    dmgStapleValidateIndex,
+    dmgSpctlIndex,
+    dmgFinalizerIndex,
+  ]) {
+    assert.notEqual(marker, -1);
+  }
+  assert.equal(dmgCodesignIndex < dmgSubmitIndex, true);
+  assert.equal(dmgSubmitIndex < dmgStapleIndex, true);
+  assert.equal(dmgStapleIndex < dmgStapleValidateIndex, true);
+  assert.equal(dmgStapleValidateIndex < dmgSpctlIndex, true);
+  assert.equal(dmgSpctlIndex < dmgFinalizerIndex, true);
+  assert.doesNotMatch(dmgEnvelopeFlow, /(?:require|run).*spctl.*before submission/iu);
+
   const approvalCommands = releasePlaybook.slice(
     releasePlaybook.indexOf('## Commands Requiring Explicit Bryant Approval'),
     releasePlaybook.indexOf('## Standard Flow')
@@ -3959,6 +3986,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" release verify-asset <tag> <local-approved-artifact>/u);
   assert.match(approvalCommands, /\/usr\/bin\/hdiutil attach -readonly -nobrowse/u);
   assert.match(approvalCommands, /\/usr\/bin\/ditto -x -k/u);
+  assert.match(approvalCommands, /\/usr\/bin\/codesign --verify --strict --verbose=2 <dmg>/u);
   assert.match(approvalCommands, /scripts\/finalize-mac-release-metadata\.js/u);
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" pr checks <pr-number> --watch/u);
   assert.match(approvalCommands, /<sanitized-gh-environment> "<canonical-gh-executable>" pr merge <pr-number>/u);
@@ -3985,6 +4013,10 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.match(releaseGate, /<sanitized-gh-environment> "<canonical-gh-executable>" release verify <tag>/u);
   assert.match(releaseGate, /<sanitized-gh-environment> "<canonical-gh-executable>" release verify-asset <tag> <local-approved-artifact>/u);
   assert.match(releaseGate, /complete outer inventories.*explicit reviewed allowlists/iu);
+  assert.match(releaseGate, /`codesign` validates that pre-submission signature/iu);
+  assert.match(releaseGate, /Pre-notarization `spctl` acceptance is not a gate/iu);
+  assert.match(releaseGate, /\/usr\/bin\/codesign --verify --strict --verbose=2 <path-to-dmg>/u);
+  assert.match(releaseGate, /Pre-submission DMG signature check:[\s\S]*codesign[\s\S]*Post-notarization and post-staple DMG checks:[\s\S]*stapler validate[\s\S]*spctl/iu);
   assert.match(releaseGate, /immutable asset set.*attested subjects.*same exact manifest/iu);
   assert.match(releaseGate, /code-owned `crate-site\/index\.html`/iu);
   assert.match(
