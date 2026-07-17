@@ -966,6 +966,12 @@ test('deferred project cache cleanup rechecks current projects immediately befor
     };
     releaseRename();
     await waitForPathMode(cacheDir, 0o700, 'reactivated cache should be restored and hardened');
+    if (process.platform !== 'win32') {
+      await waitForCondition(
+        () => cleanupYieldCount >= 2,
+        'unsafe cache entries should still yield in bounded batches'
+      );
+    }
 
     assert.equal(fs.existsSync(cacheDir), true);
     const activeProjectIds = new Set((await callIpc('projects:get-all')).map(item => item.id));

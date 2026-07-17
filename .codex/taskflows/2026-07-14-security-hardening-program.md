@@ -3,14 +3,14 @@
 ## Metadata
 
 - created: 2026-07-14
-- updated: 2026-07-16
+- updated: 2026-07-17
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-release-proof-phase6b`
+- branch: `codex/final-security-audit-closeout`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1 through 6A are merged; PR #140 is open from exact merged `v2.4.x` commit `c9092fbdc715691f7ae2a06ca3ebc0dbef140721`; its failure loop has locally corrected every CI, GitHub-review, and independent-Autoreview finding through workflow, release-playbook, verifier-toolchain, clean-install integration, buffered-proof, and Canvas rollback failure-first tests; the focused lane reports 66 tests total, 65 passed, zero failed, and one CI-only integration skip, the fresh committed-lock integration separately passes 1/1, and the complete suite reports 400 tests total, 399 passed, zero failed, and one environment-gated skip; final narrow independent rereview reports no actionable findings; amended PR CI and merge readiness remain required before separate merge approval
+- status: phases 1 through 6B and the separately reviewed `uuid` cleanup are merged. The final integrated source gate passed at exact `origin/v2.4.x` commit `8bda30102fcd79a99c9f5a6efefdb698a5bc1422`; the remaining security-program gate is a newly versioned signed tester artifact and targeted installed-app validation before Olivia resumes.
 
 ## Goal
 
@@ -37,10 +37,10 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: Phase 6B CI enforcement and signed-artifact proof
-- security target: make the Phase 6A artifact protections repeatable and fail closed so a later build cannot silently lose its signature, hardened runtime, fuse policy, entitlement separation, privacy-safe metadata, or packaged-content boundary
-- implementation target: add failure-first release-artifact policy tests, a privacy-safe macOS signed-app verifier, a least-privilege source-only GitHub Actions gate for `v2.4.x`, and release-gate documentation that requires notarization and Gatekeeper proof for public artifacts
-- workflow target: preserve all normal launch, renderer, project, Quick Package, Package Details, and Figma behavior; CI receives no signing or notarization credentials and does not build or release the app
+- phase: final integrated source gate and post-security tester-build preflight
+- security target: prove the combined six-phase program and dependency cleanup preserve Crate behavior before producing a new signed tester artifact
+- implementation target: no app implementation is active; close durable evidence, apply narrow ordinary-PR governance, and run a contained Mac mini QA build before establishing the independent release authority required for a version-only tester candidate
+- workflow target: preserve all normal launch, renderer, project, Quick Package, Package Details, and Figma behavior; the installed-app gate is focused on security-affected boundaries rather than repeating the full historical QA matrix
 - package-engine impact: no package selection, copied or extracted file, naming, output, quota, Package Details, watcher, parser, or provenance behavior change
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, prompt, permission, setting, or credential action
@@ -51,11 +51,10 @@ Before Crate's public release, specify and implement an in-app update or install
 
 This is deliberately outside the security patches. The later updater work must require signed update metadata and artifacts, preserve user projects and settings, support staged internal QA and rollback, fail safely if verification fails, and receive its own threat model and release-gate review.
 
-## Deferred Dependency Cleanup Gate
+## Completed Dependency Cleanup Gate
 
-- After Phase 6B, remind Bryant that the direct `uuid@9.0.1` dependency still has a moderate advisory affecting buffer-writing UUID v3, v5, and v6 paths. Crate currently calls only UUID v4 without a caller-provided buffer, so this does not interrupt Phase 6A or 6B.
-- Prefer a narrow removal of the dependency in favor of Node's built-in `crypto.randomUUID()` rather than taking npm's SemVer-major `uuid@14` fix automatically.
-- Complete and review that dependency cleanup before the final integrated six-phase audit so the audit covers the shipped dependency graph. If Bryant explicitly defers it until after that audit, remind him again at audit close and require the affected dependency, source, signed-app, and integrated audit lanes to be rerun before Olivia or public-release rollout.
+- PR #141 replaced the two `uuid.v4()` calls with Node's built-in `crypto.randomUUID()` and removed only the direct dependency and root lock record.
+- The exact-base cleanup Reprobox and final integrated audit report zero vulnerabilities and no package, Figma, provenance, renderer, quota, or UI behavior change.
 
 ## Deferred CI Action Runtime Migration Gate
 
@@ -142,13 +141,15 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] add failure-first tests for signed-app proof and least-privilege CI policy
 - [x] implement the privacy-safe macOS signed-app verifier and source-only CI gate
 - [x] validate the verifier against the separately approved Phase 6A signed QA app without rebuilding, installing, notarizing, or releasing it
-- [ ] after the workflow exists on GitHub, configure `Source security and regression suite` as a required `v2.4.x` branch check before any release mutation
-- [ ] before public release, add a second eligible code owner or use a separately controlled PR-author identity so the required release-policy approval cannot be self-approved
+- [x] set `v2.4.x` as the default branch and require `Source security and regression suite`, ordinary PR flow with zero approvals, admin enforcement, conversation resolution, and no force-push or deletion
+- [ ] before any version bump or distributable tester release, activate the full release-grade branch and layered tag rulesets and require at least one code-owner approval from an independently controlled principal; Jenna needs GitHub only if selected for that release-authority role, not for installed-app QA
 - [ ] under a separately approved build and release gate, validate a newly signed artifact against an isolated exact-commit proof root with the approved Canvas rebuild
 - [x] complete Phase 6B Autoreview, regression, security, provenance, runner, exact-base Reprobox, and pre-PR merge-readiness review before commit approval
 - [x] obtain Bryant approval, commit and push the frozen Phase 6B source, and open PR #140 against `v2.4.x`
-- [ ] freeze and pass the post-failure-loop Autoreview and complete local gate stack, then pass the fresh Node 22 source-security workflow and final PR merge-readiness review before separate merge approval
-- [ ] after Phase 6B, remind Bryant and resolve or explicitly disposition the `uuid` cleanup before the final integrated six-phase audit closes
+- [x] freeze and pass the post-failure-loop Autoreview and complete local gate stack, then pass the fresh Node 22 source-security workflow and final PR merge-readiness review
+- [x] merge Phase 6B PR #140 and the narrow `uuid` cleanup PR #141 into `v2.4.x`
+- [x] complete the final integrated full source suite, clean dependency reconstruction, exact-base Reprobox, verifier integration, privacy review, and product/regression Autoreview with no actionable finding
+- [ ] build a uniquely versioned signed tester artifact under a separate approval and pass the targeted installed-app gate before Olivia resumes
 
 ## Stop Gates
 
@@ -159,7 +160,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Amend and force-push the reviewed PR #140 commit with the Canvas rollback closure, require its fresh Node 22 `npm ci --ignore-scripts` source-security workflow, resolve the addressed inline review thread with evidence, and complete final merge-readiness review before stopping for separate merge approval. After a clean merge, configure the required GitHub branch rule and independent review authority before any release mutation, then separately approve a fresh signed-artifact proof. Do not build, install, notarize, release, deploy, mutate dependencies, start updater work, or resume Olivia.
+Complete the documentation and narrow ordinary-PR governance closeout, then run a contained Mac mini QA build and focused installed-app smoke for launch/recovery, Keychain/Figma behavior, Quick Package, a normal package, diagnostics/privacy, and unchanged core behavior. Do not prepare `v3.0.0-beta.2` or a distributable tester release until the independent release authority and full ruleset/tag protections satisfy the release gate. Olivia remains paused until both the installed-app and release-governance gates pass and Bryant explicitly resumes testing. Public-release updater, billing, website, legal, support, observability, and launch work remains post-Olivia.
 
 ## Phase 6B Working Evidence
 
