@@ -1627,3 +1627,13 @@ Secondary:
 - Installed plugin `0.11.1+codex.20260716214926`; its bridge resolves inside the plugin cache and no longer executes code from the Crate app repository.
 - Created and read persistent task `019f6dd8-b8e6-7812-a9f8-3432d4648e07`; it returned `CRATE_OPS_THREAD_PROBE=PASS` under workspace-write, on-request authority with network disabled.
 - Began the separate ops-only removal of the duplicate `.codex` bridge. No Crate runtime, UI, parser, package, Figma, provenance, dependency, build, release, updater, website, or deploy behavior changed.
+
+### 2026-07-17 Final Integrated Security Source Gate
+
+- Audited exact `origin/v2.4.x` commit `8bda30102fcd79a99c9f5a6efefdb698a5bc1422` after Phases 1 through 6B and UUID cleanup PR #141 merged. App PR #143 removed the duplicate app-owned task bridge; Crate Ops PR #11 had already made the plugin self-contained.
+- The full Node `22.23.1` source suite passed twice with 401 tests total, 400 passed, zero failed, and one intentional CI-only skip. The real verifier-toolchain integration passed 1/1 and authenticated all 29 packages.
+- A fresh `npm ci --ignore-scripts` reconstruction installed 433 packages, the six-package install-script policy passed, and full plus production dependency audits report zero vulnerabilities.
+- Exact-base Reprobox `/private/tmp/crate-final-reprobox.Hwgo71` reproduced the passing source result. Product/regression and privacy Autoreview lanes reported no actionable finding.
+- Narrow repository governance was applied and verified: `v2.4.x` is now the default branch; `Source security and regression suite` and PR flow are required with zero human approvals; admin enforcement and conversation resolution are enabled; force-pushes and branch deletion are disabled. Jenna does not need a GitHub account for installed-app QA.
+- Watcher, package selection and output, parsers, provenance, quota, alerts, window lifecycle, renderer, Quick Package, and Figma scope behavior remain unchanged. No build, install, signing, notarization, release, website deployment, updater work, or Olivia tester mutation occurred.
+- Next gate is a uniquely versioned post-security tester artifact and focused installed-app smoke on the Mac mini. Olivia testing and feedback triage remain the first priority before broader public-release work.
