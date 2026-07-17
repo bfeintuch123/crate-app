@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -253,7 +254,11 @@ setStub('ag-psd', () => ({
   readPsd: () => currentPsdFixture,
 }));
 
-setStub('uuid', () => ({ v4: () => `test-id-${Math.random().toString(16).slice(2)}` }));
+let uuidCounter = 0;
+setStub('crypto', () => ({
+  ...crypto,
+  randomUUID: () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, '0')}`,
+}));
 
 require(path.resolve(__dirname, '..', 'main.js'));
 

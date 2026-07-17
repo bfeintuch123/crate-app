@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -202,7 +203,10 @@ test('main window uses normal macOS app lifecycle', async () => {
   }));
   setStub('electron-store', () => FakeStore);
   setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
-  setStub('uuid', () => ({ v4: () => '00000000-0000-4000-8000-000000000001' }));
+  setStub('crypto', () => ({
+    ...crypto,
+    randomUUID: () => '00000000-0000-4000-8000-000000000001',
+  }));
   setStub('ag-psd', () => ({ readPsd: () => ({}) }));
   setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
   setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
@@ -633,7 +637,10 @@ test('startup recovery recreates window if first launch window closes before bec
   }));
   setStub('electron-store', () => FakeStore);
   setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
-  setStub('uuid', () => ({ v4: () => '00000000-0000-4000-8000-000000000001' }));
+  setStub('crypto', () => ({
+    ...crypto,
+    randomUUID: () => '00000000-0000-4000-8000-000000000001',
+  }));
   setStub('ag-psd', () => ({ readPsd: () => ({}) }));
   setStub('chokidar', () => ({ watch: () => ({ on: () => {}, close: () => {}, add: () => {}, unwatch: () => {} }) }));
   setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
