@@ -4,7 +4,17 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const USAGE = 'Usage: node scripts/run-electron-builder-release.js --mac --arm64 --config.npmRebuild=false';
+const REQUIRED_ARGS = Object.freeze([
+  '--mac',
+  '--arm64',
+  '--config.npmRebuild=false',
+  '--config.publish.provider=github',
+  '--config.publish.owner=bfeintuch123',
+  '--config.publish.repo=crate-app',
+  '--publish',
+  'never',
+]);
+const USAGE = `Usage: node scripts/run-electron-builder-release.js ${REQUIRED_ARGS.join(' ')}`;
 const REQUIRED_ENV = Object.freeze([
   'CRATE_RELEASE_CANONICAL_NODE',
   'CRATE_RELEASE_CANONICAL_NODE_SHA256',
@@ -91,9 +101,13 @@ function forceTraversalCollector() {
   return traversalOnly;
 }
 
+function releaseArgsAreExact(argv) {
+  return Array.isArray(argv) && argv.length === REQUIRED_ARGS.length &&
+    argv.every((argument, index) => argument === REQUIRED_ARGS[index]);
+}
+
 function run(argv = process.argv.slice(2), env = process.env) {
-  if (argv.length !== 3 || argv[0] !== '--mac' || argv[1] !== '--arm64' ||
-      argv[2] !== '--config.npmRebuild=false') {
+  if (!releaseArgsAreExact(argv)) {
     process.stderr.write(`${USAGE}\n`);
     return 2;
   }
@@ -113,11 +127,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+  REQUIRED_ARGS,
   REQUIRED_ENV,
   USAGE,
   authenticateNode,
   authenticateReleaseProcess,
   forceTraversalCollector,
+  releaseArgsAreExact,
   run,
   sha256,
 };
