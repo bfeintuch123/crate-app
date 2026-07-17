@@ -1,11 +1,12 @@
 // Phase 2 — Figma Link Per-Project tests.
 // Loads main.js with stubbed Electron / electron-store / chokidar / ag-psd /
-// node-fetch / uuid so we can exercise the IPC handlers in isolation. The
+// node-fetch / crypto so we can exercise the IPC handlers in isolation. The
 // real Figma URL/scope parsing helpers are reused.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -394,10 +395,11 @@ class TestFigmaParser extends RealFigmaParser {
 }
 setStub('./parsers/figma', () => ({ FigmaParser: TestFigmaParser }));
 
-// Deterministic uuid.
+// Deterministic UUIDs while preserving the rest of Node crypto.
 let uuidCounter = 0;
-setStub('uuid', () => ({
-  v4: () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, '0')}`,
+setStub('crypto', () => ({
+  ...crypto,
+  randomUUID: () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, '0')}`,
 }));
 
 // canvas/keytar are pulled by parsers but absent from node_modules. The figma

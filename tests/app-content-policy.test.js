@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const packageJson = require('../package.json');
+const packageLock = require('../package-lock.json');
 const afterPack = require('../scripts/patch-helper-info-plists');
 const {
   REQUIRED_ASAR_ENTRIES,
@@ -27,6 +28,16 @@ const EXPECTED_BUILD_FILES = Object.freeze([
   'parsers/*.js',
   'assets/tray-icon.png'
 ]);
+
+test('runtime UUID policy uses Node crypto without an external uuid dependency', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+
+  assert.equal(Object.hasOwn(packageJson.dependencies, 'uuid'), false);
+  assert.equal(Object.hasOwn(packageLock.packages[''].dependencies, 'uuid'), false);
+  assert.equal(Object.hasOwn(packageLock.packages, 'node_modules/uuid'), false);
+  assert.equal(mainSource.includes("require('uuid')"), false);
+  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 2);
+});
 
 function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {
   return fs.readdirSync(currentDirectory, { withFileTypes: true }).flatMap(entry => {

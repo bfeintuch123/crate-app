@@ -3,7 +3,6 @@ const path = require('path');
 const fs = require('fs');
 const Store = require('electron-store');
 const chokidar = require('chokidar');
-const { v4: uuidv4 } = require('uuid');
 const { execSync, exec, execFile, execFileSync } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
@@ -8453,7 +8452,7 @@ async function runScanOnSave(projectId, psdFilePath) {
           parentPsd: psdFilePath,
           embeddedOriginalName: lf.name || '',
           embeddedIndex,
-          fileId: uuidv4(), // C2: unique key so embedded entries can be individually removed
+          fileId: crypto.randomUUID(), // C2: unique key so embedded entries can be individually removed
         });
       }
     }
@@ -9649,7 +9648,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
   }
 
   const newProject = {
-    id: uuidv4(),
+    id: crypto.randomUUID(),
     name: cleanedName,
     type: projectType,
     figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,

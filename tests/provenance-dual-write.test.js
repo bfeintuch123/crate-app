@@ -419,7 +419,10 @@ setStub('child_process', () => ({
 
 let currentPsdFixture = { children: [], linkedFiles: [] };
 setStub('ag-psd', () => ({ readPsd: () => currentPsdFixture }));
-setStub('uuid', () => ({ v4: () => `dual-write-project-${watcherRecords.length + 1}` }));
+setStub('crypto', () => ({
+  ...crypto,
+  randomUUID: () => `00000000-0000-4000-8000-${String(watcherRecords.length + 1).padStart(12, '0')}`,
+}));
 
 require(path.resolve(__dirname, '..', 'main.js'));
 
