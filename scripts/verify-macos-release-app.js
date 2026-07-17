@@ -1025,6 +1025,7 @@ function inspectBundleLayout(appPath, executableName) {
       return { valid: false };
     }
     if (!hasExactTypedEntries(contentsPath, {
+      CodeResources: 'file',
       Frameworks: 'directory',
       'Info.plist': 'file',
       MacOS: 'directory',

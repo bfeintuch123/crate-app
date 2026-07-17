@@ -712,6 +712,7 @@ test('bundle layout requires the configured executable and exact resource entry 
       fs.mkdirSync(path.join(contentsPath, 'Frameworks', directory));
     }
     for (const file of [
+      'CodeResources',
       'Info.plist',
       'MacOS/Crate',
       'Resources/app.asar',
@@ -722,6 +723,19 @@ test('bundle layout requires the configured executable and exact resource entry 
     }
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
+
+    fs.rmSync(path.join(contentsPath, 'CodeResources'));
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.mkdirSync(path.join(contentsPath, 'CodeResources'));
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.rmSync(path.join(contentsPath, 'CodeResources'), { recursive: true });
+    fs.symlinkSync('_CodeSignature/CodeResources', path.join(contentsPath, 'CodeResources'));
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.unlinkSync(path.join(contentsPath, 'CodeResources'));
+    fs.writeFileSync(path.join(contentsPath, 'CodeResources'), 'fixture');
+    fs.writeFileSync(path.join(contentsPath, 'unexpected-ticket'), 'fixture');
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.rmSync(path.join(contentsPath, 'unexpected-ticket'));
 
     const realContentsPath = path.join(appPath, 'Contents-authenticated');
     fs.renameSync(contentsPath, realContentsPath);
@@ -2570,6 +2584,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       fs.mkdirSync(path.join(contentsPath, directory), { recursive: true });
     }
     for (const file of [
+      'CodeResources',
       'Info.plist',
       'Resources/app.asar',
       'Resources/icon.icns',
