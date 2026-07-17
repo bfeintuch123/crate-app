@@ -39,7 +39,7 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 - phase: final integrated source gate and post-security tester-build preflight
 - security target: prove the combined six-phase program and dependency cleanup preserve Crate behavior before producing a new signed tester artifact
-- implementation target: no app implementation is active; close durable evidence, apply narrow repository governance, and prepare a version-only tester candidate
+- implementation target: no app implementation is active; close durable evidence, apply narrow ordinary-PR governance, and run a contained Mac mini QA build before establishing the independent release authority required for a version-only tester candidate
 - workflow target: preserve all normal launch, renderer, project, Quick Package, Package Details, and Figma behavior; the installed-app gate is focused on security-affected boundaries rather than repeating the full historical QA matrix
 - package-engine impact: no package selection, copied or extracted file, naming, output, quota, Package Details, watcher, parser, or provenance behavior change
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
@@ -141,8 +141,8 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] add failure-first tests for signed-app proof and least-privilege CI policy
 - [x] implement the privacy-safe macOS signed-app verifier and source-only CI gate
 - [x] validate the verifier against the separately approved Phase 6A signed QA app without rebuilding, installing, notarizing, or releasing it
-- [x] set `v2.4.x` as the default branch and require `Source security and regression suite`, PR flow with zero approvals, admin enforcement, conversation resolution, and no force-push or deletion; Bryant remains the sole required owner for the private tester beta
-- [ ] before public release, add a second eligible code owner or separately controlled release authority; Jenna does not need GitHub access for installed-app QA
+- [x] set `v2.4.x` as the default branch and require `Source security and regression suite`, ordinary PR flow with zero approvals, admin enforcement, conversation resolution, and no force-push or deletion
+- [ ] before any version bump or distributable tester release, activate the full release-grade branch and layered tag rulesets and require at least one code-owner approval from an independently controlled principal; Jenna needs GitHub only if selected for that release-authority role, not for installed-app QA
 - [ ] under a separately approved build and release gate, validate a newly signed artifact against an isolated exact-commit proof root with the approved Canvas rebuild
 - [x] complete Phase 6B Autoreview, regression, security, provenance, runner, exact-base Reprobox, and pre-PR merge-readiness review before commit approval
 - [x] obtain Bryant approval, commit and push the frozen Phase 6B source, and open PR #140 against `v2.4.x`
@@ -160,7 +160,7 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Complete the documentation and narrow `v2.4.x` governance closeout, then prepare a version-only `v3.0.0-beta.2` candidate. Under a separate build approval, sign and notarize that exact revision and run the focused Mac mini installed-app smoke for launch/recovery, Keychain/Figma behavior, Quick Package, a normal package, diagnostics/privacy, and unchanged core behavior. Olivia remains paused until that gate passes and Bryant explicitly resumes testing. Public-release updater, billing, website, legal, support, observability, and launch work remains post-Olivia.
+Complete the documentation and narrow ordinary-PR governance closeout, then run a contained Mac mini QA build and focused installed-app smoke for launch/recovery, Keychain/Figma behavior, Quick Package, a normal package, diagnostics/privacy, and unchanged core behavior. Do not prepare `v3.0.0-beta.2` or a distributable tester release until the independent release authority and full ruleset/tag protections satisfy the release gate. Olivia remains paused until both the installed-app and release-governance gates pass and Bryant explicitly resumes testing. Public-release updater, billing, website, legal, support, observability, and launch work remains post-Olivia.
 
 ## Phase 6B Working Evidence
 
