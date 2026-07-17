@@ -3765,8 +3765,12 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.doesNotMatch(standardFlow, /npm_config_(?:user|global)config=\/dev\/null/u);
   assert.match(
     standardFlow,
-    /build under the exact sanitized Node environment with `"<canonical-node-executable>" node_modules\/electron-builder\/out\/cli\/cli\.js --mac --arm64 --config\.npmRebuild=false`/u
+    /build under the exact sanitized Node environment with `"<canonical-node-executable>" scripts\/run-electron-builder-release\.js --mac --arm64 --config\.npmRebuild=false`/u
   );
+  assert.match(standardFlow, /reauthenticates the canonical Node bytes/iu);
+  assert.match(standardFlow, /built-in in-process filesystem traversal collector/iu);
+  assert.match(standardFlow, /fails closed if Electron Builder requests an npm subprocess/iu);
+  assert.match(standardFlow, /cannot run install, rebuild, lifecycle, version, publish, or other npm commands/iu);
   assert.match(
     standardFlow,
     /fresh lockfile-integrity-reconstructed Electron Builder CLI/iu
