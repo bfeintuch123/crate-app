@@ -3640,6 +3640,63 @@ test('release gate requires the signed-app verifier for approved artifacts', () 
   assert.match(releaseGate, /crate-release-notarytool/u);
 });
 
+test('tester beta keeps verified website distribution without public-stable governance', () => {
+  const releasePlaybook = fs.readFileSync(
+    path.join(ROOT, '.codex', 'playbooks', 'release-crate.md'),
+    'utf8'
+  );
+  const releaseGate = fs.readFileSync(
+    path.join(ROOT, '.codex', 'playbooks', 'crate-release-gate.md'),
+    'utf8'
+  );
+  const instructions = fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf8');
+  const workstream = fs.readFileSync(
+    path.join(ROOT, '.codex', 'state', 'current-workstream.md'),
+    'utf8'
+  );
+  const testerFlow = releasePlaybook.slice(
+    releasePlaybook.indexOf('## Tester Beta Flow'),
+    releasePlaybook.indexOf('## Standard Flow')
+  );
+  const betaOrdering = releaseGate.slice(
+    releaseGate.indexOf('Hard ordering rules:'),
+    releaseGate.indexOf('## Must Never Do')
+  );
+  const commonGovernance = releasePlaybook.slice(
+    releasePlaybook.indexOf('#### Common Evidence (Both Profiles)'),
+    releasePlaybook.indexOf('#### Public Stable Extensions Only')
+  );
+
+  assert.match(testerFlow, /Bryant's explicit approval/iu);
+  assert.match(testerFlow, /Source security and regression suite/u);
+  assert.match(testerFlow, /signed\/notarized\/stapled app and containers/iu);
+  assert.match(testerFlow, /releaseReady: true/u);
+  assert.match(testerFlow, /--prerelease/u);
+  assert.match(testerFlow, /complete remote set and bytes.*frozen manifest/iu);
+  assert.match(testerFlow, /`crate-site\/index\.html`.*beta download button/iu);
+  assert.match(testerFlow, /Cloudflare/iu);
+  assert.match(testerFlow, /Install the published DMG on the Mac mini/iu);
+  assert.match(testerFlow, /Independent code-owner approval.*are not tester-beta gates/iu);
+  assert.match(testerFlow, /no-bypass `v\*` tag update\/deletion protection is active/iu);
+  assert.match(testerFlow, /`immutable-releases` reports enabled/iu);
+  assert.match(testerFlow, /published release to report immutable/iu);
+  assert.match(testerFlow, /use only `Common Evidence \(Both Profiles\)`/iu);
+  assert.match(testerFlow, /manual controlling-principal attestation.*not tester-beta gates/iu);
+  assert.doesNotMatch(testerFlow, /reviews\?per_page=100/iu);
+  assert.match(commonGovernance, /immutable-releases/u);
+  assert.match(commonGovernance, /Source security and regression suite/u);
+  assert.doesNotMatch(commonGovernance, /pulls\/<release-pr-number>\/reviews/iu);
+  assert.match(releaseGate, /Never report tester-beta evidence as satisfying public stable/iu);
+  assert.match(releaseGate, /account-gated download backend.*public launch/iu);
+  assert.match(betaOrdering, /No tester-beta site deploy until the published prerelease is immutable/iu);
+  assert.doesNotMatch(betaOrdering, /No tester-beta site deploy[^\n]*attested subjects/iu);
+  assert.match(instructions, /tester beta.*existing GitHub release and `get-crate\.com` download flow/iu);
+  assert.match(instructions, /Both profiles require source-CI provenance.*append-only `v\*` tag protection.*immutable-release enforcement.*immutable published release assets/iu);
+  assert.match(instructions, /Account-gated downloads.*public stable launch, not.*tester-beta flow/iu);
+  assert.match(workstream, /tester beta only when the common no-bypass tag update\/deletion and immutable-release artifact controls also pass/iu);
+  assert.match(workstream, /public-stable branch review controls.*separately controlled tag-creation authority remain public-stable requirements/iu);
+});
+
 test('release flow reconstructs dependencies narrowly and proves the stapled app before tagging', () => {
   const releasePlaybook = fs.readFileSync(
     path.join(ROOT, '.codex', 'playbooks', 'release-crate.md'),
@@ -4004,6 +4061,10 @@ test('Cloudflare deployment authenticates fixed tools before reading the token',
 
 test('top-level release authority matches the hardened release playbook', () => {
   const instructions = fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf8');
+  assert.match(instructions, /Select the release profile before mutation/iu);
+  assert.match(instructions, /tester beta.*GitHub release and `get-crate\.com` download flow/iu);
+  assert.match(instructions, /public stable release.*independent controlling-principal approval/iu);
+  assert.match(instructions, /account-gated download backend/iu);
   assert.match(instructions, /version-only release-prep PR/iu);
   assert.match(instructions, /combined build, signing, app-notarization, app-stapling, and app-staple-validation approval/iu);
   assert.match(instructions, /separate clean proof and verifier worktrees at the release commit/iu);
@@ -4019,7 +4080,7 @@ test('top-level release authority matches the hardened release playbook', () => 
   assert.match(instructions, /GitHub release as a draft/iu);
   assert.match(instructions, /immutable-release enforcement/iu);
   assert.match(instructions, /attested subjects to equal the same exact set/iu);
-  const governanceIndex = instructions.indexOf('Before any version or release mutation');
+  const governanceIndex = instructions.indexOf('Select the release profile before mutation');
   const versionIndex = instructions.indexOf('version-only release-prep PR');
   assert.notEqual(governanceIndex, -1);
   assert.notEqual(versionIndex, -1);

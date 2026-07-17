@@ -1,7 +1,7 @@
 # Release Crate Playbook
 
 ## Purpose
-Run the standard Crate release flow from `v2.4.x` through version bump, macOS build, notarization, staple, validation, GitHub release, site update, Cloudflare Pages deploy, and live download verification.
+Run the selected Crate release profile from `v2.4.x` through version bump, macOS build, notarization, staple, validation, GitHub release, site update, Cloudflare Pages deploy, and live download verification.
 
 ## When To Use
 - Only after Bryant says a release should begin.
@@ -15,6 +15,13 @@ Use a prompt like:
 Use .codex/playbooks/release-crate.md for Crate release <version>. Start with read-only readiness checks only. Do not pull, bump, build, notarize, tag, create a release, or deploy until Bryant approves that specific step.
 ```
 
+## Release Profiles
+
+- **Tester beta:** Bryant explicitly approves a prerelease for named testers. It uses the existing direct-download flow: version-only PR, required source CI, exact merged-source build, signing/notarization/stapling, independent signed-artifact proof, immutable tag/release asset integrity, frozen asset manifest, GitHub prerelease, a reviewed `crate-site` link update, Cloudflare deploy, live-link verification, and installed-app smoke. It does not require an independent GitHub approver, public-stable tag-creation authority, or the future account backend.
+- **Public stable:** requires every tester-beta artifact gate plus the independently controlled code-owner/release approval, public-stable branch and tag-creation rulesets, attestation checks, and the account-gated download backend approved for public launch.
+
+Record the selected profile in the proof bundle before any mutation. A tester beta must never be described as public stable, and public-stable requirements must not be silently waived by labeling a build beta.
+
 ## Inspect
 - Current branch is `v2.4.x`.
 - Working tree is clean before release changes begin.
@@ -22,7 +29,7 @@ Use .codex/playbooks/release-crate.md for Crate release <version>. Start with re
 - Version bump target and changelog/release notes are confirmed.
 - Apple signing and notarization credentials are available without exposing secrets.
 - The reviewed `notarytool` Keychain profile `crate-release-notarytool` exists under the approved release account, and `notarytool history --keychain-profile "crate-release-notarytool"` succeeds before any build or envelope submission. The committed `afterSign` hook uses only that profile. Never place Apple credentials in a command argument, environment variable, log, proof bundle, or repository file.
-- GitHub's default branch is `v2.4.x`, immutable releases are enabled, and the active branch/tag rulesets below are verified through the GitHub API and archived in the release proof.
+- GitHub's default branch is `v2.4.x`, the required source-security check is active, no-bypass `v*` tag update/deletion protection is active, and immutable releases are enabled. Public stable additionally verifies its branch/tag-creation rulesets through the GitHub API and archives them in the release proof.
 - `crate-site/index.html` points to the new release asset after the release artifact exists.
 - GitHub release tag, uploaded DMG, Cloudflare Pages deployment, and `get-crate.com` live response all agree.
 
@@ -36,9 +43,9 @@ Create distinct empty mode-`0600` regular files `<private-release-user-npmrc>` a
 
 ## Release Session Trust Boundary
 
-- Run the release from one exclusive local session under the separately controlled release authority. Stop if another agent, shell, automation, or unknown process may be mutating the same checkout, proof roots, artifact roots, draft release, tag, or Cloudflare project.
+- Run the release from one exclusive local session under the Bryant-approved release operator. Public stable additionally requires the separately controlled release authority. Stop if another agent, shell, automation, or unknown process may be mutating the same checkout, proof roots, artifact roots, draft release, tag, or Cloudflare project.
 - Private mode-`0700` roots, authenticated snapshots, and repeated fingerprints protect against accidental drift, ordinary concurrent work, and unprivileged local users. They cannot make a release trustworthy after the active macOS login or another process with the same user identity is compromised. Treat suspected same-user compromise as a hard stop and restart from a known-clean release machine/session.
-- Source and API fields cannot prove that two GitHub logins represent different controlling people. The release proof must include a manual attestation naming the PR author, approving code owner, and separately controlled release authority, and must confirm they satisfy the independence rules below.
+- Source and API fields cannot prove that two GitHub logins represent different controlling people. The public-stable proof must include a manual attestation naming the PR author, approving code owner, and separately controlled release authority, and must confirm they satisfy the independence rules below. A tester-beta proof records Bryant's explicit approval and does not claim independent review.
 
 ## Commands Codex May Run
 ```sh
@@ -95,20 +102,30 @@ test "$(<sanitized-git-command> rev-parse '<tag>^{commit}')" = "<approved-releas
 
 Approval is required for every release mutation, build, signing, notarization, tag, GitHub release, deploy, and live verification step that Bryant wants Codex to execute. Because `package.json` configures `afterSign` as `scripts/notarize.js`, the canonical-Node Electron Builder command requires one combined build, signing, app-notarization, app-stapling, and app-staple-validation approval. A build-only approval is insufficient and must not start that command.
 
-## Required Repository Protections
+## Common Artifact Integrity Protections
+
+Both release profiles require live GitHub API evidence for all of the following:
+
+- `v2.4.x` is the repository default branch; force pushes and branch deletion are blocked; and the exact `Source security and regression suite` succeeds for the version PR and its protected-branch merge SHA through `.github/workflows/security-gate.yml` and the `github-actions` app.
+- A separate no-bypass immutability ruleset targets `refs/tags/v*` and blocks tag updates and deletion for every normal and administrator path after a tag is created. Tester beta does not require a separately controlled tag creator, but its tag must remain append-only once pushed.
+- Repository release immutability is enabled. The live `immutable-releases` API response reports `enabled: true` before a release mutation, so a published release locks its tag and assets. Tester-beta proof verifies immutable published assets but does not claim independent release-authority approval or use release attestation as a governance substitute.
+- The bounded API fields proving these common controls are stored in the privacy-safe release proof bundle.
+
+## Public Stable Repository Protections
 
 Public release work is blocked until live GitHub API evidence proves all of the following:
 
 - `v2.4.x` is the repository default branch, so the canonical workflow and CODEOWNERS file come from the same protected source of truth. The source-security workflow must expose only `pull_request` and protected-branch `push` triggers, never a manual or reusable trigger.
 - An active ruleset targets `refs/heads/v2.4.x`, requires the exact `Source security and regression suite` check with a non-null GitHub App `integration_id`, requires the branch to be up to date, blocks force pushes and deletion, dismisses stale approvals, requires approval after the latest reviewable push, and requires at least one code-owner approval from a controlling principal different from the PR author. For the exact release merge SHA, the successful check run must have that same name, `head_sha`, and integration ID; its app slug must be `github-actions`; and its check-suite ID must equal a successful Actions workflow run whose immutable path is `.github/workflows/security-gate.yml`, whose event is `push`, whose ref is `refs/heads/v2.4.x`, and whose `head_sha` is the release merge SHA. Reject any status from another source, app, workflow, event, ref, or commit. Archive only bounded provenance fields: check name, conclusion, head SHA, app ID/slug, check-suite ID, workflow run ID/path/event/ref/conclusion, and required-check integration ID.
 - Repository administrators and ordinary repository roles cannot bypass that branch ruleset. An approval from another login controlled by the same person is not independent review.
-- Two active rulesets target `refs/tags/v*`. A creation-control ruleset restricts tag creation to one separately controlled release authority as its only bypass actor. A separate no-bypass immutability ruleset blocks tag updates and deletion for every human, administrator, token, repository role, and normal app path; the creation authority must not bypass this second ruleset. The release proof must record both ruleset IDs, targets, enforcement, rules, and bypass actors before the tag is created and again before the GitHub release is published.
-- Repository release immutability is enabled. The live `immutable-releases` API response must report `enabled: true` before any release mutation so a published release locks its tag and assets and receives GitHub's release attestation.
-- The API responses proving default branch, rule targets, enforcement, bypass actors, required checks, review controls, force-push/deletion controls, and tag immutability are stored in the privacy-safe release proof bundle.
+- A separate creation-control ruleset targets `refs/tags/v*` and restricts tag creation to one separately controlled release authority as its only bypass actor. That authority must not bypass the common no-bypass tag immutability rule. The release proof records both ruleset IDs, targets, enforcement, rules, and bypass actors before the tag is created and again before the GitHub release is published.
+- The public-stable proof additionally records the API responses proving required review controls and separate release-authority controls.
 
-Source files cannot configure or prove these repository settings. If any setting is absent, bypassable, or not independently controlled, stop before version bump, build, tag, or release mutation.
+Source files cannot configure or prove these repository settings. For public stable, if any common or public-stable setting is absent, bypassable, or not independently controlled, stop before version bump, build, tag, or release mutation. Tester beta requires every common artifact-integrity control plus Bryant's explicit release approval, but not an independent code-owner/release approval or public-stable tag-creation authority.
 
 ### Bounded GitHub Governance Evidence
+
+#### Common Evidence (Both Profiles)
 
 Run these exact read-only API queries through the authenticated sanitized GitHub CLI. Keep only the bounded fields shown; stop if any query returns zero or multiple candidates where exactly one is required.
 
@@ -117,15 +134,34 @@ Run these exact read-only API queries through the authenticated sanitized GitHub
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/rulesets?includes_parents=false' --jq '[.[] | {id,name,target,enforcement}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/rulesets/<ruleset-id> --jq '{id,name,target,enforcement,conditions,rules,bypass_actors}'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/immutable-releases --jq '{enabled}'
-<sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/pulls/<release-pr-number>/reviews?per_page=100' --jq '[.[] | {user:.user.login,state,commit_id,submitted_at}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/commits/<release-merge-sha>/check-runs?filter=latest&per_page=100' --jq '[.check_runs[] | select(.name == "Source security and regression suite") | {id,name,status,conclusion,head_sha,app:{id:.app.id,slug:.app.slug},check_suite_id:.check_suite.id}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/actions/workflows/security-gate.yml/runs?branch=v2.4.x&event=push&per_page=100' --jq '[.workflow_runs[] | select(.head_sha == "<release-merge-sha>") | {id,path,event,head_branch,head_sha,status,conclusion,check_suite_id}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/actions/runs/<workflow-run-id> --jq '{id,path,event,head_branch,head_sha,status,conclusion,check_suite_id}'
 ```
 
-Require exactly one successful check-run object and exactly one successful workflow-run object at the release merge SHA. Their check-suite IDs must be equal, the workflow path must be `.github/workflows/security-gate.yml`, the event must be `push`, the branch must be `v2.4.x`, and the app slug must be `github-actions`. Review evidence must bind an approval to the latest reviewable commit and be paired with the manual controlling-principal attestation from the trust boundary.
+Require exactly one successful check-run object and exactly one successful workflow-run object at the release merge SHA. Their check-suite IDs must be equal, the workflow path must be `.github/workflows/security-gate.yml`, the event must be `push`, the branch must be `v2.4.x`, and the app slug must be `github-actions`.
 
-## Standard Flow
+#### Public Stable Extensions Only
+
+Public stable additionally runs the review query below. Review evidence must bind an approval to the latest reviewable commit and be paired with the manual controlling-principal attestation from the trust boundary. Tester beta does not collect or require this evidence.
+
+```sh
+<sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/pulls/<release-pr-number>/reviews?per_page=100' --jq '[.[] | {user:.user.login,state,commit_id,submitted_at}]'
+```
+
+## Tester Beta Flow
+
+1. Record `tester-beta` as the selected profile, the target version, named testing purpose, and Bryant's explicit approval. Confirm no public-stable claim or account-gated launch is being made.
+2. Authenticate the fixed Git, GitHub CLI, Node, npm, signing, notarization, and Cloudflare tools using the same sanitized environments and drift checks required by the Standard Flow.
+3. Confirm every Common Artifact Integrity Protection and use only `Common Evidence (Both Profiles)`: `v2.4.x` is the default branch, force pushes and deletion are blocked, the exact `Source security and regression suite` succeeds for the version-only PR and its protected-branch merge SHA, no-bypass `v*` tag update/deletion protection is active, and `immutable-releases` reports enabled. Independent code-owner approval, manual controlling-principal attestation, review evidence, and public-stable tag-creation authority are not tester-beta gates.
+4. Run Steps 4 through 15 of the Standard Flow unchanged: clean source, version-only PR, frozen dependency reconstruction, authenticated Canvas prebuild, signed/notarized/stapled app and containers, independent proof worktrees, `releaseReady: true`, container inventories, hashes, update metadata, and blockmaps.
+5. Tag only the verified tester-beta merge commit, push the tag, and verify the remote tag resolves to that exact commit.
+6. Freeze the exact `{name,size,sha256}` asset manifest, create the GitHub release as a draft with `--prerelease`, download every draft asset into a new empty directory, and require the complete remote set and bytes to match the frozen manifest before publication.
+7. Publish only after the draft still has `prerelease: true`, the expected tag, and exactly the frozen asset names and sizes. Require the published release to report immutable, then re-download the published assets and require every filename, byte size, and SHA-256 to match. Do not claim independent release-authority approval or treat an attestation as a substitute for the common artifact-integrity controls.
+8. Update `crate-site/index.html` on a separate reviewed site branch so the beta download button points to the exact verified GitHub prerelease DMG. Merge that PR, deploy the exact site merge commit through the authenticated Cloudflare workflow, and confirm `get-crate.com` resolves to the beta DMG.
+9. Install the published DMG on the Mac mini, run the targeted tester smoke, archive privacy-safe evidence, and clean temporary worktrees, mounts, logs, and launched QA apps. Only then send the website download flow to the named tester.
+
+## Standard Flow (Public Stable)
 1. Confirm Bryant approved the release and target version.
 2. Before any repository or release command, record an existing canonical `<approved-home>`. Require `/usr/bin/git` and one canonical realpath GitHub CLI executable to be regular executables outside the worktree and every `node_modules` directory; record their realpaths, SHA-256 hashes, and versions, then stop if they drift. Establish the exact fixed command environments above, authenticate and hash the local Git config, and reject every executable or redirecting config key. Confirm the fixed Git remote is exactly the approved repository and the GitHub CLI account authenticated through the sanitized home is the approved release account. Every Git and GitHub CLI invocation must use the fixed wrappers so inherited `GIT_*`, `GH_*`, proxy, shell, executable-path, hook, filesystem-monitor, credential-helper, alias, include, and URL-rewrite configuration cannot redirect the operation.
 3. Complete every Required Repository Protection check below through those authenticated sanitized tools and archive its bounded API evidence before any version or release mutation.
@@ -156,7 +192,7 @@ Require exactly one successful check-run object and exactly one successful workf
 - `crate-site/index.html` links to the intended DMG.
 - Release commit and tag exist on remote.
 - GitHub release exists with the expected artifact.
-- The complete draft, published, and attested GitHub asset sets equal the frozen approved filenames, sizes, and SHA-256 hashes exactly, with no additional asset.
+- The complete draft and published GitHub asset sets equal the frozen approved filenames, sizes, and SHA-256 hashes exactly, with no additional asset. Public stable additionally proves the attested asset set matches.
 - Cloudflare Pages deployed successfully.
 - `get-crate.com` resolves to the new DMG.
 - Exact commands, files changed, tests/checks, risks, and proceed status were reported.
@@ -176,7 +212,7 @@ Require exactly one successful check-run object and exactly one successful workf
 - Electron Builder creates DMG/ZIP containers before the app ticket is stapled, or only the standalone app is verified.
 - A DMG or ZIP contains any entry outside its explicit reviewed inventory.
 - The draft, published, or attested GitHub asset set differs from the frozen approved manifest or contains an additional asset.
-- A release is published before its draft assets are downloaded and compared, repository release immutability is disabled, or release/asset attestation verification fails.
+- A release is published before its draft assets are downloaded and compared, repository release immutability or no-bypass tag immutability is disabled, or public-stable release/asset attestation verification fails.
 - Electron Builder starts under build-only approval even though its `afterSign` hook notarizes the app.
 - `crate-site/index.html` points to an old artifact.
 - Cloudflare deploy succeeds but production domain still serves cached HTML.

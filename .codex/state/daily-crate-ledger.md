@@ -1638,3 +1638,9 @@ Secondary:
 - PR #144's first post-review CI rerun exposed a pre-existing test-only scheduling race: the cache-hardening test observed directory mode before asynchronous bounded-batch yields completed. The test now waits for the already-required yield count before asserting it; no production source or Crate behavior changed.
 - Watcher, package selection and output, parsers, provenance, quota, alerts, window lifecycle, renderer, Quick Package, and Figma scope behavior remain unchanged. No build, install, signing, notarization, release, website deployment, updater work, or Olivia tester mutation occurred.
 - Next gate is a uniquely versioned post-security tester artifact and focused installed-app smoke on the Mac mini. Olivia testing and feedback triage remain the first priority before broader public-release work.
+
+### 2026-07-17 Tester Beta Release Profile Decision
+
+- Bryant confirmed that beta testers continue using the established direct-download flow: Crate publishes a signed and notarized GitHub prerelease, updates the beta download button on `get-crate.com`, deploys that reviewed site commit through Cloudflare, and validates the installed app before sharing it with Olivia.
+- This decision supersedes the pre-beta wording at line 1637 that treated independent approval and layered public tag governance as beta blockers. Both profiles still require source CI, append-only tags, immutable published release assets, and exact asset verification; independent approval, public-stable tag-creation authority, attestation proof, and the account-gated download backend apply only to public stable. Jenna does not need a GitHub account for beta QA or beta distribution.
+- This release-policy distinction does not change Crate runtime, user-data security, watcher, parser, package, provenance, diagnostics, Figma, quota, renderer, or website design behavior. The public account/backend flow remains intentionally unbuilt and post-Olivia.
