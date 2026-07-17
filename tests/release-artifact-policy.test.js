@@ -3780,7 +3780,7 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   assert.doesNotMatch(standardFlow, /npm_config_(?:user|global)config=\/dev\/null/u);
   assert.match(
     standardFlow,
-    /build under the exact sanitized Node environment with `"<canonical-node-executable>" scripts\/run-electron-builder-release\.js --mac --arm64 --config\.npmRebuild=false`/u
+    /build under the exact sanitized Node environment with `"<canonical-node-executable>" scripts\/run-electron-builder-release\.js --mac --arm64 --config\.npmRebuild=false --config\.publish\.provider=github --config\.publish\.owner=bfeintuch123 --config\.publish\.repo=crate-app --publish never`/u
   );
   assert.match(standardFlow, /reauthenticates the canonical Node bytes/iu);
   assert.match(standardFlow, /built-in in-process filesystem traversal collector/iu);

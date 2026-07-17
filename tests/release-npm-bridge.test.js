@@ -4,14 +4,77 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const {
+  configureBuildCommand,
+  createYargs,
+  normalizeOptions,
+} = require('electron-builder/out/builder');
+const {
+  PublishManager,
+  getPublishConfigsForUpdateInfo,
+} = require('app-builder-lib/out/publish/PublishManager');
 
 const {
+  REQUIRED_ARGS,
   authenticateReleaseProcess,
   forceTraversalCollector,
+  releaseArgsAreExact,
   sha256,
 } = require('../scripts/run-electron-builder-release');
 
 const CANONICAL_NODE = fs.realpathSync(process.execPath);
+
+test('release launcher requires local update metadata without publishing', () => {
+  assert.equal(releaseArgsAreExact(REQUIRED_ARGS), true);
+  assert.equal(releaseArgsAreExact(REQUIRED_ARGS.slice(0, -2)), false);
+  assert.equal(releaseArgsAreExact([...REQUIRED_ARGS.slice(0, -1), 'always']), false);
+  assert.equal(releaseArgsAreExact([...REQUIRED_ARGS].reverse()), false);
+});
+
+test('release launcher gives Electron Builder explicit local update metadata configuration', async () => {
+  const parser = createYargs();
+  configureBuildCommand(parser);
+  const options = normalizeOptions(parser.parse(REQUIRED_ARGS));
+  const publishConfig = {
+    provider: 'github',
+    owner: 'bfeintuch123',
+    repo: 'crate-app',
+  };
+
+  assert.equal(options.publish, 'never');
+  assert.deepEqual(options.config.publish, publishConfig);
+  assert.deepEqual(
+    await getPublishConfigsForUpdateInfo({}, [publishConfig], 3),
+    [publishConfig]
+  );
+});
+
+test('release launcher keeps Electron Builder upload scheduling unreachable', async () => {
+  const handlers = {};
+  const cancellationToken = { cancelled: false };
+  const packager = {
+    cancellationToken,
+    onAfterPack(handler) {
+      handlers.afterPack = handler;
+    },
+    onArtifactCreated(handler) {
+      handlers.artifactCreated = handler;
+    },
+  };
+  const manager = new PublishManager(packager, { publish: 'never' }, cancellationToken);
+  let uploadWasScheduled = false;
+  manager.scheduleUpload = async () => {
+    uploadWasScheduled = true;
+  };
+
+  assert.equal(manager.isPublish, false);
+  await handlers.artifactCreated({
+    file: '/private/tmp/Crate-test.dmg',
+    packager: null,
+    publishConfig: { provider: 'github' },
+  });
+  assert.equal(uploadWasScheduled, false);
+});
 
 test('release launcher binds the authenticated Node to the running executable', () => {
   const env = {
