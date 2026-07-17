@@ -134,12 +134,14 @@ Run these exact read-only API queries through the authenticated sanitized GitHub
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/rulesets?includes_parents=false' --jq '[.[] | {id,name,target,enforcement}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/rulesets/<ruleset-id> --jq '{id,name,target,enforcement,conditions,rules,bypass_actors}'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/immutable-releases --jq '{enabled}'
+<sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/commits/<release-pr-head-sha>/check-runs?filter=latest&per_page=100' --jq '[.check_runs[] | select(.name == "Source security and regression suite") | {id,name,status,conclusion,head_sha,app:{id:.app.id,slug:.app.slug},check_suite_id:.check_suite.id}]'
+<sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/actions/workflows/security-gate.yml/runs?branch=<release-prep-branch>&event=pull_request&per_page=100' --jq '[.workflow_runs[] | select(.head_sha == "<release-pr-head-sha>") | {id,path,event,head_branch,head_sha,status,conclusion,check_suite_id}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/commits/<release-merge-sha>/check-runs?filter=latest&per_page=100' --jq '[.check_runs[] | select(.name == "Source security and regression suite") | {id,name,status,conclusion,head_sha,app:{id:.app.id,slug:.app.slug},check_suite_id:.check_suite.id}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api 'repos/bfeintuch123/crate-app/actions/workflows/security-gate.yml/runs?branch=v2.4.x&event=push&per_page=100' --jq '[.workflow_runs[] | select(.head_sha == "<release-merge-sha>") | {id,path,event,head_branch,head_sha,status,conclusion,check_suite_id}]'
 <sanitized-gh-environment> "<canonical-gh-executable>" api repos/bfeintuch123/crate-app/actions/runs/<workflow-run-id> --jq '{id,path,event,head_branch,head_sha,status,conclusion,check_suite_id}'
 ```
 
-Require exactly one successful check-run object and exactly one successful workflow-run object at the release merge SHA. Their check-suite IDs must be equal, the workflow path must be `.github/workflows/security-gate.yml`, the event must be `push`, the branch must be `v2.4.x`, and the app slug must be `github-actions`.
+Require exactly one successful check-run object and exactly one successful workflow-run object at both the version-only PR head SHA and the protected-branch release merge SHA. For each SHA, their check-suite IDs must be equal, the workflow path must be `.github/workflows/security-gate.yml`, and the app slug must be `github-actions`. The PR-head workflow event must be `pull_request` and its head branch must be `<release-prep-branch>`; the merge workflow event must be `push` and its branch must be `v2.4.x`.
 
 #### Public Stable Extensions Only
 

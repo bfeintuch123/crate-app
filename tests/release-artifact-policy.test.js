@@ -3830,6 +3830,8 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
     'repos/bfeintuch123/crate-app/rulesets/<ruleset-id>',
     'repos/bfeintuch123/crate-app/immutable-releases',
     'repos/bfeintuch123/crate-app/pulls/<release-pr-number>/reviews?per_page=100',
+    'repos/bfeintuch123/crate-app/commits/<release-pr-head-sha>/check-runs?filter=latest&per_page=100',
+    'repos/bfeintuch123/crate-app/actions/workflows/security-gate.yml/runs?branch=<release-prep-branch>&event=pull_request&per_page=100',
     'repos/bfeintuch123/crate-app/commits/<release-merge-sha>/check-runs?filter=latest&per_page=100',
     'repos/bfeintuch123/crate-app/actions/workflows/security-gate.yml/runs?branch=v2.4.x&event=push&per_page=100',
     'repos/bfeintuch123/crate-app/actions/runs/<workflow-run-id>',
@@ -3838,6 +3840,8 @@ test('release flow reconstructs dependencies narrowly and proves the stapled app
   }
   assert.match(governanceEvidence, /check_suite_id:\.check_suite\.id/u);
   assert.match(governanceEvidence, /app:\{id:\.app\.id,slug:\.app\.slug\}/u);
+  assert.match(governanceEvidence, /version-only PR head SHA.*protected-branch release merge SHA/iu);
+  assert.match(governanceEvidence, /PR-head workflow event must be `pull_request`/iu);
   assert.match(governanceEvidence, /\{user:\.user\.login,state,commit_id,submitted_at\}/u);
   assert.match(governanceEvidence, /zero or multiple candidates where exactly one is required/iu);
   assert.doesNotMatch(governanceEvidence, /--paginate/u);
