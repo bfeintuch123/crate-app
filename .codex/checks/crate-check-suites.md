@@ -9,7 +9,8 @@ Use for workflow docs, playbooks, skills, and Markdown-only changes.
 ```sh
 git diff --check
 git diff --name-only
-python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py
+python3 -m py_compile .codex/tools/crate_doctor.py
+python3 -m unittest discover -s .codex/tools/tests -p 'test_*.py'
 rg -n "[[:blank:]]$" AGENTS.md WORKSPACE.md docs .codex .agents
 LC_ALL=C rg -n "[^[:ascii:]]" AGENTS.md WORKSPACE.md docs .codex .agents
 ```
@@ -20,7 +21,8 @@ Use when changes affect Crate standing orders, taskflows, memory, proof bundles,
 
 ```sh
 python3 .codex/tools/crate_doctor.py
-python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py
+python3 -m py_compile .codex/tools/crate_doctor.py
+python3 -m unittest discover -s .codex/tools/tests -p 'test_*.py'
 python3 -m json.tool .codex/ops/crate-feature-inventory.json >/dev/null
 python3 -m json.tool .codex/ops/crate-loop-catalog.json >/dev/null
 python3 -m json.tool .codex/ops/crate-automations.json >/dev/null

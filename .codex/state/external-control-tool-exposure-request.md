@@ -2,6 +2,11 @@
 
 Date: 2026-06-29
 
+Status: Resolved 2026-07-16. Crate Ops plugin
+`0.11.1+codex.20260716214926` now owns the persistent task transport and
+exposes create, send, read, list, and title tools. Commands below describe the
+historical app-repo bridge and are retained only as original request evidence.
+
 ## Goal
 
 Expose persistent user-owned Codex thread tools to the Crate source-of-truth thread so Codex can create, message, read, list, title, pin, archive, and hand off visible sidebar threads directly for Crate workflows.

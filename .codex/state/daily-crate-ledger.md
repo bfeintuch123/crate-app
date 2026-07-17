@@ -1619,3 +1619,11 @@ Secondary:
 - Manifest/lock comparison shows no dependency drift beyond removal of the root `uuid` declaration and `node_modules/uuid` record. Protected renderer, preload, parser, package, provenance, release, Figma, quota, and UI surfaces are unchanged.
 - First release-blocker Autoreview found one documentation-only P2: the taskflow still described the pre-implementation state. No code, compatibility, package, lockfile, test-harness, Figma, or provenance finding was reported. Durable evidence is corrected pending the final no-finding rereview; nothing is staged, committed, pushed, built, installed, released, deployed, or sent to Olivia.
 - After the stale taskflow and durable state were corrected, the final narrow release-blocker rereview returned `NO_ACTIONABLE_FINDINGS`; the reviewer and builder were both closed. The frozen candidate is ready for separate staging, commit, push, and PR approval. Nothing is staged, committed, pushed, built, installed, released, deployed, or sent to Olivia.
+
+### 2026-07-16 Crate Ops Persistent Task Ownership
+
+- Closed app PR #142 unmerged and moved the persistent task transport into the Crate Ops plugin.
+- Crate Ops PR #11 merged as `989d65aa9d81622b10266d5bc357bb2de712a3a7` after 126 local tests, Python 3.9/3.12 CI, plugin validation, and final `NO_ACTIONABLE_FINDINGS` Autoreview.
+- Installed plugin `0.11.1+codex.20260716214926`; its bridge resolves inside the plugin cache and no longer executes code from the Crate app repository.
+- Created and read persistent task `019f6dd8-b8e6-7812-a9f8-3432d4648e07`; it returned `CRATE_OPS_THREAD_PROBE=PASS` under workspace-write, on-request authority with network disabled.
+- Began the separate ops-only removal of the duplicate `.codex` bridge. No Crate runtime, UI, parser, package, Figma, provenance, dependency, build, release, updater, website, or deploy behavior changed.

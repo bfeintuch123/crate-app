@@ -185,7 +185,7 @@ Trigger:
 
 Allowed actions:
 - use native thread tools when available
-- use `.codex/tools/codex_thread_control.py` when native tools are unavailable
+- use the installed Crate Ops persistent task tools or its plugin-owned fallback CLI when native tools are unavailable
 - use sub-agents for bounded read-only sidecar work
 
 Approval gates:
