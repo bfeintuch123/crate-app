@@ -3680,7 +3680,12 @@ test('tester beta keeps verified website distribution without public-stable gove
   assert.match(testerFlow, /no-bypass `v\*` tag update\/deletion protection is active/iu);
   assert.match(testerFlow, /`immutable-releases` reports enabled/iu);
   assert.match(testerFlow, /published release to report immutable/iu);
-  assert.match(testerFlow, /use only `Common Evidence \(Both Profiles\)`/iu);
+  assert.match(testerFlow, /complete draft asset set again into a second new empty directory/iu);
+  assert.match(testerFlow, /every filename, byte size, and SHA-256.*frozen manifest/iu);
+  assert.match(testerFlow, /The next bounded operation must be.*release edit <tag> --draft=false/iu);
+  assert.match(testerFlow, /version-only tester-beta release-prep PR/iu);
+  assert.match(testerFlow, /After it merges, bind the exact `Source security and regression suite` success/iu);
+  assert.match(testerFlow, /Common Artifact Integrity Protection that is available before the version-only release-prep PR/iu);
   assert.match(testerFlow, /manual controlling-principal attestation.*not tester-beta gates/iu);
   assert.doesNotMatch(testerFlow, /reviews\?per_page=100/iu);
   assert.match(commonGovernance, /immutable-releases/u);
@@ -3689,6 +3694,9 @@ test('tester beta keeps verified website distribution without public-stable gove
   assert.match(releaseGate, /Never report tester-beta evidence as satisfying public stable/iu);
   assert.match(releaseGate, /account-gated download backend.*public launch/iu);
   assert.match(betaOrdering, /No tester-beta site deploy until the published prerelease is immutable/iu);
+  assert.match(betaOrdering, /No tester-beta build, tag, GitHub release, site deploy, or live verification/iu);
+  assert.match(betaOrdering, /version-only release-prep merge SHA/iu);
+  assert.doesNotMatch(betaOrdering, /No version or release mutation until/iu);
   assert.doesNotMatch(betaOrdering, /No tester-beta site deploy[^\n]*attested subjects/iu);
   assert.match(instructions, /tester beta.*existing GitHub release and `get-crate\.com` download flow/iu);
   assert.match(instructions, /Both profiles require source-CI provenance.*append-only `v\*` tag protection.*immutable-release enforcement.*immutable published release assets/iu);
