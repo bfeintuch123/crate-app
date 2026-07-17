@@ -40,6 +40,7 @@ const {
   collectReleaseEvidence,
   collectSourceBinding,
   createPrivateAppSnapshot,
+  dependencyPackageInventoriesMatch,
   evaluateReleaseEvidence,
   expectedTeamIdentifier,
   installedPackageMatchesLockArchive,
@@ -1243,6 +1244,18 @@ test('source binding requires a canonical Git root and regular committed source 
     fs.mkdirSync(dependencyRoot, { recursive: true });
     fs.writeFileSync(path.join(dependencyRoot, 'package.json'), dependencyManifest);
     fs.writeFileSync(path.join(dependencyRoot, 'index.js'), 'module.exports = "safe";');
+    const nestedFixtureManifest = {
+      main: 'index.js',
+      name: 'runtime-dep-benchmark',
+      scripts: { benchmark: 'node index.js' },
+      keywords: ['benchmark'],
+      version: '1.0.0',
+    };
+    fs.mkdirSync(path.join(dependencyRoot, 'benchmark'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dependencyRoot, 'benchmark', 'package.json'),
+      JSON.stringify(nestedFixtureManifest)
+    );
     const transitiveManifest = JSON.stringify({
       dependencies: { shared: '2.0.0' },
       name: 'transitive',
@@ -1267,6 +1280,11 @@ test('source binding requires a canonical Git root and regular committed source 
       ['package.json', JSON.stringify(packagedManifest)],
       ['node_modules/runtime-dep/package.json', dependencyManifest],
       ['node_modules/runtime-dep/index.js', 'module.exports = "safe";'],
+      ['node_modules/runtime-dep/benchmark/package.json', JSON.stringify({
+        main: nestedFixtureManifest.main,
+        name: nestedFixtureManifest.name,
+        version: nestedFixtureManifest.version,
+      })],
       ['node_modules/transitive/package.json', transitiveManifest],
       ['node_modules/transitive/index.js', 'module.exports = "transitive";'],
       ['node_modules/shared/package.json', sharedV1Manifest],
@@ -1526,6 +1544,21 @@ test('source binding requires a canonical Git root and regular committed source 
     changedBodyFiles.set('node_modules/runtime-dep/index.js', 'module.exports = "substituted";');
     assert.equal(collectSourceBinding(appPath, cleanRunner, {
       asar: createFakeAsar(changedBodyFiles),
+      archiveVerifier: () => true,
+      sourceRoot,
+    }).dependencyLockMatches, false);
+
+    const changedNestedManifestFiles = new Map(asarFiles);
+    changedNestedManifestFiles.set(
+      'node_modules/runtime-dep/benchmark/package.json',
+      JSON.stringify({
+        main: 'replacement.js',
+        name: nestedFixtureManifest.name,
+        version: nestedFixtureManifest.version,
+      })
+    );
+    assert.equal(collectSourceBinding(appPath, cleanRunner, {
+      asar: createFakeAsar(changedNestedManifestFiles),
       archiveVerifier: () => true,
       sourceRoot,
     }).dependencyLockMatches, false);
@@ -2159,6 +2192,130 @@ test('packaged Canvas native output must match the authenticated prebuild', () =
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test('dependency proof accepts only byte-identical Electron Builder deduplication', () => {
+  const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+  const expectedPackage = (name, root, body, dependencies = {}) => ({
+    files: new Map([
+      ['package.json', {
+        kind: 'manifest',
+        value: { dependencies, name, version: '1.0.0' },
+      }],
+      ['index.js', { kind: 'ordinary', rawDigest: digest(body) }],
+    ]),
+    name,
+    root,
+    version: '1.0.0',
+  });
+  const actualPackage = (name, root, body, dependencies = {}, version = '1.0.0') => ({
+    files: new Map([
+      ['package.json', Buffer.from(JSON.stringify({ dependencies, name, version }))],
+      ['index.js', Buffer.from(body)],
+    ]),
+    name,
+    root,
+    version,
+  });
+  const sourceManifest = {
+    dependencies: { first: '1.0.0', second: '1.0.0' },
+  };
+  const sourceLockfile = {
+    packages: {
+      'node_modules/first': { dependencies: { shared: '1.0.0' } },
+      'node_modules/first/node_modules/shared': {},
+      'node_modules/second': { dependencies: { shared: '1.0.0' } },
+      'node_modules/second/node_modules/shared': {},
+    },
+  };
+  const expected = new Map([
+    ['node_modules/first', expectedPackage(
+      'first',
+      'node_modules/first',
+      'first',
+      { shared: '1.0.0' }
+    )],
+    ['node_modules/first/node_modules/shared', expectedPackage(
+      'shared',
+      'node_modules/first/node_modules/shared',
+      'approved'
+    )],
+    ['node_modules/second', expectedPackage(
+      'second',
+      'node_modules/second',
+      'second',
+      { shared: '1.0.0' }
+    )],
+    ['node_modules/second/node_modules/shared', expectedPackage(
+      'shared',
+      'node_modules/second/node_modules/shared',
+      'approved'
+    )],
+  ]);
+  const hoisted = new Map([
+    ['node_modules/first', actualPackage(
+      'first',
+      'node_modules/first',
+      'first',
+      { shared: '1.0.0' }
+    )],
+    ['node_modules/second', actualPackage(
+      'second',
+      'node_modules/second',
+      'second',
+      { shared: '1.0.0' }
+    )],
+    ['node_modules/shared', actualPackage('shared', 'node_modules/shared', 'approved')],
+  ]);
+
+  assert.equal(dependencyPackageInventoriesMatch(
+    expected,
+    hoisted,
+    sourceManifest,
+    sourceLockfile
+  ), true);
+  assert.equal(dependencyPackageInventoriesMatch(expected, new Map([
+    ...hoisted,
+    ['node_modules/shared', actualPackage('shared', 'node_modules/shared', 'substituted')],
+  ]), sourceManifest, sourceLockfile), false);
+  const wrongVersion = new Map(hoisted);
+  wrongVersion.set(
+    'node_modules/shared',
+    actualPackage('shared', 'node_modules/shared', 'approved', {}, '2.0.0')
+  );
+  assert.equal(dependencyPackageInventoriesMatch(
+    expected,
+    wrongVersion,
+    sourceManifest,
+    sourceLockfile
+  ), false);
+
+  const conflictingExpected = new Map(expected);
+  conflictingExpected.set(
+    'node_modules/second/node_modules/shared',
+    expectedPackage(
+      'shared',
+      'node_modules/second/node_modules/shared',
+      'different-approved-copy'
+    )
+  );
+  assert.equal(dependencyPackageInventoriesMatch(
+    conflictingExpected,
+    hoisted,
+    sourceManifest,
+    sourceLockfile
+  ), false);
+  const extraActual = new Map(hoisted);
+  extraActual.set(
+    'node_modules/unapproved/node_modules/shared',
+    actualPackage('shared', 'node_modules/unapproved/node_modules/shared', 'approved')
+  );
+  assert.equal(dependencyPackageInventoriesMatch(
+    expected,
+    extraActual,
+    sourceManifest,
+    sourceLockfile
+  ), false);
 });
 
 test('signed-app verification isolates a private snapshot and rejects source or snapshot drift', () => {

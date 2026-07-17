@@ -1815,7 +1815,9 @@ function packageFileEvidence(bytes, relativePath, options = {}) {
     kind: 'sha256',
     rawDigest: hashBuffer(bytes),
   };
-  if (relativePath === 'package.json' || relativePath === 'checksums.json') {
+  const isPackageManifest = relativePath === 'package.json' ||
+    relativePath.endsWith('/package.json');
+  if (isPackageManifest || relativePath === 'checksums.json') {
     try {
       evidence.json = JSON.parse(bytes.toString('utf8'));
     } catch (error) {
@@ -1823,7 +1825,7 @@ function packageFileEvidence(bytes, relativePath, options = {}) {
     }
   }
   if (!options.sealForPackaging) return evidence;
-  if (relativePath === 'package.json') {
+  if (isPackageManifest) {
     return {
       ...evidence,
       kind: 'manifest',
@@ -2698,6 +2700,97 @@ function packagePayloadMatches(expectedPackage, actualFiles, options = {}) {
   return true;
 }
 
+function dependencyPackageInventoriesMatch(
+  expectedPackages,
+  actualPackages,
+  sourceManifest,
+  sourceLockfile,
+  options = {}
+) {
+  if (!(expectedPackages instanceof Map) || !(actualPackages instanceof Map) ||
+      expectedPackages.size === 0 || actualPackages.size === 0 ||
+      actualPackages.size > expectedPackages.size || !isPlainObject(sourceManifest) ||
+      !isPlainObject(sourceLockfile) || !isPlainObject(sourceLockfile.packages)) {
+    return false;
+  }
+  const payloadMatches = (expectedPackage, actualPackage) => (
+    expectedPackage.name === actualPackage.name &&
+    expectedPackage.version === actualPackage.version &&
+    packagePayloadMatches(expectedPackage, actualPackage.files, options)
+  );
+  const actualTree = {
+    packages: Object.fromEntries([...actualPackages.keys()].map(root => [root, {}])),
+  };
+  const mappedExpected = new Map();
+  const usedActual = new Set();
+  const visited = new Set();
+  const queue = [];
+  const addRequests = (expectedParent, actualParent, metadata, includePeers) => {
+    const required = dependencySection(metadata, 'dependencies');
+    const optional = dependencySection(metadata, 'optionalDependencies');
+    const peers = includePeers ? dependencySection(metadata, 'peerDependencies') : {};
+    const peerMetadata = includePeers && metadata.peerDependenciesMeta !== undefined
+      ? metadata.peerDependenciesMeta
+      : {};
+    if (required === null || optional === null || peers === null || !isPlainObject(peerMetadata)) {
+      return false;
+    }
+    for (const name of Object.keys(required).sort()) {
+      queue.push({ actualParent, expectedParent, name, optional: false });
+    }
+    for (const name of Object.keys(optional).sort()) {
+      queue.push({ actualParent, expectedParent, name, optional: true });
+    }
+    for (const name of Object.keys(peers).sort()) {
+      const optionalPeer = isPlainObject(peerMetadata[name]) &&
+        peerMetadata[name].optional === true;
+      queue.push({ actualParent, expectedParent, name, optional: optionalPeer });
+    }
+    return true;
+  };
+  if (!addRequests('', '', sourceManifest, false)) return false;
+
+  // Electron Builder hoists identical production packages and emits one copy for
+  // multiple lock paths. Follow the actual Node resolution graph and require
+  // every parent edge to resolve to the authenticated version and bytes from the
+  // lockfile. This permits safe hoisting without allowing topology swaps.
+  while (queue.length > 0) {
+    const request = queue.shift();
+    const expectedRoot = resolveDependencyLockPath(
+      sourceLockfile,
+      request.expectedParent,
+      request.name
+    );
+    if (!expectedRoot || !expectedPackages.has(expectedRoot)) {
+      if (request.optional) continue;
+      return false;
+    }
+    const actualRoot = resolveDependencyLockPath(
+      actualTree,
+      request.actualParent,
+      request.name
+    );
+    const expectedPackage = expectedPackages.get(expectedRoot);
+    const actualPackage = actualRoot && actualPackages.get(actualRoot);
+    if (!actualPackage || !payloadMatches(expectedPackage, actualPackage)) return false;
+    if (mappedExpected.has(expectedRoot) && mappedExpected.get(expectedRoot) !== actualRoot) {
+      return false;
+    }
+    mappedExpected.set(expectedRoot, actualRoot);
+    usedActual.add(actualRoot);
+    const pair = `${expectedRoot}\0${actualRoot}`;
+    if (visited.has(pair)) continue;
+    visited.add(pair);
+    const metadata = sourceLockfile.packages[expectedRoot];
+    if (!isPlainObject(metadata) ||
+        !addRequests(expectedRoot, actualRoot, metadata, true)) {
+      return false;
+    }
+  }
+  return mappedExpected.size === expectedPackages.size &&
+    usedActual.size === actualPackages.size;
+}
+
 function dependencyInventoryMatchesLock(asar, asarPath, sourceRoot, sourceManifest, options = {}) {
   const expected = collectExpectedProductionPackages(sourceRoot, sourceManifest, options);
   const packaged = collectPackagedDependencyFiles(asar, asarPath);
@@ -2725,16 +2818,13 @@ function dependencyInventoryMatchesLock(asar, asarPath, sourceRoot, sourceManife
     owner.files.set(entry.slice(owner.root.length + 1), bytes);
   }
 
-  const expectedKeys = [...expected.packages.keys()].sort();
-  const actualKeys = [...actualPackages.keys()].sort();
-  if (!isDeepStrictEqual(expectedKeys, actualKeys)) return false;
-  const payloadMatches = expectedKeys.every(root => {
-    const expectedPackage = expected.packages.get(root);
-    const actualPackage = actualPackages.get(root);
-    return expectedPackage.name === actualPackage.name &&
-      expectedPackage.version === actualPackage.version &&
-      packagePayloadMatches(expectedPackage, actualPackage.files, options);
-  });
+  const payloadMatches = dependencyPackageInventoriesMatch(
+    expected.packages,
+    actualPackages,
+    sourceManifest,
+    options.sourceLockfile,
+    options
+  );
   return payloadMatches && expected.recheck();
 }
 
@@ -3452,6 +3542,7 @@ module.exports = {
   collectSourceBinding,
   collectReleaseEvidence,
   createPrivateAppSnapshot,
+  dependencyPackageInventoriesMatch,
   evaluateReleaseEvidence,
   expectedTeamIdentifier,
   installedPackageMatchesLockArchive,
