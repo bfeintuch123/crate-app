@@ -21,6 +21,8 @@ ROOT = Path(os.environ.get("CRATE_REPO", "/Users/bryantfeintuchclaw/Projects")).
 EXPECTED_REMOTE = "bfeintuch123/crate-app"
 EXPECTED_BRANCH = "v2.4.x"
 KEYCHAIN_SERVICE = "crate-cloudflare-api-token"
+CRATE_OPS_SOURCE_ROOT = Path.home() / "plugins" / "crate-ops"
+CRATE_OPS_CACHE_ROOT = Path.home() / ".codex" / "plugins" / "cache" / "personal" / "crate-ops"
 MIB = 1024 * 1024
 
 
@@ -57,6 +59,77 @@ def fail(name: str, detail: str) -> Check:
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
+
+
+def is_regular_file_without_plugin_symlinks(path: Path, plugin_root: Path) -> bool:
+    """Return true only for regular files reached without plugin-local symlinks."""
+    try:
+        relative = path.relative_to(plugin_root)
+    except ValueError:
+        return False
+
+    current = plugin_root
+    if current.is_symlink() or not current.is_dir():
+        return False
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return current.is_file()
+
+
+def coherent_crate_ops_plugin(plugin_root: Path, expected_version: str | None = None) -> bool:
+    """Validate the minimum self-contained Crate Ops thread-control contract."""
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    mcp_config_path = plugin_root / ".mcp.json"
+    server_path = plugin_root / "mcp" / "crate_thread_control_server.py"
+    bridge_path = plugin_root / "mcp" / "codex_thread_control.py"
+    required_files = (manifest_path, mcp_config_path, server_path, bridge_path)
+    if not all(is_regular_file_without_plugin_symlinks(path, plugin_root) for path in required_files):
+        return False
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mcp_config = json.loads(mcp_config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    if not isinstance(manifest, dict) or not isinstance(mcp_config, dict):
+        return False
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        return False
+    if manifest.get("name") != "crate-ops" or manifest.get("mcpServers") != "./.mcp.json":
+        return False
+    if expected_version is not None and version != expected_version:
+        return False
+
+    servers = mcp_config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return False
+    server = servers.get("crate-thread-control")
+    if not isinstance(server, dict):
+        return False
+    return (
+        server.get("cwd") == "."
+        and server.get("command") == "python3"
+        and server.get("args") == ["./mcp/crate_thread_control_server.py"]
+    )
+
+
+def coherent_installed_crate_ops_plugin(cache_root: Path) -> bool:
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        return False
+    try:
+        candidates = tuple(cache_root.iterdir())
+    except OSError:
+        return False
+    return any(
+        candidate.is_dir()
+        and not candidate.is_symlink()
+        and coherent_crate_ops_plugin(candidate, expected_version=candidate.name)
+        for candidate in candidates
+    )
 
 
 def human_size(size: int) -> str:
@@ -150,10 +223,10 @@ def check_tools() -> list[Check]:
         else:
             checks.append(warn(f"tool.{tool}", "missing; release signing/notary gates cannot run here"))
 
-    if (ROOT / ".codex" / "tools" / "codex_thread_control.py").exists():
-        checks.append(ok("tool.thread_control", "local Codex thread bridge present"))
+    if coherent_crate_ops_plugin(CRATE_OPS_SOURCE_ROOT) or coherent_installed_crate_ops_plugin(CRATE_OPS_CACHE_ROOT):
+        checks.append(ok("tool.thread_control", "coherent self-contained Crate Ops thread bridge present"))
     else:
-        checks.append(warn("tool.thread_control", "local Codex thread bridge missing"))
+        checks.append(warn("tool.thread_control", "coherent self-contained Crate Ops thread bridge missing"))
 
     return checks
 

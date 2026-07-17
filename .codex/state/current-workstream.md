@@ -592,12 +592,12 @@ Historical qa44 validation target:
 - External tester feedback should flow through the professional testing company's portal with a structured Crate intake form. Bryant reviews first for product/privacy, Codex synthesizes triage, bugs route to the Autonomous Crate Failure Loop, and UX/design feedback routes to Jenna's redesign backlog.
 - This Codex thread is the Crate source of truth and command center. When Crate work needs a fresh thread, Figma-specific thread, QA thread, or scoped handoff thread, Codex should create or message that thread directly when thread tools are exposed, instead of defaulting to giving Bryant a prompt to paste manually. If thread tools are unavailable, Codex should say so and provide the fallback prompt.
 - External control layer update:
-  - native model-visible persistent thread tools such as `create_thread`, `send_message_to_thread`, `read_thread`, and `list_threads` are still not exposed in this session
-  - local Codex app-server bridge is verified at `.codex/tools/codex_thread_control.py`
-  - verified bridge operations: persistent thread start/list/read/name/send via app-server `thread/start`, `thread/list`, `thread/read`, `thread/name/set`, `thread/resume`, and `turn/start`
+  - Crate Ops plugin `0.11.1+codex.20260716214926` owns and exposes persistent task start/list/read/name/send through the local app-server transport
+  - the duplicate app-repo bridge is retired; Crate app runtime and product behavior are unchanged
+  - verified task `Crate Ops Thread Probe` / `019f6dd8-b8e6-7812-a9f8-3432d4648e07` returned `CRATE_OPS_THREAD_PROBE=PASS` with workspace-write, on-request authority
   - probe thread: `Crate Control Probe` / `019f1601-f049-72a0-a5cb-841a4b306598`, persisted response `PONG`
   - sub-agent controls are exposed and verified: `spawn_agent`, `send_input`, `wait_agent`, `resume_agent`, `close_agent`
-  - use `.codex/playbooks/crate-external-control-layer.md` to coordinate source-of-truth, persistent bridge threads, native persistent threads when exposed, sub-agents, and paste-ready fallback behavior
+  - use `.codex/playbooks/crate-external-control-layer.md` to coordinate source-of-truth, Crate Ops persistent tasks, native persistent tasks when exposed, sub-agents, and paste-ready fallback behavior
   - exact persistent-thread exposure request is documented at `.codex/state/external-control-tool-exposure-request.md`
 
 ## Known Non-Blocking Public-Release Follow-Ups

@@ -35,7 +35,7 @@ Responsibilities:
 
 Preferred when available.
 
-Preferred native model tools:
+Preferred native model tools when exposed:
 
 - `create_thread`
 - `send_message_to_thread`
@@ -46,15 +46,18 @@ Preferred native model tools:
 - `set_thread_pinned`
 - `set_thread_archived`
 
-Verified local bridge:
+Crate Ops plugin tools currently expose:
 
-- `.codex/tools/codex_thread_control.py list`
-- `.codex/tools/codex_thread_control.py start`
-- `.codex/tools/codex_thread_control.py read`
-- `.codex/tools/codex_thread_control.py send`
-- `.codex/tools/codex_thread_control.py name`
+- `create_thread`
+- `send_message_to_thread`
+- `read_thread`
+- `list_threads`
+- `set_thread_title`
 
-The bridge talks to the local Codex app-server protocol (`thread/start`, `thread/list`, `thread/read`, `thread/name/set`, `thread/resume`, and `turn/start`). It is the current Crate control-layer implementation while native model-visible thread tools remain unavailable.
+The Crate Ops plugin owns the local Codex app-server transport for
+`thread/start`, `thread/list`, `thread/read`, `thread/name/set`,
+`thread/resume`, and `turn/start`. The Crate app repository does not own or
+execute that transport.
 
 Use persistent user-owned threads for work Bryant may want to see, resume, or steer directly from the Codex sidebar:
 
@@ -64,7 +67,9 @@ Use persistent user-owned threads for work Bryant may want to see, resume, or st
 - tester-feedback triage threads
 - public-release prep threads
 
-If native tools are available, Codex should use them directly instead of shelling through the bridge. If native tools are unavailable, use the verified local bridge before asking Bryant to paste prompts manually.
+Use model-visible tools directly when exposed. If this already-open task has a
+stale plugin binding, use the reviewed plugin-owned fallback CLI or start a
+fresh task before asking Bryant to paste prompts manually.
 
 ### Layer 3: Sub-Agents
 
@@ -98,8 +103,8 @@ Before coordinating another thread or agent, confirm:
 - working tree state is understood
 - exact requested mode is clear
 - whether the work is read-only, code-editing, QA, release-gate, Figma, or public-release prep
-- whether native persistent thread tools are currently exposed
-- whether the local app-server bridge is available
+- whether persistent task tools are currently exposed
+- whether the installed Crate Ops plugin transport is current
 
 ## Delegation Rules
 
@@ -112,7 +117,7 @@ Before coordinating another thread or agent, confirm:
 
 ## Persistent Thread Workflow
 
-When persistent user-owned thread tools are available, either as native model tools or through the local app-server bridge:
+When persistent user-owned task tools are available, either natively or through Crate Ops:
 
 1. Create or select the target thread.
 2. Give it a scoped Crate prompt with:
@@ -128,13 +133,13 @@ When persistent user-owned thread tools are available, either as native model to
 5. Integrate the result in this source-of-truth thread.
 6. Update state/ledger with the outcome.
 
-Bridge commands:
+Plugin-owned fallback commands:
 
 ```bash
-.codex/tools/codex_thread_control.py list --limit 10
-.codex/tools/codex_thread_control.py start --title "Crate Side Task" --message "<prompt>" --wait 180
-.codex/tools/codex_thread_control.py send <thread-id> "<prompt>" --wait 180
-.codex/tools/codex_thread_control.py read <thread-id> --include-turns
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/mcp/codex_thread_control.py list --limit 10
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/mcp/codex_thread_control.py start --title "Crate Side Task" --message "<prompt>" --wait 180
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/mcp/codex_thread_control.py send <thread-id> "<prompt>" --wait 180
+python3 /Users/bryantfeintuchclaw/plugins/crate-ops/mcp/codex_thread_control.py read <thread-id> --include-turns
 ```
 
 Use `send` only for scoped prompts that can safely run as a separate thread. Do not send secrets, full Figma URLs, signed URLs, raw diagnostics, or unrelated private paths.
@@ -152,7 +157,7 @@ When only sub-agent tools are available:
 
 ## Fallback Workflow
 
-If neither persistent thread tools/bridge nor sub-agent tools are available:
+If neither persistent task tools nor sub-agent tools are available:
 
 - say which tool family is missing
 - provide Bryant a paste-ready prompt
@@ -175,22 +180,20 @@ unless Bryant explicitly approves that exact scope.
 
 ## Current Tool State
 
-Last verified: 2026-06-29.
+Last verified: 2026-07-16.
 
 Available:
 
-- local Codex app-server bridge for persistent thread start/list/read/send/name:
-  - `.codex/tools/codex_thread_control.py`
+- Crate Ops plugin `0.11.1+codex.20260716214926` persistent task tools
+- plugin-owned fallback CLI under `/Users/bryantfeintuchclaw/plugins/crate-ops/mcp/`
 - sub-agent spawn/send/wait/resume/close
 - Computer Use
 - GitHub PR review-thread tools
 - partial Figma MCP tools depending on active tool exposure
 
-Not currently exposed in this thread:
-
-- native model-visible persistent user-owned thread creation/messaging/list/read tools
-
-Until native model-visible thread tools appear, use the local app-server bridge for persistent Crate side threads and sub-agents for internal bounded sidecar work.
+Long-running tasks may retain the plugin cache version loaded when they were
+opened. A fresh task uses the installed version; do not overwrite immutable
+plugin caches to force a hot reload.
 
 ## Definition Of Done
 

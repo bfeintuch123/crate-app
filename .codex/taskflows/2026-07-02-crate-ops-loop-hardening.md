@@ -3,14 +3,14 @@
 ## Metadata
 
 - created: 2026-07-02
-- updated: 2026-07-02
+- updated: 2026-07-16
 - owner: Bryant / Codex source-of-truth thread
 - standing order: SO-006 External Control / Thread Coordination, plus docs-only ops hardening
 - repo: `/Users/bryantfeintuchclaw/Projects`
 - branch: `codex/crate-ops-loop-hardening`
 - base: `v2.4.x`
 - mode: docs/ops-only
-- status: ready-for-review
+- status: completed
 
 ## Goal
 
@@ -42,11 +42,11 @@ Forbidden:
 
 ## State
 
-- current phase: PR review
-- last completed checkpoint: ops docs, skills, doctor tool, router/loop updates, decision, ledger, workstream state, docs/ops checks, commit, push, and PR
-- next action: review PR #121, then merge only after Bryant approval and merge-readiness if requested
+- current phase: completed
+- last completed checkpoint: PR #121 merged on 2026-07-03
+- next action: none; this file is historical evidence, not a current runbook
 - blocker: none
-- approval state: Bryant approved implementing and formalizing the ops/workflow improvements; merge not yet approved
+- approval state: Bryant approved implementation and merge; PR #121 is complete
 
 ## Checkpoints
 
@@ -69,6 +69,9 @@ Forbidden:
 | 2026-07-02 | Ran syntax/diff checks | `python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py`; `git diff --check` | pass |
 | 2026-07-02 | Ran docs hygiene checks | trailing whitespace clean; ASCII check found pre-existing non-ASCII in historical QA state text | pass with known pre-existing note |
 | 2026-07-02 | Committed/pushed/opened PR | commit `b839b74`; PR #121 | pass |
+| 2026-07-03 | Merged ops hardening | PR #121 | pass |
+
+The commands above record the app-repo ownership model that existed when this taskflow ran. Current thread-control transport is owned by the Crate Ops plugin; do not reuse the historical app-owned bridge command as a current runbook.
 
 ## Risks
 
@@ -80,5 +83,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Review PR #121. If Bryant wants it merged, run merge-readiness first and merge only if clean.
+No action. PR #121 is merged; retain this taskflow as historical evidence.
 ```
