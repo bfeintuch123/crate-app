@@ -54,7 +54,7 @@ Verified local bridge:
 - `.codex/tools/codex_thread_control.py send`
 - `.codex/tools/codex_thread_control.py name`
 
-The bridge talks to the local Codex app-server protocol (`thread/start`, `thread/list`, `thread/read`, `thread/name/set`, `thread/resume`, and `turn/start`). It is the current Crate control-layer implementation while native model-visible thread tools remain unavailable.
+The bridge talks to the local Codex app-server protocol (`thread/start`, `thread/list`, `thread/read`, `thread/name/set`, `thread/resume`, and `turn/start`). It remains the fallback Crate control-layer implementation for operations that are not exposed as native model-visible task tools.
 
 Use persistent user-owned threads for work Bryant may want to see, resume, or steer directly from the Codex sidebar:
 
@@ -137,6 +137,16 @@ Bridge commands:
 .codex/tools/codex_thread_control.py read <thread-id> --include-turns
 ```
 
+The bridge resolves the local Codex executable in this order:
+
+1. an explicit `CRATE_CODEX_EXECUTABLE` override
+2. the current ChatGPT app bundle
+3. the legacy Codex app bundle
+4. `codex` on `PATH`
+
+Every candidate must be an executable file. An invalid explicit override fails
+closed without echoing the configured path.
+
 Use `send` only for scoped prompts that can safely run as a separate thread. Do not send secrets, full Figma URLs, signed URLs, raw diagnostics, or unrelated private paths.
 
 ## Sub-Agent Workflow
@@ -175,12 +185,16 @@ unless Bryant explicitly approves that exact scope.
 
 ## Current Tool State
 
-Last verified: 2026-06-29.
+Last verified: 2026-07-16.
 
 Available:
 
+- native model-visible persistent task create/list/read/send/title tools through
+  the Crate Ops plugin
 - local Codex app-server bridge for persistent thread start/list/read/send/name:
   - `.codex/tools/codex_thread_control.py`
+  - executable discovery supports the current ChatGPT app bundle, the legacy
+    Codex app bundle, an explicit override, and a validated `PATH` fallback
 - sub-agent spawn/send/wait/resume/close
 - Computer Use
 - GitHub PR review-thread tools
@@ -188,9 +202,12 @@ Available:
 
 Not currently exposed in this thread:
 
-- native model-visible persistent user-owned thread creation/messaging/list/read tools
+- native persistent task archive, pin, fork, or handoff tools
 
-Until native model-visible thread tools appear, use the local app-server bridge for persistent Crate side threads and sub-agents for internal bounded sidecar work.
+Use native persistent task tools when their required operation is exposed. Use
+the local app-server bridge for the remaining start/list/read/send/name workflow
+and sub-agents for internal bounded sidecar work. Archive probe or completed
+sidebar tasks manually until an archive tool is exposed.
 
 ## Definition Of Done
 

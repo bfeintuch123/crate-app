@@ -1619,3 +1619,15 @@ Secondary:
 - Manifest/lock comparison shows no dependency drift beyond removal of the root `uuid` declaration and `node_modules/uuid` record. Protected renderer, preload, parser, package, provenance, release, Figma, quota, and UI surfaces are unchanged.
 - First release-blocker Autoreview found one documentation-only P2: the taskflow still described the pre-implementation state. No code, compatibility, package, lockfile, test-harness, Figma, or provenance finding was reported. Durable evidence is corrected pending the final no-finding rereview; nothing is staged, committed, pushed, built, installed, released, deployed, or sent to Olivia.
 - After the stale taskflow and durable state were corrected, the final narrow release-blocker rereview returned `NO_ACTIONABLE_FINDINGS`; the reviewer and builder were both closed. The frozen candidate is ready for separate staging, commit, push, and PR approval. Nothing is staged, committed, pushed, built, installed, released, deployed, or sent to Olivia.
+
+### 2026-07-16 Persistent Task Bridge Discovery
+
+- PR #141 merged the bounded `uuid` cleanup into `v2.4.x` as `29a651619fdd6c47396fc97dd7e150e5bdddfd95` after fresh CI and final merge readiness passed.
+- Began a separate ops-only repair on `codex/ops-thread-bridge-discovery` from that exact merge commit. The canonical checkout remains untouched because it contains unrelated user work.
+- Root cause: `.codex/tools/codex_thread_control.py` hard-coded the removed `/Applications/Codex.app` executable, while the current executable is under `/Applications/ChatGPT.app` and the legacy path is absent.
+- Failure-first discovery coverage fails 5/5 on the base because no executable resolver exists. The candidate adds a validated override, current and legacy app-bundle candidates, and a validated `PATH` fallback with privacy-safe failure output.
+- Focused discovery tests pass, direct resolution selects the current ChatGPT bundle, and live bridge list/start/read operations pass. Verification task `019f6dab-2c6e-7383-a1fb-c4515f11c287` returned exactly `BRIDGE_PROBE=PASS`.
+- Native and bridge tooling expose create/list/read/send/title but not archive; the verification task remains available for manual archival rather than claiming automatic cleanup.
+- First independent Autoreview blocked publication on relative executable normalization, launch-error path leakage, and one stale playbook sentence. Successful candidates now resolve to absolute paths before `Popen`, launch `OSError` output is fixed and path-free, and the tool-state language is consistent; direct regressions cover both P2 issues.
+- The corrected focused suite passes 8/8, Python compilation, JSON catalog validation, whitespace checks, direct ChatGPT executable resolution, app-server interface inspection, and live bridge list/start/read probes pass. Final independent rereview returns `NO_ACTIONABLE_FINDINGS`.
+- No Crate app runtime, dependency, renderer, parser, package, Figma, provenance, build, install, release, deploy, updater, or tester behavior is in scope.

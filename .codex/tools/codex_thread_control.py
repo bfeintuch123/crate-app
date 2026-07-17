@@ -16,6 +16,7 @@ import json
 import os
 import secrets
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -23,10 +24,14 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping, Sequence
 
 
-CODEX = Path("/Applications/Codex.app/Contents/Resources/codex")
+CODEX_EXECUTABLE_ENV = "CRATE_CODEX_EXECUTABLE"
+CODEX_BUNDLE_CANDIDATES = (
+    Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+    Path("/Applications/Codex.app/Contents/Resources/codex"),
+)
 CODEX_HOME = Path.home() / ".codex"
 SOCKET_PATH = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 DEFAULT_CWD = "/Users/bryantfeintuchclaw/Projects"
@@ -34,6 +39,48 @@ DEFAULT_CWD = "/Users/bryantfeintuchclaw/Projects"
 
 class ProtocolError(RuntimeError):
     pass
+
+
+def is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def normalize_executable(path: Path) -> Path | None:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if is_executable_file(resolved) else None
+
+
+def resolve_codex_executable(
+    env: Mapping[str, str] | None = None,
+    candidates: Sequence[Path] = CODEX_BUNDLE_CANDIDATES,
+    which: Callable[[str], str | None] = shutil.which,
+) -> Path:
+    environment = os.environ if env is None else env
+    override = environment.get(CODEX_EXECUTABLE_ENV, "").strip()
+    if override:
+        override_path = normalize_executable(Path(override))
+        if override_path:
+            return override_path
+        raise RuntimeError(f"{CODEX_EXECUTABLE_ENV} is not an executable file")
+
+    for candidate in candidates:
+        bundle_path = normalize_executable(candidate)
+        if bundle_path:
+            return bundle_path
+
+    path_match = which("codex")
+    if path_match:
+        path_candidate = normalize_executable(Path(path_match))
+        if path_candidate:
+            return path_candidate
+
+    raise RuntimeError(
+        "Unable to locate the Codex executable. Install ChatGPT/Codex. Set "
+        f"{CODEX_EXECUTABLE_ENV} to its executable path."
+    )
 
 
 def encode_ws_text(payload: str) -> bytes:
@@ -122,13 +169,17 @@ class AppServer:
 
     def _start_temp_server(self) -> None:
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.proc = subprocess.Popen(
-            [str(CODEX), "app-server", "--listen", "unix://"],
-            cwd=DEFAULT_CWD,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        codex = resolve_codex_executable()
+        try:
+            self.proc = subprocess.Popen(
+                [str(codex), "app-server", "--listen", "unix://"],
+                cwd=DEFAULT_CWD,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            raise RuntimeError("Unable to start the Codex app server") from None
         deadline = time.time() + 10
         while time.time() < deadline:
             if self.proc.poll() is not None:

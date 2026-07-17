@@ -21,6 +21,7 @@ Use when changes affect Crate standing orders, taskflows, memory, proof bundles,
 ```sh
 python3 .codex/tools/crate_doctor.py
 python3 -m py_compile .codex/tools/crate_doctor.py .codex/tools/codex_thread_control.py
+python3 .codex/tools/tests/test_codex_thread_control.py
 python3 -m json.tool .codex/ops/crate-feature-inventory.json >/dev/null
 python3 -m json.tool .codex/ops/crate-loop-catalog.json >/dev/null
 python3 -m json.tool .codex/ops/crate-automations.json >/dev/null
