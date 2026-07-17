@@ -1,0 +1,113 @@
+name: Crate source security gate
+
+on:
+  pull_request:
+    branches: [v2.4.x]
+  push:
+    branches: [v2.4.x]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crate-source-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-security:
+    name: Source security and regression suite
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      NODE_OPTIONS: ''
+      NODE_PATH: ''
+      npm_config_fund: 'false'
+      npm_config_ignore_scripts: 'true'
+      npm_config_registry: https://registry.npmjs.org/
+      npm_config_strict_ssl: 'true'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+          submodules: false
+
+      - name: Scrub checkout credentials and map legacy gitlinks
+        run: |
+          test ! -e .gitmodules && test ! -L .gitmodules
+          git config --file .gitmodules submodule.crate-web.path crate-web
+          git config --file .gitmodules submodule.crate-web.url ./crate-web
+          git config --file .gitmodules submodule.mission-control.path mission-control
+          git config --file .gitmodules submodule.mission-control.url ./mission-control
+          git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null
+          git config --local --unset-all http.https://github.com/.extraheader
+          ! git config --local --name-only --get-regexp '^http\..*\.extraheader$' >/dev/null
+
+      - name: Reject repository package-manager configuration
+        run: test ! -e .npmrc && test ! -L .npmrc && test ! -e npm-shrinkwrap.json && test ! -L npm-shrinkwrap.json
+
+      - name: Prepare isolated npm configuration
+        run: |
+          /usr/bin/install -m 600 /dev/null "$RUNNER_TEMP/crate-user-npmrc"
+          /usr/bin/install -m 600 /dev/null "$RUNNER_TEMP/crate-global-npmrc"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.23.1
+
+      - name: Install frozen dependencies
+        env:
+          npm_config_cache: ${{ runner.temp }}/crate-npm-cache
+          npm_config_globalconfig: ${{ runner.temp }}/crate-global-npmrc
+          npm_config_userconfig: ${{ runner.temp }}/crate-user-npmrc
+        run: npm ci --ignore-scripts --registry=https://registry.npmjs.org/
+
+      - name: Reject high-severity dependency findings
+        env:
+          npm_config_cache: ${{ runner.temp }}/crate-npm-cache
+          npm_config_globalconfig: ${{ runner.temp }}/crate-global-npmrc
+          npm_config_userconfig: ${{ runner.temp }}/crate-user-npmrc
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
+
+      - name: Verify dependency lifecycle policy
+        run: node scripts/verify-install-scripts.js
+
+      - name: Check security verifier syntax
+        run: |
+          node --check main.js
+          node --check preload.js
+          node --check provenance.js
+          node --check diagnostic-summary.js
+          node --check renderer/app.js
+          node --check parsers/figma-credential-store.js
+          node --check parsers/figma-network.js
+          node --check parsers/figma-redaction.js
+          node --check parsers/figma.js
+          node --check parsers/package-safety.js
+          node --check scripts/install-approved-canvas-prebuild.js
+          node --check scripts/verify-app-contents.js
+          node --check scripts/verify-install-scripts.js
+          node --check scripts/verify-macos-release-app.js
+          node --check scripts/run-macos-release-proof.js
+
+      - name: Authenticate installed release verifier toolchain
+        env:
+          CRATE_VERIFY_LIVE_TOOLCHAIN: '1'
+          npm_config_cache: ${{ runner.temp }}/crate-npm-cache
+        run: node --test --test-concurrency=1 tests/release-toolchain-integration.test.js
+
+      - name: Run complete serial source suite
+        env:
+          npm_config_cache: ${{ runner.temp }}/crate-npm-cache
+        run: node --test --test-concurrency=1 tests/*.test.js
+
+      - name: Reject pull-request whitespace errors
+        if: github.event_name == 'pull_request'
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+
+      - name: Reject pushed whitespace errors
+        if: github.event_name == 'push'
+        run: git diff --check "${{ github.event.before }}..${{ github.sha }}"

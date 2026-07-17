@@ -125,17 +125,17 @@ Before merge:
 7. Do not merge unless Bryant explicitly approves.
 
 ## Release Workflow
-After a PR is merged:
-1. Pull latest `v2.4.x`.
-2. Bump version.
-3. Build with `npx electron-builder --mac --arm64`.
-4. Staple and verify app.
-5. Update `crate-site/index.html`.
-6. Commit release files.
-7. Tag release.
-8. Create GitHub release.
-9. Deploy Cloudflare Pages.
-10. Confirm `get-crate.com` points to the new DMG.
+Follow `.codex/playbooks/release-crate.md` and `.codex/playbooks/crate-release-gate.md` as the executable release authority:
+1. Before any version or release mutation, establish one exclusive release session and the manual controlling-principal attestation, then use the bounded GitHub API evidence commands to verify `v2.4.x` is the default branch, repository release immutability is enabled, the non-bypassable branch ruleset and layered `v*` tag creation/immutability rulesets are active, and independent code-owner review plus the required source-security check are enforceable. Authenticate fixed Git, GitHub CLI, Node, and npm paths, hashes, and versions, and define the minimal sanitized environment required for every Node invocation.
+2. Create, review, and merge a version-only release-prep PR into `v2.4.x`; bind the protected-branch push check to that exact release SHA, GitHub Actions app, check suite, and `.github/workflows/security-gate.yml`, then pull that exact clean release commit.
+3. Reconstruct dependencies from the committed lockfile with lifecycle scripts disabled, verify the approved lifecycle allowlist, and install only the exact pinned official Canvas arm64 prebuild through the reviewed installer without running dependency lifecycle scripts.
+4. Start Electron Builder only after one combined build, signing, app-notarization, app-stapling, and app-staple-validation approval; the configured `afterSign` hook must use only the fixed `crate-release-notarytool` Keychain profile and complete those app steps before DMG/ZIP creation.
+5. Notarize, staple, and validate release envelopes under their separate approval gate.
+6. Create separate clean proof and verifier worktrees at the release commit, assert their canonical paths differ, reconstruct dependencies independently with lifecycle scripts disabled in both, and install the same authenticated Canvas prebuild only in the proof worktree.
+7. From the explicit verifier worktree at the approved release commit, verify the standalone signed app and the app extracted from every final DMG/ZIP against the isolated proof root and exact Canvas archive at that same commit, including Apple-anchored Developer ID trust, exact launch/security metadata, internally consistent main/helper build metadata, and complete allowlisted outer container inventories; then validate artifact hashes, update metadata, and blockmaps before tagging, push the protected tag, and verify its remote SHA matches the approved release commit.
+8. Freeze an exact asset manifest, create the GitHub release as a draft with the verified remote tag, and compare every downloaded draft asset to every and only approved filename, byte size, and SHA-256. Immediately before publication, re-fetch draft metadata, recheck immutability, repeat the full download and comparison in a second empty directory, and publish as the next bounded operation. After publishing under immutable-release enforcement, require the attested subjects to equal the same exact set and verify every local asset before updating the code-owned `crate-site`.
+9. Commit, review, and merge the site update, reconstruct Wrangler immediately from its authenticated lockfile, bind `whoami` to Cloudflare account `ba2eae4575a070ed70ae9be217fa21dc`, then deploy only from an isolated private working directory and a private inventory-verified snapshot of that exact remote commit; never deploy the live worktree.
+10. Confirm `get-crate.com` points to the exact immutable, attested, hash-verified GitHub DMG.
 Do not run release, build, notarization, tagging, GitHub release, or deploy commands unless Bryant explicitly approves that release step.
 
 ## Crate Guardrails

@@ -3,14 +3,14 @@
 ## Metadata
 
 - created: 2026-07-14
-- updated: 2026-07-15
+- updated: 2026-07-16
 - owner: source-of-truth Codex task
 - standing order: SO-002
 - repo: crate-app
-- branch: `codex/security-release-runtime-phase6a`
+- branch: `codex/security-release-proof-phase6b`
 - base: `v2.4.x`
 - mode: implementation and validation; no release, deploy, or dependency mutation without the applicable approval gate
-- status: phases 1 through 5B are merged and their installed-app gates are complete; Phase 6A runtime artifact hardening, full pre-commit review, exact-base reproduction, and contained signed-app validation are complete; Bryant approved commit, push, PR creation, and merge if merge readiness remains clean
+- status: phases 1 through 6A are merged; PR #140 is open from exact merged `v2.4.x` commit `c9092fbdc715691f7ae2a06ca3ebc0dbef140721`; its failure loop has locally corrected every CI, GitHub-review, and independent-Autoreview finding through workflow, release-playbook, verifier-toolchain, clean-install integration, buffered-proof, and Canvas rollback failure-first tests; the focused lane reports 66 tests total, 65 passed, zero failed, and one CI-only integration skip, the fresh committed-lock integration separately passes 1/1, and the complete suite reports 400 tests total, 399 passed, zero failed, and one environment-gated skip; final narrow independent rereview reports no actionable findings; amended PR CI and merge readiness remain required before separate merge approval
 
 ## Goal
 
@@ -37,10 +37,10 @@ Each phase must remain independently reviewable and revertible. Existing functio
 
 ## Current Phase
 
-- phase: Phase 6A runtime artifact hardening
-- security target: constrain packaged Electron execution to the signed ASAR, remove unused permission declarations, and keep Automation authority out of helper processes
-- implementation target: disable RunAsNode, NODE_OPTIONS, and Node CLI inspection; require embedded ASAR integrity and ASAR-only application loading; audit and retain the file-protocol privilege required by Crate's local signed renderer; keep strict HTTPS transport metadata; and separate main and inherited entitlements
-- workflow target: preserve normal launch, renderer styling, project creation, Quick Package, Package Details, and Figma behavior without a new user prompt or setup step
+- phase: Phase 6B CI enforcement and signed-artifact proof
+- security target: make the Phase 6A artifact protections repeatable and fail closed so a later build cannot silently lose its signature, hardened runtime, fuse policy, entitlement separation, privacy-safe metadata, or packaged-content boundary
+- implementation target: add failure-first release-artifact policy tests, a privacy-safe macOS signed-app verifier, a least-privilege source-only GitHub Actions gate for `v2.4.x`, and release-gate documentation that requires notarization and Gatekeeper proof for public artifacts
+- workflow target: preserve all normal launch, renderer, project, Quick Package, Package Details, and Figma behavior; CI receives no signing or notarization credentials and does not build or release the app
 - package-engine impact: no package selection, copied or extracted file, naming, output, quota, Package Details, watcher, parser, or provenance behavior change
 - Figma scope impact: Current Page Only remains default and fail closed; Entire File remains opt-in
 - normal user-workflow impact: no new step, prompt, permission, setting, or credential action
@@ -56,6 +56,12 @@ This is deliberately outside the security patches. The later updater work must r
 - After Phase 6B, remind Bryant that the direct `uuid@9.0.1` dependency still has a moderate advisory affecting buffer-writing UUID v3, v5, and v6 paths. Crate currently calls only UUID v4 without a caller-provided buffer, so this does not interrupt Phase 6A or 6B.
 - Prefer a narrow removal of the dependency in favor of Node's built-in `crypto.randomUUID()` rather than taking npm's SemVer-major `uuid@14` fix automatically.
 - Complete and review that dependency cleanup before the final integrated six-phase audit so the audit covers the shipped dependency graph. If Bryant explicitly defers it until after that audit, remind him again at audit close and require the affected dependency, source, signed-app, and integrated audit lanes to be rerun before Olivia or public-release rollout.
+
+## Deferred CI Action Runtime Migration Gate
+
+- The SHA-pinned checkout and setup-node v4 actions currently emit GitHub runtime deprecation warnings and are forced onto Node 24 by the hosted runner.
+- Do not combine their major-version migration with the Phase 6B failure loop: checkout v7 changes credential persistence from the locally tested repository extraheader to a temporary included credential file, so the current cleanup proof cannot be assumed to cover it.
+- Before public release, use a separate CI-only PR with failure-first credential-removal tests, pinned current action SHAs, a live pull-request CI run, and the same no-secrets, no-release, read-only workflow boundaries.
 
 ## Checkpoints
 
@@ -131,6 +137,17 @@ This is deliberately outside the security patches. The later updater work must r
 - [x] pass the corrected 251-test focused regression lane and 334-test complete serial source suite
 - [x] complete Phase 6A Autoreview, regression, security, provenance, runner, exact-base Reprobox, and contained signed-app gates
 - [x] obtain Bryant approval before Phase 6A commit, push, and PR creation
+- [x] merge Phase 6A PR #139 into `v2.4.x` as `c9092fbdc715691f7ae2a06ca3ebc0dbef140721`
+- [x] create a clean Phase 6B branch from merged `origin/v2.4.x`
+- [x] add failure-first tests for signed-app proof and least-privilege CI policy
+- [x] implement the privacy-safe macOS signed-app verifier and source-only CI gate
+- [x] validate the verifier against the separately approved Phase 6A signed QA app without rebuilding, installing, notarizing, or releasing it
+- [ ] after the workflow exists on GitHub, configure `Source security and regression suite` as a required `v2.4.x` branch check before any release mutation
+- [ ] before public release, add a second eligible code owner or use a separately controlled PR-author identity so the required release-policy approval cannot be self-approved
+- [ ] under a separately approved build and release gate, validate a newly signed artifact against an isolated exact-commit proof root with the approved Canvas rebuild
+- [x] complete Phase 6B Autoreview, regression, security, provenance, runner, exact-base Reprobox, and pre-PR merge-readiness review before commit approval
+- [x] obtain Bryant approval, commit and push the frozen Phase 6B source, and open PR #140 against `v2.4.x`
+- [ ] freeze and pass the post-failure-loop Autoreview and complete local gate stack, then pass the fresh Node 22 source-security workflow and final PR merge-readiness review before separate merge approval
 - [ ] after Phase 6B, remind Bryant and resolve or explicitly disposition the `uuid` cleanup before the final integrated six-phase audit closes
 
 ## Stop Gates
@@ -142,7 +159,32 @@ This is deliberately outside the security patches. The later updater work must r
 
 ## Next Action
 
-Commit and push Phase 6A, open its PR against `v2.4.x`, run merge readiness, and merge only if every required gate remains clean. Then begin Phase 6B from the merged canonical branch. Stop before release, site deployment, updater work, dependency change, installed-app mutation, or external tester rollout. Olivia remains paused.
+Amend and force-push the reviewed PR #140 commit with the Canvas rollback closure, require its fresh Node 22 `npm ci --ignore-scripts` source-security workflow, resolve the addressed inline review thread with evidence, and complete final merge-readiness review before stopping for separate merge approval. After a clean merge, configure the required GitHub branch rule and independent review authority before any release mutation, then separately approve a fresh signed-artifact proof. Do not build, install, notarize, release, deploy, mutate dependencies, start updater work, or resume Olivia.
+
+## Phase 6B Working Evidence
+
+This section records the frozen local source-candidate closeout. Fresh GitHub Node 22 CI, repository governance, and a newly signed artifact remain separate downstream gates and are not claimed here.
+
+- the branch is based exactly on merged `origin/v2.4.x` commit `c9092fbdc715691f7ae2a06ca3ebc0dbef140721`; app runtime, renderer, package engine, watcher, parser, provenance, quota, Figma behavior, dependencies, and lockfiles are unchanged
+- the source-only GitHub Actions workflow has read-only repository permission, pinned action SHAs, Node 22, an ignore-scripts dependency reconstruction, the six-package lifecycle allowlist, syntax and policy checks, the complete serial source suite, high-severity dependency audit, and no signing, notarization, release, deployment, or secret-bearing step
+- the install-script verifier rejects unapproved lifecycle commands, package/version/source/integrity drift, implicit `binding.gyp` install behavior, linked dependency roots, child symlinks, and path escape; the exact-base Reprobox reports all six approved lifecycle packages
+- the signed-app verifier proves canonical signing identity, Developer ID signature and hardened runtime, app/helper/nested entitlement separation, bundle layout, strict transport and privacy metadata, actual ASAR-header integrity, exact Electron fuse policy, approved arm64 architecture with only the explicit universal-module exception, first-party Git blob binding, committed manifest and lock topology, registry-tarball bytes authenticated by lockfile SHA-512, the isolated Canvas build-output exception, packaged-content policy, Gatekeeper acceptance, and notarization staple
+- proof output is privacy-safe: fixed policy errors omit local paths and credentials, while JSON proof records only bounded policy state, the approved source revision, and non-sensitive fingerprints
+- the post-PR failure-loop focused release and install-policy lane passes 63/63 and the then-current complete serial source suite passed with zero failures in the working Reprobox; the earlier exact-base clone at `/private/tmp/crate-phase6b-exact.YlV3zq/repo` passed its then-current 394/394 suite
+- current corrections additionally seal dependency evidence before package comparison, pin every Git object read to one captured revision, disable ambient Git config/hooks/filesystem monitors, contain Canvas destination and cleanup races, require independent verifier/proof dependency reconstruction, and deploy only an authenticated committed site snapshot
+- final release-blocker Autoreview found and closed a malformed electron-builder context path that could expose a raw local TypeError during notarization; the fixed boundary now rejects malformed output paths and product names with one path-free error before submission
+- syntax checks for every changed JavaScript file, workflow YAML parsing, whitespace checks, current-tree credential scans, unchanged manifest/lock hashes, and the high-severity dependency gate pass; `npm audit --audit-level=high` reports only the separately deferred moderate `uuid` advisory
+- the exact-base clone is byte-identical to the working candidate outside Git metadata and dependencies. Its full suite passes, while direct install-policy inspection intentionally rejects a copied postinstall-populated Electron dependency tree because it contains framework symlinks. A fresh Node 22 `npm ci --ignore-scripts` reconstruction was not authorized locally and therefore remains a mandatory PR-CI merge gate rather than being represented as local proof
+- PR #140's first GitHub Actions record failed before creating a job because `runner.temp` is unavailable in job-level environment evaluation. The cache expression now exists only in the two npm step environments, and direct regression coverage requires exactly those two bounded uses; the corrected focused lane passes 60/60
+- the corrected workflow then created its macOS Node 22 job but pinned `actions/checkout` failed while removing credentials because Crate intentionally stores `crate-web` and `mission-control` as gitlinks without a `.gitmodules` mapping. The checkout now persists credentials only through the pinned action, the immediately following source-controlled step creates local relative placeholder mappings for checkout cleanup and removes the GitHub authorization header before any repository script runs, and submodule fetching remains disabled. A disposable exact-base probe proves the mappings make `git submodule foreach --recursive` exit successfully without initializing either nested repository; release-policy tests, YAML parsing, and whitespace checks pass locally pending CI rerun
+- final post-CI-failure Autoreview also required the cleanup step to fail before writing if `.gitmodules` already exists or is a symlink, remain immediately adjacent to checkout, and forbid conditional skipping or `continue-on-error`. The full credential-scrub sequence passes in a disposable exact-base repository with a harmless synthetic authorization header, and the focused release/install lane passes 60/60 after the guard
+- the next live job passed checkout and credential scrubbing, then npm rejected the job because both its user and global config roles resolved to `/dev/null`. The narrow correction creates separate owner-only empty config files in `RUNNER_TEMP` before setup-node and binds both files plus the isolated cache only to the two npm steps. Exact policy tests prevent job-wide reuse, command insertion, reordering, conditional skipping, and partial npm-step coverage; the affected lane passes 60/60 locally pending fresh CI
+- subsequent independent Autoreview found four additional gaps: the Canvas download command omitted its pinned URL and destination, the read-only gate did not separate mutation-free inspection from approved disposable test setup, CI lacked a clean-install default-loader integration, and success JSON could be emitted before final drift checks. The playbooks now pin the exact official URL and private output path and require explicit approval before temporary test-state creation. A fresh `npm ci --ignore-scripts` integration authenticates and loads the real 29-package tool closure, and the bootstrap buffers all output until final package/source rechecks pass. Failure-first coverage passes within the 63/63 focused unit lane, the fresh integration passes 1/1, and the 398-test complete source suite reports 397 passed, zero failed, and one environment-gated skip; both final independent rereview lanes report no actionable findings
+- a later GitHub inline review found that a post-commit Canvas validation failure could restore the original package with the newly staged build still present. Failure-first coverage now requires an identity-matched committed build to be atomically detached before restoration, preserves external targets, permits a clean retry, and exercises both pre-rename and post-rename restore substitution. Restored package state is accepted only after its original identity is reverified. The focused lane now reports 66 tests total, 65 passed, zero failed, and one CI-only integration skip; the complete suite reports 400 tests total, 399 passed, zero failed, and one environment-gated skip; final narrow independent rereview reports no actionable findings
+- the current pinned action runtime warning is explicitly deferred to a separate CI-only migration because checkout v7 changes credential-storage semantics and needs a new failure-first cleanup proof; it is not being silently accepted or mixed into this narrow source-gate closure
+- the existing Phase 6A signed QA app fails closed only because its packaged dependency payload predates the final independent archive proof; no replacement app was built, installed, signed, notarized, or released under Phase 6B
+- live GitHub inspection shows `v2.4.x` currently has no branch protection or ruleset and only one eligible admin owner; required-check enforcement and independent owner approval therefore remain explicit external pre-public-release gates that cannot be claimed by source files alone
+- one reviewed Phase 6B commit was pushed and PR #140 opened after Bryant approval; no merge, build, install, signing, notarization, tag, GitHub release, Cloudflare deploy, dependency mutation, updater work, or Olivia rollout occurred
 
 ## Phase 6A Evidence
 
