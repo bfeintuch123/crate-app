@@ -1444,7 +1444,7 @@ test('source binding requires a canonical Git root and regular committed source 
     const manifestDriftFiles = new Map(asarFiles);
     manifestDriftFiles.set('package.json', JSON.stringify({
       ...packagedManifest,
-      version: '3.0.0-beta.2',
+      version: `${packagedManifest.version}-drift`,
     }));
     const manifestDriftAsar = createFakeAsar(manifestDriftFiles);
     assert.equal(collectSourceBinding(appPath, cleanRunner, {
