@@ -715,12 +715,20 @@ test('bundle layout requires the configured executable and exact resource entry 
       'CodeResources',
       'Info.plist',
       'MacOS/Crate',
+      'Resources/app-update.yml',
       'Resources/app.asar',
       'Resources/icon.icns',
       '_CodeSignature/CodeResources',
     ]) {
       fs.writeFileSync(path.join(contentsPath, file), 'fixture');
     }
+    fs.writeFileSync(
+      path.join(contentsPath, 'Resources', 'app-update.yml'),
+      'owner: bfeintuch123\n' +
+      'repo: crate-app\n' +
+      'provider: github\n' +
+      'updaterCacheDirName: crate-app-updater\n'
+    );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, true);
 
@@ -757,6 +765,29 @@ test('bundle layout requires the configured executable and exact resource entry 
     assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
     fs.rmSync(path.join(contentsPath, 'Resources', 'icon.icns'), { recursive: true });
     fs.writeFileSync(path.join(contentsPath, 'Resources', 'icon.icns'), 'fixture');
+
+    const updateMetadataPath = path.join(contentsPath, 'Resources', 'app-update.yml');
+    fs.writeFileSync(updateMetadataPath, 'owner: unapproved\n');
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.rmSync(updateMetadataPath);
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.mkdirSync(updateMetadataPath);
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.rmSync(updateMetadataPath, { recursive: true });
+    fs.symlinkSync('icon.icns', updateMetadataPath);
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.unlinkSync(updateMetadataPath);
+    fs.writeFileSync(
+      updateMetadataPath,
+      'owner: bfeintuch123\n' +
+      'repo: crate-app\n' +
+      'provider: github\n' +
+      'updaterCacheDirName: crate-app-updater\n'
+    );
+    const unexpectedResourcePath = path.join(contentsPath, 'Resources', 'unexpected');
+    fs.writeFileSync(unexpectedResourcePath, 'fixture');
+    assert.equal(inspectBundleLayout(appPath, 'Crate').valid, false);
+    fs.rmSync(unexpectedResourcePath);
 
     assert.equal(inspectBundleLayout(appPath, 'Renamed').valid, false);
   } finally {
@@ -2586,6 +2617,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     for (const file of [
       'CodeResources',
       'Info.plist',
+      'Resources/app-update.yml',
       'Resources/app.asar',
       'Resources/icon.icns',
       '_CodeSignature/CodeResources',
@@ -2593,6 +2625,13 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     ]) {
       fs.writeFileSync(path.join(contentsPath, file), 'fixture');
     }
+    fs.writeFileSync(
+      path.join(contentsPath, 'Resources', 'app-update.yml'),
+      'owner: bfeintuch123\n' +
+      'repo: crate-app\n' +
+      'provider: github\n' +
+      'updaterCacheDirName: crate-app-updater\n'
+    );
     fs.writeFileSync(path.join(contentsPath, 'PkgInfo'), 'APPL????');
     fs.chmodSync(path.join(contentsPath, 'MacOS', executableName), 0o755);
     const helperNames = [

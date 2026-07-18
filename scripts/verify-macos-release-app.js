@@ -155,6 +155,13 @@ const EXPECTED_NESTED_BUNDLE_IDENTIFIERS = Object.freeze({
   'Squirrel.framework': 'com.github.Squirrel',
 });
 const EXPECTED_ASAR_INTEGRITY_PATH = 'Resources/app.asar';
+const EXPECTED_APP_UPDATE_METADATA = Buffer.from(
+  'owner: bfeintuch123\n' +
+  'repo: crate-app\n' +
+  'provider: github\n' +
+  'updaterCacheDirName: crate-app-updater\n',
+  'utf8'
+);
 const SOURCE_BOUND_ENTRIES = Object.freeze([
   'main.js',
   'preload.js',
@@ -1060,7 +1067,12 @@ function inspectBundleLayout(appPath, executableName) {
 
     const resourcesPath = path.join(contentsPath, 'Resources');
     const resourceEntries = fs.readdirSync(resourcesPath, { withFileTypes: true });
-    const requiredResources = new Set(['app.asar', 'app.asar.unpacked', 'icon.icns']);
+    const requiredResources = new Set([
+      'app-update.yml',
+      'app.asar',
+      'app.asar.unpacked',
+      'icon.icns',
+    ]);
     for (const entry of resourceEntries) {
       const entryPath = path.join(resourcesPath, entry.name);
       const metadata = fs.lstatSync(entryPath);
@@ -1070,6 +1082,12 @@ function inspectBundleLayout(appPath, executableName) {
         if ((expectedType === 'directory' && !metadata.isDirectory()) ||
             (expectedType === 'file' && !metadata.isFile())) {
           return { valid: false };
+        }
+        if (entry.name === 'app-update.yml') {
+          const metadataBytes = readStableRegularFile(entryPath);
+          if (!metadataBytes || !metadataBytes.equals(EXPECTED_APP_UPDATE_METADATA)) {
+            return { valid: false };
+          }
         }
         requiredResources.delete(entry.name);
         continue;
