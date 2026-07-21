@@ -124,6 +124,20 @@ Before merge:
 6. Summarize risks.
 7. Do not merge unless Bryant explicitly approves.
 
+## Code Review Rules
+
+### Preserve protected Crate behavior
+- Flag a change when it alters generic watcher capture, package filtering, parser behavior, provenance or manifest generation, or Figma scope enforcement without the PR explicitly scoping that behavior and providing focused regression evidence.
+- Do not flag an explicitly scoped behavior change with relevant tests, or an unrelated UI, copy, documentation, or test-only change that leaves those paths and their existing regression coverage untouched.
+
+### Prevent sensitive-data exposure
+- Flag a change when new user-visible, logged, diagnostic, package, manifest, fixture, or persisted output can expose a Figma token, complete Figma URL, Figma file key, signed URL, Keychain value, or unrelated private filesystem path.
+- Do not flag redacted values, clearly synthetic placeholders, paths displayed only to the same local user who selected them, or internal path handling that does not create a new disclosure boundary. The path exception does not apply to logs, diagnostics, packages, manifests, or other shared output.
+
+### Enforce the approved mutation lane
+- Flag a change when it mutates dependencies or lockfiles, release/signing/notarization configuration, GitHub release state, or `crate-site`/deployment behavior outside a PR whose stated scope explicitly authorizes that lane.
+- Do not flag an explicitly scoped dependency, release, or site PR that follows its required approval gates, or a change with no mutations in those areas.
+
 ## Release Workflow
 Follow `.codex/playbooks/release-crate.md` and `.codex/playbooks/crate-release-gate.md` as the executable release authority:
 1. Select the release profile before mutation. A **tester beta** is an explicitly Bryant-approved prerelease distributed through the existing GitHub release and `get-crate.com` download flow. Both profiles require source-CI provenance, blocked force-push/deletion, append-only `v*` tag protection, immutable-release enforcement with immutable published release assets, and exact remote asset verification. A **public stable release** additionally requires the independent controlling-principal approval, layered branch/public tag-creation rulesets, attestation verification, and future account-gated download backend defined by the release playbooks.
