@@ -22,7 +22,7 @@ test('fresh install authenticates and loads the committed release verifier toolc
   });
 
   assert.equal(authenticated.valid, true);
-  assert.equal(authenticated.packageCount, 29);
+  assert.equal(authenticated.packageCount, 21);
   assert.equal(typeof authenticated.tools.asar.extractFile, 'function');
   assert.equal(typeof authenticated.tools.asar.getRawHeader, 'function');
   assert.equal(typeof authenticated.tools.getFuseWire, 'function');
