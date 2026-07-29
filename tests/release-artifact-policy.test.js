@@ -53,6 +53,7 @@ const {
   packagedManifestMatchesSource,
   runCli,
   safeCliErrorMessage,
+  verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 } = require('../scripts/verify-macos-release-app');
 const {
@@ -299,6 +300,18 @@ function createFixtureGitRunner(sourceRoot, revision = 'b'.repeat(40), options =
 }
 
 function createFakeAsar(files, headerString = 'fixture-asar-header') {
+  const integrityFor = value => {
+    const bytes = Buffer.from(value);
+    const blockSize = 4 * 1024 * 1024;
+    return {
+      algorithm: 'SHA256',
+      hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+      blockSize,
+      blocks: [
+        crypto.createHash('sha256').update(bytes).digest('hex'),
+      ],
+    };
+  };
   return {
     extractFile(_asarPath, entry) {
       const normalized = String(entry).replace(/^\/+/, '');
@@ -314,7 +327,10 @@ function createFakeAsar(files, headerString = 'fixture-asar-header') {
     statFile(_asarPath, entry) {
       const normalized = String(entry).replace(/^\/+/, '');
       if (!files.has(normalized)) throw new Error('Fixture entry is missing.');
-      return { size: Buffer.byteLength(files.get(normalized)) };
+      return {
+        size: Buffer.byteLength(files.get(normalized)),
+        integrity: integrityFor(files.get(normalized)),
+      };
     },
   };
 }
@@ -556,6 +572,11 @@ function safeEvidence(version = packageJson.version) {
     },
     infoPlist: safeMainInfo(version),
     asarIntegrityHash: 'a'.repeat(64),
+    asarFileIntegrity: {
+      valid: true,
+      checkedFileCount: 2862,
+      failedFileCount: 0,
+    },
     fuseVersion: '1',
     fuseIndices: [0, 1, 2, 3, 4, 5, 6, 7],
     fuses: { ...EXPECTED_FUSES },
@@ -930,6 +951,53 @@ test('release evidence binds embedded ASAR integrity metadata to the actual arch
     result.failures.includes('Embedded ASAR integrity metadata does not match the packaged archive.'),
     true
   );
+});
+
+test('release evidence rejects ASAR file integrity metadata that does not match archived bytes', () => {
+  const evidence = safeEvidence();
+  evidence.asarFileIntegrity = {
+    valid: false,
+    checkedFileCount: 2862,
+    failedFileCount: 1,
+  };
+
+  const result = evaluateReleaseEvidence(evidence, releaseOptions());
+
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.failures.includes('Packaged ASAR file integrity metadata does not match the archived files.'),
+    true
+  );
+  assert.equal(result.proof.checks.asarFiles, 'fail');
+});
+
+test('ASAR file integrity verification detects transformed-byte hash drift', () => {
+  const files = new Map([
+    ['package.json', '{"name":"crate-app","version":"test"}'],
+    ['main.js', 'module.exports = true;'],
+  ]);
+  const asar = createFakeAsar(files);
+  assert.deepEqual(verifyAsarFileIntegrity(asar, '/tmp/app.asar'), {
+    valid: true,
+    checkedFileCount: 2,
+    failedFileCount: 0,
+  });
+
+  const originalStatFile = asar.statFile;
+  asar.statFile = (asarPath, entry) => {
+    const metadata = originalStatFile(asarPath, entry);
+    if (String(entry).replace(/^\/+/, '') === 'package.json') {
+      metadata.integrity.hash = '0'.repeat(64);
+      metadata.integrity.blocks = ['0'.repeat(64)];
+    }
+    return metadata;
+  };
+
+  assert.deepEqual(verifyAsarFileIntegrity(asar, '/tmp/app.asar'), {
+    valid: false,
+    checkedFileCount: 2,
+    failedFileCount: 1,
+  });
 });
 
 test('release evidence supports a future approved version without hard-coded test metadata', () => {

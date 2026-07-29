@@ -197,7 +197,7 @@ Public stable additionally runs the review query below. Review evidence must bin
 - Release was started only after Bryant approval.
 - `v2.4.x` was current before release changes.
 - Version, build artifact, notarization, staple, and validation were verified.
-- The clean approved verifier checkout proves the signed app's exact launch and security metadata, internally consistent main/helper build metadata, executable identity, Apple-anchored Developer ID signature, Electron runtime, ASAR header, approved arm64 architecture policy, and complete production dependency payload match authenticated locked inputs plus the exact pinned official Canvas prebuild.
+- The clean approved verifier checkout proves the signed app's exact launch and security metadata, internally consistent main/helper build metadata, executable identity, Apple-anchored Developer ID signature, Electron runtime, ASAR header and per-file integrity records, approved arm64 architecture policy, and complete production dependency payload match authenticated locked inputs plus the exact pinned official Canvas prebuild.
 - `crate-site/index.html` links to the intended DMG.
 - Release commit and tag exist on remote.
 - GitHub release exists with the expected artifact.
