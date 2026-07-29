@@ -3140,6 +3140,7 @@ function getPackageLimitResult() {
 }
 
 function incrementPackageUsage() {
+  checkAndResetUsage();
   const usage = store.get('usage');
   usage.packagesThisMonth++;
   store.set('usage', usage);
@@ -11341,35 +11342,42 @@ registerTrustedIpcHandler('v2:browse-file', async () => {
 registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
-  const limitResult = getPackageLimitResult();
-  if (limitResult) return limitResult;
-
-  // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
-  // Previously showed an output directory picker, which combined with the browse file
-  // picker created a double-prompt regression.
-  const outputDir = path.join(os.homedir(), 'Desktop');
-
-  // Generate folder name based on master file
-  const baseName = path.basename(filePath, path.extname(filePath));
-  const dateStr = new Date().toISOString().split('T')[0];
-  const folderName = `${baseName}_${dateStr}`;
-  const destFolder = path.join(outputDir, folderName);
+  if (packageInFlight) return { error: 'package_in_flight' };
+  packageInFlight = true;
 
   try {
-    const result = await packageMasterFile(filePath, destFolder);
-    rememberGeneratedPackageOutputPath(destFolder);
-    incrementPackageUsage();
-    return {
-      success: true,
-      masterFile: result.masterFile,
-      assetsFound: result.assetsFound,
-      assetsCopied: result.assetsCopied,
-      assetsMissing: result.assetsMissing,
-      outputDir: destFolder,
-      files: result.files
-    };
-  } catch (err) {
-    return { error: err.message };
+    const limitResult = getPackageLimitResult();
+    if (limitResult) return limitResult;
+
+    // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
+    // Previously showed an output directory picker, which combined with the browse file
+    // picker created a double-prompt regression.
+    const outputDir = path.join(os.homedir(), 'Desktop');
+
+    // Generate folder name based on master file
+    const baseName = path.basename(filePath, path.extname(filePath));
+    const dateStr = new Date().toISOString().split('T')[0];
+    const folderName = `${baseName}_${dateStr}`;
+    const destFolder = path.join(outputDir, folderName);
+
+    try {
+      const result = await packageMasterFile(filePath, destFolder);
+      rememberGeneratedPackageOutputPath(destFolder);
+      incrementPackageUsage();
+      return {
+        success: true,
+        masterFile: result.masterFile,
+        assetsFound: result.assetsFound,
+        assetsCopied: result.assetsCopied,
+        assetsMissing: result.assetsMissing,
+        outputDir: destFolder,
+        files: result.files
+      };
+    } catch (err) {
+      return { error: err.message };
+    }
+  } finally {
+    packageInFlight = false;
   }
 });
 

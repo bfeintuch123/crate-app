@@ -1928,6 +1928,112 @@ test('Quick Package consumes package quota only after successful packaging', asy
   }
 });
 
+test('concurrent Quick Package requests share one main-process package lock', async () => {
+  const tmpRoot = makeTempDir();
+  const firstPath = path.join(tmpRoot, 'First Concurrent Quick Package.pptx');
+  const secondPath = path.join(tmpRoot, 'Second Concurrent Quick Package.pptx');
+  fs.writeFileSync(firstPath, Buffer.from('first concurrent quick package bytes'));
+  fs.writeFileSync(secondPath, Buffer.from('second concurrent quick package bytes'));
+
+  try {
+    storeInstance.set('usage.packagesThisMonth', 24);
+    const firstPackage = callIpc('v2:package-file', firstPath);
+    const blockedPackage = await callIpc('v2:package-file', secondPath);
+    const firstResult = await firstPackage;
+
+    assert.equal(firstResult.success, true);
+    assert.equal(blockedPackage.error, 'package_in_flight');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+    assert.equal(fs.existsSync(quickPackageFolder(firstPath)), true);
+    assert.equal(fs.existsSync(quickPackageFolder(secondPath)), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(firstPath), { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(secondPath), { recursive: true, force: true });
+  }
+});
+
+test('normal and Quick Package share the same main-process package lock', async () => {
+  const tmpRoot = makeTempDir();
+  const quickPath = path.join(tmpRoot, 'Cross Flow Quick Package.pptx');
+  const outputDir = path.join(tmpRoot, 'normal-output');
+  fs.writeFileSync(quickPath, Buffer.from('cross-flow quick package bytes'));
+  fs.mkdirSync(outputDir);
+
+  try {
+    const project = await createProject('Cross Flow Normal Package');
+    const sourcePath = path.join(tmpRoot, 'Cross Flow Logo.ai');
+    fs.writeFileSync(sourcePath, Buffer.from('cross-flow normal package bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Cross Flow Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    storeInstance.set('usage.packagesThisMonth', 24);
+    const quickPackage = callIpc('v2:package-file', quickPath);
+    const blockedNormalPackage = await callIpc('projects:package', project.id, outputDir);
+    const quickResult = await quickPackage;
+
+    assert.equal(quickResult.success, true);
+    assert.equal(blockedNormalPackage.error, 'package_in_flight');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+    assert.equal(fs.existsSync(quickPackageFolder(quickPath)), true);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(quickPath), { recursive: true, force: true });
+  }
+});
+
+test('successful packaging increments the active month after reset rollover', async () => {
+  const tmpRoot = makeTempDir();
+  const RealDate = global.Date;
+  let currentTime = new RealDate(2026, 5, 30, 23, 59, 0).getTime();
+  class MutableDate extends RealDate {
+    constructor(...args) {
+      if (args.length === 0) {
+        super(currentTime);
+      } else {
+        super(...args);
+      }
+    }
+    static now() { return currentTime; }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  }
+
+  const deckPath = path.join(tmpRoot, 'Month Rollover Quick Package.pptx');
+  fs.writeFileSync(deckPath, Buffer.from('month rollover quick package bytes'));
+
+  try {
+    global.Date = MutableDate;
+    storeInstance.set('usage', {
+      packagesThisMonth: 2,
+      resetDate: '2026-07-01',
+    });
+
+    const packagePromise = callIpc('v2:package-file', deckPath);
+    currentTime = new RealDate(2026, 6, 1, 0, 1, 0).getTime();
+    const result = await packagePromise;
+
+    assert.equal(result.success, true);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+    assert.equal(storeInstance.get('usage.resetDate'), '2026-08-01');
+  } finally {
+    global.Date = RealDate;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(
+      path.join(TEST_HOME, 'Desktop', 'Month Rollover Quick Package_2026-06-30'),
+      { recursive: true, force: true }
+    );
+  }
+});
+
 test('closed beta quota is 25 without mutating persisted usage state', async () => {
   testAppVersion = '3.0.0-beta.2';
   storeInstance.set('usage', {
