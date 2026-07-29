@@ -44,6 +44,15 @@ test('Electron Builder ASAR stream packaging hashes the transformed archived byt
         mode: 0o100644,
         size: transformedManifest.length,
       },
+    }, {
+      path: 'empty.txt',
+      streamGenerator: () => Readable.from(Buffer.alloc(0)),
+      unpacked: false,
+      type: 'file',
+      stat: {
+        mode: 0o100644,
+        size: 0,
+      },
     }]);
 
     const archivedBytes = Buffer.from(asar.extractFile(archivePath, 'package.json'));
@@ -52,6 +61,13 @@ test('Electron Builder ASAR stream packaging hashes the transformed archived byt
     assert.equal(metadata.integrity.algorithm, 'SHA256');
     assert.equal(metadata.integrity.hash, sha256(archivedBytes));
     assert.deepEqual(metadata.integrity.blocks, [sha256(archivedBytes)]);
+
+    const emptyBytes = Buffer.from(asar.extractFile(archivePath, 'empty.txt'));
+    const emptyMetadata = asar.statFile(archivePath, 'empty.txt', false);
+    assert.equal(emptyBytes.length, 0);
+    assert.equal(emptyMetadata.integrity.algorithm, 'SHA256');
+    assert.equal(emptyMetadata.integrity.hash, sha256(emptyBytes));
+    assert.deepEqual(emptyMetadata.integrity.blocks, [sha256(emptyBytes)]);
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
