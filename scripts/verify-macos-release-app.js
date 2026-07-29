@@ -441,6 +441,87 @@ function asarIntegrityMatches(infoPlist, actualHash) {
   return infoPlist.ElectronAsarIntegrity[EXPECTED_ASAR_INTEGRITY_PATH].hash === actualHash;
 }
 
+function expectedAsarFileIntegrity(bytes, blockSize) {
+  if (!Buffer.isBuffer(bytes) || !Number.isSafeInteger(blockSize) || blockSize < 1) return null;
+  const blocks = [];
+  for (let offset = 0; offset < bytes.length; offset += blockSize) {
+    blocks.push(hashBuffer(bytes.subarray(offset, Math.min(offset + blockSize, bytes.length))));
+  }
+  if (blocks.length === 0) blocks.push(hashBuffer(bytes));
+  return {
+    algorithm: 'SHA256',
+    hash: hashBuffer(bytes),
+    blockSize,
+    blocks,
+  };
+}
+
+function verifyAsarFileIntegrity(asar, asarPath) {
+  const invalid = (checkedFileCount = 0, failedFileCount = 1) => ({
+    valid: false,
+    checkedFileCount,
+    failedFileCount,
+  });
+  if (!asar || typeof asar.listPackage !== 'function' || typeof asar.statFile !== 'function' ||
+      typeof asar.extractFile !== 'function' || typeof asarPath !== 'string' || asarPath.length === 0) {
+    return invalid();
+  }
+
+  let entries;
+  try {
+    entries = asar.listPackage(asarPath);
+  } catch (error) {
+    return invalid();
+  }
+  if (!Array.isArray(entries) || entries.length === 0) return invalid();
+
+  let checkedFileCount = 0;
+  let failedFileCount = 0;
+  for (const entry of entries) {
+    const normalized = String(entry || '').replace(/^\/+/u, '');
+    if (!normalized || normalized === '.' || normalized === '..' ||
+        path.isAbsolute(normalized) || path.normalize(normalized).startsWith(`..${path.sep}`)) {
+      failedFileCount += 1;
+      continue;
+    }
+
+    try {
+      const metadata = asar.statFile(asarPath, normalized, false);
+      if (!isPlainObject(metadata) || isPlainObject(metadata.files) || typeof metadata.link === 'string') {
+        continue;
+      }
+      const integrity = metadata.integrity;
+      if (!isPlainObject(integrity) ||
+          Object.keys(integrity).sort().join(',') !== 'algorithm,blockSize,blocks,hash' ||
+          integrity.algorithm !== 'SHA256' ||
+          !/^[a-f0-9]{64}$/u.test(String(integrity.hash || '')) ||
+          !Number.isSafeInteger(integrity.blockSize) ||
+          integrity.blockSize < 1 ||
+          !Array.isArray(integrity.blocks) ||
+          integrity.blocks.length < 1 ||
+          !integrity.blocks.every(block => /^[a-f0-9]{64}$/u.test(String(block || '')))) {
+        failedFileCount += 1;
+        continue;
+      }
+
+      const bytes = Buffer.from(asar.extractFile(asarPath, normalized));
+      checkedFileCount += 1;
+      if (metadata.size !== bytes.length ||
+          !isDeepStrictEqual(integrity, expectedAsarFileIntegrity(bytes, integrity.blockSize))) {
+        failedFileCount += 1;
+      }
+    } catch (error) {
+      failedFileCount += 1;
+    }
+  }
+
+  return {
+    valid: checkedFileCount > 0 && failedFileCount === 0,
+    checkedFileCount,
+    failedFileCount,
+  };
+}
+
 function isSafeExecutableName(value) {
   return typeof value === 'string' &&
     value.length > 0 &&
@@ -576,6 +657,13 @@ function collectPolicyFailures(evidence, options = {}) {
     failures.push('Embedded ASAR integrity metadata is missing or invalid.');
   } else if (!asarIntegrityMatches(infoPlist, evidence.asarIntegrityHash)) {
     failures.push('Embedded ASAR integrity metadata does not match the packaged archive.');
+  }
+  const asarFileIntegrity = evidence.asarFileIntegrity || {};
+  if (asarFileIntegrity.valid !== true ||
+      !Number.isSafeInteger(asarFileIntegrity.checkedFileCount) ||
+      asarFileIntegrity.checkedFileCount < 1 ||
+      asarFileIntegrity.failedFileCount !== 0) {
+    failures.push('Packaged ASAR file integrity metadata does not match the archived files.');
   }
   if (infoPlist.CFBundleShortVersionString !== expectedVersion) {
     failures.push('Final app version does not match source release metadata.');
@@ -758,6 +846,9 @@ function buildPrivacySafeProof(evidence, failures, options = {}) {
         : 'fail',
       packageManifest: sourceBinding.manifestMatches === true ? 'pass' : 'fail',
       dependencyLock: sourceBinding.dependencyLockMatches === true ? 'pass' : 'fail',
+      asarFiles: evidence.asarFileIntegrity && evidence.asarFileIntegrity.valid === true
+        ? 'pass'
+        : 'fail',
       electronRuntime: electronRuntime.valid === true ? 'pass' : 'fail',
       sourceRevision: notarization.required === true
         ? (sourceBinding.releaseSourceClean === true &&
@@ -772,6 +863,11 @@ function buildPrivacySafeProof(evidence, failures, options = {}) {
       nestedCodeBundles: helperCount + nestedBundleCount,
       asarEntries: Number.isInteger(packagedContents.asarEntryCount)
         ? packagedContents.asarEntryCount
+        : 0,
+      asarFilesVerified: Number.isInteger(
+        evidence.asarFileIntegrity && evidence.asarFileIntegrity.checkedFileCount
+      )
+        ? evidence.asarFileIntegrity.checkedFileCount
         : 0,
       unpackedEntries: Number.isInteger(packagedContents.unpackedEntryCount)
         ? packagedContents.unpackedEntryCount
@@ -3174,12 +3270,14 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
   }
   const asarPath = resolveAsarPath(resolvedAppPath);
   let asarIntegrityHash;
+  let asarFileIntegrity;
   try {
     const rawHeader = asar.getRawHeader(asarPath);
     if (!rawHeader || typeof rawHeader.headerString !== 'string') {
       throw new Error('Invalid ASAR header.');
     }
     asarIntegrityHash = hashBuffer(Buffer.from(rawHeader.headerString, 'utf8'));
+    asarFileIntegrity = verifyAsarFileIntegrity(asar, asarPath);
   } catch (error) {
     throw createVerificationError('Unable to verify the packaged ASAR integrity header.');
   }
@@ -3315,6 +3413,7 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     architecture,
     infoPlist,
     asarIntegrityHash,
+    asarFileIntegrity,
     fuseVersion: inspectedFuses.version,
     fuseIndices: inspectedFuses.indices,
     fuses: inspectedFuses.states,
@@ -3584,5 +3683,6 @@ module.exports = {
   parseCodeSignatureMetadata,
   runCli,
   safeCliErrorMessage,
+  verifyAsarFileIntegrity,
   verifierSourceMatchesExpectedRevision,
 };
