@@ -346,11 +346,11 @@ async function finalizeMacReleaseMetadata(options = {}) {
 }
 
 function loadReleaseTools() {
-  const { executeAppBuilderAsJson } = require('app-builder-lib/out/util/appBuilder');
+  const { buildBlockMap } = require('app-builder-lib/out/targets/blockmap/blockmap');
   const { serializeToYaml } = require('builder-util');
   return {
     generateBlockmap(input, output) {
-      return executeAppBuilderAsJson(['blockmap', '--input', input, '--output', output]);
+      return buildBlockMap(input, 'gzip', output);
     },
     serializeToYaml,
   };
