@@ -614,6 +614,30 @@ test('renderer binds primary controls before startup IPC resolves', () => {
   assert.equal(elements['input-project-name'].focused, true);
 });
 
+test('renderer shows the authoritative package quota in Settings, sidebar, and limit dialog', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document);
+  vm.runInContext(`state.usage = {
+    packagesThisMonth: 10,
+    packageLimit: 25,
+    planId: 'closed-beta',
+    planName: 'Closed beta'
+  }`, renderer);
+
+  renderer.renderSettingsControls();
+  renderer.renderFooter();
+  renderer.showPackageLimitModal({ daysLeft: 12, packageLimit: 25 });
+
+  assert.equal(elements['plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['plan-info'].textContent, '25 packages/month \u00B7 10/25 used');
+  assert.equal(elements['plan-badge'].textContent, 'Beta tester');
+  assert.equal(elements['sidebar-plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['footer-usage'].textContent, '10 of 25 packages used this month');
+  assert.equal(elements['upgrade-title'].textContent, "You've used all 25 packages");
+  assert.equal(elements['upgrade-days-left'].textContent, '12');
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), false);
+});
+
 test('Quick Package drop uses preload File handling while Browse keeps its existing path flow', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const neverResolves = new Promise(() => {});

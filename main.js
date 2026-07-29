@@ -56,6 +56,8 @@ const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3
 const CRATE_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
+const FREE_PACKAGE_LIMIT = 10;
+const CLOSED_BETA_PACKAGE_LIMIT = 25;
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
 const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
 const RENDERER_ENTRY_PATH = path.join(__dirname, 'renderer', 'index.html');
@@ -3100,17 +3102,45 @@ function checkAndResetUsage() {
   }
 }
 
-function getPackageLimitResult() {
+function getPackageEntitlement() {
+  const version = getCrateVersion() || '';
+  const isClosedBeta = /-beta(?:\.|$)/i.test(version);
+  return isClosedBeta
+    ? {
+        packageLimit: CLOSED_BETA_PACKAGE_LIMIT,
+        planId: 'closed-beta',
+        planName: 'Closed beta',
+      }
+    : {
+        packageLimit: FREE_PACKAGE_LIMIT,
+        planId: 'free',
+        planName: 'Free',
+      };
+}
+
+function getUsageSnapshot() {
   checkAndResetUsage();
-  const usage = store.get('usage');
-  if (usage.packagesThisMonth >= 10) {
+  return {
+    ...store.get('usage'),
+    ...getPackageEntitlement(),
+  };
+}
+
+function getPackageLimitResult() {
+  const usage = getUsageSnapshot();
+  if (usage.packagesThisMonth >= usage.packageLimit) {
     const daysLeft = Math.ceil((new Date(usage.resetDate) - new Date()) / (1000 * 60 * 60 * 24));
-    return { error: 'limit_reached', daysLeft };
+    return {
+      error: 'limit_reached',
+      daysLeft,
+      packageLimit: usage.packageLimit,
+    };
   }
   return null;
 }
 
 function incrementPackageUsage() {
+  checkAndResetUsage();
   const usage = store.get('usage');
   usage.packagesThisMonth++;
   store.set('usage', usage);
@@ -11312,35 +11342,42 @@ registerTrustedIpcHandler('v2:browse-file', async () => {
 registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
   const { packageMasterFile } = require('./parsers/index.js');
 
-  const limitResult = getPackageLimitResult();
-  if (limitResult) return limitResult;
-
-  // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
-  // Previously showed an output directory picker, which combined with the browse file
-  // picker created a double-prompt regression.
-  const outputDir = path.join(os.homedir(), 'Desktop');
-
-  // Generate folder name based on master file
-  const baseName = path.basename(filePath, path.extname(filePath));
-  const dateStr = new Date().toISOString().split('T')[0];
-  const folderName = `${baseName}_${dateStr}`;
-  const destFolder = path.join(outputDir, folderName);
+  if (packageInFlight) return { error: 'package_in_flight' };
+  packageInFlight = true;
 
   try {
-    const result = await packageMasterFile(filePath, destFolder);
-    rememberGeneratedPackageOutputPath(destFolder);
-    incrementPackageUsage();
-    return {
-      success: true,
-      masterFile: result.masterFile,
-      assetsFound: result.assetsFound,
-      assetsCopied: result.assetsCopied,
-      assetsMissing: result.assetsMissing,
-      outputDir: destFolder,
-      files: result.files
-    };
-  } catch (err) {
-    return { error: err.message };
+    const limitResult = getPackageLimitResult();
+    if (limitResult) return limitResult;
+
+    // v2.5.0: Quick Package defaults to Desktop — no second confirmation dialog.
+    // Previously showed an output directory picker, which combined with the browse file
+    // picker created a double-prompt regression.
+    const outputDir = path.join(os.homedir(), 'Desktop');
+
+    // Generate folder name based on master file
+    const baseName = path.basename(filePath, path.extname(filePath));
+    const dateStr = new Date().toISOString().split('T')[0];
+    const folderName = `${baseName}_${dateStr}`;
+    const destFolder = path.join(outputDir, folderName);
+
+    try {
+      const result = await packageMasterFile(filePath, destFolder);
+      rememberGeneratedPackageOutputPath(destFolder);
+      incrementPackageUsage();
+      return {
+        success: true,
+        masterFile: result.masterFile,
+        assetsFound: result.assetsFound,
+        assetsCopied: result.assetsCopied,
+        assetsMissing: result.assetsMissing,
+        outputDir: destFolder,
+        files: result.files
+      };
+    } catch (err) {
+      return { error: err.message };
+    }
+  } finally {
+    packageInFlight = false;
   }
 });
 
@@ -11525,8 +11562,7 @@ registerTrustedIpcHandler('settings:update', (event, key, value) => {
 });
 
 registerTrustedIpcHandler('usage:get', () => {
-  checkAndResetUsage();
-  return store.get('usage');
+  return getUsageSnapshot();
 });
 
 registerTrustedIpcHandler('shell:open-folder', (event, folderPath) => {

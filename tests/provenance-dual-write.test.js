@@ -107,6 +107,7 @@ const ipcHandlers = new Map();
 let nextOpenDialogResult = { canceled: true };
 let testNotificationSupported = false;
 let testAppActive = true;
+let testAppVersion = packageJson.version;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
 const testNotifications = [];
@@ -179,6 +180,7 @@ setStub('electron', () => ({
     show: () => {},
     focus: () => {},
     isActive: () => testAppActive,
+    getVersion: () => testAppVersion,
     getPath: () => path.join(TEST_HOME, 'user-data'),
     dock: { setMenu: () => {} },
   },
@@ -1013,6 +1015,7 @@ test.afterEach(async () => {
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   testNotificationSupported = false;
   testAppActive = true;
+  testAppVersion = packageJson.version;
   testBrowserWindowCreateCount = 0;
   testMainWindowShowCount = 0;
   testNotifications.length = 0;
@@ -1901,17 +1904,183 @@ test('Quick Package consumes package quota only after successful packaging', asy
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 3);
     assert.equal(fs.existsSync(quickPackageFolder(missingPath)), false);
 
+    const continuedPath = path.join(tmpRoot, 'Continued Beta Quick Quota Deck.pptx');
+    fs.writeFileSync(continuedPath, Buffer.from('continued beta quick package pptx bytes'));
+    storeInstance.set('usage.packagesThisMonth', 10);
+    const continuedResult = await callIpc('v2:package-file', continuedPath);
+    assert.equal(continuedResult.success, true);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 11);
+    assert.equal(fs.existsSync(quickPackageFolder(continuedPath)), true);
+
     const limitPath = path.join(tmpRoot, 'Limit Quick Quota Deck.pptx');
     fs.writeFileSync(limitPath, Buffer.from('limit quick package pptx bytes'));
-    storeInstance.set('usage.packagesThisMonth', 10);
+    storeInstance.set('usage.packagesThisMonth', 25);
     const limitResult = await callIpc('v2:package-file', limitPath);
     assert.equal(limitResult.error, 'limit_reached');
-    assert.equal(storeInstance.get('usage.packagesThisMonth'), 10);
+    assert.equal(limitResult.packageLimit, 25);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
     assert.equal(fs.existsSync(quickPackageFolder(limitPath)), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     fs.rmSync(path.join(TEST_HOME, 'Desktop', 'Quick Quota Deck_' + new Date().toISOString().split('T')[0]), { recursive: true, force: true });
+    fs.rmSync(path.join(TEST_HOME, 'Desktop', 'Continued Beta Quick Quota Deck_' + new Date().toISOString().split('T')[0]), { recursive: true, force: true });
     fs.rmSync(path.join(TEST_HOME, 'Desktop', 'Limit Quick Quota Deck_' + new Date().toISOString().split('T')[0]), { recursive: true, force: true });
+  }
+});
+
+test('concurrent Quick Package requests share one main-process package lock', async () => {
+  const tmpRoot = makeTempDir();
+  const firstPath = path.join(tmpRoot, 'First Concurrent Quick Package.pptx');
+  const secondPath = path.join(tmpRoot, 'Second Concurrent Quick Package.pptx');
+  fs.writeFileSync(firstPath, Buffer.from('first concurrent quick package bytes'));
+  fs.writeFileSync(secondPath, Buffer.from('second concurrent quick package bytes'));
+
+  try {
+    storeInstance.set('usage.packagesThisMonth', 24);
+    const firstPackage = callIpc('v2:package-file', firstPath);
+    const blockedPackage = await callIpc('v2:package-file', secondPath);
+    const firstResult = await firstPackage;
+
+    assert.equal(firstResult.success, true);
+    assert.equal(blockedPackage.error, 'package_in_flight');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+    assert.equal(fs.existsSync(quickPackageFolder(firstPath)), true);
+    assert.equal(fs.existsSync(quickPackageFolder(secondPath)), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(firstPath), { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(secondPath), { recursive: true, force: true });
+  }
+});
+
+test('normal and Quick Package share the same main-process package lock', async () => {
+  const tmpRoot = makeTempDir();
+  const quickPath = path.join(tmpRoot, 'Cross Flow Quick Package.pptx');
+  const outputDir = path.join(tmpRoot, 'normal-output');
+  fs.writeFileSync(quickPath, Buffer.from('cross-flow quick package bytes'));
+  fs.mkdirSync(outputDir);
+
+  try {
+    const project = await createProject('Cross Flow Normal Package');
+    const sourcePath = path.join(tmpRoot, 'Cross Flow Logo.ai');
+    fs.writeFileSync(sourcePath, Buffer.from('cross-flow normal package bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Cross Flow Logo.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    storeInstance.set('usage.packagesThisMonth', 24);
+    const quickPackage = callIpc('v2:package-file', quickPath);
+    const blockedNormalPackage = await callIpc('projects:package', project.id, outputDir);
+    const quickResult = await quickPackage;
+
+    assert.equal(quickResult.success, true);
+    assert.equal(blockedNormalPackage.error, 'package_in_flight');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+    assert.equal(fs.existsSync(quickPackageFolder(quickPath)), true);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(quickPackageFolder(quickPath), { recursive: true, force: true });
+  }
+});
+
+test('successful packaging increments the active month after reset rollover', async () => {
+  const tmpRoot = makeTempDir();
+  const RealDate = global.Date;
+  let currentTime = new RealDate(2026, 5, 30, 23, 59, 0).getTime();
+  class MutableDate extends RealDate {
+    constructor(...args) {
+      if (args.length === 0) {
+        super(currentTime);
+      } else {
+        super(...args);
+      }
+    }
+    static now() { return currentTime; }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  }
+
+  const deckPath = path.join(tmpRoot, 'Month Rollover Quick Package.pptx');
+  fs.writeFileSync(deckPath, Buffer.from('month rollover quick package bytes'));
+
+  try {
+    global.Date = MutableDate;
+    storeInstance.set('usage', {
+      packagesThisMonth: 2,
+      resetDate: '2026-07-01',
+    });
+
+    const packagePromise = callIpc('v2:package-file', deckPath);
+    currentTime = new RealDate(2026, 6, 1, 0, 1, 0).getTime();
+    const result = await packagePromise;
+
+    assert.equal(result.success, true);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+    assert.equal(storeInstance.get('usage.resetDate'), '2026-08-01');
+  } finally {
+    global.Date = RealDate;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(
+      path.join(TEST_HOME, 'Desktop', 'Month Rollover Quick Package_2026-06-30'),
+      { recursive: true, force: true }
+    );
+  }
+});
+
+test('closed beta quota is 25 without mutating persisted usage state', async () => {
+  testAppVersion = '3.0.0-beta.2';
+  storeInstance.set('usage', {
+    packagesThisMonth: 10,
+    resetDate: '2099-01-01',
+  });
+
+  const usage = await callIpc('usage:get');
+
+  assert.deepEqual(usage, {
+    packagesThisMonth: 10,
+    resetDate: '2099-01-01',
+    packageLimit: 25,
+    planId: 'closed-beta',
+    planName: 'Closed beta',
+  });
+  assert.deepEqual(storeInstance.get('usage'), {
+    packagesThisMonth: 10,
+    resetDate: '2099-01-01',
+  });
+});
+
+test('stable and internal QA builds retain the 10 package baseline', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    storeInstance.set('usage', {
+      packagesThisMonth: 10,
+      resetDate: '2099-01-01',
+    });
+
+    for (const version of ['3.0.0', '3.0.0-qa.1']) {
+      testAppVersion = version;
+      const usage = await callIpc('usage:get');
+      assert.equal(usage.packageLimit, 10);
+      assert.equal(usage.planId, 'free');
+      assert.equal(usage.planName, 'Free');
+
+      const deckPath = path.join(tmpRoot, `Limit ${version}.pptx`);
+      fs.writeFileSync(deckPath, Buffer.from(`limit ${version} bytes`));
+      const result = await callIpc('v2:package-file', deckPath);
+      assert.equal(result.error, 'limit_reached');
+      assert.equal(result.packageLimit, 10);
+      assert.equal(storeInstance.get('usage.packagesThisMonth'), 10);
+      assert.equal(fs.existsSync(quickPackageFolder(deckPath)), false);
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
@@ -1933,12 +2102,20 @@ test('normal project package still consumes package quota after success', async 
       }],
     });
 
-    storeInstance.set('usage.packagesThisMonth', 4);
+    storeInstance.set('usage.packagesThisMonth', 24);
     const result = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(result);
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
-    assert.equal(storeInstance.get('usage.packagesThisMonth'), 5);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+
+    const blockedOutputDir = path.join(tmpRoot, 'blocked-out');
+    fs.mkdirSync(blockedOutputDir);
+    const blockedResult = await callIpc('projects:package', project.id, blockedOutputDir);
+    assert.equal(blockedResult.error, 'limit_reached');
+    assert.equal(blockedResult.packageLimit, 25);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 25);
+    assert.deepEqual(fs.readdirSync(blockedOutputDir), []);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

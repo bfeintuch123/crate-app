@@ -31,8 +31,8 @@
       </nav>
 
       <div class="sidebar-plan-card">
-        <div class="sidebar-plan-title">Free Plan</div>
-        <div class="app-usage" id="footer-usage">0 of 10 packages used this month</div>
+        <div class="sidebar-plan-title" id="sidebar-plan-title">Current plan</div>
+        <div class="app-usage" id="footer-usage">Loading package usage...</div>
         <a class="app-upgrade" href="#">Upgrade</a>
       </div>
     </aside>
@@ -262,17 +262,10 @@
           <div class="quota-state-list">
             <div class="quota-state-row">
               <div>
-                <div class="quota-state-title">Free</div>
-                <div class="quota-state-copy" id="plan-info">10 packages/month</div>
+                <div class="quota-state-title" id="plan-title">Current plan</div>
+                <div class="quota-state-copy" id="plan-info">Loading package usage...</div>
               </div>
-              <span class="quota-state-badge upgrade">Upgrade to Premium</span>
-            </div>
-            <div class="quota-state-row">
-              <div>
-                <div class="quota-state-title">Closed beta</div>
-                <div class="quota-state-copy">25 packages/month</div>
-              </div>
-              <span class="quota-state-badge beta">Beta tester</span>
+              <span class="quota-state-badge upgrade" id="plan-badge">Current plan</span>
             </div>
             <div class="quota-state-row">
               <div>
@@ -403,7 +396,7 @@
     <div class="modal-overlay hidden" id="modal-upgrade">
       <div class="modal">
         <div class="modal-header-area">
-          <div class="modal-title">You've used all 10 packages</div>
+          <div class="modal-title" id="upgrade-title">You've reached your package limit</div>
           <div class="modal-subtitle">Upgrade to Crate Pro for higher package limits.</div>
         </div>
         <div class="modal-body">
