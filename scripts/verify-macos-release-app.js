@@ -186,6 +186,7 @@ const EXPECTED_PACKAGED_MANIFEST_KEYS = Object.freeze([
   'description',
   'main',
   'name',
+  'overrides',
   'productName',
   'version',
 ]);
@@ -1329,6 +1330,15 @@ function rootLockMatchesSourceManifest(sourceManifest, sourceLockfile) {
     }
   }
   return true;
+}
+
+function packagedManifestMatchesSource(sourceManifest, packagedManifest) {
+  if (!isPlainObject(sourceManifest) || !isPlainObject(packagedManifest)) return false;
+  const packagedKeys = Object.keys(packagedManifest).sort();
+  return isDeepStrictEqual(packagedKeys, EXPECTED_PACKAGED_MANIFEST_KEYS) &&
+    EXPECTED_PACKAGED_MANIFEST_KEYS.every(key => (
+      isDeepStrictEqual(packagedManifest[key], sourceManifest[key])
+    ));
 }
 
 function parseStrictVersion(value) {
@@ -2953,12 +2963,8 @@ function collectSourceBinding(appPath, commandRunner, options = {}) {
     const sourceManifest = JSON.parse(String(manifestResult.stdout || ''));
     const sourceLockfile = JSON.parse(String(lockfileResult.stdout || ''));
     const packagedManifest = JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8'));
-    const packagedKeys = Object.keys(packagedManifest).sort();
     manifestMatches = rootLockMatchesSourceManifest(sourceManifest, sourceLockfile) &&
-      isDeepStrictEqual(packagedKeys, EXPECTED_PACKAGED_MANIFEST_KEYS) &&
-      EXPECTED_PACKAGED_MANIFEST_KEYS.every(key => (
-        isDeepStrictEqual(packagedManifest[key], sourceManifest[key])
-      ));
+      packagedManifestMatchesSource(sourceManifest, packagedManifest);
     dependencyLockMatches = dependencyInventoryMatchesLock(
       asar,
       asarPath,
@@ -3566,6 +3572,7 @@ module.exports = {
   expectedTeamIdentifier,
   installedPackageMatchesLockArchive,
   packagePayloadMatches,
+  packagedManifestMatchesSource,
   rootLockMatchesSourceManifest,
   electronRuntimePayloadMatches,
   inspectFuseWire,
