@@ -56,6 +56,8 @@ const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3
 const CRATE_CACHE_QUARANTINE_PATTERN = /^\.crate-cleanup-\d+-\d+-[0-9a-f]{12}$/i;
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
+const FREE_PACKAGE_LIMIT = 10;
+const CLOSED_BETA_PACKAGE_LIMIT = 25;
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
 const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
 const RENDERER_ENTRY_PATH = path.join(__dirname, 'renderer', 'index.html');
@@ -3100,12 +3102,39 @@ function checkAndResetUsage() {
   }
 }
 
-function getPackageLimitResult() {
+function getPackageEntitlement() {
+  const version = getCrateVersion() || '';
+  const isClosedBeta = /-beta(?:\.|$)/i.test(version);
+  return isClosedBeta
+    ? {
+        packageLimit: CLOSED_BETA_PACKAGE_LIMIT,
+        planId: 'closed-beta',
+        planName: 'Closed beta',
+      }
+    : {
+        packageLimit: FREE_PACKAGE_LIMIT,
+        planId: 'free',
+        planName: 'Free',
+      };
+}
+
+function getUsageSnapshot() {
   checkAndResetUsage();
-  const usage = store.get('usage');
-  if (usage.packagesThisMonth >= 10) {
+  return {
+    ...store.get('usage'),
+    ...getPackageEntitlement(),
+  };
+}
+
+function getPackageLimitResult() {
+  const usage = getUsageSnapshot();
+  if (usage.packagesThisMonth >= usage.packageLimit) {
     const daysLeft = Math.ceil((new Date(usage.resetDate) - new Date()) / (1000 * 60 * 60 * 24));
-    return { error: 'limit_reached', daysLeft };
+    return {
+      error: 'limit_reached',
+      daysLeft,
+      packageLimit: usage.packageLimit,
+    };
   }
   return null;
 }
@@ -11525,8 +11554,7 @@ registerTrustedIpcHandler('settings:update', (event, key, value) => {
 });
 
 registerTrustedIpcHandler('usage:get', () => {
-  checkAndResetUsage();
-  return store.get('usage');
+  return getUsageSnapshot();
 });
 
 registerTrustedIpcHandler('shell:open-folder', (event, folderPath) => {

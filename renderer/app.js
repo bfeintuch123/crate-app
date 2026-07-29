@@ -838,7 +838,17 @@ function renderSettingsControls() {
 
   const used = Number(state.usage.packagesThisMonth) || 0;
   const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
+  const planName = state.usage.planName || 'Free';
+  const planId = state.usage.planId || 'free';
+  const planTitle = $('#plan-title');
+  const planBadge = $('#plan-badge');
+  if (planTitle) planTitle.textContent = planName;
   $('#plan-info').textContent = `${packageLimit} packages/month \u00B7 ${used}/${packageLimit} used`;
+  if (planBadge) {
+    const isClosedBeta = planId === 'closed-beta';
+    planBadge.textContent = isClosedBeta ? 'Beta tester' : 'Current plan';
+    planBadge.className = `quota-state-badge ${isClosedBeta ? 'beta' : 'upgrade'}`;
+  }
   const limitState = $('#quota-limit-state');
   if (limitState) {
     const isBlocked = used >= packageLimit;
@@ -906,7 +916,19 @@ function updateSettingsNamingPreview() {
 // ===== Render Footer =====
 function renderFooter() {
   const used = Number(state.usage.packagesThisMonth) || 0;
-  $('#footer-usage').textContent = `${used} of 10 packages used this month`;
+  const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
+  const planName = state.usage.planName || 'Free';
+  const planTitle = $('#sidebar-plan-title');
+  if (planTitle) planTitle.textContent = planName;
+  $('#footer-usage').textContent = `${used} of ${packageLimit} packages used this month`;
+}
+
+function showPackageLimitModal(result = {}) {
+  const packageLimit = Number(result.packageLimit || state.usage.packageLimit || state.usage.limit) || 10;
+  const title = $('#upgrade-title');
+  if (title) title.textContent = `You've used all ${packageLimit} packages`;
+  $('#upgrade-days-left').textContent = result.daysLeft;
+  $('#modal-upgrade').classList.remove('hidden');
 }
 
 // ===== Package Flow =====
@@ -1059,8 +1081,7 @@ async function confirmPackage() {
   $('#modal-progress').classList.add('hidden');
 
   if (result.error === 'limit_reached') {
-    $('#upgrade-days-left').textContent = result.daysLeft;
-    $('#modal-upgrade').classList.remove('hidden');
+    showPackageLimitModal(result);
     return;
   }
 
@@ -1574,8 +1595,7 @@ function setupMainProcessListeners() {
         $('#modal-progress').classList.add('hidden');
 
         if (result.error === 'limit_reached') {
-          $('#upgrade-days-left').textContent = result.daysLeft;
-          $('#modal-upgrade').classList.remove('hidden');
+          showPackageLimitModal(result);
           return;
         }
 
@@ -1794,8 +1814,7 @@ async function handleV2FileDrop(filePath, droppedFile = null) {
     }
 
     if (result.error === 'limit_reached') {
-      $('#upgrade-days-left').textContent = result.daysLeft;
-      $('#modal-upgrade').classList.remove('hidden');
+      showPackageLimitModal(result);
       return;
     }
 
