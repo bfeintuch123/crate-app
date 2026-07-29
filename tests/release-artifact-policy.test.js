@@ -50,6 +50,7 @@ const {
   parseCliArguments,
   parseCodeSignatureMetadata,
   packagePayloadMatches,
+  packagedManifestMatchesSource,
   runCli,
   safeCliErrorMessage,
   verifierSourceMatchesExpectedRevision,
@@ -394,6 +395,37 @@ test('release policy allowlists match the independent reviewed snapshot', () => 
     [...APPROVED_CANVAS_PREBUILD_ENTRIES].sort(),
     [...REVIEWED_CANVAS_PREBUILD_OUTPUTS, ...REVIEWED_CANVAS_PREBUILD_METADATA].sort()
   );
+});
+
+test('packaged manifest policy accepts exact source overrides', () => {
+  const packagedManifest = {
+    dependencies: packageJson.dependencies,
+    description: packageJson.description,
+    main: packageJson.main,
+    name: packageJson.name,
+    overrides: packageJson.overrides,
+    productName: packageJson.productName,
+    version: packageJson.version,
+  };
+
+  assert.equal(packagedManifestMatchesSource(packageJson, packagedManifest), true);
+});
+
+test('packaged manifest policy rejects override drift', () => {
+  const packagedManifest = {
+    dependencies: packageJson.dependencies,
+    description: packageJson.description,
+    main: packageJson.main,
+    name: packageJson.name,
+    overrides: {
+      ...packageJson.overrides,
+      minimatch: '0.0.0',
+    },
+    productName: packageJson.productName,
+    version: packageJson.version,
+  };
+
+  assert.equal(packagedManifestMatchesSource(packageJson, packagedManifest), false);
 });
 
 function safeNestedSignature(identifier) {
@@ -1228,6 +1260,7 @@ test('source binding requires a canonical Git root and regular committed source 
       devDependencies: { electron: '^39.8.10' },
       main: 'main.js',
       name: 'crate-app',
+      overrides: packageJson.overrides,
       productName: 'Crate',
       version: packageJson.version,
     };
@@ -1236,6 +1269,7 @@ test('source binding requires a canonical Git root and regular committed source 
       description: sourceManifest.description,
       main: sourceManifest.main,
       name: sourceManifest.name,
+      overrides: sourceManifest.overrides,
       productName: sourceManifest.productName,
       version: sourceManifest.version,
     };
@@ -2670,6 +2704,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       devDependencies: { electron: '^39.8.10' },
       main: 'main.js',
       name: 'crate-app',
+      overrides: packageJson.overrides,
       productName: 'Crate',
       version: packageJson.version,
     };
@@ -2678,6 +2713,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       description: sourceManifest.description,
       main: sourceManifest.main,
       name: sourceManifest.name,
+      overrides: sourceManifest.overrides,
       productName: sourceManifest.productName,
       version: sourceManifest.version,
     };
