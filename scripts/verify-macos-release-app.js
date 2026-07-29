@@ -456,7 +456,21 @@ function expectedAsarFileIntegrity(bytes, blockSize) {
   };
 }
 
-function verifyAsarFileIntegrity(asar, asarPath) {
+function hasMachOMagic(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 4) return false;
+  return [
+    0xfeedface,
+    0xcefaedfe,
+    0xfeedfacf,
+    0xcffaedfe,
+    0xcafebabe,
+    0xbebafeca,
+    0xcafebabf,
+    0xbfbafeca,
+  ].includes(bytes.readUInt32BE(0));
+}
+
+function verifyAsarFileIntegrity(asar, asarPath, options = {}) {
   const invalid = (checkedFileCount = 0, failedFileCount = 1) => ({
     valid: false,
     checkedFileCount,
@@ -487,27 +501,40 @@ function verifyAsarFileIntegrity(asar, asarPath) {
 
     try {
       const metadata = asar.statFile(asarPath, normalized, false);
-      if (!isPlainObject(metadata) || isPlainObject(metadata.files) || typeof metadata.link === 'string') {
+      if (!isPlainObject(metadata)) {
+        failedFileCount += 1;
         continue;
       }
+      if (isPlainObject(metadata.files) || typeof metadata.link === 'string') {
+        continue;
+      }
+      checkedFileCount += 1;
       const integrity = metadata.integrity;
-      if (!isPlainObject(integrity) ||
-          Object.keys(integrity).sort().join(',') !== 'algorithm,blockSize,blocks,hash' ||
-          integrity.algorithm !== 'SHA256' ||
-          !/^[a-f0-9]{64}$/u.test(String(integrity.hash || '')) ||
-          !Number.isSafeInteger(integrity.blockSize) ||
-          integrity.blockSize < 1 ||
-          !Array.isArray(integrity.blocks) ||
-          integrity.blocks.length < 1 ||
-          !integrity.blocks.every(block => /^[a-f0-9]{64}$/u.test(String(block || '')))) {
+      const validSchema = Number.isSafeInteger(metadata.size) &&
+        metadata.size >= 0 &&
+        isPlainObject(integrity) &&
+        Object.keys(integrity).sort().join(',') === 'algorithm,blockSize,blocks,hash' &&
+        integrity.algorithm === 'SHA256' &&
+        /^[a-f0-9]{64}$/u.test(String(integrity.hash || '')) &&
+        Number.isSafeInteger(integrity.blockSize) &&
+        integrity.blockSize >= 1 &&
+        Array.isArray(integrity.blocks) &&
+        integrity.blocks.length === Math.max(1, Math.ceil(metadata.size / integrity.blockSize)) &&
+        integrity.blocks.every(block => /^[a-f0-9]{64}$/u.test(String(block || '')));
+      if (!validSchema) {
         failedFileCount += 1;
         continue;
       }
 
       const bytes = Buffer.from(asar.extractFile(asarPath, normalized));
-      checkedFileCount += 1;
-      if (metadata.size !== bytes.length ||
-          !isDeepStrictEqual(integrity, expectedAsarFileIntegrity(bytes, integrity.blockSize))) {
+      const rawBytesMatch = metadata.size === bytes.length &&
+        isDeepStrictEqual(integrity, expectedAsarFileIntegrity(bytes, integrity.blockSize));
+      const authenticatedSignedNative = !rawBytesMatch &&
+        metadata.unpacked === true &&
+        options.authenticatedNativeFiles instanceof Set &&
+        options.authenticatedNativeFiles.has(normalized) &&
+        hasMachOMagic(bytes);
+      if (!rawBytesMatch && !authenticatedSignedNative) {
         failedFileCount += 1;
       }
     } catch (error) {
@@ -2805,6 +2832,7 @@ function packagePayloadMatches(expectedPackage, actualFiles, options = {}) {
   const expectedEntries = [...expectedPackage.files.keys()].sort();
   const actualEntries = [...actualFiles.keys()].sort();
   if (!isDeepStrictEqual(expectedEntries, actualEntries)) return false;
+  const authenticatedNativeFiles = new Set();
   for (const entry of expectedEntries) {
     const packagedBytes = actualFiles.get(entry);
     const evidence = expectedPackage.files.get(entry);
@@ -2814,13 +2842,18 @@ function packagePayloadMatches(expectedPackage, actualFiles, options = {}) {
     } else if (evidence.kind === 'native-custom') {
       if (typeof options.nativeFileMatcher !== 'function' ||
           !options.nativeFileMatcher(packagedBytes, evidence)) return false;
+      authenticatedNativeFiles.add(entry);
     } else if (evidence.kind === 'native') {
       if (canonicalNativeDigestFromBytes(packagedBytes, options.commandRunner) !== evidence.digest) {
         return false;
       }
+      authenticatedNativeFiles.add(entry);
     } else if (hashBuffer(packagedBytes) !== evidence.rawDigest) {
       return false;
     }
+  }
+  if (options.authenticatedNativeFiles instanceof Set) {
+    for (const entry of authenticatedNativeFiles) options.authenticatedNativeFiles.add(entry);
   }
   return true;
 }
@@ -2838,11 +2871,24 @@ function dependencyPackageInventoriesMatch(
       !isPlainObject(sourceLockfile) || !isPlainObject(sourceLockfile.packages)) {
     return false;
   }
-  const payloadMatches = (expectedPackage, actualPackage) => (
-    expectedPackage.name === actualPackage.name &&
-    expectedPackage.version === actualPackage.version &&
-    packagePayloadMatches(expectedPackage, actualPackage.files, options)
-  );
+  const authenticatedNativeFiles = new Set();
+  const payloadMatches = (expectedPackage, actualPackage) => {
+    if (expectedPackage.name !== actualPackage.name ||
+        expectedPackage.version !== actualPackage.version) {
+      return false;
+    }
+    const packageNativeFiles = new Set();
+    if (!packagePayloadMatches(expectedPackage, actualPackage.files, {
+      ...options,
+      authenticatedNativeFiles: packageNativeFiles,
+    })) {
+      return false;
+    }
+    for (const entry of packageNativeFiles) {
+      authenticatedNativeFiles.add(`${actualPackage.root}/${entry}`);
+    }
+    return true;
+  };
   const actualTree = {
     packages: Object.fromEntries([...actualPackages.keys()].map(root => [root, {}])),
   };
@@ -2912,8 +2958,12 @@ function dependencyPackageInventoriesMatch(
       return false;
     }
   }
-  return mappedExpected.size === expectedPackages.size &&
+  const valid = mappedExpected.size === expectedPackages.size &&
     usedActual.size === actualPackages.size;
+  if (valid && options.authenticatedNativeFiles instanceof Set) {
+    for (const entry of authenticatedNativeFiles) options.authenticatedNativeFiles.add(entry);
+  }
+  return valid;
 }
 
 function dependencyInventoryMatchesLock(asar, asarPath, sourceRoot, sourceManifest, options = {}) {
@@ -2943,14 +2993,22 @@ function dependencyInventoryMatchesLock(asar, asarPath, sourceRoot, sourceManife
     owner.files.set(entry.slice(owner.root.length + 1), bytes);
   }
 
+  const authenticatedNativeFiles = new Set();
   const payloadMatches = dependencyPackageInventoriesMatch(
     expected.packages,
     actualPackages,
     sourceManifest,
     options.sourceLockfile,
-    options
+    {
+      ...options,
+      authenticatedNativeFiles,
+    }
   );
-  return payloadMatches && expected.recheck();
+  const valid = payloadMatches && expected.recheck();
+  if (valid && options.authenticatedNativeFiles instanceof Set) {
+    for (const entry of authenticatedNativeFiles) options.authenticatedNativeFiles.add(entry);
+  }
+  return valid;
 }
 
 function collectSourceBinding(appPath, commandRunner, options = {}) {
@@ -3009,6 +3067,7 @@ function collectSourceBinding(appPath, commandRunner, options = {}) {
   let matches = true;
   let manifestMatches = false;
   let dependencyLockMatches = false;
+  const authenticatedNativeFiles = new Set();
   try {
     for (const entry of SOURCE_BOUND_ENTRIES) {
       const treeEntry = gitCommand(commandRunner, ['ls-tree', revision, '--', entry], {
@@ -3077,6 +3136,7 @@ function collectSourceBinding(appPath, commandRunner, options = {}) {
         archiveVerifier: options.archiveVerifier,
         afterDependencyAuthentication: options.afterDependencyAuthentication,
         onDependencyEvidenceSealed: options.onDependencyEvidenceSealed,
+        authenticatedNativeFiles,
         sourceLockfile,
       }
     );
@@ -3092,6 +3152,10 @@ function collectSourceBinding(appPath, commandRunner, options = {}) {
     matches = false;
     manifestMatches = false;
     dependencyLockMatches = false;
+  }
+  if (matches && manifestMatches && dependencyLockMatches && releaseSourceClean &&
+      options.authenticatedNativeFiles instanceof Set) {
+    for (const entry of authenticatedNativeFiles) options.authenticatedNativeFiles.add(entry);
   }
   return {
     matches,
@@ -3270,17 +3334,16 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
   }
   const asarPath = resolveAsarPath(resolvedAppPath);
   let asarIntegrityHash;
-  let asarFileIntegrity;
   try {
     const rawHeader = asar.getRawHeader(asarPath);
     if (!rawHeader || typeof rawHeader.headerString !== 'string') {
       throw new Error('Invalid ASAR header.');
     }
     asarIntegrityHash = hashBuffer(Buffer.from(rawHeader.headerString, 'utf8'));
-    asarFileIntegrity = verifyAsarFileIntegrity(asar, asarPath);
   } catch (error) {
     throw createVerificationError('Unable to verify the packaged ASAR integrity header.');
   }
+  const authenticatedNativeFiles = new Set();
   const sourceBinding = collectSourceBinding(resolvedAppPath, commandRunner, {
     asar,
     arch: options.arch,
@@ -3293,7 +3356,11 @@ async function collectReleaseEvidenceFromSnapshot(appPath, options = {}) {
     archiveVerifier: options.archiveVerifier,
     afterDependencyAuthentication: options.afterDependencyAuthentication,
     onDependencyEvidenceSealed: options.onDependencyEvidenceSealed,
+    authenticatedNativeFiles,
     sourceRoot,
+  });
+  const asarFileIntegrity = verifyAsarFileIntegrity(asar, asarPath, {
+    authenticatedNativeFiles,
   });
   const verifyElectronRuntime = options.verifyElectronRuntime || collectElectronRuntimeEvidence;
   let electronRuntime = verifyElectronRuntime(

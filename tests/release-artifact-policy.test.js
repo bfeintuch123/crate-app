@@ -1000,6 +1000,195 @@ test('ASAR file integrity verification detects transformed-byte hash drift', () 
   });
 });
 
+test('ASAR file integrity verification rejects packed and unpacked non-native tampering', () => {
+  const original = Buffer.from('approved bytes');
+  const tampered = Buffer.from('tampered bytes');
+  const originalMetadata = createFakeAsar(
+    new Map([['node_modules/fixture/payload.bin', original]])
+  ).statFile('', 'node_modules/fixture/payload.bin');
+  const createTamperedAsar = unpacked => ({
+    extractFile() {
+      return tampered;
+    },
+    listPackage() {
+      return ['/node_modules/fixture/payload.bin'];
+    },
+    statFile() {
+      return {
+        ...originalMetadata,
+        ...(unpacked ? { unpacked: true } : {}),
+      };
+    },
+  });
+
+  assert.deepEqual(verifyAsarFileIntegrity(createTamperedAsar(false), '/tmp/app.asar'), {
+    valid: false,
+    checkedFileCount: 1,
+    failedFileCount: 1,
+  });
+  assert.deepEqual(verifyAsarFileIntegrity(createTamperedAsar(true), '/tmp/app.asar'), {
+    valid: false,
+    checkedFileCount: 1,
+    failedFileCount: 1,
+  });
+});
+
+test('ASAR file integrity permits signed unpacked Mach-O mutation only for the exact proven path', () => {
+  const entry = 'node_modules/native/build/Release/addon.node';
+  const original = Buffer.concat([
+    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]),
+    Buffer.from('approved native bytes'),
+  ]);
+  const signed = Buffer.concat([original, Buffer.from('codesign mutation')]);
+  const originalMetadata = createFakeAsar(new Map([[entry, original]])).statFile('', entry);
+  const authenticatedNativeFiles = new Set();
+  const packageManifest = { name: 'native', version: '1.0.0' };
+  const expectedPackages = new Map([['node_modules/native', {
+    files: new Map([
+      ['package.json', { kind: 'manifest', value: packageManifest }],
+      ['build/Release/addon.node', {
+        kind: 'native-custom',
+        rawDigest: crypto.createHash('sha256').update(original).digest('hex'),
+      }],
+    ]),
+    name: 'native',
+    root: 'node_modules/native',
+    version: '1.0.0',
+  }]]);
+  const actualPackages = new Map([['node_modules/native', {
+    files: new Map([
+      ['package.json', Buffer.from(JSON.stringify(packageManifest))],
+      ['build/Release/addon.node', signed],
+    ]),
+    name: 'native',
+    root: 'node_modules/native',
+    version: '1.0.0',
+  }]]);
+  assert.equal(dependencyPackageInventoriesMatch(
+    expectedPackages,
+    actualPackages,
+    { dependencies: { native: '1.0.0' } },
+    { packages: { 'node_modules/native': {} } },
+    {
+      authenticatedNativeFiles,
+      nativeFileMatcher(packagedBytes, evidence) {
+        return crypto.createHash('sha256')
+          .update(packagedBytes.subarray(0, original.length))
+          .digest('hex') === evidence.rawDigest;
+      },
+    }
+  ), true);
+  assert.deepEqual([...authenticatedNativeFiles], [entry]);
+  const partialProofFiles = new Set();
+  assert.equal(dependencyPackageInventoriesMatch(
+    expectedPackages,
+    actualPackages,
+    { dependencies: { missing: '1.0.0', native: '1.0.0' } },
+    { packages: { 'node_modules/native': {} } },
+    {
+      authenticatedNativeFiles: partialProofFiles,
+      nativeFileMatcher: () => true,
+    }
+  ), false);
+  assert.deepEqual([...partialProofFiles], []);
+  const asar = {
+    extractFile() {
+      return signed;
+    },
+    listPackage() {
+      return [`/${entry}`];
+    },
+    statFile() {
+      return {
+        ...originalMetadata,
+        unpacked: true,
+      };
+    },
+  };
+
+  assert.deepEqual(verifyAsarFileIntegrity(asar, '/tmp/app.asar', {
+    authenticatedNativeFiles,
+  }), {
+    valid: true,
+    checkedFileCount: 1,
+    failedFileCount: 0,
+  });
+  for (const authenticatedNativeFiles of [
+    new Set(),
+    new Set(['node_modules/native/build/Release/other.node']),
+  ]) {
+    assert.deepEqual(verifyAsarFileIntegrity(asar, '/tmp/app.asar', {
+      authenticatedNativeFiles,
+    }), {
+      valid: false,
+      checkedFileCount: 1,
+      failedFileCount: 1,
+    });
+  }
+});
+
+test('ASAR native proof does not exempt extension-only non-Mach-O mutation', () => {
+  const entry = 'node_modules/native/build/Release/addon.node';
+  const original = Buffer.from('approved non-native bytes');
+  const originalMetadata = createFakeAsar(new Map([[entry, original]])).statFile('', entry);
+  const asar = {
+    extractFile() {
+      return Buffer.from('signed-looking but non-native mutation');
+    },
+    listPackage() {
+      return [`/${entry}`];
+    },
+    statFile() {
+      return {
+        ...originalMetadata,
+        unpacked: true,
+      };
+    },
+  };
+
+  assert.deepEqual(verifyAsarFileIntegrity(asar, '/tmp/app.asar', {
+    authenticatedNativeFiles: new Set([entry]),
+  }), {
+    valid: false,
+    checkedFileCount: 1,
+    failedFileCount: 1,
+  });
+});
+
+test('ASAR file integrity fails closed on malformed file metadata or schema', () => {
+  const createAsar = metadata => ({
+    extractFile() {
+      return Buffer.from('fixture');
+    },
+    listPackage() {
+      return ['/fixture'];
+    },
+    statFile() {
+      return metadata;
+    },
+  });
+  const validMetadata = createFakeAsar(
+    new Map([['fixture', Buffer.from('fixture')]])
+  ).statFile('', 'fixture');
+
+  for (const metadata of [
+    null,
+    {
+      ...validMetadata,
+      integrity: {
+        ...validMetadata.integrity,
+        unreviewed: true,
+      },
+    },
+  ]) {
+    assert.deepEqual(verifyAsarFileIntegrity(createAsar(metadata), '/tmp/app.asar'), {
+      valid: false,
+      checkedFileCount: metadata === null ? 0 : 1,
+      failedFileCount: 1,
+    });
+  }
+});
+
 test('release evidence supports a future approved version without hard-coded test metadata', () => {
   const version = '9.9.9-test';
   const result = evaluateReleaseEvidence(safeEvidence(version), {

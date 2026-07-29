@@ -6,6 +6,9 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
+const {
+  verifyAsarFileIntegrity,
+} = require('../scripts/verify-macos-release-app');
 
 function findPackageManifest(entryPath) {
   let current = path.dirname(entryPath);
@@ -68,6 +71,11 @@ test('Electron Builder ASAR stream packaging hashes the transformed archived byt
     assert.equal(emptyMetadata.integrity.algorithm, 'SHA256');
     assert.equal(emptyMetadata.integrity.hash, sha256(emptyBytes));
     assert.deepEqual(emptyMetadata.integrity.blocks, [sha256(emptyBytes)]);
+    assert.deepEqual(verifyAsarFileIntegrity(asar, archivePath), {
+      valid: true,
+      checkedFileCount: 2,
+      failedFileCount: 0,
+    });
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
