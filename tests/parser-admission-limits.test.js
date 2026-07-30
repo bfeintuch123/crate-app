@@ -80,6 +80,12 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-parser-admission-'));
 }
 
+function admitSyntheticFixturePaths(parser, allowedPaths) {
+  const allowed = new Set(allowedPaths.map(filePath => path.resolve(filePath)));
+  parser.isUserPath = filePath => allowed.has(path.resolve(filePath));
+  return parser;
+}
+
 test('whole-file parser reads reject an oversized sparse file before allocating it', () => {
   const tmpRoot = makeTempDir();
   try {
@@ -266,14 +272,19 @@ test('normal compressed Premiere projects keep their linked-media result shape',
   const tmpRoot = makeTempDir();
   try {
     const mediaPath = path.join(tmpRoot, 'clip.mov');
+    const unrelatedPath = path.join(tmpRoot, 'unrelated.mov');
     const projectPath = path.join(tmpRoot, 'project.prproj');
     fs.writeFileSync(mediaPath, 'media');
     fs.writeFileSync(
       projectPath,
       zlib.gzipSync(Buffer.from(`<ActualMediaFilePath>${mediaPath}</ActualMediaFilePath>`))
     );
+    const parser = admitSyntheticFixturePaths(new PremiereParser(), [mediaPath]);
 
-    assert.deepEqual(await new PremiereParser().extractAssets(projectPath), [{
+    assert.equal(new PremiereParser().isUserPath('/private/crate-user-asset.mov'), false);
+    assert.equal(parser.isUserPath(mediaPath), true);
+    assert.equal(parser.isUserPath(unrelatedPath), false);
+    assert.deepEqual(await parser.extractAssets(projectPath), [{
       path: mediaPath,
       source: 'prproj-mediapath',
       exists: true,
@@ -548,6 +559,7 @@ test('normal IDML archives keep their linked-asset result shape', async () => {
   unzipExtractData = new Map();
   try {
     const linkedPath = path.join(tmpRoot, 'linked image.png');
+    const unrelatedPath = path.join(tmpRoot, 'unrelated image.png');
     const archivePath = path.join(tmpRoot, 'project.idml');
     const xmlPath = 'Resources/Links.xml';
     const xmlContent = `<Link LinkResourceURI="file://${encodeURI(linkedPath)}"/>`;
@@ -559,8 +571,12 @@ test('normal IDML archives keep their linked-asset result shape', async () => {
       '',
     ].join('\n');
     unzipExtractData.set(xmlPath, xmlContent);
+    const parser = admitSyntheticFixturePaths(new InDesignParser(), [linkedPath]);
 
-    assert.deepEqual(await new InDesignParser().extractAssets(archivePath), [{
+    assert.equal(new InDesignParser().isUserPath('/private/crate-user-asset.png'), false);
+    assert.equal(parser.isUserPath(linkedPath), true);
+    assert.equal(parser.isUserPath(unrelatedPath), false);
+    assert.deepEqual(await parser.extractAssets(archivePath), [{
       path: linkedPath,
       source: 'idml-link',
       exists: true,
