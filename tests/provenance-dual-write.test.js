@@ -4608,6 +4608,82 @@ test('InDesign modified live document and links remain needs-save until saved', 
   ], 'InDesign unsaved live session pending files');
 });
 
+test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
+  const first = await createProject('Single watcher A');
+  const firstWatcher = watcherRecords[watcherRecords.length - 1];
+  assert.equal(typeof firstWatcher.handlers.add, 'function');
+
+  const second = await createProject('Single watcher B');
+  const secondWatcher = watcherRecords[watcherRecords.length - 1];
+  const observedPath = path.join(TEST_HOME, 'Desktop', 'single-watch-event.ai');
+  fs.writeFileSync(observedPath, 'synthetic illustrator source');
+
+  await firstWatcher.handlers.add(observedPath);
+  let firstFresh = await getProject(first.id);
+  let secondFresh = await getProject(second.id);
+  assert.equal(firstFresh.status, 'paused');
+  assert.equal(secondFresh.status, 'watching');
+  assert.equal(firstFresh.files.some(file => file.path === observedPath), false);
+  assert.equal(firstFresh.pendingFiles.some(file => file.path === observedPath), false);
+
+  await secondWatcher.handlers.add(observedPath);
+  secondFresh = await getProject(second.id);
+  firstFresh = await getProject(first.id);
+  assert.equal(secondFresh.files.some(file => file.path === observedPath), true);
+
+  const secondObservation = secondFresh.provenance.observations.find(observation => (
+    observation.observer &&
+    observation.observer.kind === OBSERVER_KINDS.CHOKIDAR &&
+    observation.observer.method === 'add'
+  ));
+  assert.ok(secondObservation);
+  assert.equal(Object.prototype.hasOwnProperty.call(firstFresh.provenance.nodes, secondObservation.objectNodeId), false);
+});
+
+test('one Illustrator observation stream is staged only for the active Watching project', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'B_Project.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'B_Asset.png');
+  fs.writeFileSync(sourcePath, 'synthetic illustrator source');
+  fs.writeFileSync(linkedPath, 'synthetic linked asset');
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tB_Project.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          `LINK\t${sourcePath}\tB_Project.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const first = await createProject('Illustrator attribution A');
+  const second = await createProject('Illustrator attribution B');
+  const secondFresh = await waitForProject(
+    second.id,
+    project => [sourcePath, linkedPath].every(filePath => (
+      project.pendingFiles.some(file => file.path === filePath)
+    )),
+    5000
+  );
+  const firstFresh = await getProject(first.id);
+
+  assert.equal(firstFresh.status, 'paused');
+  assert.equal(secondFresh.status, 'watching');
+  assert.equal(firstFresh.files.some(file => [sourcePath, linkedPath].includes(file.path)), false);
+  assert.equal(firstFresh.pendingFiles.some(file => [sourcePath, linkedPath].includes(file.path)), false);
+
+  const secondEvidenceKeys = Object.keys(secondFresh.liveEvidenceLedger.candidates || {});
+  const firstEvidenceKeys = new Set(Object.keys((firstFresh.liveEvidenceLedger && firstFresh.liveEvidenceLedger.candidates) || {}));
+  assert.equal(secondEvidenceKeys.length, 2);
+  assert.equal(secondEvidenceKeys.some(key => firstEvidenceKeys.has(key)), false);
+});
+
 test('Illustrator live app evidence stages open source and linked asset as needs-save candidates', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');

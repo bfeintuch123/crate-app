@@ -4534,6 +4534,8 @@ const mainWindowStartupRetryTimers = new Set();
 const watchers = new Map(); // projectId -> chokidar watcher
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
+const watchingActivationTokens = new Map(); // projectId -> current watch-session token
+let watchingActivationSequence = 0;
 
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
@@ -4563,6 +4565,101 @@ function sendToRenderer(channel, data) {
   if (trayWindow && !trayWindow.isDestroyed()) {
     trayWindow.webContents.send(channel, data);
   }
+}
+
+function projectWatchActivityTime(project) {
+  for (const value of [project && project.watchStartedAt, project && project.createdAt]) {
+    const timestamp = typeof value === 'number' ? value : Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return 0;
+}
+
+function mostRecentWatchingProject(projects) {
+  let selected = null;
+  let selectedIndex = -1;
+  let selectedTime = -1;
+  for (let index = 0; index < projects.length; index++) {
+    const project = projects[index];
+    if (!project || project.status !== 'watching') continue;
+    const activityTime = projectWatchActivityTime(project);
+    if (activityTime > selectedTime || (activityTime === selectedTime && index > selectedIndex)) {
+      selected = project;
+      selectedIndex = index;
+      selectedTime = activityTime;
+    }
+  }
+  return selected;
+}
+
+function repairPersistedWatchingProjects() {
+  const projects = getProjects();
+  const watchingProjects = projects.filter(project => project && project.status === 'watching');
+  if (watchingProjects.length <= 1) {
+    return watchingProjects[0] || null;
+  }
+
+  const retainedProject = mostRecentWatchingProject(projects);
+  for (const project of watchingProjects) {
+    if (project.id !== retainedProject.id) project.status = 'paused';
+  }
+  store.set('projects', projects);
+  console.warn(
+    `[startup] repaired ${watchingProjects.length} Watching projects; retained the most recent project`
+  );
+  return retainedProject;
+}
+
+function isActiveWatchingProject(projectId, activationToken = null) {
+  if (activationToken !== null && watchingActivationTokens.get(projectId) !== activationToken) {
+    return false;
+  }
+  const watchingProjects = getProjects().filter(project => project && project.status === 'watching');
+  return watchingProjects.length === 1 && watchingProjects[0].id === projectId;
+}
+
+function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
+  const projects = getProjects();
+  const project = projects.find(item => item.id === projectId);
+  if (!project) return null;
+
+  const pausedProjectIds = [];
+  for (const otherProject of projects) {
+    if (otherProject.id === projectId || otherProject.status !== 'watching') continue;
+    otherProject.status = 'paused';
+    pausedProjectIds.push(otherProject.id);
+  }
+
+  project.status = 'watching';
+  if (!preserveWatchStartedAt || !project.watchStartedAt) {
+    project.watchStartedAt = Date.now();
+  }
+  project.figmaSession = buildFigmaSessionSnapshot(project, settings);
+  normalizeAutoCaptureProjectState(project);
+  safelyEnsureProjectProvenance(project);
+  store.set('projects', projects);
+
+  for (const pausedProjectId of pausedProjectIds) {
+    stopWatching(pausedProjectId);
+  }
+
+  const activationToken = ++watchingActivationSequence;
+  watchingActivationTokens.clear();
+  watchingActivationTokens.set(projectId, activationToken);
+
+  return {
+    activationToken,
+    pausedProjectIds,
+    projectSnapshot: {
+      id: project.id,
+      type: project.type,
+      files: project.files,
+      createdAt: project.createdAt,
+      watchStartedAt: project.watchStartedAt,
+      figmaTrackedFiles: project.figmaTrackedFiles,
+      figmaSession: project.figmaSession,
+    },
+  };
 }
 
 function cleanName(s) {
@@ -4697,16 +4794,20 @@ function getRunningDesignAppPids(projectType, callback) {
 
 // Poll lsof for a single watching project. Runs every LSOF_POLL_MS.
 // Finds files that design apps have open (reads + writes) in watched dirs → Tier 1 auto-capture.
-function pollLsofForProject(projectId) {
+function pollLsofForProject(projectId, activationToken = null) {
   if (lsofInProgress.has(projectId)) return; // skip if already running for this project
 
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
-  if (!project || project.status !== 'watching') return;
+  if (!project || !isActiveWatchingProject(projectId, activationToken)) return;
 
   lsofInProgress.add(projectId);
 
   getRunningDesignAppPids(project.type, (pids, pidToCmd) => {
+    if (!isActiveWatchingProject(projectId, activationToken)) {
+      lsofInProgress.delete(projectId);
+      return;
+    }
     designAppRunningCache.set(projectId, pids.length > 0); // v2.4.2: per-project
     if (pids.length === 0) {
       lsofInProgress.delete(projectId);
@@ -4731,7 +4832,7 @@ function pollLsofForProject(projectId) {
 
     exec(cmd, { timeout: 12000 }, (err, stdout) => {
       lsofInProgress.delete(projectId);
-      if (!stdout) return;
+      if (!stdout || !isActiveWatchingProject(projectId, activationToken)) return;
 
       const parsedLines = stdout.trim().split('\n');
 
@@ -4792,8 +4893,8 @@ function pollLsofForProject(projectId) {
       for (const [filePath, prevPidSet] of prevPids) {
         if (!currentPollFiles.has(filePath)) {
           // v2.2.3: Scan-on-close — re-scan file that just closed to catch final-save assets
-          if (prevPidSet.size > 0) {
-            runScanOnOpen(projectId, filePath).catch(() => {});
+          if (prevPidSet.size > 0 && isActiveWatchingProject(projectId, activationToken)) {
+            runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
           }
           prevPids.set(filePath, new Set()); // closed
         }
@@ -4804,7 +4905,8 @@ function pollLsofForProject(projectId) {
 
       // Fire-and-forget: run scan-on-open for newly detected design files
       for (const filePath of filesToScan) {
-        runScanOnOpen(projectId, filePath).catch(() => {});
+        if (!isActiveWatchingProject(projectId, activationToken)) break;
+        runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
       }
 
       // Second pass: standard lsof file capture (same as before, minus mtime filter)
@@ -4812,7 +4914,7 @@ function pollLsofForProject(projectId) {
       currentType = null;
 
       const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return { changed: false };
+        if (!isActiveWatchingProject(projectId, activationToken)) return { changed: false };
 
         const existingPaths = getNormalizedPathSet(proj.files);
         const pendingPaths = getNormalizedPathSet(proj.pendingFiles);
@@ -4986,11 +5088,11 @@ function pollLsofForProject(projectId) {
 
 const LSOF_POLL_MS = 3000; // v1.3.27: reduced from 2s to 3s — still fast enough for capture, less system load
 
-function startLsofPolling(projectId) {
+function startLsofPolling(projectId, activationToken = null) {
   stopLsofPolling(projectId); // clear any existing interval first
   // Run once immediately, then on the regular interval
-  setTimeout(() => pollLsofForProject(projectId), 500);
-  const intervalId = setInterval(() => pollLsofForProject(projectId), LSOF_POLL_MS);
+  setTimeout(() => pollLsofForProject(projectId, activationToken), 500);
+  const intervalId = setInterval(() => pollLsofForProject(projectId, activationToken), LSOF_POLL_MS);
   lsofPollers.set(projectId, intervalId);
 }
 
@@ -6023,12 +6125,14 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
  * Poll Figma API for recent files and extract assets.
  * Runs on watch session start and every 60 seconds.
  */
-async function pollFigmaForProject(projectId, isInitialScan = false) {
+async function pollFigmaForProject(projectId, isInitialScan = false, activationToken = null) {
   if (figmaInProgress.has(projectId)) return { skipped: true, reason: 'in-progress' }; // Prevent overlapping polls
 
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
-  if (!project || project.status !== 'watching') return { skipped: true, reason: 'not-watching' };
+  if (!project || !isActiveWatchingProject(projectId, activationToken)) {
+    return { skipped: true, reason: 'not-watching' };
+  }
   const scanStartedAt = Date.now();
   const rateLimitRetryAt = figmaRateLimitBackoffs.get(projectId) || 0;
   if (rateLimitRetryAt > scanStartedAt) {
@@ -6050,6 +6154,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
+  if (!isActiveWatchingProject(projectId, activationToken)) {
+    return { skipped: true, reason: 'watch-session-superseded' };
+  }
   if (!token) {
     stopFigmaPolling(projectId);
     return { skipped: true, reason: 'not-connected' }; // Figma not connected
@@ -6097,6 +6204,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
       fileKeys,
       scopeEntries: scanTrackedFiles
     });
+    if (!isActiveWatchingProject(projectId, activationToken)) {
+      return { skipped: true, reason: 'watch-session-superseded' };
+    }
 
     const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
     const activeProject = getProjects().find(p => p.id === projectId) || latestProject;
@@ -6257,9 +6367,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false) {
 /**
  * Start Figma polling for a project.
  */
-async function startFigmaPolling(projectId) {
+async function startFigmaPolling(projectId, activationToken = null) {
   const project = getProjects().find(p => p.id === projectId);
-  if (!project || project.status !== 'watching' || !projectHasFigmaTrackedFiles(project)) {
+  if (!project || !isActiveWatchingProject(projectId, activationToken) || !projectHasFigmaTrackedFiles(project)) {
     stopFigmaPolling(projectId);
     return;
   }
@@ -6271,7 +6381,7 @@ async function startFigmaPolling(projectId) {
   let initialResult;
   try {
     // Run initial scan immediately
-    initialResult = await pollFigmaForProject(projectId, true);
+    initialResult = await pollFigmaForProject(projectId, true, activationToken);
   } finally {
     figmaPollerStarting.delete(projectId);
   }
@@ -6284,13 +6394,17 @@ async function startFigmaPolling(projectId) {
   if (figmaPollers.has(projectId)) return;
 
   const latestProject = getProjects().find(p => p.id === projectId);
-  if (!latestProject || latestProject.status !== 'watching' || !projectHasFigmaTrackedFiles(latestProject)) {
+  if (
+    !latestProject ||
+    !isActiveWatchingProject(projectId, activationToken) ||
+    !projectHasFigmaTrackedFiles(latestProject)
+  ) {
     return;
   }
 
   // Start 60-second polling interval
   const intervalId = setInterval(() => {
-    pollFigmaForProject(projectId, false);
+    pollFigmaForProject(projectId, false, activationToken);
   }, FIGMA_POLL_INTERVAL_MS);
 
   figmaPollers.set(projectId, intervalId);
@@ -7363,13 +7477,13 @@ function createInDesignLiveEvidenceRecords(projectId, activeState, project = nul
  * Poll Photoshop and InDesign for open smart objects / linked assets (embedded + linked).
  * Fires every 3 seconds; skips silently if neither app is running.
  */
-async function pollPsForProject(projectId) {
+async function pollPsForProject(projectId, activationToken = null) {
   if (psInProgress.has(projectId)) return;
 
   const currentProjects = getProjects();
   const project = currentProjects.find(p => p.id === projectId);
   if (!project) return;
-  if (project.status !== 'watching') {
+  if (!isActiveWatchingProject(projectId, activationToken)) {
     for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -7617,7 +7731,7 @@ async function pollPsForProject(projectId) {
       console.log(`[crate][live-app] Polled active app evidence for project ${projectId}: ${polledApps.join(', ')} (${liveEvidenceRecords.length} records)`);
     }
 
-    if (liveEvidenceRecords.length === 0) return;
+    if (liveEvidenceRecords.length === 0 || !isActiveWatchingProject(projectId, activationToken)) return;
 
     const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords);
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
@@ -7646,7 +7760,7 @@ async function pollPsForProject(projectId) {
 /**
  * Start live app evidence refresh for a project.
  */
-function startPsPolling(projectId) {
+function startPsPolling(projectId, activationToken = null) {
   if (psPollers.has(projectId) || psPollerStarting.has(projectId)) return;
   psPollerStarting.add(projectId);
   logLiveAppDiagnostic(projectId, 'poll-installed', `live app evidence refresh installed for project ${projectId}`, 0);
@@ -7660,12 +7774,12 @@ function startPsPolling(projectId) {
   }
 
   const intervalId = setInterval(() => {
-    return pollPsForProject(projectId);
+    return pollPsForProject(projectId, activationToken);
   }, PS_POLL_INTERVAL_MS);
   psPollers.set(projectId, intervalId);
 
   setTimeout(() => {
-    pollPsForProject(projectId).finally(() => {
+    pollPsForProject(projectId, activationToken).finally(() => {
       psPollerStarting.delete(projectId);
     });
   }, LIVE_APP_INITIAL_REFRESH_DELAY_MS);
@@ -7692,11 +7806,11 @@ function stopPsPolling(projectId) {
 // kMDItemLastUsedDate on that file but lsof misses it (<1 sec open).
 // This poller runs every 10s during active watch sessions to catch those files.
 
-async function pollLastUsedForProject(projectId) {
+async function pollLastUsedForProject(projectId, activationToken = null) {
   try {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
-  if (!project || project.status !== 'watching') return;
+  if (!project || !isActiveWatchingProject(projectId, activationToken)) return;
   if (!designAppRunningCache.get(projectId)) return; // only run when a design app is open
 
   const homedir = os.homedir();
@@ -7757,10 +7871,10 @@ async function pollLastUsedForProject(projectId) {
     // mdfind failed — skip this poll cycle
   }
 
-  if (newFiles.length === 0) return;
+  if (newFiles.length === 0 || !isActiveWatchingProject(projectId, activationToken)) return;
 
   const result = mutateProject(projectId, (proj) => {
-    if (proj.status !== 'watching') return null;
+    if (!isActiveWatchingProject(projectId, activationToken)) return null;
     const acceptedFiles = [];
     let added = 0;
     for (const f of newFiles) {
@@ -7800,10 +7914,10 @@ async function pollLastUsedForProject(projectId) {
   }
 }
 
-function startLastUsedPolling(projectId) {
+function startLastUsedPolling(projectId, activationToken = null) {
   if (lastUsedPollers.has(projectId)) return;
-  setTimeout(() => pollLastUsedForProject(projectId), 10000); // v2.4.8: 10s delay — ensures watchStartedAt is written before first poll
-  const intervalId = setInterval(() => pollLastUsedForProject(projectId), LAST_USED_POLL_MS);
+  setTimeout(() => pollLastUsedForProject(projectId, activationToken), 10000); // v2.4.8: 10s delay — ensures watchStartedAt is written before first poll
+  const intervalId = setInterval(() => pollLastUsedForProject(projectId, activationToken), LAST_USED_POLL_MS);
   lastUsedPollers.set(projectId, intervalId);
 }
 
@@ -8285,14 +8399,19 @@ async function extractLinkedAssetsPxd(filePath) {
  * Run scan-on-open for a design file: extract linked assets and merge into project.
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
-async function runScanOnOpen(projectId, filePath) {
+async function runScanOnOpen(projectId, filePath, activationToken = null) {
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
   const currentProject = getProjects().find(p => p.id === projectId);
-  if (!currentProject || !isAcceptedProjectFilePath(currentProject, filePath)) return;
+  if (
+    !currentProject ||
+    (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) ||
+    !isAcceptedProjectFilePath(currentProject, filePath)
+  ) return;
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const linkedPaths = await extractLinkedAssets(filePath);
+  if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return;
 
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
@@ -8316,7 +8435,10 @@ async function runScanOnOpen(projectId, filePath) {
   console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
 
   const result = mutateProject(projectId, (proj) => {
-    if (proj.status !== 'watching') return null;
+    if (
+      proj.status !== 'watching' ||
+      (activationToken !== null && !isActiveWatchingProject(projectId, activationToken))
+    ) return null;
     // v2.4.0: normalize paths before comparing to prevent duplicates
     const acceptedFiles = [];
     let changed = false;
@@ -8367,9 +8489,13 @@ async function runScanOnOpen(projectId, filePath) {
     if (Date.now() - lastParsed < 5000) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
     const psdAssets = await extractPsdAssets(filePath, projectId);
+    if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return;
     if (psdAssets.length > 0) {
       const psdResult = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
+        if (
+          proj.status !== 'watching' ||
+          (activationToken !== null && !isActiveWatchingProject(projectId, activationToken))
+        ) return null;
         // v2.4.0: normalize paths before comparing to prevent duplicates
         const acceptedFiles = [];
         let changed = false;
@@ -9130,22 +9256,11 @@ function createTray() {
 
 // --- File Watching ---
 
-async function startWatching(projectId) {
+async function startWatching(projectId, { preserveWatchStartedAt = false } = {}) {
   const settings = store.get('settings') || {};
-  // FIX 1: Use mutateProject for initial watchStartedAt write
-  const projectSnapshot = mutateProject(projectId, (project) => {
-    project.watchStartedAt = Date.now();
-    project.figmaSession = buildFigmaSessionSnapshot(project, settings);
-    return {
-      type: project.type,
-      files: project.files,
-      createdAt: project.createdAt,
-      watchStartedAt: project.watchStartedAt,
-      figmaTrackedFiles: project.figmaTrackedFiles,
-      figmaSession: project.figmaSession
-    };
-  });
-  if (!projectSnapshot) return;
+  const activation = activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt });
+  if (!activation) return null;
+  const { activationToken, projectSnapshot } = activation;
 
   // FIX 4 (H1): Converted from execSync to async — no longer blocks main process
   // v1.3.38: One-time lsof snapshot to capture files already open in design apps
@@ -9181,7 +9296,9 @@ async function startWatching(projectId) {
         // v2.2.2: Collect design files for scan-on-open
         const snapshotDesignFiles = [];
 
+        if (!isActiveWatchingProject(projectId, activationToken)) return null;
         const snapshotResult = mutateProject(projectId, (project) => {
+          if (!isActiveWatchingProject(projectId, activationToken)) return null;
           const existingPaths = getNormalizedPathSet(project.files);
           const pendingPaths = getNormalizedPathSet(project.pendingFiles);
           let snapshotChanged = false;
@@ -9355,12 +9472,12 @@ async function startWatching(projectId) {
 
         // v2.2.2: Fire-and-forget scan-on-open for design files found in initial snapshot.
         // Initialize scannedDesignFiles for this project and mark these as scanned.
-        if (snapshotDesignFiles.length > 0) {
+        if (snapshotDesignFiles.length > 0 && isActiveWatchingProject(projectId, activationToken)) {
           if (!scannedDesignFiles.has(projectId)) scannedDesignFiles.set(projectId, new Set());
           const scanned = scannedDesignFiles.get(projectId);
           for (const fp of snapshotDesignFiles) {
             scanned.add(fp);
-            runScanOnOpen(projectId, fp).catch(() => {});
+            runScanOnOpen(projectId, fp, activationToken).catch(() => {});
           }
         }
       }
@@ -9369,8 +9486,11 @@ async function startWatching(projectId) {
     console.error('[crate] initial lsof snapshot error:', e.message);
   }
 
+  if (!isActiveWatchingProject(projectId, activationToken)) return null;
+
   // Stop existing watcher if any
-  stopWatching(projectId);
+  stopWatching(projectId, { invalidateActivation: false });
+  if (!isActiveWatchingProject(projectId, activationToken)) return null;
 
   const homedir = os.homedir();
   const watchPaths = [
@@ -9414,6 +9534,7 @@ async function startWatching(projectId) {
 
   // FIX 1: chokidar add handler uses mutateProject
   watcher.on('add', async (filePath) => {
+    if (!isActiveWatchingProject(projectId, activationToken)) return;
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
     if (name.startsWith('.') || name.startsWith('._') || name === 'Thumbs.db') return;
@@ -9423,6 +9544,7 @@ async function startWatching(projectId) {
 
     // Small delay to let macOS write file metadata
     await new Promise(resolve => setTimeout(resolve, 500));
+    if (!isActiveWatchingProject(projectId, activationToken)) return;
 
     // v2.2.6: Only capture PRIMARY design source files via chokidar 'add'.
     // Image/media/font/pdf files are NOT captured here — they produce false positives
@@ -9431,7 +9553,7 @@ async function startWatching(projectId) {
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
+        if (!isActiveWatchingProject(projectId, activationToken)) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
           reason: 'chokidar-add',
@@ -9465,19 +9587,21 @@ async function startWatching(projectId) {
   // FIX 1: chokidar change handler uses mutateProject
   // v2.2.2: Also triggers scan-on-open when a design file is modified
   watcher.on('change', async (filePath) => {
+    if (!isActiveWatchingProject(projectId, activationToken)) return;
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
     if (name.startsWith('.') || name === 'Thumbs.db') return;
     if (name.startsWith('~$')) return;
 
     await new Promise(resolve => setTimeout(resolve, 500));
+    if (!isActiveWatchingProject(projectId, activationToken)) return;
 
     // v2.2.6: Only re-scan PRIMARY design source files on change.
     // Same rationale as the 'add' handler — image/media changes are noise here.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
-        if (proj.status !== 'watching') return null;
+        if (!isActiveWatchingProject(projectId, activationToken)) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
           reason: 'chokidar-change',
@@ -9509,7 +9633,7 @@ async function startWatching(projectId) {
       // C3: Skip runScanOnOpen for .psd — scheduleScanOnSave handles it with debounce
       // to avoid double ag-psd parse on every .psd save event.
       if (sourceIsAccepted && SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
-        runScanOnOpen(projectId, filePath).catch(() => {});
+        runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
       }
 
       // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
@@ -9527,15 +9651,17 @@ async function startWatching(projectId) {
   });
 
   watchers.set(projectId, watcher);
-  startLsofPolling(projectId); // begin lsof polling for linked assets
+  startLsofPolling(projectId, activationToken); // begin lsof polling for linked assets
   if (projectHasFigmaTrackedFiles(projectSnapshot)) {
-    startFigmaPolling(projectId); // begin Figma auto-tracking (if token is configured)
+    startFigmaPolling(projectId, activationToken); // begin Figma auto-tracking (if token is configured)
   }
-  startPsPolling(projectId);    // begin live app evidence refresh
-  startLastUsedPolling(projectId); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
+  startPsPolling(projectId, activationToken);    // begin live app evidence refresh
+  startLastUsedPolling(projectId, activationToken); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
+  return getProjects().find(project => project.id === projectId) || null;
 }
 
-function stopWatching(projectId) {
+function stopWatching(projectId, { invalidateActivation = true } = {}) {
+  if (invalidateActivation) watchingActivationTokens.delete(projectId);
   const watcher = watchers.get(projectId);
   if (watcher) {
     watcher.close();
@@ -9683,7 +9809,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
     type: projectType,
     figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
     figmaTrackedFiles,
-    status: 'watching',
+    status: 'paused',
     files: [],
     pendingFiles: [], // Tier 2 candidates awaiting user review
     createdAt: Date.now(),
@@ -9693,8 +9819,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
   safelyEnsureProjectProvenance(newProject);
   projects.push(newProject);
   store.set('projects', projects);
-  await startWatching(newProject.id);
-  return newProject;
+  return await startWatching(newProject.id);
 });
 
 // Phase 2: per-project Figma link.
@@ -9748,13 +9873,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
 });
 
 registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
-  const project = mutateProject(id, (proj) => {
-    proj.status = 'watching';
-  });
-  if (project) {
-    await startWatching(id);
-  }
-  return project;
+  return await startWatching(id);
 });
 
 registerTrustedIpcHandler('projects:pause', (event, id) => {
@@ -11308,6 +11427,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   lastUsedPollers.clear();
   lastFileActivity.clear();
   inactivityNotified.clear();
+  watchingActivationTokens.clear();
   designAppRunningCache.clear(); // v2.4.2
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
@@ -11626,15 +11746,14 @@ app.whenReady().then(async () => {
       });
     }
 
-    // Resume watching for any active projects without letting watcher recovery block the UI.
-    const projects = getProjects();
-    for (const project of projects) {
-      if (project.status === 'watching') {
-        try {
-          await startWatching(project.id);
-        } catch (e) {
-          console.error('[startup] failed to resume project watch:', redactFigmaLogText(e && e.message));
-        }
+    // Repair legacy state before watcher recovery so only one project can consume
+    // the global creative-app observation streams.
+    const activeProject = repairPersistedWatchingProjects();
+    if (activeProject) {
+      try {
+        await startWatching(activeProject.id, { preserveWatchStartedAt: true });
+      } catch (e) {
+        console.error('[startup] failed to resume project watch:', redactFigmaLogText(e && e.message));
       }
     }
   } catch (e) {
