@@ -10,7 +10,7 @@
 - branch: `fix/single-active-watching-project`
 - base: `982d8de2a7dee5ffff6411d13d4ce0dcc2f49a0a`
 - mode: fix-and-PR
-- status: review-corrections-validated
+- status: ready-for-merge-review
 
 ## Goal
 
@@ -35,9 +35,9 @@ Forbidden:
 
 ## State
 
-- current phase: PR correction publication
-- last completed checkpoint: delayed Figma, PSD, and presentation work is activation-bound and the full serial suite passed
-- next action: commit and push the corrections, wait for CI, then resolve only the fixed PR review thread
+- current phase: merge-readiness handoff
+- last completed checkpoint: correction commit pushed, GitHub CI passed, and the fixed P1 review thread was factually answered and resolved
+- next action: Bryant decides whether PR #166 should merge; build, release, deploy, and Jenna QA remain forbidden
 - blocker: none
 - approval state: Bryant approved implementation, commit, push, and PR; merge and release are forbidden
 - preferences applied: one builder, narrow diff, no release activity
@@ -54,7 +54,7 @@ Forbidden:
 - [x] proof bundle
 - [x] ledger/state update
 - [x] review corrections
-- [ ] handoff
+- [x] handoff
 
 ## Evidence
 
@@ -80,6 +80,7 @@ Forbidden:
 | 2026-07-29 | Full serial suite after review corrections | `node --test --test-concurrency=1 tests/*.test.js` | 447 passed, 0 failed, 1 expected CI-only skip |
 | 2026-07-29 | Dependency audit | production and full dependency audits at high severity | 0 vulnerabilities |
 | 2026-07-29 | Final Autoreview and risk lanes | full diff, async ownership, regression, security, provenance, runner, and diff-hygiene review | no unresolved source finding; no package, dependency, parser, renderer, release, site, credential, schema, or write-root drift |
+| 2026-07-29 | PR correction publication | commit `6eb14ff`, PR #166 source security and regression suite | CI passed; fixed P1 thread answered and resolved |
 
 ## Risks
 
