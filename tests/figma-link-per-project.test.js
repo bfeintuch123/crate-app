@@ -253,6 +253,43 @@ class FakeStore {
     if (LOCAL_STORE_PROBE_MODE === 'malformed-settings') {
       this.data.settings = null;
     }
+    if (LOCAL_STORE_PROBE_MODE === 'multiple-watching-projects') {
+      this.data.projects = [
+        {
+          id: 'startup-older-watching',
+          name: 'Older Watching',
+          type: 'branding',
+          status: 'watching',
+          createdAt: 100,
+          watchStartedAt: 1000,
+          files: [{ id: 'older-file', path: '/synthetic/older.ai', name: 'older.ai', ext: '.ai' }],
+          pendingFiles: [{ id: 'older-pending', path: '/synthetic/review.ai', name: 'review.ai', ext: '.ai' }],
+          figmaTrackedFiles: [{ key: 'OLDERFIGMA', scopeMode: 'current-page' }],
+        },
+        {
+          id: 'startup-newer-watching',
+          name: 'Newer Watching',
+          type: 'branding',
+          status: 'watching',
+          createdAt: 200,
+          watchStartedAt: 2000,
+          files: [{ id: 'newer-file', path: '/synthetic/newer.ai', name: 'newer.ai', ext: '.ai' }],
+          pendingFiles: [],
+          figmaTrackedFiles: [],
+        },
+        {
+          id: 'startup-paused',
+          name: 'Already Paused',
+          type: 'branding',
+          status: 'paused',
+          createdAt: 300,
+          watchStartedAt: 3000,
+          files: [{ id: 'paused-file', path: '/synthetic/paused.ai', name: 'paused.ai', ext: '.ai' }],
+          pendingFiles: [],
+          figmaTrackedFiles: [],
+        },
+      ];
+    }
     fakeStoreInstance = this;
   }
   get(key, fallback) {
@@ -448,6 +485,9 @@ if (LOCAL_STORE_PROBE_MODE) {
     errorText: storageErrorMessages.map(item => `${item.title} ${item.message}`).join(' '),
     targetUntouched,
     targetModeUnchanged,
+    projects: LOCAL_STORE_PROBE_MODE === 'multiple-watching-projects'
+      ? fakeStoreInstance.data.projects
+      : undefined,
   })}\n`);
   clearTrackedTimers();
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
@@ -882,6 +922,27 @@ test('local config rejects an unexpected electron-store path with the same nativ
   }
 });
 
+test('startup keeps only the most recently active Watching project without deleting project state', () => {
+  const result = runLocalStoreStartupProbe('multiple-watching-projects');
+  assert.equal(result.storageErrorShown, false);
+  assert.equal(result.appQuitRequested, false);
+  assert.equal(result.projects.filter(project => project.status === 'watching').length, 1);
+
+  const older = result.projects.find(project => project.id === 'startup-older-watching');
+  const newer = result.projects.find(project => project.id === 'startup-newer-watching');
+  const paused = result.projects.find(project => project.id === 'startup-paused');
+
+  assert.equal(older.status, 'paused');
+  assert.deepEqual(older.files.map(file => file.id), ['older-file']);
+  assert.deepEqual(older.pendingFiles.map(file => file.id), ['older-pending']);
+  assert.deepEqual(older.figmaTrackedFiles.map(file => file.key), ['OLDERFIGMA']);
+  assert.equal(newer.status, 'watching');
+  assert.equal(newer.watchStartedAt, 2000);
+  assert.deepEqual(newer.files.map(file => file.id), ['newer-file']);
+  assert.equal(paused.status, 'paused');
+  assert.deepEqual(paused.files.map(file => file.id), ['paused-file']);
+});
+
 test('deleting one project removes only its caches while preserving active and unrelated cache directories', async () => {
   const deletedProject = await callIpc('projects:create', 'Delete cache project');
   const activeProject = await callIpc('projects:create', 'Keep cache project');
@@ -1189,6 +1250,59 @@ test('deleting a project during an in-flight Figma download removes the late cac
   assert.equal((await callIpc('projects:get-all')).some(item => item.id === project.id), false);
 });
 
+test('a delayed Figma download from an old A activation cannot mutate or cache after A to B to A', async () => {
+  const first = await createLinkedFigmaProject('Delayed Figma Activation A');
+  const cacheDir = projectCacheDir('figma-assets', first.id);
+  const cacheEntriesBefore = fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [];
+  const downloadGate = setGatedFigmaDownloadResponse('stale activation figma cache');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/stale-activation.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-stale-activation',
+    imageRef: 'img-stale-activation',
+    name: 'Stale Activation Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const staleScan = callIpc('figma:scan-project', first.id);
+  await downloadGate.started;
+
+  storedFigmaToken = null;
+  const second = await callIpc('projects:create', 'Delayed Figma Activation B');
+  await callIpc('projects:start-watching', first.id);
+  downloadGate.release();
+  await staleScan;
+  await new Promise(resolve => originalSetTimeout(resolve, 30));
+
+  const projects = await callIpc('projects:get-all');
+  const firstFresh = projects.find(project => project.id === first.id);
+  const secondFresh = projects.find(project => project.id === second.id);
+  assert.equal(firstFresh.status, 'watching');
+  assert.equal(secondFresh.status, 'paused');
+  assert.equal(firstFresh.files.some(file => file.source === 'figma-auto'), false);
+  assert.equal(secondFresh.files.some(file => file.source === 'figma-auto'), false);
+  assert.equal(
+    getProvenanceNodes(firstFresh, NODE_TYPES.FILE)
+      .some(node => node.name === 'Brand_Cloud_Stale_Activation_Asset.png'),
+    false
+  );
+  assert.deepEqual(
+    fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [],
+    cacheEntriesBefore
+  );
+});
+
 test('delete-all during an in-flight Figma download removes the late cache write', async () => {
   const project = await createLinkedFigmaProject('Delete all in-flight Figma cache');
   const downloadGate = setGatedFigmaDownloadResponse('late delete-all figma cache');
@@ -1352,6 +1466,43 @@ test('projects:create rejects an invalid Figma URL', async () => {
   // Project must NOT have been created.
   const projects = await callIpc('projects:get-all');
   assert.ok(!projects.some(p => p.name === 'Phase2-create-invalid-url'));
+});
+
+test('starting or resuming a project atomically pauses the previous watcher and preserves both projects', async () => {
+  const first = await callIpc(
+    'projects:create',
+    'Single Watch First',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  const firstStored = fakeStoreInstance.data.projects.find(project => project.id === first.id);
+  firstStored.files = [{ id: 'first-file', path: '/synthetic/first.ai', name: 'first.ai', ext: '.ai' }];
+  firstStored.pendingFiles = [{ id: 'first-pending', path: '/synthetic/review.ai', name: 'review.ai', ext: '.ai' }];
+
+  const second = await callIpc('projects:create', 'Single Watch Second');
+  let projects = await callIpc('projects:get-all');
+  let firstFresh = projects.find(project => project.id === first.id);
+  let secondFresh = projects.find(project => project.id === second.id);
+
+  assert.equal(projects.filter(project => project.status === 'watching').length, 1);
+  assert.equal(firstFresh.status, 'paused');
+  assert.equal(secondFresh.status, 'watching');
+  assert.deepEqual(firstFresh.files.map(file => file.id), ['first-file']);
+  assert.deepEqual(firstFresh.pendingFiles.map(file => file.id), ['first-pending']);
+  assert.equal(firstFresh.figmaTrackedFiles[0].key, 'FIG22');
+
+  secondFresh.files = [{ id: 'second-file', path: '/synthetic/second.ai', name: 'second.ai', ext: '.ai' }];
+  await callIpc('projects:start-watching', first.id);
+  projects = await callIpc('projects:get-all');
+  firstFresh = projects.find(project => project.id === first.id);
+  secondFresh = projects.find(project => project.id === second.id);
+
+  assert.equal(projects.filter(project => project.status === 'watching').length, 1);
+  assert.equal(firstFresh.status, 'watching');
+  assert.equal(secondFresh.status, 'paused');
+  assert.deepEqual(secondFresh.files.map(file => file.id), ['second-file']);
+  assert.equal(firstFresh.figmaTrackedFiles[0].key, 'FIG22');
 });
 
 test('projects:set-figma-link preserves the link when replacement URL is empty', async () => {

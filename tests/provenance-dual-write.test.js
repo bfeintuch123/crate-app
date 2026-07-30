@@ -1147,6 +1147,58 @@ test('deleting a project during presentation extraction leaves no late project c
   }
 });
 
+test('a delayed presentation scan from an old A activation cannot cache or mutate after A to B to A', async () => {
+  const tmpRoot = makeTempDir();
+  let releaseRead = () => {};
+  try {
+    resetPresentationCacheRoot();
+    const first = await createProject('Delayed Presentation Activation A');
+    const firstWatcher = latestWatcherHandlers();
+    const pptxPath = path.join(tmpRoot, 'Delayed-Activation.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(first.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Delayed-Activation.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('STALE_PRESENTATION_MEDIA'.repeat(40)),
+    }], {
+      readGate,
+      onReadStart: markReadStarted,
+    });
+
+    await firstWatcher.change(pptxPath);
+    await readStarted;
+    const second = await createProject('Delayed Presentation Activation B');
+    await callIpc('projects:start-watching', first.id);
+    releaseRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+    const firstFresh = await getProject(first.id);
+    const secondFresh = await getProject(second.id);
+    assert.equal(firstFresh.status, 'watching');
+    assert.equal(secondFresh.status, 'paused');
+    assert.equal(firstFresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.equal(secondFresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    const cacheDir = presentationCachePaths(first.id).projectDir;
+    assert.equal(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).length : 0, 0);
+  } finally {
+    releaseRead();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('delete-all during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
   let releaseRead = () => {};
@@ -4608,6 +4660,82 @@ test('InDesign modified live document and links remain needs-save until saved', 
   ], 'InDesign unsaved live session pending files');
 });
 
+test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
+  const first = await createProject('Single watcher A');
+  const firstWatcher = watcherRecords[watcherRecords.length - 1];
+  assert.equal(typeof firstWatcher.handlers.add, 'function');
+
+  const second = await createProject('Single watcher B');
+  const secondWatcher = watcherRecords[watcherRecords.length - 1];
+  const observedPath = path.join(TEST_HOME, 'Desktop', 'single-watch-event.ai');
+  fs.writeFileSync(observedPath, 'synthetic illustrator source');
+
+  await firstWatcher.handlers.add(observedPath);
+  let firstFresh = await getProject(first.id);
+  let secondFresh = await getProject(second.id);
+  assert.equal(firstFresh.status, 'paused');
+  assert.equal(secondFresh.status, 'watching');
+  assert.equal(firstFresh.files.some(file => file.path === observedPath), false);
+  assert.equal(firstFresh.pendingFiles.some(file => file.path === observedPath), false);
+
+  await secondWatcher.handlers.add(observedPath);
+  secondFresh = await getProject(second.id);
+  firstFresh = await getProject(first.id);
+  assert.equal(secondFresh.files.some(file => file.path === observedPath), true);
+
+  const secondObservation = secondFresh.provenance.observations.find(observation => (
+    observation.observer &&
+    observation.observer.kind === OBSERVER_KINDS.CHOKIDAR &&
+    observation.observer.method === 'add'
+  ));
+  assert.ok(secondObservation);
+  assert.equal(Object.prototype.hasOwnProperty.call(firstFresh.provenance.nodes, secondObservation.objectNodeId), false);
+});
+
+test('one Illustrator observation stream is staged only for the active Watching project', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'B_Project.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'B_Asset.png');
+  fs.writeFileSync(sourcePath, 'synthetic illustrator source');
+  fs.writeFileSync(linkedPath, 'synthetic linked asset');
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      return { stdout: '123\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\tB_Project.ai\ttrue\ttrue`,
+          'PLACED\t1',
+          `LINK\t${sourcePath}\tB_Project.ai\t${linkedPath}\ttrue\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const first = await createProject('Illustrator attribution A');
+  const second = await createProject('Illustrator attribution B');
+  const secondFresh = await waitForProject(
+    second.id,
+    project => [sourcePath, linkedPath].every(filePath => (
+      project.pendingFiles.some(file => file.path === filePath)
+    )),
+    5000
+  );
+  const firstFresh = await getProject(first.id);
+
+  assert.equal(firstFresh.status, 'paused');
+  assert.equal(secondFresh.status, 'watching');
+  assert.equal(firstFresh.files.some(file => [sourcePath, linkedPath].includes(file.path)), false);
+  assert.equal(firstFresh.pendingFiles.some(file => [sourcePath, linkedPath].includes(file.path)), false);
+
+  const secondEvidenceKeys = Object.keys(secondFresh.liveEvidenceLedger.candidates || {});
+  const firstEvidenceKeys = new Set(Object.keys((firstFresh.liveEvidenceLedger && firstFresh.liveEvidenceLedger.candidates) || {}));
+  assert.equal(secondEvidenceKeys.length, 2);
+  assert.equal(secondEvidenceKeys.some(key => firstEvidenceKeys.has(key)), false);
+});
+
 test('Illustrator live app evidence stages open source and linked asset as needs-save candidates', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
@@ -7132,6 +7260,63 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
     assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async () => {
+  const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile;
+  let releaseRead = () => {};
+  try {
+    const first = await createProject('Delayed PSD Activation A');
+    const firstWatcher = latestWatcherHandlers();
+    const psdPath = path.join(tmpRoot, 'delayed-source.psd');
+    const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    await setProjectFiles(first.id, {
+      files: [{
+        path: psdPath,
+        name: 'delayed-source.psd',
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: linkedPath } }],
+      linkedFiles: [],
+    };
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(psdPath)) {
+        markReadStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    await firstWatcher.change(psdPath);
+    await readStarted;
+    const second = await createProject('Delayed PSD Activation B');
+    await callIpc('projects:start-watching', first.id);
+    releaseRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+    const firstFresh = await getProject(first.id);
+    const secondFresh = await getProject(second.id);
+    assert.equal(firstFresh.status, 'watching');
+    assert.equal(secondFresh.status, 'paused');
+    assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
