@@ -1250,6 +1250,59 @@ test('deleting a project during an in-flight Figma download removes the late cac
   assert.equal((await callIpc('projects:get-all')).some(item => item.id === project.id), false);
 });
 
+test('a delayed Figma download from an old A activation cannot mutate or cache after A to B to A', async () => {
+  const first = await createLinkedFigmaProject('Delayed Figma Activation A');
+  const cacheDir = projectCacheDir('figma-assets', first.id);
+  const cacheEntriesBefore = fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [];
+  const downloadGate = setGatedFigmaDownloadResponse('stale activation figma cache');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/stale-activation.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'node-stale-activation',
+    imageRef: 'img-stale-activation',
+    name: 'Stale Activation Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+  }]);
+
+  const staleScan = callIpc('figma:scan-project', first.id);
+  await downloadGate.started;
+
+  storedFigmaToken = null;
+  const second = await callIpc('projects:create', 'Delayed Figma Activation B');
+  await callIpc('projects:start-watching', first.id);
+  downloadGate.release();
+  await staleScan;
+  await new Promise(resolve => originalSetTimeout(resolve, 30));
+
+  const projects = await callIpc('projects:get-all');
+  const firstFresh = projects.find(project => project.id === first.id);
+  const secondFresh = projects.find(project => project.id === second.id);
+  assert.equal(firstFresh.status, 'watching');
+  assert.equal(secondFresh.status, 'paused');
+  assert.equal(firstFresh.files.some(file => file.source === 'figma-auto'), false);
+  assert.equal(secondFresh.files.some(file => file.source === 'figma-auto'), false);
+  assert.equal(
+    getProvenanceNodes(firstFresh, NODE_TYPES.FILE)
+      .some(node => node.name === 'Brand_Cloud_Stale_Activation_Asset.png'),
+    false
+  );
+  assert.deepEqual(
+    fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [],
+    cacheEntriesBefore
+  );
+});
+
 test('delete-all during an in-flight Figma download removes the late cache write', async () => {
   const project = await createLinkedFigmaProject('Delete all in-flight Figma cache');
   const downloadGate = setGatedFigmaDownloadResponse('late delete-all figma cache');

@@ -4618,6 +4618,18 @@ function isActiveWatchingProject(projectId, activationToken = null) {
   return watchingProjects.length === 1 && watchingProjects[0].id === projectId;
 }
 
+function getActiveWatchingActivationToken(projectId) {
+  const activationToken = watchingActivationTokens.get(projectId);
+  if (activationToken === undefined || !isActiveWatchingProject(projectId, activationToken)) {
+    return null;
+  }
+  return activationToken;
+}
+
+function isBoundWatchingActivationCurrent(projectId, activationToken) {
+  return activationToken === null || isActiveWatchingProject(projectId, activationToken);
+}
+
 function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
   const projects = getProjects();
   const project = projects.find(item => item.id === projectId);
@@ -5950,7 +5962,14 @@ function sanitizeFigmaAssetFormat(format) {
  * Download a Figma asset from CDN URL to local disk.
  * @returns {Promise<string|null>} Local file path or null on failure
  */
-async function downloadFigmaAsset(url, fileName, projectId, format = 'png', assetBudget = null) {
+async function downloadFigmaAsset(
+  url,
+  fileName,
+  projectId,
+  format = 'png',
+  assetBudget = null,
+  activationToken = null
+) {
   try {
     const { response, buffer } = await fetchBufferWithLimits({
       fetchImpl: fetch,
@@ -5966,6 +5985,7 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png', asse
     if (!response.ok) return null;
 
     if (buffer.length === 0) return null;
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
 
     const projectDir = ensureFigmaProjectAssetsDir(projectId);
 
@@ -5979,6 +5999,7 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png', asse
     if (existingStat) {
       const existingSize = existingStat.size;
       if (existingSize === buffer.length) {
+        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
         if (!hardenOwnerOnlyCacheFileSync(
           localPath,
           projectDir,
@@ -5991,6 +6012,7 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png', asse
       }
     }
 
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
     writeOwnerOnlyCacheFileSync(localPath, buffer, projectDir, FIGMA_ASSET_FILE_MODE, { replace: !!existingStat });
     console.log(`[crate][figma] downloaded asset: ${formatFigmaLocalNameForLog(localPath)}`);
     return localPath;
@@ -6004,8 +6026,15 @@ async function downloadFigmaAsset(url, fileName, projectId, format = 'png', asse
  * Download Figma scan assets and insert them into project state.
  * @returns {Promise<number>} count of inserted assets
  */
-async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextLabel = 'scan') {
+async function ingestFigmaAssetsIntoProject(
+  projectId,
+  project,
+  assets,
+  contextLabel = 'scan',
+  activationToken = null
+) {
   if (!assets || assets.length === 0) return 0;
+  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return 0;
 
   const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
   const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
@@ -6016,6 +6045,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
   let addedCount = 0;
 
   for (const asset of assets) {
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
     const figmaFileKey = typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
       ? asset.figmaFileKey.trim()
       : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null);
@@ -6037,8 +6067,16 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
 
     const fileName = `${asset.figmaFileName}_${asset.name}`;
     const assetFormat = sanitizeFigmaAssetFormat(asset.format);
-    const localPath = await downloadFigmaAsset(asset.url, fileName, projectId, assetFormat, assetBudget);
+    const localPath = await downloadFigmaAsset(
+      asset.url,
+      fileName,
+      projectId,
+      assetFormat,
+      assetBudget,
+      activationToken
+    );
 
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
     if (!localPath) {
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
@@ -6061,6 +6099,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     }
 
     const result = mutateProject(projectId, (proj) => {
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
       const projectPaths = new Set(proj.files.map(f => normalizeTrackedFilePath(f.path)));
       if (projectPaths.has(normalizedLocalPath)) return null;
       if (figmaAssetKey) {
@@ -6093,6 +6132,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
     });
 
     if (result) {
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
       const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
       const projectHasFigmaKey = figmaAssetKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetKey);
       if (!projectHasLocalPath && !projectHasFigmaKey) {
@@ -6100,6 +6140,7 @@ async function ingestFigmaAssetsIntoProject(projectId, project, assets, contextL
         project.files = deduplicateFiles(project.files);
       }
       mutateProject(projectId, (proj) => {
+        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
         const storedFile = (proj.files || []).find(file => (
           normalizeTrackedFilePath(file.path) === normalizedLocalPath &&
           (!figmaAssetKey || getFigmaAssetDedupKey(file) === figmaAssetKey)
@@ -6301,7 +6342,16 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       ...asset,
       figmaScopeMode: getProjectFigmaScopeMode(latestProject)
     }));
-    const addedCount = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'poll');
+    const addedCount = await ingestFigmaAssetsIntoProject(
+      projectId,
+      project,
+      scopedAssets,
+      'poll',
+      activationToken
+    );
+    if (!isActiveWatchingProject(projectId, activationToken)) {
+      return { skipped: true, reason: 'watch-session-superseded' };
+    }
 
     if (addedCount > 0) {
       // Update activity timestamp
@@ -6347,6 +6397,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       candidateDiagnostics
     };
   } catch (e) {
+    if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) {
+      return { skipped: true, reason: 'watch-session-superseded' };
+    }
     const safeError = sanitizeFigmaRendererIssue(e);
     console.error('[crate][figma] pollFigmaForProject error:', safeError);
     sendToRenderer('figma:scan-error', { projectId, error: safeError });
@@ -6359,7 +6412,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
     }
     return { projectId, error: safeError };
   } finally {
-    figmaInProgress.delete(projectId);
+    if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) {
+      figmaInProgress.delete(projectId);
+    }
     scheduleDeletedProjectCacheCleanup(projectId);
   }
 }
@@ -6383,7 +6438,9 @@ async function startFigmaPolling(projectId, activationToken = null) {
     // Run initial scan immediately
     initialResult = await pollFigmaForProject(projectId, true, activationToken);
   } finally {
-    figmaPollerStarting.delete(projectId);
+    if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) {
+      figmaPollerStarting.delete(projectId);
+    }
   }
 
   if (initialResult && initialResult.reason === 'not-connected') {
@@ -8547,26 +8604,33 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
  * For embedded smart objects: marks as embedded (source: 'scan-on-save-embedded', embedded: true).
  * Never breaks the session — all errors caught silently.
  */
-function scheduleScanOnSave(projectId, psdFilePath) {
+function scheduleScanOnSave(projectId, psdFilePath, activationToken = null) {
+  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
   const key = `${projectId}:${psdFilePath}`;
   if (scanOnSaveTimers.has(key)) {
     clearTimeout(scanOnSaveTimers.get(key));
   }
-  scanOnSaveTimers.set(key, setTimeout(() => {
-    scanOnSaveTimers.delete(key);
-    runScanOnSave(projectId, psdFilePath).catch(() => {});
-  }, 2000));
+  const timerId = setTimeout(() => {
+    if (scanOnSaveTimers.get(key) === timerId) {
+      scanOnSaveTimers.delete(key);
+    }
+    runScanOnSave(projectId, psdFilePath, activationToken).catch(() => {});
+  }, 2000);
+  scanOnSaveTimers.set(key, timerId);
 }
 
-async function runScanOnSave(projectId, psdFilePath) {
+async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
   try {
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, psdFilePath)) return;
 
     const stat = await fs.promises.stat(psdFilePath);
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     if (stat.size > MAX_PARSE_FILE_SIZE) return;
 
     const buf = await fs.promises.readFile(psdFilePath);
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
 
     const newEntries = [];
@@ -8614,9 +8678,10 @@ async function runScanOnSave(projectId, psdFilePath) {
     }
 
     if (newEntries.length === 0) return;
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (proj.status !== 'watching') return null;
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
       let changed = false;
 
       for (const entry of newEntries) {
@@ -8638,6 +8703,7 @@ async function runScanOnSave(projectId, psdFilePath) {
     });
 
     if (result) {
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendToRenderer('files:updated', { projectId, files: result.files });
@@ -8654,19 +8720,24 @@ async function runScanOnSave(projectId, psdFilePath) {
  * When a presentation is saved (Cmd+S), extract embedded media immediately
  * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
  */
-function scheduleScanOnSavePresentation(projectId, filePath) {
+function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null) {
+  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
   const key = `${projectId}:${filePath}`;
   if (scanOnSavePresentationTimers.has(key)) {
     clearTimeout(scanOnSavePresentationTimers.get(key));
   }
-  scanOnSavePresentationTimers.set(key, setTimeout(() => {
-    scanOnSavePresentationTimers.delete(key);
-    runScanOnSavePresentation(projectId, filePath).catch(() => {});
-  }, 2000));
+  const timerId = setTimeout(() => {
+    if (scanOnSavePresentationTimers.get(key) === timerId) {
+      scanOnSavePresentationTimers.delete(key);
+    }
+    runScanOnSavePresentation(projectId, filePath, activationToken).catch(() => {});
+  }, 2000);
+  scanOnSavePresentationTimers.set(key, timerId);
 }
 
-async function runScanOnSavePresentation(projectId, presentationPath) {
+async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null) {
   try {
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     const ext = path.extname(presentationPath).toLowerCase();
     const base = path.basename(presentationPath, ext);
     const currentProject = getProjects().find(p => p.id === projectId);
@@ -8678,7 +8749,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     // Build dedup sets from existing project files
     const currentProjects = getProjects();
     const project = currentProjects.find(p => p.id === projectId);
-    if (!project || project.status !== 'watching') return;
+    if (!project || !isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     const projectFiles = project.files || [];
 
     // Name-based dedup for .key files. Do not add prior scan-on-save media to
@@ -8759,6 +8830,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', presentationPath], {
       timeout: 10000, encoding: 'utf8'
     });
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
 
     const newEntries = [];
 
@@ -8803,10 +8875,12 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
       }
 
       try {
+        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
         const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
           timeout: 10000, maxBuffer: 50 * 1024 * 1024,
           encoding: 'buffer'
         });
+        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
         let extractedFingerprint = null;
 
         // Content-based dedup for presentation media.
@@ -8856,6 +8930,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
         }
         if (!destPath) continue;
 
+        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
         writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
@@ -8874,9 +8949,10 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     }
 
     if (newEntries.length === 0) return;
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (proj.status !== 'watching') return null;
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
       let changed = false;
 
       for (const entry of newEntries) {
@@ -8903,6 +8979,7 @@ async function runScanOnSavePresentation(projectId, presentationPath) {
     });
 
     if (result) {
+      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendToRenderer('files:updated', { projectId, files: result.files });
@@ -9638,12 +9715,12 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 
       // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
       if (sourceIsAccepted && ext === '.psd') {
-        scheduleScanOnSave(projectId, filePath);
+        scheduleScanOnSave(projectId, filePath, activationToken);
       }
 
       // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
       if (sourceIsAccepted && (ext === '.pptx' || ext === '.ppt' || ext === '.key')) {
-        scheduleScanOnSavePresentation(projectId, filePath);
+        scheduleScanOnSavePresentation(projectId, filePath, activationToken);
       }
     }
 
@@ -9863,7 +9940,8 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
 
   if (updated && updated.status === 'watching') {
     if (projectHasFigmaTrackedFiles(updated)) {
-      startFigmaPolling(projectId);
+      const activationToken = getActiveWatchingActivationToken(projectId);
+      if (activationToken !== null) startFigmaPolling(projectId, activationToken);
     } else {
       stopFigmaPolling(projectId);
     }
@@ -11556,7 +11634,8 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
   const projects = getProjects();
   for (const project of projects) {
     if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
-      startFigmaPolling(project.id);
+      const activationToken = getActiveWatchingActivationToken(project.id);
+      if (activationToken !== null) startFigmaPolling(project.id, activationToken);
     }
   }
 
@@ -11584,6 +11663,7 @@ registerTrustedIpcHandler('figma:disconnect', async () => {
 
 // Trigger a manual Figma scan for a specific project
 registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
+  const activationToken = getActiveWatchingActivationToken(projectId);
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
   const token = await parser.getStoredToken();
@@ -11596,9 +11676,12 @@ registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
   if (!project) {
     return { success: false, error: 'Project not found' };
   }
+  if (activationToken === null) {
+    return { success: false, error: 'Project is not watching' };
+  }
 
   try {
-    await pollFigmaForProject(projectId, true);
+    await pollFigmaForProject(projectId, true, activationToken);
     return { success: true };
   } catch (e) {
     return { success: false, error: sanitizeFigmaRendererIssue(e) };
@@ -11634,14 +11717,21 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
     return { triggered: 0, skipped: 0, totalAddedCount: 0 };
   }
 
-  const scannableProjects = projects.filter(project => !figmaManualScanInFlight.has(project.id));
+  const scannableProjects = projects
+    .map(project => ({
+      project,
+      activationToken: getActiveWatchingActivationToken(project.id),
+    }))
+    .filter(({ project, activationToken }) => (
+      activationToken !== null && !figmaManualScanInFlight.has(project.id)
+    ));
   const skipped = projects.length - scannableProjects.length;
 
   if (scannableProjects.length === 0) {
     return { triggered: 0, skipped, totalAddedCount: 0, inFlight: true };
   }
 
-  scannableProjects.forEach(project => {
+  scannableProjects.forEach(({ project }) => {
     figmaManualScanInFlight.add(project.id);
     sendToRenderer('figma:scan-started', {
       projectId: project.id,
@@ -11651,11 +11741,13 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
   });
 
   const scanResults = await Promise.all(
-    scannableProjects.map(async (project) => {
+    scannableProjects.map(async ({ project, activationToken }) => {
       try {
-        return await pollFigmaForProject(project.id, false);
+        return await pollFigmaForProject(project.id, false, activationToken);
       } finally {
-        figmaManualScanInFlight.delete(project.id);
+        if (watchingActivationTokens.get(project.id) === activationToken) {
+          figmaManualScanInFlight.delete(project.id);
+        }
       }
     })
   );

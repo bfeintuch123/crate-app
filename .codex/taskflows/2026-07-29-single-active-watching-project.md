@@ -10,7 +10,7 @@
 - branch: `fix/single-active-watching-project`
 - base: `982d8de2a7dee5ffff6411d13d4ce0dcc2f49a0a`
 - mode: fix-and-PR
-- status: ready-for-pr
+- status: review-corrections-validated
 
 ## Goal
 
@@ -35,9 +35,9 @@ Forbidden:
 
 ## State
 
-- current phase: PR publication
-- last completed checkpoint: full serial test suite passed 444/444 runnable tests
-- next action: commit, push, and open a PR against `v2.4.x`
+- current phase: PR correction publication
+- last completed checkpoint: delayed Figma, PSD, and presentation work is activation-bound and the full serial suite passed
+- next action: commit and push the corrections, wait for CI, then resolve only the fixed PR review thread
 - blocker: none
 - approval state: Bryant approved implementation, commit, push, and PR; merge and release are forbidden
 - preferences applied: one builder, narrow diff, no release activity
@@ -53,6 +53,7 @@ Forbidden:
 - [x] verification
 - [x] proof bundle
 - [x] ledger/state update
+- [x] review corrections
 - [ ] handoff
 
 ## Evidence
@@ -70,6 +71,15 @@ Forbidden:
 | 2026-07-29 | Full serial suite | `node --test --test-concurrency=1 tests/*.test.js` | 444 passed, 0 failed, 1 CI-only test skipped |
 | 2026-07-29 | Autoreview and risk lanes | diff scope, regression, security, provenance, and runner-loop review | no unresolved finding; package/parser/Figma/pending behavior preserved |
 | 2026-07-29 | Diff hygiene | syntax checks and `git diff --check` | passed; no dependency or release-file diff |
+| 2026-07-29 | PR #166 review correction scope | unresolved GitHub P1 plus independent P2 review | delayed live Figma download/cache and PSD/presentation scan-on-save work must remain bound to the originating activation |
+| 2026-07-29 | Implemented delayed-work guards | `main.js` activation token propagation through live Figma, PSD, and presentation paths | stale A work is rejected before cache, project, provenance, activity, and renderer mutation after A -> B -> A |
+| 2026-07-29 | Added deterministic regressions | focused Figma and provenance suites | delayed Figma download, PSD read, and presentation extraction cases assert no stale cache or state mutation |
+| 2026-07-29 | Focused correction regressions | `node --test --test-concurrency=1 --test-name-pattern='delayed (Figma|presentation|PSD)' tests/figma-link-per-project.test.js tests/provenance-dual-write.test.js` | 3 passed, 0 failed |
+| 2026-07-29 | Complete corrected Figma and provenance suites | `node --test --test-concurrency=1 tests/figma-link-per-project.test.js tests/provenance-dual-write.test.js` | 183 passed, 0 failed |
+| 2026-07-29 | Remaining focused behavior suites | serial main-window, provenance, PSD, Figma scope/privacy, renderer, admission, and Quick Package tests | 113 passed, 0 failed |
+| 2026-07-29 | Full serial suite after review corrections | `node --test --test-concurrency=1 tests/*.test.js` | 447 passed, 0 failed, 1 expected CI-only skip |
+| 2026-07-29 | Dependency audit | production and full dependency audits at high severity | 0 vulnerabilities |
+| 2026-07-29 | Final Autoreview and risk lanes | full diff, async ownership, regression, security, provenance, runner, and diff-hygiene review | no unresolved source finding; no package, dependency, parser, renderer, release, site, credential, schema, or write-root drift |
 
 ## Risks
 

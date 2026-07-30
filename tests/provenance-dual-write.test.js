@@ -1147,6 +1147,58 @@ test('deleting a project during presentation extraction leaves no late project c
   }
 });
 
+test('a delayed presentation scan from an old A activation cannot cache or mutate after A to B to A', async () => {
+  const tmpRoot = makeTempDir();
+  let releaseRead = () => {};
+  try {
+    resetPresentationCacheRoot();
+    const first = await createProject('Delayed Presentation Activation A');
+    const firstWatcher = latestWatcherHandlers();
+    const pptxPath = path.join(tmpRoot, 'Delayed-Activation.pptx');
+    fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
+    await setProjectFiles(first.id, {
+      files: [{
+        path: pptxPath,
+        name: 'Delayed-Activation.pptx',
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpeg',
+      data: Buffer.from('STALE_PRESENTATION_MEDIA'.repeat(40)),
+    }], {
+      readGate,
+      onReadStart: markReadStarted,
+    });
+
+    await firstWatcher.change(pptxPath);
+    await readStarted;
+    const second = await createProject('Delayed Presentation Activation B');
+    await callIpc('projects:start-watching', first.id);
+    releaseRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+    const firstFresh = await getProject(first.id);
+    const secondFresh = await getProject(second.id);
+    assert.equal(firstFresh.status, 'watching');
+    assert.equal(secondFresh.status, 'paused');
+    assert.equal(firstFresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.equal(secondFresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 0);
+    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
+    const cacheDir = presentationCachePaths(first.id).projectDir;
+    assert.equal(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).length : 0, 0);
+  } finally {
+    releaseRead();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('delete-all during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
   let releaseRead = () => {};
@@ -7208,6 +7260,63 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
     assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async () => {
+  const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile;
+  let releaseRead = () => {};
+  try {
+    const first = await createProject('Delayed PSD Activation A');
+    const firstWatcher = latestWatcherHandlers();
+    const psdPath = path.join(tmpRoot, 'delayed-source.psd');
+    const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    fs.writeFileSync(linkedPath, 'linked bytes');
+    await setProjectFiles(first.id, {
+      files: [{
+        path: psdPath,
+        name: 'delayed-source.psd',
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: linkedPath } }],
+      linkedFiles: [],
+    };
+
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    let markReadStarted;
+    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+    fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(psdPath)) {
+        markReadStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    await firstWatcher.change(psdPath);
+    await readStarted;
+    const second = await createProject('Delayed PSD Activation B');
+    await callIpc('projects:start-watching', first.id);
+    releaseRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+    const firstFresh = await getProject(first.id);
+    const secondFresh = await getProject(second.id);
+    assert.equal(firstFresh.status, 'watching');
+    assert.equal(secondFresh.status, 'paused');
+    assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
