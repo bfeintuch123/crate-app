@@ -6203,7 +6203,7 @@ for (const rowKind of ['DOC', 'LINK']) {
   }
 }
 
-test('Illustrator guarded path fallback fails closed when file object query fails', async () => {
+test('Illustrator guarded path fallback stages complete linked evidence when file object query fails', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'path-fallback-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa21-live-only-IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
@@ -6222,6 +6222,7 @@ test('Illustrator guarded path fallback fails closed when file object query fail
         stdout: [
           `DOC\t${sourcePath}\tpath-fallback-illustrator.ai\ttrue\ttrue`,
           'STATUS\tillustrator-placed-item-file-query-failed',
+          'STATUS\tillustrator-placed-item-file-of-query-failed',
           'STATUS\tillustrator-placed-item-path-fallback-used',
           `LINK\t${sourcePath}\tpath-fallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
           'COMPLETE\t1\t1',
@@ -6232,25 +6233,28 @@ test('Illustrator guarded path fallback fails closed when file object query fail
   });
 
   const project = await createProject('Illustrator placed path fallback');
-  const fresh = await waitForProject(project.id, item => getLiveAppStatusEntries(item, 'illustrator')
-    .some(entry => entry.scriptAttempted === true && entry.scriptSuccess === false), 5000);
+  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
   assert.deepEqual(fresh.files, []);
-  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(fresh.pendingFiles.some(file => file.path === sourcePath && file.source === 'app-opened'), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath && file.source === 'ai-linked'), true);
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
+  assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+    .filter(entry => entry.strongestState === 'needs-save').length, 2);
 
   const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => (
     entry.scriptAttempted === true &&
-    entry.scriptSuccess === false &&
+    entry.scriptSuccess === true &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
     entry.placedItemsCount === 1 &&
-    entry.errorCategory === 'illustrator-placed-item-file-query-failed' &&
+    entry.errorCategory === 'script-success' &&
     entry.statusReasonCounts &&
     entry.statusReasonCounts['illustrator-placed-item-file-query-failed'] === 1 &&
+    entry.statusReasonCounts['illustrator-placed-item-file-of-query-failed'] === 1 &&
     entry.statusReasonCounts['illustrator-placed-item-path-fallback-used'] === 1
   )));
-  assert.equal(statusEntries.some(entry => entry.stagedCount > 0), false);
+  assert.equal(statusEntries.some(entry => entry.stagedCount === 2), true);
 
   assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
     sourcePath,
@@ -6264,8 +6268,6 @@ test('Illustrator guarded path fallback fails closed when file object query fail
     'raw',
   ], 'Illustrator path fallback status breadcrumbs');
   assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
-    sourcePath,
-    linkedPath,
     'DOC\t',
     'LINK\t',
     'file path of pItem',
@@ -6274,6 +6276,18 @@ test('Illustrator guarded path fallback fails closed when file object query fail
     'stderr',
     'raw',
   ], 'Illustrator path fallback live evidence ledger');
+});
+
+test('Illustrator mixed direct and JavaScript fallback statuses remain fail closed', async () => {
+  await assertIllustratorSnapshotOutputFailsClosed('mixed-path-and-javascript-fallback', (sourcePath, linkedPath) => [
+    `DOC\t${sourcePath}\tmixed-path-and-javascript-fallback.ai\ttrue\ttrue`,
+    'STATUS\tillustrator-placed-item-file-query-failed',
+    'STATUS\tillustrator-placed-item-file-of-query-failed',
+    'STATUS\tillustrator-placed-item-path-fallback-used',
+    'STATUS\tillustrator-placed-item-file-fallback-used',
+    `LINK\t${sourcePath}\tmixed-path-and-javascript-fallback.ai\t${linkedPath}\ttrue\ttrue`,
+    'COMPLETE\t1\t1',
+  ].join('\n') + '\n');
 });
 
 test('Illustrator path text coercion fallback fails closed when object reads fail', async () => {
