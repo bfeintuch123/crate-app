@@ -4428,10 +4428,10 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     });
 
     const result = await callIpc('projects:accept-pending', project.id, sourcePath);
-    assert.equal(result.files.length, 1);
-    assert.equal(result.files[0].path, sourcePath);
-    assert.equal(result.files[0].acceptedPending, true);
-    assert.equal(Object.prototype.hasOwnProperty.call(result.files[0], 'captureState'), false);
+    assert.equal(result.files.length, 2);
+    const acceptedSource = result.files.find(file => file.path === sourcePath);
+    assert.equal(acceptedSource.acceptedPending, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(acceptedSource, 'captureState'), false);
 
     const fresh = await waitForProject(
       project.id,
@@ -9243,7 +9243,10 @@ test('initial snapshot does not parse linked assets from stale pending source fi
     assert.deepEqual(fresh.pendingFiles, []);
     assert.equal(fresh.files.some(file => file.path === linkedPath), false);
     assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
+    const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+    assert.equal(Object.values((storedProject.liveEvidenceLedger && storedProject.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
     assert.equal(observations.length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
@@ -9520,13 +9523,19 @@ test('pre-package app-script parser and regex recovered additions record session
     });
 
     setChildProcessHandler(({ kind, command, args, commandText }) => {
-      if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-        return { stdout: '/Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+      if (isIllustratorPgrepCheck({ kind, command, args })) {
+        return { stdout: '777\n' };
       }
-      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-scan.applescript')) {
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         assertPrivateTempScriptPath(args[0]);
         assert.equal(commandText.includes('tell application'), false);
-        return { stdout: `${scriptLinkedPath}\n` };
+        return {
+          stdout: [
+            `DOC\t${aiPath}\tlayout.ai\ttrue\tfalse`,
+            `LINK\t${aiPath}\tlayout.ai\t${scriptLinkedPath}\ttrue\tfalse`,
+            'COMPLETE\t1\t1',
+          ].join('\n') + '\n',
+        };
       }
       return { stdout: '' };
     });

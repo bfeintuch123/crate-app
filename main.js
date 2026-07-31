@@ -7183,6 +7183,30 @@ function admitIllustratorSourcesForProject(projectId, filePaths) {
   if (revised && revised.status === 'ready') pollPsForProject(projectId, activationToken);
   return revised;
 }
+function admitIllustratorRelationshipPathsForProject(projectId, sourcePath, linkedPaths) {
+  const activationToken = getActiveWatchingActivationToken(projectId);
+  const scope = getIllustratorActivationScope(projectId, activationToken);
+  const project = getFreshActiveWatchingProject(projectId, activationToken);
+  const normalizedSourcePath = normalizeTrackedFilePath(sourcePath);
+  if (!scope || !project || !normalizedSourcePath) return scope;
+  const sourceAccepted = (project.files || []).some(file => (
+    normalizeTrackedFilePath(file && file.path) === normalizedSourcePath &&
+    (
+      isAcceptedIllustratorProjectFile(project, file) ||
+      (ILLUSTRATOR_SOURCE_EXTENSIONS.has((file.ext || path.extname(file.path || '')).toLowerCase()) &&
+        isAcceptedPendingCapturedFile(project, file))
+    )
+  ));
+  if (!scope.admittedDocumentPaths.has(normalizedSourcePath) && !sourceAccepted) return scope;
+  return reviseIllustratorActivationScope(projectId, scope, next => {
+    next.admittedDocumentPaths.add(normalizedSourcePath);
+    next.baselineDocumentPaths.delete(normalizedSourcePath);
+    for (const linkedPath of (linkedPaths || []).map(normalizeTrackedFilePath).filter(Boolean)) {
+      next.allowedLinkedPaths.add(linkedPath);
+      next.excludedLinkedPaths.delete(linkedPath);
+    }
+  });
+}
 function createLinkedAssetLiveEvidenceRecord({
   projectId,
   filePath,
@@ -8500,8 +8524,8 @@ async function extractLinkedAssetsPxd(filePath) {
  * Run scan-on-open for a design file: extract linked assets and merge into project.
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
-async function runScanOnOpen(projectId, filePath, activationToken = null, operationGuard = null) {
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
+async function runScanOnOpen(projectId, filePath, activationToken = null, operation = null) {
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operation || operation.current());
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
   const currentProject = getProjects().find(p => p.id === projectId);
@@ -8533,6 +8557,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
 
   console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
+
+  const revisedScope = admitIllustratorRelationshipPathsForProject(projectId, filePath, validPaths);
+  if (operation && revisedScope && !operation.adoptScope(revisedScope)) return;
+  if (!isCurrent()) return;
 
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching' || !isCurrent()) return null;
@@ -10057,7 +10085,7 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
     sendProjectFileStateToRenderer(projectId, operation.activationToken);
 
     if (acceptedSourceForScan && SCAN_ON_OPEN_EXTENSIONS.has((acceptedSourceForScan.ext || path.extname(acceptedSourceForScan.path || '')).toLowerCase())) {
-      await runScanOnOpen(projectId, acceptedSourceForScan.path, operation.activationToken, operation.current);
+      await runScanOnOpen(projectId, acceptedSourceForScan.path, operation.activationToken, operation);
       if (!operation.current()) return null;
     }
 
