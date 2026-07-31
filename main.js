@@ -30,7 +30,6 @@ const {
   sanitizePackageFileName,
   ensureSafePackageDirectory,
   resolveUniquePackagePath: resolveSafeUniquePackagePath,
-  copyFileIntoPackage,
   assertSafeCopySource,
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
@@ -1770,6 +1769,7 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
 }
 
 function stageLiveObservedFile(project, fileEntry, observation = {}) {
+  observation = { ...observation, appFamily: getLiveCaptureAppFamily(fileEntry, observation) || 'generic' }; if (!isIllustratorScopedFileAllowed(project, fileEntry, observation)) return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, changed: false, file: fileEntry, reason: 'illustrator-activation-scope', captureReason: 'illustrator-activation-scope', captureState: LIVE_CAPTURE_STATES.IGNORED, normalizedPath: normalizeTrackedFilePath(fileEntry && fileEntry.path) };
   const classification = classifyLiveObservedFile(project, fileEntry, observation);
   const normalizedPath = classification.normalizedPath;
   recordLiveEvidence(project, fileEntry, classification);
@@ -2830,7 +2830,7 @@ function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
 }
 
 async function selectProjectFilesForPackaging(project) {
-  const dedupedFiles = deduplicateFiles(project.files || []);
+  const dedupedFiles = deduplicateFiles(getIllustratorScopedProjectView(project).files || []);
   const packageFiles = [];
 
   for (const file of dedupedFiles) {
@@ -4196,10 +4196,10 @@ function upsertPackagePresentationResourceNode(provenance, resource = {}) {
   return resourceNodeId;
 }
 
-function recordPackageProvenance(projectId, packageInfo, events = []) {
+function recordPackageProvenance(projectId, packageInfo, events = [], targetProject = null) {
   try {
     if (!Array.isArray(events) || events.length === 0) return;
-    mutateProject(projectId, (project) => {
+    const apply = project => {
       const provenance = ensureProjectProvenance(project);
       if (!provenance) return null;
       const packageNodeId = upsertPackageNode(provenance, project, packageInfo);
@@ -4227,12 +4227,7 @@ function recordPackageProvenance(projectId, packageInfo, events = []) {
             : (event.file && (event.file.fileId || event.file.path || event.file.name))
         );
         const edgeId = createEdgeId(relationType, packageNodeId, objectNodeId, dedupeKey);
-        const payload = {
-          outputPath: event.outputPath || null,
-          source: event.resource && event.resource.source
-            ? event.resource.source
-            : (event.file && event.file.source ? event.file.source : null),
-        };
+        const eventSource = event.resource?.source || event.file?.source || null, payload = { outputPath: event.outputPath || null, source: eventSource, appFamily: event.file ? getScopedFileAppFamily(project, event.file) : getScopedRecordAppFamily(eventSource) };
         if (event.resource && event.resource.internalPath) {
           payload.internalPath = event.resource.internalPath;
         }
@@ -4251,7 +4246,7 @@ function recordPackageProvenance(projectId, packageInfo, events = []) {
         };
       }
       return null;
-    });
+    }; targetProject ? apply(targetProject) : mutateProject(projectId, apply);
   } catch (e) {
     console.warn('[crate][provenance] package provenance skipped:', e.message);
   }
@@ -4464,10 +4459,10 @@ function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
   };
 }
 
-function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {
+function isDiagnosticManifestDestinationSafe(destFolder) { const directoryPath = path.join(destFolder, DIAGNOSTICS_FOLDER_NAME), filePath = path.join(directoryPath, PROVENANCE_MANIFEST_FILENAME), lstat = target => { try { return fs.lstatSync(target); } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } }, directory = lstat(directoryPath); if (directory && (directory.isSymbolicLink() || !directory.isDirectory())) return false; const file = directory && lstat(filePath); return !file || (!file.isSymbolicLink() && file.isFile()); } function writePackageProvenanceManifest(projectId, packageInfo, packageResult, targetProject = null, fatal = false) { let writeStarted = false;
   try {
-    const project = getProjects().find(p => p.id === projectId) || null;
-    const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
+    if (!isDiagnosticManifestDestinationSafe(packageInfo.destFolder)) throw new Error('Unsafe diagnostic manifest destination'); const project = targetProject || getProjects().find(p => p.id === projectId) || null;
+    const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult); writeStarted = true;
     writeFileIntoPackageExact(
       packageInfo.destFolder,
       path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME),
@@ -4479,6 +4474,7 @@ function writePackageProvenanceManifest(projectId, packageInfo, packageResult) {
       }
     );
   } catch (e) {
+    if (fatal && writeStarted) throw Object.assign(new Error('diagnostic_manifest_write_failed'), { code: 'diagnostic_manifest_write_failed' });
     const message = e && typeof e.message === 'string' ? e.message : '';
     const safeMessage = /^(Invalid package output folder|Package output |Package destination )/.test(message)
       ? message
@@ -4535,6 +4531,7 @@ const watchers = new Map(); // projectId -> chokidar watcher
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
 const watchingActivationTokens = new Map(); // projectId -> current watch-session token
+const illustratorActivationScopes = new Map(); // projectId -> transient Illustrator activation scope
 let watchingActivationSequence = 0;
 
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
@@ -4561,11 +4558,9 @@ function isPackageAutoForegroundSuppressed() {
   return Date.now() < packageForegroundSuppressionUntil;
 }
 
-function sendToRenderer(channel, data) {
-  if (trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send(channel, data);
-  }
-}
+function sendToRenderer(channel, data) { if (trayWindow && !trayWindow.isDestroyed()) trayWindow.webContents.send(channel, data); }
+
+function sendProjectFileStateToRenderer(projectId, activationToken = null) { const current = () => isBoundWatchingActivationCurrent(projectId, activationToken), project = current() && getProjects().find(item => item && item.id === projectId); if (!project || !current()) return; const { files = [], pendingFiles = [] } = getIllustratorScopedProjectView(project); sendToRenderer('files:updated', { projectId, files }); if (current()) sendToRenderer('files:pending', { projectId, pendingFiles }); }
 
 function projectWatchActivityTime(project) {
   for (const value of [project && project.watchStartedAt, project && project.createdAt]) {
@@ -4630,6 +4625,9 @@ function isBoundWatchingActivationCurrent(projectId, activationToken) {
   return activationToken === null || isActiveWatchingProject(projectId, activationToken);
 }
 
+function captureProjectOperation(projectId) { const project = getProjects().find(item => item && item.id === projectId); if (!project) return null; const status = project.status, generation = watchingActivationSequence, activationToken = status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; let scopeRevision = illustratorActivationScopes.get(projectId)?.revision, open = true; const baseCurrent = () => { const latest = getProjects().find(item => item && item.id === projectId), currentToken = latest?.status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken; }; return { activationToken, close() { open = false; }, current() { return baseCurrent() && (activationToken === null || illustratorActivationScopes.get(projectId)?.revision === scopeRevision); },
+    adoptScope(scope) { if (activationToken === null) return baseCurrent(); if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope || ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false; scopeRevision = scope.revision; return true; } }; }
+
 function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
   const projects = getProjects();
   const project = projects.find(item => item.id === projectId);
@@ -4658,6 +4656,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   const activationToken = ++watchingActivationSequence;
   watchingActivationTokens.clear();
   watchingActivationTokens.set(projectId, activationToken);
+  illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
 
   return {
     activationToken,
@@ -4816,7 +4815,7 @@ function pollLsofForProject(projectId, activationToken = null) {
   lsofInProgress.add(projectId);
 
   getRunningDesignAppPids(project.type, (pids, pidToCmd) => {
-    if (!isActiveWatchingProject(projectId, activationToken)) {
+    if (!getFreshActiveWatchingProject(projectId, activationToken)) {
       lsofInProgress.delete(projectId);
       return;
     }
@@ -4844,7 +4843,8 @@ function pollLsofForProject(projectId, activationToken = null) {
 
     exec(cmd, { timeout: 12000 }, (err, stdout) => {
       lsofInProgress.delete(projectId);
-      if (!stdout || !isActiveWatchingProject(projectId, activationToken)) return;
+      const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
+      if (!stdout || !latestProject) return;
 
       const parsedLines = stdout.trim().split('\n');
 
@@ -4874,6 +4874,9 @@ function pollLsofForProject(projectId, activationToken = null) {
         currentType = null;
 
         const ext = path.extname(filePath).toLowerCase();
+        const processIdentity = currentPid ? getDesignAppProcessIdentity(pidToCmd.get(currentPid) || '') : null;
+        if (!isIllustratorScopedFileAllowed(latestProject, buildAutoCaptureFileEntry(filePath, 'lsof', { ext }),
+          { appFamily: processIdentity && processIdentity.appFamily })) continue;
         if (SCAN_ON_OPEN_EXTENSIONS.has(ext) && currentPid) {
           if (!currentPollFiles.has(filePath)) currentPollFiles.set(filePath, new Set());
           currentPollFiles.get(filePath).add(currentPid);
@@ -5066,7 +5069,7 @@ function pollLsofForProject(projectId, activationToken = null) {
             reason: isPrimarySource ? 'opened-after-watch' : 'app-file-observed',
             captureReason: isPrimarySource ? 'opened-after-watch' : 'app-file-observed',
             captureState: isPrimarySource ? LIVE_CAPTURE_STATES.OBSERVED : LIVE_CAPTURE_STATES.PENDING,
-            appFamily: processIdentity && processIdentity.appFamily,
+            appFamily: processIdentity ? processIdentity.appFamily : 'generic',
           });
           if (!staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -5090,10 +5093,7 @@ function pollLsofForProject(projectId, activationToken = null) {
         return { changed, files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
-      if (result && result.changed && trayWindow && !trayWindow.isDestroyed()) {
-        trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-        trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
-      }
+      if (result && result.changed) sendProjectFileStateToRenderer(projectId, activationToken);
     });
   });
 }
@@ -5968,8 +5968,10 @@ async function downloadFigmaAsset(
   projectId,
   format = 'png',
   assetBudget = null,
-  activationToken = null
+  activationToken = null,
+  operationGuard = null
 ) {
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
   try {
     const { response, buffer } = await fetchBufferWithLimits({
       fetchImpl: fetch,
@@ -5985,7 +5987,7 @@ async function downloadFigmaAsset(
     if (!response.ok) return null;
 
     if (buffer.length === 0) return null;
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+    if (!isCurrent()) return null;
 
     const projectDir = ensureFigmaProjectAssetsDir(projectId);
 
@@ -5999,7 +6001,7 @@ async function downloadFigmaAsset(
     if (existingStat) {
       const existingSize = existingStat.size;
       if (existingSize === buffer.length) {
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+        if (!isCurrent()) return null;
         if (!hardenOwnerOnlyCacheFileSync(
           localPath,
           projectDir,
@@ -6012,7 +6014,7 @@ async function downloadFigmaAsset(
       }
     }
 
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+    if (!isCurrent()) return null;
     writeOwnerOnlyCacheFileSync(localPath, buffer, projectDir, FIGMA_ASSET_FILE_MODE, { replace: !!existingStat });
     console.log(`[crate][figma] downloaded asset: ${formatFigmaLocalNameForLog(localPath)}`);
     return localPath;
@@ -6031,10 +6033,12 @@ async function ingestFigmaAssetsIntoProject(
   project,
   assets,
   contextLabel = 'scan',
-  activationToken = null
+  activationToken = null,
+  operationGuard = null
 ) {
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
   if (!assets || assets.length === 0) return 0;
-  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return 0;
+  if (!isCurrent()) return 0;
 
   const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
   const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
@@ -6045,7 +6049,7 @@ async function ingestFigmaAssetsIntoProject(
   let addedCount = 0;
 
   for (const asset of assets) {
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
+    if (!isCurrent()) return addedCount;
     const figmaFileKey = typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
       ? asset.figmaFileKey.trim()
       : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null);
@@ -6073,10 +6077,11 @@ async function ingestFigmaAssetsIntoProject(
       projectId,
       assetFormat,
       assetBudget,
-      activationToken
+      activationToken,
+      operationGuard
     );
 
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
+    if (!isCurrent()) return addedCount;
     if (!localPath) {
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
@@ -6099,7 +6104,7 @@ async function ingestFigmaAssetsIntoProject(
     }
 
     const result = mutateProject(projectId, (proj) => {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+      if (!isCurrent()) return null;
       const projectPaths = new Set(proj.files.map(f => normalizeTrackedFilePath(f.path)));
       if (projectPaths.has(normalizedLocalPath)) return null;
       if (figmaAssetKey) {
@@ -6121,6 +6126,7 @@ async function ingestFigmaAssetsIntoProject(
       };
       const staged = stageLiveObservedFile(proj, fileRecord, {
         allowDirect: true,
+        appFamily: 'figma',
         reason: 'figma-project-tracked-cloud',
       });
       if (!staged.changed || staged.decision !== LIVE_CAPTURE_DECISIONS.DIRECT_ADD) return null;
@@ -6132,7 +6138,7 @@ async function ingestFigmaAssetsIntoProject(
     });
 
     if (result) {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return addedCount;
+      if (!isCurrent()) return addedCount;
       const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
       const projectHasFigmaKey = figmaAssetKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetKey);
       if (!projectHasLocalPath && !projectHasFigmaKey) {
@@ -6140,7 +6146,7 @@ async function ingestFigmaAssetsIntoProject(
         project.files = deduplicateFiles(project.files);
       }
       mutateProject(projectId, (proj) => {
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+        if (!isCurrent()) return null;
         const storedFile = (proj.files || []).find(file => (
           normalizeTrackedFilePath(file.path) === normalizedLocalPath &&
           (!figmaAssetKey || getFigmaAssetDedupKey(file) === figmaAssetKey)
@@ -6359,10 +6365,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       inactivityNotified.delete(projectId);
 
       // Notify renderer
-      const updatedProject = getProjects().find(p => p.id === projectId);
-      if (updatedProject) {
-        sendToRenderer('files:updated', { projectId, files: updatedProject.files });
-      }
+      sendProjectFileStateToRenderer(projectId, activationToken);
 
       console.log(`[crate][figma] Added ${addedCount} Figma assets to project ${projectId}`);
     }
@@ -6767,7 +6770,6 @@ tell application "Adobe Illustrator"
       on error
         set end of outputLines to "ERROR" & tab & "illustrator-document-query-failed"
       end try
-      set end of outputLines to "PLACED" & tab & placedItemCount
       if placedItemFileFailures > 0 then
         set fallbackRows to my crateIllustratorPlacedItemFallbackRows()
         if fallbackRows is not "" then
@@ -6783,6 +6785,7 @@ tell application "Adobe Illustrator"
         end if
       end if
     end if
+    set end of outputLines to "COMPLETE" & tab & documentCount & tab & placedItemCount
     set AppleScript's text item delimiters to linefeed
     return outputLines as text
   on error errMsg number errNum
@@ -6915,31 +6918,31 @@ function parseIllustratorActiveSessionOutput(output) {
   const links = [];
   const statuses = [];
   const errors = [];
-  const diagnostics = {
-    docRowsSeen: 0,
-    linkRowsSeen: 0,
-    placedItemsCount: 0,
-    normalizedPaths: 0,
-    pathSkipped: {},
-  };
+  const diagnostics = { docRowsSeen: 0, linkRowsSeen: 0, documentCount: null,
+    placedItemsCount: null, terminalSeen: false, malformedRows: 0,
+    normalizedPaths: 0, pathSkipped: {} };
   for (const rawLine of String(output || '').split('\n')) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const parts = line.split('\t');
+    if (!rawLine) continue;
+    const parts = rawLine.split('\t');
     const kind = parts[0];
-    if (kind === 'STATUS' && parts.length >= 2) {
+    if (diagnostics.terminalSeen) { diagnostics.malformedRows++; continue; }
+    if (kind === 'STATUS' && parts.length === 2) {
       statuses.push(normalizeLiveAppStatusCode(parts[1], 'illustrator-query-failed'));
       continue;
     }
-    if (kind === 'ERROR' && parts.length >= 2) {
+    if (kind === 'ERROR' && parts.length === 2) {
       errors.push(normalizeLiveAppStatusCode(parts[1], 'illustrator-query-failed'));
       continue;
     }
-    if (kind === 'PLACED' && parts.length >= 2) {
-      diagnostics.placedItemsCount = sanitizeLiveAppStatusCount(parts[1]);
-      continue;
+    if (kind === 'COMPLETE') {
+      const canonicalCount = value => /^(0|[1-9]\d*)$/.test(value) ? Number(value) : null;
+      const documentCount = canonicalCount(parts[1]), placedItemsCount = canonicalCount(parts[2]);
+      diagnostics.terminalSeen = true; const valid = parts.length === 3 && Number.isSafeInteger(documentCount) &&
+        Number.isSafeInteger(placedItemsCount);
+      if (valid) Object.assign(diagnostics, { documentCount, placedItemsCount });
+      else diagnostics.malformedRows++; continue;
     }
-    if (kind === 'DOC' && parts.length >= 3) {
+    if (kind === 'DOC' && parts.length === 5 && (parts[3] === 'true' || parts[3] === 'false') && (parts[4] === 'true' || parts[4] === 'false')) {
       const hasDocumentName = parts.length >= 4;
       const documentPath = normalizeIllustratorEvidencePath(parts[1]);
       recordIllustratorPathNormalization(diagnostics, 'doc', documentPath);
@@ -6950,12 +6953,11 @@ function parseIllustratorActiveSessionOutput(output) {
       documents.push({
         documentPath: documentPath.path,
         documentName: documentName || (documentPath.path ? path.basename(documentPath.path) : null),
-        modified: modifiedValue === 'true',
-        current: currentValue === 'true',
+        modified: modifiedValue === 'true', current: currentValue === 'true',
       });
       continue;
     }
-    if (kind === 'LINK' && parts.length >= 4) {
+    if (kind === 'LINK' && parts.length === 6 && (parts[4] === 'true' || parts[4] === 'false') && (parts[5] === 'true' || parts[5] === 'false')) {
       const hasDocumentName = parts.length >= 5;
       const documentPath = normalizeIllustratorEvidencePath(parts[1]);
       const documentName = hasDocumentName ? sanitizeLiveEvidenceText(parts[2]) : null;
@@ -6967,30 +6969,39 @@ function parseIllustratorActiveSessionOutput(output) {
       links.push({
         documentPath: documentPath.path,
         documentName: documentName || (documentPath.path ? path.basename(documentPath.path) : null),
-        linkedPath: linkedPath.path,
-        modified: modifiedValue === 'true',
+        linkedPath: linkedPath.path, modified: modifiedValue === 'true',
         current: currentValue === 'true',
       });
+      continue;
     }
+    diagnostics.malformedRows++;
   }
   return { documents, links, statuses, errors, diagnostics };
 }
 
 const ILLUSTRATOR_SOURCE_EXTENSIONS = new Set(['.ai', '.eps', '.pdf', '.svg']);
-
-function normalizeIllustratorDocumentName(value) {
-  const safe = sanitizeLiveEvidenceText(value);
-  return safe ? safe.toLowerCase() : null;
-}
-
-function isIllustratorSourceCandidate(file) {
-  if (!file || typeof file !== 'object') return false;
-  const ext = (file.ext || path.extname(file.path || file.name || '') || '').toLowerCase();
-  if (ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext)) return true;
-  const appFamily = file.captureEvidence && file.captureEvidence.appFamily;
-  return normalizeLiveCaptureReason(appFamily, '') === 'illustrator';
-}
-
+const ILLUSTRATOR_SCOPE_SET_KEYS = ['baselineDocumentPaths', 'admittedDocumentPaths', 'allowedLinkedPaths', 'excludedLinkedPaths'], CAPTURE_SOURCE_APP_FAMILY = new Map([['ai-linked', 'illustrator'], ['ps-poll', 'photoshop'], ['psd-linked', 'photoshop'], ['psd-embedded', 'photoshop'], ['scan-on-save-linked', 'photoshop'], ['scan-on-save-embedded', 'photoshop'], ['indd-poll', 'indesign'], ['indd-linked', 'indesign'], ['figma-auto', 'figma'], ['fig-scan', 'figma'], ['scan-on-save-presentation', 'presentation'], ['lastused-scan', 'generic'], ['manual-browse', 'generic'], ['lsof', 'generic']]);
+function normalizeIllustratorDocumentName(value) { const safe = sanitizeLiveEvidenceText(value); return safe ? safe.toLowerCase() : null; } function getExplicitCaptureAppFamily(fileEntry, observation = {}) { const capture = fileEntry && fileEntry.captureEvidence, evidence = observation.liveEvidence || {}; for (const value of [observation.appFamily, evidence.appFamily, capture && capture.appFamily]) { const family = getScopedRecordAppFamily(value); if (family) return family; } return getScopedRecordAppFamily(fileEntry && fileEntry.source); }
+function getScopedFileAppFamily(project, fileEntry, observation = {}) { const explicit = getExplicitCaptureAppFamily(fileEntry, observation); if (explicit || !project || !fileEntry) return explicit; const key = getLiveEvidenceKeyHash(normalizeTrackedFilePath(fileEntry.path)), latest = key && project.liveEvidenceLedger?.candidates?.[key]?.latest; return getExplicitCaptureAppFamily(latest, latest || {}); } function isIllustratorSourceCandidate(file) { const family = getExplicitCaptureAppFamily(file); return family === 'illustrator' || ((!family || family === 'generic') && isExplicitUserCapturedFile(file) && ILLUSTRATOR_SOURCE_EXTENSIONS.has((file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase())); }
+function getIllustratorActivationScope(projectId, activationToken = null) { const scope = illustratorActivationScopes.get(projectId); return !scope || (activationToken !== null && scope.activationToken !== activationToken) ? null : scope; } function getFreshActiveWatchingProject(projectId, activationToken) { return isActiveWatchingProject(projectId, activationToken) ? getProjects().find(project => project && project.id === projectId) || null : null; }
+function isAcceptedIllustratorProjectFile(project, file) { return !!file && isIllustratorSourceCandidate(file) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
+function getIllustratorSnapshotFailureReason(queryResult) { if (!queryResult || queryResult.stale) return 'stale-activation'; if (queryResult.running === false) return null; if (queryResult.errorCategory) return queryResult.errorCategory; if (queryResult.outputEmpty) return 'empty-output'; const activeState = queryResult.activeState; if (!activeState || activeState.errors?.length) return 'illustrator-query-failed'; const { documents = [], links = [], diagnostics = {}, statuses = [] } = activeState; if (documents.some(doc => !normalizeTrackedFilePath(doc && doc.documentPath))) return 'pathless-document'; if (links.some(link => !normalizeTrackedFilePath(link?.documentPath) || !normalizeTrackedFilePath(link?.linkedPath))) return 'pathless-link'; if (!diagnostics.terminalSeen) return 'missing-terminal'; if (diagnostics.malformedRows) return 'malformed-snapshot'; if (diagnostics.documentCount !== diagnostics.docRowsSeen || diagnostics.docRowsSeen !== documents.length) return 'document-count-mismatch'; if (diagnostics.placedItemsCount !== diagnostics.linkRowsSeen || diagnostics.linkRowsSeen !== links.length) return 'placed-item-count-mismatch'; return statuses.find(status => status.endsWith('-query-failed') || status === 'illustrator-placed-item-file-fallback-failed') || (documents.length === 0 && !statuses.includes('no-documents') ? 'partial-document-snapshot' : null); }
+function updateIllustratorActivationScope(projectId, activationToken, queryResult, isActivation = false) {
+  let scope = getIllustratorActivationScope(projectId, activationToken); const project = getFreshActiveWatchingProject(projectId, activationToken); if (!scope || !project) return null; if (getIllustratorSnapshotFailureReason(queryResult)) { scope = reviseIllustratorActivationScope(projectId, scope, next => { next.status = 'failed-closed'; const active = queryResult?.activeState || {}; for (const doc of active.documents || []) next.baselineDocumentPaths.add(normalizeTrackedFilePath(doc.documentPath)); for (const link of active.links || []) next.excludedLinkedPaths.add(normalizeTrackedFilePath(link.linkedPath)); next.baselineDocumentPaths.delete(null); next.excludedLinkedPaths.delete(null); }); return { scope, project, ready: false }; } if (scope.status === 'failed-closed' && !isActivation) return { scope, project, ready: false }; const active = queryResult.activeState || {}, recovery = scope.status === 'recovering-explicit', acceptedPaths = new Set((project.files || []).filter(file => isAcceptedIllustratorProjectFile(project, file)).map(file => normalizeTrackedFilePath(file.path)).filter(Boolean));
+  scope = reviseIllustratorActivationScope(projectId, scope, next => {
+    if (isActivation) for (const key of ILLUSTRATOR_SCOPE_SET_KEYS) next[key].clear(); for (const acceptedPath of acceptedPaths) { next.admittedDocumentPaths.add(acceptedPath); next.baselineDocumentPaths.delete(acceptedPath); } for (const doc of active.documents || []) { const documentPath = normalizeTrackedFilePath(doc.documentPath); if (!documentPath) continue; const admitted = acceptedPaths.has(documentPath) || (!isActivation && scope.status === 'ready' && !scope.baselineDocumentPaths.has(documentPath)); if (admitted) next.admittedDocumentPaths.add(documentPath); else if (isActivation || recovery) next.baselineDocumentPaths.add(documentPath); } for (const link of active.links || []) { const documentPath = normalizeTrackedFilePath(link.documentPath), linkedPath = normalizeTrackedFilePath(link.linkedPath); if (documentPath && linkedPath) (next.admittedDocumentPaths.has(documentPath) ? next.allowedLinkedPaths : next.excludedLinkedPaths).add(linkedPath); } next.status = 'ready'; }); return scope ? { scope, project, ready: true } : null; }
+function getIllustratorRelationshipSourcePath(fileEntry, observation = {}) { const evidence = observation.liveEvidence || {}; return normalizeTrackedFilePath(observation.relationshipSourcePath || evidence.relationshipSourcePath || evidence.sourceDocumentPath || fileEntry?.sourceDocumentPath); }
+function isIllustratorScopedFileAllowed(project, fileEntry, observation = {}) { if (!project || !fileEntry || getScopedFileAppFamily(project, fileEntry, observation) !== 'illustrator') return true; const normalizedPath = normalizeTrackedFilePath(fileEntry.path), scope = getIllustratorActivationScope(project.id);
+  if (isExplicitUserCapturedFile(fileEntry) || isAcceptedPendingCapturedFile(project, fileEntry) || (project.files || []).some(file => normalizeTrackedFilePath(file && file.path) === normalizedPath && isAcceptedIllustratorProjectFile(project, file))) return true; if (!scope || !normalizedPath) return false; if (scope.allowedLinkedPaths.has(normalizedPath) || scope.admittedDocumentPaths.has(normalizedPath)) return true; if (scope.status !== 'ready' || scope.excludedLinkedPaths.has(normalizedPath) || scope.baselineDocumentPaths.has(normalizedPath)) return false; const sourcePath = getIllustratorRelationshipSourcePath(fileEntry, observation); return sourcePath ? scope.admittedDocumentPaths.has(sourcePath) : (!isWeakBroadObserverFile(fileEntry) && ILLUSTRATOR_SOURCE_EXTENSIONS.has(path.extname(fileEntry.path || '').toLowerCase())); }
+function getScopedRecordAppFamily(value) { const normalized = normalizeLiveCaptureReason(value, ''); if (!normalized) return null; if (CAPTURE_SOURCE_APP_FAMILY.has(value)) return CAPTURE_SOURCE_APP_FAMILY.get(value); if (normalized === 'illustrator' || normalized.startsWith('ai-') || normalized.includes('illustrator')) return 'illustrator'; if (normalized === 'photoshop' || normalized.startsWith('psd-') || normalized.startsWith('ps-') || normalized.includes('photoshop')) return 'photoshop'; if (normalized === 'indesign' || normalized.startsWith('indd-') || normalized.includes('indesign')) return 'indesign'; if (normalized === 'figma' || normalized.startsWith('fig-') || normalized.includes('figma')) return 'figma'; if (normalized.includes('powerpoint') || normalized.includes('keynote') || normalized.includes('presentation')) return 'presentation'; if (normalized === 'generic' || normalized.startsWith('lastused-') || normalized === 'manual-browse' || normalized === 'lsof') return 'generic'; return null; } function getScopedRecordFamilies(record) { const values = [record?.appFamily, record?.source, record?.captureEvidence?.appFamily, record?.captureEvidence?.source, record?.captureEvidence?.observerMethod, record?.latest?.appFamily, record?.latest?.source, record?.latest?.observerMethod, record?.observer?.appFamily, record?.observer?.method, record?.payload?.appFamily, record?.payload?.source, record?.payload?.observer?.method]; return new Set(values.map(getScopedRecordAppFamily).filter(Boolean)); }
+const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalizedPath']; function isScopedRecord(value) { return isRecord(value) && ['id', 'fileId', 'evidenceKey', 'path', 'source', 'appFamily', 'captureEvidence', 'latest', 'observer', 'relationType', 'subjectNodeId', 'objectNodeId', 'type'].some(key => Object.prototype.hasOwnProperty.call(value, key)); } function scopedRecordIdentities(entry) { const item = entry.item, ids = [item.id, item.fileId, item.evidenceKey]; if (!Array.isArray(entry.parent) && typeof entry.key === 'string' && !['captureEvidence', 'latest', 'observer', 'payload', 'metadata'].includes(entry.key)) ids.push(entry.key); return ids.filter(value => typeof value === 'string'); } function scopedRecordPrimaryPath(record, key, nodePaths, ledgerPaths) { const values = [...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.latest?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.payload?.[field])]; for (const value of values) { const normalized = typeof value === 'string' && (path.isAbsolute(value) || /normalizedPath/.test(key || '')) ? normalizeTrackedFilePath(value) : null; if (normalized) return normalized; } return ledgerPaths.get(key) || nodePaths.get(record?.objectNodeId) || (typeof key === 'string' && path.isAbsolute(key) ? normalizeTrackedFilePath(key) : null); }
+function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
+function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+  const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
+  const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if (path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
+  for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
+  const hiddenIds = new Set(); let changed = true; while (changed) { changed = false; for (const info of infos) { const { entry } = info; if (isHidden(entry.parent, entry.key)) continue; const identities = scopedRecordIdentities(entry), keyHidden = typeof entry.key === 'string' && (hiddenIds.has(entry.key) || (path.isAbsolute(entry.key) && hiddenPaths.has(normalizeTrackedFilePath(entry.key)))), deniedPrimary = hiddenPaths.has(info.primaryPath) && !info.authorized; if (!keyHidden && !deniedPrimary && !identities.some(id => hiddenIds.has(id)) && !scopedRecordReferencesHidden(entry.item, info, hiddenPaths, hiddenIds, nodePaths)) continue; changed = markHidden(entry.parent, entry.key) || changed; for (const id of [...identities, ...(entry.item.evidenceIds || [])]) if (typeof id === 'string' && !hiddenIds.has(id)) { hiddenIds.add(id); changed = true; } } }
+  const OMIT = Symbol('scoped-omit'); let filteredCount = 0; const filter = (value, parent = null, key = '', ancestors = new Set(), owner = null) => { if (parent && (isHidden(parent, key) || hiddenIds.has(key) || (path.isAbsolute(key) && hiddenPaths.has(normalizeTrackedFilePath(key))))) return OMIT; if (typeof value === 'string') { if (hiddenIds.has(value)) return OMIT; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(value) : null, normalized = (path.isAbsolute(value) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(value) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return deniedPath && !(owner?.authorized && owner.primaryPath === deniedPath) ? OMIT : value; } if (!Array.isArray(value) && !isRecord(value)) return value; if (++filteredCount > 50000 || ancestors.has(value)) return OMIT; const nextOwner = infoByObject.get(value) || owner, output = Array.isArray(value) ? [] : {}; ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { const filtered = filter(child, value, childKey, ancestors, nextOwner); if (filtered !== OMIT) Array.isArray(output) ? output.push(filtered) : output[childKey] = filtered; } return output; } catch (_) { return OMIT; } finally { ancestors.delete(value); } }; const view = filter(project); return view === OMIT ? null : view; }
 function buildIllustratorSessionScope(project, activeState) {
   const trackedPaths = new Set();
   const trackedNames = new Set();
@@ -7059,8 +7070,10 @@ function classifyIllustratorDocumentSessionRelevance(doc, scope) {
 function createIllustratorLiveEvidenceRecords(projectId, activeState, project = null, diagnostics = null) {
   const evidenceRecords = [];
   const scope = buildIllustratorSessionScope(project, activeState);
+  const activationScope = getIllustratorActivationScope(projectId);
+  const relevanceFor = entry => activationScope ? (activationScope.admittedDocumentPaths.has(normalizeTrackedFilePath(entry && entry.documentPath)) ? { relevant: true, reason: 'activation-admitted-document' } : { relevant: false, reason: 'activation-excluded-document' }) : classifyIllustratorDocumentSessionRelevance(entry, scope);
   for (const doc of (activeState && activeState.documents) || []) {
-    const relevance = classifyIllustratorDocumentSessionRelevance(doc, scope);
+    const relevance = relevanceFor(doc);
     if (!relevance.relevant) {
       incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
       continue;
@@ -7080,7 +7093,7 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState, project = 
     }));
   }
   for (const link of (activeState && activeState.links) || []) {
-    const relevance = classifyIllustratorDocumentSessionRelevance(link, scope);
+    const relevance = relevanceFor(link);
     if (!relevance.relevant) {
       incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
       continue;
@@ -7107,17 +7120,20 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState, project = 
   return evidenceRecords.filter(Boolean);
 }
 
-async function isIllustratorRunningForLiveEvidence() {
+async function isIllustratorRunningForLiveEvidence(projectId = null, activationToken = null) {
+  const stillCurrent = () => projectId === null || !!getFreshActiveWatchingProject(projectId, activationToken);
   const pgrep = await execFileAsync('/usr/bin/pgrep', ['-x', 'Adobe Illustrator'], {
     timeout: 3000,
     encoding: 'utf8',
   }).catch(() => ({ stdout: '' }));
+  if (!stillCurrent()) return null;
   if (pgrep.stdout && pgrep.stdout.trim()) return true;
 
   const ps = await execFileAsync('/bin/ps', ['ax', '-o', 'comm='], {
     timeout: 3000,
     encoding: 'utf8',
-  }).catch(() => ({ stdout: '' }));
+  }).catch(() => ({ stdout: '', failed: true }));
+  if (!stillCurrent()) return null;
   if (String(ps.stdout || '')
     .split('\n')
     .some(line => {
@@ -7133,7 +7149,9 @@ async function isIllustratorRunningForLiveEvidence() {
   const psCommand = await execFileAsync('/bin/ps', ['axww', '-o', 'command='], {
     timeout: 3000,
     encoding: 'utf8',
-  }).catch(() => ({ stdout: '' }));
+  }).catch(() => ({ stdout: '', failed: true }));
+  if (!stillCurrent()) return null;
+  if (ps.failed && psCommand.failed) return 'failed';
   return String(psCommand.stdout || '')
     .split('\n')
     .some(line => {
@@ -7144,6 +7162,27 @@ async function isIllustratorRunningForLiveEvidence() {
     });
 }
 
+async function queryIllustratorActiveState(projectId, activationToken) {
+  const running = await isIllustratorRunningForLiveEvidence(projectId, activationToken); if (running === null || !getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true };
+  if (running === 'failed') return { running: true, errorCategory: 'illustrator-query-failed', activeState: parseIllustratorActiveSessionOutput('') };
+  if (!running) return { running: false, activeState: parseIllustratorActiveSessionOutput('STATUS\tno-documents\nCOMPLETE\t0\t0') };
+  try { const { stdout } = await runOsascriptInPrivateTemp(() => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }), 'crate-ai-active-session.applescript', { timeout: 10000, encoding: 'utf8' });
+    if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; return { running: true, outputEmpty: !String(stdout || '').trim(), activeState: parseIllustratorActiveSessionOutput(stdout) }; }
+  catch (error) { if (!getFreshActiveWatchingProject(projectId, activationToken)) return { stale: true }; logLiveAppEvidenceUnavailable('Illustrator', error); return { running: true, errorCategory: getSafeLiveAppUnavailableReason(error), activeState: parseIllustratorActiveSessionOutput('') }; }
+}
+async function initializeIllustratorActivationScope(projectId, activationToken) {
+  const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
+  const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
+  applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken); return updated;
+}
+function admitIllustratorSourcesForProject(projectId, filePaths) {
+  const activationToken = getActiveWatchingActivationToken(projectId), scope = getIllustratorActivationScope(projectId, activationToken); if (!scope || !getFreshActiveWatchingProject(projectId, activationToken)) return;
+  const revised = reviseIllustratorActivationScope(projectId, scope, next => {
+    if (next.status === 'failed-closed') next.status = 'recovering-explicit'; for (const documentPath of (filePaths || []).map(normalizeTrackedFilePath).filter(Boolean)) { next.admittedDocumentPaths.add(documentPath); next.baselineDocumentPaths.delete(documentPath); }
+  });
+  if (revised && revised.status === 'ready') pollPsForProject(projectId, activationToken);
+  return revised;
+}
 function createLinkedAssetLiveEvidenceRecord({
   projectId,
   filePath,
@@ -7203,7 +7242,10 @@ function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
   return collectLiveAppEvidenceCandidates(liveEvidenceRecords).candidates;
 }
 
-function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
+function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null) {
+  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) {
+    return { changed: false, stagedCount: 0, skipped: {} };
+  }
   const { candidates, skipped } = collectLiveAppEvidenceCandidates(liveEvidenceRecords);
   const skipSummary = formatLiveAppSkipCounts(skipped);
   if (skipSummary) {
@@ -7212,7 +7254,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
   if (candidates.length === 0) return { changed: false, stagedCount: 0, skipped };
 
   const result = mutateProject(projectId, (proj) => {
-    if (proj.status !== 'watching') return null;
+    if (proj.status !== 'watching' || !isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
     let changed = false;
     let stagedCount = 0;
     const stagedStates = new Map();
@@ -7227,6 +7269,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
       const staged = stageLiveObservedFile(proj, fileEntry, {
         forcePending: shouldForcePending,
         allowDirect: evidence.allowDirect === true,
+        appFamily: evidence.appFamily,
         savedEvidence: evidence.savedEvidence === true,
         filesystemSaved: evidence.filesystemSaved === true,
         parserConfirmed: evidence.parserConfirmed === true,
@@ -7272,11 +7315,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = []) {
   lastFileActivity.set(projectId, Date.now());
   inactivityNotified.delete(projectId);
 
-  const updatedProject = getProjects().find(p => p.id === projectId);
-  if (updatedProject) {
-    sendToRenderer('files:updated', { projectId, files: updatedProject.files });
-    sendToRenderer('files:pending', { projectId, pendingFiles: updatedProject.pendingFiles || [] });
-  }
+  sendProjectFileStateToRenderer(projectId, activationToken);
 
   return result;
 }
@@ -7541,6 +7580,7 @@ async function pollPsForProject(projectId, activationToken = null) {
   const project = currentProjects.find(p => p.id === projectId);
   if (!project) return;
   if (!isActiveWatchingProject(projectId, activationToken)) {
+    if (activationToken !== null) return;
     for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -7561,7 +7601,9 @@ async function pollPsForProject(projectId, activationToken = null) {
     const polledApps = [];
 
     // --- Illustrator ---
-    const illustratorRunning = await isIllustratorRunningForLiveEvidence();
+    const illustratorQuery = await queryIllustratorActiveState(projectId, activationToken);
+    if (illustratorQuery.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return;
+    const illustratorRunning = illustratorQuery.running;
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
     recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
       pollFired: true,
@@ -7581,22 +7623,19 @@ async function pollPsForProject(projectId, activationToken = null) {
           appRunning: true,
           scriptAttempted: true,
         });
-        const { stdout: aiOut } = await runOsascriptInPrivateTemp(
-          () => ({ 'crate-ai-active-session.applescript': AI_ACTIVE_SESSION_APPLESCRIPT }),
-          'crate-ai-active-session.applescript',
-          { timeout: 10000, encoding: 'utf8' }
-        );
-        const aiOutputText = String(aiOut || '');
-        const aiOutputEmpty = !aiOutputText.trim();
-        if (!String(aiOut || '').trim()) {
+        const aiOutputEmpty = illustratorQuery.outputEmpty === true;
+        if (aiOutputEmpty) {
           logLiveAppDiagnostic(projectId, 'illustrator-empty-output', `Illustrator returned no structured live evidence for project ${projectId}; check Automation permissions if this persists`);
         }
-        const activeState = parseIllustratorActiveSessionOutput(aiOut);
+        const activeState = illustratorQuery.activeState;
         for (const safeReason of activeState.errors || []) {
           logLiveAppEvidenceUnavailable('Illustrator', new Error(safeReason));
         }
         const illustratorDiagnostics = { skipped: {} };
-        const illustratorRecords = createIllustratorLiveEvidenceRecords(projectId, activeState, project, illustratorDiagnostics);
+        const scopeResult = updateIllustratorActivationScope(projectId, activationToken, illustratorQuery, false);
+        const illustratorRecords = scopeResult && scopeResult.ready
+          ? createIllustratorLiveEvidenceRecords(projectId, activeState, scopeResult.project, illustratorDiagnostics)
+          : [];
         const illustratorSkipSummary = formatLiveAppSkipCounts(illustratorDiagnostics.skipped);
         const statusSummary = [...(activeState.statuses || []), ...(activeState.errors || [])]
           .filter(Boolean)
@@ -7607,10 +7646,10 @@ async function pollPsForProject(projectId, activationToken = null) {
           : '';
         const safeStatusReasons = [...(activeState.statuses || []), ...(activeState.errors || [])]
           .filter(Boolean);
-        const scriptErrorCategory = aiOutputEmpty
+        const scriptErrorCategory = illustratorQuery.errorCategory || (aiOutputEmpty
           ? 'empty-output'
-          : normalizeLiveAppStatusErrorCategory(safeStatusReasons[0], null);
-        const scriptSuccess = !aiOutputEmpty && (!activeState.errors || activeState.errors.length === 0);
+          : normalizeLiveAppStatusErrorCategory(safeStatusReasons[0], null));
+        const scriptSuccess = !!(scopeResult && scopeResult.ready);
         recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
           pollFired: true,
           projectWatching: true,
@@ -7654,6 +7693,7 @@ async function pollPsForProject(projectId, activationToken = null) {
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
+    if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
 
     const photoshopRunning = Boolean(psCheck.trim());
     recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
@@ -7683,6 +7723,7 @@ async function pollPsForProject(projectId, activationToken = null) {
           'crate-ps-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
+        if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
         const psLines = psOut.split('\n').filter(Boolean);
         recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
           pollFired: true,
@@ -7706,6 +7747,7 @@ async function pollPsForProject(projectId, activationToken = null) {
           if (evidence) liveEvidenceRecords.push(evidence);
         }
       } catch (e) {
+        if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
         logLiveAppEvidenceUnavailable('Photoshop', e);
         recordLiveAppStatusBreadcrumb(projectId, 'photoshop', {
           pollFired: true,
@@ -7724,6 +7766,7 @@ async function pollPsForProject(projectId, activationToken = null) {
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
+    if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
 
     const indesignRunning = Boolean(inddCheck.trim());
     recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
@@ -7750,6 +7793,7 @@ async function pollPsForProject(projectId, activationToken = null) {
           'crate-indd-poll.applescript',
           { timeout: 10000, encoding: 'utf8' }
         );
+        if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
         const inddActiveState = parseInDesignActiveSessionOutput(inddOut);
         const inddDiagnostics = { skipped: {} };
         const inddRecords = createInDesignLiveEvidenceRecords(projectId, inddActiveState, project, inddDiagnostics);
@@ -7771,6 +7815,7 @@ async function pollPsForProject(projectId, activationToken = null) {
         });
         liveEvidenceRecords.push(...inddRecords);
       } catch (e) {
+        if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
         logLiveAppEvidenceUnavailable('InDesign', e);
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
           pollFired: true,
@@ -7790,7 +7835,7 @@ async function pollPsForProject(projectId, activationToken = null) {
 
     if (liveEvidenceRecords.length === 0 || !isActiveWatchingProject(projectId, activationToken)) return;
 
-    const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords);
+    const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken);
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -7808,9 +7853,10 @@ async function pollPsForProject(projectId, activationToken = null) {
       console.log(`[crate][live-app] Staged ${refreshResult.stagedCount} active-session evidence candidates for project ${projectId}${stateSummary ? ` (${stateSummary})` : ''}`);
     }
   } catch (e) {
+    if (activationToken !== null && !getFreshActiveWatchingProject(projectId, activationToken)) return;
     console.error('[crate][live-app] pollPsForProject error:', redactFigmaLogText(e && e.message));
   } finally {
-    psInProgress.delete(projectId);
+    if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) psInProgress.delete(projectId);
   }
 }
 
@@ -7937,6 +7983,7 @@ async function pollLastUsedForProject(projectId, activationToken = null) {
     for (const f of newFiles) {
       const staged = stageLiveObservedFile(proj, f, {
         forcePending: true,
+        appFamily: 'generic',
         reason: 'lastused-broad-observer',
       });
       if (!staged.changed) continue;
@@ -7962,10 +8009,7 @@ async function pollLastUsedForProject(projectId, activationToken = null) {
     return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
   });
 
-  if (result && trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-    trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
-  }
+  if (result) sendProjectFileStateToRenderer(projectId, activationToken);
   } catch (e) {
     console.error('[crate][lastused-poll] pollLastUsedForProject error:', e.message);
   }
@@ -8124,15 +8168,17 @@ async function extractLinkedAssetsPhotoshop(filePath) {
  * Complements the AppleScript/do-javascript approach — works even when
  * Photoshop is not running.
  */
-async function extractPsdAssets(psdFilePath, projectId) {
+async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true) { const invocationFiles = []; let keepInvocationFiles = false;
   try {
     // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
     const stat = await fs.promises.stat(psdFilePath);
+    if (!isCurrent()) return [];
     if (stat.size > MAX_PARSE_FILE_SIZE) {
       console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
       return [];
     }
     const buf = await fs.promises.readFile(psdFilePath);
+    if (!isCurrent()) return [];
     const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
     const discoveredPaths = [];
 
@@ -8154,26 +8200,24 @@ async function extractPsdAssets(psdFilePath, projectId) {
     // Extract embedded files from psd.linkedFiles
     if (psd.linkedFiles && psd.linkedFiles.length > 0) {
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
+      if (!isCurrent()) return [];
       await fs.promises.mkdir(extractDir, { recursive: true });
-      const usedEmbeddedNames = new Set();
-      for (const lf of psd.linkedFiles) {
+      if (!isCurrent()) return [];
+      const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase())); for (const lf of psd.linkedFiles) {
         if (!lf.data) continue;
         const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
         const extractPath = path.join(extractDir, safeName);
-        await fs.promises.writeFile(extractPath, Buffer.from(lf.data));
-        discoveredPaths.push({
-          filePath: extractPath,
-          source: 'psd-embedded',
-          embeddedOriginalName: lf.name || '',
-        });
+        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, Buffer.from(lf.data), { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
       }
+      if (!isCurrent()) return []; for (const staged of invocationFiles) { fs.linkSync(staged.stagedPath, staged.extractPath); staged.committed = true; fs.unlinkSync(staged.stagedPath); const finalStat = fs.lstatSync(staged.extractPath); if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed'); discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName }); }
     }
 
-    return discoveredPaths;
+    if (!isCurrent()) return []; keepInvocationFiles = true; return discoveredPaths;
   } catch (e) {
+    if (!isCurrent()) return [];
     console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     return [];
-  }
+  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino); if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
 }
 
 /**
@@ -8456,19 +8500,16 @@ async function extractLinkedAssetsPxd(filePath) {
  * Run scan-on-open for a design file: extract linked assets and merge into project.
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
-async function runScanOnOpen(projectId, filePath, activationToken = null) {
+async function runScanOnOpen(projectId, filePath, activationToken = null, operationGuard = null) {
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
   const currentProject = getProjects().find(p => p.id === projectId);
-  if (
-    !currentProject ||
-    (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) ||
-    !isAcceptedProjectFilePath(currentProject, filePath)
-  ) return;
+  if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) return;
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const linkedPaths = await extractLinkedAssets(filePath);
-  if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return;
+  if (!isCurrent()) return;
 
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
@@ -8478,12 +8519,14 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
     if (!DESIGN_FILE_EXTENSIONS.has(pExt)) continue;
     try {
       await fs.promises.access(p, fs.constants.F_OK);
+      if (!isCurrent()) return;
       validPaths.push(p);
     } catch (e) {
       // file doesn't exist — skip
     }
   }
 
+  if (!isCurrent()) return;
   if (validPaths.length === 0) {
     console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
     return;
@@ -8492,10 +8535,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
   console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
 
   const result = mutateProject(projectId, (proj) => {
-    if (
-      proj.status !== 'watching' ||
-      (activationToken !== null && !isActiveWatchingProject(projectId, activationToken))
-    ) return null;
+    if (proj.status !== 'watching' || !isCurrent()) return null;
     // v2.4.0: normalize paths before comparing to prevent duplicates
     const acceptedFiles = [];
     let changed = false;
@@ -8504,6 +8544,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
       const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'scan-on-open');
       const staged = stageLiveObservedFile(proj, fileEntry, {
         relationshipSourcePath: filePath,
+        appFamily: getPrimaryDesignAppFamilyForExt(ext) || 'generic',
         reason: 'scan-on-open-source-relationship',
       });
       if (!staged.changed) continue;
@@ -8531,11 +8572,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
     return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
   });
 
-  if (result) {
+  if (result && isCurrent()) {
     lastFileActivity.set(projectId, Date.now());
     inactivityNotified.delete(projectId);
-    sendToRenderer('files:updated', { projectId, files: result.files });
-    sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
+    sendProjectFileStateToRenderer(projectId, activationToken);
   }
 
   // v2.3.6: PSD binary parse — extract embedded smart object assets via ag-psd.
@@ -8544,15 +8584,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
   if (ext === '.psd') {
     const lastParsed = psdParseDebounce.get(filePath) || 0;
     if (Date.now() - lastParsed < 5000) return;
+    if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
-    const psdAssets = await extractPsdAssets(filePath, projectId);
-    if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return;
+    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent);
+    if (!isCurrent()) return;
     if (psdAssets.length > 0) {
       const psdResult = mutateProject(projectId, (proj) => {
-        if (
-          proj.status !== 'watching' ||
-          (activationToken !== null && !isActiveWatchingProject(projectId, activationToken))
-        ) return null;
+        if (proj.status !== 'watching' || !isCurrent()) return null;
         // v2.4.0: normalize paths before comparing to prevent duplicates
         const acceptedFiles = [];
         let changed = false;
@@ -8560,6 +8598,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
           const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
           const staged = stageLiveObservedFile(proj, fileEntry, {
             relationshipSourcePath: filePath,
+            appFamily: 'photoshop',
             reason: 'scan-on-open-psd-parser',
           });
           if (!staged.changed) continue;
@@ -8586,11 +8625,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null) {
         }
         return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
       });
-      if (psdResult) {
+      if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
-        sendToRenderer('files:updated', { projectId, files: psdResult.files });
-        sendToRenderer('files:pending', { projectId, pendingFiles: psdResult.pendingFiles || [] });
+        sendProjectFileStateToRenderer(projectId, activationToken);
       }
     }
   }
@@ -8686,7 +8724,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
 
       for (const entry of newEntries) {
         const staged = stageLiveObservedFile(proj, entry, {
-          relationshipSourcePath: psdFilePath,
+          relationshipSourcePath: psdFilePath, appFamily: 'photoshop',
           reason: 'scan-on-save-psd',
         });
         if (!staged.changed) continue;
@@ -8706,8 +8744,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
       if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
-      sendToRenderer('files:updated', { projectId, files: result.files });
-      sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
+      sendProjectFileStateToRenderer(projectId, activationToken);
     }
   } catch (e) {
     // L2: Log so failures are debuggable — never break the session
@@ -8959,6 +8996,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         const { internalPath, presentationPath: sourcePresentationPath, ...fileEntry } = entry;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           relationshipSourcePath: sourcePresentationPath,
+          appFamily: getPrimaryDesignAppFamilyForExt(path.extname(sourcePresentationPath)) || 'generic',
           reason: 'scan-on-save-presentation',
         });
         if (!staged.changed) continue;
@@ -8982,8 +9020,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
-      sendToRenderer('files:updated', { projectId, files: result.files });
-      sendToRenderer('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
+      sendProjectFileStateToRenderer(projectId, activationToken);
     }
   } catch (e) {
     console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
@@ -9338,6 +9375,8 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   const activation = activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt });
   if (!activation) return null;
   const { activationToken, projectSnapshot } = activation;
+  await initializeIllustratorActivationScope(projectId, activationToken);
+  if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
 
   // FIX 4 (H1): Converted from execSync to async — no longer blocks main process
   // v1.3.38: One-time lsof snapshot to capture files already open in design apps
@@ -9348,6 +9387,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
     const { stdout: psOut } = await execFileAsync('/bin/ps', ['ax', '-o', 'pid=', '-o', 'command='], {
       timeout: 5000, encoding: 'utf8'
     });
+    if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
     const pids = [];
     const pidToCmd = new Map();
     for (const line of psOut.trim().split('\n')) {
@@ -9368,6 +9408,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         const { stdout: lsofOut } = await execFileAsync('/usr/sbin/lsof', ['-F', 'ptn', '-p', validPids.join(',')], {
           timeout: 12000, encoding: 'utf8'
         });
+        if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
 
         // FIX 1: Use mutateProject to atomically apply snapshot results
         // v2.2.2: Collect design files for scan-on-open
@@ -9463,7 +9504,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
               reason: 'initial-lsof-snapshot',
               captureReason: 'stale-prewatch-opened',
               captureState: LIVE_CAPTURE_STATES.PENDING,
-              appFamily: processIdentity && processIdentity.appFamily,
+              appFamily: processIdentity ? processIdentity.appFamily : 'generic',
             });
             if (!staged.changed) continue;
             if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
@@ -9505,6 +9546,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
                   const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
                   const staged = stageLiveObservedFile(project, fileEntry, {
                     relationshipSourcePath: designFile.path,
+                    appFamily: getExplicitCaptureAppFamily(designFile) || 'generic',
                     reason: 'initial-snapshot-linked-regex',
                   });
                   if (!staged.changed) continue;
@@ -9542,10 +9584,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           }
           return snapshotChanged ? { files: project.files, pendingFiles: project.pendingFiles || [] } : null;
         });
-        if (snapshotResult) {
-          sendToRenderer('files:updated', { projectId, files: snapshotResult.files });
-          sendToRenderer('files:pending', { projectId, pendingFiles: snapshotResult.pendingFiles || [] });
-        }
+        if (snapshotResult) sendProjectFileStateToRenderer(projectId, activationToken);
 
         // v2.2.2: Fire-and-forget scan-on-open for design files found in initial snapshot.
         // Initialize scannedDesignFiles for this project and mark these as scanned.
@@ -9633,6 +9672,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         if (!isActiveWatchingProject(projectId, activationToken)) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
+          appFamily: 'generic',
           reason: 'chokidar-add',
         });
         if (!staged.changed) return null;
@@ -9648,10 +9688,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       if (result) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-          trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
-        }
+        sendProjectFileStateToRenderer(projectId, activationToken);
       }
     }
 
@@ -9681,6 +9718,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         if (!isActiveWatchingProject(projectId, activationToken)) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
+          appFamily: 'generic',
           reason: 'chokidar-change',
         });
         if (!staged.changed) return null;
@@ -9696,10 +9734,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       if (result) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
-        if (trayWindow && !trayWindow.isDestroyed()) {
-          trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-          trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles || [] });
-        }
+        sendProjectFileStateToRenderer(projectId, activationToken);
       }
 
       const updatedProject = getProjects().find(p => p.id === projectId);
@@ -9734,7 +9769,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   }
   startPsPolling(projectId, activationToken);    // begin live app evidence refresh
   startLastUsedPolling(projectId, activationToken); // begin real-time kMDItemLastUsedDate polling (v2.3.3)
-  return getProjects().find(project => project.id === projectId) || null;
+  return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId) || null);
 }
 
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
@@ -9858,7 +9893,7 @@ registerTrustedIpcHandler('projects:get-all', () => {
     if (normalizeAutoCaptureProjectState(project)) changed = true;
   }
   if (changed) store.set('projects', projects);
-  return projects;
+  return projects.map(getIllustratorScopedProjectView);
 });
 
 registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
@@ -9947,7 +9982,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     }
   }
 
-  return { success: true, project: updated };
+  return { success: true, project: getIllustratorScopedProjectView(updated) };
 });
 
 registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
@@ -9961,13 +9996,13 @@ registerTrustedIpcHandler('projects:pause', (event, id) => {
   if (project) {
     stopWatching(id);
   }
-  return project;
+  return getIllustratorScopedProjectView(getProjects().find(item => item.id === id) || null);
 });
 
 registerTrustedIpcHandler('projects:get-files', (event, id) => {
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
-  return project ? project.files : [];
+  return project ? getIllustratorScopedProjectView(project).files : [];
 });
 
 registerTrustedIpcHandler('projects:remove-file', (event, projectId, fileIdOrPath) => {
@@ -9981,16 +10016,21 @@ registerTrustedIpcHandler('projects:remove-file', (event, projectId, fileIdOrPat
     });
     return project.files;
   });
-  return result || [];
+  const project = getProjects().find(item => item.id === projectId);
+  return project ? getIllustratorScopedProjectView(project).files : [];
 });
 
 // --- Tier 2: Accept / reject pending files ---
 
-registerTrustedIpcHandler('projects:accept-pending', (event, projectId, filePath) => {
+registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, filePath) => {
+  const operation = captureProjectOperation(projectId); if (!operation) return null;
   let acceptedSourceForScan = null;
-  const result = mutateProject(projectId, (project) => {
+  try {
+    const result = mutateProject(projectId, (project) => {
+    if (!operation.current()) return null;
     const idx = (project.pendingFiles || []).findIndex(f => f.path === filePath);
     if (idx === -1) return null;
+    if (!isIllustratorScopedFileAllowed(project, project.pendingFiles[idx])) return null;
 
     const [file] = project.pendingFiles.splice(idx, 1);
     const acceptedKey = getTrackedFileDedupKey(file);
@@ -10012,21 +10052,18 @@ registerTrustedIpcHandler('projects:accept-pending', (event, projectId, filePath
     return { files: project.files, pendingFiles: project.pendingFiles };
   });
 
-  if (!result) return null;
+    if (!result || !operation.current()) return null;
 
-  if (trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send('files:updated', { projectId, files: result.files });
-    trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles });
-  }
+    sendProjectFileStateToRenderer(projectId, operation.activationToken);
 
-  if (
-    acceptedSourceForScan &&
-    SCAN_ON_OPEN_EXTENSIONS.has((acceptedSourceForScan.ext || path.extname(acceptedSourceForScan.path || '')).toLowerCase())
-  ) {
-    runScanOnOpen(projectId, acceptedSourceForScan.path).catch(() => {});
-  }
+    if (acceptedSourceForScan && SCAN_ON_OPEN_EXTENSIONS.has((acceptedSourceForScan.ext || path.extname(acceptedSourceForScan.path || '')).toLowerCase())) {
+      await runScanOnOpen(projectId, acceptedSourceForScan.path, operation.activationToken, operation.current);
+      if (!operation.current()) return null;
+    }
 
-  return result;
+    const view = getIllustratorScopedProjectView(getProjects().find(item => item.id === projectId));
+    return operation.current() && view ? { files: view.files, pendingFiles: view.pendingFiles } : null;
+  } finally { operation.close(); }
 });
 
 registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath) => {
@@ -10041,14 +10078,15 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
 
   if (!result) return null;
 
-  if (trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send('files:pending', { projectId, pendingFiles: result.pendingFiles });
-  }
+  sendProjectFileStateToRenderer(projectId);
 
-  return result.pendingFiles;
+  const project = getProjects().find(item => item.id === projectId);
+  return project ? getIllustratorScopedProjectView(project).pendingFiles : [];
 });
 
 registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
+  const operation = captureProjectOperation(projectId);
+  if (!operation) return null;
   // M6: Filter to supported design + image file types
   const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
     .map(e => e.slice(1)); // strip leading dot
@@ -10064,9 +10102,11 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   showTrayWindow();
 
   if (dialogResult.canceled) return null;
+  if (!operation.current()) return null;
 
   const filePaths = dialogResult.filePaths;
   const result = mutateProject(projectId, (project) => {
+    if (!operation.current()) return null;
     const acceptedKeys = getTrackedFileKeySet(project.files);
     for (const filePath of filePaths) {
       const fileEntry = {
@@ -10089,7 +10129,10 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
     return project.files;
   });
 
-  return result;
+  if (!result || !operation.current()) return null;
+  const revisedScope = admitIllustratorSourcesForProject(projectId, filePaths);
+  if ((revisedScope && !operation.adoptScope(revisedScope)) || !operation.current()) return null;
+  return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
 });
 
 // --- Session file scan (Spotlight-based, runs at package time) ---
@@ -10114,12 +10157,15 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
 // session (mtime >= watchStartedAt) to catch locally-saved Figma files.
 // For .fig files saved BEFORE the session, users should use "+ Add files".
 registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) => {
+  const operation = captureProjectOperation(projectId); if (!operation) return null;
+  const operationCurrent = operation.current, stagePrePackageFile = (project, file, observation) => operationCurrent() ? stageLiveObservedFile(project, file, observation) : null;
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
+  const previousFigmaPackageBlock = figmaPackageTransferBlocks.get(projectId);
   try {
   const projects = getProjects();
-  const project = projects.find(p => p.id === projectId);
-  if (!project) return null;
+  let project = projects.find(p => p.id === projectId);
+  if (!project || !operationCurrent()) return null;
   figmaPackageTransferBlocks.delete(projectId);
   let figmaPackageError = null;
 
@@ -10148,6 +10194,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   try {
     const figmaPids = [];
     const { stdout: psOut } = await execAsync("/bin/ps ax -o pid= -o command= 2>/dev/null", { timeout: 5000, encoding: "utf8" });
+    if (!operationCurrent()) return;
     for (const line of psOut.trim().split("\n")) {
       const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
       if (m && m[2].includes("Figma")) figmaPids.push(m[1]);
@@ -10157,6 +10204,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         `/usr/sbin/lsof -F n -p ${figmaPids.join(",")} 2>/dev/null`,
         { timeout: 10000, encoding: "utf8" }
       );
+      if (!operationCurrent()) return;
       for (const line of lsofOut.trim().split("\n")) {
         if (!line.startsWith("n")) continue;
         const filePath = line.slice(1);
@@ -10171,11 +10219,12 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof-package-scan', {
           ext: '.fig',
         });
-        const staged = stageLiveObservedFile(project, fileEntry, {
+        const staged = stagePrePackageFile(project, fileEntry, {
           forcePending: true,
+          appFamily: 'figma',
           reason: 'pre-package-lsof-scan',
         });
-        if (!staged.changed) continue;
+        if (!staged || !staged.changed) continue;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
           existingPaths.add(normalizedFilePath);
         } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10229,11 +10278,12 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             name: entry.name,
             ext: '.fig',
           });
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             forcePending: true,
+            appFamily: 'figma',
             reason: 'pre-package-fig-scan',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedFullPath);
           } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10272,6 +10322,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
 
           if (entry.isDirectory() && depth < 3) {
             await scanFolderLastUsed(fullPath, depth + 1);
+            if (!operationCurrent()) return;
             continue;
           }
 
@@ -10286,6 +10337,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
               timeout: 2000, encoding: 'utf8'
             });
+            if (!operationCurrent()) return;
             const mdlsOut = mdlsRaw.trim();
             if (!mdlsOut || mdlsOut === '(null)') continue;
 
@@ -10293,6 +10345,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             if (isNaN(lastUsedTime) || lastUsedTime < watchStart) {
               // Fallback: check xattr directly — no Spotlight delay
               const xattrTime = await getXattrLastUsedMs(fullPath);
+              if (!operationCurrent()) return;
               if (!xattrTime || xattrTime < watchStart) continue;
             }
           } catch (e) {
@@ -10303,11 +10356,12 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
             name: entry.name,
             ext,
           });
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             forcePending: true,
+            appFamily: 'generic',
             reason: 'pre-package-lastused-scan',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedFullPath);
           } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10317,6 +10371,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         }
       };
       await scanFolderLastUsed(dir, 0);
+      if (!operationCurrent()) return;
     } catch (e) {
       // scan error — continue with others
     }
@@ -10324,76 +10379,23 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     })(),
     new Promise(resolve => setTimeout(resolve, 8000))
   ]);
+  if (!operationCurrent()) return null;
 
   // v2.4.2: 30s aggregate timeout wrapping all AppleScript + ag-psd queries
   await Promise.race([
     (async () => {
-  // v1.3.39 / v2.2.7: AppleScript query to Illustrator for linked files.
-  // The regex approach fails on modern .ai files because PDF 1.6 compresses object
-  // streams (FlateDecode), making linked paths unreadable from raw bytes.
-  // AppleScript bypasses this entirely by asking Illustrator directly.
-  // v2.2.7: Write AppleScript to temp file instead of inline osascript -e.
-  try {
-    const { stdout: aiPsCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Illustrator' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
-
-    if (aiPsCheck.trim()) {
-      const aiAppleScript = `tell application "Adobe Illustrator"
-  try
-    set pathList to {}
-    repeat with aDoc in documents
-      repeat with pItem in every placed item of aDoc
-        try
-          if linked of pItem is true then
-            set filePath to POSIX path of (file of pItem as alias)
-            set end of pathList to filePath
-          end if
-        end try
-      end repeat
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return pathList as text
-  on error errMsg
-    return ""
-  end try
-end tell`;
-
-      const { stdout: aiPaths } = await runOsascriptInPrivateTemp(
-        () => ({ 'crate-ai-scan.applescript': aiAppleScript }),
-        'crate-ai-scan.applescript',
-        { timeout: 10000, encoding: 'utf8' }
-      ).catch(() => ({ stdout: '' }));
-
-      if (aiPaths.trim()) {
-        for (const linkedPath of aiPaths.trim().split('\n')) {
-          const trimmed = linkedPath.trim();
-          if (!trimmed) continue;
-          if (isAutoCaptureExcludedPath(trimmed)) continue;
-          const normalizedTrimmed = normalizeTrackedFilePath(trimmed);
-          if (existingPaths.has(normalizedTrimmed) || pendingPaths.has(normalizedTrimmed)) continue;
-          if (!fs.existsSync(trimmed)) continue;
-          const ext = path.extname(trimmed).toLowerCase();
-          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-
-          const fileEntry = buildAutoCaptureFileEntry(trimmed, 'ai-linked', { ext });
-          const staged = stageLiveObservedFile(project, fileEntry, {
-            forcePending: true,
-            reason: 'pre-package-app-script-broad-observer',
-          });
-          if (!staged.changed) continue;
-          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
-            existingPaths.add(normalizedTrimmed);
-          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
-            pendingPaths.add(normalizedTrimmed);
-          }
-          newCount++;
-        }
+  const illustratorActivationToken = getActiveWatchingActivationToken(projectId);
+  if (illustratorActivationToken !== null) {
+    const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken); if (!operationCurrent()) return;
+    if (!illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
+      const scopeResult = updateIllustratorActivationScope(projectId, illustratorActivationToken, illustratorQuery, false); if (!scopeResult || !operation.adoptScope(scopeResult.scope) || !operationCurrent()) return;
+      if (scopeResult && scopeResult.ready) {
+        const records = createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }), refreshed = applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken); newCount += refreshed.stagedCount || 0;
+        project = getFreshActiveWatchingProject(projectId, illustratorActivationToken) || project;
+        for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
+        for (const file of project.pendingFiles || []) pendingPaths.add(normalizeTrackedFilePath(file.path));
       }
     }
-  } catch (e) {
-    // AppleScript failed or Illustrator not responding — fall through to regex
   }
 
   // v2.3.4: do javascript query to Photoshop for smart object / placed item paths.
@@ -10405,6 +10407,7 @@ end tell`;
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
+    if (!operationCurrent()) return;
 
     if (psPsCheck.trim()) {
       const { stdout: psPaths } = await runOsascriptInPrivateTemp(
@@ -10415,6 +10418,7 @@ end tell`;
         'crate-ps-scan.applescript',
         { timeout: 10000, encoding: 'utf8' }
       ).catch(() => ({ stdout: '' }));
+      if (!operationCurrent()) return;
 
       if (psPaths.trim()) {
         for (const trimmed of psPaths.split('\n').filter(Boolean)) {
@@ -10426,11 +10430,12 @@ end tell`;
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
           const fileEntry = buildAutoCaptureFileEntry(trimmed, 'psd-linked', { ext });
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             forcePending: true,
+            appFamily: 'photoshop',
             reason: 'pre-package-app-script-broad-observer',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedTrimmed);
           } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10450,16 +10455,18 @@ end tell`;
     const psdFiles = project.files.filter(f => f.ext === '.psd');
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
-      const psdAssets = await extractPsdAssets(psdFile.path, projectId);
+      const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
+      if (!operationCurrent()) return;
       for (const asset of psdAssets) {
         const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
         if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
         const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
-        const staged = stageLiveObservedFile(project, fileEntry, {
+        const staged = stagePrePackageFile(project, fileEntry, {
           relationshipSourcePath: psdFile.path,
+          appFamily: 'photoshop',
           reason: 'pre-package-psd-parser',
         });
-        if (!staged.changed) continue;
+        if (!staged || !staged.changed) continue;
         if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
           existingPaths.add(normalizedAssetPath);
         } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10479,6 +10486,7 @@ end tell`;
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(() => ({ stdout: '' }));
+    if (!operationCurrent()) return;
 
     if (inddPsCheck.trim()) {
       const inddAppleScript = `tell application "Adobe InDesign"
@@ -10504,6 +10512,7 @@ end tell`;
         'crate-indd-scan.applescript',
         { timeout: 10000, encoding: 'utf8' }
       ).catch(() => ({ stdout: '' }));
+      if (!operationCurrent()) return;
 
       if (inddPaths.trim()) {
         for (const linkedPath of inddPaths.trim().split('\n')) {
@@ -10517,11 +10526,12 @@ end tell`;
           if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
 
           const fileEntry = buildAutoCaptureFileEntry(trimmed, 'indd-linked', { ext });
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             forcePending: true,
+            appFamily: 'indesign',
             reason: 'pre-package-app-script-broad-observer',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPaths.add(normalizedTrimmed);
           } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -10537,6 +10547,7 @@ end tell`;
     })(),
     new Promise(resolve => setTimeout(resolve, 30000))
   ]);
+  if (!operationCurrent()) return null;
 
   // v1.3.24: Extract linked file paths from design files in the project.
   // Adobe/Affinity apps store absolute paths of linked/placed files as text
@@ -10555,6 +10566,7 @@ end tell`;
       try {
         if (!fs.existsSync(designFile.path)) continue;
         const buf = await fs.promises.readFile(designFile.path);
+        if (!operationCurrent()) return null;
         const content = buf.toString('utf8');
         let match;
         LINKED_ASSET_REGEX.lastIndex = 0;
@@ -10566,11 +10578,12 @@ end tell`;
           if (!fs.existsSync(linkedPath)) continue;
 
           const fileEntry = buildAutoCaptureFileEntry(linkedPath, 'linked-asset');
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             relationshipSourcePath: designFile.path,
+            appFamily: getExplicitCaptureAppFamily(designFile) || 'generic',
             reason: 'pre-package-linked-regex',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             linkExisting.add(normalizedLinkedPath);
             existingPaths.add(normalizedLinkedPath);
@@ -10599,6 +10612,7 @@ end tell`;
       try {
         if (!fs.existsSync(file.path)) continue;
         const linkedPaths = await extractLinkedAssets(file.path);
+        if (!operationCurrent()) return null;
         for (const lp of linkedPaths) {
           if (isAutoCaptureExcludedPath(lp)) continue;
           const normalizedLinkedPath = normalizeTrackedFilePath(lp);
@@ -10610,11 +10624,12 @@ end tell`;
           const fileEntry = buildAutoCaptureFileEntry(lp, 'pre-package-doublecheck', {
             ext: lpExt,
           });
-          const staged = stageLiveObservedFile(project, fileEntry, {
+          const staged = stagePrePackageFile(project, fileEntry, {
             relationshipSourcePath: file.path,
+            appFamily: getExplicitCaptureAppFamily(file) || 'generic',
             reason: 'pre-package-doublecheck',
           });
-          if (!staged.changed) continue;
+          if (!staged || !staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             existingPathsCheck.add(normalizedLinkedPath);
             existingPaths.add(normalizedLinkedPath);
@@ -10640,9 +10655,11 @@ end tell`;
   // added files via mutateProject during the scan. Using mutateProject here re-reads the
   // latest store state and merges in only the new files this scan discovered.
   if (newCount > 0) {
+    if (!operationCurrent()) return null;
     const scanFiles = project.files;
     const scanPending = project.pendingFiles || [];
     const merged = mutateProject(projectId, (proj) => {
+      if (!operationCurrent()) return null;
       const existingKeys = getTrackedFileKeySet(proj.files);
       const recoveredFilesForProvenance = [];
       for (const f of scanFiles) {
@@ -10680,12 +10697,14 @@ end tell`;
       }
       return { files: proj.files };
     });
+    if (!operationCurrent()) return null;
     if (merged) project.files = merged.files;
   }
 
   // Figma authoritative recovery pass for package-time scan.
   // Keeps local lsof/.fig heuristics as-is and supplements with cloud originals.
   try {
+    if (!operationCurrent()) return null;
     const ensuredSession = ensureProjectFigmaSession(projectId);
     const latestProject = getProjects().find(p => p.id === projectId) || project;
     const figmaSession = latestProject.figmaSession || ensuredSession || null;
@@ -10699,6 +10718,7 @@ end tell`;
     const safeTrackedFileSummaries = summarizeTrackedFigmaFilesForLog(rawTrackedFiles);
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
+      if (!operationCurrent()) return null;
       figmaPackageTransferBlocks.set(projectId, FIGMA_PACKAGE_TRANSFER_ERROR);
       const { FigmaParser } = require('./parsers/figma');
       const parser = new FigmaParser();
@@ -10718,6 +10738,7 @@ end tell`;
         fileKeys,
         scopeEntries: scanTrackedFiles
       });
+      if (!operationCurrent()) return null;
 
       mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
 
@@ -10730,9 +10751,13 @@ end tell`;
           ...asset,
           figmaScopeMode: getProjectFigmaScopeMode(latestProject)
         }));
-        const figmaAdded = await ingestFigmaAssetsIntoProject(projectId, project, scopedAssets, 'pre-package');
+        const figmaAdded = await ingestFigmaAssetsIntoProject(
+          projectId, project, scopedAssets, 'pre-package', operation.activationToken, operationCurrent
+        );
+        if (!operationCurrent()) return null;
         newCount += figmaAdded;
       }
+      if (!operationCurrent()) return null;
       if (didFigmaPrePackageScanSucceed(figmaScanResult, rawTrackedFiles)) {
         figmaPackageTransferBlocks.delete(projectId);
       } else {
@@ -10741,6 +10766,7 @@ end tell`;
       }
     }
   } catch (e) {
+    if (!operationCurrent()) return null;
     console.warn('[crate][figma] pre-package recovery failed:', redactFigmaLogText(e.message));
     if (figmaPackageTransferBlocks.has(projectId)) {
       figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
@@ -10748,14 +10774,17 @@ end tell`;
     }
   }
 
+  if (!operationCurrent()) return null;
   project.files = deduplicateFiles(project.files);
-
+  const finalProject = getProjects().find(item => item.id === projectId);
   return {
-    files: project.files,
+    files: getIllustratorScopedProjectView(finalProject).files,
     newCount,
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
+    if (!operation.current()) previousFigmaPackageBlock === undefined ? figmaPackageTransferBlocks.delete(projectId) : figmaPackageTransferBlocks.set(projectId, previousFigmaPackageBlock);
+    operation.close();
     // FIX 2 (C2): Always clear scan-in-flight flag
     scanInFlight.delete(projectId);
     scheduleDeletedProjectCacheCleanup(projectId);
@@ -11092,6 +11121,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         outputName = `${base} — ${outputName}`;
 
         const destPath = resolveUniquePackagePath(destFolder, outputName);
+        if (typeof options.onBeforeWrite === 'function') options.onBeforeWrite(destPath);
         fs.writeFileSync(destPath, data, { flag: 'wx' });
         extracted.push(destPath);
         if (typeof options.onExtracted === 'function') {
@@ -11109,6 +11139,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         }
         console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
       } catch (e) {
+        if (e instanceof PackageTransactionInvariantError) throw e;
         const message = formatEmbeddedMediaExtractionFailure(presentationPath, zipPath);
         console.error(`[crate] ${message}`);
         if (typeof options.onExtractionError === 'function') {
@@ -11125,6 +11156,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       }
     }
   } catch (e) {
+    if (e instanceof PackageTransactionInvariantError) throw e;
     const message = formatEmbeddedMediaInspectionFailure(presentationPath);
     console.error(`[crate] ${message}`);
     if (typeof options.onInspectionError === 'function') {
@@ -11208,7 +11240,7 @@ async function waitForPackageInputScans(projectId, timeoutMs = PACKAGE_SCAN_WAIT
   }
 }
 
-async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
+async function writeEmbeddedPsdAssetToPackage(file, finalPath, verifyWrite) {
   const parentPsd = file.parentPsd || file.path;
   if (!parentPsd || !packageSourceExists(parentPsd)) {
     throw new Error('Parent PSD not found');
@@ -11227,19 +11259,30 @@ async function writeEmbeddedPsdAssetToPackage(file, finalPath) {
     throw new Error('Embedded PSD asset not found');
   }
 
+  verifyWrite(finalPath);
   await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data), { flag: 'wx' });
 }
+
+class PackageTransactionInvariantError extends Error { constructor() { super('package_output_changed'); this.name = 'PackageTransactionInvariantError'; this.code = 'package_output_changed'; } } function createPackageWriteTransaction(destFolder, rootExisted) {
+  const root = path.resolve(destFolder), parent = path.dirname(root), parentReal = realpathSync(parent), identity = fs.lstatSync(root), intended = new Set(), isOriginal = candidate => { try { const stat = fs.lstatSync(candidate); return !stat.isSymbolicLink() && stat.isDirectory() && stat.dev === identity.dev && stat.ino === identity.ino; } catch (_) { return false; } };
+  const locate = () => { if (isOriginal(root)) return root; try { const stat = fs.lstatSync(parent); if (!stat.isSymbolicLink() && stat.isDirectory() && realpathSync(parent) === parentReal) for (const name of fs.readdirSync(parent)) { const candidate = path.join(parent, name); if (isOriginal(candidate)) return candidate; } } catch (_) {} return null; }, assertRoot = () => { if (!isOriginal(root)) throw new PackageTransactionInvariantError(); }, relativeFor = filePath => { const relative = path.relative(root, path.resolve(filePath)); if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new PackageTransactionInvariantError(); return relative; }, exists = relative => { const located = locate(); return !!located && fs.existsSync(path.join(located, relative)); };
+  return { assertRoot, track(filePath) { assertRoot(); const relative = relativeFor(filePath); intended.add(relative); return path.join(root, relative); }, verify(filePath) { assertRoot(); if (!intended.has(relativeFor(filePath))) throw new PackageTransactionInvariantError(); }, hasOutput(filePath) { return exists(relativeFor(filePath)); },
+    cleanup() { const located = locate(); if (!located) return false; let clean = true; for (const relative of [...intended].reverse()) { const target = path.join(located, relative); try { const stat = fs.lstatSync(target); if (!isPathInsideDirectory(realpathSync(located), realpathSync(path.dirname(target))) || (!stat.isFile() && !stat.isSymbolicLink())) clean = false; else fs.unlinkSync(target); } catch (e) { if (e.code !== 'ENOENT') clean = false; } if (!rootExisted) for (let dir = path.dirname(target); dir !== located; dir = path.dirname(dir)) try { const stat = fs.lstatSync(dir); if (stat.isSymbolicLink() || !stat.isDirectory() || !isPathInsideDirectory(realpathSync(located), realpathSync(dir))) { clean = false; break; } fs.rmdirSync(dir); } catch (e) { if (e.code !== 'ENOENT' && e.code !== 'ENOTEMPTY') clean = false; break; } } if (!rootExisted) try { fs.rmdirSync(located); } catch (_) { clean = false; } return clean && [...intended].every(relative => !exists(relative)); } }; }
 
 registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
   // C1: Prevent double-click / concurrent packaging
   if (packageInFlight) return { error: 'package_in_flight' };
   packageInFlight = true;
 
+  let packageActivation = null, packageWrites = null, failPackage = null;
   try {
+  packageActivation = captureProjectOperation(id); if (!packageActivation) return { error: 'not_found' };
+  const isPackageActivationCurrent = () => packageActivation.current(true);
   // Wait for in-flight pre-package and Figma scans to finish before selecting
   // package files. Large Figma pages can still be downloading when the user
   // clicks Package, and selecting too early yields a zero-file package.
   await waitForPackageInputScans(id);
+  if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
 
   const figmaPackageError = figmaPackageTransferBlocks.get(id);
   if (figmaPackageError) return { error: figmaPackageError };
@@ -11251,7 +11294,9 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
   const projects = getProjects();
   const project = projects.find(p => p.id === id);
   if (!project) return { error: 'not_found' };
+  if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
   const packageFiles = await selectProjectFilesForPackaging(project);
+  if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
 
   // Build folder name from naming template
   const settings = store.get('settings');
@@ -11265,6 +11310,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
     .replace('{Project}', cleanName(project.name))
     .replace('{Date}', dateStr);
 
+  const expectedDestFolder = path.resolve(path.resolve(outputPath), sanitizePackageFolderName(folderName)), destFolderExisted = fs.existsSync(expectedDestFolder);
   const destFolder = resolvePackageFolderInsideOutput(outputPath, folderName);
 
   try {
@@ -11275,14 +11321,18 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
       destFolder,
       createdAt: Date.now(),
     };
+    packageWrites = createPackageWriteTransaction(destFolder, destFolderExisted); failPackage = error => ({ error: packageWrites.cleanup() ? (error.code || error.message || error) : 'package_cleanup_failed' }); const abortStalePackage = () => isPackageActivationCurrent() ? null : failPackage('stale_activation');
 
     for (const file of packageFiles) {
+      const staleResult = abortStalePackage(); if (staleResult) return staleResult;
       const packageFileName = getPackageFileDisplayName(file);
+      let intendedPath = null;
       try {
         if (isScanOnSaveEmbeddedPsdFile(file)) {
           const safeName = sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName);
-          const finalPath = resolveUniquePackagePath(destFolder, safeName);
-          await writeEmbeddedPsdAssetToPackage(file, finalPath);
+          const finalPath = packageWrites.track(resolveUniquePackagePath(destFolder, safeName)); intendedPath = finalPath;
+          await writeEmbeddedPsdAssetToPackage(file, finalPath, packageWrites.verify);
+          const staleResult = abortStalePackage(); if (staleResult) return staleResult;
           packageProvenanceEvents.push({
             relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
             file,
@@ -11293,9 +11343,9 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
         }
 
         if (packageSourceExists(file.path)) {
-          const finalPath = copyFileIntoPackage(file.path, destFolder, packageFileName, {
-            fallbackName: packageFileName
-          });
+          assertSafeCopySource(file.path);
+          const finalPath = packageWrites.track(resolveUniquePackagePath(destFolder, packageFileName)); intendedPath = finalPath; packageWrites.verify(finalPath);
+          fs.copyFileSync(file.path, finalPath, fs.constants.COPYFILE_EXCL);
           packageProvenanceEvents.push({
             relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
             file,
@@ -11306,6 +11356,8 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
           errors.push(`File not found: ${packageFileName}`);
         }
       } catch (err) {
+        if (err instanceof PackageTransactionInvariantError) return failPackage(err);
+        if (intendedPath && packageWrites.hasOutput(intendedPath)) return failPackage('package_write_failed');
         errors.push(`Failed to copy ${packageFileName}: ${err.message}`);
       }
     }
@@ -11337,10 +11389,13 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
     }
 
     for (const { file } of presentationsByName.values()) {
+      const pendingMediaWrites = new Set();
       try {
         const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, packageFiles, {
           source: 'package-extraction',
+          onBeforeWrite: materializedPath => pendingMediaWrites.add(packageWrites.track(materializedPath)),
           onExtracted: (extraction) => {
+            pendingMediaWrites.delete(path.resolve(extraction.materializedPath));
             const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
             if (!resource) return;
             presentationExtractionEvents.push(extraction);
@@ -11365,23 +11420,28 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
             if (failure && failure.message) errors.push(failure.message);
           },
         });
+        if ([...pendingMediaWrites].some(filePath => packageWrites.hasOutput(filePath))) return failPackage('package_write_failed');
+        const staleResult = abortStalePackage(); if (staleResult) return staleResult;
         embeddedCount += embeddedFiles.length;
       } catch (embedErr) {
+        if (embedErr instanceof PackageTransactionInvariantError) return failPackage(embedErr);
+        if ([...pendingMediaWrites].some(filePath => packageWrites.hasOutput(filePath))) return failPackage('package_write_failed');
         // M7: Report embedded extraction errors so user sees 'X files packaged, Y errors'
         errors.push(`Could not inspect embedded media in ${getPackageFileDisplayName(file)}.`);
       }
     }
 
-    recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents);
-    recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
+    const staleResult = abortStalePackage(); if (staleResult) return staleResult;
     if (settings.includeDiagnosticReport === true) {
+      let manifestProject; try { manifestProject = structuredClone(project); recordPresentationMediaExtractionProvenanceForProject(manifestProject, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents, manifestProject); } catch (_) { manifestProject = project; }
+      packageWrites.track(path.join(destFolder, DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)); packageWrites.assertRoot();
       writePackageProvenanceManifest(id, packageProvenanceInfo, {
         copiedCount,
         embeddedCount,
         totalFiles: packageFiles.length,
         errors,
-      });
-    }
+      }, manifestProject, true);
+    } packageWrites.assertRoot(); recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
@@ -11420,13 +11480,12 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
       errors
     };
   } catch (err) {
+    if (failPackage) return failPackage(err);
     clearPackageAutoForegroundSuppression();
     showTrayWindow();
     return { error: err.message };
   }
-  } finally {
-    packageInFlight = false;
-  }
+  } finally { if (packageActivation) packageActivation.close(); packageInFlight = false; }
 });
 
 registerTrustedIpcHandler('projects:select-output', async () => {
@@ -11448,6 +11507,7 @@ registerTrustedIpcHandler('projects:select-output', async () => {
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
   stopWatching(id);
+  illustratorActivationScopes.delete(id);
   figmaPackageTransferBlocks.delete(id);
   let removed = false;
   const result = mutateProject(id, (project, projects) => {
@@ -11465,7 +11525,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
     });
   }
   // If project wasn't found, return current state
-  return result || getProjects();
+  return (result || getProjects()).map(getIllustratorScopedProjectView);
 });
 
 registerTrustedIpcHandler('projects:delete-all', () => {
@@ -11506,6 +11566,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   lastFileActivity.clear();
   inactivityNotified.clear();
   watchingActivationTokens.clear();
+  illustratorActivationScopes.clear();
   designAppRunningCache.clear(); // v2.4.2
   // v2.2.2: Clean up scan-on-open state
   scannedDesignFiles.clear();
@@ -11690,7 +11751,7 @@ registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
 
 // Get Figma assets count for a specific project
 registerTrustedIpcHandler('figma:project-assets', async (event, projectId) => {
-  const project = getProjects().find(p => p.id === projectId);
+  const project = getIllustratorScopedProjectView(getProjects().find(p => p.id === projectId));
   if (!project) {
     return { count: 0, assets: [] };
   }
