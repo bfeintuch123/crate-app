@@ -7337,6 +7337,81 @@ test('Illustrator baseline document stays excluded until Add files admits its so
   assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath && file.source === 'ai-linked'), true);
 });
 
+for (const projectState of ['watching', 'paused']) {
+  test(`Add files explicitly authorizes a hidden same-path Illustrator record for a ${projectState} project`, async () => {
+    resetTestHomeWorkspace();
+    const sourcePath = path.join(TEST_HOME, 'Desktop', `Hidden_Same_Path_${projectState}.ai`);
+    const outputDir = path.join(TEST_HOME, 'Desktop', `hidden-same-path-${projectState}-package`);
+    fs.writeFileSync(sourcePath, `${projectState} source bytes`);
+    fs.mkdirSync(outputDir, { recursive: true });
+    let queryCount = 0;
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '876\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+        queryCount++;
+        return {
+          stdout: `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\nCOMPLETE\t1\t0\n`,
+        };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject(`Hidden same path ${projectState}`);
+    await waitForProject(project.id, () => queryCount >= 1, 5000);
+    if (projectState === 'paused') await callIpc('projects:pause', project.id);
+
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const { file: discoveredFile } = seedScopedRendererCandidate(stored, sourcePath, {
+      appFamily: 'illustrator',
+      source: 'app-opened',
+      includePending: false,
+    });
+    stored.files.push(discoveredFile);
+    const originalObservationId = `scoped-renderer-observation-${createNodeId(NODE_TYPES.FILE, {
+      normalizedPath: normalizeLedgerPathForTest(sourcePath),
+    })}`;
+
+    let view = await getProject(project.id);
+    assert.equal(view.files.some(file => file.path === sourcePath), false);
+
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const persisted = storeInstance.data.projects.find(item => item.id === project.id);
+    const authorizedRecords = persisted.files.filter(file => file.path === sourcePath);
+    assert.equal(authorizedRecords.length, 1);
+    assert.equal(authorizedRecords[0].source, 'app-opened');
+    assert.equal(authorizedRecords[0].captureEvidence.appFamily, 'illustrator');
+    assert.deepEqual(authorizedRecords[0].explicitUserAuthority, {
+      granted: true,
+      source: 'manual-browse',
+      method: 'projects:add-files',
+      grantedAt: authorizedRecords[0].explicitUserAuthority.grantedAt,
+    });
+    assert.equal(Number.isFinite(authorizedRecords[0].explicitUserAuthority.grantedAt), true);
+    assert.ok(persisted.provenance.observations.some(observation => observation.id === originalObservationId));
+    const manualObservations = getSessionObservedByMethod(persisted, 'projects:add-files')
+      .filter(observation => observation.objectNodeId === createNodeId(NODE_TYPES.FILE, {
+        normalizedPath: normalizeLedgerPathForTest(sourcePath),
+      }));
+    assert.equal(manualObservations.length, 1);
+    assert.equal(manualObservations[0].observer.kind, OBSERVER_KINDS.MANUAL_USER_ACTION);
+    assert.equal(manualObservations[0].payload.authoritySource, 'manual-browse');
+
+    view = await getProject(project.id);
+    assert.equal(view.files.some(file => file.path === sourcePath), true);
+    assert.ok(view.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(sourcePath)]);
+    assert.ok(view.provenance.observations.some(observation => observation.id === originalObservationId));
+    assert.equal(getSessionObservedByMethod(view, 'projects:add-files').length, 1);
+
+    const packageResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(packageResult);
+    assert.equal(packageResult.success, true);
+    assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(sourcePath))), true);
+  });
+}
+
 test('Illustrator Add files during activation admits an old-project source and its links', async () => {
   resetTestHomeWorkspace();
   const oldSource = path.join(TEST_HOME, 'Desktop', 'Reusable_Old_Project.ai');
