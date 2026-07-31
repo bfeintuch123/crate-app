@@ -15,6 +15,7 @@ const {
   EDGE_TYPES,
   OBSERVER_KINDS,
   CONFIDENCE_BANDS,
+  createNodeId,
 } = require('../provenance');
 
 const originalSetInterval = global.setInterval;
@@ -111,6 +112,7 @@ let testAppVersion = packageJson.version;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
 const testNotifications = [];
+const testRendererEvents = [];
 const trustedRendererMainFrame = {
   url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
 };
@@ -131,7 +133,7 @@ const trustedRendererWindow = {
   webContents: {
     handlers: new Map(),
     mainFrame: trustedRendererMainFrame,
-    send: () => {},
+    send: (channel, data) => { testRendererEvents.push({ channel, data }); },
     on(channel, fn) { this.handlers.set(channel, fn); },
     once(channel, fn) { this.handlers.set(channel, fn); },
     setWindowOpenHandler(fn) { this.windowOpenHandler = fn; },
@@ -252,6 +254,7 @@ class FakeStore {
 setStub('electron-store', () => FakeStore);
 
 const watcherRecords = [];
+let testUuidCounter = 0;
 setStub('chokidar', () => ({
   watch: () => {
     const handlers = {};
@@ -269,12 +272,27 @@ setStub('chokidar', () => ({
   },
 }));
 
-setStub('node-fetch', () => async () => ({ ok: false, status: 500, json: async () => ({}) }));
+let testFetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
+setStub('node-fetch', () => (...args) => testFetchHandler(...args));
 
 let childProcessHandler = null;
 
 function setChildProcessHandler(handler) {
   childProcessHandler = handler;
+}
+
+function setIllustratorOpenedAfterActivationHandler(handler, activationQueries = 1) {
+  let remainingActivationQueries = activationQueries;
+  setChildProcessHandler(request => {
+    if (
+      remainingActivationQueries > 0 &&
+      isOsascriptInvocation(request, 'crate-ai-active-session.applescript')
+    ) {
+      remainingActivationQueries--;
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return handler(request);
+  });
 }
 
 function commandText(command, args = []) {
@@ -423,7 +441,7 @@ let currentPsdFixture = { children: [], linkedFiles: [] };
 setStub('ag-psd', () => ({ readPsd: () => currentPsdFixture }));
 setStub('crypto', () => ({
   ...crypto,
-  randomUUID: () => `00000000-0000-4000-8000-${String(watcherRecords.length + 1).padStart(12, '0')}`,
+  randomUUID: () => `00000000-0000-4000-8000-${String(++testUuidCounter).padStart(12, '0')}`,
 }));
 
 require(path.resolve(__dirname, '..', 'main.js'));
@@ -494,8 +512,7 @@ function makePendingFile(filePath, source = 'lastused-scan') {
 }
 
 async function setProjectFiles(projectId, { files = [], pendingFiles = [], liveEvidenceLedger } = {}) {
-  const projects = await callIpc('projects:get-all');
-  const project = projects.find(item => item.id === projectId);
+  const project = storeInstance.data.projects.find(item => item.id === projectId);
   assert.ok(project, 'expected project to exist');
   project.files = files;
   project.pendingFiles = pendingFiles;
@@ -691,6 +708,61 @@ function makeLiveEvidenceLedgerEntry(filePath, captureState, observedAtMs, overr
   }];
 }
 
+function seedScopedRendererCandidate(project, filePath, {
+  appFamily = 'illustrator',
+  source = 'ai-linked',
+  includePending = true,
+} = {}) {
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, {
+    normalizedPath: normalizeLedgerPathForTest(filePath),
+  });
+  const sessionNodeId = Object.keys(project.provenance.nodes)
+    .find(nodeId => project.provenance.nodes[nodeId].type === NODE_TYPES.SESSION);
+  const file = {
+    ...makePendingFile(filePath, source),
+    captureEvidence: {
+      appFamily,
+      observerMethod: appFamily === 'illustrator' ? 'illustrator-active-session' : `${appFamily}-test`,
+    },
+  };
+  if (includePending) project.pendingFiles.push(file);
+  project.liveEvidenceLedger = project.liveEvidenceLedger || { schemaVersion: 1, candidates: {} };
+  project.liveEvidenceLedger.candidates = project.liveEvidenceLedger.candidates || {};
+  Object.assign(project.liveEvidenceLedger.candidates, Object.fromEntries([
+    makeLiveEvidenceLedgerEntry(filePath, 'pending', Date.now(), {
+      latest: {
+        source,
+        observerMethod: file.captureEvidence.observerMethod,
+        appFamily,
+      },
+    }),
+  ]));
+  project.provenance.nodes[fileNodeId] = {
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: filePath,
+    normalizedPath: normalizeLedgerPathForTest(filePath),
+  };
+  const edgeId = `scoped-renderer-edge-${fileNodeId}`;
+  project.provenance.edges[edgeId] = {
+    id: edgeId,
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: fileNodeId,
+  };
+  project.provenance.observations.push({
+    id: `scoped-renderer-observation-${fileNodeId}`,
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: fileNodeId,
+    observer: {
+      kind: OBSERVER_KINDS.APP_SCRIPT,
+      method: file.captureEvidence.observerMethod,
+    },
+  });
+  return { file, fileNodeId };
+}
+
 async function captureConsoleDuring(fn) {
   const originals = {
     log: console.log,
@@ -799,6 +871,650 @@ function assertPackageResultShape(result) {
     'success',
     'totalFiles',
   ]);
+}
+
+async function assertPackageActivationDriftFailsClosed(scenario, mutateActivation) {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject(`Package drift ${scenario}`);
+    const parentPsd = path.join(tmpRoot, `${scenario}.psd`);
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(parentPsd, 'parent PSD bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{
+        name: `${scenario}.png`,
+        data: Buffer.from(`${scenario} embedded bytes`),
+      }],
+    };
+    await setProjectFiles(project.id, {
+      files: [
+        {
+          path: parentPsd,
+          name: `${scenario}.png`,
+          ext: '.png',
+          addedAt: Date.now(),
+          source: 'scan-on-save-embedded',
+          embedded: true,
+          parentPsd,
+          embeddedOriginalName: `${scenario}.png`,
+          embeddedIndex: 0,
+          fileId: `${scenario}-embedded`,
+        },
+      ],
+    });
+    const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+    const packagePath = packageFolder(outputDir, `Package drift ${scenario}`);
+    let releaseWrite;
+    let markWriteStarted;
+    let deferred = true;
+    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
+    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
+    fs.promises.writeFile = async function deferredPackageWrite(filePath, ...args) {
+      if (
+        deferred &&
+        path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)
+      ) {
+        deferred = false;
+        markWriteStarted();
+        await writeGate;
+      }
+      return originalWriteFile.call(fs.promises, filePath, ...args);
+    };
+
+    const packagePromise = callIpc('projects:package', project.id, outputDir);
+    const firstResult = await Promise.race([
+      writeStarted.then(() => null),
+      packagePromise,
+    ]);
+    assert.equal(firstResult, null, `package completed before deferred write: ${JSON.stringify(firstResult)}`);
+    await mutateActivation(project);
+    testRendererEvents.length = 0;
+    releaseWrite();
+    const result = await packagePromise;
+
+    assert.deepEqual(result, { error: 'stale_activation' });
+    assert.equal(fs.existsSync(packagePath), false);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+    assert.equal(
+      getProvenanceEdges(storedProject, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
+      0
+    );
+    assert.equal(
+      getProvenanceEdges(storedProject, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length,
+      0
+    );
+    assert.notEqual(storedProject.status, 'packaged');
+    assert.equal(storedProject.packagedAt == null, true);
+    assert.equal(storedProject.outputPath == null, true);
+    assert.equal(
+      testRendererEvents.some(entry => entry.channel === 'project:updated'),
+      false
+    );
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+async function assertPackageScopePollBehavior(semanticChange) {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let releaseWrite = () => {};
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const label = semanticChange ? 'same-token scope drift' : 'unchanged poll';
+    const project = await createProject(`Package ${label}`);
+    const parentPsd = path.join(tmpRoot, 'scope-poll.psd');
+    const changedSource = path.join(tmpRoot, 'scope-poll.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(parentPsd, 'parent PSD bytes');
+    fs.writeFileSync(changedSource, 'Illustrator bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'scope-poll.png', data: Buffer.from('embedded bytes') }],
+    };
+    await setProjectFiles(project.id, {
+      files: [{
+        path: parentPsd,
+        name: 'scope-poll.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        parentPsd,
+        embeddedOriginalName: 'scope-poll.png',
+        embeddedIndex: 0,
+        fileId: 'scope-poll-embedded',
+      }],
+    });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const packagePath = packageFolder(outputDir, `Package ${label}`);
+    let markWriteStarted;
+    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
+    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
+    fs.promises.writeFile = async function deferredScopeWrite(filePath, ...args) {
+      if (path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)) {
+        markWriteStarted();
+        await writeGate;
+      }
+      return originalWriteFile.call(fs.promises, filePath, ...args);
+    };
+
+    const packagePromise = callIpc('projects:package', project.id, outputDir);
+    await writeStarted;
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+        return {
+          stdout: semanticChange
+            ? `DOC\t${changedSource}\t${path.basename(changedSource)}\tfalse\ttrue\nCOMPLETE\t1\t0\n`
+            : 'STATUS\tno-documents\nCOMPLETE\t0\t0\n',
+        };
+      }
+      return { stdout: '' };
+    });
+    await runTrackedIntervalCallbacks();
+    releaseWrite();
+    const result = await packagePromise;
+
+    if (semanticChange) {
+      assert.deepEqual(result, { error: 'stale_activation' });
+      assert.equal(fs.existsSync(packagePath), false);
+      assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+      assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+      assert.notEqual(stored.status, 'packaged');
+      return;
+    }
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(fs.existsSync(path.join(packagePath, 'scope-poll.png')), true);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+    assert.equal(stored.status, 'packaged');
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    releaseWrite();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+async function assertStalePsdExtractionLeavesNoInvocationFiles(scenario) {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let releaseLaterWrite = () => {};
+  let extractDir = null;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const otherProject = scenario === 'B-A-B'
+      ? await createProject('Stale PSD extraction A')
+      : null;
+    const project = await createProject(`Stale PSD extraction ${scenario}`);
+    const psdPath = path.join(tmpRoot, `${scenario}.psd`);
+    extractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+    fs.writeFileSync(psdPath, 'psd bytes');
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [
+        { name: 'earlier.png', data: Buffer.from('earlier invocation bytes') },
+        { name: 'later.png', data: Buffer.from('later invocation bytes') },
+      ],
+    };
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: path.basename(psdPath),
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const persistedBefore = structuredClone({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    });
+    let extractionWriteCount = 0;
+    let markLaterWriteFinished;
+    const laterWriteFinished = new Promise(resolve => { markLaterWriteFinished = resolve; });
+    const laterWriteGate = new Promise(resolve => { releaseLaterWrite = resolve; });
+    fs.promises.writeFile = async function deferAfterPsdExtractionWrite(filePath, ...args) {
+      if (path.dirname(path.resolve(filePath)) === path.resolve(extractDir)) {
+        extractionWriteCount++;
+        await originalWriteFile.call(fs.promises, filePath, ...args);
+        if (extractionWriteCount === 2) {
+          markLaterWriteFinished();
+          await laterWriteGate;
+          return;
+        }
+      } else {
+        return originalWriteFile.call(fs.promises, filePath, ...args);
+      }
+    };
+
+    testRendererEvents.length = 0;
+    const scanPromise = callIpc('projects:pre-package-scan', project.id);
+    await laterWriteFinished;
+    if (scenario === 'pause') await callIpc('projects:pause', project.id);
+    if (scenario === 'delete') await callIpc('projects:delete', project.id);
+    if (scenario === 'B-A-B') {
+      await callIpc('projects:start-watching', otherProject.id);
+      await callIpc('projects:start-watching', project.id);
+    }
+    testRendererEvents.length = 0;
+    releaseLaterWrite();
+    const result = await scanPromise;
+
+    assert.equal(result, null);
+    assert.deepEqual(fs.existsSync(extractDir) ? fs.readdirSync(extractDir) : [], []);
+    assert.deepEqual({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    }, persistedBefore);
+    assert.equal(JSON.stringify(testRendererEvents).includes(extractDir), false);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    releaseLaterWrite();
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+async function assertPackageRootReplacementFailsClosed(lane, replacement) {
+  resetTestHomeWorkspace();
+  const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile;
+  let releaseWrite = () => {};
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const projectName = `Package root ${lane} ${replacement}`;
+    const project = await createProject(projectName);
+    const outputDir = path.join(tmpRoot, 'out');
+    const packagePath = packageFolder(outputDir, projectName);
+    const movedRoot = path.join(outputDir, 'moved-package-root');
+    const replacementRoot = path.join(outputDir, 'replacement-target');
+    const regularPath = path.join(tmpRoot, 'already-copied.txt');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(regularPath, 'transaction-owned copy');
+    const files = [{
+      path: regularPath,
+      name: path.basename(regularPath),
+      ext: '.txt',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }];
+
+    let markWriteStarted;
+    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
+    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
+    if (lane === 'psd') {
+      const parentPsd = path.join(tmpRoot, 'deferred.psd');
+      fs.writeFileSync(parentPsd, 'PSD bytes');
+      currentPsdFixture = {
+        children: [],
+        linkedFiles: [{ name: 'deferred.png', data: Buffer.from('embedded transaction bytes') }],
+      };
+      files.push({
+        path: parentPsd,
+        name: 'deferred.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        parentPsd,
+        embeddedOriginalName: 'deferred.png',
+        embeddedIndex: 0,
+        fileId: 'deferred-root-embedded',
+      });
+      fs.promises.readFile = async function deferredPsdRead(filePath, ...args) {
+        if (path.resolve(filePath) === path.resolve(parentPsd)) {
+          markWriteStarted();
+          await writeGate;
+        }
+        return originalReadFile.call(fs.promises, filePath, ...args);
+      };
+      setChildProcessHandler(() => ({ stdout: '' }));
+    } else {
+      const presentationPath = path.join(tmpRoot, 'Deck.pptx');
+      fs.writeFileSync(presentationPath, 'presentation bytes');
+      files.push({
+        path: presentationPath,
+        name: path.basename(presentationPath),
+        ext: '.pptx',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      });
+      setChildProcessHandler(({ kind, command, args }) => {
+        if (kind === 'execFile' && command === '/usr/bin/unzip' && args[0] === '-l') {
+          return {
+            stdout: [
+              'Archive: Deck.pptx',
+              '  Length      Date    Time    Name',
+              '---------  ---------- -----   ----',
+              '     2048  07-31-2026 12:00   ppt/media/image1.png',
+              '---------                     -------',
+            ].join('\n'),
+          };
+        }
+        if (kind === 'execFile' && command === '/usr/bin/unzip' && args[0] === '-p') {
+          markWriteStarted();
+          return writeGate.then(() => ({ stdout: Buffer.from('presentation transaction bytes') }));
+        }
+        return { stdout: '' };
+      });
+    }
+    await setProjectFiles(project.id, { files });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+
+    const packagePromise = callIpc('projects:package', project.id, outputDir);
+    await writeStarted;
+    fs.renameSync(packagePath, movedRoot);
+    if (replacement === 'symlink') {
+      fs.mkdirSync(replacementRoot);
+      fs.symlinkSync(replacementRoot, packagePath, 'dir');
+    } else {
+      fs.mkdirSync(packagePath);
+    }
+    testRendererEvents.length = 0;
+    releaseWrite();
+    const result = await packagePromise;
+
+    assert.deepEqual(result, { error: 'package_output_changed' });
+    for (const root of [packagePath, movedRoot, replacementRoot]) {
+      for (const fileName of ['already-copied.txt', 'deferred.png', 'Deck.pptx', 'Deck — image1.png']) {
+        assert.equal(fs.existsSync(path.join(root, fileName)), false, `${root}/${fileName} must be absent`);
+      }
+    }
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+    assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
+    assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.notEqual(stored.status, 'packaged');
+    assert.equal(stored.packagedAt == null, true);
+    assert.equal(stored.outputPath == null, true);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseWrite();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+async function assertPrePackageAwaitRaceFailsClosed(awaitPoint, race) {
+  resetTestHomeWorkspace();
+  const originalReadFile = fs.promises.readFile;
+  let releaseAwait = () => {};
+  let restoreFigmaParser = null;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject(`Prepackage ${awaitPoint} ${race}`);
+    const candidatePath = path.join(TEST_HOME, 'Desktop', `${awaitPoint}-${race}-candidate.png`);
+    const sourceExtension = awaitPoint === 'psd-parser' ? '.psd' : '.ai';
+    const sourcePath = path.join(TEST_HOME, 'Desktop', `${awaitPoint}-${race}-source${sourceExtension}`);
+    const scopeDriftPath = path.join(TEST_HOME, 'Desktop', `.scope-drift-${awaitPoint}.ai`);
+    fs.writeFileSync(candidatePath, `${awaitPoint} candidate bytes`);
+    fs.writeFileSync(sourcePath, `${sourcePath}\n${candidatePath}\n`);
+    fs.writeFileSync(scopeDriftPath, 'scope drift source bytes');
+    if (awaitPoint === 'metadata') {
+      fs.writeFileSync(
+        path.join(TEST_HOME, 'Desktop', `${awaitPoint}-${race}-metadata.svg`),
+        'metadata candidate bytes'
+      );
+    } else if (awaitPoint === 'psd-parser' || awaitPoint === 'linked-file') {
+      await setProjectFiles(project.id, {
+        files: [{
+          path: sourcePath,
+          name: path.basename(sourcePath),
+          ext: sourceExtension,
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        }],
+      });
+    }
+    if (awaitPoint === 'psd-parser') {
+      currentPsdFixture = {
+        children: [{ linkedFile: { fullPath: candidatePath } }],
+        linkedFiles: [],
+      };
+    }
+
+    let markAwaitStarted;
+    const awaitStarted = new Promise(resolve => { markAwaitStarted = resolve; });
+    const awaitGate = new Promise(resolve => { releaseAwait = resolve; });
+    let gateUsed = false;
+    const gateResult = async (result) => {
+      if (!gateUsed) {
+        gateUsed = true;
+        markAwaitStarted();
+        await awaitGate;
+      }
+      return result;
+    };
+    if (awaitPoint === 'figma') {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      stored.figmaSession = {
+        startedAt: stored.watchStartedAt,
+        scopeMode: 'current-page',
+        teamIds: [],
+        warnings: [],
+        trackedFiles: [{
+          key: 'same-token-figma-file',
+          lockStatus: 'locked',
+          lockedPageId: '1:1',
+          lockedPageName: 'Page 1',
+        }],
+      };
+      const { FigmaParser } = require('../parsers/figma');
+      class DeferredFigmaParser extends FigmaParser {
+        async autoTrackScan() {
+          return gateResult({
+            assets: [],
+            errors: [],
+            scopeEntries: [{
+              fileKey: 'same-token-figma-file',
+              primaryKey: 'same-token-figma-file',
+              fileFetchStatus: 'success',
+              assetFetchStatus: 'success',
+              lockStatus: 'locked',
+              lockedPageId: '1:1',
+              lockedPageName: 'Page 1',
+            }],
+          });
+        }
+      }
+      setStub('./parsers/figma', () => ({ FigmaParser: DeferredFigmaParser }));
+      restoreFigmaParser = () => STUBS.delete('./parsers/figma');
+    }
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
+      if (
+        awaitPoint === 'metadata' &&
+        kind === 'execFile' &&
+        command === '/usr/bin/mdls'
+      ) {
+        return gateResult({ stdout: new Date(Date.now() + 1000).toISOString() });
+      }
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return { stdout: awaitPoint === 'photoshop' ? 'Adobe Photoshop\n' : '' };
+      }
+      if (
+        awaitPoint === 'photoshop' &&
+        isOsascriptInvocation({ kind, command, args }, 'crate-ps-scan.applescript')
+      ) {
+        return gateResult({ stdout: `${candidatePath}\n` });
+      }
+      if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+        return { stdout: awaitPoint === 'indesign' ? 'Adobe InDesign\n' : '' };
+      }
+      if (
+        awaitPoint === 'indesign' &&
+        isOsascriptInvocation({ kind, command, args }, 'crate-indd-scan.applescript')
+      ) {
+        return gateResult({ stdout: `${candidatePath}\n` });
+      }
+      return { stdout: '' };
+    });
+    if (awaitPoint === 'psd-parser' || awaitPoint === 'linked-file') {
+      fs.promises.readFile = async function gatedPrePackageRead(filePath, ...args) {
+        if (!gateUsed && path.resolve(filePath) === path.resolve(sourcePath)) {
+          await gateResult(null);
+        }
+        return originalReadFile.call(fs.promises, filePath, ...args);
+      };
+    }
+
+    const scanPromise = callIpc('projects:pre-package-scan', project.id);
+    const firstResult = await Promise.race([awaitStarted.then(() => null), scanPromise]);
+    assert.equal(firstResult, null, `${awaitPoint}/${race} scan completed before deferred await`);
+    if (race === 'same-token') {
+      manualDialogFor([scopeDriftPath]);
+      await callIpc('projects:add-files', project.id);
+    } else if (race === 'pause') {
+      await callIpc('projects:pause', project.id);
+    } else if (race === 'delete') {
+      await callIpc('projects:delete', project.id);
+    } else {
+      const other = await createProject(`Prepackage ${awaitPoint} switch`);
+      await callIpc('projects:start-watching', project.id);
+      assert.equal((await getProject(other.id)).status, 'paused');
+    }
+    testRendererEvents.length = 0;
+    releaseAwait();
+    const result = await scanPromise;
+
+    assert.equal(result, null, `${awaitPoint}/${race} must not return a stale scan payload`);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    if (stored) {
+      assert.equal(
+        [...stored.files, ...(stored.pendingFiles || [])].some(file => file.path === candidatePath),
+        false,
+        `${awaitPoint}/${race} must not stage the stale candidate`
+      );
+      assert.equal(
+        JSON.stringify(stored.provenance || {}).includes(candidatePath),
+        false,
+        `${awaitPoint}/${race} must not record stale provenance`
+      );
+    }
+    assert.equal(
+      testRendererEvents.some(entry => entry.data && entry.data.projectId === project.id),
+      false,
+      `${awaitPoint}/${race} must not emit stale renderer state`
+    );
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    if (restoreFigmaParser) restoreFigmaParser();
+    releaseAwait();
+  }
+}
+
+async function assertAcceptPendingScanRaceFailsClosed(parserLane, race) {
+  resetTestHomeWorkspace();
+  const fixtureRoot = path.join(
+    path.resolve(__dirname, '..'),
+    `test-accept-${parserLane}-${race}`
+  );
+  const originalReadFile = fs.promises.readFile;
+  const originalStat = fs.promises.stat;
+  const originalAccess = fs.promises.access;
+  let releaseParse = () => {};
+  let psdExtractDir = null;
+  try {
+    fs.mkdirSync(fixtureRoot, { recursive: true });
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject(`Accept ${parserLane} ${race}`);
+    const sourceExt = parserLane === 'psd' ? '.psd' : '.indd';
+    const sourcePath = path.join(fixtureRoot, `accepted-source${sourceExt}`);
+    psdExtractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+    const bootstrapLinkedPath = `/Users/crate-test/${parserLane}-${race}-bootstrap.png`;
+    const candidatePath = parserLane === 'psd'
+      ? path.join(psdExtractDir, 'psd-candidate.png')
+      : `/Users/crate-test/${parserLane}-${race}-candidate.png`;
+    fs.writeFileSync(
+      sourcePath,
+      `linked reference ${parserLane === 'linked' ? candidatePath : bootstrapLinkedPath}`
+    );
+    if (parserLane === 'psd') {
+      currentPsdFixture = {
+        children: [],
+        linkedFiles: [{ name: 'psd-candidate.png', data: Buffer.from('embedded candidate bytes') }],
+      };
+    }
+    await setProjectFiles(project.id, {
+      pendingFiles: [makePendingFile(sourcePath)],
+    });
+
+    let sourceStats = 0;
+    let markParseStarted;
+    const parseStarted = new Promise(resolve => { markParseStarted = resolve; });
+    const parseGate = new Promise(resolve => { releaseParse = resolve; });
+    fs.promises.readFile = async function deferredAcceptedSourceRead(filePath, ...args) {
+      if (parserLane === 'linked' && path.resolve(filePath) === path.resolve(sourcePath)) {
+        markParseStarted();
+        await parseGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+    fs.promises.stat = async function deferredAcceptedSourceStat(filePath, ...args) {
+      if (parserLane === 'psd' && path.resolve(filePath) === path.resolve(sourcePath)) {
+        sourceStats++;
+        if (sourceStats === 2) {
+          markParseStarted();
+          await parseGate;
+        }
+      }
+      return originalStat.call(fs.promises, filePath, ...args);
+    };
+    fs.promises.access = async function acceptedLinkedCandidateAccess(filePath, ...args) {
+      if (filePath === candidatePath || filePath === bootstrapLinkedPath) return;
+      return originalAccess.call(fs.promises, filePath, ...args);
+    };
+
+    const acceptPromise = callIpc('projects:accept-pending', project.id, sourcePath);
+    await parseStarted;
+    if (race === 'pause') {
+      await callIpc('projects:pause', project.id);
+    } else if (race === 'delete') {
+      await callIpc('projects:delete', project.id);
+    } else {
+      await createProject(`Accept ${parserLane} switch`);
+      await callIpc('projects:start-watching', project.id);
+    }
+    testRendererEvents.length = 0;
+    releaseParse();
+    const result = await acceptPromise;
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+
+    assert.equal(result, null, `${parserLane}/${race} must not return stale accepted state`);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    if (stored) {
+      assert.equal(
+        [...stored.files, ...(stored.pendingFiles || [])].some(file => file.path === candidatePath),
+        false,
+        `${parserLane}/${race} must not stage parser output`
+      );
+      assert.equal(JSON.stringify(stored.provenance || {}).includes(candidatePath), false);
+    }
+    assert.equal(
+      testRendererEvents.some(entry => entry.data && entry.data.projectId === project.id),
+      false,
+      `${parserLane}/${race} must not emit stale parser state`
+    );
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    fs.promises.access = originalAccess;
+    releaseParse();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    if (psdExtractDir) fs.rmSync(psdExtractDir, { recursive: true, force: true });
+  }
 }
 
 test('mac build metadata declares Apple Events usage and preserves Automation entitlement', () => {
@@ -1000,6 +1716,7 @@ function assertPsdParserEdge(project, relationType, objectType, source) {
 
 test.afterEach(async () => {
   childProcessHandler = null;
+  testFetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   nextOpenDialogResult = { canceled: true };
   currentPsdFixture = { children: [], linkedFiles: [] };
   if (storeInstance) {
@@ -1020,6 +1737,7 @@ test.afterEach(async () => {
   testMainWindowShowCount = 0;
   testNotifications.length = 0;
   watcherRecords.length = 0;
+  testUuidCounter = 0;
   clearTrackedTimers();
 });
 
@@ -2641,6 +3359,124 @@ test('PowerPoint provenance stays internal when diagnostic report is disabled', 
   }
 });
 
+test('diagnostic manifest package transaction preserves normal modes and fails closed after a partial FD write', async () => {
+  const tmpRoot = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const sourcePath = path.join(tmpRoot, 'diagnostic-source.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'diagnostic source bytes');
+    storeInstance.set('usage.packagesThisMonth', 0);
+
+    const packageDiagnosticProject = async (projectName, includeDiagnosticReport) => {
+      const project = await createProject(projectName);
+      await setProjectFiles(project.id, {
+        files: [{
+          path: sourcePath,
+          name: path.basename(sourcePath),
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        }],
+      });
+      await callIpc('settings:update', 'includeDiagnosticReport', includeDiagnosticReport);
+      return {
+        project,
+        result: await callIpc('projects:package', project.id, outputDir),
+      };
+    };
+
+    const disabled = await packageDiagnosticProject('Diagnostic transaction disabled', false);
+    assertPackageResultShape(disabled.result);
+    assert.equal(disabled.result.success, true);
+    assert.equal(fs.existsSync(manifestPath(outputDir, 'Diagnostic transaction disabled')), false);
+    assert.equal(
+      fs.readFileSync(
+        path.join(packageFolder(outputDir, 'Diagnostic transaction disabled'), path.basename(sourcePath)),
+        'utf8'
+      ),
+      'diagnostic source bytes'
+    );
+    let fresh = await getProject(disabled.project.id);
+    assert.equal(fresh.status, 'packaged');
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+
+    const enabled = await packageDiagnosticProject('Diagnostic transaction enabled', true);
+    assertPackageResultShape(enabled.result);
+    assert.equal(enabled.result.success, true);
+    assert.equal(readManifest(outputDir, 'Diagnostic transaction enabled').schemaVersion, 2);
+    fresh = await getProject(enabled.project.id);
+    assert.equal(fresh.status, 'packaged');
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 2);
+
+    const failingName = 'Diagnostic transaction partial FD failure';
+    const failingProject = await createProject(failingName);
+    await setProjectFiles(failingProject.id, {
+      files: [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const failingManifestPath = manifestPath(outputDir, failingName);
+    let manifestFd = null;
+    let injectedFailure = false;
+    fs.openSync = function captureManifestFd(filePath, ...args) {
+      const fd = originalOpenSync.call(fs, filePath, ...args);
+      if (typeof filePath === 'string' && path.resolve(filePath) === path.resolve(failingManifestPath)) {
+        manifestFd = fd;
+      }
+      return fd;
+    };
+    fs.writeFileSync = function partialManifestFdWrite(file, ...args) {
+      if (!injectedFailure && typeof file === 'number' && file === manifestFd) {
+        injectedFailure = true;
+        originalWriteFileSync.call(fs, file, '{"schemaVersion":');
+        throw new Error('forced diagnostic manifest partial FD write');
+      }
+      return originalWriteFileSync.call(fs, file, ...args);
+    };
+
+    testRendererEvents.length = 0;
+    testNotifications.length = 0;
+    let failureResult;
+    try {
+      failureResult = await callIpc('projects:package', failingProject.id, outputDir);
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.writeFileSync = originalWriteFileSync;
+    }
+
+    assert.equal(injectedFailure, true);
+    assert.deepEqual(failureResult, { error: 'diagnostic_manifest_write_failed' });
+    assert.equal(Object.prototype.hasOwnProperty.call(failureResult, 'success'), false);
+    assert.equal(fs.existsSync(packageFolder(outputDir, failingName)), false);
+    assert.equal(fs.existsSync(failingManifestPath), false);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 2);
+    fresh = await getProject(failingProject.id);
+    assert.notEqual(fresh.status, 'packaged');
+    assert.equal(fresh.packagedAt == null, true);
+    assert.equal(fresh.outputPath == null, true);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
+    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+    assert.equal(testNotifications.length, 0);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.writeFileSync = originalWriteFileSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('PowerPoint provenance failure does not block package extraction success', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -3592,10 +4428,10 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     });
 
     const result = await callIpc('projects:accept-pending', project.id, sourcePath);
-    assert.equal(result.files.length, 1);
-    assert.equal(result.files[0].path, sourcePath);
-    assert.equal(result.files[0].acceptedPending, true);
-    assert.equal(Object.prototype.hasOwnProperty.call(result.files[0], 'captureState'), false);
+    assert.equal(result.files.length, 2);
+    const acceptedSource = result.files.find(file => file.path === sourcePath);
+    assert.equal(acceptedSource.acceptedPending, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(acceptedSource, 'captureState'), false);
 
     const fresh = await waitForProject(
       project.id,
@@ -3619,6 +4455,14 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
   }
 });
+
+for (const parserLane of ['linked', 'psd']) {
+  for (const race of ['pause', 'delete', 'b-a-b']) {
+    test(`accept-pending ${parserLane} parser rejects ${race} stale work`, async () => {
+      await assertAcceptPendingScanRaceFailsClosed(parserLane, race);
+    });
+  }
+}
 
 test('duplicate or already-present pending accept does not duplicate observations', async () => {
   const project = await createProject('Duplicate pending accept provenance');
@@ -3842,7 +4686,7 @@ test('automatic live capture ignores old package output and diagnostics folders'
   assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
   assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
   assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
     packageRootFile,
     diagnosticsFile,
     quickPackageFile,
@@ -3954,7 +4798,7 @@ test('live evidence ledger caps candidates and preserves active project evidence
   assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
   assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
   assert.ok(retainedIgnored.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceName')));
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
     acceptedPath,
     pendingPath,
     needsSavePath,
@@ -4184,7 +5028,7 @@ test('PowerPoint lsof open-after-watch evidence stays quarantined until confirme
   ]);
 });
 
-test('repeated lsof observations for the same pending file are deduped', async () => {
+test('failed Illustrator activation blocks repeated lsof rows before the ledger', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'dedupe-logo.ai');
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
@@ -4209,10 +5053,32 @@ test('repeated lsof observations for the same pending file are deduped', async (
   assert.deepEqual(fresh.files, []);
   assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 0);
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.APP_OPENED_FILE).length, 0);
   assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
+});
+
+test('failed Illustrator process snapshot does not claim generic chokidar source admission', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'process-query-failed.ai');
+  fs.writeFileSync(filePath, 'Illustrator source bytes');
+  setChildProcessHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return { stdout: '' };
+    if (isIllustratorPsCommCheck(request) || isIllustratorPsCommandCheck(request)) {
+      return { error: new Error('process query unavailable') };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator process query failure');
+  testRendererEvents.length = 0;
+  await emitWatcher('add', filePath);
+  const fresh = await getProject(project.id);
+
+  assert.equal(fresh.files.some(file => file.path === filePath), true);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(JSON.stringify(fresh.liveEvidenceLedger || {}).includes(path.basename(filePath)), true);
+  assert.equal(testRendererEvents.some(entry => entry.data && entry.data.projectId === project.id), true);
 });
 
 test('rejected lsof candidates do not record provenance', async () => {
@@ -4698,7 +5564,7 @@ test('one Illustrator observation stream is staged only for the active Watching 
   fs.writeFileSync(sourcePath, 'synthetic illustrator source');
   fs.writeFileSync(linkedPath, 'synthetic linked asset');
 
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -4706,13 +5572,13 @@ test('one Illustrator observation stream is staged only for the active Watching 
       return {
         stdout: [
           `DOC\t${sourcePath}\tB_Project.ai\ttrue\ttrue`,
-          'PLACED\t1',
           `LINK\t${sourcePath}\tB_Project.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
     return { stdout: '' };
-  });
+  }, 2);
 
   const first = await createProject('Illustrator attribution A');
   const second = await createProject('Illustrator attribution B');
@@ -4741,7 +5607,7 @@ test('Illustrator live app evidence stages open source and linked asset as needs
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
-  setChildProcessHandler(({ kind, command, args, commandText }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args, commandText }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -4764,8 +5630,8 @@ test('Illustrator live app evidence stages open source and linked asset as needs
       return {
         stdout: [
           `DOC\t${sourcePath}\tlive-illustrator.ai\ttrue\ttrue`,
-          'PLACED\t1',
           `LINK\t${sourcePath}\tlive-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -4932,8 +5798,8 @@ test('Illustrator live app fallback does not leak stale source into InDesign-anc
       return {
         stdout: [
           `DOC\t${staleIllustratorPath}\tBris Invitation-03 copy.ai\ttrue\ttrue`,
-          'PLACED\t1',
           `LINK\t${staleIllustratorPath}\tBris Invitation-03 copy.ai\t${staleIllustratorLinkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -5033,7 +5899,7 @@ test('Illustrator live app fallback does not leak stale source into InDesign-anc
   ]);
 });
 
-test('pre-package broad scan does not surface stale Illustrator source in fresh InDesign project UI', async () => {
+test('generic pre-package broad scan quarantines stale Illustrator-extension source in an InDesign project', async () => {
   resetTestHomeWorkspace();
   const qa36Root = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.36-jenna');
   const sourceDir = path.join(qa36Root, 'source-copies');
@@ -5158,12 +6024,12 @@ test('pre-package broad scan does not surface stale Illustrator source in fresh 
   ]);
 });
 
-test('Illustrator live app evidence stages valid rows when placed item reads report safe partial status', async () => {
+test('Illustrator live app evidence rejects query-failed partial placed item output', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'live-illustrator-partial.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -5181,9 +6047,9 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
       return {
         stdout: [
           `DOC\t${sourcePath}\tlive-illustrator-partial.ai\ttrue\ttrue`,
-          'PLACED\t2',
           'STATUS\tillustrator-placed-item-file-query-failed',
           `LINK\t${sourcePath}\tlive-illustrator-partial.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t2',
         ].join('\n') + '\n',
       };
     }
@@ -5191,28 +6057,25 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
   });
 
   const project = await createProject('Illustrator partial placed item status');
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
-  const sourceCandidate = fresh.pendingFiles.find(file => file.path === sourcePath);
-  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
+  const fresh = await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.scriptAttempted === true),
+    5000
+  );
 
-  assert.ok(sourceCandidate);
-  assert.ok(linkedCandidate);
-  assert.equal(linkedCandidate.source, 'ai-linked');
-  assert.equal(linkedCandidate.captureState, 'needs-save');
-  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
-  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
-  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
-  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'live-illustrator-partial.ai');
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
   const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => (
     entry.scriptAttempted === true &&
-    entry.scriptSuccess === true &&
+    entry.scriptSuccess === false &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
     entry.placedItemsCount === 2 &&
     entry.errorCategory === 'illustrator-placed-item-file-query-failed'
   )));
-  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+  assert.equal(statusEntries.some(entry => entry.stagedCount > 0), false);
   assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
     sourcePath,
     linkedPath,
@@ -5224,12 +6087,128 @@ test('Illustrator live app evidence stages valid rows when placed item reads rep
   ], 'Illustrator partial status breadcrumbs');
 });
 
-test('Illustrator guarded placed item path fallback stages linked asset when file object query fails', async () => {
+async function assertIllustratorSnapshotOutputFailsClosed(label, buildOutput) {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', `${label}.ai`);
+  const linkedPath = path.join(TEST_HOME, 'Desktop', `${label}.png`);
+  fs.writeFileSync(sourcePath, 'source bytes');
+  fs.writeFileSync(linkedPath, 'linked bytes');
+  let osascriptInvocations = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '123\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
+      return {
+        stdout: buildOutput(sourcePath, linkedPath),
+        rawIllustratorOutput: true,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject(`Illustrator ${label}`);
+  await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+  await runTrackedIntervalCallbacks();
+  const fresh = await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.scriptAttempted === true),
+    5000
+  );
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
+  const statusEntries = getLiveAppStatusEntries(fresh);
+  assert.equal(statusEntries.some(entry => entry.stagedCount > 0), false);
+  assert.ok(statusEntries.some(entry => (
+    entry.scriptAttempted === true && entry.scriptSuccess === false
+  )));
+  assert.equal(statusEntries.some(entry => (
+    entry.scriptAttempted === true && entry.scriptSuccess === true
+  )), false);
+}
+
+test('Illustrator activation rejects truncated structured output with zero foreign staging', async () => {
+  await assertIllustratorSnapshotOutputFailsClosed('truncated-output', (sourcePath, linkedPath) => [
+    `DOC\t${sourcePath}\ttruncated-output.ai\tfalse\ttrue`,
+    `LINK\t${sourcePath}\ttruncated-output.ai\t${linkedPath}\tfalse\ttrue`,
+    'COMPLETE\t1',
+  ].join('\n') + '\n');
+});
+
+test('Illustrator activation rejects output without a terminal marker', async () => {
+  await assertIllustratorSnapshotOutputFailsClosed('missing-terminal', (sourcePath, linkedPath) => [
+    `DOC\t${sourcePath}\tmissing-terminal.ai\tfalse\ttrue`,
+    `LINK\t${sourcePath}\tmissing-terminal.ai\t${linkedPath}\tfalse\ttrue`,
+  ].join('\n') + '\n');
+});
+
+test('Illustrator activation rejects placed item count mismatch with zero foreign staging', async () => {
+  await assertIllustratorSnapshotOutputFailsClosed('count-mismatch', (sourcePath, linkedPath) => [
+    `DOC\t${sourcePath}\tcount-mismatch.ai\tfalse\ttrue`,
+    `LINK\t${sourcePath}\tcount-mismatch.ai\t${linkedPath}\tfalse\ttrue`,
+    'COMPLETE\t1\t2',
+  ].join('\n') + '\n');
+});
+
+for (const [label, terminalRows] of [
+  ['empty-count', ['STATUS\tno-documents', 'COMPLETE\t\t0']],
+  ['whitespace-count', ['STATUS\tno-documents', 'COMPLETE\t \t0']],
+  ['negative-count', ['STATUS\tno-documents', 'COMPLETE\t-1\t0']],
+  ['signed-count', ['STATUS\tno-documents', 'COMPLETE\t+0\t0']],
+  ['leading-zero-count', ['STATUS\tno-documents', 'COMPLETE\t00\t0']],
+  ['decimal-count', ['STATUS\tno-documents', 'COMPLETE\t0.0\t0']],
+  ['exponent-count', ['STATUS\tno-documents', 'COMPLETE\t0e0\t0']],
+  ['hexadecimal-count', ['STATUS\tno-documents', 'COMPLETE\t0x0\t0']],
+  ['overflow-count', ['STATUS\tno-documents', `COMPLETE\t${Number.MAX_SAFE_INTEGER + 1}\t0`]],
+  ['trailing-whitespace', ['STATUS\tno-documents', 'COMPLETE\t0\t0 ']],
+  ['legacy-placed-count', ['STATUS\tno-documents', 'PLACED\t0', 'COMPLETE\t0\t0']],
+  ['duplicate-terminal', ['STATUS\tno-documents', 'COMPLETE\t0\t0', 'COMPLETE\t0\t0']],
+  ['trailing-record', ['STATUS\tno-documents', 'COMPLETE\t0\t0', 'STATUS\tno-documents']],
+]) {
+  test(`Illustrator activation rejects ${label} terminal records with zero staging`, async () => {
+    await assertIllustratorSnapshotOutputFailsClosed(
+      `canonical-${label}`,
+      () => `${terminalRows.join('\n')}\n`
+    );
+  });
+}
+
+for (const rowKind of ['DOC', 'LINK']) {
+  for (const [label, booleanFields] of [
+    ['banana', ['banana', 'true']],
+    ['TRUE/FALSE', ['TRUE', 'FALSE']],
+    ['0/1', ['0', '1']],
+    ['empty', ['', 'true']],
+    ['surrounding whitespace', [' true', 'false ']],
+    ['missing fields', ['true']],
+    ['extra fields', ['true', 'false', 'extra']],
+  ]) {
+    test(`Illustrator activation rejects ${label} ${rowKind} boolean fields with zero staging`, async () => {
+      await assertIllustratorSnapshotOutputFailsClosed(
+        `canonical-${rowKind.toLowerCase()}-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+        (sourcePath, linkedPath) => {
+          const validDoc = ['DOC', sourcePath, path.basename(sourcePath), 'false', 'true'];
+          const validLink = ['LINK', sourcePath, path.basename(sourcePath), linkedPath, 'false', 'true'];
+          const malformedPrefix = rowKind === 'DOC'
+            ? ['DOC', sourcePath, path.basename(sourcePath)]
+            : ['LINK', sourcePath, path.basename(sourcePath), linkedPath];
+          return [
+            (rowKind === 'DOC' ? [...malformedPrefix, ...booleanFields] : validDoc).join('\t'),
+            (rowKind === 'LINK' ? [...malformedPrefix, ...booleanFields] : validLink).join('\t'),
+            'COMPLETE\t1\t1',
+          ].join('\n') + '\n';
+        }
+      );
+    });
+  }
+}
+
+test('Illustrator guarded path fallback fails closed when file object query fails', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'path-fallback-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa21-live-only-IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -5242,10 +6221,10 @@ test('Illustrator guarded placed item path fallback stages linked asset when fil
       return {
         stdout: [
           `DOC\t${sourcePath}\tpath-fallback-illustrator.ai\ttrue\ttrue`,
-          'PLACED\t1',
           'STATUS\tillustrator-placed-item-file-query-failed',
           'STATUS\tillustrator-placed-item-path-fallback-used',
           `LINK\t${sourcePath}\tpath-fallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -5253,23 +6232,16 @@ test('Illustrator guarded placed item path fallback stages linked asset when fil
   });
 
   const project = await createProject('Illustrator placed path fallback');
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
-  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
-
-  assert.ok(linkedCandidate);
-  assert.equal(linkedCandidate.source, 'ai-linked');
-  assert.equal(linkedCandidate.captureState, 'needs-save');
-  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
-  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
-  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
-  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'path-fallback-illustrator.ai');
-  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  const fresh = await waitForProject(project.id, item => getLiveAppStatusEntries(item, 'illustrator')
+    .some(entry => entry.scriptAttempted === true && entry.scriptSuccess === false), 5000);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
 
   const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => (
     entry.scriptAttempted === true &&
-    entry.scriptSuccess === true &&
+    entry.scriptSuccess === false &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
     entry.placedItemsCount === 1 &&
@@ -5278,7 +6250,7 @@ test('Illustrator guarded placed item path fallback stages linked asset when fil
     entry.statusReasonCounts['illustrator-placed-item-file-query-failed'] === 1 &&
     entry.statusReasonCounts['illustrator-placed-item-path-fallback-used'] === 1
   )));
-  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+  assert.equal(statusEntries.some(entry => entry.stagedCount > 0), false);
 
   assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
     sourcePath,
@@ -5291,7 +6263,7 @@ test('Illustrator guarded placed item path fallback stages linked asset when fil
     'stderr',
     'raw',
   ], 'Illustrator path fallback status breadcrumbs');
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
     sourcePath,
     linkedPath,
     'DOC\t',
@@ -5304,12 +6276,12 @@ test('Illustrator guarded placed item path fallback stages linked asset when fil
   ], 'Illustrator path fallback live evidence ledger');
 });
 
-test('Illustrator placed item path text coercion fallback stages linked asset when object reads fail', async () => {
+test('Illustrator path text coercion fallback fails closed when object reads fail', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'path-text-fallback-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa22-live-only-IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -5324,13 +6296,13 @@ test('Illustrator placed item path text coercion fallback stages linked asset wh
       return {
         stdout: [
           `DOC\t${sourcePath}\tpath-text-fallback-illustrator.ai\ttrue\ttrue`,
-          'PLACED\t3',
           'STATUS\tillustrator-placed-item-file-query-failed',
           'STATUS\tillustrator-placed-item-file-of-query-failed',
           'STATUS\tillustrator-placed-item-path-query-failed',
           'STATUS\tillustrator-placed-item-file-path-object-query-failed',
           'STATUS\tillustrator-placed-item-file-path-text-fallback-used',
           `LINK\t${sourcePath}\tpath-text-fallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t3',
         ].join('\n') + '\n',
       };
     }
@@ -5338,23 +6310,16 @@ test('Illustrator placed item path text coercion fallback stages linked asset wh
   });
 
   const project = await createProject('Illustrator placed path text fallback');
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
-  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
-
-  assert.ok(linkedCandidate);
-  assert.equal(linkedCandidate.source, 'ai-linked');
-  assert.equal(linkedCandidate.captureState, 'needs-save');
-  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
-  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
-  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
-  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'path-text-fallback-illustrator.ai');
-  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  const fresh = await waitForProject(project.id, item => getLiveAppStatusEntries(item, 'illustrator')
+    .some(entry => entry.scriptAttempted === true && entry.scriptSuccess === false), 5000);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
 
   const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => (
     entry.scriptAttempted === true &&
-    entry.scriptSuccess === true &&
+    entry.scriptSuccess === false &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
     entry.placedItemsCount === 3 &&
@@ -5366,7 +6331,7 @@ test('Illustrator placed item path text coercion fallback stages linked asset wh
     entry.statusReasonCounts['illustrator-placed-item-file-path-object-query-failed'] === 1 &&
     entry.statusReasonCounts['illustrator-placed-item-file-path-text-fallback-used'] === 1
   )));
-  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
+  assert.equal(statusEntries.some(entry => entry.stagedCount > 0), false);
 
   assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
     sourcePath,
@@ -5379,7 +6344,7 @@ test('Illustrator placed item path text coercion fallback stages linked asset wh
     'stderr',
     'raw',
   ], 'Illustrator path text fallback status breadcrumbs');
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
     sourcePath,
     linkedPath,
     'DOC\t',
@@ -5392,16 +6357,18 @@ test('Illustrator placed item path text coercion fallback stages linked asset wh
   ], 'Illustrator path text fallback live evidence ledger');
 });
 
-test('Illustrator placed item file fallback stages live linked asset when AppleScript file query fails', async () => {
+test('Illustrator placed item fallback without a source path fails closed', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'fallback-illustrator.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'qa20-live-only-IMG_5331.JPG');
   fs.writeFileSync(sourcePath, 'ai bytes');
   fs.writeFileSync(linkedPath, 'jpg bytes');
-  setChildProcessHandler(({ kind, command, args }) => {
+  let osascriptInvocations = 0;
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      osascriptInvocations++;
       const scriptText = fs.readFileSync(args[0], 'utf8');
       assert.equal(scriptText.includes('file of pItem'), true);
       assertIllustratorPlacedItemPathFallbackGuarded(scriptText);
@@ -5413,10 +6380,10 @@ test('Illustrator placed item file fallback stages live linked asset when AppleS
       return {
         stdout: [
           `DOC\t${sourcePath}\tfallback-illustrator.ai\ttrue\ttrue`,
-          'PLACED\t1',
           'STATUS\tillustrator-placed-item-file-query-failed',
           'STATUS\tillustrator-placed-item-file-fallback-used',
           `LINK\t\tfallback-illustrator.ai\t${linkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -5424,28 +6391,21 @@ test('Illustrator placed item file fallback stages live linked asset when AppleS
   });
 
   const project = await createProject('Illustrator placed file fallback');
-  const fresh = await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
-  const linkedCandidate = fresh.pendingFiles.find(file => file.path === linkedPath);
-
-  assert.ok(linkedCandidate);
-  assert.equal(linkedCandidate.source, 'ai-linked');
-  assert.equal(linkedCandidate.captureState, 'needs-save');
-  assert.equal(linkedCandidate.captureReason, 'linked-asset-observed');
-  assert.equal(linkedCandidate.captureEvidence.observerMethod, 'illustrator-active-session');
-  assert.equal(linkedCandidate.captureEvidence.documentModified, true);
-  assert.equal(linkedCandidate.captureEvidence.sourceDocumentName, 'fallback-illustrator.ai');
+  await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+  const fresh = await getProject(project.id);
+  assert.deepEqual(fresh.files, []);
+  assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
 
   const statusEntries = getLiveAppStatusEntries(fresh, 'illustrator');
   assert.ok(statusEntries.some(entry => (
     entry.scriptAttempted === true &&
-    entry.scriptSuccess === true &&
+    entry.scriptSuccess === false &&
     entry.docsCount === 1 &&
     entry.linksCount === 1 &&
     entry.placedItemsCount === 1 &&
     entry.errorCategory === 'illustrator-placed-item-file-query-failed'
   )));
-  assert.ok(statusEntries.some(entry => entry.stagedCount === 2 && entry.errorCategory === 'script-success'));
 
   assertTextExcludes(JSON.stringify(fresh.liveAppEvidenceStatus), [
     sourcePath,
@@ -5458,7 +6418,7 @@ test('Illustrator placed item file fallback stages live linked asset when AppleS
     'stderr',
     'raw',
   ], 'Illustrator fallback status breadcrumbs');
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
+  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
     sourcePath,
     linkedPath,
     'DOC\t',
@@ -5547,7 +6507,7 @@ test('live app breadcrumbs are capped per app family across repeated watch start
 test('Illustrator running detection recognizes realistic command paths without retaining process output', async () => {
   resetTestHomeWorkspace();
   let osascriptInvocations = 0;
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '' };
     }
@@ -5561,7 +6521,7 @@ test('Illustrator running detection recognizes realistic command paths without r
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       osascriptInvocations++;
-      return { stdout: 'STATUS\tno-documents\n' };
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
     }
     return { stdout: '' };
   });
@@ -5610,7 +6570,7 @@ test('Illustrator live evidence normalizes HFS placed asset paths before staging
   const hfsSourcePath = toStartupHfsPath(sourcePath);
   const hfsLinkedPath = toStartupHfsPath(linkedPath);
 
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -5619,6 +6579,7 @@ test('Illustrator live evidence normalizes HFS placed asset paths before staging
         stdout: [
           `DOC\t${hfsSourcePath}\tBris Invitation-03 CLEAN QA14.ai\ttrue\ttrue`,
           `LINK\t${hfsSourcePath}\tBris Invitation-03 CLEAN QA14.ai\t${hfsLinkedPath}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -5662,7 +6623,7 @@ test('Illustrator live evidence normalizes file URL placed asset paths before st
   fs.writeFileSync(linkedPath, 'jpg bytes');
   const linkedFileUrl = pathToFileURL(linkedPath).href;
 
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
@@ -5671,6 +6632,7 @@ test('Illustrator live evidence normalizes file URL placed asset paths before st
         stdout: [
           `DOC\t${sourcePath}\tfile-url-illustrator.ai\ttrue\ttrue`,
           `LINK\t${sourcePath}\tfile-url-illustrator.ai\t${linkedFileUrl}\ttrue\ttrue`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -5713,6 +6675,7 @@ test('Illustrator live evidence rejects ambiguous placed asset paths safely', as
           'DOC\t\tBris Invitation-03 CLEAN QA14.ai\ttrue\ttrue',
           'LINK\t\tBris Invitation-03 CLEAN QA14.ai\tv2.8.0-qa.14-jenna:test-photos:IMG_5331_QA14_LIVE_ONLY.JPG\ttrue\ttrue',
           'LINK\t\tBris Invitation-03 CLEAN QA14.ai\trelative/IMG_5331_QA14_LIVE_ONLY.JPG\ttrue\ttrue',
+          'COMPLETE\t1\t2',
         ].join('\n') + '\n',
       };
     }
@@ -5722,6 +6685,7 @@ test('Illustrator live evidence rejects ambiguous placed asset paths safely', as
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator invalid path normalization');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
@@ -5774,6 +6738,7 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
         `LINK\t${unrelatedSourcePath}\tunrelated-open.ai\t${unrelatedLinkedPath}\ttrue\ttrue`,
       ];
       if (includeNewLink) lines.push(`LINK\t${sourcePath}\trefresh-illustrator.ai\t${newLinkedPath}\ttrue\tfalse`);
+      lines.push(`COMPLETE\t2\t${includeNewLink ? 3 : 2}`);
       return { stdout: `${lines.join('\n')}\n` };
     }
     return { stdout: '' };
@@ -5842,13 +6807,20 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
   assert.equal(fresh.files.some(file => file.path === newLinkedPath), false);
 });
 
-test('Illustrator refresh invokes fallback process check and stages pathless source-linked evidence', async () => {
+test('Illustrator activation fails closed when the structured snapshot contains a pathless document', async () => {
   resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Bris Invitation-03 copy.ai');
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
+  const foreignSourcePath = path.join(TEST_HOME, 'Desktop', 'Foreign recovery.ai');
+  const foreignLinkedPath = path.join(TEST_HOME, 'Desktop', 'Foreign recovery.png');
+  fs.writeFileSync(sourcePath, 'source bytes');
   fs.writeFileSync(linkedPath, 'new linked bytes');
+  fs.writeFileSync(foreignSourcePath, 'foreign source bytes');
+  fs.writeFileSync(foreignLinkedPath, 'foreign linked bytes');
   let pgrepProcessChecks = 0;
   let psCommProcessChecks = 0;
   let osascriptInvocations = 0;
+  let snapshotResolved = false;
 
   setChildProcessHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
@@ -5862,44 +6834,1575 @@ test('Illustrator refresh invokes fallback process check and stages pathless sou
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       osascriptInvocations++;
       return {
-        stdout: `DOC\t\tBris Invitation-03 copy.ai\ttrue\nLINK\t\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\n`,
+        stdout: snapshotResolved
+          ? `DOC\t${sourcePath}\tBris Invitation-03 copy.ai\ttrue\ttrue\n` +
+            `LINK\t${sourcePath}\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\ttrue\n` +
+            `DOC\t${foreignSourcePath}\tForeign recovery.ai\ttrue\ttrue\n` +
+            `LINK\t${foreignSourcePath}\tForeign recovery.ai\t${foreignLinkedPath}\ttrue\ttrue\nCOMPLETE\t2\t2\n`
+          : `DOC\t\tBris Invitation-03 copy.ai\ttrue\ttrue\nLINK\t\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\ttrue\nCOMPLETE\t1\t1\n`,
       };
     }
     return { stdout: '' };
   });
 
   const project = await createProject('Illustrator pathless refresh');
-  const fresh = await waitForProject(
-    project.id,
-    item => item.pendingFiles.some(file => file.path === linkedPath),
-    5000
-  );
+  await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+  let fresh = await getProject(project.id);
 
   assert.ok(pgrepProcessChecks >= 1);
   assert.ok(psCommProcessChecks >= 1);
   assert.ok(osascriptInvocations >= 1);
   assert.deepEqual(fresh.files, []);
-  assert.equal(fresh.pendingFiles.length, 1);
-  const imgCandidate = fresh.pendingFiles[0];
-  assert.equal(imgCandidate.path, linkedPath);
-  assert.equal(imgCandidate.source, 'ai-linked');
-  assert.equal(imgCandidate.captureState, 'needs-save');
-  assert.equal(imgCandidate.captureReason, 'linked-asset-observed');
-  assert.equal(imgCandidate.captureEvidence.captureRecommendation, 'needs-save');
-  assert.equal(imgCandidate.captureEvidence.documentModified, true);
-  assert.equal(imgCandidate.captureEvidence.sourceDocumentName, 'Bris Invitation-03 copy.ai');
-  assert.equal(imgCandidate.captureEvidence.sourceName, 'Bris Invitation-03 copy.ai');
-  assert.equal(Object.prototype.hasOwnProperty.call(imgCandidate.captureEvidence, 'relationship'), false);
-  assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(JSON.stringify(fresh.liveEvidenceLedger || {}).includes(path.basename(linkedPath)), false);
   assertTextExcludes(JSON.stringify(fresh), [
     '/Applications/Adobe Illustrator 2026',
     'Contents/MacOS',
     'stdout',
     'raw',
   ], 'Illustrator process detection state');
+
+  snapshotResolved = true;
+  manualDialogFor([sourcePath]);
+  await callIpc('projects:add-files', project.id);
+  fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === linkedPath),
+    5000
+  );
+  assert.equal(fresh.files.some(file => file.path === sourcePath && file.source === 'manual-browse'), true);
+  assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => (
+    file.path === foreignSourcePath || file.path === foreignLinkedPath
+  )), false);
 });
 
-test('Illustrator pathless duplicate document names stay conservative', async () => {
+test('Illustrator activation scope excludes baseline A and admits B1/B2 with shared-link inclusion', async () => {
+  resetTestHomeWorkspace();
+  const aSource = path.join(TEST_HOME, 'Desktop', 'A_Project.ai');
+  const aLink = path.join(TEST_HOME, 'Desktop', 'A_Asset.png');
+  const sharedLink = path.join(TEST_HOME, 'Desktop', 'Shared_Asset.png');
+  const b1Source = path.join(TEST_HOME, 'Desktop', 'B1_Project.ai');
+  const b1Link = path.join(TEST_HOME, 'Desktop', 'B1_Asset.png');
+  const b2Source = path.join(TEST_HOME, 'Desktop', 'B2_Project.ai');
+  const b2Link = path.join(TEST_HOME, 'Desktop', 'B2_Asset.png');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'activation-scope-package');
+  for (const filePath of [aSource, aLink, sharedLink, b1Source, b1Link, b2Source, b2Link]) {
+    fs.writeFileSync(filePath, path.basename(filePath));
+  }
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  let rows = [
+    `DOC\t${aSource}\tA_Project.ai\tfalse\ttrue`,
+    `LINK\t${aSource}\tA_Project.ai\t${aLink}\tfalse\ttrue`,
+    `LINK\t${aSource}\tA_Project.ai\t${sharedLink}\tfalse\ttrue`,
+  ];
+  let queryCount = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      return { stdout: `${rows.join('\n')}\n${rows.length === 3 ? 'COMPLETE\t1\t2' : 'COMPLETE\t3\t5'}\n` };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator activation scope B');
+  await waitForProject(project.id, () => queryCount >= 1, 5000);
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === aSource || file.path === aLink), false);
+  assert.equal(fresh.pendingFiles.some(file => [aSource, aLink, sharedLink].includes(file.path)), false);
+  assertProvenanceTextExcludes(fresh, [aSource, aLink, sharedLink]);
+  assert.equal(JSON.stringify(fresh.liveEvidenceLedger || {}).includes('A_Project.ai'), false);
+
+  rows = [
+    ...rows,
+    `DOC\t${b1Source}\tB1_Project.ai\tfalse\ttrue`,
+    `LINK\t${b1Source}\tB1_Project.ai\t${b1Link}\tfalse\ttrue`,
+    `LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`,
+    `DOC\t${b2Source}\tB2_Project.ai\tfalse\tfalse`,
+    `LINK\t${b2Source}\tB2_Project.ai\t${b2Link}\tfalse\tfalse`,
+  ];
+  await runTrackedIntervalCallbacks();
+  fresh = await waitForProject(
+    project.id,
+    item => [b1Source, b1Link, sharedLink, b2Source, b2Link]
+      .every(filePath => [...item.files, ...item.pendingFiles].some(file => file.path === filePath)),
+    5000
+  );
+  assert.equal(fresh.pendingFiles.some(file => file.path === aSource || file.path === aLink), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink), true);
+
+  manualDialogFor([b1Source, b2Source]);
+  await callIpc('projects:add-files', project.id);
+  fresh = await getProject(project.id);
+  for (const linkedPath of [b1Link, sharedLink]) {
+    if (fresh.pendingFiles.some(file => file.path === linkedPath)) {
+      await callIpc('projects:accept-pending', project.id, linkedPath);
+      fresh = await getProject(project.id);
+    }
+  }
+
+  const packageResult = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(packageResult);
+  assert.equal(packageResult.success, true);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(aSource))), false);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(aLink))), false);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b1Source))), true);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b2Source))), true);
+});
+
+test('unrelated app and generic assets survive ready and failed Illustrator scopes', async () => {
+  for (const scopeState of ['ready', 'failed']) {
+    resetTestHomeWorkspace();
+    const prefix = `unrelated-${scopeState}`;
+    const assetDir = path.join(TEST_HOME, 'Desktop', `${prefix}-assets`);
+    fs.mkdirSync(assetDir, { recursive: true });
+    const baselineSource = path.join(assetDir, `${prefix}-baseline.ai`);
+    const baselineLink = path.join(assetDir, `${prefix}-baseline.png`);
+    const trustedAiAnchor = path.join(assetDir, `${prefix}-trusted.ai`);
+    const appPaths = [
+      path.join(assetDir, `${prefix}.psd`),
+      path.join(assetDir, `${prefix}.indd`),
+      path.join(assetDir, `${prefix}.pptx`),
+    ];
+    const genericPaths = ['pdf', 'svg', 'eps', 'ai']
+      .map(ext => path.join(assetDir, `${prefix}-generic.${ext}`));
+    const outputDir = path.join(TEST_HOME, 'Desktop', `${prefix}-package`);
+    for (const filePath of [baselineSource, baselineLink, trustedAiAnchor, ...appPaths, ...genericPaths]) {
+      fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+    }
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+        if (scopeState === 'failed') return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
+        return {
+          stdout: [
+            `DOC\t${baselineSource}\t${path.basename(baselineSource)}\tfalse\ttrue`,
+            `LINK\t${baselineSource}\t${path.basename(baselineSource)}\t${baselineLink}\tfalse\ttrue`,
+            'COMPLETE\t1\t1',
+          ].join('\n') + '\n',
+        };
+      }
+      if (kind === 'execFile' && command === '/bin/ps') return { stdout: '' };
+      if (kind === 'exec' && command === '/bin/ps ax -o pid= -o command= 2>/dev/null') {
+        return { stdout: '777 Figma\n' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn')) {
+        return {
+          stdout: genericPaths.map((filePath, index) => (
+            `f${index + 1}\ntREG\nn${filePath}`
+          )).join('\n') + '\n',
+        };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject(`Unrelated ${scopeState} scope`);
+    manualDialogFor([trustedAiAnchor]);
+    await callIpc('projects:add-files', project.id);
+    for (const filePath of appPaths) await emitWatcher('add', filePath);
+    await runTrackedIntervalCallbacks();
+    await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+    let fresh = await getProject(project.id);
+    for (const filePath of appPaths) {
+      assert.equal(fresh.files.some(file => file.path === filePath), true, `${scopeState}: ${path.extname(filePath)} source`);
+    }
+    for (const filePath of genericPaths) {
+      assert.equal(
+        fresh.pendingFiles.some(file => file.path === filePath),
+        true,
+        `${scopeState}: generic ${path.extname(filePath)} pending`
+      );
+      assert.ok(fresh.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(filePath)]);
+      await callIpc('projects:accept-pending', project.id, filePath);
+    }
+    const savedAt = new Date(Date.now() + 1000);
+    for (const filePath of genericPaths) fs.utimesSync(filePath, savedAt, savedAt);
+
+    fresh = await getProject(project.id);
+    for (const filePath of [...appPaths, ...genericPaths]) {
+      assert.equal(fresh.files.some(file => file.path === filePath), true);
+    }
+    assert.equal(
+      getSessionObservedByMethod(fresh, 'projects:accept-pending').length,
+      genericPaths.length
+    );
+
+    const packageResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(packageResult);
+    assert.equal(packageResult.success, true);
+    for (const filePath of [...appPaths, ...genericPaths]) {
+      assert.equal(
+        fs.existsSync(path.join(packageResult.folderPath, path.basename(filePath))),
+        true,
+        `${scopeState}: package ${path.basename(filePath)}`
+      );
+    }
+    fresh = await getProject(project.id);
+    assert.equal(
+      getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
+      appPaths.length + genericPaths.length + 1
+    );
+    await callIpc('projects:delete-all');
+  }
+});
+
+for (const scopeState of ['ready', 'failed']) {
+  test(`explicit non-Illustrator families retain same-path state under a ${scopeState} scope`, async () => {
+    resetTestHomeWorkspace();
+    const sourcePath = path.join(TEST_HOME, 'Desktop', `${scopeState}-scope-source.ai`);
+    const candidateDir = path.join(TEST_HOME, 'Desktop', `${scopeState}-same-path-files`);
+    const anchorPath = path.join(candidateDir, `${scopeState}-manual-anchor.ai`);
+    const candidates = [
+      ['photoshop', 'psd-linked', '.psd'],
+      ['indesign', 'indd-linked', '.indd'],
+      ['powerpoint', 'app-opened', '.pptx'],
+      ['figma', 'app-opened', '.png'],
+      ['generic', 'lastused-scan', '.pdf'],
+      ['generic', 'lastused-scan', '.svg'],
+      ['generic', 'lastused-scan', '.eps'],
+      ['generic', 'lastused-scan', '.ai'],
+    ].map(([appFamily, source, ext], index) => ({
+      appFamily,
+      source,
+      path: path.join(candidateDir, `${scopeState}-${appFamily}-${index}${ext}`),
+    }));
+    const outputDir = path.join(TEST_HOME, 'Desktop', `${scopeState}-same-path-package`);
+    fs.mkdirSync(candidateDir, { recursive: true });
+    fs.writeFileSync(sourcePath, 'Illustrator source bytes');
+    fs.writeFileSync(anchorPath, 'manual anchor bytes');
+    for (const candidate of candidates) fs.writeFileSync(candidate.path, `${candidate.appFamily} bytes`);
+    fs.mkdirSync(outputDir, { recursive: true });
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+        const rows = [
+          ...(scopeState === 'failed' ? ['ERROR\tillustrator-query-failed'] : []),
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          ...candidates.map(candidate => (
+            `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${candidate.path}\tfalse\ttrue`
+          )),
+          `COMPLETE\t1\t${candidates.length}`,
+        ];
+        return { stdout: `${rows.join('\n')}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject(`Same path ${scopeState}`);
+    manualDialogFor([anchorPath]);
+    await callIpc('projects:add-files', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    for (const candidate of candidates) {
+      seedScopedRendererCandidate(stored, candidate.path, candidate);
+      const evidenceId = `${scopeState}-${candidate.appFamily}-same-path-evidence`;
+      stored.provenance.evidence[evidenceId] = {
+        id: evidenceId,
+        kind: OBSERVER_KINDS.APP_SCRIPT,
+        source: candidate.source,
+        appFamily: candidate.appFamily,
+        observer: { method: `${candidate.appFamily}-test` },
+        payload: { localPath: candidate.path },
+      };
+    }
+
+    let view = await getProject(project.id);
+    for (const candidate of candidates) {
+      assert.equal(
+        view.pendingFiles.some(file => file.path === candidate.path),
+        true,
+        `${candidate.appFamily} ${path.extname(candidate.path)} pending must remain visible`
+      );
+      assert.ok(view.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(candidate.path)]);
+      assert.equal(JSON.stringify(view.provenance).includes(candidate.path), true);
+      assert.ok(view.provenance.evidence[`${scopeState}-${candidate.appFamily}-same-path-evidence`]);
+      await callIpc('projects:accept-pending', project.id, candidate.path);
+    }
+
+    view = await getProject(project.id);
+    for (const candidate of candidates) {
+      assert.equal(view.files.some(file => file.path === candidate.path), true);
+    }
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    for (const candidate of candidates) {
+      assert.equal(
+        fs.existsSync(path.join(result.folderPath, path.basename(candidate.path))),
+        true,
+        `${candidate.appFamily} ${path.extname(candidate.path)} must be packaged`
+      );
+    }
+    view = await getProject(project.id);
+    assert.equal(
+      getProvenanceEdges(view, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
+      candidates.length + 1
+    );
+  });
+}
+
+test('same denied paths preserve explicit non-Illustrator authority while hiding Illustrator records', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'same-path-baseline.ai');
+  const authorities = [
+    { appFamily: 'photoshop', source: 'psd-linked', path: path.join(TEST_HOME, 'Desktop', 'same-path-photoshop.png') },
+    { appFamily: 'indesign', source: 'indd-linked', path: path.join(TEST_HOME, 'Desktop', 'same-path-indesign.jpg') },
+  ];
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'same-path-authority-package');
+  fs.writeFileSync(sourcePath, 'Illustrator baseline bytes');
+  for (const authority of authorities) fs.writeFileSync(authority.path, `${authority.appFamily} authority bytes`);
+  fs.mkdirSync(outputDir, { recursive: true });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          ...authorities.map(authority => (
+            `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${authority.path}\tfalse\ttrue`
+          )),
+          `COMPLETE\t1\t${authorities.length}`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Per-record same-path authority');
+  await callIpc('projects:pause', project.id);
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  stored.liveEvidenceLedger = stored.liveEvidenceLedger || { schemaVersion: 1, candidates: {} };
+  stored.liveEvidenceLedger.candidateLimit = EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP;
+  stored.liveEvidenceLedger.records = [];
+  stored.illustratorSamePathRecords = [];
+  const forbidden = [];
+  for (const authority of authorities) {
+    const { file, fileNodeId } = seedScopedRendererCandidate(stored, authority.path, {
+      appFamily: authority.appFamily,
+      source: authority.source,
+      includePending: false,
+    });
+    stored.files.push(file);
+    const authorityEvidenceId = `${authority.appFamily}-same-path-authority-evidence`;
+    stored.provenance.evidence[authorityEvidenceId] = {
+      id: authorityEvidenceId,
+      source: authority.source,
+      appFamily: authority.appFamily,
+      observer: { method: `${authority.appFamily}-test` },
+      payload: { localPath: authority.path },
+    };
+    const illustratorIds = {
+      file: `illustrator-same-path-${authority.appFamily}-file`,
+      ledger: `illustrator-same-path-${authority.appFamily}-ledger`,
+      observation: `illustrator-same-path-${authority.appFamily}-observation`,
+      edge: `illustrator-same-path-${authority.appFamily}-edge`,
+      evidence: `illustrator-same-path-${authority.appFamily}-evidence`,
+    };
+    stored.illustratorSamePathRecords.push({
+      ...makePendingFile(authority.path, 'ai-linked'),
+      id: illustratorIds.file,
+      captureEvidence: { appFamily: 'illustrator', observerMethod: 'illustrator-active-session' },
+    });
+    stored.liveEvidenceLedger.records.push({
+      id: illustratorIds.ledger,
+      source: 'ai-linked',
+      appFamily: 'illustrator',
+      latest: { source: 'ai-linked', appFamily: 'illustrator', localPath: authority.path },
+      observer: { method: 'illustrator-active-session' },
+    });
+    stored.provenance.observations.push({
+      id: illustratorIds.observation,
+      source: 'ai-linked',
+      appFamily: 'illustrator',
+      relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+      objectNodeId: fileNodeId,
+      observer: { kind: OBSERVER_KINDS.APP_SCRIPT, method: 'illustrator-active-session' },
+      payload: { localPath: authority.path },
+    });
+    stored.provenance.edges[illustratorIds.edge] = {
+      id: illustratorIds.edge,
+      source: 'ai-linked',
+      appFamily: 'illustrator',
+      relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+      objectNodeId: fileNodeId,
+      observer: { method: 'illustrator-active-session' },
+    };
+    stored.provenance.evidence[illustratorIds.evidence] = {
+      id: illustratorIds.evidence,
+      source: 'ai-linked',
+      appFamily: 'illustrator',
+      observer: { method: 'illustrator-active-session' },
+      payload: { localPath: authority.path },
+    };
+    forbidden.push(...Object.values(illustratorIds));
+  }
+  forbidden.push('illustrator-active-session');
+  const persistedBeforeViews = structuredClone({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+    illustratorSamePathRecords: stored.illustratorSamePathRecords,
+  });
+
+  testRendererEvents.length = 0;
+  const responses = [];
+  const record = (surface, payload) => responses.push([surface, JSON.stringify(payload) || '']);
+  record('projects:get-all', await callIpc('projects:get-all'));
+  record('projects:get-files', await callIpc('projects:get-files', project.id));
+  record('figma:project-assets', await callIpc('figma:project-assets', project.id));
+  const view = await getProject(project.id);
+  for (const authority of authorities) {
+    assert.equal(view.files.some(file => file.path === authority.path && file.captureEvidence.appFamily === authority.appFamily), true);
+    assert.ok(view.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(authority.path)]);
+    assert.ok(view.provenance.evidence[`${authority.appFamily}-same-path-authority-evidence`]);
+    assert.ok(view.provenance.nodes[createNodeId(NODE_TYPES.FILE, {
+      normalizedPath: normalizeLedgerPathForTest(authority.path),
+    })]);
+  }
+  assert.deepEqual(
+    responses.filter(([, payload]) => forbidden.some(value => payload.includes(value))).map(([surface]) => surface),
+    []
+  );
+  assert.equal(forbidden.some(value => JSON.stringify(testRendererEvents).includes(value)), false);
+  assert.deepEqual({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+    illustratorSamePathRecords: stored.illustratorSamePathRecords,
+  }, persistedBeforeViews);
+  record('projects:reject-pending', await callIpc('projects:reject-pending', project.id, 'not-present'));
+  record('projects:pre-package-scan', await callIpc('projects:pre-package-scan', project.id));
+  assert.deepEqual(
+    responses.filter(([, payload]) => forbidden.some(value => payload.includes(value))).map(([surface]) => surface),
+    []
+  );
+  assert.equal(forbidden.some(value => JSON.stringify(testRendererEvents).includes(value)), false);
+
+  await callIpc('settings:update', 'includeDiagnosticReport', true);
+  const packageResult = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(packageResult);
+  assert.equal(packageResult.success, true);
+  assert.equal(packageResult.totalFiles, authorities.length);
+  for (const authority of authorities) {
+    assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(authority.path))), true);
+  }
+  assert.equal(
+    forbidden.some(value => JSON.stringify(readManifest(outputDir, 'Per-record same-path authority')).includes(value)),
+    false
+  );
+});
+
+test('Illustrator baseline document stays excluded until Add files admits its source and links', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Baseline_B.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'Baseline_B_Asset.png');
+  fs.writeFileSync(sourcePath, 'baseline source bytes');
+  fs.writeFileSync(linkedPath, 'baseline linked bytes');
+  let queryCount = 0;
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '432\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      return {
+        stdout: `DOC\t${sourcePath}\tBaseline_B.ai\tfalse\ttrue\n` +
+          `LINK\t${sourcePath}\tBaseline_B.ai\t${linkedPath}\tfalse\ttrue\nCOMPLETE\t1\t1\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Illustrator baseline Add override');
+  await waitForProject(project.id, () => queryCount >= 1, 5000);
+  let fresh = await getProject(project.id);
+  assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.path === sourcePath), false);
+  assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.path === linkedPath), false);
+
+  manualDialogFor([sourcePath]);
+  await callIpc('projects:add-files', project.id);
+  fresh = await waitForProject(
+    project.id,
+    item => item.files.some(file => file.path === sourcePath) &&
+      item.pendingFiles.some(file => file.path === linkedPath),
+    5000
+  );
+  assert.equal(fresh.files.some(file => file.path === sourcePath && file.source === 'manual-browse'), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath && file.source === 'ai-linked'), true);
+});
+
+for (const projectState of ['watching', 'paused']) {
+  test(`Add files explicitly authorizes a hidden same-path Illustrator record for a ${projectState} project`, async () => {
+    resetTestHomeWorkspace();
+    const sourcePath = path.join(TEST_HOME, 'Desktop', `Hidden_Same_Path_${projectState}.ai`);
+    const outputDir = path.join(TEST_HOME, 'Desktop', `hidden-same-path-${projectState}-package`);
+    fs.writeFileSync(sourcePath, `${projectState} source bytes`);
+    fs.mkdirSync(outputDir, { recursive: true });
+    let queryCount = 0;
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '876\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+        queryCount++;
+        return {
+          stdout: `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\nCOMPLETE\t1\t0\n`,
+        };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject(`Hidden same path ${projectState}`);
+    await waitForProject(project.id, () => queryCount >= 1, 5000);
+    if (projectState === 'paused') await callIpc('projects:pause', project.id);
+
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const { file: discoveredFile } = seedScopedRendererCandidate(stored, sourcePath, {
+      appFamily: 'illustrator',
+      source: 'app-opened',
+      includePending: false,
+    });
+    stored.files.push(discoveredFile);
+    const originalObservationId = `scoped-renderer-observation-${createNodeId(NODE_TYPES.FILE, {
+      normalizedPath: normalizeLedgerPathForTest(sourcePath),
+    })}`;
+
+    let view = await getProject(project.id);
+    assert.equal(view.files.some(file => file.path === sourcePath), false);
+
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const persisted = storeInstance.data.projects.find(item => item.id === project.id);
+    const authorizedRecords = persisted.files.filter(file => file.path === sourcePath);
+    assert.equal(authorizedRecords.length, 1);
+    assert.equal(authorizedRecords[0].source, 'app-opened');
+    assert.equal(authorizedRecords[0].captureEvidence.appFamily, 'illustrator');
+    assert.deepEqual(authorizedRecords[0].explicitUserAuthority, {
+      granted: true,
+      source: 'manual-browse',
+      method: 'projects:add-files',
+      grantedAt: authorizedRecords[0].explicitUserAuthority.grantedAt,
+    });
+    assert.equal(Number.isFinite(authorizedRecords[0].explicitUserAuthority.grantedAt), true);
+    assert.ok(persisted.provenance.observations.some(observation => observation.id === originalObservationId));
+    const manualObservations = getSessionObservedByMethod(persisted, 'projects:add-files')
+      .filter(observation => observation.objectNodeId === createNodeId(NODE_TYPES.FILE, {
+        normalizedPath: normalizeLedgerPathForTest(sourcePath),
+      }));
+    assert.equal(manualObservations.length, 1);
+    assert.equal(manualObservations[0].observer.kind, OBSERVER_KINDS.MANUAL_USER_ACTION);
+    assert.equal(manualObservations[0].payload.authoritySource, 'manual-browse');
+
+    view = await getProject(project.id);
+    assert.equal(view.files.some(file => file.path === sourcePath), true);
+    assert.ok(view.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(sourcePath)]);
+    assert.ok(view.provenance.observations.some(observation => observation.id === originalObservationId));
+    assert.equal(getSessionObservedByMethod(view, 'projects:add-files').length, 1);
+
+    const packageResult = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(packageResult);
+    assert.equal(packageResult.success, true);
+    assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(sourcePath))), true);
+  });
+}
+
+test('Illustrator Add files during activation admits an old-project source and its links', async () => {
+  resetTestHomeWorkspace();
+  const oldSource = path.join(TEST_HOME, 'Desktop', 'Reusable_Old_Project.ai');
+  const oldLink = path.join(TEST_HOME, 'Desktop', 'Reusable_Old_Asset.png');
+  fs.writeFileSync(oldSource, 'old source bytes');
+  fs.writeFileSync(oldLink, 'old linked bytes');
+
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const oldProject = await createProject('Old Illustrator project');
+  manualDialogFor([oldSource]);
+  await callIpc('projects:add-files', oldProject.id);
+
+  let releaseQuery;
+  let markQueryStarted;
+  const queryStarted = new Promise(resolve => { markQueryStarted = resolve; });
+  const queryGate = new Promise(resolve => { releaseQuery = resolve; });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '654\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      markQueryStarted();
+      return queryGate.then(() => ({
+        stdout: [
+          `DOC\t${oldSource}\tReusable_Old_Project.ai\tfalse\ttrue`,
+          `LINK\t${oldSource}\tReusable_Old_Project.ai\t${oldLink}\tfalse\ttrue`,
+          'COMPLETE\t1\t1',
+        ].join('\n') + '\n',
+      }));
+    }
+    return { stdout: '' };
+  });
+
+  const createNewProject = createProject('New Illustrator project');
+  await queryStarted;
+  const newProjectId = storeInstance.data.projects[storeInstance.data.projects.length - 1].id;
+  manualDialogFor([oldSource]);
+  await callIpc('projects:add-files', newProjectId);
+  releaseQuery();
+  const newProject = await createNewProject;
+  const fresh = await waitForProject(
+    newProject.id,
+    item => item.files.some(file => file.path === oldSource) &&
+      item.pendingFiles.some(file => file.path === oldLink),
+    5000
+  );
+  assert.equal(fresh.files.some(file => file.path === oldSource && file.source === 'manual-browse'), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === oldLink && file.source === 'ai-linked'), true);
+});
+
+test('Add files on a paused project aborts after a B-to-A-to-B generation change', async () => {
+  resetTestHomeWorkspace();
+  const filePath = path.join(TEST_HOME, 'Desktop', 'stale-add-files.ai');
+  fs.writeFileSync(filePath, 'stale add bytes');
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Stale Add Files A');
+  await callIpc('projects:pause', project.id);
+  let releaseDialog;
+  nextOpenDialogResult = new Promise(resolve => { releaseDialog = () => resolve({ canceled: false, filePaths: [filePath] }); });
+  const addPromise = callIpc('projects:add-files', project.id);
+  await createProject('Stale Add Files B');
+  await callIpc('projects:start-watching', project.id);
+  await callIpc('projects:pause', project.id);
+  releaseDialog();
+  assert.equal(await addPromise, null);
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  assert.equal(stored.files.some(file => file.path === filePath), false);
+  assert.equal(JSON.stringify(stored.provenance).includes(filePath), false);
+});
+
+test('Illustrator restart keeps accepted B sources while excluding unrelated baseline documents', async () => {
+  resetTestHomeWorkspace();
+  const bSource = path.join(TEST_HOME, 'Desktop', 'Restart_B.ai');
+  const bLink = path.join(TEST_HOME, 'Desktop', 'Restart_B_Asset.png');
+  const unrelatedSource = path.join(TEST_HOME, 'Desktop', 'Restart_A.ai');
+  const unrelatedLink = path.join(TEST_HOME, 'Desktop', 'Restart_A_Asset.png');
+  for (const filePath of [bSource, bLink, unrelatedSource, unrelatedLink]) {
+    fs.writeFileSync(filePath, path.basename(filePath));
+  }
+
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Illustrator restart scope');
+  manualDialogFor([bSource]);
+  await callIpc('projects:add-files', project.id);
+  await callIpc('projects:pause', project.id);
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '987\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${bSource}\tRestart_B.ai\tfalse\ttrue`,
+          `LINK\t${bSource}\tRestart_B.ai\t${bLink}\tfalse\ttrue`,
+          `DOC\t${unrelatedSource}\tRestart_A.ai\tfalse\tfalse`,
+          `LINK\t${unrelatedSource}\tRestart_A.ai\t${unrelatedLink}\tfalse\tfalse`,
+          'COMPLETE\t2\t2',
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  await callIpc('projects:start-watching', project.id);
+  const fresh = await waitForProject(
+    project.id,
+    item => item.pendingFiles.some(file => file.path === bLink),
+    5000
+  );
+  assert.equal(fresh.files.some(file => file.path === bSource), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === bLink), true);
+  assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.path === unrelatedSource), false);
+  assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.path === unrelatedLink), false);
+});
+
+test('persisted foreign Illustrator pending and provenance rows are view-only filtered', async () => {
+  resetTestHomeWorkspace();
+  const foreignSource = path.join(TEST_HOME, 'Desktop', 'Persisted_A.ai');
+  const foreignLink = path.join(TEST_HOME, 'Desktop', 'Persisted_A_Asset.png');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'persisted-filter-package');
+  fs.writeFileSync(foreignSource, 'foreign source bytes');
+  fs.writeFileSync(foreignLink, 'foreign linked bytes');
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${foreignSource}\tPersisted_A.ai\tfalse\ttrue`,
+          `LINK\t${foreignSource}\tPersisted_A.ai\t${foreignLink}\tfalse\ttrue`,
+          'COMPLETE\t1\t1',
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Persisted foreign Illustrator filter');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, {
+    normalizedPath: normalizeLedgerPathForTest(foreignLink),
+  });
+  stored.pendingFiles.push({
+    ...makePendingFile(foreignLink, 'app-opened'),
+    captureEvidence: {
+      sourceDocumentName: 'Persisted_A.ai',
+    },
+  });
+  stored.liveEvidenceLedger = {
+    schemaVersion: 1,
+    candidates: Object.fromEntries([
+      makeLiveEvidenceLedgerEntry(foreignLink, 'pending', Date.now(), {
+        latest: {
+          source: 'ai-linked',
+          observerMethod: 'illustrator-active-session',
+          appFamily: 'illustrator',
+          sourceDocumentName: 'Persisted_A.ai',
+        },
+      }),
+    ]),
+  };
+  stored.provenance.nodes[fileNodeId] = {
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: foreignLink,
+  };
+  stored.provenance.observations.push({
+    id: 'persisted-foreign-observation',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    objectNodeId: fileNodeId,
+    observer: { kind: OBSERVER_KINDS.APP_SCRIPT, method: 'ai-linked' },
+  });
+
+  const view = await getProject(project.id);
+  assert.deepEqual(view.pendingFiles, []);
+  assert.equal(JSON.stringify(view.liveEvidenceLedger || {}).includes('Persisted_A_Asset.png'), false);
+  assert.equal(JSON.stringify(view.provenance || {}).includes(fileNodeId), false);
+  assert.equal((await callIpc('projects:get-files', project.id)).some(file => file.path === foreignLink), false);
+  assert.equal(stored.pendingFiles.some(file => file.path === foreignLink), true);
+  assert.equal(JSON.stringify(stored.provenance).includes(fileNodeId), true);
+  assert.equal(await callIpc('projects:accept-pending', project.id, foreignLink), null);
+  assert.equal(stored.pendingFiles.some(file => file.path === foreignLink), true);
+
+  const prePackage = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(prePackage.files.some(file => file.path === foreignLink), false);
+  const packageResult = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(packageResult);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(foreignLink))), false);
+  assert.equal(stored.pendingFiles.some(file => file.path === foreignLink), true);
+});
+
+test('true provenance-only activation baseline is filtered from project views and packaging without mutation', async () => {
+  resetTestHomeWorkspace();
+  const foreignSource = path.join(TEST_HOME, 'Desktop', 'Provenance_Only_A.ai');
+  const evidenceOnlyPath = path.join(TEST_HOME, 'Desktop', 'Evidence_Only_A.ai');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'provenance-only-package');
+  fs.writeFileSync(foreignSource, 'foreign source bytes');
+  fs.writeFileSync(evidenceOnlyPath, 'evidence-only source bytes');
+  fs.mkdirSync(outputDir, { recursive: true });
+  let queryCount = 0;
+  let releaseQuery;
+  let markQueryStarted;
+  const queryStarted = new Promise(resolve => { markQueryStarted = resolve; });
+  const queryGate = new Promise(resolve => { releaseQuery = resolve; });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      markQueryStarted();
+      return queryGate.then(() => ({
+        stdout: [
+          `DOC\t${foreignSource}\t${path.basename(foreignSource)}\tfalse\ttrue`,
+          `DOC\t${evidenceOnlyPath}\t${path.basename(evidenceOnlyPath)}\tfalse\tfalse`,
+          'COMPLETE\t2\t0',
+        ].join('\n') + '\n',
+      }));
+    }
+    return { stdout: '' };
+  });
+
+  const createPromise = createProject('Provenance-only Illustrator filter');
+  await queryStarted;
+  const stored = storeInstance.data.projects[storeInstance.data.projects.length - 1];
+  const projectId = stored.id;
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, {
+    normalizedPath: normalizeLedgerPathForTest(foreignSource),
+  });
+  const sessionNodeId = Object.keys(stored.provenance.nodes)
+    .find(nodeId => stored.provenance.nodes[nodeId].type === NODE_TYPES.SESSION);
+  stored.provenance.nodes[fileNodeId] = {
+    id: fileNodeId,
+    type: NODE_TYPES.FILE,
+    path: foreignSource,
+    normalizedPath: normalizeLedgerPathForTest(foreignSource),
+  };
+  stored.provenance.edges['provenance-only-foreign-edge'] = {
+    id: 'provenance-only-foreign-edge',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: fileNodeId,
+  };
+  stored.provenance.observations.push({
+    id: 'provenance-only-foreign-observation',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: fileNodeId,
+    observer: { kind: OBSERVER_KINDS.APP_SCRIPT, method: 'ai-linked' },
+  });
+  stored.provenance.evidence['provenance-only-hidden-payload'] = {
+    id: 'provenance-only-hidden-payload',
+    kind: OBSERVER_KINDS.APP_SCRIPT,
+    payload: {
+      localPath: evidenceOnlyPath,
+      nested: {
+        sourcePath: evidenceOnlyPath,
+        candidates: [{ filePath: evidenceOnlyPath }],
+      },
+    },
+  };
+  assert.deepEqual(stored.files, []);
+  assert.deepEqual(stored.pendingFiles, []);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      (stored.liveEvidenceLedger && stored.liveEvidenceLedger.candidates) || {},
+      liveEvidenceKeyForTest(foreignSource)
+    ),
+    false
+  );
+  const persistedProvenanceBytes = JSON.stringify(stored.provenance);
+  const persistedProvenanceSnapshot = structuredClone(stored.provenance);
+
+  testRendererEvents.length = 0;
+  const responses = [];
+  const record = (surface, payload) => responses.push([surface, JSON.stringify(payload) || '']);
+  releaseQuery();
+  record('projects:create', await createPromise);
+  assert.ok(queryCount >= 1);
+  record('projects:pause', await callIpc('projects:pause', projectId));
+  record('projects:start-watching', await callIpc('projects:start-watching', projectId));
+  record('projects:get-all', await callIpc('projects:get-all'));
+  record('projects:get-files', await callIpc('projects:get-files', projectId));
+  record('figma:project-assets', await callIpc('figma:project-assets', projectId));
+  record(
+    'projects:set-figma-link',
+    await callIpc('projects:set-figma-link', projectId, { action: 'preserve' })
+  );
+  record('projects:remove-file', await callIpc('projects:remove-file', projectId, 'not-present'));
+  record('projects:accept-pending', await callIpc('projects:accept-pending', projectId, foreignSource));
+  record('projects:reject-pending', await callIpc('projects:reject-pending', projectId, foreignSource));
+  const prePackage = await callIpc('projects:pre-package-scan', projectId);
+  record('projects:pre-package-scan', prePackage);
+  assert.deepEqual(prePackage.files, []);
+  assert.equal(prePackage.newCount, 0);
+
+  const packageResult = await callIpc('projects:package', projectId, outputDir);
+  assertPackageResultShape(packageResult);
+  record('projects:package', packageResult);
+  assert.equal(packageResult.success, true);
+  assert.equal(packageResult.totalFiles, 0);
+  assert.equal(
+    fs.readdirSync(packageResult.folderPath, { recursive: true })
+      .some(entry => String(entry).includes(path.basename(foreignSource))),
+    false
+  );
+
+  const disposable = await createProject('Filtered delete response');
+  record('projects:delete', await callIpc('projects:delete', disposable.id));
+  const forbidden = [
+    foreignSource,
+    evidenceOnlyPath,
+    fileNodeId,
+    'provenance-only-hidden-payload',
+  ];
+  const leakingSurfaces = responses
+    .filter(([, payload]) => forbidden.some(value => payload.includes(value)))
+    .map(([surface]) => surface);
+  assert.deepEqual(leakingSurfaces, []);
+  assert.equal(forbidden.some(value => JSON.stringify(testRendererEvents).includes(value)), false);
+  assert.equal(JSON.stringify(stored.provenance), persistedProvenanceBytes);
+  assert.deepEqual(stored.provenance, persistedProvenanceSnapshot);
+});
+
+test('nested hidden Illustrator references are filtered from every scoped record family without mutation', async () => {
+  resetTestHomeWorkspace();
+  const hiddenPath = path.join(TEST_HOME, 'Desktop', 'Nested_Hidden.ai');
+  const authorityPath = path.join(TEST_HOME, 'Desktop', 'Nested_Authority.psd');
+  const packageCandidate = path.join(TEST_HOME, 'Desktop', 'Nested_Package.png');
+  const pendingCandidate = path.join(TEST_HOME, 'Desktop', 'Nested_Pending.png');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'nested-hidden-package');
+  for (const filePath of [hiddenPath, authorityPath, packageCandidate, pendingCandidate]) {
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+  fs.mkdirSync(outputDir, { recursive: true });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${hiddenPath}\t${path.basename(hiddenPath)}\tfalse\ttrue`,
+          `DOC\t${authorityPath}\t${path.basename(authorityPath)}\tfalse\tfalse`,
+          'COMPLETE\t2\t0',
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Nested hidden Illustrator records');
+  await callIpc('projects:pause', project.id);
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const sessionNodeId = Object.keys(stored.provenance.nodes)
+    .find(nodeId => stored.provenance.nodes[nodeId].type === NODE_TYPES.SESSION);
+  const projectNodeId = Object.keys(stored.provenance.nodes)
+    .find(nodeId => stored.provenance.nodes[nodeId].type === NODE_TYPES.PROJECT);
+  stored.files.push(
+    {
+      ...makePendingFile(packageCandidate, 'manual-browse'),
+      id: 'nested-hidden-file',
+      metadata: { sourcePath: hiddenPath },
+    },
+    {
+      ...makePendingFile(authorityPath, 'ps-poll'),
+      id: 'nested-authority-file',
+      captureEvidence: { appFamily: 'photoshop' },
+      metadata: { sourcePath: authorityPath },
+    }
+  );
+  stored.pendingFiles.push({
+    ...makePendingFile(pendingCandidate, 'manual-browse'),
+    id: 'nested-hidden-pending',
+    metadata: { sourcePath: hiddenPath },
+  });
+  stored.liveEvidenceLedger = {
+    schemaVersion: 1,
+    candidateLimit: EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP,
+    candidates: {
+      'nested-hidden-candidate': {
+        evidenceKey: 'nested-hidden-candidate',
+        latest: { appFamily: 'photoshop', metadata: { sourcePath: hiddenPath } },
+      },
+      'nested-authority-candidate': {
+        evidenceKey: 'nested-authority-candidate',
+        latest: { appFamily: 'photoshop', source: 'psd-linked', localPath: authorityPath, metadata: { sourcePath: authorityPath } },
+      },
+    },
+    records: [
+      { id: 'nested-hidden-ledger-record', metadata: { sourcePath: hiddenPath } },
+      { id: 'nested-authority-ledger-record', appFamily: 'photoshop', source: 'psd-linked', path: authorityPath, metadata: { sourcePath: authorityPath } },
+    ],
+  };
+  stored.provenance.nodes['nested-hidden-node'] = {
+    type: NODE_TYPES.APPLICATION,
+    metadata: { sourcePath: hiddenPath },
+  };
+  stored.provenance.nodes['nested-authority-node'] = {
+    id: 'nested-authority-node',
+    type: NODE_TYPES.APPLICATION,
+    appFamily: 'photoshop',
+    source: 'psd-linked',
+    path: authorityPath,
+    metadata: { sourcePath: authorityPath },
+  };
+  stored.provenance.edges['nested-hidden-edge'] = {
+    id: 'nested-hidden-edge',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: projectNodeId,
+    payload: { metadata: { sourcePath: hiddenPath } },
+  };
+  stored.provenance.edges['nested-hidden-node-edge'] = {
+    id: 'nested-hidden-node-edge',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: 'nested-hidden-node',
+  };
+  stored.provenance.observations.push({
+    id: 'nested-hidden-observation',
+    relationType: EDGE_TYPES.SESSION_OBSERVED_FILE,
+    subjectNodeId: sessionNodeId,
+    objectNodeId: projectNodeId,
+    payload: { sourcePath: hiddenPath },
+  });
+  stored.provenance.evidence['nested-hidden-evidence'] = {
+    id: 'nested-hidden-evidence',
+    kind: OBSERVER_KINDS.APP_SCRIPT,
+    payload: { metadata: { sourcePath: hiddenPath } },
+  };
+  stored.rendererRecords = [
+    { id: 'nested-hidden-extra-record', metadata: { sourcePath: hiddenPath } },
+    { id: 'nested-authority-extra-record', appFamily: 'photoshop', source: 'psd-linked', path: authorityPath, metadata: { sourcePath: authorityPath } },
+  ];
+  const cyclicDictionary = { safeCycleValue: 'cycle-safe-value' };
+  cyclicDictionary.self = cyclicDictionary;
+  stored.rendererDictionaries = {
+    byPath: {
+      [hiddenPath]: { id: 'nested-hidden-path-key-record', value: 'hidden-path-key-value' },
+      'safe-relative-path-key': { id: 'nested-safe-path-key-record', value: 'safe-path-key-value' },
+    },
+    byId: {
+      'nested-hidden-edge': { value: 'hidden-id-key-value' },
+      'nested-safe-id-key': { value: 'safe-id-key-value' },
+    },
+    cyclicDictionary,
+  };
+
+  const persistedBeforeViews = structuredClone({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+    rendererRecords: stored.rendererRecords,
+    rendererDictionaries: stored.rendererDictionaries,
+  });
+  testRendererEvents.length = 0;
+  const responses = [];
+  const record = (surface, payload) => responses.push([surface, JSON.stringify(payload) || '']);
+  record('projects:get-all', await callIpc('projects:get-all'));
+  record('projects:get-files', await callIpc('projects:get-files', project.id));
+  record('figma:project-assets', await callIpc('figma:project-assets', project.id));
+  assert.deepEqual({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+    rendererRecords: stored.rendererRecords,
+    rendererDictionaries: stored.rendererDictionaries,
+  }, persistedBeforeViews);
+  record(
+    'projects:set-figma-link',
+    await callIpc('projects:set-figma-link', project.id, { action: 'preserve' })
+  );
+  record('projects:remove-file', await callIpc('projects:remove-file', project.id, 'not-present'));
+  record('projects:accept-pending', await callIpc('projects:accept-pending', project.id, 'not-present'));
+  record('projects:reject-pending', await callIpc('projects:reject-pending', project.id, 'not-present'));
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  record('projects:pre-package-scan', scan);
+
+  const forbidden = [
+    hiddenPath,
+    'nested-hidden-file',
+    'nested-hidden-pending',
+    'nested-hidden-candidate',
+    'nested-hidden-ledger-record',
+    'nested-hidden-node',
+    'nested-hidden-edge',
+    'nested-hidden-node-edge',
+    'nested-hidden-observation',
+    'nested-hidden-evidence',
+    'nested-hidden-extra-record',
+    'nested-hidden-path-key-record',
+    'hidden-path-key-value',
+    'hidden-id-key-value',
+  ];
+  const leakingSurfaces = responses
+    .filter(([, payload]) => forbidden.some(value => payload.includes(value)))
+    .map(([surface]) => surface);
+  assert.deepEqual(leakingSurfaces, []);
+  assert.equal(forbidden.some(value => JSON.stringify(testRendererEvents).includes(value)), false);
+  assert.deepEqual({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+    rendererRecords: stored.rendererRecords,
+  }, {
+    files: persistedBeforeViews.files,
+    pendingFiles: persistedBeforeViews.pendingFiles,
+    liveEvidenceLedger: persistedBeforeViews.liveEvidenceLedger,
+    provenance: persistedBeforeViews.provenance,
+    rendererRecords: persistedBeforeViews.rendererRecords,
+  });
+
+  const view = await getProject(project.id);
+  assert.equal(view.files.some(file => file.id === 'nested-authority-file'), true);
+  assert.equal(view.provenance.nodes['nested-authority-node'].metadata.sourcePath, authorityPath);
+  assert.equal(view.liveEvidenceLedger.candidates['nested-authority-candidate'].latest.metadata.sourcePath, authorityPath);
+  assert.equal(view.liveEvidenceLedger.records.some(record => record.id === 'nested-authority-ledger-record'), true);
+  assert.equal(view.rendererRecords.some(record => record.id === 'nested-authority-extra-record'), true);
+  assert.deepEqual(Object.keys(view.rendererDictionaries.byPath), ['safe-relative-path-key']);
+  assert.deepEqual(Object.keys(view.rendererDictionaries.byId), ['nested-safe-id-key']);
+  assert.deepEqual(view.rendererDictionaries.cyclicDictionary, { safeCycleValue: 'cycle-safe-value' });
+  assert.deepEqual(scan.files.map(file => file.id), ['nested-authority-file']);
+
+  await callIpc('settings:update', 'includeDiagnosticReport', true);
+  const packageResult = await callIpc('projects:package', project.id, outputDir);
+  assertPackageResultShape(packageResult);
+  record('projects:package', packageResult);
+  assert.equal(packageResult.totalFiles, 1);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(packageCandidate))), false);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(authorityPath))), true);
+  assert.equal(forbidden.some(value => JSON.stringify(readManifest(outputDir, 'Nested hidden Illustrator records')).includes(value)), false);
+  assert.deepEqual(
+    responses.filter(([, payload]) => forbidden.some(value => payload.includes(value))).map(([surface]) => surface),
+    []
+  );
+  assert.equal(forbidden.some(value => JSON.stringify(testRendererEvents).includes(value)), false);
+  assert.deepEqual(stored.files, persistedBeforeViews.files);
+  assert.deepEqual(stored.pendingFiles, persistedBeforeViews.pendingFiles);
+  assert.deepEqual(stored.liveEvidenceLedger, persistedBeforeViews.liveEvidenceLedger);
+  assert.deepEqual(stored.rendererRecords, persistedBeforeViews.rendererRecords);
+});
+
+test('every existing-project IPC file or project response uses the transient filtered view', async () => {
+  resetTestHomeWorkspace();
+  const foreignFile = path.join(TEST_HOME, 'Desktop', 'ipc-foreign-file.ai');
+  const foreignPending = path.join(TEST_HOME, 'Desktop', 'ipc-foreign-pending.svg');
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'ipc-foreign-source.ai');
+  const benignFile = path.join(TEST_HOME, 'Desktop', 'ipc-benign.psd');
+  const benignPendingAccept = path.join(TEST_HOME, 'Desktop', 'ipc-benign-accept.png');
+  const benignPendingReject = path.join(TEST_HOME, 'Desktop', 'ipc-benign-reject.png');
+  for (const filePath of [
+    foreignFile,
+    foreignPending,
+    sourcePath,
+    benignFile,
+    benignPendingAccept,
+    benignPendingReject,
+  ]) {
+    fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
+  }
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${foreignFile}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${foreignPending}\tfalse\ttrue`,
+          'COMPLETE\t1\t2',
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+  const project = await createProject('IPC filtered surfaces');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const foreignStoredFile = seedScopedRendererCandidate(
+    stored,
+    foreignFile,
+    { includePending: false }
+  ).file;
+  stored.files.push(foreignStoredFile);
+  seedScopedRendererCandidate(stored, foreignPending);
+  stored.pendingFiles.push(
+    makePendingFile(benignPendingAccept),
+    makePendingFile(benignPendingReject)
+  );
+
+  const responses = [];
+  const record = (surface, payload) => responses.push([surface, JSON.stringify(payload) || '']);
+  record('projects:get-all', await callIpc('projects:get-all'));
+  record('projects:get-files', await callIpc('projects:get-files', project.id));
+  record('figma:project-assets', await callIpc('figma:project-assets', project.id));
+  record(
+    'projects:set-figma-link',
+    await callIpc('projects:set-figma-link', project.id, { action: 'preserve' })
+  );
+  record('projects:pause', await callIpc('projects:pause', project.id));
+  record('projects:start-watching', await callIpc('projects:start-watching', project.id));
+  record('projects:remove-file', await callIpc('projects:remove-file', project.id, 'not-present'));
+  manualDialogFor([benignFile]);
+  record('projects:add-files', await callIpc('projects:add-files', project.id));
+  record(
+    'projects:accept-pending',
+    await callIpc('projects:accept-pending', project.id, benignPendingAccept)
+  );
+  record(
+    'projects:reject-pending',
+    await callIpc('projects:reject-pending', project.id, benignPendingReject)
+  );
+  record('projects:pre-package-scan', await callIpc('projects:pre-package-scan', project.id));
+  record('inactivity:pause', await callIpc('inactivity:pause', project.id));
+
+  const forbidden = [foreignFile, foreignPending, liveEvidenceKeyForTest(foreignPending)];
+  const leakingSurfaces = responses
+    .filter(([, payload]) => forbidden.some(value => payload.includes(value)))
+    .map(([surface]) => surface);
+  assert.deepEqual(leakingSurfaces, []);
+  assert.equal(stored.files.some(file => file.path === foreignFile), true);
+  assert.equal(stored.pendingFiles.some(file => file.path === foreignPending), true);
+});
+
+test('projects:create filters provenance-only foreign state added during activation', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'ipc-create-source.ai');
+  const foreignPath = path.join(TEST_HOME, 'Desktop', 'ipc-create-foreign.svg');
+  fs.writeFileSync(sourcePath, 'source bytes');
+  fs.writeFileSync(foreignPath, 'foreign bytes');
+  let releaseQuery;
+  let markQueryStarted;
+  const queryStarted = new Promise(resolve => { markQueryStarted = resolve; });
+  const queryGate = new Promise(resolve => { releaseQuery = resolve; });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      markQueryStarted();
+      return queryGate.then(() => ({
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${foreignPath}\tfalse\ttrue`,
+          'COMPLETE\t1\t1',
+        ].join('\n') + '\n',
+      }));
+    }
+    return { stdout: '' };
+  });
+
+  const createPromise = createProject('IPC create filtered');
+  await queryStarted;
+  const stored = storeInstance.data.projects[storeInstance.data.projects.length - 1];
+  seedScopedRendererCandidate(stored, foreignPath, { includePending: false });
+  releaseQuery();
+  const response = await createPromise;
+  assert.equal(JSON.stringify(response).includes(foreignPath), false);
+  assert.equal(JSON.stringify(response).includes(liveEvidenceKeyForTest(foreignPath)), false);
+  assert.equal(JSON.stringify(stored.provenance).includes(foreignPath), true);
+});
+
+test('paused linked Figma project preserves pre-package locked-page asset ingestion', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const fileKey = 'paused-prepackage-figma';
+  const project = await callIpc(
+    'projects:create',
+    'Paused Figma pre-package',
+    'branding',
+    'current-page',
+    `https://www.figma.com/file/${fileKey}/Paused-File?page-id=1%3A1`
+  );
+  await callIpc('projects:pause', project.id);
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  stored.figmaSession = {
+    startedAt: stored.watchStartedAt,
+    scopeMode: 'current-page',
+    teamIds: [],
+    warnings: [],
+    trackedFiles: [{
+      key: fileKey,
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page 1',
+    }],
+  };
+  const asset = {
+    url: 'https://cdn.figma.example/paused-prepackage.png',
+    nodeId: 'paused-prepackage-node',
+    imageRef: 'paused-prepackage-image',
+    name: 'Paused Asset',
+    format: 'png',
+    figmaFileKey: fileKey,
+    figmaFileName: 'Paused File',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page 1',
+  };
+  const { FigmaParser } = require('../parsers/figma');
+  class PausedPrePackageFigmaParser extends FigmaParser {
+    async autoTrackScan() {
+      return {
+        files: [{ key: fileKey }],
+        assets: [asset],
+        errors: [],
+        warnings: [],
+        scopeEntries: [{
+          fileKey,
+          primaryKey: fileKey,
+          fileFetchStatus: 'success',
+          assetFetchStatus: 'success',
+          lockStatus: 'locked',
+          lockedPageId: '1:1',
+          lockedPageName: 'Page 1',
+        }],
+      };
+    }
+  }
+  setStub('./parsers/figma', () => ({ FigmaParser: PausedPrePackageFigmaParser }));
+  testFetchHandler = async () => ({
+    ok: true,
+    status: 200,
+    buffer: async () => Buffer.from('paused Figma asset bytes'),
+    json: async () => ({}),
+  });
+
+  try {
+    const scan = await callIpc('projects:pre-package-scan', project.id);
+    assert.equal(scan.newCount, 1);
+    assert.equal(scan.files.length, 1);
+    assert.equal(scan.files[0].source, 'figma-auto');
+    assert.equal(scan.files[0].figmaFileKey, fileKey);
+    assert.equal(scan.files[0].figmaPageId, '1:1');
+    assert.equal(fs.readFileSync(scan.files[0].path, 'utf8'), 'paused Figma asset bytes');
+    assert.equal(stored.status, 'paused');
+  } finally {
+    STUBS.delete('./parsers/figma');
+  }
+});
+
+test('package aborts without output when activation drifts B-to-A-to-B during a deferred write', async () => {
+  await assertPackageActivationDriftFailsClosed('reactivation', async (projectA) => {
+    const projectB = await createProject('Package drift reactivation B');
+    await callIpc('projects:start-watching', projectA.id);
+    await callIpc('projects:start-watching', projectB.id);
+  });
+});
+
+test('package aborts without output when its activation is paused during a deferred write', async () => {
+  await assertPackageActivationDriftFailsClosed('pause', async (project) => {
+    await callIpc('projects:pause', project.id);
+  });
+});
+
+test('package aborts without output when its project is deleted during a deferred write', async () => {
+  await assertPackageActivationDriftFailsClosed('delete', async (project) => {
+    await callIpc('projects:delete', project.id);
+  });
+});
+
+test('package aborts when the same activation mutates its scope during an awaited write', async () => {
+  await assertPackageScopePollBehavior(true);
+});
+
+test('unchanged Illustrator poll does not abort a long package', async () => {
+  await assertPackageScopePollBehavior(false);
+});
+
+test('package removes partial writer output and leaves no success side effects', async () => {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject('Package partial rejection');
+    const parentPsd = path.join(tmpRoot, 'partial.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(parentPsd, 'parent PSD bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'partial.png', data: Buffer.from('complete embedded bytes') }],
+    };
+    await setProjectFiles(project.id, {
+      files: [{
+        path: parentPsd,
+        name: 'partial.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        parentPsd,
+        embeddedOriginalName: 'partial.png',
+        embeddedIndex: 0,
+        fileId: 'partial-embedded',
+      }],
+    });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const packagePath = packageFolder(outputDir, 'Package partial rejection');
+    let injectedFailure = false;
+    fs.promises.writeFile = async function partialThenReject(filePath) {
+      if (
+        !injectedFailure &&
+        path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)
+      ) {
+        injectedFailure = true;
+        await originalWriteFile.call(fs.promises, filePath, Buffer.from('partial bytes'), { flag: 'wx' });
+        throw new Error('forced partial write rejection');
+      }
+      return originalWriteFile.apply(fs.promises, arguments);
+    };
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(result.success === true, false);
+    assert.equal(fs.existsSync(packagePath), false);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+    assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
+    assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
+    assert.notEqual(stored.status, 'packaged');
+    assert.equal(stored.packagedAt == null, true);
+    assert.equal(stored.outputPath == null, true);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package treats a renamed output root during deferred PSD work as fatal', async () => {
+  await assertPackageRootReplacementFailsClosed('psd', 'rename');
+});
+
+test('package treats a symlink-substituted output root during presentation work as fatal', async () => {
+  await assertPackageRootReplacementFailsClosed('presentation', 'symlink');
+});
+
+test('stale Illustrator activation and old watcher callbacks cannot mutate or emit after project switches', async () => {
+  resetTestHomeWorkspace();
+  const staleSource = path.join(TEST_HOME, 'Desktop', 'Stale_A.ai');
+  const staleLink = path.join(TEST_HOME, 'Desktop', 'Stale_A_Asset.png');
+  const staleWatcherPath = path.join(TEST_HOME, 'Desktop', 'Stale_Watcher.ai');
+  for (const filePath of [staleSource, staleLink, staleWatcherPath]) {
+    fs.writeFileSync(filePath, path.basename(filePath));
+  }
+
+  let queryCount = 0;
+  let releaseFirstQuery;
+  let markFirstQueryStarted;
+  const firstQueryStarted = new Promise(resolve => { markFirstQueryStarted = resolve; });
+  const firstQueryGate = new Promise(resolve => { releaseFirstQuery = resolve; });
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '852\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      if (queryCount === 1) {
+        markFirstQueryStarted();
+        return firstQueryGate.then(() => ({
+          stdout: [
+            `DOC\t${staleSource}\tStale_A.ai\tfalse\ttrue`,
+            `LINK\t${staleSource}\tStale_A.ai\t${staleLink}\tfalse\ttrue`,
+            'COMPLETE\t1\t1',
+          ].join('\n') + '\n',
+        }));
+      }
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  const createA = createProject('Stale activation A');
+  await firstQueryStarted;
+  const aId = storeInstance.data.projects[storeInstance.data.projects.length - 1].id;
+  const projectB = await createProject('Stale activation B');
+  testRendererEvents.length = 0;
+  releaseFirstQuery();
+  await createA;
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+  const storedA = storeInstance.data.projects.find(item => item.id === aId);
+  assert.equal([...storedA.files, ...storedA.pendingFiles].some(file => [staleSource, staleLink].includes(file.path)), false);
+  assert.equal(testRendererEvents.some(entry => entry.data && entry.data.projectId === aId), false);
+
+  await callIpc('projects:start-watching', aId);
+  const oldAWatcher = latestWatcherHandlers();
+  await callIpc('projects:start-watching', projectB.id);
+  await callIpc('projects:delete', aId);
+  testRendererEvents.length = 0;
+  await oldAWatcher.add(staleWatcherPath);
+  assert.equal(storeInstance.data.projects.some(item => item.id === aId), false);
+  assert.equal((await getProject(projectB.id)).files.some(file => file.path === staleWatcherPath), false);
+  assert.equal(testRendererEvents.some(entry => entry.data && entry.data.projectId === aId), false);
+
+  const oldBWatcher = latestWatcherHandlers();
+  await callIpc('projects:pause', projectB.id);
+  testRendererEvents.length = 0;
+  await oldBWatcher.change(staleWatcherPath);
+  assert.equal((await getProject(projectB.id)).files.some(file => file.path === staleWatcherPath), false);
+  assert.equal(testRendererEvents.some(entry => entry.data && entry.data.projectId === projectB.id), false);
+
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const switchA = await createProject('Stale token switch A');
+  let releaseStaleBQuery;
+  let markStaleBQueryStarted;
+  const staleBQueryStarted = new Promise(resolve => { markStaleBQueryStarted = resolve; });
+  const staleBQueryGate = new Promise(resolve => { releaseStaleBQuery = resolve; });
+  let bQueryCount = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '963\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      bQueryCount++;
+      if (bQueryCount === 1) {
+        markStaleBQueryStarted();
+        return staleBQueryGate.then(() => ({
+          stdout: `DOC\t${staleSource}\tStale_A.ai\tfalse\ttrue\n` +
+            `LINK\t${staleSource}\tStale_A.ai\t${staleLink}\tfalse\ttrue\nCOMPLETE\t1\t1\n`,
+        }));
+      }
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  const staleBActivation = callIpc('projects:start-watching', projectB.id);
+  await staleBQueryStarted;
+  await callIpc('projects:start-watching', switchA.id);
+  await callIpc('projects:start-watching', projectB.id);
+  testRendererEvents.length = 0;
+  releaseStaleBQuery();
+  await staleBActivation;
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+  const storedB = storeInstance.data.projects.find(item => item.id === projectB.id);
+  assert.equal([...storedB.files, ...storedB.pendingFiles].some(file => [staleSource, staleLink].includes(file.path)), false);
+  assert.equal(testRendererEvents.some(entry => entry.data && entry.data.projectId === projectB.id), false);
+});
+
+test('stale Photoshop and InDesign awaits cannot mutate old-project diagnostics or renderer state', async () => {
+  for (const appFamily of ['photoshop', 'indesign']) {
+    resetTestHomeWorkspace();
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const projectA = await createProject(`Stale ${appFamily} A`);
+
+    let releaseScript;
+    let markScriptStarted;
+    const scriptStarted = new Promise(resolve => { markScriptStarted = resolve; });
+    const scriptGate = new Promise(resolve => { releaseScript = resolve; });
+    const scriptName = appFamily === 'photoshop'
+      ? 'crate-ps-poll.applescript'
+      : 'crate-indd-poll.applescript';
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
+      if (isIllustratorPsCommCheck({ kind, command, args })) return { stdout: '' };
+      if (isIllustratorPsCommandCheck({ kind, command, args })) return { stdout: '' };
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return { stdout: appFamily === 'photoshop' ? 'Adobe Photoshop\n' : '' };
+      }
+      if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+        return { stdout: appFamily === 'indesign' ? 'Adobe InDesign\n' : '' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, scriptName)) {
+        markScriptStarted();
+        return scriptGate.then(() => ({ stdout: '' }));
+      }
+      return { stdout: '' };
+    });
+
+    const intervalRun = runTrackedIntervalCallbacks();
+    await scriptStarted;
+    const projectB = await createProject(`Stale ${appFamily} B`);
+    const storedA = storeInstance.data.projects.find(item => item.id === projectA.id);
+    const entriesBeforeRelease = getLiveAppStatusEntries(storedA, appFamily).length;
+    testRendererEvents.length = 0;
+    releaseScript();
+    await intervalRun;
+    await new Promise(resolve => originalSetTimeout(resolve, 600));
+
+    assert.equal(getLiveAppStatusEntries(storedA, appFamily).length, entriesBeforeRelease);
+    assert.equal(
+      testRendererEvents.some(entry => entry.data && entry.data.projectId === projectA.id),
+      false
+    );
+    assert.ok(await getProject(projectB.id));
+    await callIpc('projects:delete-all');
+  }
+});
+
+for (const awaitPoint of ['metadata', 'photoshop', 'psd-parser', 'indesign', 'linked-file', 'figma']) {
+  for (const race of ['pause', 'delete', 'b-a-b']) {
+    test(`pre-package ${awaitPoint} await aborts cleanly after ${race}`, async () => {
+      await assertPrePackageAwaitRaceFailsClosed(awaitPoint, race);
+    });
+  }
+}
+
+for (const awaitPoint of ['metadata', 'photoshop', 'psd-parser', 'indesign', 'linked-file', 'figma']) {
+  test(`pre-package ${awaitPoint} await aborts cleanly after same-token scope drift`, async () => {
+    await assertPrePackageAwaitRaceFailsClosed(awaitPoint, 'same-token');
+  });
+}
+
+test('Illustrator pathless duplicate document names fail closed', async () => {
   resetTestHomeWorkspace();
   const linkedPath = path.join(TEST_HOME, 'Desktop', 'IMG_5331.JPG');
   const otherLinkedPath = path.join(TEST_HOME, 'Desktop', 'unrelated-duplicate.jpg');
@@ -5919,6 +8422,7 @@ test('Illustrator pathless duplicate document names stay conservative', async ()
           `LINK\t\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\tfalse`,
           `DOC\t\tBris Invitation-03 copy.ai\ttrue\tfalse`,
           `LINK\t\tBris Invitation-03 copy.ai\t${otherLinkedPath}\ttrue\tfalse`,
+          'COMPLETE\t2\t2',
         ].join('\n') + '\n',
       };
     }
@@ -5928,13 +8432,14 @@ test('Illustrator pathless duplicate document names stay conservative', async ()
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator ambiguous pathless refresh');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
 
   assert.deepEqual(fresh.files, []);
   assert.deepEqual(fresh.pendingFiles, []);
-  assert.ok(output.includes('ambiguous-document-name'));
+  assert.ok(output.includes('script-success=false'));
   assertTextExcludes(output, [
     linkedPath,
     otherLinkedPath,
@@ -5965,6 +8470,7 @@ test('Illustrator live evidence Automation failure logs safe guidance without st
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator TCC failure');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
@@ -6005,6 +8511,7 @@ test('Illustrator live evidence thrown Automation errors log safe category witho
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator thrown TCC failure');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
@@ -6049,6 +8556,7 @@ test('Illustrator placed item path query failures record safe category without r
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator placed path failure');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
@@ -6101,6 +8609,7 @@ test('Illustrator live evidence missing usage description errors log safe catego
   const { result: fresh, output } = await captureConsoleDuring(async () => {
     const project = await createProject('Illustrator missing usage description failure');
     await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
+    await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 50));
     return getProject(project.id);
   });
@@ -6147,12 +8656,12 @@ test('Illustrator live evidence missing usage description errors log safe catego
 test('strong Illustrator evidence updates an existing weak lsof pending candidate', async () => {
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'reconciled-live-illustrator.ai');
   fs.writeFileSync(sourcePath, 'ai bytes');
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) {
       return { stdout: '123\n' };
     }
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
-      return { stdout: `DOC\t${sourcePath}\treconciled-live-illustrator.ai\ttrue\n` };
+      return { stdout: `DOC\t${sourcePath}\treconciled-live-illustrator.ai\ttrue\ttrue\nCOMPLETE\t1\t0\n` };
     }
     return { stdout: '' };
   });
@@ -6344,7 +8853,7 @@ test('lastused-poll broad discovery outside session scope is quarantined', async
   assert.equal(observations.length, 0);
 });
 
-test('session-related broad observer evidence stages pending review without direct-add', async () => {
+test('session-related broad Illustrator evidence remains blocked without structured admission', async () => {
   resetTestHomeWorkspace();
   const projectRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.8.0-qa.13-jenna', 'source-copies');
   const sourcePath = path.join(projectRoot, 'current-layout.ai');
@@ -6376,16 +8885,10 @@ test('session-related broad observer evidence stages pending review without dire
   });
   pollReady = true;
 
-  const fresh = await waitForProject(
-    project.id,
-    item => item.pendingFiles.some(file => file.path === broadPath),
-    5000
-  );
-  const candidate = fresh.pendingFiles.find(file => file.path === broadPath);
-  assert.ok(candidate);
-  assert.equal(candidate.source, 'lsof');
-  assert.equal(candidate.captureState, 'observed');
+  await new Promise(resolve => originalSetTimeout(resolve, 800));
+  const fresh = await getProject(project.id);
   assert.equal(fresh.files.some(file => file.path === broadPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === broadPath), false);
   assert.deepEqual(getSessionObservedByMethod(fresh, 'lsof'), []);
   assertProvenanceTextExcludes(fresh, [
     'SHOULD_NOT_APPEAR_PROCESS_ARG',
@@ -6509,7 +9012,7 @@ test('broad observer quarantine does not block clean Illustrator DOC/LINK live e
     fs.writeFileSync(filePath, `${path.basename(filePath)} bytes`);
   }
 
-  setChildProcessHandler(({ kind, command, args }) => {
+  setIllustratorOpenedAfterActivationHandler(({ kind, command, args }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
       return { stdout: '444 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator --secret SHOULD_NOT_APPEAR_PROCESS_ARG\n' };
     }
@@ -6530,6 +9033,7 @@ test('broad observer quarantine does not block clean Illustrator DOC/LINK live e
         stdout: [
           `DOC\t${sourcePath}\tBris Invitation-03 copy.ai\ttrue\tfalse`,
           `LINK\t${sourcePath}\tBris Invitation-03 copy.ai\t${linkedPath}\ttrue\tfalse`,
+          'COMPLETE\t1\t1',
         ].join('\n') + '\n',
       };
     }
@@ -6555,7 +9059,7 @@ test('broad observer quarantine does not block clean Illustrator DOC/LINK live e
   assert.equal(fresh.files.some(file => file.path === staleBroadPath), false);
   assert.equal(fresh.pendingFiles.some(file => file.path === staleBroadPath), false);
   assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
+    .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
   assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger), [
     staleBroadPath,
     'SHOULD_NOT_APPEAR_PROCESS_ARG',
@@ -6814,7 +9318,10 @@ test('initial snapshot does not parse linked assets from stale pending source fi
     assert.deepEqual(fresh.pendingFiles, []);
     assert.equal(fresh.files.some(file => file.path === linkedPath), false);
     assert.equal(Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), true);
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
+    const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+    assert.equal(Object.values((storedProject.liveEvidenceLedger && storedProject.liveEvidenceLedger.candidates) || {})
+      .some(entry => entry.latest && entry.latest.reason === 'broad-observer-outside-session'), false);
     assert.equal(observations.length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
@@ -7091,13 +9598,19 @@ test('pre-package app-script parser and regex recovered additions record session
     });
 
     setChildProcessHandler(({ kind, command, args, commandText }) => {
-      if (kind === 'exec' && command.includes("grep -i 'Adobe Illustrator'")) {
-        return { stdout: '/Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+      if (isIllustratorPgrepCheck({ kind, command, args })) {
+        return { stdout: '777\n' };
       }
-      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-scan.applescript')) {
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         assertPrivateTempScriptPath(args[0]);
         assert.equal(commandText.includes('tell application'), false);
-        return { stdout: `${scriptLinkedPath}\n` };
+        return {
+          stdout: [
+            `DOC\t${aiPath}\tlayout.ai\ttrue\tfalse`,
+            `LINK\t${aiPath}\tlayout.ai\t${scriptLinkedPath}\ttrue\tfalse`,
+            'COMPLETE\t1\t1',
+          ].join('\n') + '\n',
+        };
       }
       return { stdout: '' };
     });
@@ -7317,6 +9830,149 @@ test('a delayed PSD scan from an old A activation cannot mutate after A to B to 
   } finally {
     fs.promises.readFile = originalReadFile;
     releaseRead();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+for (const staleScenario of ['pause', 'delete', 'B-A-B']) {
+  test(`stale multi-asset PSD extraction cleans staged output after ${staleScenario}`, async () => {
+    await assertStalePsdExtractionLeavesNoInvocationFiles(staleScenario);
+  });
+}
+
+test('multi-asset PSD extraction error cleans earlier staged output and preserves unrelated files', async () => {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let extractDir = null;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject('PSD extraction later write error');
+    const psdPath = path.join(tmpRoot, 'write-error.psd');
+    extractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+    const sentinelPath = path.join(extractDir, 'pre-existing-unrelated.txt');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    fs.mkdirSync(extractDir, { recursive: true });
+    fs.writeFileSync(sentinelPath, 'unrelated bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [
+        { name: 'earlier.png', data: Buffer.from('earlier invocation bytes') },
+        { name: 'later.png', data: Buffer.from('later invocation bytes') },
+      ],
+    };
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: path.basename(psdPath),
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const persistedBefore = structuredClone({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    });
+    let extractionWriteCount = 0;
+    fs.promises.writeFile = async function failAfterLaterPsdExtractionWrite(filePath, ...args) {
+      if (path.dirname(path.resolve(filePath)) === path.resolve(extractDir)) {
+        extractionWriteCount++;
+        await originalWriteFile.call(fs.promises, filePath, ...args);
+        if (extractionWriteCount === 2) throw new Error('forced later PSD extraction write error');
+        return;
+      }
+      return originalWriteFile.call(fs.promises, filePath, ...args);
+    };
+
+    testRendererEvents.length = 0;
+    const result = await callIpc('projects:pre-package-scan', project.id);
+
+    assert.equal(result.newCount, 0);
+    assert.deepEqual(fs.readdirSync(extractDir), [path.basename(sentinelPath)]);
+    assert.equal(fs.readFileSync(sentinelPath, 'utf8'), 'unrelated bytes');
+    assert.deepEqual({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    }, persistedBefore);
+    assert.equal(JSON.stringify(testRendererEvents).includes(extractDir), false);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('multi-asset PSD extraction partial commit error cleans final and staged output', async () => {
+  const tmpRoot = makeTempDir();
+  const originalUnlinkSync = fs.unlinkSync;
+  let extractDir = null;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject('PSD extraction partial commit error');
+    const psdPath = path.join(tmpRoot, 'partial-commit-error.psd');
+    extractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+    const sentinelPath = path.join(extractDir, 'pre-existing-unrelated.txt');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    fs.mkdirSync(extractDir, { recursive: true });
+    fs.writeFileSync(sentinelPath, 'unrelated bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [
+        { name: 'earlier.png', data: Buffer.from('earlier invocation bytes') },
+        { name: 'later.png', data: Buffer.from('later invocation bytes') },
+      ],
+    };
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: path.basename(psdPath),
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const persistedBefore = structuredClone({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    });
+    let committedTempUnlinkCount = 0;
+    let failedLaterCommitUnlink = false;
+    fs.unlinkSync = function failLaterCommittedTempUnlink(filePath, ...args) {
+      const isExtractionTemp = path.dirname(path.resolve(filePath)) === path.resolve(extractDir)
+        && path.basename(filePath).startsWith('.')
+        && path.basename(filePath).includes('.tmp');
+      if (isExtractionTemp && !failedLaterCommitUnlink && ++committedTempUnlinkCount === 2) {
+        failedLaterCommitUnlink = true;
+        throw new Error('forced later PSD committed temp unlink error');
+      }
+      return originalUnlinkSync.call(fs, filePath, ...args);
+    };
+
+    testRendererEvents.length = 0;
+    const result = await callIpc('projects:pre-package-scan', project.id);
+
+    assert.equal(result.newCount, 0);
+    assert.equal(failedLaterCommitUnlink, true);
+    assert.deepEqual(fs.readdirSync(extractDir), [path.basename(sentinelPath)]);
+    assert.equal(fs.readFileSync(sentinelPath, 'utf8'), 'unrelated bytes');
+    assert.deepEqual({
+      files: stored.files,
+      pendingFiles: stored.pendingFiles,
+      liveEvidenceLedger: stored.liveEvidenceLedger,
+      provenance: stored.provenance,
+    }, persistedBefore);
+    assert.equal(JSON.stringify(testRendererEvents).includes(extractDir), false);
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
