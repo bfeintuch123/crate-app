@@ -9442,6 +9442,32 @@ function createTray() {
 
 // --- File Watching ---
 
+async function isUnacceptedGenericChangeInCurrentWatchSession(project, filePath, suppliedStats = null) {
+  if (!project || isAcceptedProjectFilePath(project, filePath)) return !!project;
+
+  let stats = suppliedStats;
+  if (!stats || !Number.isFinite(stats.mtimeMs) || !Number.isFinite(stats.birthtimeMs)) {
+    try {
+      stats = await fs.promises.stat(filePath);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  const watchStartedAt = typeof project.watchStartedAt === 'number'
+    ? project.watchStartedAt
+    : Date.parse(project.watchStartedAt);
+  if (
+    !Number.isFinite(watchStartedAt) ||
+    !Number.isFinite(stats.mtimeMs) ||
+    !Number.isFinite(stats.birthtimeMs)
+  ) {
+    return false;
+  }
+
+  return stats.mtimeMs >= watchStartedAt || stats.birthtimeMs >= watchStartedAt;
+}
+
 async function startWatching(projectId, { preserveWatchStartedAt = false } = {}) {
   const settings = store.get('settings') || {};
   const activation = activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt });
@@ -9772,7 +9798,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 
   // FIX 1: chokidar change handler uses mutateProject
   // v2.2.2: Also triggers scan-on-open when a design file is modified
-  watcher.on('change', async (filePath) => {
+  watcher.on('change', async (filePath, suppliedStats = null) => {
     if (!isActiveWatchingProject(projectId, activationToken)) return;
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
@@ -9785,6 +9811,19 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
     // v2.2.6: Only re-scan PRIMARY design source files on change.
     // Same rationale as the 'add' handler — image/media changes are noise here.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
+      const currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+      if (!currentProject) return;
+      const changeBelongsToCurrentSession = await isUnacceptedGenericChangeInCurrentWatchSession(
+        currentProject,
+        filePath,
+        suppliedStats
+      );
+      if (!changeBelongsToCurrentSession) {
+        const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
+        if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
+      }
+      if (!isActiveWatchingProject(projectId, activationToken)) return;
+
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
         if (!isActiveWatchingProject(projectId, activationToken)) return null;
