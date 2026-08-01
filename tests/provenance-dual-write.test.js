@@ -474,6 +474,14 @@ async function waitForProject(projectId, predicate, timeoutMs = 3000) {
   return project;
 }
 
+async function waitForCondition(predicate, message, timeoutMs = 3000) {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) assert.fail(message);
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+  }
+}
+
 async function waitForNotificationShown(index = 0, timeoutMs = 1500) {
   const startedAt = Date.now();
   while (!testNotifications[index] || !testNotifications[index].shown) {
@@ -491,10 +499,10 @@ function latestWatcherHandlers() {
   return record.handlers;
 }
 
-async function emitWatcher(eventName, filePath) {
+async function emitWatcher(eventName, filePath, ...args) {
   const handler = latestWatcherHandlers()[eventName];
   assert.equal(typeof handler, 'function', `expected ${eventName} watcher handler`);
-  await handler(filePath);
+  await handler(filePath, ...args);
 }
 
 function manualDialogFor(filePaths) {
@@ -4594,8 +4602,11 @@ test('provenance recording failure does not block manual file capture', async ()
 });
 
 test('chokidar add records session observation only after primary design file add succeeds', async () => {
-  const project = await createProject('Chokidar add provenance');
   const filePath = path.join(os.tmpdir(), 'layout.psd');
+  fs.writeFileSync(filePath, 'older design file');
+  const oldTimestamp = new Date(Date.now() - 60000);
+  fs.utimesSync(filePath, oldTimestamp, oldTimestamp);
+  const project = await createProject('Chokidar add provenance');
 
   await emitWatcher('add', filePath);
   await emitWatcher('add', filePath);
@@ -4615,6 +4626,7 @@ test('chokidar add records session observation only after primary design file ad
 test('chokidar change records observation only for a previously unseen primary design file', async () => {
   const project = await createProject('Chokidar change provenance');
   const filePath = path.join(os.tmpdir(), 'identity.ai');
+  fs.writeFileSync(filePath, 'current-session identity source');
 
   await emitWatcher('change', filePath);
   await emitWatcher('change', filePath);
@@ -4629,6 +4641,269 @@ test('chokidar change records observation only for a previously unseen primary d
     'change',
     CONFIDENCE_BANDS.CANDIDATE
   );
+});
+
+test('current watcher rejects a stale prior-session change before any stateful work', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const staleSource = path.join(TEST_HOME, 'Desktop', 'A_Project.ai');
+  const staleLink = path.join(TEST_HOME, 'Desktop', 'A_Asset.png');
+  fs.writeFileSync(staleSource, staleLink);
+  fs.writeFileSync(staleLink, 'stale linked asset');
+
+  const projectA = await createProject('Generic change session A');
+  const watcherA = latestWatcherHandlers();
+  const projectB = await createProject('Generic change session B');
+  const watcherB = latestWatcherHandlers();
+  const storedB = storeInstance.data.projects.find(item => item.id === projectB.id);
+  const staleStats = {
+    mtimeMs: storedB.watchStartedAt - 10000,
+    birthtimeMs: storedB.watchStartedAt - 20000,
+  };
+  const stateBefore = structuredClone({
+    files: storedB.files,
+    pendingFiles: storedB.pendingFiles,
+    liveEvidenceLedger: storedB.liveEvidenceLedger,
+    provenance: storedB.provenance,
+  });
+  const originalStat = fs.promises.stat;
+  const originalReadFile = fs.promises.readFile;
+  let sourceStatCount = 0;
+  let sourceReadCount = 0;
+  fs.promises.stat = async function returnStaleSourceStats(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(staleSource)) {
+      sourceStatCount++;
+      return staleStats;
+    }
+    return originalStat.call(fs.promises, filePath, ...args);
+  };
+  fs.promises.readFile = async function countStaleSourceReads(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(staleSource)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, filePath, ...args);
+  };
+
+  try {
+    testRendererEvents.length = 0;
+    await watcherB.change(staleSource);
+    await watcherA.change(staleSource);
+
+    const freshA = await getProject(projectA.id);
+    const freshB = await getProject(projectB.id);
+    assert.equal(freshA.status, 'paused');
+    assert.equal(freshB.status, 'watching');
+    assert.deepEqual({
+      files: storedB.files,
+      pendingFiles: storedB.pendingFiles,
+      liveEvidenceLedger: storedB.liveEvidenceLedger,
+      provenance: storedB.provenance,
+    }, stateBefore);
+    assert.equal([...freshB.files, ...freshB.pendingFiles].some(file => file.path === staleSource), false);
+    assert.equal([...freshB.files, ...freshB.pendingFiles].some(file => file.path === staleLink), false);
+    assert.equal(sourceStatCount, 1);
+    assert.equal(sourceReadCount, 0);
+    assert.equal(testRendererEvents.some(event => event.data && event.data.projectId === projectB.id), false);
+    assert.equal(testRendererEvents.some(event => event.data && event.data.projectId === projectA.id), false);
+  } finally {
+    fs.promises.stat = originalStat;
+    fs.promises.readFile = originalReadFile;
+  }
+});
+
+test('fresh generic change captures B source and discovers its linked asset', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'B_Project.ai');
+  const linkedPath = '/Users/CrateQA/B_Asset.png';
+  fs.writeFileSync(sourcePath, 'fresh source bytes');
+  let illustratorRows = [];
+  let illustratorQueryCount = 0;
+  setChildProcessHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return { stdout: '321\n' };
+    if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+      illustratorQueryCount++;
+      if (illustratorRows.length === 0) {
+        return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+      }
+      return { stdout: `${illustratorRows.join('\n')}\nCOMPLETE\t1\t1\n` };
+    }
+    return { stdout: '' };
+  });
+  const originalAccess = fs.promises.access;
+  const originalAccessSync = fs.accessSync;
+  const originalReadFile = fs.promises.readFile;
+  let sourceReadCount = 0;
+  fs.promises.readFile = async function readSyntheticLinkedPath(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(sourcePath)) {
+      sourceReadCount++;
+      return Buffer.from(linkedPath);
+    }
+    return originalReadFile.call(fs.promises, filePath, ...args);
+  };
+  fs.promises.access = async function accessSyntheticLinkedPath(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(linkedPath)) return;
+    return originalAccess.call(fs.promises, filePath, ...args);
+  };
+  fs.accessSync = function accessSyntheticLinkedPathSync(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(linkedPath)) return;
+    return originalAccessSync.call(fs, filePath, ...args);
+  };
+
+  try {
+    const project = await createProject('Fresh generic change session');
+    await waitForCondition(
+      () => illustratorQueryCount >= 1,
+      'timed out waiting for initial Illustrator activation scope'
+    );
+    illustratorRows = [
+      `DOC\t${sourcePath}\tB_Project.ai\ttrue\ttrue`,
+      `LINK\t${sourcePath}\tB_Project.ai\t${linkedPath}\ttrue\ttrue`,
+    ];
+    await runTrackedIntervalCallbacks();
+    const stagedProject = await waitForProject(
+      project.id,
+      item => item.pendingFiles.some(file => file.path === sourcePath) &&
+        item.pendingFiles.some(file => file.path === linkedPath),
+      5000
+    );
+
+    const savedDuringSession = new Date(stagedProject.watchStartedAt + 1000);
+    fs.utimesSync(sourcePath, savedDuringSession, savedDuringSession);
+    await emitWatcher('change', sourcePath);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      5000
+    );
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'), true);
+    assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.name === 'A_Project.ai'), false);
+    assert.equal([...fresh.files, ...fresh.pendingFiles].some(file => file.name === 'A_Asset.png'), false);
+    await waitForCondition(() => sourceReadCount > 0, 'timed out waiting for initial scan-on-open');
+
+    const readCountBeforeRescan = sourceReadCount;
+    const staleStats = {
+      mtimeMs: fresh.watchStartedAt - 10000,
+      birthtimeMs: fresh.watchStartedAt - 20000,
+    };
+    await emitWatcher('change', sourcePath, staleStats);
+    await waitForCondition(
+      () => sourceReadCount > readCountBeforeRescan,
+      'timed out waiting for accepted-source rescan'
+    );
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
+  } finally {
+    fs.promises.access = originalAccess;
+    fs.accessSync = originalAccessSync;
+    fs.promises.readFile = originalReadFile;
+  }
+});
+
+test('generic change rescans a file accepted through Add Files while stat is pending', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Accepted_During_Stat.ai');
+  fs.writeFileSync(sourcePath, 'accepted during stat bytes');
+  const project = await createProject('Generic change Add Files race');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const staleStats = {
+    mtimeMs: stored.watchStartedAt - 10000,
+    birthtimeMs: stored.watchStartedAt - 20000,
+  };
+
+  const originalStat = fs.promises.stat;
+  const originalReadFile = fs.promises.readFile;
+  let releaseStat;
+  let markStatStarted;
+  let sourceReadCount = 0;
+  const statStarted = new Promise(resolve => { markStatStarted = resolve; });
+  const statGate = new Promise(resolve => { releaseStat = resolve; });
+  fs.promises.stat = async function deferSourceStat(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(sourcePath)) {
+      markStatStarted();
+      return statGate;
+    }
+    return originalStat.call(fs.promises, filePath, ...args);
+  };
+  fs.promises.readFile = async function countSourceReads(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(sourcePath)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, filePath, ...args);
+  };
+
+  try {
+    const changePromise = emitWatcher('change', sourcePath);
+    await statStarted;
+
+    manualDialogFor([sourcePath]);
+    const manuallyAdded = await callIpc('projects:add-files', project.id);
+    assert.equal(manuallyAdded.filter(file => file.path === sourcePath).length, 1);
+
+    releaseStat(staleStats);
+    await changePromise;
+    await waitForCondition(
+      () => sourceReadCount > 0,
+      'timed out waiting for accepted-source rescan after deferred stat'
+    );
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(fresh.files.find(file => file.path === sourcePath).source, 'manual-browse');
+    assert.equal(fresh.pendingFiles.some(file => file.path === sourcePath), false);
+  } finally {
+    fs.promises.stat = originalStat;
+    fs.promises.readFile = originalReadFile;
+  }
+});
+
+test('generic watcher enforces the exact Watching-session timestamp boundary', async () => {
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const cases = [
+    { label: 'old birth with fresh save', mtimeOffset: 1, birthtimeOffset: -10000, expected: true },
+    { label: 'fresh replacement with old mtime', mtimeOffset: -10000, birthtimeOffset: 1, expected: true },
+    { label: 'save at the exact boundary', mtimeOffset: 0, birthtimeOffset: -10000, expected: true },
+    { label: 'both timestamps predate the boundary', mtimeOffset: -1, birthtimeOffset: -10000, expected: false },
+  ];
+
+  for (const scenario of cases) {
+    const project = await createProject(`Generic change boundary: ${scenario.label}`);
+    const filePath = path.join(TEST_HOME, 'Desktop', `${scenario.label.replaceAll(' ', '-')}.ai`);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    await emitWatcher('change', filePath, {
+      mtimeMs: stored.watchStartedAt + scenario.mtimeOffset,
+      birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset,
+    });
+
+    const fresh = await getProject(project.id);
+    assert.equal(
+      fresh.files.some(file => file.path === filePath),
+      scenario.expected,
+      scenario.label
+    );
+  }
+});
+
+test('generic watcher stat failure for an unaccepted change leaves no state mutation', async () => {
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Generic change stat failure');
+  const missingPath = path.join(TEST_HOME, 'Desktop', 'missing-change.ai');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const stateBefore = structuredClone({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+  });
+  testRendererEvents.length = 0;
+
+  await emitWatcher('change', missingPath);
+
+  assert.deepEqual({
+    files: stored.files,
+    pendingFiles: stored.pendingFiles,
+    liveEvidenceLedger: stored.liveEvidenceLedger,
+    provenance: stored.provenance,
+  }, stateBefore);
+  assert.equal(testRendererEvents.some(event => event.data && event.data.projectId === project.id), false);
 });
 
 test('chokidar ignored, non-primary, and temp files do not record provenance', async () => {
