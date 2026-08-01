@@ -10,7 +10,7 @@
 - branch: `codex/fix-generic-watcher-session-boundary`
 - base: `b2229c2c59de225996ae08edc5f31b2cd024c29f`
 - mode: fix-and-PR
-- status: source-and-independent-review-pass-pr-preparation
+- status: draft-pr-source-merge-ready-awaiting-merge-approval
 
 ## Goal
 
@@ -65,9 +65,9 @@ Forbidden:
 
 ## State
 
-- current phase: approved commit, push, and draft PR preparation
-- last completed checkpoint: strict-boundary and Add Files race corrections passed focused and complete serial suites plus independent Autoreview and regression review
-- next action: commit the scoped files, push, and open the approved draft PR
+- current phase: merge-approval gate
+- last completed checkpoint: draft PR #172 is mergeable and its source security and regression suite passed
+- next action: stop for Bryant's explicit merge approval; build and installed QA remain separate gates
 - blocker: none
 - approval state: Bryant approved the ordered implementation and PR sequence;
   merge and every build/release/QA mutation remain separate gates
@@ -83,8 +83,8 @@ Forbidden:
 - [x] focused verification
 - [x] independent Autoreview
 - [x] regression, security, and provenance review
-- [ ] commit, push, and PR
-- [ ] merge-readiness handoff
+- [x] commit, push, and PR
+- [x] merge-readiness handoff
 
 ## Acceptance Criteria
 
@@ -143,7 +143,12 @@ Forbidden:
 - Repeated Autoreview then identified an asynchronous stat race with explicit
   Add Files. The handler now refetches the active project after the stat await,
   preserves a concurrent explicit acceptance, rescans it, and leaves one
-  duplicate-free manual entry. Final independent review is pending.
+  duplicate-free manual entry.
+- Final independent Autoreview and regression, security, and provenance review
+  both passed with no findings.
+- Draft PR #172 targets `v2.4.x`, contains exactly the two scoped code/test files
+  plus this taskflow, is mergeable, and passed GitHub's source security and
+  regression suite.
 
 ## Next Approval Gate
 
