@@ -599,15 +599,22 @@ async function waitForProjectCacheCleanup(projectIds, timeoutMs = 2500) {
       timeoutMs
     );
   }
-  const hasQuarantine = ['figma-assets', 'presentation-assets'].some((category) => {
-    const categoryDir = path.join(TEST_HOME, '.crate', category);
-    try {
-      return fs.readdirSync(categoryDir).some(name => /^\.crate-cleanup-/.test(name));
-    } catch (_) {
-      return false;
+  const cleanupStartedAt = Date.now();
+  while (true) {
+    const hasQuarantine = ['figma-assets', 'presentation-assets'].some((category) => {
+      const categoryDir = path.join(TEST_HOME, '.crate', category);
+      try {
+        return fs.readdirSync(categoryDir).some(name => /^\.crate-cleanup-/.test(name));
+      } catch (_) {
+        return false;
+      }
+    });
+    if (!hasQuarantine) break;
+    if (Date.now() - cleanupStartedAt > timeoutMs) {
+      assert.fail('serialized cleanup queue should leave no pending quarantine');
     }
-  });
-  assert.equal(hasQuarantine, false, 'serialized cleanup queue should leave no pending quarantine');
+    await new Promise(resolve => originalSetTimeout(resolve, 20));
+  }
   await new Promise(resolve => setImmediate(resolve));
 }
 
