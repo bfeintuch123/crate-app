@@ -28,6 +28,8 @@ const {
 } = require('./provenance');
 const {
   sanitizePackageFileName,
+  truncatePackageComponent,
+  createPackageNameAllocator,
   ensureSafePackageDirectory,
   resolveUniquePackagePath: resolveSafeUniquePackagePath,
   assertSafeCopySource,
@@ -127,39 +129,12 @@ function sanitizePackageFolderName(rawName, fallbackName = DEFAULT_PACKAGE_FOLDE
 
   if (name.startsWith('..')) name = name.replace(/^\.+/, '').trim();
   if (!name || name === '.' || name === '..') name = fallback;
-  if (name.length > MAX_PACKAGE_FOLDER_NAME_LENGTH) {
-    name = name.slice(0, MAX_PACKAGE_FOLDER_NAME_LENGTH).trim();
-  }
+  name = truncatePackageComponent(name, MAX_PACKAGE_FOLDER_NAME_LENGTH).trim();
   return name || fallback;
 }
 
 function sanitizeNamingTemplate(rawTemplate) {
   return sanitizePackageFolderName(rawTemplate, DEFAULT_NAMING_TEMPLATE);
-}
-
-function resolvePackageFolderInsideOutput(outputPath, rawFolderName) {
-  if (!outputPath || typeof outputPath !== 'string' || outputPath.includes('\0')) {
-    throw new Error('Invalid package output folder');
-  }
-
-  const outputRoot = path.resolve(outputPath);
-  const safeFolderName = sanitizePackageFolderName(rawFolderName);
-  const destFolder = path.resolve(outputRoot, safeFolderName);
-  if (!isPathInsideDirectory(outputRoot, destFolder) || path.relative(outputRoot, destFolder) === '') {
-    throw new Error('Package output folder escapes selected output folder');
-  }
-
-  const ensuredFolder = ensureSafePackageDirectory(destFolder);
-  if (!isPathInsideDirectory(outputRoot, ensuredFolder)) {
-    throw new Error('Package output folder escapes selected output folder');
-  }
-
-  const realOutputRoot = realpathSync(outputRoot);
-  const realDestFolder = realpathSync(ensuredFolder);
-  if (!isPathInsideDirectory(realOutputRoot, realDestFolder)) {
-    throw new Error('Package output folder escapes selected output folder');
-  }
-  return ensuredFolder;
 }
 
 function safeTempScriptName(name) {
@@ -2437,7 +2412,7 @@ const DESIGN_FILE_EXTENSIONS = new Set([
 // by lsof polling, which correctly detects when a design app actually opens them.
 const PRIMARY_DESIGN_EXTENSIONS = new Set([
   '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
-  '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.pxd',
+  '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.ppt', '.pxd',
 ]);
 
 // Package-time confirmation window for source docs that were only observed via lsof.
@@ -3864,7 +3839,7 @@ function recordPsdParserRelationship(project, psdFilePath, fileEntry) {
 
 function isPowerPointPresentationPath(filePath) {
   const ext = path.extname(filePath || '').toLowerCase();
-  return ext === '.pptx' || ext === '.ppt';
+  return ext === '.pptx';
 }
 
 function isKeynotePresentationPath(filePath) {
@@ -4484,13 +4459,14 @@ function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
   };
 }
 
-function isDiagnosticManifestDestinationSafe(destFolder) { const directoryPath = path.join(destFolder, DIAGNOSTICS_FOLDER_NAME), filePath = path.join(directoryPath, PROVENANCE_MANIFEST_FILENAME), lstat = target => { try { return fs.lstatSync(target); } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } }, directory = lstat(directoryPath); if (directory && (directory.isSymbolicLink() || !directory.isDirectory())) return false; const file = directory && lstat(filePath); return !file || (!file.isSymbolicLink() && file.isFile()); } function writePackageProvenanceManifest(projectId, packageInfo, packageResult, targetProject = null, fatal = false) { let writeStarted = false;
+function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)) { const filePath = path.join(destFolder, relativePath), directoryPath = path.dirname(filePath), lstat = target => { try { return fs.lstatSync(target); } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } }, directory = lstat(directoryPath); if (directory && (directory.isSymbolicLink() || !directory.isDirectory())) return false; const file = directory && lstat(filePath); return !file || (!file.isSymbolicLink() && file.isFile()); } function writePackageProvenanceManifest(projectId, packageInfo, packageResult, targetProject = null, fatal = false, writeDestFolder = null, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)) {
   try {
-    if (!isDiagnosticManifestDestinationSafe(packageInfo.destFolder)) throw new Error('Unsafe diagnostic manifest destination'); const project = targetProject || getProjects().find(p => p.id === projectId) || null;
-    const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult); writeStarted = true;
+    const destination = writeDestFolder || packageInfo.destFolder;
+    if (!isDiagnosticManifestDestinationSafe(destination, relativePath)) throw new Error('Unsafe diagnostic manifest destination'); const project = targetProject || getProjects().find(p => p.id === projectId) || null;
+    const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
     writeFileIntoPackageExact(
-      packageInfo.destFolder,
-      path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME),
+      destination,
+      relativePath,
       `${JSON.stringify(manifest, null, 2)}\n`,
       {
         preserveRelativePath: true,
@@ -4499,7 +4475,7 @@ function isDiagnosticManifestDestinationSafe(destFolder) { const directoryPath =
       }
     );
   } catch (e) {
-    if (fatal && writeStarted) throw Object.assign(new Error('diagnostic_manifest_write_failed'), { code: 'diagnostic_manifest_write_failed' });
+    if (fatal) throw Object.assign(new Error('diagnostic_manifest_write_failed'), { code: 'diagnostic_manifest_write_failed' });
     const message = e && typeof e.message === 'string' ? e.message : '';
     const safeMessage = /^(Invalid package output folder|Package output |Package destination )/.test(message)
       ? message
@@ -4522,6 +4498,7 @@ function mutateProject(projectId, fn) {
 
 // FIX 2 (C2): Track in-flight pre-package scans
 const scanInFlight = new Set();
+const incompletePackageScans = new Set();
 const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
 const figmaPackageTransferBlocks = new Map();
 
@@ -4546,6 +4523,12 @@ function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
 
 // C1: In-flight lock for confirmPackage / projects:package
 let packageInFlight = false;
+const PACKAGE_REVIEW_TOKEN_TTL_MS = 15 * 60 * 1000;
+const CONSUMED_PACKAGE_REVIEW_TOKEN_CAPACITY = 256;
+const PACKAGE_REVIEW_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const packageReviewSnapshots = new Map();
+const currentPackageReviewTokenByProject = new Map();
+const consumedPackageReviewTokens = new Map();
 
 let tray = null;
 // Historical name retained for existing renderer send paths; this is now the main app window.
@@ -4765,6 +4748,8 @@ const figmaRateLimitBackoffs = new Map(); // projectId -> retry-after timestamp 
 const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 const FIGMA_RATE_LIMIT_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes
 const PACKAGE_SCAN_WAIT_TIMEOUT_MS = 30000;
+const PRE_PACKAGE_DISCOVERY_TIMEOUT_MS = 8000;
+const PRE_PACKAGE_APP_SCAN_TIMEOUT_MS = 30000;
 // Keep a narrow overlap between incremental polls so a just-added image ref can't
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
 const FIGMA_INCREMENTAL_OVERLAP_MS = FIGMA_POLL_INTERVAL_MS * 2; // 2 minutes
@@ -8141,8 +8126,9 @@ async function extractLinkedAssets(filePath) {
         return await extractLinkedAssetsAffinity(filePath);
       case '.key':
       case '.pptx':
-      case '.ppt':
         return await extractLinkedAssetsZipMedia(filePath);
+      case '.ppt':
+        return await extractLinkedAssetsRegex(filePath);
       case '.pxd':
         return await extractLinkedAssetsPxd(filePath);
       case '.fig':
@@ -8491,7 +8477,7 @@ async function extractLinkedAssetsAffinity(filePath) {
 }
 
 /**
- * Zip media extractor for .key/.pptx/.ppt: lists embedded media files
+ * Zip media extractor for .key/.pptx: lists embedded media files
  * and returns their paths after extracting to a temp location.
  * Unlike the package-time extractEmbeddedMedia, this returns references
  * to the presentation file itself (the design file IS the asset container).
@@ -8787,12 +8773,25 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
       }
     }
 
-    if (newEntries.length === 0) return;
     if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
 
     const result = mutateProject(projectId, (proj) => {
       if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
-      let changed = false;
+      const currentEmbeddedKeys = new Set(
+        newEntries
+          .filter(entry => entry.source === 'scan-on-save-embedded')
+          .map(getEmbeddedPsdDedupKey)
+      );
+      const isStaleEmbeddedEntry = entry => (
+        isScanOnSaveEmbeddedPsdFile(entry) &&
+        normalizeTrackedFilePath(entry.parentPsd || entry.path) === normalizeTrackedFilePath(psdFilePath) &&
+        !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry))
+      );
+      const filesBefore = proj.files.length;
+      const pendingBefore = (proj.pendingFiles || []).length;
+      proj.files = proj.files.filter(entry => !isStaleEmbeddedEntry(entry));
+      proj.pendingFiles = (proj.pendingFiles || []).filter(entry => !isStaleEmbeddedEntry(entry));
+      let changed = proj.files.length !== filesBefore || proj.pendingFiles.length !== pendingBefore;
 
       for (const entry of newEntries) {
         const staged = stageLiveObservedFile(proj, entry, {
@@ -8825,7 +8824,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
 }
 
 /**
- * v2.5.3: Scan-on-save for presentation files (.pptx, .key, .ppt).
+ * v2.5.3: Scan-on-save for ZIP presentation files (.pptx, .key).
  * When a presentation is saved (Cmd+S), extract embedded media immediately
  * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
  */
@@ -8848,6 +8847,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
   try {
     if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
     const ext = path.extname(presentationPath).toLowerCase();
+    if (ext !== '.pptx' && ext !== '.key') return;
     const base = path.basename(presentationPath, ext);
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, presentationPath)) return;
@@ -8884,7 +8884,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     // cleaned display base. Content identity is the safe cross-save dedupe key.
     const contentFingerprints = new Set();
     const capturedSizes = new Set();
-    if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
+    if (ext === '.pptx' || ext === '.key') {
       for (const f of projectFiles) {
         const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
         if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
@@ -8959,7 +8959,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
 
       // Scope to known media folders
       const inMediaFolder =
-        (ext === '.pptx' || ext === '.ppt') ? zipPath.startsWith('ppt/media/') :
+        (ext === '.pptx')                    ? zipPath.startsWith('ppt/media/') :
         (ext === '.key')                     ? zipPath.startsWith('Data/')       :
         false;
       if (!inMediaFolder) continue;
@@ -8993,7 +8993,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         let extractedFingerprint = null;
 
         // Content-based dedup for presentation media.
-        if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
+        if (ext === '.pptx' || ext === '.key') {
           const extractedSize = data.length;
           const extractedHash = crypto.createHash('md5').update(data).digest('hex');
           extractedFingerprint = `${extractedSize}:${extractedHash}`;
@@ -9014,7 +9014,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         let counter = 1;
         while (fs.existsSync(destPath)) {
           hardenPresentationCacheFileIfPresent(destPath, tempDir);
-          if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
+          if (ext === '.pptx' || ext === '.key') {
             try {
               const existingBuf = readOwnerOnlyCacheFileSync(
                 destPath,
@@ -9865,7 +9865,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       }
 
       // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
-      if (sourceIsAccepted && (ext === '.pptx' || ext === '.ppt' || ext === '.key')) {
+      if (sourceIsAccepted && (ext === '.pptx' || ext === '.key')) {
         scheduleScanOnSavePresentation(projectId, filePath, activationToken);
       }
     }
@@ -10275,11 +10275,31 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
 // file handle. Scan Desktop/Documents/Downloads for .fig files modified during the
 // session (mtime >= watchStartedAt) to catch locally-saved Figma files.
 // For .fig files saved BEFORE the session, users should use "+ Add files".
+async function runPackageScanPhase(operation, timeoutMs, work) {
+  let timeoutId = null;
+  const workResult = Promise.resolve().then(work).then(
+    () => ({ status: 'complete' }),
+    error => ({ status: 'error', error })
+  );
+  const timeoutResult = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve({ status: 'timeout' }), timeoutMs);
+  });
+  const result = await Promise.race([workResult, timeoutResult]);
+  if (timeoutId) clearTimeout(timeoutId);
+  if (result.status === 'error') throw result.error;
+  if (result.status === 'timeout') {
+    operation.close();
+    return false;
+  }
+  return true;
+}
+
 registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) => {
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current, stagePrePackageFile = (project, file, observation) => operationCurrent() ? stageLiveObservedFile(project, file, observation) : null;
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
+  incompletePackageScans.delete(projectId);
   const previousFigmaPackageBlock = figmaPackageTransferBlocks.get(projectId);
   try {
   const projects = getProjects();
@@ -10306,8 +10326,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const existingPaths = getNormalizedPathSet(project.files);
   const pendingPaths = getNormalizedPathSet(project.pendingFiles);
 
-  await Promise.race([
-    (async () => {
+  const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
   try {
@@ -10495,14 +10514,15 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       // scan error — continue with others
     }
   }
-    })(),
-    new Promise(resolve => setTimeout(resolve, 8000))
-  ]);
+  });
+  if (!discoveryComplete) {
+    incompletePackageScans.add(projectId);
+    return { error: 'package_scan_incomplete' };
+  }
   if (!operationCurrent()) return null;
 
   // v2.4.2: 30s aggregate timeout wrapping all AppleScript + ag-psd queries
-  await Promise.race([
-    (async () => {
+  const appScanComplete = await runPackageScanPhase(operation, PRE_PACKAGE_APP_SCAN_TIMEOUT_MS, async () => {
   const illustratorActivationToken = getActiveWatchingActivationToken(projectId);
   if (illustratorActivationToken !== null) {
     const illustratorQuery = await queryIllustratorActiveState(projectId, illustratorActivationToken); if (!operationCurrent()) return;
@@ -10663,9 +10683,11 @@ end tell`;
   } catch (e) {
     // AppleScript failed or InDesign not responding — fall through to regex
   }
-    })(),
-    new Promise(resolve => setTimeout(resolve, 30000))
-  ]);
+  });
+  if (!appScanComplete) {
+    incompletePackageScans.add(projectId);
+    return { error: 'package_scan_incomplete' };
+  }
   if (!operationCurrent()) return null;
 
   // v1.3.24: Extract linked file paths from design files in the project.
@@ -10896,6 +10918,7 @@ end tell`;
   if (!operationCurrent()) return null;
   project.files = deduplicateFiles(project.files);
   const finalProject = getProjects().find(item => item.id === projectId);
+  incompletePackageScans.delete(projectId);
   return {
     files: getIllustratorScopedProjectView(finalProject).files,
     newCount,
@@ -11042,6 +11065,15 @@ async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, l
   }
 }
 
+function getPackageContentFingerprint(data) {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  return `${buffer.length}:${crypto.createHash('sha256').update(buffer).digest('hex')}`;
+}
+
+function isPackageContentFingerprint(value) {
+  return typeof value === 'string' && /^\d+:[0-9a-f]{64}$/.test(value);
+}
+
 // Parse a zip entry date from `unzip -l` output (macOS format: MM-DD-YYYY HH:MM)
 // Returns a Date object or null if parsing fails.
 function parseZipEntryDate(dateStr, timeStr) {
@@ -11064,9 +11096,12 @@ function parseZipEntryDate(dateStr, timeStr) {
 }
 
 async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, options = {}) {
-  const ext = path.extname(presentationPath).toLowerCase();
-  const base = path.basename(presentationPath, ext);
+  const logicalPresentationPath = options.logicalPresentationPath || presentationPath;
+  const ext = path.extname(logicalPresentationPath).toLowerCase();
+  const base = path.basename(logicalPresentationPath, ext);
   const extracted = [];
+  let expectedOutputIndex = 0;
+  if (ext !== '.pptx' && ext !== '.key') return extracted;
 
   // v1.3.10: Build a set of base names already captured by chokidar/lsof.
   // Normalise: lowercase, strip extension, collapse whitespace.
@@ -11075,8 +11110,12 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
   // scan-on-save media is intentionally excluded from this name set because
   // Keynote can save multiple distinct pasted images as pasted-image-NNNN.jpeg;
   // exact duplicates are handled by content fingerprints below.
-  const alreadyCapturedBases = new Set();
-  if (projectFiles) {
+  const alreadyCapturedBases = new Set(
+    Array.isArray(options.dedupNameBases)
+      ? options.dedupNameBases.filter(value => typeof value === 'string')
+      : []
+  );
+  if (!Array.isArray(options.dedupNameBases) && projectFiles) {
     for (const f of projectFiles) {
       if (f && f.source === 'scan-on-save-presentation') continue;
       const n = path.basename(f.name, path.extname(f.name)).toLowerCase().replace(/\s+/g, ' ').trim();
@@ -11088,19 +11127,24 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
   // PowerPoint renames all embedded images generically (image1.png, image2.png),
   // and Keynote can collapse distinct pasted images to the same cleaned display
   // base. Build a Set of size:md5 fingerprints from already-captured media, then
-  // check each extracted entry against it. Same size + same hash = same file.
-  const contentFingerprints = new Set();
+  // check each extracted entry against it. Same size + same SHA-256 = same file.
+  const contentFingerprints = new Set(
+    Array.isArray(options.dedupFingerprints)
+      ? options.dedupFingerprints.filter(isPackageContentFingerprint)
+      : []
+  );
   const capturedSizes = new Set();
-  if ((ext === '.pptx' || ext === '.ppt' || ext === '.key') && projectFiles) {
+  for (const fingerprint of contentFingerprints) {
+    capturedSizes.add(Number(fingerprint.slice(0, fingerprint.indexOf(':'))));
+  }
+  if (!Array.isArray(options.dedupFingerprints) && (ext === '.pptx' || ext === '.key') && projectFiles) {
     for (const f of projectFiles) {
       const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
       if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
       try {
         const buf = fs.readFileSync(f.path);
-        const size = buf.length;
-        capturedSizes.add(size);
-        const hash = crypto.createHash('md5').update(buf).digest('hex');
-        contentFingerprints.add(`${size}:${hash}`);
+        capturedSizes.add(buf.length);
+        contentFingerprints.add(getPackageContentFingerprint(buf));
       } catch (e) {
         // file may no longer exist on disk — skip
       }
@@ -11139,7 +11183,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
       // Scope to known media folders for each format
       const inMediaFolder =
-        (ext === '.pptx' || ext === '.ppt') ? zipPath.startsWith('ppt/media/') :
+        (ext === '.pptx')                    ? zipPath.startsWith('ppt/media/') :
         (ext === '.key')                     ? zipPath.startsWith('Data/')       :
         false;
       if (!inMediaFolder) continue;
@@ -11216,13 +11260,12 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
         // v1.3.18: Content-based dedup for presentation media — skip if
         // identical to a captured file.
-        if (ext === '.pptx' || ext === '.ppt' || ext === '.key') {
+        if (ext === '.pptx' || ext === '.key') {
           const extractedSize = data.length;
-          const extractedHash = crypto.createHash('md5').update(data).digest('hex');
-          extractedFingerprint = `${extractedSize}:${extractedHash}`;
+          extractedFingerprint = getPackageContentFingerprint(data);
           if (extractedPresentationFingerprints.has(extractedFingerprint)) {
             if (capturedSizes.has(extractedSize)) {
-              console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes, md5:${extractedHash})`);
+              console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes)`);
             }
             continue;
           }
@@ -11239,14 +11282,33 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         // Prefix with presentation name to avoid collisions with other files
         outputName = `${base} — ${outputName}`;
 
-        const destPath = resolveUniquePackagePath(destFolder, outputName);
+        const usesPackagePlan = options.planOnly || Array.isArray(options.expectedOutputs);
+        const descriptor = usesPackagePlan ? {
+          internalPath: zipPath,
+          outputName: options.reserveOutputName(outputName),
+          size: data.length,
+          sha256: crypto.createHash('sha256').update(data).digest('hex'),
+          contentFingerprint: extractedFingerprint,
+        } : null;
+        if (descriptor && Array.isArray(options.expectedOutputs)) {
+          const expectedOutput = options.expectedOutputs[expectedOutputIndex++];
+          if (!expectedOutput || JSON.stringify(descriptor) !== JSON.stringify(expectedOutput)) {
+            throw new PackageReviewChangedError();
+          }
+        }
+        if (descriptor && typeof options.onPlanned === 'function') options.onPlanned(descriptor);
+        if (options.planOnly) continue;
+
+        if (typeof options.onBeforeMaterialize === 'function') options.onBeforeMaterialize();
+        const destPath = resolveUniquePackagePath(destFolder, descriptor ? descriptor.outputName : outputName);
+        if (descriptor && path.basename(destPath) !== descriptor.outputName) throw new PackageReviewChangedError();
         if (typeof options.onBeforeWrite === 'function') options.onBeforeWrite(destPath);
         fs.writeFileSync(destPath, data, { flag: 'wx' });
         extracted.push(destPath);
         if (typeof options.onExtracted === 'function') {
           try {
             options.onExtracted({
-              presentationPath,
+              presentationPath: logicalPresentationPath,
               internalPath: zipPath,
               materializedPath: destPath,
               source: options.source || 'package-extraction',
@@ -11258,13 +11320,14 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         }
         console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
       } catch (e) {
-        if (e instanceof PackageTransactionInvariantError) throw e;
-        const message = formatEmbeddedMediaExtractionFailure(presentationPath, zipPath);
+        if (e instanceof PackageTransactionInvariantError || e instanceof PackageReviewChangedError) throw e;
+        if (options.failClosed) throw new PackageReviewChangedError();
+        const message = formatEmbeddedMediaExtractionFailure(logicalPresentationPath, zipPath);
         console.error(`[crate] ${message}`);
         if (typeof options.onExtractionError === 'function') {
           try {
             options.onExtractionError({
-              presentationPath,
+              presentationPath: logicalPresentationPath,
               internalPath: zipPath,
               message,
             });
@@ -11274,14 +11337,18 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         }
       }
     }
+    if (Array.isArray(options.expectedOutputs) && expectedOutputIndex !== options.expectedOutputs.length) {
+      throw new PackageReviewChangedError();
+    }
   } catch (e) {
-    if (e instanceof PackageTransactionInvariantError) throw e;
-    const message = formatEmbeddedMediaInspectionFailure(presentationPath);
+    if (e instanceof PackageTransactionInvariantError || e instanceof PackageReviewChangedError) throw e;
+    if (options.failClosed) throw new PackageReviewChangedError();
+    const message = formatEmbeddedMediaInspectionFailure(logicalPresentationPath);
     console.error(`[crate] ${message}`);
     if (typeof options.onInspectionError === 'function') {
       try {
         options.onInspectionError({
-          presentationPath,
+          presentationPath: logicalPresentationPath,
           message,
         });
       } catch (callbackErr) {
@@ -11304,28 +11371,11 @@ function getPackageFileDisplayName(file) {
   return sanitizePackageFileName(file && file.name, fallbackName || 'file');
 }
 
-function packageSourceExists(sourcePath) {
-  try {
-    return typeof sourcePath === 'string' && !sourcePath.includes('\0') && fs.existsSync(sourcePath);
-  } catch (e) {
-    return false;
-  }
-}
-
-function isSafePackageSourceFile(sourcePath) {
-  try {
-    assertSafeCopySource(sourcePath);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
 function isScanOnSaveEmbeddedPsdFile(file) {
   return !!(file && file.embedded && file.source === 'scan-on-save-embedded');
 }
 
-function findEmbeddedPsdLinkedFile(file, linkedFiles) {
+function findEmbeddedPsdLinkedFileMatch(file, linkedFiles) {
   if (!Array.isArray(linkedFiles)) return null;
 
   const hasData = (linkedFile) => linkedFile && linkedFile.data !== undefined && linkedFile.data !== null;
@@ -11339,10 +11389,14 @@ function findEmbeddedPsdLinkedFile(file, linkedFiles) {
 
   if (Number.isInteger(file.embeddedIndex)) {
     const linkedFile = linkedFiles[file.embeddedIndex];
-    return hasData(linkedFile) && matchesFile(linkedFile) ? linkedFile : null;
+    return hasData(linkedFile) && matchesFile(linkedFile)
+      ? { linkedFile, embeddedIndex: file.embeddedIndex }
+      : null;
   }
 
-  const matches = linkedFiles.filter(linkedFile => hasData(linkedFile) && matchesFile(linkedFile));
+  const matches = linkedFiles
+    .map((linkedFile, embeddedIndex) => ({ linkedFile, embeddedIndex }))
+    .filter(match => hasData(match.linkedFile) && matchesFile(match.linkedFile));
   return matches.length === 1 ? matches[0] : null;
 }
 
@@ -11357,50 +11411,1341 @@ async function waitForPackageInputScans(projectId, timeoutMs = PACKAGE_SCAN_WAIT
   while (hasInFlightPackageInputScan(projectId) && Date.now() - scanWaitStart < timeoutMs) {
     await new Promise(resolve => setTimeout(resolve, 200));
   }
+  return !hasInFlightPackageInputScan(projectId);
 }
 
-async function writeEmbeddedPsdAssetToPackage(file, finalPath, verifyWrite) {
-  const parentPsd = file.parentPsd || file.path;
-  if (!parentPsd || !packageSourceExists(parentPsd)) {
-    throw new Error('Parent PSD not found');
-  }
-  assertSafeCopySource(parentPsd);
+function packageReviewStatValue(value) {
+  return typeof value === 'bigint' ? value.toString() : String(value ?? 0);
+}
 
-  const stat = await fs.promises.stat(parentPsd);
-  if (stat.size > MAX_PARSE_FILE_SIZE) {
-    throw new Error('Parent PSD exceeds parse size limit');
+function serializePackageReviewStat(stat) {
+  return {
+    dev: packageReviewStatValue(stat.dev),
+    ino: packageReviewStatValue(stat.ino),
+    mode: packageReviewStatValue(stat.mode),
+    nlink: packageReviewStatValue(stat.nlink),
+    size: packageReviewStatValue(stat.size),
+    mtimeNs: packageReviewStatValue(stat.mtimeNs),
+    ctimeNs: packageReviewStatValue(stat.ctimeNs),
+  };
+}
+
+function serializePackageReviewIdentityStat(stat) {
+  return {
+    dev: packageReviewStatValue(stat.dev),
+    ino: packageReviewStatValue(stat.ino),
+    mode: packageReviewStatValue(stat.mode),
+  };
+}
+
+function getPackageReviewParentFingerprint(sourcePath) {
+  const parentPath = path.dirname(path.resolve(sourcePath));
+  const linkStat = fs.lstatSync(parentPath, { bigint: true });
+  const targetStat = fs.statSync(parentPath, { bigint: true });
+  if (!targetStat.isDirectory()) throw new Error('package_source_parent_unavailable');
+  return {
+    normalizedPath: parentPath.normalize('NFC').toLowerCase(),
+    realPath: normalizeTrackedFilePath(parentPath),
+    link: serializePackageReviewIdentityStat(linkStat),
+    target: serializePackageReviewIdentityStat(targetStat),
+  };
+}
+
+function getPackageReviewSourceFingerprint(sourcePath) {
+  const normalizedPath = normalizeTrackedFilePath(sourcePath);
+  if (!normalizedPath) return { state: 'virtual' };
+
+  try {
+    const parent = getPackageReviewParentFingerprint(sourcePath);
+    const linkStat = fs.lstatSync(sourcePath, { bigint: true });
+    if (linkStat.isSymbolicLink()) {
+      return { state: 'symlink', normalizedPath, parent, link: serializePackageReviewStat(linkStat) };
+    }
+    if (!linkStat.isFile()) {
+      return { state: 'unavailable', normalizedPath, parent, link: serializePackageReviewStat(linkStat) };
+    }
+    const sourceStat = fs.statSync(sourcePath, { bigint: true });
+    return {
+      state: 'present',
+      normalizedPath,
+      parent,
+      link: serializePackageReviewStat(linkStat),
+      source: serializePackageReviewStat(sourceStat),
+    };
+  } catch (error) {
+    return { state: error?.code === 'ENOENT' ? 'missing' : 'unavailable', normalizedPath };
+  }
+}
+
+function getPackageReviewManifestEntry(file) {
+  const embeddedPsd = isScanOnSaveEmbeddedPsdFile(file);
+  const sourcePath = embeddedPsd ? (file.parentPsd || file.path) : file && file.path;
+  const displayName = getPackageFileDisplayName(file);
+  const ext = (file && (file.ext || path.extname(displayName || sourcePath || '')) || '').toLowerCase();
+  const identity = embeddedPsd
+    ? {
+        kind: 'embedded-psd',
+        parentPath: normalizeTrackedFilePath(sourcePath),
+        embeddedIndex: Number.isInteger(file.embeddedIndex) ? file.embeddedIndex : null,
+        embeddedOriginalName: typeof file.embeddedOriginalName === 'string' ? file.embeddedOriginalName : '',
+        outputName: displayName,
+      }
+    : (typeof sourcePath === 'string' && sourcePath.trim()
+      ? { kind: 'file', normalizedPath: normalizeTrackedFilePath(sourcePath) }
+      : {
+          kind: 'virtual',
+          source: getFileCaptureSource(file) || 'unknown',
+          fileId: typeof file?.fileId === 'string' ? file.fileId : '',
+          outputName: displayName,
+        });
+
+  return {
+    identity,
+    sourceFingerprint: getPackageReviewSourceFingerprint(sourcePath),
+    displayName,
+    ext,
+    embedded: embeddedPsd,
+  };
+}
+
+function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
+  const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
+  if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
+    throw new PackageReviewChangedError();
   }
 
-  const buf = await fs.promises.readFile(parentPsd);
+  let descriptor;
+  let fd = null;
+  try {
+    fd = fs.openSync(sourcePath, 'r');
+    const beforeStat = fs.fstatSync(fd, { bigint: true });
+    if (
+      !beforeStat.isFile() ||
+      beforeStat.size > BigInt(MAX_PARSE_FILE_SIZE) ||
+      !packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(beforeStat))
+    ) {
+      throw new PackageReviewChangedError();
+    }
+    const buffer = fs.readFileSync(fd);
+    const afterStat = fs.fstatSync(fd, { bigint: true });
+    if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(afterStat))) {
+      throw new PackageReviewChangedError();
+    }
+    descriptor = readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+
+  if (!packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) {
+    throw new PackageReviewChangedError();
+  }
+  return descriptor;
+}
+
+function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint) {
+  const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
+  if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
+    throw new PackageReviewChangedError();
+  }
+
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  let fd = null;
+  try {
+    fd = fs.openSync(sourcePath, fs.constants.O_RDONLY | noFollow);
+    const beforeStat = fs.fstatSync(fd, { bigint: true });
+    if (
+      !beforeStat.isFile() ||
+      !packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(beforeStat))
+    ) {
+      throw new PackageReviewChangedError();
+    }
+
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let size = 0;
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      size += bytesRead;
+    }
+
+    const afterStat = fs.fstatSync(fd, { bigint: true });
+    if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(afterStat))) {
+      throw new PackageReviewChangedError();
+    }
+    return `${size}:${hash.digest('hex')}`;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+    if (!packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) {
+      throw new PackageReviewChangedError();
+    }
+  }
+}
+
+function getEmbeddedPsdResourceFingerprint(match) {
+  const data = Buffer.from(match.linkedFile.data);
+  return {
+    embeddedIndex: match.embeddedIndex,
+    nameSha256: crypto.createHash('sha256').update(String(match.linkedFile.name || '')).digest('hex'),
+    size: data.length,
+    sha256: crypto.createHash('sha256').update(data).digest('hex'),
+    contentFingerprint: getPackageContentFingerprint(data),
+  };
+}
+
+function bindEmbeddedPsdPackageReviewResources(files, entries) {
+  const parsedBySource = new Map();
+  entries.forEach((entry, entryIndex) => {
+    if (!entry.embedded || entry.sourceFingerprint.state !== 'present') return;
+    const file = files[entryIndex];
+    const sourcePath = file && (file.parentPsd || file.path);
+    if (!sourcePath) return;
+
+    const cacheKey = JSON.stringify({
+      normalizedPath: entry.sourceFingerprint.normalizedPath,
+      source: entry.sourceFingerprint.source,
+    });
+    let parsed = parsedBySource.get(cacheKey);
+    if (!parsed) {
+      try {
+        parsed = { psd: readStablePsdForPackageReview(sourcePath, entry.sourceFingerprint) };
+      } catch (_) {
+        parsed = { psd: null };
+      }
+      parsedBySource.set(cacheKey, parsed);
+    }
+    if (!parsed.psd) return;
+
+    const match = findEmbeddedPsdLinkedFileMatch(file, parsed.psd.linkedFiles || []);
+    if (!match) return;
+    entry.embeddedResource = getEmbeddedPsdResourceFingerprint(match);
+  });
+}
+
+const PACKAGE_PRESENTATION_EXTENSIONS = new Set(['.key', '.pptx']);
+
+function getPackageReviewEntryStatus(entry) {
+  if (entry.sourceFingerprint.state !== 'present') {
+    return entry.sourceFingerprint.state === 'virtual' ? 'unmaterializable' : entry.sourceFingerprint.state;
+  }
+  if (entry.identity.kind === 'file') return 'ready';
+  if (entry.identity.kind === 'embedded-psd' && !entry.embeddedResource) return 'unavailable';
+  if (
+    entry.identity.kind === 'embedded-psd' &&
+    entry.embeddedResource &&
+    entry.identity.parentPath &&
+    ((Number.isInteger(entry.identity.embeddedIndex) && entry.identity.embeddedIndex >= 0) ||
+      entry.identity.embeddedOriginalName || entry.identity.outputName)
+  ) return 'ready';
+  return 'unmaterializable';
+}
+
+async function buildAuthoritativePackagePlan(files, entries, packageSettings, destinationFolderName) {
+  const allocateOutputName = createPackageNameAllocator();
+  const reviewedSourceInputs = [];
+  const deterministicDerivedOutputs = [];
+  const outputNamesByEntryIndex = [];
+  const diagnosticsMetadata = packageSettings.includeDiagnosticReport ? {
+    materialization: 'crate-provenance-v2',
+    schemaVersion: DIAGNOSTIC_MANIFEST_SCHEMA_VERSION,
+    relativePath: path.posix.join(allocateOutputName(DIAGNOSTICS_FOLDER_NAME), PROVENANCE_MANIFEST_FILENAME),
+  } : null;
+  entries.forEach((entry, entryIndex) => {
+    const outputName = allocateOutputName(entry.displayName);
+    outputNamesByEntryIndex[entryIndex] = outputName;
+    if (entry.embedded) {
+      deterministicDerivedOutputs.push({
+        sourceEntryIndex: entryIndex,
+        materialization: 'psd-embedded-resource',
+        expectedOutputs: [{ outputName, resourceFingerprint: entry.embeddedResource }],
+      });
+    } else {
+      reviewedSourceInputs.push({ entryIndex, materialization: 'source-copy', expectedOutputName: outputName });
+    }
+  });
+
+  const presentationEntryIndexes = [];
+  const seenPresentationSources = new Set();
+  for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+    const entry = entries[entryIndex];
+    if (entry.embedded || !PACKAGE_PRESENTATION_EXTENSIONS.has(entry.ext)) continue;
+    const sourceIdentity = JSON.stringify(entry.identity);
+    if (seenPresentationSources.has(sourceIdentity)) continue;
+    seenPresentationSources.add(sourceIdentity);
+    presentationEntryIndexes.push(entryIndex);
+  }
+
+  const presentationDedupFingerprints = new Set();
+  const dedupFingerprintBySource = new Map();
+  if (presentationEntryIndexes.length > 0) {
+    for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+      const outputName = outputNamesByEntryIndex[entryIndex];
+      if (!EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(outputName || '').toLowerCase())) continue;
+
+      const entry = entries[entryIndex];
+      let contentFingerprint = entry.embeddedResource?.contentFingerprint || null;
+      if (!entry.embedded) {
+        const cacheKey = JSON.stringify(entry.sourceFingerprint);
+        contentFingerprint = dedupFingerprintBySource.get(cacheKey) || null;
+        if (!contentFingerprint) {
+          contentFingerprint = getStablePackageReviewSourceContentFingerprint(
+            files[entryIndex].path,
+            entry.sourceFingerprint
+          );
+          dedupFingerprintBySource.set(cacheKey, contentFingerprint);
+        }
+      }
+      if (!isPackageContentFingerprint(contentFingerprint)) throw new PackageReviewChangedError();
+      presentationDedupFingerprints.add(contentFingerprint);
+    }
+  }
+
+  const dedupNameBases = [...new Set(entries
+    .map((entry, entryIndex) => {
+      if (files[entryIndex]?.source === 'scan-on-save-presentation') return null;
+      const displayName = entry.displayName || '';
+      return path.basename(displayName, path.extname(displayName)).toLowerCase().replace(/\s+/g, ' ').trim();
+    })
+    .filter(Boolean))].sort();
+
+  for (const entryIndex of presentationEntryIndexes) {
+    const expectedOutputs = [];
+    const dedupFingerprints = [...presentationDedupFingerprints].sort();
+    await extractEmbeddedMedia(files[entryIndex].path, null, files, {
+      planOnly: true,
+      failClosed: true,
+      dedupFingerprints,
+      dedupNameBases,
+      reserveOutputName: allocateOutputName,
+      onPlanned: output => expectedOutputs.push(output),
+    });
+    for (const output of expectedOutputs) {
+      if (!isPackageContentFingerprint(output.contentFingerprint)) throw new PackageReviewChangedError();
+      presentationDedupFingerprints.add(output.contentFingerprint);
+    }
+    deterministicDerivedOutputs.push({
+      sourceEntryIndex: entryIndex,
+      materialization: 'presentation-media',
+      dedupFingerprints,
+      dedupNameBases,
+      expectedOutputs,
+    });
+  }
+  return {
+    schemaVersion: 1,
+    collisionPolicy: 'stable-macos-nfc-casefold-v1',
+    packageSettings,
+    destinationFolderName,
+    reviewedSourceInputs,
+    deterministicDerivedOutputs,
+    diagnosticsMetadata,
+  };
+}
+
+function getRelevantPackageReviewSettings() {
+  const settings = store.get('settings') || {};
+  return {
+    includeDiagnosticReport: settings.includeDiagnosticReport === true,
+    namingTemplate: sanitizeNamingTemplate(settings.namingTemplate),
+  };
+}
+
+function getReviewedPackageFolderName(project, packageSettings, now = new Date()) {
+  const dateStr = now.toISOString().split('T')[0];
+  return sanitizePackageFolderName(
+    packageSettings.namingTemplate
+      .replace('{Project}', cleanName(project.name))
+      .replace('{Date}', dateStr)
+  );
+}
+
+function getPackageSelectionInputSignature(project) {
+  if (!project) return null;
+  const scopedProject = getIllustratorScopedProjectView(project);
+  if (!scopedProject) return null;
+  const illustratorScope = getIllustratorActivationScope(project.id);
+  const acceptedPendingNodeIds = (project.provenance?.observations || [])
+    .filter(observation => observation?.observer?.method === 'projects:accept-pending')
+    .map(observation => observation.objectNodeId)
+    .filter(value => typeof value === 'string')
+    .sort();
+  const input = {
+    files: Array.isArray(scopedProject.files) ? scopedProject.files : [],
+    watchStartedAt: project.watchStartedAt || null,
+    createdAt: project.createdAt || null,
+    figmaScopeMode: getProjectFigmaScopeMode(project),
+    figmaSession: project.figmaSession || null,
+    acceptedPendingNodeIds,
+    illustratorScope: illustratorScope ? {
+      revision: illustratorScope.revision,
+      status: illustratorScope.status,
+      baselineDocumentPaths: [...illustratorScope.baselineDocumentPaths].sort(),
+      admittedDocumentPaths: [...illustratorScope.admittedDocumentPaths].sort(),
+      allowedLinkedPaths: [...illustratorScope.allowedLinkedPaths].sort(),
+      excludedLinkedPaths: [...illustratorScope.excludedLinkedPaths].sort(),
+    } : null,
+  };
+  try {
+    return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+  } catch (_) {
+    return null;
+  }
+}
+
+async function buildCanonicalPackageReviewManifest(projectId) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const project = getProjects().find(item => item && item.id === projectId);
+    if (!project) return { error: 'not_found' };
+    const inputSignature = getPackageSelectionInputSignature(project);
+    const packageSettings = getRelevantPackageReviewSettings();
+    const packageSettingsKey = JSON.stringify(packageSettings);
+    if (!inputSignature) return { error: 'package_review_unavailable' };
+
+    const files = await selectProjectFilesForPackaging(project);
+    const currentProject = getProjects().find(item => item && item.id === projectId);
+    if (!currentProject) return { error: 'not_found' };
+    if (inputSignature !== getPackageSelectionInputSignature(currentProject)) continue;
+    if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
+
+    const entries = files.map(getPackageReviewManifestEntry);
+    bindEmbeddedPsdPackageReviewResources(files, entries);
+    const entryStatuses = entries.map(getPackageReviewEntryStatus);
+    if (entryStatuses.some(status => status !== 'ready')) {
+      return {
+        project: currentProject,
+        files,
+        entries,
+        entryStatuses,
+        materializable: false,
+      };
+    }
+    let plan;
+    try {
+      plan = await buildAuthoritativePackagePlan(
+        files,
+        entries,
+        packageSettings,
+        getReviewedPackageFolderName(currentProject, packageSettings)
+      );
+    } catch (error) {
+      if (error instanceof PackageReviewChangedError) {
+        return {
+          project: currentProject,
+          files,
+          entries,
+          entryStatuses: entries.map(entry => PACKAGE_PRESENTATION_EXTENSIONS.has(entry.ext) ? 'unavailable' : 'ready'),
+          materializable: false,
+        };
+      }
+      throw error;
+    }
+    const finalProject = getProjects().find(item => item && item.id === projectId);
+    if (!finalProject || inputSignature !== getPackageSelectionInputSignature(finalProject)) continue;
+    if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
+    const finalEntries = files.map(getPackageReviewManifestEntry);
+    bindEmbeddedPsdPackageReviewResources(files, finalEntries);
+    if (!packageReviewFingerprintsMatch(entries, finalEntries)) continue;
+    const manifestKey = crypto.createHash('sha256').update(JSON.stringify({ entries, plan })).digest('hex');
+    return {
+      project: finalProject,
+      files,
+      entries,
+      plan,
+      manifestKey,
+      materializable: true,
+    };
+  }
+  return { error: 'package_review_unstable' };
+}
+
+function cleanExpiredPackageReviewTokens(now = Date.now()) {
+  for (const [token, snapshot] of packageReviewSnapshots) {
+    if (snapshot.expiresAt > now) continue;
+    packageReviewSnapshots.delete(token);
+    if (currentPackageReviewTokenByProject.get(snapshot.projectId) === token) {
+      currentPackageReviewTokenByProject.delete(snapshot.projectId);
+    }
+  }
+  for (const [token, expiresAt] of consumedPackageReviewTokens) {
+    if (expiresAt <= now) consumedPackageReviewTokens.delete(token);
+  }
+}
+
+function hasConsumedPackageReviewToken(token, now = Date.now()) {
+  const expiresAt = consumedPackageReviewTokens.get(token);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= now) {
+    consumedPackageReviewTokens.delete(token);
+    return false;
+  }
+  consumedPackageReviewTokens.delete(token);
+  consumedPackageReviewTokens.set(token, expiresAt);
+  return true;
+}
+
+function rememberConsumedPackageReviewToken(token, expiresAt) {
+  consumedPackageReviewTokens.delete(token);
+  while (consumedPackageReviewTokens.size >= CONSUMED_PACKAGE_REVIEW_TOKEN_CAPACITY) {
+    const leastRecentlyUsed = consumedPackageReviewTokens.keys().next().value;
+    if (leastRecentlyUsed === undefined) break;
+    consumedPackageReviewTokens.delete(leastRecentlyUsed);
+  }
+  consumedPackageReviewTokens.set(token, expiresAt);
+}
+
+function invalidatePackageReviewForProject(projectId) {
+  const token = currentPackageReviewTokenByProject.get(projectId);
+  if (token) packageReviewSnapshots.delete(token);
+  currentPackageReviewTokenByProject.delete(projectId);
+}
+
+function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = null) {
+  if (!manifest.materializable || !manifest.plan || !manifest.manifestKey) {
+    throw new Error('Cannot issue an unmaterializable package review');
+  }
+  cleanExpiredPackageReviewTokens();
+  invalidatePackageReviewForProject(projectId);
+  const token = crypto.randomUUID();
+  const snapshot = {
+    projectId,
+    manifestKey: manifest.manifestKey,
+    expiresAt: Date.now() + PACKAGE_REVIEW_TOKEN_TTL_MS,
+    ...(destinationBinding ? { destinationBinding } : {}),
+  };
+  packageReviewSnapshots.set(token, snapshot);
+  currentPackageReviewTokenByProject.set(projectId, token);
+  return {
+    token,
+    projectId,
+    files: manifest.entries.map(entry => ({
+      name: entry.displayName,
+      ext: entry.ext,
+      embedded: entry.embedded,
+    })),
+    totalFiles: manifest.entries.length,
+    materializable: true,
+    folderName: destinationBinding?.folderName || manifest.plan.destinationFolderName,
+    planSummary: {
+      reviewedSourceInputCount: manifest.plan.reviewedSourceInputs.length,
+      visibleDerivedDesignCount: manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'psd-embedded-resource').length,
+      derivedDesignGeneratorCount: manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'presentation-media').length,
+      diagnosticsMetadataIncluded: !!manifest.plan.diagnosticsMetadata,
+    },
+  };
+}
+
+function createUnavailablePackageReview(projectId, manifest) {
+  invalidatePackageReviewForProject(projectId);
+  return {
+    projectId,
+    files: manifest.entries.map((entry, index) => ({
+      name: entry.displayName,
+      status: manifest.entryStatuses[index] || 'unavailable',
+    })),
+    totalFiles: manifest.entries.length,
+    materializable: false,
+    message: 'Some files are unavailable. Resolve them before packaging.',
+  };
+}
+
+function createPackageReviewResponse(projectId, manifest, destinationBinding = null) {
+  return manifest.materializable
+    ? issuePackageReviewSnapshot(projectId, manifest, destinationBinding)
+    : createUnavailablePackageReview(projectId, manifest);
+}
+
+function consumePackageReviewSnapshot(projectId, token) {
+  const now = Date.now();
+  cleanExpiredPackageReviewTokens(now);
+  if (typeof token !== 'string' || token.length > 64 || !PACKAGE_REVIEW_TOKEN_PATTERN.test(token)) {
+    return { error: token ? 'package_review_invalid' : 'package_review_required' };
+  }
+  if (hasConsumedPackageReviewToken(token, now)) return { error: 'package_review_replayed' };
+
+  const snapshot = packageReviewSnapshots.get(token);
+  if (!snapshot || currentPackageReviewTokenByProject.get(snapshot.projectId) !== token) {
+    return { error: 'package_review_stale' };
+  }
+  if (snapshot.projectId !== projectId) return { error: 'package_review_project_mismatch' };
+
+  packageReviewSnapshots.delete(token);
+  currentPackageReviewTokenByProject.delete(projectId);
+  rememberConsumedPackageReviewToken(token, now + PACKAGE_REVIEW_TOKEN_TTL_MS);
+  return { snapshot };
+}
+
+async function refreshedPackageReviewChangedResult(projectId) {
+  const manifest = await buildCanonicalPackageReviewManifest(projectId);
+  return {
+    error: 'package_review_changed',
+    ...(manifest.error ? {} : { review: createPackageReviewResponse(projectId, manifest) }),
+  };
+}
+
+registerTrustedIpcHandler('projects:prepare-package-review', async (event, projectId, outputPath) => {
+  if (packageInFlight) return { error: 'package_in_flight' };
+  if (!await waitForPackageInputScans(projectId)) return { error: 'package_scan_in_flight' };
+  if (incompletePackageScans.has(projectId)) return { error: 'package_scan_incomplete' };
+  if (packageInFlight) return { error: 'package_in_flight' };
+  const manifest = await buildCanonicalPackageReviewManifest(projectId);
+  if (manifest.error) return { error: manifest.error };
+  if (packageInFlight) return { error: 'package_in_flight' };
+  if (outputPath !== undefined && manifest.materializable) {
+    if (typeof outputPath !== 'string' || !outputPath) return { error: 'package_output_changed' };
+    try {
+      const destination = inspectPrivatePackageDestination(outputPath, manifest.plan.destinationFolderName);
+      return createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination));
+    } catch (_) {
+      return { error: 'package_output_changed' };
+    }
+  }
+  return createPackageReviewResponse(projectId, manifest);
+});
+
+class PackageReviewChangedError extends Error {
+  constructor() {
+    super('package_review_changed');
+    this.name = 'PackageReviewChangedError';
+    this.code = 'package_review_changed';
+  }
+}
+
+function packageReviewFingerprintsMatch(expected, actual) {
+  return !!expected && !!actual && JSON.stringify(expected) === JSON.stringify(actual);
+}
+
+function assertReviewedPackageSource(sourcePath, expectedFingerprint) {
+  let actualFingerprint;
+  try {
+    assertSafeCopySource(sourcePath);
+    actualFingerprint = getPackageReviewSourceFingerprint(sourcePath);
+  } catch (_) {
+    throw new PackageReviewChangedError();
+  }
+  if (
+    expectedFingerprint?.state !== 'present' ||
+    actualFingerprint.state !== 'present' ||
+    !packageReviewFingerprintsMatch(expectedFingerprint, actualFingerprint)
+  ) {
+    throw new PackageReviewChangedError();
+  }
+  return actualFingerprint;
+}
+
+async function withStableReviewedPackageSource(reviewedSource, readSource) {
+  assertReviewedPackageSourceHandle(reviewedSource);
+  const sourceStat = fs.fstatSync(reviewedSource.handle.fd, { bigint: true });
+  const result = await readSource(reviewedSource.handle, sourceStat);
+  assertReviewedPackageSourceHandle(reviewedSource);
+  return result;
+}
+
+function assertReviewedPackageSourceHandle(reviewedSource) {
+  assertReviewedPackageSource(reviewedSource.sourcePath, reviewedSource.expectedFingerprint);
+  let handleStat;
+  try {
+    handleStat = fs.fstatSync(reviewedSource.handle.fd, { bigint: true });
+  } catch (_) {
+    throw new PackageReviewChangedError();
+  }
+  if (
+    !handleStat.isFile() ||
+    !packageReviewFingerprintsMatch(
+      reviewedSource.expectedFingerprint.source,
+      serializePackageReviewStat(handleStat)
+    )
+  ) {
+    throw new PackageReviewChangedError();
+  }
+}
+
+function getReviewedPackageSourcePath(file, entry) {
+  return entry && entry.embedded ? file && (file.parentPsd || file.path) : file && file.path;
+}
+
+async function openReviewedPackageSources(files, entries) {
+  const byEntryIndex = new Map();
+  const byNormalizedPath = new Map();
+  const sources = [];
+  try {
+    for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+      const entry = entries[entryIndex];
+      const sourcePath = getReviewedPackageSourcePath(files[entryIndex], entry);
+      if (!entry || entry.sourceFingerprint?.state !== 'present' || !sourcePath) {
+        throw new PackageReviewChangedError();
+      }
+      const key = entry.sourceFingerprint.normalizedPath;
+      let reviewedSource = byNormalizedPath.get(key);
+      if (reviewedSource) {
+        if (!packageReviewFingerprintsMatch(reviewedSource.expectedFingerprint, entry.sourceFingerprint)) {
+          throw new PackageReviewChangedError();
+        }
+      } else {
+        assertReviewedPackageSource(sourcePath, entry.sourceFingerprint);
+        let handle;
+        try {
+          handle = await fs.promises.open(sourcePath, 'r');
+        } catch (_) {
+          throw new PackageReviewChangedError();
+        }
+        reviewedSource = { sourcePath, expectedFingerprint: entry.sourceFingerprint, handle };
+        sources.push(reviewedSource);
+        byNormalizedPath.set(key, reviewedSource);
+        assertReviewedPackageSourceHandle(reviewedSource);
+      }
+      byEntryIndex.set(entryIndex, reviewedSource);
+    }
+  } catch (error) {
+    await Promise.all(sources.map(source => source.handle.close().catch(() => {})));
+    throw error;
+  }
+  return {
+    get(entryIndex) {
+      const source = byEntryIndex.get(entryIndex);
+      if (!source) throw new PackageReviewChangedError();
+      return source;
+    },
+    assertCurrent() {
+      for (const source of sources) assertReviewedPackageSourceHandle(source);
+    },
+    async close() {
+      await Promise.all(sources.map(source => source.handle.close().catch(() => {})));
+    },
+  };
+}
+
+async function copyReviewedPackageSource(reviewedSource, finalPath, verifyWrite) {
+  return withStableReviewedPackageSource(reviewedSource, async (sourceHandle, sourceStat) => {
+    verifyWrite(finalPath);
+    const destinationMode = Number(sourceStat.mode & 0o777n) || OWNER_ONLY_FILE_MODE;
+    const destinationHandle = await fs.promises.open(finalPath, 'wx', destinationMode);
+    try {
+      const buffer = Buffer.allocUnsafe(1024 * 1024);
+      let position = 0;
+      while (true) {
+        const { bytesRead } = await sourceHandle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        let written = 0;
+        while (written < bytesRead) {
+          const result = await destinationHandle.write(buffer, written, bytesRead - written);
+          written += result.bytesWritten;
+        }
+        position += bytesRead;
+      }
+    } finally {
+      await destinationHandle.close().catch(() => {});
+    }
+  });
+}
+
+async function readReviewedPackageSourceBuffer(sourceHandle, size) {
+  const length = Number(size);
+  if (!Number.isSafeInteger(length) || length < 0) throw new PackageReviewChangedError();
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await sourceHandle.read(buffer, offset, length - offset, offset);
+    if (bytesRead === 0) throw new PackageReviewChangedError();
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
+async function writeEmbeddedPsdAssetToPackage(file, reviewedSource, expectedResource, finalPath, verifyWrite) {
+  const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
+    if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+    return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
+  });
   const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
-  const linkedFile = findEmbeddedPsdLinkedFile(file, psd.linkedFiles || []);
-  if (!linkedFile) {
-    throw new Error('Embedded PSD asset not found');
+  const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
+  if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
+    throw new PackageReviewChangedError();
   }
 
   verifyWrite(finalPath);
-  await fs.promises.writeFile(finalPath, Buffer.from(linkedFile.data), { flag: 'wx' });
+  await fs.promises.writeFile(finalPath, Buffer.from(match.linkedFile.data), { flag: 'wx' });
 }
 
-class PackageTransactionInvariantError extends Error { constructor() { super('package_output_changed'); this.name = 'PackageTransactionInvariantError'; this.code = 'package_output_changed'; } } function createPackageWriteTransaction(destFolder, rootExisted) {
-  const root = path.resolve(destFolder), parent = path.dirname(root), parentReal = realpathSync(parent), identity = fs.lstatSync(root), intended = new Set(), isOriginal = candidate => { try { const stat = fs.lstatSync(candidate); return !stat.isSymbolicLink() && stat.isDirectory() && stat.dev === identity.dev && stat.ino === identity.ino; } catch (_) { return false; } };
-  const locate = () => { if (isOriginal(root)) return root; try { const stat = fs.lstatSync(parent); if (!stat.isSymbolicLink() && stat.isDirectory() && realpathSync(parent) === parentReal) for (const name of fs.readdirSync(parent)) { const candidate = path.join(parent, name); if (isOriginal(candidate)) return candidate; } } catch (_) {} return null; }, assertRoot = () => { if (!isOriginal(root)) throw new PackageTransactionInvariantError(); }, relativeFor = filePath => { const relative = path.relative(root, path.resolve(filePath)); if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new PackageTransactionInvariantError(); return relative; }, exists = relative => { const located = locate(); return !!located && fs.existsSync(path.join(located, relative)); };
-  return { assertRoot, track(filePath) { assertRoot(); const relative = relativeFor(filePath); intended.add(relative); return path.join(root, relative); }, verify(filePath) { assertRoot(); if (!intended.has(relativeFor(filePath))) throw new PackageTransactionInvariantError(); }, hasOutput(filePath) { return exists(relativeFor(filePath)); },
-    cleanup() { const located = locate(); if (!located) return false; let clean = true; for (const relative of [...intended].reverse()) { const target = path.join(located, relative); try { const stat = fs.lstatSync(target); if (!isPathInsideDirectory(realpathSync(located), realpathSync(path.dirname(target))) || (!stat.isFile() && !stat.isSymbolicLink())) clean = false; else fs.unlinkSync(target); } catch (e) { if (e.code !== 'ENOENT') clean = false; } if (!rootExisted) for (let dir = path.dirname(target); dir !== located; dir = path.dirname(dir)) try { const stat = fs.lstatSync(dir); if (stat.isSymbolicLink() || !stat.isDirectory() || !isPathInsideDirectory(realpathSync(located), realpathSync(dir))) { clean = false; break; } fs.rmdirSync(dir); } catch (e) { if (e.code !== 'ENOENT' && e.code !== 'ENOTEMPTY') clean = false; break; } } if (!rootExisted) try { fs.rmdirSync(located); } catch (_) { clean = false; } return clean && [...intended].every(relative => !exists(relative)); } }; }
+function lstatPackagePath(targetPath) {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
-registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
+function inspectPrivatePackageDestination(outputPath, rawFolderName) {
+  const outputRoot = ensureSafePackageDirectory(outputPath);
+  const outputParent = path.dirname(outputRoot);
+  const outputParentReal = realpathSync(outputParent);
+  const outputParentStat = fs.lstatSync(outputParent);
+  const outputRootReal = realpathSync(outputRoot);
+  const outputRootStat = fs.lstatSync(outputRoot);
+  const baseName = sanitizePackageFolderName(rawFolderName);
+  let folderName = baseName;
+  for (let counter = 1; lstatPackagePath(path.join(outputRoot, folderName)); counter++) {
+    const suffix = `_${counter}`;
+    const maxBaseLength = Math.max(1, MAX_PACKAGE_FOLDER_NAME_LENGTH - suffix.length);
+    const maxBaseBytes = 255 - Buffer.byteLength(suffix, 'utf8');
+    const candidateBase = truncatePackageComponent(baseName, maxBaseLength, maxBaseBytes).trimEnd();
+    if (!candidateBase) throw new Error('package_output_invalid');
+    folderName = `${candidateBase}${suffix}`;
+  }
+  const destFolder = path.join(outputRoot, folderName);
+  if (!isPathInsideDirectory(outputRoot, destFolder) || path.dirname(destFolder) !== outputRoot) {
+    throw new Error('package_output_invalid');
+  }
+  return {
+    outputParent,
+    outputParentReal,
+    outputParentStat,
+    outputRoot,
+    outputRootReal,
+    outputRootStat,
+    folderName,
+    destFolder,
+  };
+}
+
+function getPrivatePackageDestinationBinding(destination) {
+  return {
+    outputRoot: destination.outputRoot,
+    outputRootReal: destination.outputRootReal,
+    outputRootIdentity: serializePackageReviewIdentityStat(destination.outputRootStat),
+    folderName: destination.folderName,
+  };
+}
+
+function privatePackageDestinationBindingMatches(binding, destination) {
+  return packageReviewFingerprintsMatch(binding, getPrivatePackageDestinationBinding(destination));
+}
+
+function createPackageDestinationReviewChangedResult(projectId, manifest, destination) {
+  return {
+    error: 'package_review_changed',
+    reason: 'package_destination_changed',
+    review: createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination)),
+  };
+}
+
+async function refreshedPackageDestinationReviewChangedResult(projectId, outputPath) {
+  const manifest = await buildCanonicalPackageReviewManifest(projectId);
+  if (manifest.error) return { error: manifest.error };
+  try {
+    const destination = inspectPrivatePackageDestination(outputPath, manifest.plan.destinationFolderName);
+    return createPackageDestinationReviewChangedResult(projectId, manifest, destination);
+  } catch (_) {
+    return { error: 'package_output_changed' };
+  }
+}
+
+function createPrivatePackageStagingFolder(stagingParent) {
+  const stagingFolder = fs.mkdtempSync(path.join(stagingParent, '.crate-package-staging-'));
+  try {
+    fs.chmodSync(stagingFolder, OWNER_ONLY_DIR_MODE);
+    const stagingStat = fs.lstatSync(stagingFolder);
+    if (
+      stagingStat.isSymbolicLink() ||
+      !stagingStat.isDirectory() ||
+      (stagingStat.mode & 0o777) !== OWNER_ONLY_DIR_MODE ||
+      path.dirname(stagingFolder) !== stagingParent
+    ) {
+      throw new PackageTransactionInvariantError();
+    }
+    return { stagingFolder, stagingStat };
+  } catch (error) {
+    try { fs.rmdirSync(stagingFolder); } catch (_) {}
+    throw error;
+  }
+}
+
+function createPrivatePackageDestination(inspectedDestination) {
+  const canStageBesideOutputRoot =
+    inspectedDestination.outputParent !== inspectedDestination.outputRoot &&
+    inspectedDestination.outputParentStat.dev === inspectedDestination.outputRootStat.dev;
+  const stagingParent = canStageBesideOutputRoot
+    ? inspectedDestination.outputParent
+    : inspectedDestination.outputRoot;
+  // A nested output root can be renamed while packaging. Keep staging beside it
+  // so cleanup retains a stable path. Only a filesystem/mount root stages inside
+  // itself, because its parent is on a different device (or is the same path).
+  const staged = createPrivatePackageStagingFolder(stagingParent);
+  const { stagingFolder, stagingStat } = staged;
+  try {
+    if (stagingStat.dev !== inspectedDestination.outputRootStat.dev) {
+      throw new PackageTransactionInvariantError();
+    }
+    const stagingParentIsOutputRoot = stagingParent === inspectedDestination.outputRoot;
+    const stagingAnchorParent = path.dirname(stagingParent);
+    const destination = {
+      ...inspectedDestination,
+      stagingParent,
+      stagingParentReal: stagingParentIsOutputRoot
+        ? inspectedDestination.outputRootReal
+        : inspectedDestination.outputParentReal,
+      stagingParentStat: stagingParentIsOutputRoot
+        ? inspectedDestination.outputRootStat
+        : inspectedDestination.outputParentStat,
+      stagingAnchorParent,
+      stagingAnchorParentReal: realpathSync(stagingAnchorParent),
+      stagingAnchorParentStat: fs.lstatSync(stagingAnchorParent),
+      stagingFolder,
+      stagingStat,
+    };
+    assertPrivatePackageDestinationCurrent(destination);
+    return destination;
+  } catch (error) {
+    try { fs.rmdirSync(stagingFolder); } catch (_) {}
+    throw error;
+  }
+}
+
+function serializePrivateStagedPackageStat(stat) {
+  return {
+    dev: packageReviewStatValue(stat.dev),
+    ino: packageReviewStatValue(stat.ino),
+    mode: packageReviewStatValue(stat.mode),
+    nlink: packageReviewStatValue(stat.nlink),
+    size: packageReviewStatValue(stat.size),
+    mtimeNs: packageReviewStatValue(stat.mtimeNs),
+    ctimeNs: packageReviewStatValue(stat.ctimeNs),
+  };
+}
+
+function buildExpectedPrivateStagedPackageTree(intendedFiles) {
+  const expected = new Map([['', 'directory']]);
+  for (const relativePath of intendedFiles) {
+    const normalized = path.normalize(relativePath);
+    if (
+      !normalized ||
+      normalized === '.' ||
+      normalized.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(normalized)
+    ) {
+      throw new PackageReviewChangedError();
+    }
+
+    let parent = path.dirname(normalized);
+    while (parent && parent !== '.') {
+      if (expected.get(parent) === 'file') throw new PackageReviewChangedError();
+      expected.set(parent, 'directory');
+      parent = path.dirname(parent);
+    }
+    if (expected.has(normalized)) throw new PackageReviewChangedError();
+    expected.set(normalized, 'file');
+  }
+  return expected;
+}
+
+function inspectPrivateStagedPackageFile(filePath, hardenMode) {
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlock);
+    let beforeStat = fs.fstatSync(fd, { bigint: true });
+    if (
+      !beforeStat.isFile() ||
+      beforeStat.nlink !== 1n
+    ) {
+      throw new PackageReviewChangedError();
+    }
+    if (hardenMode) fs.fchmodSync(fd, OWNER_ONLY_FILE_MODE);
+    beforeStat = fs.fstatSync(fd, { bigint: true });
+    if ((beforeStat.mode & 0o7777n) !== BigInt(OWNER_ONLY_FILE_MODE)) {
+      throw new PackageReviewChangedError();
+    }
+
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+
+    const afterStat = fs.fstatSync(fd, { bigint: true });
+    const pathStat = fs.lstatSync(filePath, { bigint: true });
+    const stableStat = serializePrivateStagedPackageStat(beforeStat);
+    if (
+      !afterStat.isFile() ||
+      pathStat.isSymbolicLink() ||
+      !pathStat.isFile() ||
+      !packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(afterStat)) ||
+      !packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(pathStat))
+    ) {
+      throw new PackageReviewChangedError();
+    }
+    return { stat: stableStat, sha256: hash.digest('hex') };
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function inspectPrivateStagedPackageTree(stagingFolder, expected, hardenModes) {
+  const entries = [];
+  const seen = new Set();
+
+  const visit = (absolutePath, relativePath) => {
+    const expectedType = expected.get(relativePath);
+    if (!expectedType || seen.has(relativePath)) throw new PackageReviewChangedError();
+    seen.add(relativePath);
+
+    let stat = fs.lstatSync(absolutePath, { bigint: true });
+    if (stat.isSymbolicLink()) throw new PackageReviewChangedError();
+    const actualType = stat.isDirectory() ? 'directory' : (stat.isFile() ? 'file' : 'special');
+    if (actualType !== expectedType) throw new PackageReviewChangedError();
+
+    if (actualType === 'file') {
+      const file = inspectPrivateStagedPackageFile(absolutePath, hardenModes);
+      entries.push({ relativePath, type: 'file', ...file });
+      return;
+    }
+
+    const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+    const directoryOnly = Number.isInteger(fs.constants.O_DIRECTORY) ? fs.constants.O_DIRECTORY : 0;
+    const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+    let directoryFd = null;
+    try {
+      directoryFd = fs.openSync(absolutePath, fs.constants.O_RDONLY | noFollow | directoryOnly | nonBlock);
+      let openStat = fs.fstatSync(directoryFd, { bigint: true });
+      if (!openStat.isDirectory() || openStat.dev !== stat.dev || openStat.ino !== stat.ino) {
+        throw new PackageReviewChangedError();
+      }
+      if (hardenModes) fs.fchmodSync(directoryFd, OWNER_ONLY_DIR_MODE);
+      openStat = fs.fstatSync(directoryFd, { bigint: true });
+      if ((openStat.mode & 0o7777n) !== BigInt(OWNER_ONLY_DIR_MODE)) {
+        throw new PackageReviewChangedError();
+      }
+      const stableStat = serializePrivateStagedPackageStat(openStat);
+      const pathStat = fs.lstatSync(absolutePath, { bigint: true });
+      if (
+        pathStat.isSymbolicLink() ||
+        !pathStat.isDirectory() ||
+        !packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(pathStat))
+      ) {
+        throw new PackageReviewChangedError();
+      }
+
+      const childNames = fs.readdirSync(absolutePath).sort();
+      if (!packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(fs.lstatSync(absolutePath, { bigint: true })))) {
+        throw new PackageReviewChangedError();
+      }
+      for (const childName of childNames) {
+        const childRelativePath = relativePath ? path.join(relativePath, childName) : childName;
+        visit(path.join(absolutePath, childName), childRelativePath);
+      }
+
+      const afterOpenStat = fs.fstatSync(directoryFd, { bigint: true });
+      const afterPathStat = fs.lstatSync(absolutePath, { bigint: true });
+      if (
+        afterPathStat.isSymbolicLink() ||
+        !afterPathStat.isDirectory() ||
+        !packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(afterOpenStat)) ||
+        !packageReviewFingerprintsMatch(stableStat, serializePrivateStagedPackageStat(afterPathStat))
+      ) {
+        throw new PackageReviewChangedError();
+      }
+      entries.push({ relativePath, type: 'directory', stat: stableStat });
+    } finally {
+      if (directoryFd !== null) fs.closeSync(directoryFd);
+    }
+  };
+
+  visit(stagingFolder, '');
+  if (seen.size !== expected.size || [...expected.keys()].some(relativePath => !seen.has(relativePath))) {
+    throw new PackageReviewChangedError();
+  }
+  return entries.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function capturePrivateStagedPackageTree(stagingFolder, intendedFiles) {
+  const expected = buildExpectedPrivateStagedPackageTree(intendedFiles);
+  return inspectPrivateStagedPackageTree(stagingFolder, expected, true);
+}
+
+function assertPrivateStagedPackageTree(stagingFolder, snapshot) {
+  if (!Array.isArray(snapshot)) throw new PackageReviewChangedError();
+  const expected = new Map(snapshot.map(entry => [entry.relativePath, entry.type]));
+  if (expected.size !== snapshot.length) throw new PackageReviewChangedError();
+  const actual = inspectPrivateStagedPackageTree(stagingFolder, expected, false);
+  if (!packageReviewFingerprintsMatch(snapshot, actual)) throw new PackageReviewChangedError();
+}
+
+function removePrivateStagedPackageTree(stagingFolder, identity) {
+  const removeNode = (targetPath, isRoot = false) => {
+    let stat;
+    try {
+      stat = fs.lstatSync(targetPath);
+    } catch (error) {
+      return !!(error && error.code === 'ENOENT');
+    }
+    if (isRoot && (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== identity.dev || stat.ino !== identity.ino)) {
+      return false;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      try {
+        fs.unlinkSync(targetPath);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    let clean = true;
+    let childNames;
+    try {
+      childNames = fs.readdirSync(targetPath);
+    } catch (_) {
+      return false;
+    }
+    for (const childName of childNames) {
+      if (!removeNode(path.join(targetPath, childName))) clean = false;
+    }
+    try {
+      fs.rmdirSync(targetPath);
+    } catch (_) {
+      clean = false;
+    }
+    return clean;
+  };
+  return removeNode(stagingFolder, true);
+}
+
+function privatePackageDirectoryMatches(candidatePath, identity) {
+  try {
+    const stat = fs.lstatSync(candidatePath);
+    return !stat.isSymbolicLink() &&
+      stat.isDirectory() &&
+      stat.dev === identity.dev &&
+      stat.ino === identity.ino;
+  } catch (_) {
+    return false;
+  }
+}
+
+class PackageTransactionInvariantError extends Error {
+  constructor() {
+    super('package_output_changed');
+    this.name = 'PackageTransactionInvariantError';
+    this.code = 'package_output_changed';
+  }
+}
+
+class PackageDestinationOccupiedError extends PackageTransactionInvariantError {
+  constructor() {
+    super();
+    this.name = 'PackageDestinationOccupiedError';
+  }
+}
+
+function assertPrivatePackageDestinationCurrent(destination) {
+  try {
+    const currentParent = fs.lstatSync(destination.outputParent);
+    const currentRoot = fs.lstatSync(destination.outputRoot);
+    const currentStagingParent = fs.lstatSync(destination.stagingParent);
+    const currentStaging = fs.lstatSync(destination.stagingFolder);
+    if (
+      currentParent.isSymbolicLink() ||
+      !currentParent.isDirectory() ||
+      currentParent.dev !== destination.outputParentStat.dev ||
+      currentParent.ino !== destination.outputParentStat.ino ||
+      realpathSync(destination.outputParent) !== destination.outputParentReal ||
+      currentRoot.isSymbolicLink() ||
+      !currentRoot.isDirectory() ||
+      currentRoot.dev !== destination.outputRootStat.dev ||
+      currentRoot.ino !== destination.outputRootStat.ino ||
+      realpathSync(destination.outputRoot) !== destination.outputRootReal ||
+      currentStagingParent.isSymbolicLink() ||
+      !currentStagingParent.isDirectory() ||
+      currentStagingParent.dev !== destination.stagingParentStat.dev ||
+      currentStagingParent.ino !== destination.stagingParentStat.ino ||
+      realpathSync(destination.stagingParent) !== destination.stagingParentReal ||
+      currentStaging.isSymbolicLink() ||
+      !currentStaging.isDirectory() ||
+      currentStaging.dev !== destination.stagingStat.dev ||
+      currentStaging.ino !== destination.stagingStat.ino ||
+      currentStaging.dev !== currentRoot.dev ||
+      path.dirname(destination.stagingFolder) !== destination.stagingParent ||
+      path.dirname(destination.destFolder) !== destination.outputRoot
+    ) {
+      throw new PackageTransactionInvariantError();
+    }
+    if (lstatPackagePath(destination.destFolder)) throw new PackageDestinationOccupiedError();
+  } catch (error) {
+    if (error instanceof PackageTransactionInvariantError) throw error;
+    throw new PackageTransactionInvariantError();
+  }
+}
+
+function locatePrivatePackageStagingParent(destination) {
+  if (privatePackageDirectoryMatches(destination.stagingParent, destination.stagingParentStat)) {
+    return destination.stagingParent;
+  }
+  if (!privatePackageDirectoryMatches(destination.stagingAnchorParent, destination.stagingAnchorParentStat)) return null;
+  try {
+    if (realpathSync(destination.stagingAnchorParent) !== destination.stagingAnchorParentReal) return null;
+    for (const childName of fs.readdirSync(destination.stagingAnchorParent)) {
+      const candidate = path.join(destination.stagingAnchorParent, childName);
+      if (privatePackageDirectoryMatches(candidate, destination.stagingParentStat)) return candidate;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function locatePrivatePackageStaging(destination) {
+  for (const candidate of [destination.stagingFolder, destination.destFolder]) {
+    if (privatePackageDirectoryMatches(candidate, destination.stagingStat)) return candidate;
+  }
+
+  const stagingParent = locatePrivatePackageStagingParent(destination);
+  if (!stagingParent) return null;
+  try {
+    for (const childName of fs.readdirSync(stagingParent)) {
+      const candidate = path.join(stagingParent, childName);
+      if (privatePackageDirectoryMatches(candidate, destination.stagingStat)) return candidate;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function cleanupPrivatePackageDestination(destination) {
+  const stagingFolder = locatePrivatePackageStaging(destination);
+  if (!stagingFolder) return false;
+  return removePrivateStagedPackageTree(stagingFolder, destination.stagingStat) &&
+    !locatePrivatePackageStaging(destination);
+}
+
+function publishPrivatePackageDestination(destination, stagedTreeSnapshot) {
+  assertPrivatePackageDestinationCurrent(destination);
+  assertPrivateStagedPackageTree(destination.stagingFolder, stagedTreeSnapshot);
+  assertPrivatePackageDestinationCurrent(destination);
+  try {
+    fs.renameSync(destination.stagingFolder, destination.destFolder);
+  } catch (error) {
+    if (['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw new PackageDestinationOccupiedError();
+    throw new PackageTransactionInvariantError();
+  }
+  try {
+    const finalStat = fs.lstatSync(destination.destFolder);
+    const currentParent = fs.lstatSync(destination.outputParent);
+    const currentRoot = fs.lstatSync(destination.outputRoot);
+    if (
+      finalStat.isSymbolicLink() ||
+      !finalStat.isDirectory() ||
+      finalStat.dev !== destination.stagingStat.dev ||
+      finalStat.ino !== destination.stagingStat.ino ||
+      (finalStat.mode & 0o777) !== OWNER_ONLY_DIR_MODE ||
+      lstatPackagePath(destination.stagingFolder) ||
+      currentParent.isSymbolicLink() ||
+      !currentParent.isDirectory() ||
+      currentParent.dev !== destination.outputParentStat.dev ||
+      currentParent.ino !== destination.outputParentStat.ino ||
+      realpathSync(destination.outputParent) !== destination.outputParentReal ||
+      currentRoot.isSymbolicLink() ||
+      !currentRoot.isDirectory() ||
+      currentRoot.dev !== destination.outputRootStat.dev ||
+      currentRoot.ino !== destination.outputRootStat.ino ||
+      realpathSync(destination.outputRoot) !== destination.outputRootReal ||
+      path.dirname(realpathSync(destination.destFolder)) !== destination.outputRootReal ||
+      path.dirname(destination.destFolder) !== destination.outputRoot
+    ) throw new PackageTransactionInvariantError();
+  } catch (error) {
+    if (error instanceof PackageTransactionInvariantError) throw error;
+    throw new PackageTransactionInvariantError();
+  }
+}
+
+function createPackageWriteTransaction(destFolder) {
+  const root = path.resolve(destFolder);
+  const parent = path.dirname(root);
+  const parentReal = realpathSync(parent);
+  const identity = fs.lstatSync(root);
+  const intended = new Set();
+  const isOriginal = candidate => {
+    try {
+      const stat = fs.lstatSync(candidate);
+      return !stat.isSymbolicLink() && stat.isDirectory() && stat.dev === identity.dev && stat.ino === identity.ino;
+    } catch (_) {
+      return false;
+    }
+  };
+  const locate = () => {
+    if (isOriginal(root)) return root;
+    try {
+      const stat = fs.lstatSync(parent);
+      if (!stat.isSymbolicLink() && stat.isDirectory() && realpathSync(parent) === parentReal) {
+        for (const name of fs.readdirSync(parent)) {
+          const candidate = path.join(parent, name);
+          if (isOriginal(candidate)) return candidate;
+        }
+      }
+    } catch (_) {}
+    return null;
+  };
+  const assertRoot = () => {
+    if (!isOriginal(root)) throw new PackageTransactionInvariantError();
+  };
+  const relativeFor = filePath => {
+    const relative = path.relative(root, path.resolve(filePath));
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new PackageTransactionInvariantError();
+    }
+    return relative;
+  };
+
+  return {
+    assertRoot,
+    track(filePath) {
+      assertRoot();
+      const relative = relativeFor(filePath);
+      intended.add(relative);
+      return path.join(root, relative);
+    },
+    verify(filePath) {
+      assertRoot();
+      if (!intended.has(relativeFor(filePath))) throw new PackageTransactionInvariantError();
+    },
+    captureTree() {
+      assertRoot();
+      return capturePrivateStagedPackageTree(root, intended);
+    },
+    cleanup() {
+      const located = locate();
+      if (!located) return false;
+      return removePrivateStagedPackageTree(located, identity) && !locate();
+    },
+  };
+}
+
+registerTrustedIpcHandler('projects:package', async (event, id, outputPath, reviewToken) => {
   // C1: Prevent double-click / concurrent packaging
   if (packageInFlight) return { error: 'package_in_flight' };
   packageInFlight = true;
 
-  let packageActivation = null, packageWrites = null, failPackage = null;
+  let packageActivation = null, packageWrites = null, packageDestination = null, packagePublished = false;
+  let reviewedPackageSources = null;
+  const cleanupStaging = () => {
+    if (packagePublished) return false;
+    if (packageDestination) return cleanupPrivatePackageDestination(packageDestination);
+    if (packageWrites) return packageWrites.cleanup();
+    return true;
+  };
+  const failPackage = error => ({
+    error: cleanupStaging() ? (error?.code || error?.message || error) : 'package_cleanup_failed'
+  });
   try {
+  const reviewResult = consumePackageReviewSnapshot(id, reviewToken);
+  if (reviewResult.error) return { error: reviewResult.error };
   packageActivation = captureProjectOperation(id); if (!packageActivation) return { error: 'not_found' };
   const isPackageActivationCurrent = () => packageActivation.current(true);
   // Wait for in-flight pre-package and Figma scans to finish before selecting
   // package files. Large Figma pages can still be downloading when the user
   // clicks Package, and selecting too early yields a zero-file package.
-  await waitForPackageInputScans(id);
+  if (!await waitForPackageInputScans(id)) return { error: 'package_scan_in_flight' };
+  if (incompletePackageScans.has(id)) return { error: 'package_scan_incomplete' };
   if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
 
   const figmaPackageError = figmaPackageTransferBlocks.get(id);
@@ -11410,74 +12755,153 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
   const limitResult = getPackageLimitResult();
   if (limitResult) return limitResult;
 
-  const projects = getProjects();
-  const project = projects.find(p => p.id === id);
-  if (!project) return { error: 'not_found' };
+  const manifest = await buildCanonicalPackageReviewManifest(id);
+  if (manifest.error) return { error: manifest.error };
+  if (!manifest.materializable) {
+    return { error: 'package_review_changed', review: createUnavailablePackageReview(id, manifest) };
+  }
   if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
-  const packageFiles = await selectProjectFilesForPackaging(project);
-  if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
+  if (manifest.manifestKey !== reviewResult.snapshot.manifestKey) {
+    return {
+      error: 'package_review_changed',
+      review: createPackageReviewResponse(id, manifest),
+    };
+  }
+  let inspectedDestination = inspectPrivatePackageDestination(
+    outputPath,
+    manifest.plan.destinationFolderName
+  );
+  const reviewedDestination = reviewResult.snapshot.destinationBinding || null;
+  if (
+    reviewedDestination
+      ? !privatePackageDestinationBindingMatches(reviewedDestination, inspectedDestination)
+      : inspectedDestination.folderName !== manifest.plan.destinationFolderName
+  ) {
+    return createPackageDestinationReviewChangedResult(id, manifest, inspectedDestination);
+  }
+  const project = manifest.project;
+  const packageFiles = manifest.files;
+  try {
+    reviewedPackageSources = await openReviewedPackageSources(packageFiles, manifest.entries);
+  } catch (error) {
+    if (error instanceof PackageReviewChangedError) {
+      return refreshedPackageReviewChangedResult(id);
+    }
+    throw error;
+  }
+  if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
 
-  // Build folder name from naming template
+  const currentDestination = inspectPrivatePackageDestination(
+    outputPath,
+    manifest.plan.destinationFolderName
+  );
+  if (!privatePackageDestinationBindingMatches(
+    getPrivatePackageDestinationBinding(inspectedDestination),
+    currentDestination
+  )) {
+    return createPackageDestinationReviewChangedResult(id, manifest, currentDestination);
+  }
+  inspectedDestination = currentDestination;
+
+  // Non-output settings are read separately; the destination name is bound to review.
   const settings = store.get('settings');
-  const template = sanitizeNamingTemplate(settings.namingTemplate);
-  const now = new Date();
-  const dateStr = now.toISOString().split('T')[0];
-
-  // Use the full project name as-is — no client/project splitting.
-  // {Project} = the full name the user typed, cleaned for filesystem use.
-  const folderName = template
-    .replace('{Project}', cleanName(project.name))
-    .replace('{Date}', dateStr);
-
-  const expectedDestFolder = path.resolve(path.resolve(outputPath), sanitizePackageFolderName(folderName)), destFolderExisted = fs.existsSync(expectedDestFolder);
-  const destFolder = resolvePackageFolderInsideOutput(outputPath, folderName);
 
   try {
+    packageDestination = createPrivatePackageDestination(inspectedDestination);
+    const stagingFolder = packageDestination.stagingFolder;
+    const destFolder = packageDestination.destFolder;
     let copiedCount = 0;
     const errors = [];
     const packageProvenanceEvents = [];
+    const stagedSourceByFile = new Map();
+    const allocateOutputName = createPackageNameAllocator();
+    const toPublishedPath = stagedPath => path.join(destFolder, path.relative(stagingFolder, stagedPath));
     const packageProvenanceInfo = {
       destFolder,
       createdAt: Date.now(),
     };
-    packageWrites = createPackageWriteTransaction(destFolder, destFolderExisted); failPackage = error => ({ error: packageWrites.cleanup() ? (error.code || error.message || error) : 'package_cleanup_failed' }); const abortStalePackage = () => isPackageActivationCurrent() ? null : failPackage('stale_activation');
+    packageWrites = createPackageWriteTransaction(stagingFolder);
+    const abortStalePackage = () => isPackageActivationCurrent() ? null : failPackage('stale_activation');
+    if (manifest.plan.diagnosticsMetadata) {
+      const diagnosticsDirectory = path.posix.dirname(manifest.plan.diagnosticsMetadata.relativePath);
+      if (
+        manifest.plan.diagnosticsMetadata.materialization !== 'crate-provenance-v2' ||
+        path.posix.basename(manifest.plan.diagnosticsMetadata.relativePath) !== PROVENANCE_MANIFEST_FILENAME ||
+        allocateOutputName(DIAGNOSTICS_FOLDER_NAME) !== diagnosticsDirectory
+      ) throw new PackageReviewChangedError();
+    }
+    const plannedDesignOutputs = [
+      ...manifest.plan.reviewedSourceInputs.map(item => ({
+        entryIndex: item.entryIndex,
+        materialization: item.materialization,
+        outputName: item.expectedOutputName,
+      })),
+      ...manifest.plan.deterministicDerivedOutputs
+        .filter(item => item.materialization === 'psd-embedded-resource')
+        .map(item => ({
+          entryIndex: item.sourceEntryIndex,
+          materialization: item.materialization,
+          outputName: item.expectedOutputs[0]?.outputName,
+          resourceFingerprint: item.expectedOutputs[0]?.resourceFingerprint,
+        })),
+    ].sort((left, right) => left.entryIndex - right.entryIndex);
 
-    for (const file of packageFiles) {
+    for (const plannedOutput of plannedDesignOutputs) {
+      const file = packageFiles[plannedOutput.entryIndex];
+      const manifestEntry = manifest.entries[plannedOutput.entryIndex];
+      if (!file || !manifestEntry) throw new PackageReviewChangedError();
       const staleResult = abortStalePackage(); if (staleResult) return staleResult;
       const packageFileName = getPackageFileDisplayName(file);
-      let intendedPath = null;
+      const plannedRawName = plannedOutput.materialization === 'psd-embedded-resource'
+        ? sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName)
+        : packageFileName;
+      if (allocateOutputName(plannedRawName) !== plannedOutput.outputName) throw new PackageReviewChangedError();
       try {
-        if (isScanOnSaveEmbeddedPsdFile(file)) {
-          const safeName = sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName);
-          const finalPath = packageWrites.track(resolveUniquePackagePath(destFolder, safeName)); intendedPath = finalPath;
-          await writeEmbeddedPsdAssetToPackage(file, finalPath, packageWrites.verify);
+        if (plannedOutput.materialization === 'psd-embedded-resource') {
+          if (!isScanOnSaveEmbeddedPsdFile(file)) throw new PackageReviewChangedError();
+          const finalPath = packageWrites.track(resolveUniquePackagePath(stagingFolder, plannedOutput.outputName));
+          if (path.basename(finalPath) !== plannedOutput.outputName) throw new PackageReviewChangedError();
+          if (!packageReviewFingerprintsMatch(manifestEntry.embeddedResource, plannedOutput.resourceFingerprint)) {
+            throw new PackageReviewChangedError();
+          }
+          await writeEmbeddedPsdAssetToPackage(
+            file,
+            reviewedPackageSources.get(plannedOutput.entryIndex),
+            plannedOutput.resourceFingerprint,
+            finalPath,
+            packageWrites.verify
+          );
+          stagedSourceByFile.set(file, finalPath);
           const staleResult = abortStalePackage(); if (staleResult) return staleResult;
           packageProvenanceEvents.push({
             relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
             file,
-            outputPath: finalPath,
+            outputPath: toPublishedPath(finalPath),
           });
           copiedCount++;
           continue;
         }
 
-        if (packageSourceExists(file.path)) {
-          assertSafeCopySource(file.path);
-          const finalPath = packageWrites.track(resolveUniquePackagePath(destFolder, packageFileName)); intendedPath = finalPath; packageWrites.verify(finalPath);
-          fs.copyFileSync(file.path, finalPath, fs.constants.COPYFILE_EXCL);
-          packageProvenanceEvents.push({
-            relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
-            file,
-            outputPath: finalPath,
-          });
-          copiedCount++;
-        } else {
-          errors.push(`File not found: ${packageFileName}`);
-        }
+        if (plannedOutput.materialization !== 'source-copy') throw new PackageReviewChangedError();
+        if (!file.path) throw new PackageReviewChangedError();
+        const finalPath = packageWrites.track(resolveUniquePackagePath(stagingFolder, plannedOutput.outputName));
+        if (path.basename(finalPath) !== plannedOutput.outputName) throw new PackageReviewChangedError();
+        await copyReviewedPackageSource(
+          reviewedPackageSources.get(plannedOutput.entryIndex),
+          finalPath,
+          packageWrites.verify
+        );
+        stagedSourceByFile.set(file, finalPath);
+        packageProvenanceEvents.push({
+          relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
+          file,
+          outputPath: toPublishedPath(finalPath),
+        });
+        copiedCount++;
       } catch (err) {
+        if (err instanceof PackageReviewChangedError) throw err;
         if (err instanceof PackageTransactionInvariantError) return failPackage(err);
-        if (intendedPath && packageWrites.hasOutput(intendedPath)) return failPackage('package_write_failed');
-        errors.push(`Failed to copy ${packageFileName}: ${err.message}`);
+        return failPackage('package_write_failed');
       }
     }
 
@@ -11486,38 +12910,30 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
     // the sub-100ms reads when assets are dragged in, so we pull them at package time.
     let embeddedCount = 0;
     const presentationExtractionEvents = [];
-    const ZIP_BASED_FORMATS = new Set(['.key', '.pptx', '.ppt']);
-
-    // v1.3.37: When Keynote/PowerPoint re-saves, both old and new versions may
-    // be tracked. Group by base filename and only extract from the newest (by mtime)
-    // to avoid double-counting embedded media.
-    const presentationsByName = new Map();
-    for (const file of packageFiles) {
-      const fileExt = path.extname(getPackageFileDisplayName(file)).toLowerCase();
-      if (ZIP_BASED_FORMATS.has(fileExt) && isSafePackageSourceFile(file.path)) {
-        // M3: Use full normalized path as dedup key, not just basename,
-        // so files with the same name in different directories aren't merged.
-        const dedupKey = path.resolve(file.path).toLowerCase();
-        let mtime = 0;
-        try { mtime = fs.statSync(file.path).mtimeMs; } catch (e) {}
-        const existing = presentationsByName.get(dedupKey);
-        if (!existing || mtime > existing.mtime) {
-          presentationsByName.set(dedupKey, { file, mtime });
-        }
-      }
-    }
-
-    for (const { file } of presentationsByName.values()) {
-      const pendingMediaWrites = new Set();
+    for (const generator of manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'presentation-media')) {
+      const file = packageFiles[generator.sourceEntryIndex];
+      const stagedPath = stagedSourceByFile.get(file);
+      if (!file || !stagedPath) throw new PackageReviewChangedError();
+      const extractionFailures = [];
       try {
-        const embeddedFiles = await extractEmbeddedMedia(file.path, destFolder, packageFiles, {
+        const embeddedFiles = await extractEmbeddedMedia(stagedPath, stagingFolder, null, {
           source: 'package-extraction',
-          onBeforeWrite: materializedPath => pendingMediaWrites.add(packageWrites.track(materializedPath)),
+          logicalPresentationPath: file.path,
+          failClosed: true,
+          dedupFingerprints: generator.dedupFingerprints,
+          dedupNameBases: generator.dedupNameBases,
+          reserveOutputName: allocateOutputName,
+          expectedOutputs: generator.expectedOutputs,
+          onBeforeMaterialize: packageWrites.assertRoot,
+          onBeforeWrite: materializedPath => packageWrites.track(materializedPath),
           onExtracted: (extraction) => {
-            pendingMediaWrites.delete(path.resolve(extraction.materializedPath));
             const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
             if (!resource) return;
-            presentationExtractionEvents.push(extraction);
+            const publishedExtraction = {
+              ...extraction,
+              materializedPath: toPublishedPath(extraction.materializedPath),
+            };
+            presentationExtractionEvents.push(publishedExtraction);
             packageProvenanceEvents.push({
               relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
               resource: {
@@ -11526,41 +12942,58 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
                 name: resource.name,
                 ext: resource.ext,
                 presentationPath: extraction.presentationPath,
-                materializedPath: extraction.materializedPath,
+                materializedPath: publishedExtraction.materializedPath,
                 source: extraction.source,
               },
-              outputPath: extraction.materializedPath,
+              outputPath: publishedExtraction.materializedPath,
             });
           },
           onExtractionError: (failure) => {
-            if (failure && failure.message) errors.push(failure.message);
+            extractionFailures.push(failure || true);
           },
           onInspectionError: (failure) => {
-            if (failure && failure.message) errors.push(failure.message);
+            extractionFailures.push(failure || true);
           },
         });
-        if ([...pendingMediaWrites].some(filePath => packageWrites.hasOutput(filePath))) return failPackage('package_write_failed');
+        if (extractionFailures.length > 0) throw new PackageReviewChangedError();
         const staleResult = abortStalePackage(); if (staleResult) return staleResult;
         embeddedCount += embeddedFiles.length;
       } catch (embedErr) {
+        if (embedErr instanceof PackageReviewChangedError) throw embedErr;
         if (embedErr instanceof PackageTransactionInvariantError) return failPackage(embedErr);
-        if ([...pendingMediaWrites].some(filePath => packageWrites.hasOutput(filePath))) return failPackage('package_write_failed');
-        // M7: Report embedded extraction errors so user sees 'X files packaged, Y errors'
-        errors.push(`Could not inspect embedded media in ${getPackageFileDisplayName(file)}.`);
+        return failPackage('package_write_failed');
       }
     }
 
     const staleResult = abortStalePackage(); if (staleResult) return staleResult;
-    if (settings.includeDiagnosticReport === true) {
+    if (manifest.plan.diagnosticsMetadata) {
       let manifestProject; try { manifestProject = structuredClone(project); recordPresentationMediaExtractionProvenanceForProject(manifestProject, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents, manifestProject); } catch (_) { manifestProject = project; }
-      packageWrites.track(path.join(destFolder, DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)); packageWrites.assertRoot();
+      packageWrites.track(path.join(stagingFolder, ...manifest.plan.diagnosticsMetadata.relativePath.split('/'))); packageWrites.assertRoot();
       writePackageProvenanceManifest(id, packageProvenanceInfo, {
         copiedCount,
         embeddedCount,
         totalFiles: packageFiles.length,
         errors,
-      }, manifestProject, true);
-    } packageWrites.assertRoot(); recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
+      }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath);
+    }
+    const stagedTreeSnapshot = packageWrites.captureTree();
+    const finalManifest = await buildCanonicalPackageReviewManifest(id);
+    if (
+      finalManifest.error ||
+      !finalManifest.materializable ||
+      finalManifest.manifestKey !== reviewResult.snapshot.manifestKey ||
+      !packageReviewFingerprintsMatch(finalManifest.plan, manifest.plan)
+    ) {
+      throw new PackageReviewChangedError();
+    }
+    if (!isPackageActivationCurrent()) throw new PackageReviewChangedError();
+    reviewedPackageSources.assertCurrent();
+    packageWrites.assertRoot();
+    publishPrivatePackageDestination(packageDestination, stagedTreeSnapshot);
+    packagePublished = true;
+    packageWrites = null;
+    recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents);
+    recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
@@ -11599,12 +13032,24 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath) => {
       errors
     };
   } catch (err) {
-    if (failPackage) return failPackage(err);
+    if (err instanceof PackageDestinationOccupiedError) {
+      if (!cleanupStaging()) return { error: 'package_cleanup_failed' };
+      return refreshedPackageDestinationReviewChangedResult(id, outputPath);
+    }
+    if (err instanceof PackageReviewChangedError) {
+      if (!cleanupStaging()) return { error: 'package_cleanup_failed' };
+      return refreshedPackageReviewChangedResult(id);
+    }
+    if (!packagePublished) return failPackage(err);
     clearPackageAutoForegroundSuppression();
     showTrayWindow();
-    return { error: err.message };
+    return { error: err?.code || 'package_failed' };
   }
-  } finally { if (packageActivation) packageActivation.close(); packageInFlight = false; }
+  } finally {
+    if (reviewedPackageSources) await reviewedPackageSources.close();
+    if (packageActivation) packageActivation.close();
+    packageInFlight = false;
+  }
 });
 
 registerTrustedIpcHandler('projects:select-output', async () => {
@@ -11625,6 +13070,8 @@ registerTrustedIpcHandler('projects:select-output', async () => {
 });
 
 registerTrustedIpcHandler('projects:delete', (event, id) => {
+  invalidatePackageReviewForProject(id);
+  incompletePackageScans.delete(id);
   stopWatching(id);
   illustratorActivationScopes.delete(id);
   figmaPackageTransferBlocks.delete(id);
@@ -11648,6 +13095,10 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
 });
 
 registerTrustedIpcHandler('projects:delete-all', () => {
+  packageReviewSnapshots.clear();
+  currentPackageReviewTokenByProject.clear();
+  consumedPackageReviewTokens.clear();
+  incompletePackageScans.clear();
   const projectCacheIds = safeStoredProjectCacheIds();
   // Stop all active watchers and lsof pollers
   for (const [id, watcher] of watchers) {

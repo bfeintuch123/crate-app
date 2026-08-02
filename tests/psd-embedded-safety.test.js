@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
+const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
 const {
   EDGE_TYPES,
   NODE_TYPES,
@@ -251,7 +252,10 @@ setStub('child_process', () => ({
 
 let currentPsdFixture = { children: [], linkedFiles: [] };
 setStub('ag-psd', () => ({
-  readPsd: () => currentPsdFixture,
+  readPsd: () => {
+    if (currentPsdFixture instanceof Error) throw currentPsdFixture;
+    return currentPsdFixture;
+  },
 }));
 
 let uuidCounter = 0;
@@ -262,11 +266,13 @@ setStub('crypto', () => ({
 
 require(path.resolve(__dirname, '..', 'main.js'));
 
-function callIpc(channel, ...args) {
+function callIpcRaw(channel, ...args) {
   const handler = ipcHandlers.get(channel);
   if (!handler) throw new Error(`No IPC handler registered for ${channel}`);
   return handler({ sender: trustedRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
+
+const callIpc = createAutomaticPackageReviewCaller(callIpcRaw);
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-psd-safety-'));
@@ -430,6 +436,106 @@ test.after(() => {
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
+function makeEmbeddedPsdEntry(psdPath, name = 'Embedded.png') {
+  return {
+    path: psdPath,
+    name,
+    ext: path.extname(name).toLowerCase(),
+    addedAt: Date.now(),
+    source: 'scan-on-save-embedded',
+    embedded: true,
+    parentPsd: psdPath,
+    embeddedOriginalName: name,
+    embeddedIndex: 0,
+    fileId: `embedded-${name}`,
+  };
+}
+
+test('corrupt or removed PSD resources withhold review tokens and recover safely', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const projectId = 'psd-review-readiness';
+    const psdPath = path.join(tmpRoot, 'source.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(psdPath, Buffer.from('synthetic parent PSD bytes'));
+    setProjects([makeProject(projectId, 'PSD Review Readiness', [makeEmbeddedPsdEntry(psdPath)])]);
+
+    currentPsdFixture = new Error('synthetic corrupt PSD');
+    const corruptReview = await callIpcRaw('projects:prepare-package-review', projectId);
+    assert.equal(corruptReview.materializable, false);
+    assert.equal(corruptReview.token, undefined);
+    assert.deepEqual(corruptReview.files, [{ name: 'Embedded.png', status: 'unavailable' }]);
+
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const missingReview = await callIpcRaw('projects:prepare-package-review', projectId);
+    assert.equal(missingReview.materializable, false);
+    assert.equal(missingReview.token, undefined);
+
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('reviewed embedded bytes') }],
+    };
+    const recoveredReview = await callIpcRaw('projects:prepare-package-review', projectId);
+    assert.equal(recoveredReview.materializable, true);
+    assert.equal(typeof recoveredReview.token, 'string');
+
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    const removed = await callIpcRaw('projects:package', projectId, outputDir, recoveredReview.token);
+    assert.equal(removed.error, 'package_review_changed');
+    assert.equal(removed.review.materializable, false);
+    assert.equal(removed.review.token, undefined);
+    assert.deepEqual(removed.review.files, [{ name: 'Embedded.png', status: 'unavailable' }]);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('recovered embedded bytes') }],
+    };
+    const secondRecovery = await callIpcRaw('projects:prepare-package-review', projectId);
+    assert.equal(secondRecovery.materializable, true);
+    assert.equal(typeof secondRecovery.token, 'string');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-review PSD resource replacement refreshes before publishing changed bytes', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const projectId = 'psd-resource-change';
+    const psdPath = path.join(tmpRoot, 'source.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(psdPath, Buffer.from('stable synthetic parent PSD bytes'));
+    setProjects([makeProject(projectId, 'PSD Resource Change', [makeEmbeddedPsdEntry(psdPath)])]);
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('reviewed resource bytes') }],
+    };
+    const review = await callIpcRaw('projects:prepare-package-review', projectId);
+
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('replacement resource bytes') }],
+    };
+    const changed = await callIpcRaw('projects:package', projectId, outputDir, review.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.equal(changed.review.materializable, true);
+    assert.equal(typeof changed.review.token, 'string');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+
+    const result = await callIpcRaw('projects:package', projectId, outputDir, changed.review.token);
+    assert.equal(result.success, true);
+    assert.equal(
+      fs.readFileSync(path.join(result.folderPath, 'Embedded.png'), 'utf8'),
+      'replacement resource bytes'
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('default package omits diagnostic report files but keeps package provenance records', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -464,7 +570,7 @@ test('default package omits diagnostic report files but keeps package provenance
   }
 });
 
-test('package provenance records copied files and skips missing files', async () => {
+test('package provenance records copied files and redacts private diagnostics', async () => {
   const tmpRoot = makeTempDir();
   try {
     const sourcePath = path.join(tmpRoot, 'logo.ai');
@@ -472,6 +578,7 @@ test('package provenance records copied files and skips missing files', async ()
     const outputDir = path.join(tmpRoot, 'out');
     fs.mkdirSync(outputDir);
     fs.writeFileSync(sourcePath, Buffer.from('logo bytes'));
+    fs.writeFileSync(missingPath, Buffer.from('secondary bytes'));
     const containerPath = path.join(tmpRoot, 'brand.psd');
     const normalizedSourcePath = fs.realpathSync.native(sourcePath).replace(/\/+$/, '').toLowerCase();
     const sourceNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath: normalizedSourcePath });
@@ -578,10 +685,10 @@ test('package provenance records copied files and skips missing files', async ()
 
     assertPackageResultShape(result);
     assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
+    assert.equal(result.copiedCount, 2);
     assert.equal(result.embeddedCount, 0);
     assert.equal(result.totalFiles, 2);
-    assert.deepEqual(result.errors, ['File not found: missing.ai']);
+    assert.deepEqual(result.errors, []);
 
     const destFolder = packageFolder(outputDir, 'Package Provenance Copy');
     const copiedPath = path.join(destFolder, 'logo.ai');
@@ -590,7 +697,7 @@ test('package provenance records copied files and skips missing files', async ()
     const project = getStoredProject('package-provenance-copy');
     const includeEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_INCLUDES_FILE);
     const extractEdges = getProvenanceEdges(project, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE);
-    assert.equal(includeEdges.length, 1);
+    assert.equal(includeEdges.length, 2);
     assert.equal(extractEdges.length, 0);
     assert.equal(includeEdges[0].payload.outputPath, copiedPath);
     assert.equal(includeEdges[0].payload.source, 'manual-browse');
@@ -635,12 +742,12 @@ test('package provenance records copied files and skips missing files', async ()
       Object.keys(manifest.package).sort().join(','),
       'copiedCount,embeddedCount,errorCategories,errorCount,totalFiles'
     );
-    assert.equal(manifest.package.copiedCount, 1);
+    assert.equal(manifest.package.copiedCount, 2);
     assert.equal(manifest.package.embeddedCount, 0);
     assert.equal(manifest.package.totalFiles, 2);
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { file_not_found: 1 });
-    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
+    assert.equal(manifest.package.errorCount, 0);
+    assert.deepEqual(manifest.package.errorCategories, {});
+    assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 2);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 1);
     assert.equal(manifest.evidence.length, 1);
@@ -1021,7 +1128,7 @@ test('package copy rejects symlinked selected output directories without writing
     await assert.rejects(
       () => callIpc('projects:package', 'package-copy-symlink-output', symlinkOutputDir),
       (error) => {
-        assert.match(error.message, /Package output parent folder is a symlink/);
+        assert.match(error.message, /Package output (?:parent )?folder is a symlink/);
         assert.equal(error.message.includes(realOutputDir), false);
         return true;
       }
@@ -1070,7 +1177,7 @@ test('package copy rejects symlinked selected output ancestors without writing t
   }
 });
 
-test('package copy rejects symlink sources without copying target contents', async () => {
+test('package copy fails closed on reviewed symlink sources without copying target contents', async () => {
   const tmpRoot = makeTempDir();
   try {
     const targetPath = path.join(tmpRoot, 'outside-secret.ai');
@@ -1094,25 +1201,18 @@ test('package copy rejects symlink sources without copying target contents', asy
     }])]);
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', 'package-copy-symlink', outputDir);
+    const result = await callIpcRaw('projects:prepare-package-review', 'package-copy-symlink');
 
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 0);
-    assert.equal(result.embeddedCount, 0);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, ['Failed to copy linked-secret.ai: Symlink source files are not copied']);
-
-    const destFolder = packageFolder(outputDir, 'Package Copy Symlink');
-    assert.equal(fs.existsSync(path.join(destFolder, 'linked-secret.ai')), false);
-    const manifest = readManifest(outputDir, 'Package Copy Symlink');
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { copy_failed: 1 });
-    assert.equal('errors' in manifest.package, false);
-    const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('linked-secret.ai'), false);
-    assert.equal(manifestText.includes(targetPath), false);
-    assert.equal(manifestText.includes('secret target bytes'), false);
+    assert.equal(result.materializable, false);
+    assert.equal(result.token, undefined);
+    assert.deepEqual(result.files, [{ name: 'linked-secret.ai', status: 'symlink' }]);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    const project = getStoredProject('package-copy-symlink');
+    assert.equal(project.status, 'watching');
+    assert.equal(getProvenanceEdges(project, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+    assert.equal(JSON.stringify(result).includes(targetPath), false);
+    assert.equal(JSON.stringify(result).includes('secret target bytes'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1209,7 +1309,7 @@ test('empty provenance writes minimal package manifest with warnings', async () 
   }
 });
 
-test('manifest write failure does not block package success', async () => {
+test('existing destination collision publishes diagnostics to a deterministic sibling', async () => {
   const tmpRoot = makeTempDir();
   try {
     const sourcePath = path.join(tmpRoot, 'logo.ai');
@@ -1239,7 +1339,10 @@ test('manifest write failure does not block package success', async () => {
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 0);
     assert.deepEqual(result.errors, []);
-    assert.equal(fs.readFileSync(path.join(destFolder, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.notEqual(result.folderPath, destFolder);
+    assert.match(path.basename(result.folderPath), /_1$/);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Crate Diagnostics', 'crate-provenance.json')), true);
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Manifest Write Failure')), false);
     assert.equal(fs.statSync(path.join(diagnosticsFolder, 'crate-provenance.json')).isDirectory(), true);
   } finally {
@@ -1247,10 +1350,8 @@ test('manifest write failure does not block package success', async () => {
   }
 });
 
-test('diagnostic manifest skips symlinked diagnostics folder without escaping package root', async () => {
+test('destination collision avoids a symlinked diagnostics folder without escaping package root', async () => {
   const tmpRoot = makeTempDir();
-  const originalWarn = console.warn;
-  const warnings = [];
   try {
     const sourcePath = path.join(tmpRoot, 'logo.ai');
     const outputDir = path.join(tmpRoot, 'out');
@@ -1273,9 +1374,6 @@ test('diagnostic manifest skips symlinked diagnostics folder without escaping pa
     ]);
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    console.warn = (...args) => {
-      warnings.push(args.map(arg => String(arg)).join(' '));
-    };
     const result = await callIpc('projects:package', 'manifest-symlink-safety', outputDir);
 
     assertPackageResultShape(result);
@@ -1284,18 +1382,16 @@ test('diagnostic manifest skips symlinked diagnostics folder without escaping pa
     assert.equal(result.embeddedCount, 0);
     assert.equal(result.totalFiles, 1);
     assert.deepEqual(result.errors, []);
-    assert.equal(fs.readFileSync(path.join(destFolder, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.notEqual(result.folderPath, destFolder);
+    assert.match(path.basename(result.folderPath), /_1$/);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'logo.ai'), 'utf8'), 'logo bytes');
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Crate Diagnostics', 'crate-provenance.json')), true);
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Manifest Symlink Safety')), false);
     assert.equal(fs.existsSync(path.join(symlinkTarget, 'crate-provenance.json')), false);
     assert.equal(fs.lstatSync(diagnosticsFolder).isSymbolicLink(), true);
     assert.equal(JSON.stringify(result).includes(symlinkTarget), false);
 
-    const warningText = warnings.join('\n');
-    assert.match(warningText, /manifest write skipped/);
-    assert.equal(warningText.includes(symlinkTarget), false);
-    assert.equal(warningText.includes(tmpRoot), false);
   } finally {
-    console.warn = originalWarn;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

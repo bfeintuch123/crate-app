@@ -12,7 +12,7 @@
 </head>
 <body>
   <div id="app">
-    <aside class="app-sidebar" aria-label="Crate navigation">
+    <aside class="app-sidebar" id="app-sidebar" aria-label="Crate navigation">
       <div class="sidebar-brand">
         <span class="app-logo">CRATE</span>
       </div>
@@ -37,7 +37,7 @@
       </div>
     </aside>
 
-    <main class="app-main">
+    <main class="app-main" id="app-main">
       <!-- Scrollable Content Area -->
       <div class="app-content">
       <!-- Projects Tab -->
@@ -312,11 +312,11 @@
     </main>
 
     <!-- Package Confirmation Modal -->
-    <div class="modal-overlay hidden" id="modal-package">
+    <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" aria-describedby="package-review-subtitle" tabindex="-1">
       <div class="modal">
         <div class="modal-header-area">
-          <div class="modal-title">Package Review</div>
-          <div class="modal-subtitle">Confirm included files before writing output.</div>
+          <div class="modal-title" id="package-review-title">Package Review</div>
+          <div class="modal-subtitle" id="package-review-subtitle">Confirm included files before writing output.</div>
         </div>
         <div class="modal-body">
           <div class="modal-info-row">
@@ -328,19 +328,20 @@
             <div class="modal-row-value" id="modal-figma-scope"></div>
           </div>
           <div id="modal-figma-warning" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
+          <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
           <div class="modal-reminder hidden" id="modal-presentation-reminder">
             <div class="modal-reminder-title">Save before packaging</div>
             <div class="modal-reminder-copy">Save your PowerPoint or Keynote file before packaging so Crate can include embedded images and media.</div>
             <div class="modal-reminder-note">Unsaved presentation changes may not be visible to Crate until the file is saved.</div>
           </div>
-          <div class="modal-file-list" id="modal-file-list"></div>
+          <div class="modal-file-list" id="modal-file-list" role="region" aria-label="Files in Package Review" tabindex="-1"></div>
           <div class="modal-naming-box">
             <div class="modal-naming-label">Output Folder Name</div>
             <div class="modal-naming-preview" id="modal-folder-name"></div>
           </div>
           <div class="modal-folder-row">
             <span class="modal-folder-path" id="modal-dest-path">~/Desktop/</span>
-            <span class="modal-folder-change" id="btn-change-dest">Change &rarr;</span>
+            <button type="button" class="modal-folder-change" id="btn-change-dest">Change &rarr;</button>
           </div>
           <div class="modal-actions">
             <button class="modal-btn-secondary" id="btn-cancel-package">Cancel</button>
@@ -351,14 +352,14 @@
     </div>
 
     <!-- Success Modal -->
-    <div class="modal-overlay hidden" id="modal-success">
+    <div class="modal-overlay hidden" id="modal-success" role="dialog" aria-modal="true" aria-labelledby="success-title" tabindex="-1">
       <div class="modal modal-centered">
         <div class="success-icon-wrap">&#x2705;</div>
-        <div class="success-title">Package Complete</div>
+        <div class="success-title" id="success-title">Package Complete</div>
         <div class="success-desc" id="success-message">14 files gathered. Your project is ready.</div>
         <div class="success-path" id="success-path"></div>
         <details class="package-details hidden" id="package-details">
-          <summary>Package Details</summary>
+          <summary id="package-details-summary">Package Details</summary>
           <div class="package-details-body">
             <div class="package-details-row">
               <div class="package-details-label">Files included</div>
@@ -393,11 +394,11 @@
     </div>
 
     <!-- Upgrade Modal -->
-    <div class="modal-overlay hidden" id="modal-upgrade">
+    <div class="modal-overlay hidden" id="modal-upgrade" role="dialog" aria-modal="true" aria-labelledby="upgrade-title" aria-describedby="upgrade-subtitle" tabindex="-1">
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title" id="upgrade-title">You've reached your package limit</div>
-          <div class="modal-subtitle">Upgrade to Crate Pro for higher package limits.</div>
+          <div class="modal-subtitle" id="upgrade-subtitle">Upgrade to Crate Pro for higher package limits.</div>
         </div>
         <div class="modal-body">
           <ul class="feature-list">
@@ -407,13 +408,13 @@
             <li>Priority support</li>
           </ul>
           <button class="app-btn" disabled>Upgrade to Pro &rarr;</button>
-          <div class="dismiss-link" id="btn-dismiss-upgrade">Maybe later &middot; resets in <span id="upgrade-days-left">30</span> days</div>
+          <button type="button" class="dismiss-link" id="btn-dismiss-upgrade">Maybe later &middot; resets in <span id="upgrade-days-left">30</span> days</button>
         </div>
       </div>
     </div>
 
     <!-- Packaging Progress -->
-    <div class="modal-overlay hidden" id="modal-progress">
+    <div class="modal-overlay hidden" id="modal-progress" role="status" aria-live="polite" aria-label="Packaging project" tabindex="-1">
       <div class="modal modal-centered">
         <div class="spinner"></div>
         <p class="progress-text">Packaging project...</p>

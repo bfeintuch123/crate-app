@@ -121,11 +121,155 @@ setStub('child_process', () => ({
 }));
 
 const { packageMasterFile } = require('../parsers');
-const { copyFileIntoPackage } = require('../parsers/package-safety');
+const {
+  PackageNameAllocationError,
+  copyFileIntoPackage,
+  createPackageNameAllocator,
+  packageCollisionKey,
+} = require('../parsers/package-safety');
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-quick-package-parser-'));
 }
+
+function assertMaterializablePackageName(name) {
+  assert.ok(name.length <= 180, `${name.length} UTF-16 units exceeds Crate's limit`);
+  assert.ok(Buffer.byteLength(name, 'utf8') <= 255, `${Buffer.byteLength(name, 'utf8')} UTF-8 bytes exceeds NAME_MAX`);
+  assert.equal(name.includes('\uFFFD'), false);
+  assert.equal(/[\uD800-\uDFFF]/u.test(name), false);
+}
+
+test('package safety shares case-insensitive Unicode-normalized collision allocation with writes', () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const outputDir = path.join(tmpRoot, 'out');
+    const rawNames = ['Logo.png', 'logo.png', 'Cafe\u0301.png', 'Caf\u00e9.png', '\u03A3.png', '\u03C2.png', '\u03C3.png'];
+    const sources = rawNames.map((value, index) => {
+      const sourcePath = path.join(tmpRoot, `source-${index}`);
+      fs.writeFileSync(sourcePath, value);
+      return sourcePath;
+    });
+    const allocate = createPackageNameAllocator();
+    const planned = rawNames.map(allocate);
+    const written = rawNames.map((name, index) => path.basename(copyFileIntoPackage(sources[index], outputDir, name)));
+
+    assert.deepEqual(planned, [
+      'Logo.png', 'logo_1.png', 'Cafe\u0301.png', 'Caf\u00e9_1.png', '\u03A3.png', '\u03C2_1.png', '\u03C3_2.png',
+    ]);
+    assert.deepEqual(written, planned);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package filename planning preserves code points and enforces UTF-8 component limits', () => {
+  const exactAstral = createPackageNameAllocator()(`${'a'.repeat(174)}\u{1F600}.ppt`);
+  const splitAstral = createPackageNameAllocator()(`${'a'.repeat(175)}\u{1F600}tail.ppt`);
+  assert.equal(exactAstral, `${'a'.repeat(174)}\u{1F600}.ppt`);
+  assert.equal(splitAstral, `${'a'.repeat(175)}.ppt`);
+
+  const suffixAllocator = createPackageNameAllocator();
+  const suffixBoundary = `${'b'.repeat(173)}\u{1F600}tail.ppt`;
+  const first = suffixAllocator(suffixBoundary);
+  const second = suffixAllocator(suffixBoundary);
+  assert.equal(first, `${'b'.repeat(173)}\u{1F600}t.ppt`);
+  assert.equal(second, `${'b'.repeat(173)}_1.ppt`);
+
+  const multibyteAllocator = createPackageNameAllocator();
+  const multibyteNames = Array.from({ length: 11 }, () => multibyteAllocator(`${'\u754C'.repeat(100)}.png`));
+  assert.ok(multibyteNames.some(name => /_9\.png$/.test(name)));
+  assert.ok(multibyteNames.some(name => /_10\.png$/.test(name)));
+
+  for (const name of [exactAstral, splitAstral, first, second, ...multibyteNames]) {
+    assertMaterializablePackageName(name);
+  }
+  assert.equal(new Set(multibyteNames.map(packageCollisionKey)).size, multibyteNames.length);
+});
+
+test('package filename allocation bounds pathological extensions and advances through 9 to 10', () => {
+  const tmpRoot = makeTempDir();
+  try {
+    for (const extensionLength of [177, 178, 179]) {
+      const outputDir = path.join(tmpRoot, `out-${extensionLength}`);
+      const rawName = `${'n'.repeat(179)}.${'x'.repeat(extensionLength)}`;
+      const sources = Array.from({ length: 11 }, (_, index) => {
+        const sourcePath = path.join(tmpRoot, `source-${extensionLength}-${index}`);
+        fs.writeFileSync(sourcePath, `${extensionLength}-${index}`);
+        return sourcePath;
+      });
+      const allocate = createPackageNameAllocator();
+      const planned = sources.map(() => allocate(rawName));
+      const written = sources.map(sourcePath => path.basename(copyFileIntoPackage(sourcePath, outputDir, rawName)));
+
+      assert.deepEqual(written, planned);
+      assert.equal(new Set(planned.map(packageCollisionKey)).size, planned.length);
+      assert.ok(planned.every(name => name.length <= 180));
+      assert.match(planned[9], /_9\./);
+      assert.match(planned[10], /_10\./);
+    }
+
+    const ordinaryExtension = createPackageNameAllocator()(`${'a'.repeat(220)}.presentation.jpeg`);
+    assert.equal(ordinaryExtension.endsWith('.jpeg'), true);
+    assert.equal(ordinaryExtension.length, 180);
+
+    const exhausted = createPackageNameAllocator(['file.txt', 'file_1.txt'], { maxAttempts: 2 });
+    assert.throws(
+      () => exhausted('file.txt'),
+      error => error instanceof PackageNameAllocationError && error.code === 'package_name_allocation_failed'
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package copies legacy binary PowerPoint without ZIP inspection errors', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const deckPath = path.join(tmpRoot, 'Legacy.ppt');
+    const outputDir = path.join(tmpRoot, 'out');
+    const legacyBytes = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.from('synthetic legacy PowerPoint compound document'),
+    ]);
+    fs.writeFileSync(deckPath, legacyBytes);
+    unzipFixture = new Map();
+
+    const result = await packageMasterFile(deckPath, outputDir);
+
+    assert.equal(result.assetsFound, 0);
+    assert.equal(result.assetsCopied, 0);
+    assert.deepEqual(result.assetsMissing, []);
+    assert.deepEqual(result.files.map(file => ({ copied: path.basename(file.copied), source: file.source })), [
+      { copied: 'Legacy.ppt', source: 'master' },
+    ]);
+    assert.deepEqual(fs.readFileSync(path.join(outputDir, 'Legacy.ppt')), legacyBytes);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Quick Package materializes an astral-boundary filename without surrogate replacement', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const rawName = `${'q'.repeat(175)}\u{1F600}tail.ppt`;
+    const deckPath = path.join(tmpRoot, rawName);
+    const outputDir = path.join(tmpRoot, 'out');
+    const expectedName = createPackageNameAllocator()(rawName);
+    fs.writeFileSync(deckPath, Buffer.from('legacy PowerPoint astral boundary bytes'));
+    unzipFixture = new Map();
+
+    const result = await packageMasterFile(deckPath, outputDir);
+    const reportedName = path.basename(result.files[0].copied);
+    const materializedNames = fs.readdirSync(outputDir);
+
+    assert.equal(reportedName, expectedName);
+    assert.deepEqual(materializedNames, [expectedName]);
+    assertMaterializablePackageName(expectedName);
+    assert.deepEqual(fs.readFileSync(path.join(outputDir, expectedName)), Buffer.from('legacy PowerPoint astral boundary bytes'));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
 
 test('Quick Package extracts PowerPoint embedded media without reporting them missing', async () => {
   const tmpRoot = makeTempDir();
