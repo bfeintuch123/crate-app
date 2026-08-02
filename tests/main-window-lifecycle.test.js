@@ -270,7 +270,8 @@ test('main window uses normal macOS app lifecycle', async () => {
     win.webContents.mainFrame = mainFrame;
     const trustedEvent = { sender: win.webContents, senderFrame: mainFrame };
     assert.deepEqual(ipcHandlers.get('projects:get-all')(trustedEvent), []);
-    assert.equal(ipcHandlers.size, 30);
+    assert.equal(ipcHandlers.has('projects:prepare-package-review'), true);
+    assert.equal(ipcHandlers.size, 31);
     assert.throws(
       () => ipcHandlers.get('projects:get-all')({}),
       /blocked an untrusted renderer request/

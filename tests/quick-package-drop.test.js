@@ -56,6 +56,23 @@ test('preload packages an operating-system-backed dropped file without a path-re
   assert.deepEqual(invocations, [{ channel: 'v2:package-file', args: [droppedPath] }]);
 });
 
+test('preload forwards authoritative Package Review destination and token bindings', async () => {
+  const { bridge, invocations } = loadPreload({ getPathForFile: () => '' });
+  const projectId = 'project-review';
+  const outputPath = '/private/tmp/crate-synthetic-output';
+  const reviewToken = '00000000-0000-4000-8000-000000000123';
+
+  await bridge.preparePackageReview(projectId);
+  await bridge.preparePackageReview(projectId, outputPath);
+  await bridge.packageProject(projectId, outputPath, reviewToken);
+
+  assert.deepEqual(invocations, [
+    { channel: 'projects:prepare-package-review', args: [projectId] },
+    { channel: 'projects:prepare-package-review', args: [projectId, outputPath] },
+    { channel: 'projects:package', args: [projectId, outputPath, reviewToken] },
+  ]);
+});
+
 test('preload rejects a dropped file without an operating-system path', async () => {
   const { bridge, invocations } = loadPreload({
     getPathForFile() { return ''; },

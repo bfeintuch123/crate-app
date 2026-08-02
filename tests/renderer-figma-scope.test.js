@@ -18,7 +18,10 @@ function createElementStub(tagName = 'div') {
     value: '',
     checked: false,
     disabled: false,
+    inert: false,
     open: false,
+    ownerDocument: null,
+    focusableElements: [],
     classList: {
       add: (...names) => names.forEach(name => classes.add(name)),
       remove: (...names) => names.forEach(name => classes.delete(name)),
@@ -35,12 +38,20 @@ function createElementStub(tagName = 'div') {
       if (!listeners[type]) listeners[type] = [];
       listeners[type].push(fn);
     },
+    removeEventListener: (type, fn) => {
+      if (!listeners[type]) return;
+      listeners[type] = listeners[type].filter(listener => listener !== fn);
+    },
     dispatchEvent: event => {
       const normalizedEvent = typeof event === 'string' ? { type: event } : event;
       for (const fn of listeners[normalizedEvent.type] || []) fn(normalizedEvent);
     },
     click: () => element.dispatchEvent({ type: 'click', preventDefault: () => {}, stopPropagation: () => {} }),
-    focus: () => { element.focused = true; },
+    focus: () => {
+      if (element.ownerDocument?.activeElement) element.ownerDocument.activeElement.focused = false;
+      element.focused = true;
+      if (element.ownerDocument) element.ownerDocument.activeElement = element;
+    },
     setAttribute: (name, value) => { attributes[name] = String(value); },
     getAttribute: name => attributes[name],
     removeAttribute: name => { delete attributes[name]; },
@@ -50,6 +61,8 @@ function createElementStub(tagName = 'div') {
       }
       return null;
     },
+    querySelectorAll: selector => selector.includes('button') ? element.focusableElements : [],
+    closest: () => null,
   };
 
   let html = '';
@@ -81,13 +94,20 @@ function createElementStub(tagName = 'div') {
 
 function createDocumentStub(elements = {}, options = {}) {
   const listeners = {};
+  const body = createElementStub('body');
+  let document;
+  const attach = element => {
+    if (element) element.ownerDocument = document;
+    return element;
+  };
   const getElementById = id => {
-    if (!elements[id] && options.createMissingIds) elements[id] = createElementStub();
-    return elements[id] || null;
+    if (!elements[id] && options.createMissingIds) elements[id] = attach(createElementStub());
+    return attach(elements[id] || null);
   };
 
-  return {
+  document = {
     listeners,
+    activeElement: body,
     addEventListener: (type, fn) => { listeners[type] = fn; },
     querySelector: selector => {
       if (selector.startsWith('#')) return getElementById(selector.slice(1));
@@ -102,12 +122,65 @@ function createDocumentStub(elements = {}, options = {}) {
       return [];
     },
     createElement: createElementStub,
-    body: { appendChild: () => {} },
+    body,
   };
+  body.ownerDocument = document;
+  for (const element of Object.values(elements)) attach(element);
+  for (const element of [...(options.tabs || []), ...(options.typePills || [])]) attach(element);
+  return document;
 }
 
 function createInteractiveRendererDom() {
-  const elements = {};
+  const elements = {
+    'app-sidebar': createElementStub('aside'),
+    'app-main': createElementStub('main'),
+    'btn-package': createElementStub('button'),
+    'btn-change-dest': createElementStub('button'),
+    'btn-cancel-package': createElementStub('button'),
+    'btn-confirm-package': createElementStub('button'),
+    'modal-package': createElementStub(),
+    'modal-progress': createElementStub(),
+    'modal-success': createElementStub(),
+    'package-details': createElementStub('details'),
+    'package-details-summary': createElementStub('summary'),
+    'btn-success-done': createElementStub('button'),
+    'btn-open-folder': createElementStub('button'),
+    'modal-upgrade': createElementStub(),
+    'btn-dismiss-upgrade': createElementStub('button'),
+    'modal-delete-confirm': createElementStub(),
+    'modal-edit-figma-link': createElementStub(),
+    'modal-clear-all': createElementStub(),
+    'modal-v2-results': createElementStub(),
+  };
+  for (const id of [
+    'modal-package',
+    'modal-progress',
+    'modal-success',
+    'modal-upgrade',
+    'modal-delete-confirm',
+    'modal-edit-figma-link',
+    'modal-clear-all',
+    'modal-v2-results',
+  ]) {
+    elements[id].classList.add('hidden');
+  }
+  elements['modal-package'].focusableElements = [
+    elements['btn-change-dest'],
+    elements['btn-cancel-package'],
+    elements['btn-confirm-package'],
+  ];
+  elements['modal-upgrade'].focusableElements = [elements['btn-dismiss-upgrade']];
+  elements['package-details'].classList.add('hidden');
+  elements['package-details-summary'].closest = selector => (
+    selector === '.hidden' && elements['package-details'].classList.contains('hidden')
+      ? elements['package-details']
+      : null
+  );
+  elements['modal-success'].focusableElements = [
+    elements['package-details-summary'],
+    elements['btn-success-done'],
+    elements['btn-open-folder'],
+  ];
   const tabs = ['projects', 'files', 'settings'].map(tabName => {
     const tab = createElementStub('button');
     tab.dataset.tab = tabName;
@@ -459,6 +532,487 @@ test('Package Details shows multiple sanitized issue messages', () => {
       'Could not extract embedded media image2.png from Presentation1.pptx.',
     ]
   );
+});
+
+test('renderer refreshes changed Package Review inline and requires a second Package Now click', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'package-review-project',
+    name: 'Package Review Project',
+    type: 'branding',
+    status: 'watching',
+    files: [
+      { name: 'Review_Project.ai', ext: '.ai' },
+      { name: 'Review_Initial.png', ext: '.png' },
+      { name: 'Review_Added_After_Review.png', ext: '.png' },
+    ],
+  };
+  const firstReview = {
+    token: '00000000-0000-4000-8000-000000000101',
+    projectId: project.id,
+    files: project.files.slice(0, 2),
+    totalFiles: 2,
+    folderName: 'Package Review Project_2026-08-02',
+  };
+  const refreshedReview = {
+    token: '00000000-0000-4000-8000-000000000102',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 3,
+    folderName: 'Package Review Project_2026-08-02_1',
+  };
+  const packageCalls = [];
+  const disabledDuringPackageCalls = [];
+  let prepareCalls = 0;
+  const crateBridge = {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async () => {
+      prepareCalls++;
+      return firstReview;
+    },
+    getProjects: async () => [project],
+    packageProject: async (...args) => {
+      packageCalls.push(args);
+      disabledDuringPackageCalls.push(elements['btn-confirm-package'].disabled);
+      return packageCalls.length === 1
+        ? { error: 'package_review_changed', reason: 'package_destination_changed', review: refreshedReview }
+        : { error: 'limit_reached', packageLimit: 25, daysLeft: 1 };
+    },
+  };
+  const renderer = loadRendererHelpers(document, { crate: crateBridge });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-package'].focus();
+  assert.equal(await renderer.showPackageModal(), true);
+  assert.equal(elements['modal-file-list'].children.length, 2);
+  assert.equal(elements['modal-folder-name'].textContent, firstReview.folderName);
+  await renderer.confirmPackage();
+
+  assert.equal(packageCalls.length, 1);
+  assert.deepEqual(disabledDuringPackageCalls, [true]);
+  assert.equal(packageCalls[0][2], firstReview.token);
+  assert.equal(
+    elements['modal-package-review-message'].textContent,
+    'Your project changed. Review the updated files before packaging.'
+  );
+  assert.equal(elements['modal-package-review-message'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package-review-message'].focused, true);
+  assert.equal(elements['modal-file-list'].children.length, 3);
+  assert.equal(elements['modal-folder-name'].textContent, refreshedReview.folderName);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), refreshedReview.token);
+
+  await renderer.confirmPackage();
+  assert.equal(packageCalls.length, 2);
+  assert.equal(packageCalls[1][2], refreshedReview.token);
+  assert.equal(prepareCalls, 1);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), false);
+  assert.equal(document.activeElement, elements['btn-dismiss-upgrade']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+
+  elements['btn-dismiss-upgrade'].click();
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(document.activeElement, elements['btn-package']);
+});
+
+test('renderer binds the selected destination after generic output drift and packages on the second click', async () => {
+  const { document, elements, tabs } = createInteractiveRendererDom();
+  const outputPath = '/private/tmp/crate-synthetic-output';
+  const project = {
+    id: 'destination-bound-review-project',
+    name: 'Destination Bound Review',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Bound.ai', ext: '.ai' }],
+  };
+  const initialReview = {
+    token: '00000000-0000-4000-8000-000000000111',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    folderName: 'Destination Bound Review_2026-08-02',
+    materializable: true,
+  };
+  const boundReview = {
+    ...initialReview,
+    token: '00000000-0000-4000-8000-000000000112',
+    folderName: 'Destination Bound Review_2026-08-02_1',
+  };
+  const prepareCalls = [];
+  const packageCalls = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async (...args) => {
+      prepareCalls.push(args);
+      return prepareCalls.length === 1 ? initialReview : boundReview;
+    },
+    getProjects: async () => {
+      if (packageCalls.length >= 2) throw new Error('synthetic post-package refresh failure');
+      return [project];
+    },
+    getUsage: async () => ({ packagesThisMonth: 1, packageLimit: 25 }),
+    packageProject: async (...args) => {
+      packageCalls.push(args);
+      if (packageCalls.length === 1) return { error: 'package_output_changed' };
+      return {
+        success: true,
+        copiedCount: 1,
+        embeddedCount: 0,
+        totalFiles: 1,
+        folderPath: `${outputPath}/${boundReview.folderName}`,
+        errors: [],
+      };
+    },
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}', showPackageDetails: false };
+    state.packageOutputPath = '${outputPath}';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  await renderer.confirmPackage();
+
+  assert.deepEqual(prepareCalls, [[project.id], [project.id, outputPath]]);
+  assert.equal(packageCalls.length, 1);
+  assert.equal(packageCalls[0][2], initialReview.token);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-folder-name'].textContent, boundReview.folderName);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), boundReview.token);
+
+  await renderer.confirmPackage();
+
+  assert.equal(packageCalls.length, 2);
+  assert.equal(packageCalls[1][2], boundReview.token);
+  assert.equal(prepareCalls.length, 2);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(elements['success-path'].textContent, `${outputPath}/${boundReview.folderName}`);
+  assert.equal(document.activeElement, elements['btn-success-done']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+  vm.runInContext('state.projects = []', renderer);
+
+  elements['btn-open-folder'].focus();
+  const tabEvent = {
+    type: 'keydown',
+    key: 'Tab',
+    shiftKey: false,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-success'].dispatchEvent(tabEvent);
+  assert.equal(tabEvent.defaultPrevented, true);
+  assert.equal(document.activeElement, elements['btn-success-done']);
+
+  const escapeEvent = {
+    type: 'keydown',
+    key: 'Escape',
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-success'].dispatchEvent(escapeEvent);
+  assert.equal(escapeEvent.defaultPrevented, true);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(document.activeElement, tabs[0]);
+});
+
+test('renderer disables unavailable Package Review and re-enables only after a fresh materializable review', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'unavailable-review-project',
+    name: 'Unavailable Review Project',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Missing.ai', ext: '.ai' }],
+  };
+  const readyReview = {
+    token: '00000000-0000-4000-8000-000000000201',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    materializable: true,
+  };
+  const unavailableReview = {
+    projectId: project.id,
+    files: [{ name: 'Missing.ai', status: 'missing' }],
+    totalFiles: 1,
+    materializable: false,
+    message: 'Some files are unavailable. Resolve them before packaging.',
+  };
+  const recoveredReview = { ...readyReview, token: '00000000-0000-4000-8000-000000000202' };
+  let preparedReview = readyReview;
+  const packageCalls = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async () => preparedReview,
+    getProjects: async () => [project],
+    packageProject: async (...args) => {
+      packageCalls.push(args);
+      return { error: 'package_review_changed', review: unavailableReview };
+    },
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  await renderer.confirmPackage();
+  assert.equal(packageCalls.length, 1);
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(elements['modal-package-review-message'].textContent, unavailableReview.message);
+  assert.equal(elements['modal-package-review-message'].focused, true);
+
+  await renderer.confirmPackage();
+  assert.equal(packageCalls.length, 1);
+  preparedReview = recoveredReview;
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), recoveredReview.token);
+});
+
+test('Package Review dialog exposes live status semantics and visible disabled styling', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+
+  assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change &rarr;<\/button>/);
+  assert.match(html, /id="modal-package-review-message"[^>]*role="status"[^>]*aria-live="polite"[^>]*tabindex="-1"/);
+  assert.match(html, /id="modal-file-list"[^>]*role="region"[^>]*tabindex="-1"/);
+  assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
+  assert.match(html, /id="modal-upgrade"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-describedby="upgrade-subtitle"/);
+  assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Maybe later[\s\S]*<\/button>/);
+  assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
+});
+
+test('Package Review traps keyboard focus, cancels with Escape, and restores its opener', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'keyboard-package-review',
+    name: 'Keyboard Package Review',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Keyboard.ai', ext: '.ai' }],
+  };
+  const review = {
+    token: '00000000-0000-4000-8000-000000000301',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    materializable: true,
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async () => review,
+    getProjects: async () => [project],
+    selectOutputFolder: async () => null,
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-package'].focus();
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  assert.equal(document.activeElement, elements['btn-cancel-package']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+  assert.equal(elements['app-sidebar'].getAttribute('aria-hidden'), 'true');
+  assert.equal(elements['app-main'].getAttribute('aria-hidden'), 'true');
+
+  elements['btn-confirm-package'].focus();
+  const forwardTab = {
+    type: 'keydown',
+    key: 'Tab',
+    shiftKey: false,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-package'].dispatchEvent(forwardTab);
+  assert.equal(forwardTab.defaultPrevented, true);
+  assert.equal(document.activeElement, elements['btn-change-dest']);
+
+  const reverseTab = {
+    type: 'keydown',
+    key: 'Tab',
+    shiftKey: true,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-package'].dispatchEvent(reverseTab);
+  assert.equal(reverseTab.defaultPrevented, true);
+  assert.equal(document.activeElement, elements['btn-confirm-package']);
+
+  const escape = {
+    type: 'keydown',
+    key: 'Escape',
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-package'].dispatchEvent(escape);
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(elements['app-sidebar'].getAttribute('aria-hidden'), undefined);
+  assert.equal(elements['app-main'].getAttribute('aria-hidden'), undefined);
+  assert.equal(document.activeElement, elements['btn-package']);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  assert.equal(document.activeElement, elements['btn-cancel-package']);
+});
+
+test('package limit dialog traps keyboard focus, dismisses with Escape, and cleans up listeners', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  renderer.setupEventListeners();
+  elements['btn-package'].focus();
+  elements['modal-package'].classList.remove('hidden');
+  elements['modal-success'].classList.remove('hidden');
+  elements['modal-v2-results'].classList.remove('hidden');
+  vm.runInContext(`state.packageReviewToken = '00000000-0000-4000-8000-000000000401'`, renderer);
+
+  renderer.showPackageLimitModal({ packageLimit: 25, daysLeft: 2 });
+
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(document.activeElement, elements['btn-dismiss-upgrade']);
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), false);
+  for (const id of [
+    'modal-package',
+    'modal-progress',
+    'modal-success',
+    'modal-delete-confirm',
+    'modal-edit-figma-link',
+    'modal-clear-all',
+    'modal-v2-results',
+  ]) {
+    assert.equal(elements[id].classList.contains('hidden'), true, `${id} must be hidden`);
+  }
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+  assert.equal(elements['modal-upgrade'].listeners.keydown.length, 1);
+
+  for (const shiftKey of [false, true]) {
+    const tab = {
+      type: 'keydown',
+      key: 'Tab',
+      shiftKey,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    elements['modal-upgrade'].dispatchEvent(tab);
+    assert.equal(tab.defaultPrevented, true);
+    assert.equal(document.activeElement, elements['btn-dismiss-upgrade']);
+  }
+
+  const escape = {
+    type: 'keydown',
+    key: 'Escape',
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-upgrade'].dispatchEvent(escape);
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-upgrade'].listeners.keydown.length, 0);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(document.activeElement, elements['btn-package']);
+
+  renderer.showPackageLimitModal({ packageLimit: 25, daysLeft: 2 }, elements['btn-package']);
+  assert.equal(elements['modal-upgrade'].listeners.keydown.length, 1);
+  elements['btn-dismiss-upgrade'].click();
+  assert.equal(elements['modal-upgrade'].listeners.keydown.length, 0);
+  assert.equal(document.activeElement, elements['btn-package']);
+});
+
+test('renderer recovers rejected IPC and typed package errors in the same modal with fresh tokens', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'package-error-recovery',
+    name: 'Package Error Recovery',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Recovery.ai', ext: '.ai' }],
+  };
+  const reviews = [1, 2, 3].map(index => ({
+    token: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    materializable: true,
+  }));
+  let prepareCalls = 0;
+  let packageCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async () => reviews[prepareCalls++],
+    getProjects: async () => [project],
+    packageProject: async () => {
+      packageCalls++;
+      assert.equal(elements['btn-confirm-package'].disabled, true);
+      if (packageCalls === 1) throw new Error('synthetic rejected package IPC');
+      return { error: 'package_write_failed' };
+    },
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  await renderer.confirmPackage();
+
+  assert.equal(packageCalls, 1);
+  assert.equal(prepareCalls, 2);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package-review-message'].textContent, 'Packaging could not finish. Review the files and try again.');
+  assert.equal(elements['modal-package-review-message'].focused, true);
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), reviews[1].token);
+
+  await renderer.confirmPackage();
+
+  assert.equal(packageCalls, 2);
+  assert.equal(prepareCalls, 3);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), reviews[2].token);
 });
 
 test('Package Details remains collapsed by default', () => {

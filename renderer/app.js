@@ -14,6 +14,7 @@ let state = {
   settings: {},
   usage: {},
   packageOutputPath: null,
+  packageReviewToken: null,
   lastPackagedPath: null,
   pendingDeleteId: null,
   projectType: 'branding',
@@ -26,6 +27,9 @@ let state = {
 
 let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
+let packageReviewOpener = null;
+let packageReviewConfirmationInFlight = false;
+let upgradeModalOpener = null;
 
 function redactRendererPrivatePaths(value) {
   // Delimiters and line breaks may appear in filenames, so redact the value tail.
@@ -923,18 +927,241 @@ function renderFooter() {
   $('#footer-usage').textContent = `${used} of ${packageLimit} packages used this month`;
 }
 
-function showPackageLimitModal(result = {}) {
+const PACKAGE_LIMIT_COMPETING_MODAL_IDS = [
+  'modal-package',
+  'modal-success',
+  'modal-progress',
+  'modal-delete-confirm',
+  'modal-edit-figma-link',
+  'modal-clear-all',
+  'modal-v2-results',
+];
+
+function getPackageLimitFocusableElements() {
+  const modal = $('#modal-upgrade');
+  if (!modal) return [];
+  if (typeof modal.querySelectorAll === 'function') {
+    return [...modal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter(element => !element.disabled && element.getAttribute?.('aria-hidden') !== 'true');
+  }
+  const dismissButton = $('#btn-dismiss-upgrade');
+  return dismissButton && !dismissButton.disabled ? [dismissButton] : [];
+}
+
+function hidePackageLimitModal({ restoreFocus = true } = {}) {
+  const modal = $('#modal-upgrade');
+  modal.classList.add('hidden');
+  modal.removeEventListener('keydown', handlePackageLimitKeydown);
+  setModalBackgroundState(false);
+  const opener = upgradeModalOpener;
+  upgradeModalOpener = null;
+  if (restoreFocus && opener && typeof opener.focus === 'function') opener.focus();
+}
+
+function handlePackageLimitKeydown(event) {
+  const modal = $('#modal-upgrade');
+  if (!modal || modal.classList.contains('hidden')) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    hidePackageLimitModal();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+
+  const focusable = getPackageLimitFocusableElements();
+  if (focusable.length === 0) {
+    event.preventDefault();
+    modal.focus();
+    return;
+  }
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const movingBeforeFirst = event.shiftKey && activeIndex <= 0;
+  const movingPastLast = !event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1);
+  if (!movingBeforeFirst && !movingPastLast) return;
+  event.preventDefault();
+  focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+}
+
+function showPackageLimitModal(result = {}, opener = document.activeElement || null) {
   const packageLimit = Number(result.packageLimit || state.usage.packageLimit || state.usage.limit) || 10;
   const title = $('#upgrade-title');
   if (title) title.textContent = `You've used all ${packageLimit} packages`;
   $('#upgrade-days-left').textContent = result.daysLeft;
-  $('#modal-upgrade').classList.remove('hidden');
+  const modal = $('#modal-upgrade');
+  state.packageReviewToken = null;
+  for (const id of PACKAGE_LIMIT_COMPETING_MODAL_IDS) $(`#${id}`)?.classList.add('hidden');
+  upgradeModalOpener = opener;
+  setModalBackgroundState(true);
+  modal.classList.remove('hidden');
+  modal.removeEventListener('keydown', handlePackageLimitKeydown);
+  modal.addEventListener('keydown', handlePackageLimitKeydown);
+  const focusTarget = $('#btn-dismiss-upgrade') || getPackageLimitFocusableElements()[0] || modal;
+  focusTarget.focus();
 }
 
 // ===== Package Flow =====
-function showPackageModal() {
-  const project = state.projects.find(p => p.id === state.selectedProjectId);
-  if (!project) return;
+const PACKAGE_REVIEW_CHANGED_MESSAGE = 'Your project changed. Review the updated files before packaging.';
+const PACKAGE_REVIEW_UNAVAILABLE_MESSAGE = 'Some files are unavailable. Resolve them before packaging.';
+const PACKAGE_REVIEW_RECOVERY_MESSAGE = 'Packaging could not finish. Review the files and try again.';
+
+function setModalBackgroundState(blocked) {
+  for (const id of ['app-sidebar', 'app-main']) {
+    const element = $(`#${id}`);
+    if (!element) continue;
+    element.inert = blocked;
+    if (blocked) element.setAttribute('aria-hidden', 'true');
+    else element.removeAttribute('aria-hidden');
+  }
+}
+
+function getPackageReviewFocusableElements() {
+  const modal = $('#modal-package');
+  if (!modal) return [];
+  if (typeof modal.querySelectorAll === 'function') {
+    return [...modal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter(element => !element.disabled && element.getAttribute?.('aria-hidden') !== 'true');
+  }
+  return ['btn-change-dest', 'btn-cancel-package', 'btn-confirm-package']
+    .map(id => $(`#${id}`))
+    .filter(element => element && !element.disabled);
+}
+
+function focusPackageReviewDialog() {
+  const reviewMessage = $('#modal-package-review-message');
+  if (reviewMessage && !reviewMessage.classList.contains('hidden')) {
+    reviewMessage.focus();
+    return;
+  }
+  const cancelButton = $('#btn-cancel-package');
+  const focusTarget = cancelButton && !cancelButton.disabled
+    ? cancelButton
+    : getPackageReviewFocusableElements()[0] || $('#modal-package');
+  focusTarget?.focus();
+}
+
+function openPackageReviewDialog() {
+  const modal = $('#modal-package');
+  setModalBackgroundState(true);
+  modal.classList.remove('hidden');
+  focusPackageReviewDialog();
+}
+
+function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false } = {}) {
+  $('#modal-package').classList.add('hidden');
+  setModalBackgroundState(false);
+  const opener = packageReviewOpener;
+  if (!preserveOpener) packageReviewOpener = null;
+  if (restoreFocus && opener && typeof opener.focus === 'function') opener.focus();
+  return opener;
+}
+
+function getPackageSuccessFocusableElements() {
+  const modal = $('#modal-success');
+  if (!modal) return [];
+  if (typeof modal.querySelectorAll === 'function') {
+    return [...modal.querySelectorAll('button:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])')]
+      .filter(element =>
+        !element.disabled &&
+        element.getAttribute?.('aria-hidden') !== 'true' &&
+        !element.closest?.('.hidden')
+      );
+  }
+  return ['btn-success-done', 'btn-open-folder']
+    .map(id => $(`#${id}`))
+    .filter(element => element && !element.disabled);
+}
+
+function hidePackageSuccessModal() {
+  const modal = $('#modal-success');
+  modal.classList.add('hidden');
+  modal.removeEventListener('keydown', handlePackageSuccessKeydown);
+  setModalBackgroundState(false);
+  const opener = packageReviewOpener;
+  packageReviewOpener = null;
+  switchTab('projects');
+  const projectsTab = $$('.app-tab').find(tab => tab.dataset.tab === 'projects');
+  const focusTarget = projectsTab || opener;
+  if (focusTarget && typeof focusTarget.focus === 'function') focusTarget.focus();
+}
+
+function handlePackageSuccessKeydown(event) {
+  const modal = $('#modal-success');
+  if (!modal || modal.classList.contains('hidden')) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    hidePackageSuccessModal();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = getPackageSuccessFocusableElements();
+  if (focusable.length === 0) {
+    event.preventDefault();
+    modal.focus();
+    return;
+  }
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const movingBeforeFirst = event.shiftKey && activeIndex <= 0;
+  const movingPastLast = !event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1);
+  if (!movingBeforeFirst && !movingPastLast) return;
+  event.preventDefault();
+  focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+}
+
+function showPackageProgressModal() {
+  const modal = $('#modal-progress');
+  setModalBackgroundState(true);
+  modal.classList.remove('hidden');
+  modal.focus();
+}
+
+function hidePackageProgressModal() {
+  $('#modal-progress').classList.add('hidden');
+}
+
+function showPackageSuccessModal() {
+  const modal = $('#modal-success');
+  setModalBackgroundState(true);
+  modal.classList.remove('hidden');
+  modal.removeEventListener('keydown', handlePackageSuccessKeydown);
+  modal.addEventListener('keydown', handlePackageSuccessKeydown);
+  const focusTarget = $('#btn-success-done') || getPackageSuccessFocusableElements()[0] || modal;
+  focusTarget.focus();
+}
+
+function cancelPackageReview() {
+  if (packageReviewConfirmationInFlight) return;
+  state.packageReviewToken = null;
+  hidePackageReviewDialog({ restoreFocus: true });
+}
+
+function handlePackageReviewKeydown(event) {
+  const modal = $('#modal-package');
+  if (!modal || modal.classList.contains('hidden')) return;
+  if (event.key === 'Escape') {
+    if (packageReviewConfirmationInFlight) return;
+    event.preventDefault();
+    cancelPackageReview();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+
+  const focusable = getPackageReviewFocusableElements();
+  if (focusable.length === 0) {
+    event.preventDefault();
+    modal.focus();
+    return;
+  }
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const movingBeforeFirst = event.shiftKey && activeIndex <= 0;
+  const movingPastLast = !event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1);
+  if (!movingBeforeFirst && !movingPastLast) return;
+  event.preventDefault();
+  focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+}
+
+function renderPackageReview(project, review, message = '') {
+  const canPackage = review.materializable !== false && typeof review.token === 'string';
+  state.packageReviewToken = canPackage ? review.token : null;
 
   $('#modal-project-name').textContent = project.name;
   const hasFigmaContext = projectHasFigmaContext(project);
@@ -956,12 +1183,21 @@ function showPackageModal() {
   if (presentationReminder) {
     presentationReminder.classList.toggle('hidden', !isPresentationWorkflow(project));
   }
+  const reviewMessage = $('#modal-package-review-message');
+  if (reviewMessage) {
+    const visibleMessage = message || review.message || '';
+    reviewMessage.textContent = visibleMessage;
+    reviewMessage.classList.toggle('hidden', !visibleMessage);
+  }
+  const confirmButton = $('#btn-confirm-package');
+  if (confirmButton) confirmButton.disabled = !canPackage;
 
   // File list
   const fileListEl = $('#modal-file-list');
   fileListEl.innerHTML = '';
 
-  const visibleFiles = project.files.slice(0, 4);
+  const reviewFiles = Array.isArray(review.files) ? review.files : [];
+  const visibleFiles = reviewFiles.slice(0, 4);
   for (const file of visibleFiles) {
     const item = document.createElement('div');
     item.className = 'modal-file-item';
@@ -970,24 +1206,89 @@ function showPackageModal() {
     fileListEl.appendChild(item);
   }
 
-  if (project.files.length > 4) {
+  if (reviewFiles.length > 4) {
     const more = document.createElement('div');
     more.className = 'modal-file-item';
     more.style.color = '#9ca3af';
     more.style.fontSize = '11px';
     more.style.paddingTop = '6px';
-    more.textContent = `+ ${project.files.length - 4} more files \u00B7 ${project.files.length} total`;
+    more.textContent = `+ ${reviewFiles.length - 4} more files \u00B7 ${reviewFiles.length} total`;
     fileListEl.appendChild(more);
   }
 
   // Folder name preview
   const folderName = resolveNamingTemplate(state.settings.namingTemplate, project.name);
-  $('#modal-folder-name').textContent = folderName;
+  $('#modal-folder-name').textContent = review.folderName || folderName;
 
   // Destination
   $('#modal-dest-path').textContent = state.packageOutputPath || '~/Desktop/';
 
-  $('#modal-package').classList.remove('hidden');
+  openPackageReviewDialog();
+}
+
+function createUnavailableRendererReview(project, message) {
+  return {
+    projectId: project?.id || state.selectedProjectId,
+    files: (project?.files || []).map(file => ({
+      name: typeof file?.name === 'string' && file.name ? file.name : 'Unavailable file',
+      status: 'unavailable',
+    })),
+    totalFiles: Array.isArray(project?.files) ? project.files.length : 0,
+    materializable: false,
+    message,
+  };
+}
+
+function getPackageReviewRecoveryMessage(error) {
+  if (error === 'package_review_changed') return PACKAGE_REVIEW_CHANGED_MESSAGE;
+  if (error === 'package_review_unavailable') return PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
+  return PACKAGE_REVIEW_RECOVERY_MESSAGE;
+}
+
+async function showPackageModal({
+  message = '',
+  runPreScan = true,
+  review: suppliedReview = null,
+  outputPath: reviewedOutputPath,
+} = {}) {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return false;
+  if (!packageReviewOpener && !packageReviewConfirmationInFlight) {
+    packageReviewOpener = document.activeElement || null;
+  }
+  state.packageReviewToken = null;
+  let project = state.projects.find(item => item.id === projectId) || null;
+
+  try {
+    if (runPreScan) {
+      await Promise.race([
+        window.crate.preScanSession(projectId),
+        new Promise(resolve => setTimeout(() => resolve(null), 12000))
+      ]);
+    }
+
+    const review = suppliedReview || await (
+      reviewedOutputPath === undefined
+        ? window.crate.preparePackageReview(projectId)
+        : window.crate.preparePackageReview(projectId, reviewedOutputPath)
+    );
+    if (!review || review.error) {
+      const failureMessage = message || getPackageReviewRecoveryMessage(review?.error || 'package_review_unavailable');
+      renderPackageReview(project, createUnavailableRendererReview(project, failureMessage), failureMessage);
+      return false;
+    }
+
+    state.projects = await window.crate.getProjects();
+    project = state.projects.find(item => item.id === projectId) || project;
+    if (!project) return false;
+    renderPackageReview(project, review, message);
+    return true;
+  } catch (error) {
+    logRendererError('Package Review recovery failed', error);
+    const failureMessage = message || PACKAGE_REVIEW_RECOVERY_MESSAGE;
+    if (project) renderPackageReview(project, createUnavailableRendererReview(project, failureMessage), failureMessage);
+    return false;
+  }
 }
 
 function formatFileCount(count, singular = 'file', plural = 'files') {
@@ -1049,60 +1350,88 @@ function renderPackageDetails(result) {
 
 async function confirmPackage() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
-  if (!project) return;
+  const confirmButton = $('#btn-confirm-package');
+  if (!project || !state.packageReviewToken || confirmButton?.disabled) return;
 
-  $('#modal-package').classList.add('hidden');
+  const reviewToken = state.packageReviewToken;
+  if (confirmButton) confirmButton.disabled = true;
+  packageReviewConfirmationInFlight = true;
+  try {
+    hidePackageReviewDialog({ preserveOpener: true });
 
-  // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
-  let outputPath = state.packageOutputPath;
-  if (!outputPath) {
-    outputPath = await window.crate.selectOutputFolder();
+    // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
+    let outputPath = state.packageOutputPath;
     if (!outputPath) {
+      outputPath = await window.crate.selectOutputFolder();
+      if (!outputPath) {
+        openPackageReviewDialog();
+        return;
+      }
+      state.packageOutputPath = outputPath;
+    }
+
+    showPackageProgressModal();
+    const scanResult = await Promise.race([
+      window.crate.preScanSession(project.id),
+      new Promise(resolve => setTimeout(() => resolve(null), 12000))
+    ]);
+    if (scanResult) state.projects = await window.crate.getProjects();
+
+    state.packageReviewToken = null;
+    const result = await window.crate.packageProject(project.id, outputPath, reviewToken);
+    if (!result || result.error) {
+      const typedError = result?.error || 'package_failed';
+      if (typedError === 'limit_reached') {
+        state.packageReviewToken = null;
+        const opener = hidePackageReviewDialog();
+        $('#modal-progress').classList.add('hidden');
+        showPackageLimitModal(result, opener);
+        return;
+      }
+      const suppliedReview = typedError === 'package_review_changed' ? result?.review || null : null;
+      const destinationReviewRequired = !suppliedReview && (
+        typedError === 'package_output_changed' || result?.reason === 'package_destination_changed'
+      );
+      const recoveryMessage = suppliedReview?.materializable === false
+        ? suppliedReview.message || PACKAGE_REVIEW_UNAVAILABLE_MESSAGE
+        : getPackageReviewRecoveryMessage(typedError);
+      hidePackageProgressModal();
+      await showPackageModal({
+        message: recoveryMessage,
+        runPreScan: false,
+        review: suppliedReview,
+        outputPath: destinationReviewRequired ? outputPath : undefined,
+      });
       return;
     }
-    state.packageOutputPath = outputPath;
+
+    const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
+    $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
+    $('#success-path').textContent = result.folderPath;
+    renderPackageDetails(result);
+    state.lastPackagedPath = result.folderPath;
+    hidePackageProgressModal();
+    hidePackageReviewDialog({ preserveOpener: true });
+    showPackageSuccessModal();
+
+    try {
+      state.projects = await window.crate.getProjects();
+      state.usage = await window.crate.getUsage();
+      renderFiles();
+      renderFooter();
+    } catch (refreshError) {
+      logRendererError('Package completed, but the project summary could not refresh', refreshError);
+    }
+  } catch (error) {
+    logRendererError('Package Review confirmation failed', error);
+    state.packageReviewToken = null;
+    hidePackageProgressModal();
+    await showPackageModal({ message: PACKAGE_REVIEW_RECOVERY_MESSAGE, runPreScan: false });
+  } finally {
+    packageReviewConfirmationInFlight = false;
+    hidePackageProgressModal();
+    if (confirmButton) confirmButton.disabled = !state.packageReviewToken;
   }
-
-  // Now show progress — user has confirmed a destination
-  $('#modal-progress').classList.remove('hidden');
-
-  // Run pre-scan now (user already confirmed, progress spinner is showing)
-  // FIX 2 (C2): Increased timeout from 5s to 12s to accommodate scan + package coordination
-  const scanResult = await Promise.race([
-    window.crate.preScanSession(project.id),
-    new Promise(resolve => setTimeout(() => resolve(null), 12000))
-  ]);
-  if (scanResult) {
-    state.projects = await window.crate.getProjects();
-  }
-
-  const result = await window.crate.packageProject(project.id, outputPath);
-
-  $('#modal-progress').classList.add('hidden');
-
-  if (result.error === 'limit_reached') {
-    showPackageLimitModal(result);
-    return;
-  }
-
-  if (result.error) {
-    alert('Error packaging: ' + result.error);
-    return;
-  }
-
-  // Show success — v2.5.0: final accurate count shown only after packaging
-  const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-  $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
-  $('#success-path').textContent = result.folderPath;
-  renderPackageDetails(result);
-  state.lastPackagedPath = result.folderPath;
-  $('#modal-success').classList.remove('hidden');
-
-  // Refresh data
-  state.projects = await window.crate.getProjects();
-  state.usage = await window.crate.getUsage();
-  renderFiles();
-  renderFooter();
 }
 
 // ===== Delete Project =====
@@ -1201,13 +1530,12 @@ function setupEventListeners() {
       const ok = confirm('This project was already packaged. Package again?');
       if (!ok) return;
     }
-    showPackageModal();
+    await showPackageModal();
   });
 
   // Package modal
-  $('#btn-cancel-package').addEventListener('click', () => {
-    $('#modal-package').classList.add('hidden');
-  });
+  $('#btn-cancel-package').addEventListener('click', cancelPackageReview);
+  $('#modal-package').addEventListener('keydown', handlePackageReviewKeydown);
 
   $('#btn-confirm-package').addEventListener('click', confirmPackage);
 
@@ -1220,23 +1548,17 @@ function setupEventListeners() {
   });
 
   // Success modal
-  $('#btn-success-done').addEventListener('click', () => {
-    $('#modal-success').classList.add('hidden');
-    switchTab('projects');
-  });
+  $('#btn-success-done').addEventListener('click', hidePackageSuccessModal);
 
   $('#btn-open-folder').addEventListener('click', () => {
     if (state.lastPackagedPath) {
       window.crate.openFolder(state.lastPackagedPath);
     }
-    $('#modal-success').classList.add('hidden');
-    switchTab('projects');
+    hidePackageSuccessModal();
   });
 
   // Upgrade modal
-  $('#btn-dismiss-upgrade').addEventListener('click', () => {
-    $('#modal-upgrade').classList.add('hidden');
-  });
+  $('#btn-dismiss-upgrade').addEventListener('click', hidePackageLimitModal);
 
   // Settings
   $('#input-naming-template').addEventListener('input', updateSettingsNamingPreview);
@@ -1571,53 +1893,12 @@ function setupMainProcessListeners() {
     });
   });
 
-  // Handle "Package Now" from inactivity dialog
-  // FIX 5 (H4): Run pre-scan before packaging, handle errors, show progress/success modals
+  // Notification-triggered packaging still requires the same authoritative review.
   window.crate.onPackageTrigger(async (data) => {
     const project = state.projects.find(p => p.id === data.projectId);
     if (project) {
       state.selectedProjectId = data.projectId;
-      const outputPath = await window.crate.selectOutputFolder();
-      if (outputPath) {
-        $('#modal-progress').classList.remove('hidden');
-
-        // Run pre-scan with 12s timeout (same as confirmPackage)
-        const scanResult = await Promise.race([
-          window.crate.preScanSession(data.projectId),
-          new Promise(resolve => setTimeout(() => resolve(null), 12000))
-        ]);
-        if (scanResult) {
-          state.projects = await window.crate.getProjects();
-        }
-
-        const result = await window.crate.packageProject(data.projectId, outputPath);
-
-        $('#modal-progress').classList.add('hidden');
-
-        if (result.error === 'limit_reached') {
-          showPackageLimitModal(result);
-          return;
-        }
-
-        if (result.error) {
-          alert('Error packaging: ' + result.error);
-          return;
-        }
-
-        // Show success — v2.5.0: final accurate count
-        const totalPackaged = (result.copiedCount || 0) + (result.embeddedCount || 0);
-        $('#success-message').textContent = `${totalPackaged} file${totalPackaged !== 1 ? 's' : ''} packaged. Your project is ready to archive or hand off.`;
-        $('#success-path').textContent = result.folderPath;
-        renderPackageDetails(result);
-        state.lastPackagedPath = result.folderPath;
-        $('#modal-success').classList.remove('hidden');
-
-        state.projects = await window.crate.getProjects();
-        state.usage = await window.crate.getUsage();
-        renderProjects();
-        renderFiles();
-        renderFooter();
-      }
+      await showPackageModal();
     }
   });
 

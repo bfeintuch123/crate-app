@@ -196,10 +196,11 @@ class PowerPointParser extends BaseParser {
   async extractAssets(filePath, options = {}) {
     const ext = path.extname(filePath).toLowerCase();
     const assets = [];
+    if (ext === '.ppt') return assets;
 
     // Determine which folder to look in
-    const mediaPrefix = (ext === '.pptx' || ext === '.ppt') ? 'ppt/media/' : 'Data/';
-    const sourceType = (ext === '.pptx' || ext === '.ppt') ? 'pptx-embedded' : 'keynote-embedded';
+    const mediaPrefix = ext === '.pptx' ? 'ppt/media/' : 'Data/';
+    const sourceType = ext === '.pptx' ? 'pptx-embedded' : 'keynote-embedded';
 
     assertFileWithinBudget(
       filePath,
@@ -299,6 +300,7 @@ class PowerPointParser extends BaseParser {
    */
   async extractToDirectory(archivePath, destDir, assets, options = {}) {
     const ext = path.extname(archivePath).toLowerCase();
+    if (ext === '.ppt') return [];
     const baseName = path.basename(archivePath, ext);
     const extracted = [];
     const seenPowerPointMedia = new Set();
@@ -330,7 +332,7 @@ class PowerPointParser extends BaseParser {
           if (extractedBytes > ADMISSION_LIMITS.presentationMediaBytes) {
             throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
           }
-          if (ext === '.pptx' || ext === '.ppt') {
+          if (ext === '.pptx') {
             const hash = crypto.createHash('md5').update(data).digest('hex');
             const fingerprint = `${data.length}:${hash}`;
             if (seenPowerPointMedia.has(fingerprint)) continue;

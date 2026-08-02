@@ -12,6 +12,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
 const { promisify: nodePromisify } = require('util');
 const {
   EDGE_TYPES,
@@ -519,11 +520,13 @@ function runLocalStoreStartupProbe(mode) {
   return JSON.parse(marker.slice('CRATE_LOCAL_STORE_PROBE_RESULT='.length));
 }
 
-async function callIpc(channel, ...args) {
+async function callIpcRaw(channel, ...args) {
   const fn = ipcHandlers.get(channel);
   if (!fn) throw new Error(`No IPC handler registered for ${channel}`);
   return fn({ sender: existingRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
+
+const callIpc = createAutomaticPackageReviewCaller(callIpcRaw);
 
 async function getActiveFigmaPollerCount() {
   const status = await callIpc('figma:status');

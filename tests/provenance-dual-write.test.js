@@ -7,8 +7,10 @@ const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
+const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
 const packageJson = require('../package.json');
 const helperPlistPatch = require('../scripts/patch-helper-info-plists');
+const { packageCollisionKey } = require('../parsers/package-safety');
 
 const {
   NODE_TYPES,
@@ -254,6 +256,7 @@ class FakeStore {
 setStub('electron-store', () => FakeStore);
 
 const watcherRecords = [];
+let watcherCloseCount = 0;
 let testUuidCounter = 0;
 setStub('chokidar', () => ({
   watch: () => {
@@ -263,7 +266,7 @@ setStub('chokidar', () => ({
         handlers[eventName] = handler;
         return watcher;
       },
-      close() {},
+      close() { watcherCloseCount += 1; },
       add() {},
       unwatch() {},
     };
@@ -438,7 +441,12 @@ setStub('child_process', () => ({
 }));
 
 let currentPsdFixture = { children: [], linkedFiles: [] };
-setStub('ag-psd', () => ({ readPsd: () => currentPsdFixture }));
+setStub('ag-psd', () => ({
+  readPsd: () => {
+    if (currentPsdFixture instanceof Error) throw currentPsdFixture;
+    return currentPsdFixture;
+  },
+}));
 setStub('crypto', () => ({
   ...crypto,
   randomUUID: () => `00000000-0000-4000-8000-${String(++testUuidCounter).padStart(12, '0')}`,
@@ -446,11 +454,13 @@ setStub('crypto', () => ({
 
 require(path.resolve(__dirname, '..', 'main.js'));
 
-async function callIpc(channel, ...args) {
+async function callIpcRaw(channel, ...args) {
   const handler = ipcHandlers.get(channel);
   if (!handler) throw new Error(`No IPC handler registered for ${channel}`);
   return handler({ sender: trustedRendererWindow.webContents, senderFrame: trustedRendererMainFrame }, ...args);
 }
+
+const callIpc = createAutomaticPackageReviewCaller(callIpcRaw);
 
 async function createProject(name = 'Provenance Dual Write') {
   return callIpc('projects:create', name, 'branding', 'current-page', null);
@@ -881,9 +891,26 @@ function assertPackageResultShape(result) {
   ]);
 }
 
+function getPrivateStagedPackageRoot(filePath, outputDir) {
+  const outputRoot = path.resolve(outputDir);
+  for (const stagingParent of [path.dirname(outputRoot), outputRoot]) {
+    const relative = path.relative(stagingParent, path.resolve(filePath));
+    if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    const [stagingName, ...rest] = relative.split(path.sep);
+    if (!stagingName.startsWith('.crate-package-staging-') || !rest.length) continue;
+    return path.join(stagingParent, stagingName);
+  }
+  return null;
+}
+
+function isExpectedStagedPackageWrite(filePath, outputDir, outputName) {
+  return !!getPrivateStagedPackageRoot(filePath, outputDir) && path.basename(filePath) === outputName;
+}
+
 async function assertPackageActivationDriftFailsClosed(scenario, mutateActivation) {
   const tmpRoot = makeTempDir();
   const originalWriteFile = fs.promises.writeFile;
+  let releaseWrite = () => {};
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
     const project = await createProject(`Package drift ${scenario}`);
@@ -916,7 +943,6 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     });
     const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
     const packagePath = packageFolder(outputDir, `Package drift ${scenario}`);
-    let releaseWrite;
     let markWriteStarted;
     let deferred = true;
     const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
@@ -924,7 +950,7 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     fs.promises.writeFile = async function deferredPackageWrite(filePath, ...args) {
       if (
         deferred &&
-        path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)
+        isExpectedStagedPackageWrite(filePath, outputDir, `${scenario}.png`)
       ) {
         deferred = false;
         markWriteStarted();
@@ -963,6 +989,7 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
       false
     );
   } finally {
+    releaseWrite();
     fs.promises.writeFile = originalWriteFile;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1003,10 +1030,12 @@ async function assertPackageScopePollBehavior(semanticChange) {
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const packagePath = packageFolder(outputDir, `Package ${label}`);
     let markWriteStarted;
+    let deferred = true;
     const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
     const writeGate = new Promise(resolve => { releaseWrite = resolve; });
     fs.promises.writeFile = async function deferredScopeWrite(filePath, ...args) {
-      if (path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)) {
+      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'scope-poll.png')) {
+        deferred = false;
         markWriteStarted();
         await writeGate;
       }
@@ -1014,7 +1043,11 @@ async function assertPackageScopePollBehavior(semanticChange) {
     };
 
     const packagePromise = callIpc('projects:package', project.id, outputDir);
-    await writeStarted;
+    const firstResult = await Promise.race([
+      writeStarted.then(() => null),
+      packagePromise,
+    ]);
+    assert.equal(firstResult, null, `package completed before deferred write: ${JSON.stringify(firstResult)}`);
     setChildProcessHandler(({ kind, command, args }) => {
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '753\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
@@ -1139,7 +1172,7 @@ async function assertStalePsdExtractionLeavesNoInvocationFiles(scenario) {
 async function assertPackageRootReplacementFailsClosed(lane, replacement) {
   resetTestHomeWorkspace();
   const tmpRoot = makeTempDir();
-  const originalReadFile = fs.promises.readFile;
+  const originalWriteFile = fs.promises.writeFile;
   let releaseWrite = () => {};
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
@@ -1147,8 +1180,8 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
     const project = await createProject(projectName);
     const outputDir = path.join(tmpRoot, 'out');
     const packagePath = packageFolder(outputDir, projectName);
-    const movedRoot = path.join(outputDir, 'moved-package-root');
-    const replacementRoot = path.join(outputDir, 'replacement-target');
+    const movedRoot = path.join(tmpRoot, 'moved-output-root');
+    const replacementRoot = path.join(tmpRoot, 'replacement-target');
     const regularPath = path.join(tmpRoot, 'already-copied.txt');
     fs.mkdirSync(outputDir);
     fs.writeFileSync(regularPath, 'transaction-owned copy');
@@ -1182,12 +1215,17 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
         embeddedIndex: 0,
         fileId: 'deferred-root-embedded',
       });
-      fs.promises.readFile = async function deferredPsdRead(filePath, ...args) {
-        if (path.resolve(filePath) === path.resolve(parentPsd)) {
-          markWriteStarted();
+      let deferred = true;
+      fs.promises.writeFile = async function deferredPsdWrite(filePath, ...args) {
+        const stagingRoot = getPrivateStagedPackageRoot(filePath, outputDir);
+        if (deferred && stagingRoot && path.basename(filePath) === 'deferred.png') {
+          deferred = false;
+          await originalWriteFile.call(fs.promises, filePath, ...args);
+          markWriteStarted(stagingRoot);
           await writeGate;
+          return;
         }
-        return originalReadFile.call(fs.promises, filePath, ...args);
+        return originalWriteFile.call(fs.promises, filePath, ...args);
       };
       setChildProcessHandler(() => ({ stdout: '' }));
     } else {
@@ -1213,8 +1251,12 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
           };
         }
         if (kind === 'execFile' && command === '/usr/bin/unzip' && args[0] === '-p') {
-          markWriteStarted();
-          return writeGate.then(() => ({ stdout: Buffer.from('presentation transaction bytes') }));
+          const stagingRoot = getPrivateStagedPackageRoot(args[1], outputDir);
+          if (stagingRoot) {
+            markWriteStarted(stagingRoot);
+            return writeGate.then(() => ({ stdout: Buffer.from('presentation transaction bytes') }));
+          }
+          return { stdout: Buffer.from('presentation transaction bytes') };
         }
         return { stdout: '' };
       });
@@ -1223,23 +1265,38 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
 
     const packagePromise = callIpc('projects:package', project.id, outputDir);
-    await writeStarted;
-    fs.renameSync(packagePath, movedRoot);
+    const boundary = await Promise.race([
+      writeStarted.then(stagingRoot => ({ stagingRoot })),
+      packagePromise.then(result => ({ result })),
+    ]);
+    assert.ok(boundary.stagingRoot, `package completed before deferred staging boundary: ${JSON.stringify(boundary.result)}`);
+    const stagingRoot = boundary.stagingRoot;
+    assert.equal(path.dirname(stagingRoot), path.dirname(outputDir));
+    assertOwnerOnlyMode(stagingRoot, 0o700);
+    fs.renameSync(outputDir, movedRoot);
     if (replacement === 'symlink') {
       fs.mkdirSync(replacementRoot);
-      fs.symlinkSync(replacementRoot, packagePath, 'dir');
+      fs.symlinkSync(replacementRoot, outputDir, 'dir');
     } else {
-      fs.mkdirSync(packagePath);
+      fs.mkdirSync(outputDir);
     }
     testRendererEvents.length = 0;
     releaseWrite();
     const result = await packagePromise;
 
     assert.deepEqual(result, { error: 'package_output_changed' });
-    for (const root of [packagePath, movedRoot, replacementRoot]) {
+    const movedPackagePath = path.join(movedRoot, path.basename(packagePath));
+    const replacementPackagePath = path.join(replacementRoot, path.basename(packagePath));
+    for (const root of [packagePath, movedPackagePath, replacementPackagePath, stagingRoot]) {
       for (const fileName of ['already-copied.txt', 'deferred.png', 'Deck.pptx', 'Deck — image1.png']) {
         assert.equal(fs.existsSync(path.join(root, fileName)), false, `${root}/${fileName} must be absent`);
       }
+    }
+    assert.equal(fs.readdirSync(movedRoot).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.equal(fs.readdirSync(outputDir).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.equal(fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-')), false);
+    if (fs.existsSync(replacementRoot)) {
+      assert.equal(fs.readdirSync(replacementRoot).some(name => name.startsWith('.crate-package-staging-')), false);
     }
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
     assert.equal(getProvenanceEdges(stored, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 0);
@@ -1249,7 +1306,7 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
     assert.equal(stored.outputPath == null, true);
     assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
   } finally {
-    fs.promises.readFile = originalReadFile;
+    fs.promises.writeFile = originalWriteFile;
     releaseWrite();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1745,6 +1802,7 @@ test.afterEach(async () => {
   testMainWindowShowCount = 0;
   testNotifications.length = 0;
   watcherRecords.length = 0;
+  watcherCloseCount = 0;
   testUuidCounter = 0;
   clearTrackedTimers();
 });
@@ -2899,6 +2957,1531 @@ test('normal project package still consumes package quota after success', async 
   }
 });
 
+test('unchanged reviewed manifest packages exactly the reviewed files', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Reviewed Manifest Unchanged');
+    const sourcePath = path.join(tmpRoot, 'Review_Project.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed source bytes');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Review_Project.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files, [{ name: 'Review_Project.ai', ext: '.ai', embedded: false }]);
+    assert.equal(JSON.stringify(review).includes(tmpRoot), false);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.totalFiles, 1);
+    assertOwnerOnlyMode(result.folderPath, 0o700);
+    assertOwnerOnlyMode(path.join(result.folderPath, 'Review_Project.ai'), 0o600);
+    assert.equal(
+      fs.readFileSync(path.join(packageFolder(outputDir, project.name), 'Review_Project.ai'), 'utf8'),
+      'reviewed source bytes'
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('unmaterializable reviews expose safe status without tokens and recover after sources return', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Unavailable Package Review');
+    const sourcePath = path.join(tmpRoot, 'Missing.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Missing.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+
+    const initiallyMissing = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(initiallyMissing.files, [{ name: 'Missing.ai', status: 'missing' }]);
+    assert.equal(initiallyMissing.materializable, false);
+    assert.equal(initiallyMissing.token, undefined);
+    assert.equal(JSON.stringify(initiallyMissing).includes(tmpRoot), false);
+
+    fs.writeFileSync(sourcePath, 'recovered source');
+    const recovered = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(recovered.materializable, true);
+    assert.equal(typeof recovered.token, 'string');
+
+    fs.unlinkSync(sourcePath);
+    const disappeared = await callIpcRaw('projects:package', project.id, outputDir, recovered.token);
+    assert.equal(disappeared.error, 'package_review_changed');
+    assert.equal(disappeared.review.materializable, false);
+    assert.equal(disappeared.review.token, undefined);
+    assert.deepEqual(disappeared.review.files, [{ name: 'Missing.ai', status: 'missing' }]);
+    assert.equal((await callIpcRaw('projects:package', project.id, outputDir, disappeared.review.token)).error, 'package_review_required');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    const stillMissing = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(stillMissing.materializable, false);
+    assert.equal(stillMissing.token, undefined);
+
+    fs.writeFileSync(sourcePath, 'recovered again');
+    const fresh = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(fresh.materializable, true);
+    assert.equal(typeof fresh.token, 'string');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('unsupported virtual entries are reviewable by safe name but cannot issue a token', async () => {
+  const project = await createProject('Unsupported Virtual Review');
+  await setProjectFiles(project.id, { files: [{
+    name: 'Virtual.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+  }] });
+
+  const review = await callIpcRaw('projects:prepare-package-review', project.id);
+  assert.deepEqual(review.files, [{ name: 'Virtual.ai', status: 'unmaterializable' }]);
+  assert.equal(review.materializable, false);
+  assert.equal(review.token, undefined);
+  await callIpcRaw('projects:delete', project.id);
+});
+
+test('authoritative plan binds reviewed sources, PSD and presentation derivatives, diagnostics, and collisions', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Authoritative Package Plan');
+    const sourcePath = path.join(tmpRoot, 'reviewed-source.png');
+    const deckPath = path.join(tmpRoot, 'Deck.pptx');
+    const parentPsd = path.join(tmpRoot, 'Parent.psd');
+    const unrelatedPath = path.join(tmpRoot, 'Unrelated.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('reviewed source bytes'));
+    fs.writeFileSync(deckPath, Buffer.from('presentation container bytes'));
+    fs.writeFileSync(parentPsd, Buffer.from('PSD container bytes'));
+    fs.writeFileSync(unrelatedPath, Buffer.from('unrelated bytes'));
+    currentPsdFixture = { children: [], linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('PSD derived bytes') }] };
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: Buffer.from('PRESENTATION_DERIVED_BYTES'.repeat(40)),
+    }]);
+    await setProjectFiles(project.id, { files: [
+      { path: sourcePath, name: 'Deck — image1.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      { path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse' },
+      {
+        path: parentPsd, parentPsd, name: 'Deck — image1.png', ext: '.png', source: 'scan-on-save-embedded',
+        embedded: true, embeddedOriginalName: 'Embedded.png', embeddedIndex: 0, fileId: 'plan-psd-resource',
+      },
+    ] });
+
+    await callIpc('settings:update', 'includeDiagnosticReport', false);
+    const firstReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(firstReview.planSummary, {
+      reviewedSourceInputCount: 2,
+      visibleDerivedDesignCount: 1,
+      derivedDesignGeneratorCount: 1,
+      diagnosticsMetadataIncluded: false,
+    });
+    assert.equal(JSON.stringify(firstReview).includes(tmpRoot), false);
+    assert.equal(JSON.stringify(firstReview).includes('Unrelated.ai'), false);
+
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, firstReview.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.equal(changed.review.planSummary.diagnosticsMetadataIncluded, true);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, changed.review.token);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 3);
+    assert.equal(result.embeddedCount, 1);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'Crate Diagnostics', 'Deck — image1.png', 'Deck — image1_1.png', 'Deck — image1_2.png', 'Deck.pptx',
+    ]);
+    assertOwnerOnlyMode(result.folderPath, 0o700);
+    assertOwnerOnlyMode(path.join(result.folderPath, 'Crate Diagnostics'), 0o700);
+    assertOwnerOnlyMode(path.join(result.folderPath, 'Crate Diagnostics', 'crate-provenance.json'), 0o600);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1.png'), 'utf8'), 'reviewed source bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1_1.png'), 'utf8'), 'PSD derived bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1_2.png'), 'utf8'), 'PRESENTATION_DERIVED_BYTES'.repeat(40));
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Unrelated.ai')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package plan resolves case, Unicode, and diagnostics collisions with one macOS-safe identity', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('macOS Collision Plan');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    const names = [
+      'Logo.png',
+      'logo.png',
+      'Cafe\u0301.png',
+      'Caf\u00e9.png',
+      'crate diagnostics',
+      '\u03A3.png',
+      '\u03C2.png',
+      `${'\u754C'.repeat(100)}.png`,
+    ];
+    const files = names.map((name, index) => {
+      const sourceDir = path.join(tmpRoot, `source-${index}`);
+      const sourcePath = path.join(sourceDir, `input-${index}`);
+      fs.mkdirSync(sourceDir);
+      fs.writeFileSync(sourcePath, `bytes-${index}`);
+      return { path: sourcePath, name, ext: path.extname(name), addedAt: Date.now(), source: 'manual-browse' };
+    });
+    await setProjectFiles(project.id, { files });
+    await callIpc('settings:update', 'includeDiagnosticReport', true);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    const outputNames = fs.readdirSync(result.folderPath).sort();
+    const fixedOutputNames = [
+      'Cafe\u0301.png',
+      'Caf\u00e9_1.png',
+      'Crate Diagnostics',
+      'Logo.png',
+      'crate diagnostics_1',
+      'logo_1.png',
+      '\u03A3.png',
+      '\u03C2_1.png',
+    ];
+    fixedOutputNames.forEach(name => assert.equal(outputNames.includes(name), true, `${name} must be materialized`));
+    ['Logo.png', 'logo_1.png', 'Cafe\u0301.png', 'Caf\u00e9_1.png', 'crate diagnostics_1', '\u03A3.png', '\u03C2_1.png']
+      .forEach((name, index) => assert.equal(fs.readFileSync(path.join(result.folderPath, name), 'utf8'), `bytes-${index}`));
+    const multibyteName = outputNames.find(name => name.startsWith('\u754C'));
+    assert.ok(multibyteName);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, multibyteName), 'utf8'), 'bytes-7');
+    assert.equal(outputNames.length, 9);
+    assert.equal(new Set(outputNames.map(packageCollisionKey)).size, outputNames.length);
+    for (const name of outputNames) {
+      assert.ok(name.length <= 180);
+      assert.ok(Buffer.byteLength(name, 'utf8') <= 255);
+      assert.equal(name.includes('\uFFFD'), false);
+      assert.equal(/[\uD800-\uDFFF]/u.test(name), false);
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination collisions refresh the reviewed folder name before publishing', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Bound Destination Collision');
+    const sourcePath = path.join(tmpRoot, 'Bound.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'bound destination bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Bound.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    fs.mkdirSync(path.join(outputDir, review.folderName));
+    const before = capturePackageSideEffects(stored);
+    testRendererEvents.length = 0;
+
+    const refreshed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(refreshed.error, 'package_review_changed');
+    assert.equal(refreshed.reason, 'package_destination_changed');
+    assert.equal(refreshed.review.folderName, `${review.folderName}_1`);
+    assert.equal(fs.existsSync(path.join(outputDir, refreshed.review.folderName)), false);
+    assert.equal(fs.readdirSync(outputDir).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, refreshed.review.token);
+    assert.equal(result.success, true);
+    assert.equal(path.basename(result.folderPath), refreshed.review.folderName);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'Bound.ai'), 'utf8'), 'bound destination bytes');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination occupancy drift refreshes again with zero package side effects', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Bound Destination Drift');
+    const sourcePath = path.join(tmpRoot, 'Drift.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'destination drift bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Drift.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    fs.mkdirSync(path.join(outputDir, review.folderName));
+    const firstRefresh = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(firstRefresh.review.folderName, `${review.folderName}_1`);
+    fs.mkdirSync(path.join(outputDir, firstRefresh.review.folderName));
+    const before = capturePackageSideEffects(stored);
+    testRendererEvents.length = 0;
+
+    const secondRefresh = await callIpcRaw('projects:package', project.id, outputDir, firstRefresh.review.token);
+
+    assert.equal(secondRefresh.error, 'package_review_changed');
+    assert.equal(secondRefresh.reason, 'package_destination_changed');
+    assert.equal(secondRefresh.review.folderName, `${review.folderName}_2`);
+    assert.equal(fs.existsSync(path.join(outputDir, secondRefresh.review.folderName)), false);
+    assert.equal(fs.readdirSync(outputDir).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('late destination occupancy refreshes once and the second confirmation publishes the bound folder', async () => {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let releaseWrite = () => {};
+  try {
+    const project = await createProject('Late Destination Occupancy');
+    const parentPsd = path.join(tmpRoot, 'Deferred.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(parentPsd, 'reviewed PSD bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Deferred.png', data: Buffer.from('late destination bytes') }],
+    };
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: parentPsd,
+      parentPsd,
+      name: 'Deferred.png',
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-save-embedded',
+      embedded: true,
+      embeddedOriginalName: 'Deferred.png',
+      embeddedIndex: 0,
+      fileId: 'late-destination-occupancy',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    let deferred = true;
+    let markWriteStarted;
+    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
+    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
+    fs.promises.writeFile = async function occupyDestinationDuringStaging(filePath, ...args) {
+      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'Deferred.png')) {
+        deferred = false;
+        await originalWriteFile.call(fs.promises, filePath, ...args);
+        markWriteStarted(getPrivateStagedPackageRoot(filePath, outputDir));
+        await writeGate;
+        return;
+      }
+      return originalWriteFile.call(fs.promises, filePath, ...args);
+    };
+
+    testRendererEvents.length = 0;
+    const firstConfirmation = callIpcRaw('projects:package', project.id, outputDir, review.token);
+    const stagingRoot = await writeStarted;
+    const occupiedFolder = path.join(outputDir, review.folderName);
+    fs.mkdirSync(occupiedFolder);
+    releaseWrite();
+    const refreshed = await firstConfirmation;
+    fs.promises.writeFile = originalWriteFile;
+
+    assert.equal(refreshed.error, 'package_review_changed');
+    assert.equal(refreshed.reason, 'package_destination_changed');
+    assert.equal(refreshed.review.folderName, `${review.folderName}_1`);
+    assert.equal(typeof refreshed.review.token, 'string');
+    assert.equal(fs.existsSync(stagingRoot), false);
+    assert.equal(fs.existsSync(path.join(outputDir, refreshed.review.folderName)), false);
+    assert.deepEqual(fs.readdirSync(occupiedFolder), []);
+    assert.equal(fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+
+    const packaged = await callIpcRaw('projects:package', project.id, outputDir, refreshed.review.token);
+    assert.equal(packaged.success, true);
+    assert.equal(path.basename(packaged.folderPath), refreshed.review.folderName);
+    assert.equal(
+      fs.readFileSync(path.join(packaged.folderPath, 'Deferred.png'), 'utf8'),
+      'late destination bytes'
+    );
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    releaseWrite();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Package Review allocates near-limit duplicate filenames through the 9-to-10 transition', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    for (const extensionLength of [177, 178, 179]) {
+      const project = await createProject(`Long Extension ${extensionLength}`);
+      const outputDir = path.join(tmpRoot, `out-${extensionLength}`);
+      const rawName = `${'p'.repeat(179)}.${'z'.repeat(extensionLength)}`;
+      fs.mkdirSync(outputDir);
+      const files = Array.from({ length: 11 }, (_, index) => {
+        const sourcePath = path.join(tmpRoot, `source-${extensionLength}-${index}.bin`);
+        fs.writeFileSync(sourcePath, `${extensionLength}-${index}`);
+        return {
+          path: sourcePath,
+          name: rawName,
+          ext: `.${'z'.repeat(extensionLength)}`,
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        };
+      });
+      await setProjectFiles(project.id, { files });
+
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.materializable, true);
+      assert.equal(review.totalFiles, 11);
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+      assert.equal(result.success, true);
+      const outputNames = fs.readdirSync(result.folderPath);
+      assert.equal(outputNames.length, 11);
+      assert.equal(new Set(outputNames.map(packageCollisionKey)).size, 11);
+      assert.ok(outputNames.every(name => name.length <= 180));
+      assert.ok(outputNames.some(name => /_9\./.test(name)));
+      assert.ok(outputNames.some(name => /_10\./.test(name)));
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('long destination folder collisions reserve suffix width through 9 to 10', async () => {
+  const tmpRoot = makeTempDir();
+  const candidateName = (base, counter) => {
+    if (counter === 0) return base;
+    const suffix = `_${counter}`;
+    return `${base.slice(0, 180 - suffix.length).trimEnd()}${suffix}`;
+  };
+  try {
+    storeInstance.set('settings.namingTemplate', '{Project}');
+    for (const length of [178, 179, 180]) {
+      const projectName = `${String(length)}${'x'.repeat(length - String(length).length)}`;
+      const project = await createProject(projectName);
+      const sourcePath = path.join(tmpRoot, `source-${length}.ai`);
+      const outputDir = path.join(tmpRoot, `out-${length}`);
+      fs.mkdirSync(outputDir);
+      fs.writeFileSync(sourcePath, `source ${length}`);
+      fs.mkdirSync(path.join(outputDir, projectName));
+      await setProjectFiles(project.id, { files: [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }] });
+
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const refreshed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+      assert.equal(refreshed.reason, 'package_destination_changed');
+      assert.equal(refreshed.review.folderName, candidateName(projectName, 1));
+      const result = await callIpcRaw('projects:package', project.id, outputDir, refreshed.review.token);
+      assert.equal(path.basename(result.folderPath), candidateName(projectName, 1));
+      assert.ok(path.basename(result.folderPath).length <= 180);
+    }
+
+    const projectName = `ten${'y'.repeat(177)}`;
+    const project = await createProject(projectName);
+    const sourcePath = path.join(tmpRoot, 'source-ten.ai');
+    const outputDir = path.join(tmpRoot, 'out-ten');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'source ten');
+    const occupiedNames = Array.from({ length: 10 }, (_, counter) => candidateName(projectName, counter));
+    for (const name of occupiedNames) fs.mkdirSync(path.join(outputDir, name));
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const refreshed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(refreshed.reason, 'package_destination_changed');
+    assert.equal(refreshed.review.folderName, candidateName(projectName, 10));
+    const result = await callIpcRaw('projects:package', project.id, outputDir, refreshed.review.token);
+    const allocatedName = path.basename(result.folderPath);
+    assert.equal(allocatedName, candidateName(projectName, 10));
+    assert.equal(new Set([...occupiedNames, allocatedName]).size, 11);
+    assert.ok([...occupiedNames, allocatedName].every(name => name.length <= 180));
+  } finally {
+    storeInstance.set('settings.namingTemplate', '{Project}_{Date}');
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy binary PowerPoint receives a review token and copies without ZIP inspection', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Legacy PowerPoint');
+    const pptPath = path.join(tmpRoot, 'Legacy.ppt');
+    const outputDir = path.join(tmpRoot, 'out');
+    const legacyBytes = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.from('synthetic legacy PowerPoint compound document'),
+    ]);
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(pptPath, legacyBytes);
+    await setProjectFiles(project.id, { files: [{
+      path: pptPath,
+      name: 'Legacy.ppt',
+      ext: '.ppt',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    let unzipCalls = 0;
+    setChildProcessHandler(request => {
+      if (request.command === '/usr/bin/unzip') unzipCalls++;
+      return { stdout: '', stderr: '' };
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.materializable, true);
+    assert.equal(typeof review.token, 'string');
+    assert.deepEqual(review.files.map(file => file.name), ['Legacy.ppt']);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Legacy.ppt')), legacyBytes);
+    assert.equal(unzipCalls, 0);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation derivative plan mismatch refreshes before staging and the refreshed plan packages', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Presentation Plan Equality');
+    const deckPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(deckPath, Buffer.from('stable presentation container'));
+    await setProjectFiles(project.id, { files: [{
+      path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png', data: Buffer.from('REVIEWED_MEDIA_BYTES'.repeat(40)),
+    }]);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png', data: Buffer.from('UPDATED_MEDIA_BYTES!'.repeat(40)),
+    }]);
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, changed.review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.embeddedCount, 1);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1.png'), 'utf8'), 'UPDATED_MEDIA_BYTES!'.repeat(40));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('staged presentation materializer rejects output bytes that do not equal the reviewed plan', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Staged Presentation Plan Mismatch');
+    const deckPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    const reviewedBytes = Buffer.from('REVIEWED_STAGED_MEDIA'.repeat(40));
+    const changedBytes = Buffer.from('CHANGED__STAGED_MEDIA'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(deckPath, Buffer.from('stable presentation container'));
+    let stagedMaterializationReached = false;
+    let stagingRoot = null;
+    await setProjectFiles(project.id, { files: [{
+      path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind !== 'execFile' || command !== '/usr/bin/unzip') return { stdout: '', stderr: '' };
+      if (args[0] === '-l') {
+        return { stdout: `      ${reviewedBytes.length}  05-26-2026 12:34   ppt/media/image1.png\n`, stderr: '' };
+      }
+      if (args[0] === '-p') {
+        const candidateStagingRoot = getPrivateStagedPackageRoot(args[1], outputDir);
+        const stagedContainer = !!candidateStagingRoot;
+        if (stagedContainer) {
+          stagingRoot = candidateStagingRoot;
+          stagedMaterializationReached = true;
+        }
+        return { stdout: stagedContainer ? changedBytes : reviewedBytes, stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const stored = await getProject(project.id);
+    const before = capturePackageSideEffects(stored);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(stagedMaterializationReached, true);
+    assert.equal(changed.error, 'package_review_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assertNoPrivatePackageStaging(outputDir, stagingRoot);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Figma cached source mutation invalidates its reviewed source plan before output', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await callIpc(
+      'projects:create',
+      'Figma Cached Source Plan',
+      'branding',
+      'entire-file',
+      'https://www.figma.com/file/SAFEFILEKEY/Cached-Source'
+    );
+    const cachedPath = path.join(tmpRoot, 'Figma-Cached.png');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(cachedPath, Buffer.from('cached-A'));
+    await setProjectFiles(project.id, { files: [{
+      path: cachedPath, name: 'Figma-Cached.png', ext: '.png', addedAt: Date.now(), source: 'figma-auto',
+      figmaFileKey: 'safe-file-key', figmaPageId: '1:2',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    fs.writeFileSync(cachedPath, Buffer.from('cached-B'));
+
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Beta 2.6 reproduction invalidates an added file and refreshed review packages it only after a second confirmation', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Package Review Reproduction');
+    const outputDir = path.join(tmpRoot, 'out');
+    const sourcePaths = [
+      path.join(tmpRoot, 'Review_Project.ai'),
+      path.join(tmpRoot, 'Review_Initial.png'),
+      path.join(tmpRoot, 'Review_Added_After_Review.png'),
+    ];
+    fs.mkdirSync(outputDir);
+    sourcePaths.forEach((filePath, index) => fs.writeFileSync(filePath, `source-${index}`));
+    const files = sourcePaths.slice(0, 2).map(filePath => ({
+      path: filePath,
+      name: path.basename(filePath),
+      ext: path.extname(filePath).toLowerCase(),
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }));
+    await setProjectFiles(project.id, { files });
+
+    const firstReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(firstReview.totalFiles, 2);
+    const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+    storedProject.files.push({
+      path: sourcePaths[2],
+      name: path.basename(sourcePaths[2]),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    });
+    const before = {
+      status: storedProject.status,
+      outputPath: storedProject.outputPath,
+      provenance: JSON.stringify(storedProject.provenance),
+      quota: storeInstance.get('usage.packagesThisMonth'),
+      watcherCloseCount,
+    };
+
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, firstReview.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.equal(changed.review.totalFiles, 3);
+    assert.deepEqual(changed.review.files.map(file => file.name), sourcePaths.map(filePath => path.basename(filePath)));
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.equal(storedProject.status, before.status);
+    assert.equal(storedProject.outputPath, before.outputPath);
+    assert.equal(JSON.stringify(storedProject.provenance), before.provenance);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), before.quota);
+    assert.equal(watcherCloseCount, before.watcherCloseCount);
+
+    const packaged = await callIpcRaw('projects:package', project.id, outputDir, changed.review.token);
+    assertPackageResultShape(packaged);
+    assert.equal(packaged.success, true);
+    assert.equal(packaged.totalFiles, 3);
+    assert.deepEqual(
+      fs.readdirSync(packageFolder(outputDir, project.name)).sort(),
+      sourcePaths.map(filePath => path.basename(filePath)).sort()
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('removed and renamed reviewed files invalidate before package output', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Removed Renamed Review');
+    const outputDir = path.join(tmpRoot, 'out');
+    const firstPath = path.join(tmpRoot, 'First.ai');
+    const secondPath = path.join(tmpRoot, 'Second.png');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(firstPath, 'first');
+    fs.writeFileSync(secondPath, 'second');
+    await setProjectFiles(project.id, {
+      files: [firstPath, secondPath].map(filePath => ({
+        path: filePath,
+        name: path.basename(filePath),
+        ext: path.extname(filePath).toLowerCase(),
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      })),
+    });
+
+    const removedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+    storedProject.files.pop();
+    const removed = await callIpcRaw('projects:package', project.id, outputDir, removedReview.token);
+    assert.equal(removed.error, 'package_review_changed');
+    assert.equal(removed.review.totalFiles, 1);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+
+    const renamedPath = path.join(tmpRoot, 'Renamed.ai');
+    const renamedReview = removed.review;
+    fs.renameSync(firstPath, renamedPath);
+    storedProject.files[0].path = renamedPath;
+    storedProject.files[0].name = path.basename(renamedPath);
+    const renamed = await callIpcRaw('projects:package', project.id, outputDir, renamedReview.token);
+    assert.equal(renamed.error, 'package_review_changed');
+    assert.deepEqual(renamed.review.files.map(file => file.name), ['Renamed.ai']);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('same-path source modification invalidates the reviewed manifest', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Same Path Review');
+    const sourcePath = path.join(tmpRoot, 'Same.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'before');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Same.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    fs.writeFileSync(sourcePath, 'after-with-different-size');
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(changed.error, 'package_review_changed');
+    assert.equal(changed.review.totalFiles, 1);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+async function packageWithSourceMutation({ project, sourcePath, outputDir, method = 'read', mutate }) {
+  const originalOpen = fs.promises.open;
+  let mutated = false;
+  fs.promises.open = async function openWithMutation(candidatePath, flags, ...args) {
+    const handle = await originalOpen.call(fs.promises, candidatePath, flags, ...args);
+    if (flags !== 'r' || path.resolve(candidatePath) !== path.resolve(sourcePath)) return handle;
+    const wrapped = {
+      fd: handle.fd,
+      stat: handle.stat.bind(handle),
+      close: handle.close.bind(handle),
+      read: handle.read.bind(handle),
+      readFile: handle.readFile.bind(handle),
+    };
+    const originalRead = wrapped[method];
+    wrapped[method] = async (...readArgs) => {
+      const result = await originalRead(...readArgs);
+      if (!mutated) {
+        mutated = true;
+        mutate();
+      }
+      return result;
+    };
+    return wrapped;
+  };
+  try {
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    return await callIpcRaw('projects:package', project.id, outputDir, review.token);
+  } finally {
+    fs.promises.open = originalOpen;
+  }
+}
+
+function assertFailedPackageHasNoSideEffects(project, outputDir, before) {
+  assert.deepEqual(fs.readdirSync(outputDir), []);
+  assert.equal(project.status, before.status);
+  assert.equal(project.packagedAt, before.packagedAt);
+  assert.equal(project.outputPath, before.outputPath);
+  assert.equal(JSON.stringify(project.provenance), before.provenance);
+  assert.equal(storeInstance.get('usage.packagesThisMonth'), before.quota);
+  assert.equal(watcherCloseCount, before.watcherCloseCount);
+}
+
+function assertUnavailablePackageReview(review, fileName) {
+  assert.equal(review.materializable, false);
+  assert.equal(review.token, undefined);
+  assert.deepEqual(review.files, [{ name: fileName, status: 'unavailable' }]);
+}
+
+function capturePackageSideEffects(project) {
+  return {
+    status: project.status,
+    packagedAt: project.packagedAt,
+    outputPath: project.outputPath,
+    provenance: JSON.stringify(project.provenance),
+    quota: storeInstance.get('usage.packagesThisMonth'),
+    watcherCloseCount,
+  };
+}
+
+function assertNoPrivatePackageStaging(outputDir, stagingRoot) {
+  assert.ok(stagingRoot, 'the staged-tree mutation hook must capture the private staging root');
+  assert.equal(fs.existsSync(stagingRoot), false);
+  assert.deepEqual(fs.readdirSync(outputDir), []);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(path.resolve(outputDir))).filter(name => name.startsWith('.crate-package-staging-')),
+    []
+  );
+}
+
+async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) {
+  const tmpRoot = makeTempDir();
+  const originalOpen = fs.promises.open;
+  const originalReaddirSync = fs.readdirSync;
+  let stagingRoot = null;
+  let stagedFilePath = null;
+  let stagedRootEnumerations = 0;
+  let hookReached = false;
+  try {
+    const project = await createProject(`Staged tree ${label}`);
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed staged tree bytes');
+    storeInstance.set('settings.includeDiagnosticReport', options.diagnostics === true);
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.promises.open = async function captureStagedDestination(candidatePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, candidatePath, flags, ...args);
+      if (flags === 'wx' && isExpectedStagedPackageWrite(candidatePath, outputDir, 'Reviewed.ai')) {
+        stagingRoot = getPrivateStagedPackageRoot(candidatePath, outputDir);
+        stagedFilePath = candidatePath;
+      }
+      return handle;
+    };
+    fs.readdirSync = function mutateBeforeFinalStagedEnumeration(candidatePath, ...args) {
+      if (stagingRoot && path.resolve(candidatePath) === path.resolve(stagingRoot)) {
+        stagedRootEnumerations++;
+        if (stagedRootEnumerations === 2) {
+          hookReached = true;
+          mutate({ stagingRoot, stagedFilePath, tmpRoot });
+        }
+      }
+      return originalReaddirSync.call(fs, candidatePath, ...args);
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    fs.promises.open = originalOpen;
+    fs.readdirSync = originalReaddirSync;
+
+    assert.equal(hookReached, true, `${label} must reach the final staged-tree verification boundary`);
+    assert.equal(result.error, 'package_review_changed');
+    assert.equal(result.review.materializable, true);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assertNoPrivatePackageStaging(outputDir, stagingRoot);
+  } finally {
+    fs.promises.open = originalOpen;
+    fs.readdirSync = originalReaddirSync;
+    storeInstance.set('settings.includeDiagnosticReport', false);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+const STAGED_TREE_MUTATION_SCENARIOS = [
+  {
+    label: 'byte replacement',
+    mutate: ({ stagedFilePath }) => {
+      const stat = fs.statSync(stagedFilePath);
+      fs.writeFileSync(stagedFilePath, 'changed! staged tree bytes');
+      fs.utimesSync(stagedFilePath, stat.atime, stat.mtime);
+    },
+  },
+  {
+    label: 'file replacement',
+    mutate: ({ stagedFilePath }) => {
+      const bytes = fs.readFileSync(stagedFilePath);
+      fs.unlinkSync(stagedFilePath);
+      fs.writeFileSync(stagedFilePath, bytes, { mode: 0o600 });
+    },
+  },
+  {
+    label: 'symlink replacement',
+    mutate: ({ stagedFilePath, tmpRoot }) => {
+      const outsidePath = path.join(tmpRoot, 'outside-target');
+      fs.writeFileSync(outsidePath, 'outside bytes');
+      fs.unlinkSync(stagedFilePath);
+      fs.symlinkSync(outsidePath, stagedFilePath);
+    },
+  },
+  {
+    label: 'extra child',
+    mutate: ({ stagingRoot }) => {
+      const extraDir = path.join(stagingRoot, 'unexpected');
+      fs.mkdirSync(extraDir);
+      fs.writeFileSync(path.join(extraDir, 'extra.bin'), 'unexpected staged bytes');
+    },
+  },
+  {
+    label: 'file permission change',
+    mutate: ({ stagedFilePath }) => fs.chmodSync(stagedFilePath, 0o644),
+  },
+  {
+    label: 'directory permission change',
+    mutate: ({ stagingRoot }) => fs.chmodSync(stagingRoot, 0o755),
+  },
+  {
+    label: 'missing child',
+    mutate: ({ stagedFilePath }) => fs.unlinkSync(stagedFilePath),
+  },
+  {
+    label: 'hard-linked child',
+    mutate: ({ stagingRoot, stagedFilePath }) => fs.linkSync(stagedFilePath, path.join(stagingRoot, 'hard-link.bin')),
+  },
+];
+
+for (const scenario of STAGED_TREE_MUTATION_SCENARIOS) {
+  test(`final staged tree rejects ${scenario.label} and removes all private staging`, async () => {
+    await assertStagedTreeMutationFailsClosed(scenario.label, scenario.mutate, scenario);
+  });
+}
+
+test('final verification cleans staging when the selected root moves outside its original parent', async () => {
+  const tmpRoot = makeTempDir();
+  const originalPromisesOpen = fs.promises.open;
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  let stagingRoot = null;
+  let stagingMode = null;
+  let finalRootFd = null;
+  let stagingRootOpenCount = 0;
+  let hookReached = false;
+  try {
+    const project = await createProject('Final output root move');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputParent = path.join(tmpRoot, 'selected-parent');
+    const outputDir = path.join(outputParent, 'out');
+    const movedParent = path.join(tmpRoot, 'relocated-parent');
+    const movedRoot = path.join(movedParent, 'moved-output-root');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.mkdirSync(movedParent);
+    fs.writeFileSync(sourcePath, 'final root move bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.promises.open = async function captureStagedDestination(candidatePath, flags, ...args) {
+      const handle = await originalPromisesOpen.call(fs.promises, candidatePath, flags, ...args);
+      if (flags === 'wx' && isExpectedStagedPackageWrite(candidatePath, outputDir, 'Reviewed.ai')) {
+        stagingRoot = getPrivateStagedPackageRoot(candidatePath, outputDir);
+        stagingMode = fs.statSync(stagingRoot).mode & 0o777;
+      }
+      return handle;
+    };
+    fs.openSync = function captureFinalStagedRootFd(candidatePath, ...args) {
+      const fd = originalOpenSync.call(fs, candidatePath, ...args);
+      if (stagingRoot && typeof candidatePath === 'string' && path.resolve(candidatePath) === path.resolve(stagingRoot)) {
+        stagingRootOpenCount++;
+        if (stagingRootOpenCount === 2) finalRootFd = fd;
+      }
+      return fd;
+    };
+    fs.closeSync = function swapRootAfterFinalVerification(fd, ...args) {
+      const result = originalCloseSync.call(fs, fd, ...args);
+      if (!hookReached && fd === finalRootFd) {
+        hookReached = true;
+        fs.renameSync(outputDir, movedRoot);
+        fs.mkdirSync(outputDir);
+      }
+      return result;
+    };
+
+    testRendererEvents.length = 0;
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    fs.promises.open = originalPromisesOpen;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+
+    assert.equal(hookReached, true);
+    assert.deepEqual(result, { error: 'package_output_changed' });
+    assert.equal(path.dirname(stagingRoot), outputParent);
+    assert.equal(stagingMode, 0o700);
+    assert.equal(fs.existsSync(packageFolder(outputDir, project.name)), false);
+    assert.equal(fs.existsSync(packageFolder(movedRoot, project.name)), false);
+    assertNoPrivatePackageStaging(outputDir, stagingRoot);
+    assert.equal(fs.readdirSync(movedRoot).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.equal(fs.readdirSync(movedParent).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+  } finally {
+    fs.promises.open = originalPromisesOpen;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('nested output roots fail closed instead of falling back to movable in-root staging', async () => {
+  const tmpRoot = makeTempDir();
+  const originalMkdtempSync = fs.mkdtempSync;
+  let inRootFallbackAttempted = false;
+  try {
+    const project = await createProject('No movable staging fallback');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputParent = path.join(tmpRoot, 'selected-parent');
+    const outputDir = path.join(outputParent, 'out');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(sourcePath, 'reviewed bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.mkdtempSync = function rejectSiblingStaging(prefix, ...args) {
+      const stagingParent = path.dirname(prefix);
+      if (path.resolve(stagingParent) === path.resolve(outputParent)) {
+        const error = new Error('sibling staging denied');
+        error.code = 'EACCES';
+        throw error;
+      }
+      if (path.resolve(stagingParent) === path.resolve(outputDir)) {
+        inRootFallbackAttempted = true;
+      }
+      return originalMkdtempSync.call(fs, prefix, ...args);
+    };
+
+    testRendererEvents.length = 0;
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.deepEqual(result, { error: 'EACCES' });
+    assert.equal(inRootFallbackAttempted, false);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.equal(fs.readdirSync(outputParent).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+  } finally {
+    fs.mkdtempSync = originalMkdtempSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('final verification locates and cleans staging after its parent is renamed', async () => {
+  const tmpRoot = makeTempDir();
+  const originalPromisesOpen = fs.promises.open;
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  let stagingRoot = null;
+  let finalRootFd = null;
+  let stagingRootOpenCount = 0;
+  let hookReached = false;
+  try {
+    const project = await createProject('Final staging parent move');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputParent = path.join(tmpRoot, 'selected-parent');
+    const outputDir = path.join(outputParent, 'out');
+    const movedParent = path.join(tmpRoot, 'moved-selected-parent');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(sourcePath, 'staging parent move bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.promises.open = async function captureStagedDestination(candidatePath, flags, ...args) {
+      const handle = await originalPromisesOpen.call(fs.promises, candidatePath, flags, ...args);
+      if (flags === 'wx' && isExpectedStagedPackageWrite(candidatePath, outputDir, 'Reviewed.ai')) {
+        stagingRoot = getPrivateStagedPackageRoot(candidatePath, outputDir);
+      }
+      return handle;
+    };
+    fs.openSync = function captureFinalStagedRootFd(candidatePath, ...args) {
+      const fd = originalOpenSync.call(fs, candidatePath, ...args);
+      if (stagingRoot && typeof candidatePath === 'string' && path.resolve(candidatePath) === path.resolve(stagingRoot)) {
+        stagingRootOpenCount++;
+        if (stagingRootOpenCount === 2) finalRootFd = fd;
+      }
+      return fd;
+    };
+    fs.closeSync = function moveStagingParentAfterFinalVerification(fd, ...args) {
+      const result = originalCloseSync.call(fs, fd, ...args);
+      if (!hookReached && fd === finalRootFd) {
+        hookReached = true;
+        fs.renameSync(outputParent, movedParent);
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+      return result;
+    };
+
+    testRendererEvents.length = 0;
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    fs.promises.open = originalPromisesOpen;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+
+    assert.equal(hookReached, true);
+    assert.deepEqual(result, { error: 'package_output_changed' });
+    assert.equal(fs.existsSync(stagingRoot), false);
+    assert.equal(fs.readdirSync(movedParent).some(name => name.startsWith('.crate-package-staging-')), false);
+    assert.equal(fs.existsSync(packageFolder(outputDir, project.name)), false);
+    assert.equal(fs.existsSync(packageFolder(path.join(movedParent, 'out'), project.name)), false);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+  } finally {
+    fs.promises.open = originalPromisesOpen;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+async function assertLateStagingInputChangeRefreshes(scenario, mutate, verifyReview) {
+  const tmpRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let releaseWrite = () => {};
+  try {
+    const project = await createProject(`Late staging ${scenario}`);
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const addedPath = path.join(tmpRoot, 'Added.png');
+    const parentPsd = path.join(tmpRoot, 'Deferred.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed source bytes');
+    fs.writeFileSync(addedPath, 'added source bytes');
+    fs.writeFileSync(parentPsd, 'reviewed PSD bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Deferred.png', data: Buffer.from('deferred embedded bytes') }],
+    };
+    storeInstance.set('settings.includeDiagnosticReport', false);
+    const stored = await setProjectFiles(project.id, { files: [
+      { path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+      {
+        path: parentPsd,
+        parentPsd,
+        name: 'Deferred.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        embeddedOriginalName: 'Deferred.png',
+        embeddedIndex: 0,
+        fileId: `late-${scenario}`,
+      },
+    ] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(typeof review.token, 'string');
+    const before = capturePackageSideEffects(stored);
+
+    let deferred = true;
+    let markWriteStarted;
+    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
+    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
+    fs.promises.writeFile = async function deferredPsdWrite(filePath, ...args) {
+      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'Deferred.png')) {
+        deferred = false;
+        await originalWriteFile.call(fs.promises, filePath, ...args);
+        markWriteStarted();
+        await writeGate;
+        return;
+      }
+      return originalWriteFile.call(fs.promises, filePath, ...args);
+    };
+
+    const packagePromise = callIpcRaw('projects:package', project.id, outputDir, review.token);
+    await writeStarted;
+    await mutate({ stored, sourcePath, addedPath });
+    releaseWrite();
+    const result = await packagePromise;
+
+    assert.equal(result.error, 'package_review_changed');
+    assert.ok(result.review);
+    verifyReview(result.review);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.equal(
+      fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-')),
+      false
+    );
+  } finally {
+    storeInstance.set('settings.includeDiagnosticReport', false);
+    fs.promises.writeFile = originalWriteFile;
+    releaseWrite();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+test('membership mutation during slow staging refreshes review and leaves no output', async () => {
+  await assertLateStagingInputChangeRefreshes(
+    'membership',
+    ({ stored, addedPath }) => {
+      stored.files.push({
+        path: addedPath,
+        name: 'Added.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      });
+    },
+    review => {
+      assert.equal(review.materializable, true);
+      assert.equal(review.totalFiles, 3);
+      assert.equal(typeof review.token, 'string');
+    }
+  );
+});
+
+test('diagnostics setting mutation during slow staging refreshes review and leaves no output', async () => {
+  await assertLateStagingInputChangeRefreshes(
+    'settings',
+    () => storeInstance.set('settings.includeDiagnosticReport', true),
+    review => {
+      assert.equal(review.materializable, true);
+      assert.equal(review.planSummary.diagnosticsMetadataIncluded, true);
+      assert.equal(typeof review.token, 'string');
+    }
+  );
+});
+
+test('reviewed source bytes changing after copy during slow staging refreshes review', async () => {
+  await assertLateStagingInputChangeRefreshes(
+    'source-bytes',
+    ({ sourcePath }) => fs.writeFileSync(sourcePath, 'changed source bytes after staged copy'),
+    review => {
+      assert.equal(review.materializable, true);
+      assert.equal(review.totalFiles, 2);
+      assert.equal(typeof review.token, 'string');
+    }
+  );
+});
+
+test('source changing during open-handle copy removes staging and fails closed', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Source Copy Race');
+    const sourcePath = path.join(tmpRoot, 'Race.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.alloc(2 * 1024 * 1024, 0x61));
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Race.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse'
+    }] });
+    const before = capturePackageSideEffects(stored);
+    const result = await packageWithSourceMutation({
+      project, sourcePath, outputDir,
+      mutate: () => fs.writeFileSync(sourcePath, Buffer.alloc(2 * 1024 * 1024, 0x62)),
+    });
+    assert.equal(result.error, 'package_review_changed');
+    assert.equal(result.review.totalFiles, 1);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('reviewed file disappearing after an earlier staged copy removes all partial output', async () => {
+  const tmpRoot = makeTempDir();
+  const originalOpen = fs.promises.open;
+  try {
+    const project = await createProject('Missing During Copy');
+    const firstPath = path.join(tmpRoot, 'First.ai');
+    const missingPath = path.join(tmpRoot, 'Missing.png');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(firstPath, 'first reviewed bytes');
+    fs.writeFileSync(missingPath, 'second reviewed bytes');
+    const stored = await setProjectFiles(project.id, { files: [firstPath, missingPath].map(filePath => ({
+      path: filePath, name: path.basename(filePath), ext: path.extname(filePath), addedAt: Date.now(), source: 'manual-browse'
+    })) });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+    let removed = false;
+    fs.promises.open = async function removeBeforeSecondDestinationOpen(candidatePath, flags, ...args) {
+      if (!removed && flags === 'wx' && isExpectedStagedPackageWrite(candidatePath, outputDir, 'Missing.png')) {
+        removed = true;
+        fs.unlinkSync(missingPath);
+      }
+      return originalOpen.call(fs.promises, candidatePath, flags, ...args);
+    };
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.error, 'package_review_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+  } finally {
+    fs.promises.open = originalOpen;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PSD parent mutation during reviewed handle read removes staging and fails closed', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PSD Parent Race');
+    const parentPsd = path.join(tmpRoot, 'Parent.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(parentPsd, 'reviewed parent bytes');
+    currentPsdFixture = { children: [], linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('embedded') }] };
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: parentPsd, parentPsd, name: 'Embedded.png', ext: '.png', source: 'scan-on-save-embedded',
+      embedded: true, embeddedOriginalName: 'Embedded.png', embeddedIndex: 0, fileId: 'psd-race'
+    }] });
+    const before = capturePackageSideEffects(stored);
+    const result = await packageWithSourceMutation({
+      project, sourcePath: parentPsd, outputDir,
+      mutate: () => fs.writeFileSync(parentPsd, 'changed! parent bytes'),
+    });
+    assert.equal(result.error, 'package_review_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('presentation container mutation during reviewed copy removes staging and skips staged extraction', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Presentation Container Race');
+    const deckPath = path.join(tmpRoot, 'Deck.pptx');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(deckPath, Buffer.alloc(2 * 1024 * 1024, 0x31));
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse'
+    }] });
+    let stagedUnzipCalls = 0;
+    setChildProcessHandler(request => {
+      if (
+        request.command === '/usr/bin/unzip' &&
+        typeof request.args[1] === 'string' &&
+        !!getPrivateStagedPackageRoot(request.args[1], outputDir)
+      ) stagedUnzipCalls++;
+      return { stdout: '' };
+    });
+    const before = capturePackageSideEffects(stored);
+    const result = await packageWithSourceMutation({
+      project, sourcePath: deckPath, outputDir,
+      mutate: () => fs.writeFileSync(deckPath, Buffer.alloc(2 * 1024 * 1024, 0x32)),
+    });
+    assert.equal(result.error, 'package_review_changed');
+    assert.equal(stagedUnzipCalls, 0);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package discovery timeout invalidates and cancels late scan work', async () => {
+  resetTestHomeWorkspace();
+  const project = await createProject('Stalled Pre-Package Scan');
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'Late.ai');
+  fs.writeFileSync(candidatePath, 'late candidate');
+  const trackedSetTimeout = global.setTimeout;
+  let releaseMdls;
+  const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        return mdlsGate.then(() => ({ stdout: new Date().toISOString() }));
+      }
+      return { stdout: '' };
+    });
+    global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 0 : delay, ...args);
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
+    releaseMdls();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual((await getProject(project.id)).files, []);
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    releaseMdls();
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('package review tokens reject missing, malformed, stale, cross-project, and replayed confirmation', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const first = await createProject('Token First');
+    const firstPath = path.join(tmpRoot, 'First.ai');
+    fs.writeFileSync(firstPath, 'first token source');
+    await setProjectFiles(first.id, {
+      files: [{ path: firstPath, name: 'First.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' }],
+    });
+    const second = await createProject('Token Second');
+    const secondPath = path.join(tmpRoot, 'Second.ai');
+    fs.writeFileSync(secondPath, 'second token source');
+    await setProjectFiles(second.id, {
+      files: [{ path: secondPath, name: 'Second.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' }],
+    });
+
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    assert.equal((await callIpcRaw('projects:package', first.id, outputDir)).error, 'package_review_required');
+    assert.equal((await callIpcRaw('projects:package', first.id, outputDir, 'not-a-token')).error, 'package_review_invalid');
+
+    const crossProjectReview = await callIpcRaw('projects:prepare-package-review', first.id);
+    assert.equal(
+      (await callIpcRaw('projects:package', second.id, outputDir, crossProjectReview.token)).error,
+      'package_review_project_mismatch'
+    );
+
+    const staleReview = await callIpcRaw('projects:prepare-package-review', first.id);
+    const currentReview = await callIpcRaw('projects:prepare-package-review', first.id);
+    assert.equal(
+      (await callIpcRaw('projects:package', first.id, outputDir, staleReview.token)).error,
+      'package_review_stale'
+    );
+
+    const success = await callIpcRaw('projects:package', first.id, outputDir, currentReview.token);
+    assert.equal(success.success, true);
+    const replayOutput = path.join(tmpRoot, 'replay-out');
+    fs.mkdirSync(replayOutput);
+    assert.equal(
+      (await callIpcRaw('projects:package', first.id, replayOutput, currentReview.token)).error,
+      'package_review_replayed'
+    );
+    assert.deepEqual(fs.readdirSync(replayOutput), []);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('consumed package review tokens enforce fixed-capacity expiry and LRU replay semantics', async () => {
+  const tmpRoot = makeTempDir();
+  const originalDateNow = Date.now;
+  let now = originalDateNow();
+  try {
+    Date.now = () => now;
+    const project = await createProject('Bounded Consumed Tokens');
+    const sourcePath = path.join(tmpRoot, 'Bounded.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'bounded token source');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Bounded.ai',
+      ext: '.ai',
+      addedAt: now,
+      source: 'manual-browse',
+    }] });
+    storeInstance.set('usage.packagesThisMonth', 25);
+
+    const consumedTokens = [];
+    for (let index = 0; index < 256; index++) {
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      consumedTokens.push(review.token);
+      assert.equal((await callIpcRaw('projects:package', project.id, outputDir, review.token)).error, 'limit_reached');
+    }
+
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, consumedTokens[0])).error,
+      'package_review_replayed'
+    );
+    const overflowReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, overflowReview.token)).error,
+      'limit_reached'
+    );
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, consumedTokens[1])).error,
+      'package_review_stale'
+    );
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, consumedTokens[0])).error,
+      'package_review_replayed'
+    );
+
+    now += 15 * 60 * 1000 + 1;
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, consumedTokens[0])).error,
+      'package_review_stale'
+    );
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.deepEqual(
+      fs.readdirSync(tmpRoot).filter(name => name.startsWith('.crate-package-staging-')),
+      []
+    );
+  } finally {
+    Date.now = originalDateNow;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('normal project package quota survives UTC rollover before local reset day', async () => {
   const tmpRoot = makeTempDir();
   const RealDate = global.Date;
@@ -3184,7 +4767,68 @@ test('PowerPoint packaging dedupes scan-on-save media collision copies', async (
   }
 });
 
-test('PowerPoint package extraction surfaces per-entry media failures without blocking successes', async () => {
+test('review and staging share logical-byte dedup for PSD resources and display-extension mismatches', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Canonical Presentation Dedupe');
+    const deckPath = path.join(tmpRoot, 'Deck.pptx');
+    const physicalAssetPath = path.join(tmpRoot, 'Reference.assetbin');
+    const parentPsd = path.join(tmpRoot, 'Parent.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    const sharedBytes = Buffer.from('CANONICAL_PRESENTATION_MEDIA_BYTES'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(deckPath, Buffer.from('stable presentation container'));
+    fs.writeFileSync(physicalAssetPath, sharedBytes);
+    fs.writeFileSync(parentPsd, Buffer.from('stable PSD container'));
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'Embedded.png', data: sharedBytes }],
+    };
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: sharedBytes,
+    }]);
+    await setProjectFiles(project.id, { files: [
+      { path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse' },
+      {
+        path: physicalAssetPath,
+        name: 'Reference.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      },
+      {
+        path: parentPsd,
+        parentPsd,
+        name: 'Embedded.png',
+        ext: '.png',
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        embeddedOriginalName: 'Embedded.png',
+        embeddedIndex: 0,
+        fileId: 'canonical-dedup-psd',
+      },
+    ] });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.materializable, true);
+    assert.equal(typeof review.token, 'string');
+    assert.deepEqual(review.files.map(file => file.name).sort(), ['Deck.pptx', 'Embedded.png', 'Reference.png']);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 3);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), review.files.map(file => file.name).sort());
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Reference.png')), sharedBytes);
+    assert.deepEqual(fs.readFileSync(path.join(result.folderPath, 'Embedded.png')), sharedBytes);
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Deck — image1.png')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('PowerPoint extraction failure makes the reviewed derivative plan unavailable', async () => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('PowerPoint Partial Failure');
@@ -3203,7 +4847,7 @@ test('PowerPoint package extraction surfaces per-entry media failures without bl
         error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
       },
     ]);
-    await setProjectFiles(project.id, {
+    const stored = await setProjectFiles(project.id, {
       files: [{
         path: pptxPath,
         name: 'Presentation1.pptx',
@@ -3214,55 +4858,17 @@ test('PowerPoint package extraction surfaces per-entry media failures without bl
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
-    assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, [
-      'Could not extract embedded media image2.png from Presentation1.pptx.'
-    ]);
-
-    const errorText = JSON.stringify(result.errors);
-    assert.equal(errorText.includes('RAW_STDERR'), false);
-    assert.equal(errorText.includes('unzip'), false);
-    assert.equal(errorText.includes('/private/tmp'), false);
-    assert.equal(errorText.includes(tmpRoot), false);
-
-    const destFolder = packageFolder(outputDir, 'PowerPoint Partial Failure');
-    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.pptx'), 'utf8'), 'pptx container bytes');
-    assert.equal(
-      fs.readFileSync(path.join(destFolder, 'Presentation1 — image1.jpeg'), 'utf8'),
-      'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
-    );
-    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — image2.png')), false);
-
-    const fresh = await getProject(project.id);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
-
-    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
-      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('ppt/media/'));
-    assert.deepEqual(
-      embeddedResources.map(node => node.sourceMetadata.internalPath),
-      ['ppt/media/image1.jpeg']
-    );
-    const manifest = readManifest(outputDir, 'PowerPoint Partial Failure');
-    assert.equal(manifest.package.embeddedCount, 1);
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 1 });
-    assert.equal('errors' in manifest.package, false);
-    assert.equal(JSON.stringify(manifest).includes('Presentation1.pptx'), false);
-    assert.equal(JSON.stringify(manifest).includes('ppt/media/image2.png'), false);
+    const before = capturePackageSideEffects(stored);
+    const result = await callIpcRaw('projects:prepare-package-review', project.id);
+    assertUnavailablePackageReview(result, 'Presentation1.pptx');
+    assert.equal(JSON.stringify(result).includes(tmpRoot), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
-test('PowerPoint package extraction surfaces archive inspection failures without blocking deck copy', async () => {
+test('PowerPoint archive inspection failure makes the reviewed derivative plan unavailable', async () => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('PowerPoint Inspection Failure');
@@ -3271,7 +4877,7 @@ test('PowerPoint package extraction surfaces archive inspection failures without
     fs.mkdirSync(outputDir);
     fs.writeFileSync(pptxPath, Buffer.from('not a zip archive'));
     setPresentationUnzipListingFailure(new Error(`unzip RAW_STDERR RAW_STDOUT /private/tmp/crate-secret ${tmpRoot}`));
-    await setProjectFiles(project.id, {
+    const stored = await setProjectFiles(project.id, {
       files: [{
         path: pptxPath,
         name: 'Presentation1.pptx',
@@ -3282,46 +4888,11 @@ test('PowerPoint package extraction surfaces archive inspection failures without
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
-    assert.equal(result.embeddedCount, 0);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, [
-      'Could not inspect embedded media in Presentation1.pptx.'
-    ]);
-
-    const errorText = JSON.stringify(result.errors);
-    assert.equal(errorText.includes('RAW_STDERR'), false);
-    assert.equal(errorText.includes('RAW_STDOUT'), false);
-    assert.equal(errorText.includes('unzip'), false);
-    assert.equal(errorText.includes('/private/tmp'), false);
-    assert.equal(errorText.includes(tmpRoot), false);
-
-    const destFolder = packageFolder(outputDir, 'PowerPoint Inspection Failure');
-    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.pptx'), 'utf8'), 'not a zip archive');
-    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — image1.jpeg')), false);
-
-    const fresh = await getProject(project.id);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
-
-    const manifest = readManifest(outputDir, 'PowerPoint Inspection Failure');
-    assert.equal(manifest.package.copiedCount, 1);
-    assert.equal(manifest.package.embeddedCount, 0);
-    assert.equal(manifest.package.totalFiles, 1);
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { embedded_media_inspection_failed: 1 });
-    assert.equal('errors' in manifest.package, false);
-    const manifestErrorText = JSON.stringify(manifest);
-    assert.equal(manifestErrorText.includes('Presentation1.pptx'), false);
-    assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
-    assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
-    assert.equal(manifestErrorText.includes('/private/tmp'), false);
-    assert.equal(manifestErrorText.includes(tmpRoot), false);
+    const before = capturePackageSideEffects(stored);
+    const result = await callIpcRaw('projects:prepare-package-review', project.id);
+    assertUnavailablePackageReview(result, 'Presentation1.pptx');
+    assert.equal(JSON.stringify(result).includes(tmpRoot), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -3440,7 +5011,12 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     let injectedFailure = false;
     fs.openSync = function captureManifestFd(filePath, ...args) {
       const fd = originalOpenSync.call(fs, filePath, ...args);
-      if (typeof filePath === 'string' && path.resolve(filePath) === path.resolve(failingManifestPath)) {
+      if (
+        typeof filePath === 'string' &&
+        path.basename(filePath) === 'crate-provenance.json' &&
+        path.basename(path.dirname(filePath)) === 'Crate Diagnostics' &&
+        !!getPrivateStagedPackageRoot(filePath, outputDir)
+      ) {
         manifestFd = fd;
       }
       return fd;
@@ -4038,7 +5614,7 @@ test('Keynote package extraction recovers mixed mojibake tails without collapsin
   }
 });
 
-test('Keynote package extraction fails closed for ambiguous mojibake wildcard tails', async () => {
+test('Keynote ambiguous mojibake wildcard tails make the reviewed derivative plan unavailable', async () => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Keynote Ambiguous Mojibake');
@@ -4058,7 +5634,7 @@ test('Keynote package extraction fails closed for ambiguous mojibake wildcard ta
         data: Buffer.from('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'.repeat(40)),
       },
     ]);
-    await setProjectFiles(project.id, {
+    const stored = await setProjectFiles(project.id, {
       files: [{
         path: keynotePath,
         name: 'Keynote Deck.key',
@@ -4069,51 +5645,17 @@ test('Keynote package extraction fails closed for ambiguous mojibake wildcard ta
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
-    assert.equal(result.embeddedCount, 0);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, [
-      'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
-      'Could not extract embedded media PM-9089.png from Keynote Deck.key.',
-    ]);
-
-    const destFolder = packageFolder(outputDir, 'Keynote Ambiguous Mojibake');
-    assert.equal(fs.readFileSync(path.join(destFolder, 'Keynote Deck.key'), 'utf8'), 'keynote container bytes');
-    assert.equal(fs.existsSync(path.join(destFolder, 'Keynote Deck — PM.png')), false);
-
-    const errorText = JSON.stringify(result.errors);
-    assert.equal(errorText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
-    assert.equal(errorText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
-    assert.equal(errorText.includes('unzip'), false);
-    assert.equal(errorText.includes('/private/tmp'), false);
-    assert.equal(errorText.includes(tmpRoot), false);
-
-    const fresh = await getProject(project.id);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
-
-    const manifest = readManifest(outputDir, 'Keynote Ambiguous Mojibake');
-    assert.equal(manifest.package.embeddedCount, 0);
-    assert.equal(manifest.package.errorCount, 2);
-    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 2 });
-    assert.equal('errors' in manifest.package, false);
-    const manifestText = JSON.stringify(manifest);
-    assert.equal(manifestText.includes('PM-9089.png'), false);
-    assert.equal(manifestText.includes('Keynote Deck.key'), false);
-    assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_A_BINARY_SHOULD_NOT_LEAK'), false);
-    assert.equal(manifestText.includes('KEYNOTE_AMBIGUOUS_B_BINARY_SHOULD_NOT_LEAK'), false);
-    assert.equal(manifestText.includes('/private/tmp'), false);
+    const before = capturePackageSideEffects(stored);
+    const result = await callIpcRaw('projects:prepare-package-review', project.id);
+    assertUnavailablePackageReview(result, 'Keynote Deck.key');
+    assert.equal(JSON.stringify(result).includes(tmpRoot), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
-test('Keynote package extraction surfaces per-entry media failures without blocking successes', async () => {
+test('Keynote extraction failure makes the reviewed derivative plan unavailable', async () => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Keynote Partial Failure');
@@ -4132,7 +5674,7 @@ test('Keynote package extraction surfaces per-entry media failures without block
         error: new Error(`unzip RAW_STDERR /private/tmp/crate-secret ${tmpRoot}`),
       },
     ]);
-    await setProjectFiles(project.id, {
+    const stored = await setProjectFiles(project.id, {
       files: [{
         path: keynotePath,
         name: 'Presentation1.key',
@@ -4143,55 +5685,17 @@ test('Keynote package extraction surfaces per-entry media failures without block
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
-    assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, [
-      'Could not extract embedded media clip-5678.mov from Presentation1.key.'
-    ]);
-
-    const errorText = JSON.stringify(result.errors);
-    assert.equal(errorText.includes('RAW_STDERR'), false);
-    assert.equal(errorText.includes('unzip'), false);
-    assert.equal(errorText.includes('/private/tmp'), false);
-    assert.equal(errorText.includes(tmpRoot), false);
-
-    const destFolder = packageFolder(outputDir, 'Keynote Partial Failure');
-    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.key'), 'utf8'), 'keynote container bytes');
-    assert.equal(
-      fs.readFileSync(path.join(destFolder, 'Presentation1 — photo.jpeg'), 'utf8'),
-      'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40)
-    );
-    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — clip.mov')), false);
-
-    const fresh = await getProject(project.id);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
-
-    const embeddedResources = getProvenanceNodes(fresh, NODE_TYPES.EMBEDDED_RESOURCE)
-      .filter(node => node.sourceMetadata && String(node.sourceMetadata.internalPath || '').startsWith('Data/'));
-    assert.deepEqual(
-      embeddedResources.map(node => node.sourceMetadata.internalPath),
-      ['Data/photo-1234.jpeg']
-    );
-    const manifest = readManifest(outputDir, 'Keynote Partial Failure');
-    assert.equal(manifest.package.embeddedCount, 1);
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { embedded_media_extraction_failed: 1 });
-    assert.equal('errors' in manifest.package, false);
-    assert.equal(JSON.stringify(manifest).includes('Presentation1.key'), false);
-    assert.equal(JSON.stringify(manifest).includes('Data/clip-5678.mov'), false);
+    const before = capturePackageSideEffects(stored);
+    const result = await callIpcRaw('projects:prepare-package-review', project.id);
+    assertUnavailablePackageReview(result, 'Presentation1.key');
+    assert.equal(JSON.stringify(result).includes(tmpRoot), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
-test('Keynote package extraction surfaces archive inspection failures without blocking deck copy', async () => {
+test('Keynote archive inspection failure makes the reviewed derivative plan unavailable', async () => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Keynote Inspection Failure');
@@ -4200,7 +5704,7 @@ test('Keynote package extraction surfaces archive inspection failures without bl
     fs.mkdirSync(outputDir);
     fs.writeFileSync(keynotePath, Buffer.from('not a zip archive'));
     setPresentationUnzipListingFailure(new Error(`unzip RAW_STDERR RAW_STDOUT /private/tmp/crate-secret ${tmpRoot}`));
-    await setProjectFiles(project.id, {
+    const stored = await setProjectFiles(project.id, {
       files: [{
         path: keynotePath,
         name: 'Presentation1.key',
@@ -4211,46 +5715,11 @@ test('Keynote package extraction surfaces archive inspection failures without bl
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assertPackageResultShape(result);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 1);
-    assert.equal(result.embeddedCount, 0);
-    assert.equal(result.totalFiles, 1);
-    assert.deepEqual(result.errors, [
-      'Could not inspect embedded media in Presentation1.key.'
-    ]);
-
-    const errorText = JSON.stringify(result.errors);
-    assert.equal(errorText.includes('RAW_STDERR'), false);
-    assert.equal(errorText.includes('RAW_STDOUT'), false);
-    assert.equal(errorText.includes('unzip'), false);
-    assert.equal(errorText.includes('/private/tmp'), false);
-    assert.equal(errorText.includes(tmpRoot), false);
-
-    const destFolder = packageFolder(outputDir, 'Keynote Inspection Failure');
-    assert.equal(fs.readFileSync(path.join(destFolder, 'Presentation1.key'), 'utf8'), 'not a zip archive');
-    assert.equal(fs.existsSync(path.join(destFolder, 'Presentation1 — photo.jpeg')), false);
-
-    const fresh = await getProject(project.id);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 0);
-    assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 0);
-
-    const manifest = readManifest(outputDir, 'Keynote Inspection Failure');
-    assert.equal(manifest.package.copiedCount, 1);
-    assert.equal(manifest.package.embeddedCount, 0);
-    assert.equal(manifest.package.totalFiles, 1);
-    assert.equal(manifest.package.errorCount, 1);
-    assert.deepEqual(manifest.package.errorCategories, { embedded_media_inspection_failed: 1 });
-    assert.equal('errors' in manifest.package, false);
-    const manifestErrorText = JSON.stringify(manifest);
-    assert.equal(manifestErrorText.includes('Presentation1.key'), false);
-    assert.equal(manifestErrorText.includes('RAW_STDERR'), false);
-    assert.equal(manifestErrorText.includes('RAW_STDOUT'), false);
-    assert.equal(manifestErrorText.includes('/private/tmp'), false);
-    assert.equal(manifestErrorText.includes(tmpRoot), false);
+    const before = capturePackageSideEffects(stored);
+    const result = await callIpcRaw('projects:prepare-package-review', project.id);
+    assertUnavailablePackageReview(result, 'Presentation1.key');
+    assert.equal(JSON.stringify(result).includes(tmpRoot), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -7233,6 +8702,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
     }
   }
 
+  await callIpc('projects:pre-package-scan', project.id);
   const packageResult = await callIpc('projects:package', project.id, outputDir);
   assertPackageResultShape(packageResult);
   assert.equal(packageResult.success, true);
@@ -8497,7 +9967,7 @@ test('package removes partial writer output and leaves no success side effects',
     fs.promises.writeFile = async function partialThenReject(filePath) {
       if (
         !injectedFailure &&
-        path.resolve(filePath).startsWith(`${path.resolve(packagePath)}${path.sep}`)
+        isExpectedStagedPackageWrite(filePath, outputDir, 'partial.png')
       ) {
         injectedFailure = true;
         await originalWriteFile.call(fs.promises, filePath, Buffer.from('partial bytes'), { flag: 'wx' });
@@ -8521,11 +9991,11 @@ test('package removes partial writer output and leaves no success side effects',
   }
 });
 
-test('package treats a renamed output root during deferred PSD work as fatal', async () => {
+test('package cleans stable staging when the selected output root is renamed and replaced during PSD work', async () => {
   await assertPackageRootReplacementFailsClosed('psd', 'rename');
 });
 
-test('package treats a symlink-substituted output root during presentation work as fatal', async () => {
+test('package cleans stable staging when the selected output root is replaced by a symlink during presentation work', async () => {
   await assertPackageRootReplacementFailsClosed('presentation', 'symlink');
 });
 
@@ -9412,6 +10882,49 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
     assert.equal(observations.length, 1);
   } finally {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extraction', async () => {
+  const sharedUsersRoot = '/Users/Shared';
+  assert.doesNotThrow(
+    () => fs.accessSync(sharedUsersRoot, fs.constants.W_OK),
+    'legacy .ppt watcher coverage requires writable /Users/Shared on the macOS test host'
+  );
+  const fixtureRoot = fs.mkdtempSync(path.join(sharedUsersRoot, 'crate-legacy-ppt-scan-'));
+  let unzipCalls = 0;
+  try {
+    const project = await createProject('Legacy PPT linked discovery');
+    const sourcePath = path.join(fixtureRoot, 'Legacy.ppt');
+    const linkedPath = path.join(fixtureRoot, 'Legacy-linked.png');
+    fs.writeFileSync(linkedPath, 'legacy linked bytes');
+    fs.writeFileSync(sourcePath, Buffer.from(`LEGACY_PPT_BINARY\0${linkedPath}\0`, 'utf8'));
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Legacy.ppt',
+      ext: '.ppt',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'execFile' && command === '/usr/bin/unzip') unzipCalls++;
+      return { stdout: '' };
+    });
+
+    await emitWatcher('change', sourcePath);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      5000
+    );
+
+    assert.equal(unzipCalls, 0);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'), true);
+    assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 1);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -10313,6 +11826,25 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
     fresh = await getProject(project.id);
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
+
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    await emitWatcher('change', psdPath);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.every(file => file.source !== 'scan-on-save-embedded')
+    );
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('recovered embedded bytes') }],
+    };
+    await emitWatcher('change', psdPath);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'scan-on-save-embedded')
+    );
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

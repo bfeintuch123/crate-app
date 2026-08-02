@@ -4,7 +4,18 @@ const fs = require('fs');
 const path = require('path');
 
 const MAX_PACKAGE_NAME_LENGTH = 180;
+const MAX_PACKAGE_COMPONENT_BYTES = 255;
+const MAX_PACKAGE_EXTENSION_LENGTH = 32;
+const MAX_PACKAGE_NAME_ALLOCATION_ATTEMPTS = 10000;
 const UNSAFE_FILENAME_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
+
+class PackageNameAllocationError extends Error {
+  constructor() {
+    super('Package filename allocation exhausted');
+    this.name = 'PackageNameAllocationError';
+    this.code = 'package_name_allocation_failed';
+  }
+}
 
 function realpathSync(targetPath) {
   return (fs.realpathSync.native || fs.realpathSync)(targetPath);
@@ -17,6 +28,28 @@ function lstatIfExists(targetPath) {
     if (e && e.code === 'ENOENT') return null;
     throw e;
   }
+}
+
+function truncatePackageComponent(rawValue, maxUnits, maxBytes = MAX_PACKAGE_COMPONENT_BYTES) {
+  const unitLimit = Number.isSafeInteger(maxUnits) && maxUnits > 0 ? maxUnits : 0;
+  const byteLimit = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : 0;
+  let output = '';
+  let units = 0;
+  let bytes = 0;
+
+  for (const character of `${rawValue || ''}`) {
+    const codeUnit = character.charCodeAt(0);
+    const safeCharacter = character.length === 1 && codeUnit >= 0xd800 && codeUnit <= 0xdfff
+      ? '_'
+      : character;
+    const characterUnits = safeCharacter.length;
+    const characterBytes = Buffer.byteLength(safeCharacter, 'utf8');
+    if (units + characterUnits > unitLimit || bytes + characterBytes > byteLimit) break;
+    output += safeCharacter;
+    units += characterUnits;
+    bytes += characterBytes;
+  }
+  return output;
 }
 
 function isAllowedMacSystemSymlink(targetPath) {
@@ -66,12 +99,17 @@ function sanitizePackageFileName(rawName, fallbackName = 'file') {
     .trim();
 
   if (!name || name === '.' || name === '..') name = fallback;
-  if (name.length > MAX_PACKAGE_NAME_LENGTH) {
-    const ext = path.extname(name);
-    const base = path.basename(name, ext).slice(0, Math.max(1, MAX_PACKAGE_NAME_LENGTH - ext.length));
-    name = `${base}${ext}`;
-  }
-  return name;
+  const rawExtension = path.extname(name);
+  const extension = truncatePackageComponent(
+    rawExtension,
+    MAX_PACKAGE_EXTENSION_LENGTH,
+    MAX_PACKAGE_COMPONENT_BYTES
+  );
+  const base = path.basename(name, rawExtension) || fallback;
+  const maxBaseLength = Math.max(1, MAX_PACKAGE_NAME_LENGTH - extension.length);
+  const maxBaseBytes = MAX_PACKAGE_COMPONENT_BYTES - Buffer.byteLength(extension, 'utf8');
+  const safeBase = truncatePackageComponent(base, maxBaseLength, maxBaseBytes);
+  return `${safeBase || truncatePackageComponent(fallback, maxBaseLength, maxBaseBytes)}${extension}`;
 }
 
 function sanitizePackageRelativePath(rawPath, fallbackName = 'file') {
@@ -82,6 +120,48 @@ function sanitizePackageRelativePath(rawPath, fallbackName = 'file') {
     .map((part, index, allParts) => sanitizePackageFileName(part, index === allParts.length - 1 ? fallbackName : 'folder'));
 
   return parts.length > 0 ? path.join(...parts) : sanitizePackageFileName(fallbackName);
+}
+
+function packageCollisionKey(rawName) {
+  return sanitizePackageFileName(rawName, 'file')
+    .normalize('NFC')
+    .toUpperCase()
+    .toLowerCase()
+    .normalize('NFC');
+}
+
+function createPackageNameAllocator(existingNames = [], options = {}) {
+  const usedKeys = new Set(existingNames.map(packageCollisionKey));
+  const maxAttempts = Number.isSafeInteger(options.maxAttempts) && options.maxAttempts > 0
+    ? options.maxAttempts
+    : MAX_PACKAGE_NAME_ALLOCATION_ATTEMPTS;
+  return rawName => {
+    const safeName = sanitizePackageFileName(rawName, 'file');
+    const ext = path.extname(safeName);
+    const base = path.basename(safeName, ext);
+    const attemptedKeys = new Set();
+    for (let counter = 0; counter < maxAttempts; counter++) {
+      const suffix = counter === 0 ? '' : `_${counter}`;
+      const maxBaseLength = MAX_PACKAGE_NAME_LENGTH - ext.length - suffix.length;
+      const maxBaseBytes = MAX_PACKAGE_COMPONENT_BYTES -
+        Buffer.byteLength(ext, 'utf8') -
+        Buffer.byteLength(suffix, 'utf8');
+      if (maxBaseLength < 1) throw new PackageNameAllocationError();
+      const outputBase = truncatePackageComponent(base, maxBaseLength, maxBaseBytes);
+      if (!outputBase) throw new PackageNameAllocationError();
+      const outputName = `${outputBase}${suffix}${ext}`;
+      if (outputName.length > MAX_PACKAGE_NAME_LENGTH || Buffer.byteLength(outputName, 'utf8') > MAX_PACKAGE_COMPONENT_BYTES) {
+        throw new PackageNameAllocationError();
+      }
+      const collisionKey = packageCollisionKey(outputName);
+      if (attemptedKeys.has(collisionKey)) throw new PackageNameAllocationError();
+      attemptedKeys.add(collisionKey);
+      if (usedKeys.has(collisionKey)) continue;
+      usedKeys.add(collisionKey);
+      return outputName;
+    }
+    throw new PackageNameAllocationError();
+  };
 }
 
 function isPathInsideDirectory(rootDir, candidatePath) {
@@ -223,23 +303,13 @@ function resolveUniquePackagePath(destFolder, rawName, options = {}) {
     throw new Error('Package destination escapes package folder');
   }
 
-  let counter = 1;
-  while (lstatIfExists(finalPath)) {
-    const dir = path.dirname(finalPath);
-    if (!isPathInsideDirectory(root, dir)) {
-      throw new Error('Package destination escapes package folder');
-    }
-    const ext = path.extname(relativeName);
-    const base = path.basename(relativeName, ext);
-    finalPath = path.join(dir, `${base}_${counter}${ext}`);
-    if (!isPathInsideDirectory(root, finalPath)) {
-      throw new Error('Package destination escapes package folder');
-    }
-    counter++;
-  }
-
   const destDir = path.dirname(finalPath);
   ensureSafeDestinationDirectory(root, realRoot, destDir);
+  const allocateName = createPackageNameAllocator(fs.readdirSync(destDir));
+  finalPath = path.join(destDir, allocateName(path.basename(relativeName)));
+  if (!isPathInsideDirectory(root, finalPath)) {
+    throw new Error('Package destination escapes package folder');
+  }
   if (lstatIfExists(finalPath)) {
     throw new Error('Package destination already exists');
   }
@@ -350,8 +420,12 @@ function removeCreatedPackageFiles(destFolder, filePaths) {
 }
 
 module.exports = {
+  PackageNameAllocationError,
+  truncatePackageComponent,
   sanitizePackageFileName,
   sanitizePackageRelativePath,
+  packageCollisionKey,
+  createPackageNameAllocator,
   isPathInsideDirectory,
   ensureSafePackageDirectory,
   resolveUniquePackagePath,
