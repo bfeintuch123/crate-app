@@ -8156,8 +8156,18 @@ test('Illustrator placed item fallback without a source path fails closed', asyn
   });
 
   const project = await createProject('Illustrator placed file fallback');
-  await waitForProject(project.id, () => osascriptInvocations >= 1, 5000);
-  const fresh = await getProject(project.id);
+  const fresh = await waitForProject(
+    project.id,
+    item => (
+      osascriptInvocations >= 1 &&
+      getLiveAppStatusEntries(item, 'illustrator').some(entry => (
+        entry.scriptAttempted === true &&
+        entry.scriptSuccess === false &&
+        entry.errorCategory === 'illustrator-placed-item-file-query-failed'
+      ))
+    ),
+    5000
+  );
   assert.deepEqual(fresh.files, []);
   assert.deepEqual(fresh.pendingFiles, []);
   assert.equal(getSessionObservedByMethod(fresh, 'ai-linked').length, 0);
