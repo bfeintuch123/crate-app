@@ -7220,7 +7220,8 @@ function admitIllustratorRelationshipPathsForProject(projectId, sourcePath, link
     (
       isAcceptedIllustratorProjectFile(project, file) ||
       (ILLUSTRATOR_SOURCE_EXTENSIONS.has((file.ext || path.extname(file.path || '')).toLowerCase()) &&
-        isAcceptedPendingCapturedFile(project, file))
+        (isAcceptedPendingCapturedFile(project, file) ||
+          (scope.status === 'ready' && isCurrentSessionSavedSource(project, file))))
     )
   ));
   if (!scope.admittedDocumentPaths.has(normalizedSourcePath) && !sourceAccepted) return scope;
