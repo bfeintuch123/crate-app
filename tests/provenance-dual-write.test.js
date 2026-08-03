@@ -9113,6 +9113,85 @@ test('Illustrator baseline document stays excluded until Add files admits its so
   assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath && file.source === 'ai-linked'), true);
 });
 
+test('current-session watcher save admits a baseline Illustrator source and its parser-confirmed linked asset', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Review_Project.ai');
+  const linkedPath = '/Users/CrateQA/Review_Initial.png';
+  fs.writeFileSync(sourcePath, `Illustrator linked asset: ${linkedPath}`);
+  let illustratorQueryCount = 0;
+  let sourceReadCount = 0;
+  let linkedAccessCount = 0;
+
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '432\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      illustratorQueryCount++;
+      return {
+        stdout: `DOC\t${sourcePath}\tReview_Project.ai\tfalse\ttrue\n` +
+          `LINK\t${sourcePath}\tReview_Project.ai\t${linkedPath}\tfalse\ttrue\nCOMPLETE\t1\t1\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const originalAccess = fs.promises.access;
+  const originalAccessSync = fs.accessSync;
+  const originalReadFile = fs.promises.readFile;
+  fs.promises.readFile = async function readReviewProject(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(sourcePath)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, filePath, ...args);
+  };
+  fs.promises.access = async function accessReviewLinkedAsset(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(linkedPath)) {
+      linkedAccessCount++;
+      return;
+    }
+    return originalAccess.call(fs.promises, filePath, ...args);
+  };
+  fs.accessSync = function accessReviewLinkedAssetSync(filePath, ...args) {
+    if (path.resolve(filePath) === path.resolve(linkedPath)) return;
+    return originalAccessSync.call(fs, filePath, ...args);
+  };
+
+  try {
+    const project = await createProject('Illustrator baseline watcher save');
+    assert.equal(illustratorQueryCount >= 1, true);
+    let fresh = await getProject(project.id);
+    assert.deepEqual(fresh.files, []);
+    assert.deepEqual(fresh.pendingFiles, []);
+
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const saveMtimeMs = stored.watchStartedAt + 1000;
+    fs.utimesSync(sourcePath, new Date(saveMtimeMs), new Date(saveMtimeMs));
+    await emitWatcher('change', sourcePath, {
+      mtimeMs: saveMtimeMs,
+      birthtimeMs: stored.watchStartedAt - 1000,
+    });
+
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath) &&
+        item.files.some(file => file.path === linkedPath && file.source === 'scan-on-open'),
+      5000
+    );
+    assert.equal(sourceReadCount > 0, true);
+    assert.equal(linkedAccessCount > 0, true);
+    assert.deepEqual(fresh.pendingFiles, []);
+    assert.deepEqual(fresh.files.map(file => file.path).sort(), [linkedPath, sourcePath].sort());
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
+    assert.equal(getSessionObservedByMethod(fresh, 'projects:add-files').length, 0);
+    assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 1);
+    const linkedLedgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+      .filter(entry => entry.latest && entry.latest.candidateName === 'Review_Initial.png');
+    assert.ok(linkedLedgerEntries.some(entry => entry.strongestState === 'package-ready'));
+  } finally {
+    fs.promises.access = originalAccess;
+    fs.accessSync = originalAccessSync;
+    fs.promises.readFile = originalReadFile;
+  }
+});
+
 for (const projectState of ['watching', 'paused']) {
   test(`Add files explicitly authorizes a hidden same-path Illustrator record for a ${projectState} project`, async () => {
     resetTestHomeWorkspace();
