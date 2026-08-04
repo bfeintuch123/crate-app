@@ -178,15 +178,24 @@ async function getXattrLastUsedMs(filePath) {
     const { stdout } = await execFileAsync("/usr/bin/xattr", ["-px", "com.apple.lastuseddate#PS", filePath], {
       timeout: 1000, encoding: 'utf8'
     });
-    const hexStr = stdout.trim();
-    if (!hexStr) return null;
-    const bytes = Buffer.from(hexStr.replace(/\s+/g, ''), 'hex');
-    if (bytes.length < 8) return null;
-    // CFAbsoluteTime: little-endian double, seconds since Jan 1, 2001
-    const cfTime = bytes.readDoubleLE(0);
-    if (cfTime <= 0) return null;
-    const MAC_EPOCH_OFFSET_MS = 978307200000;
-    return cfTime * 1000 + MAC_EPOCH_OFFSET_MS;
+    const hexStr = stdout.replace(/\s+/g, '');
+    if (hexStr.length !== 32 || !/^[0-9a-f]+$/i.test(hexStr)) return null;
+    const bytes = Buffer.from(hexStr, 'hex');
+    // com.apple.lastuseddate#PS stores a native little-endian timespec:
+    // signed Unix seconds followed by signed nanoseconds.
+    const seconds = bytes.readBigInt64LE(0);
+    const nanoseconds = bytes.readBigInt64LE(8);
+    const MAX_JAVASCRIPT_DATE_SECONDS = 8640000000000n;
+    if (
+      seconds <= 0n ||
+      seconds > MAX_JAVASCRIPT_DATE_SECONDS ||
+      nanoseconds < 0n ||
+      nanoseconds >= 1000000000n
+    ) return null;
+    const secondsNumber = Number(seconds);
+    if (!Number.isSafeInteger(secondsNumber)) return null;
+    const lastUsedMs = secondsNumber * 1000 + Number(nanoseconds) / 1000000;
+    return Number.isFinite(lastUsedMs) ? lastUsedMs : null;
   } catch (e) {
     return null;
   }
@@ -4498,6 +4507,7 @@ function mutateProject(projectId, fn) {
 
 // FIX 2 (C2): Track in-flight pre-package scans
 const scanInFlight = new Set();
+const packageScanSettlements = new Map();
 const incompletePackageScans = new Set();
 const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
 const figmaPackageTransferBlocks = new Map();
@@ -10276,7 +10286,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
 // file handle. Scan Desktop/Documents/Downloads for .fig files modified during the
 // session (mtime >= watchStartedAt) to catch locally-saved Figma files.
 // For .fig files saved BEFORE the session, users should use "+ Add files".
-async function runPackageScanPhase(operation, timeoutMs, work) {
+async function runPackageScanPhase(operation, timeoutMs, work, onTimeout = null) {
   let timeoutId = null;
   const workResult = Promise.resolve().then(work).then(
     () => ({ status: 'complete' }),
@@ -10290,12 +10300,14 @@ async function runPackageScanPhase(operation, timeoutMs, work) {
   if (result.status === 'error') throw result.error;
   if (result.status === 'timeout') {
     operation.close();
+    if (typeof onTimeout === 'function') onTimeout(workResult);
     return false;
   }
   return true;
 }
 
 registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) => {
+  if (scanInFlight.has(projectId)) return { error: 'package_scan_incomplete' };
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current, stagePrePackageFile = (project, file, observation) => operationCurrent() ? stageLiveObservedFile(project, file, observation) : null;
   // FIX 2 (C2): Track scan in-flight so package handler can wait
@@ -10447,75 +10459,88 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // pre-existing .fig file opened (imported) in Figma only updates
   // kMDItemLastUsedDate, not mtime. Removing the .fig skip lets this
   // scan catch those imports. Dedup via existingPaths prevents doubles.
-  for (const dir of scanDirs) {
-    try {
-      if (!fs.existsSync(dir)) continue;
-      const scanFolderLastUsed = async (folder, depth) => {
-        let entries;
-        try { entries = fs.readdirSync(folder, { withFileTypes: true }); }
-        catch (e) { return; }
+  const lastUsedCandidates = [];
+  const collectLastUsedCandidates = async (folder, depth) => {
+    let entries;
+    try { entries = await fs.promises.readdir(folder, { withFileTypes: true }); }
+    catch (e) { return; }
+    if (!operationCurrent()) return;
+    entries.sort((left, right) => left.name.localeCompare(right.name));
 
-        for (const entry of entries) {
-          const fullPath = path.join(folder, entry.name);
-          if (entry.name.startsWith('.')) continue;
-
-          if (entry.isDirectory() && depth < 3) {
-            await scanFolderLastUsed(fullPath, depth + 1);
-            if (!operationCurrent()) return;
-            continue;
-          }
-
-          if (!entry.isFile()) continue;
-          const ext = path.extname(entry.name).toLowerCase();
-          if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
-          if (isAutoCaptureExcludedPath(fullPath)) continue;
-          const normalizedFullPath = normalizeTrackedFilePath(fullPath);
-          if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
-
-          try {
-            const { stdout: mdlsRaw } = await execFileAsync("/usr/bin/mdls", ["-name", "kMDItemLastUsedDate", "-raw", fullPath], {
-              timeout: 2000, encoding: 'utf8'
-            });
-            if (!operationCurrent()) return;
-            const mdlsOut = mdlsRaw.trim();
-            if (!mdlsOut || mdlsOut === '(null)') continue;
-
-            const lastUsedTime = new Date(mdlsOut).getTime();
-            if (isNaN(lastUsedTime) || lastUsedTime < watchStart) {
-              // Fallback: check xattr directly — no Spotlight delay
-              const xattrTime = await getXattrLastUsedMs(fullPath);
-              if (!operationCurrent()) return;
-              if (!xattrTime || xattrTime < watchStart) continue;
-            }
-          } catch (e) {
-            continue;
-          }
-
-          const fileEntry = buildAutoCaptureFileEntry(fullPath, 'lastused-scan', {
-            name: entry.name,
-            ext,
-          });
-          const staged = stagePrePackageFile(project, fileEntry, {
-            forcePending: true,
-            appFamily: 'generic',
-            reason: 'pre-package-lastused-scan',
-          });
-          if (!staged || !staged.changed) continue;
-          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
-            existingPaths.add(normalizedFullPath);
-          } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
-            pendingPaths.add(normalizedFullPath);
-          }
-          newCount++;
-        }
-      };
-      await scanFolderLastUsed(dir, 0);
-      if (!operationCurrent()) return;
-    } catch (e) {
-      // scan error — continue with others
+    for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+      const entry = entries[entryIndex];
+      const fullPath = path.join(folder, entry.name);
+      if (entry.name.startsWith('.')) continue;
+      if (entry.isDirectory() && depth < 3) {
+        await collectLastUsedCandidates(fullPath, depth + 1);
+        if (!operationCurrent()) return;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!DESIGN_FILE_EXTENSIONS.has(ext) || isAutoCaptureExcludedPath(fullPath)) continue;
+      const normalizedFullPath = normalizeTrackedFilePath(fullPath);
+      if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
+      lastUsedCandidates.push({ fullPath, name: entry.name, ext, normalizedFullPath });
+      if (lastUsedCandidates.length % 256 === 0) {
+        await new Promise(resolve => setImmediate(resolve));
+        if (!operationCurrent()) return;
+      }
     }
+  };
+
+  for (const dir of scanDirs) {
+    if (fs.existsSync(dir)) await collectLastUsedCandidates(dir, 0);
+    if (!operationCurrent()) return;
   }
-  });
+
+  const recentLastUsedCandidates = new Array(lastUsedCandidates.length).fill(false);
+  let nextLastUsedCandidate = 0;
+  const scanLastUsedCandidate = async () => {
+    while (operationCurrent()) {
+      const candidateIndex = nextLastUsedCandidate++;
+      if (candidateIndex >= lastUsedCandidates.length) return;
+      const candidate = lastUsedCandidates[candidateIndex];
+      const xattrTime = await getXattrLastUsedMs(candidate.fullPath);
+      if (!operationCurrent()) return;
+      let lastUsedTime = xattrTime;
+      if (lastUsedTime === null || lastUsedTime < watchStart) {
+        const mdlsTime = await getMdlsLastUsedMs(candidate.fullPath);
+        if (!operationCurrent()) return;
+        if (mdlsTime !== null && (lastUsedTime === null || mdlsTime > lastUsedTime)) {
+          lastUsedTime = mdlsTime;
+        }
+      }
+      if (lastUsedTime !== null && lastUsedTime >= watchStart) {
+        recentLastUsedCandidates[candidateIndex] = true;
+      }
+    }
+  };
+  const lastUsedWorkerCount = Math.min(16, lastUsedCandidates.length);
+  await Promise.all(Array.from({ length: lastUsedWorkerCount }, () => scanLastUsedCandidate()));
+  if (!operationCurrent()) return;
+
+  for (let candidateIndex = 0; candidateIndex < lastUsedCandidates.length; candidateIndex++) {
+    if (!recentLastUsedCandidates[candidateIndex]) continue;
+    const candidate = lastUsedCandidates[candidateIndex];
+    const fileEntry = buildAutoCaptureFileEntry(candidate.fullPath, 'lastused-scan', {
+      name: candidate.name,
+      ext: candidate.ext,
+    });
+    const staged = stagePrePackageFile(project, fileEntry, {
+      forcePending: true,
+      appFamily: 'generic',
+      reason: 'pre-package-lastused-scan',
+    });
+    if (!staged || !staged.changed) continue;
+    if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+      existingPaths.add(candidate.normalizedFullPath);
+    } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
+      pendingPaths.add(candidate.normalizedFullPath);
+    }
+    newCount++;
+  }
+  }, settlement => packageScanSettlements.set(projectId, settlement));
   if (!discoveryComplete) {
     incompletePackageScans.add(projectId);
     return { error: 'package_scan_incomplete' };
@@ -10684,7 +10709,7 @@ end tell`;
   } catch (e) {
     // AppleScript failed or InDesign not responding — fall through to regex
   }
-  });
+  }, settlement => packageScanSettlements.set(projectId, settlement));
   if (!appScanComplete) {
     incompletePackageScans.add(projectId);
     return { error: 'package_scan_incomplete' };
@@ -10928,8 +10953,16 @@ end tell`;
   } finally {
     if (!operation.current()) previousFigmaPackageBlock === undefined ? figmaPackageTransferBlocks.delete(projectId) : figmaPackageTransferBlocks.set(projectId, previousFigmaPackageBlock);
     operation.close();
-    // FIX 2 (C2): Always clear scan-in-flight flag
-    scanInFlight.delete(projectId);
+    const settlement = packageScanSettlements.get(projectId);
+    if (settlement) {
+      settlement.finally(() => {
+        if (packageScanSettlements.get(projectId) !== settlement) return;
+        packageScanSettlements.delete(projectId);
+        scanInFlight.delete(projectId);
+      });
+    } else {
+      scanInFlight.delete(projectId);
+    }
     scheduleDeletedProjectCacheCleanup(projectId);
   }
 });

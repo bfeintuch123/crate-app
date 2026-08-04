@@ -544,6 +544,15 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-parser-'));
 }
 
+function encodeLastUsedXattr(timestampMs) {
+  const bytes = Buffer.alloc(16);
+  const seconds = Math.floor(timestampMs / 1000);
+  const nanoseconds = Math.floor((timestampMs - (seconds * 1000)) * 1000000);
+  bytes.writeBigInt64LE(BigInt(seconds), 0);
+  bytes.writeBigInt64LE(BigInt(nanoseconds), 8);
+  return bytes.toString('hex');
+}
+
 function presentationCachePaths(projectId) {
   const crateDir = path.join(TEST_HOME, '.crate');
   const assetsDir = path.join(crateDir, 'presentation-assets');
@@ -4367,14 +4376,335 @@ test('pre-package discovery timeout invalidates and cancels late scan work', asy
     global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 0 : delay, ...args);
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, 'package_scan_incomplete');
-    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
+    assert.equal((await callIpcRaw('projects:pre-package-scan', project.id)).error, 'package_scan_incomplete');
     releaseMdls();
     await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
     assert.deepEqual((await getProject(project.id)).files, []);
     await callIpcRaw('projects:delete', project.id);
   } finally {
     global.setTimeout = trackedSetTimeout;
     releaseMdls();
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('pre-package discovery timeout blocks an otherwise materializable project when a relevant candidate stalls', async () => {
+  resetTestHomeWorkspace();
+  const projectRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.7.1-jenna', 'source-copies');
+  const sourcePath = path.join(projectRoot, 'Review_Project.ai');
+  const linkedPath = path.join(projectRoot, 'Review_Initial.png');
+  const unrelatedRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.7.1-jenna', 'historical-fixtures');
+  const stalledCandidate = path.join(unrelatedRoot, 'relevant-open.ai');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'package-output');
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.mkdirSync(unrelatedRoot, { recursive: true });
+  fs.mkdirSync(outputDir, { recursive: true });
+  fs.writeFileSync(sourcePath, 'valid Illustrator source bytes');
+  fs.writeFileSync(linkedPath, 'valid linked PNG bytes');
+
+  const project = await createProject('Review Project');
+  await setProjectFiles(project.id, {
+    files: [sourcePath, linkedPath].map(filePath => ({
+      path: filePath,
+      name: path.basename(filePath),
+      ext: path.extname(filePath).toLowerCase(),
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+    })),
+  });
+  const initialReview = await callIpcRaw('projects:prepare-package-review', project.id);
+  assert.equal(initialReview.materializable, true);
+  assert.equal(typeof initialReview.token, 'string');
+  for (let index = 0; index < 64; index++) {
+    fs.writeFileSync(path.join(unrelatedRoot, `historical-${index}.ai`), 'unrelated design fixture');
+    fs.writeFileSync(path.join(unrelatedRoot, `historical-${index}.png`), 'unrelated image fixture');
+  }
+  fs.writeFileSync(stalledCandidate, 'relevant design fixture');
+  const before = await getProject(project.id);
+  const beforeState = JSON.stringify(before);
+  const beforeQuota = storeInstance.get('usage.packagesThisMonth');
+  const beforeWatcherCount = watcherRecords.length;
+  const beforeWatcherCloseCount = watcherCloseCount;
+  const recentXattr = encodeLastUsedXattr(Date.now() + 1000);
+  const trackedSetTimeout = global.setTimeout;
+  let mdlsCalls = 0;
+  let releaseMdls;
+  const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        const candidatePath = request.args[request.args.length - 1];
+        if (candidatePath !== stalledCandidate) return { stdout: recentXattr };
+        return { stdout: '' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsCalls++;
+        return mdlsGate.then(() => ({ stdout: '(null)' }));
+      }
+      return { stdout: '' };
+    });
+    global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 100 : delay, ...args);
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.equal(mdlsCalls, 1);
+    assert.equal((await callIpcRaw('projects:pre-package-scan', project.id)).error, 'package_scan_incomplete');
+    releaseMdls();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'package_scan_incomplete');
+    const packageResult = await callIpcRaw('projects:package', project.id, outputDir, initialReview.token);
+    assert.equal(packageResult.error, 'package_scan_incomplete');
+    assert.equal(fs.readdirSync(outputDir).length, 0);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), beforeQuota);
+    assert.equal(watcherRecords.length, beforeWatcherCount);
+    assert.equal(watcherCloseCount, beforeWatcherCloseCount);
+    const after = await getProject(project.id);
+    assert.equal(after.status, before.status);
+    assert.equal(after.outputPath, before.outputPath);
+    assert.equal(JSON.stringify(after.provenance), JSON.stringify(before.provenance));
+    assert.equal(JSON.stringify(after), beforeState);
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    releaseMdls();
+    await new Promise(resolve => setImmediate(resolve));
+    setChildProcessHandler(null);
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('bounded pre-package metadata checks settle accumulated unrelated fixtures concurrently', async () => {
+  resetTestHomeWorkspace();
+  const projectRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.7.1-jenna', 'source-copies');
+  const sourcePath = path.join(projectRoot, 'Review_Project.ai');
+  const linkedPath = path.join(projectRoot, 'Review_Initial.png');
+  const unrelatedRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.7.1-jenna', 'historical-fixtures');
+  const outputDir = path.join(TEST_HOME, 'Desktop', 'package-output');
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.mkdirSync(unrelatedRoot, { recursive: true });
+  fs.mkdirSync(outputDir, { recursive: true });
+  fs.writeFileSync(sourcePath, 'valid Illustrator source bytes');
+  fs.writeFileSync(linkedPath, 'valid linked PNG bytes');
+  for (let index = 0; index < 64; index++) {
+    fs.writeFileSync(path.join(unrelatedRoot, `historical-${index}.ai`), 'unrelated design fixture');
+    fs.writeFileSync(path.join(unrelatedRoot, `historical-${index}.png`), 'unrelated image fixture');
+  }
+
+  const project = await createProject('Review Project Without Metadata Stall');
+  await setProjectFiles(project.id, {
+    files: [sourcePath, linkedPath].map(filePath => ({
+      path: filePath,
+      name: path.basename(filePath),
+      ext: path.extname(filePath).toLowerCase(),
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+    })),
+  });
+  const before = await getProject(project.id);
+  const beforeState = JSON.stringify(before);
+  const beforeQuota = storeInstance.get('usage.packagesThisMonth');
+  const beforeWatcherCount = watcherRecords.length;
+  const beforeWatcherCloseCount = watcherCloseCount;
+  const historicalXattr = encodeLastUsedXattr(Date.now() - (24 * 60 * 60 * 1000));
+  const historicalMdls = new Date(Date.now() - (24 * 60 * 60 * 1000)).toISOString();
+  let mdlsCalls = 0;
+  let activeMdlsCalls = 0;
+  let maxActiveMdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: historicalXattr };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsCalls++;
+        activeMdlsCalls++;
+        maxActiveMdlsCalls = Math.max(maxActiveMdlsCalls, activeMdlsCalls);
+        return new Promise(resolve => setTimeout(() => {
+          activeMdlsCalls--;
+          resolve({ stdout: historicalMdls });
+        }, 5));
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 128);
+    assert.ok(maxActiveMdlsCalls > 1);
+    assert.ok(maxActiveMdlsCalls <= 16);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.materializable, true);
+    assert.equal(typeof review.token, 'string');
+    assert.deepEqual(review.files.map(file => file.name), ['Review_Project.ai', 'Review_Initial.png']);
+    assert.equal(fs.readdirSync(outputDir).length, 0);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), beforeQuota);
+    assert.equal(watcherRecords.length, beforeWatcherCount);
+    assert.equal(watcherCloseCount, beforeWatcherCloseCount);
+    assert.equal(JSON.stringify(await getProject(project.id)), beforeState);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('invalid xattr timestamps fall back to mdls without admitting candidates', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'invalid-xattr-fixtures');
+  const farFutureTimespec = Buffer.alloc(16);
+  farFutureTimespec.writeBigInt64LE(8640000000001n, 0);
+  const candidateXattrs = new Map([
+    [path.join(candidateRoot, 'malformed.ai'), 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'],
+    [path.join(candidateRoot, 'negative-seconds.ai'), 'ffffffffffffffff0000000000000000'],
+    [path.join(candidateRoot, 'invalid-nanoseconds.ai'), '00f153650000000000ca9a3b00000000'],
+    [path.join(candidateRoot, 'out-of-range-seconds.ai'), farFutureTimespec.toString('hex')],
+  ]);
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  for (const candidatePath of candidateXattrs.keys()) fs.writeFileSync(candidatePath, 'unrelated design fixture');
+
+  const project = await createProject('Invalid Xattr Review');
+  const before = await getProject(project.id);
+  const mdlsPaths = [];
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: candidateXattrs.get(request.args[request.args.length - 1]) || '' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsPaths.push(request.args[request.args.length - 1]);
+        return { stdout: '(null)' };
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.deepEqual(mdlsPaths.sort(), [...candidateXattrs.keys()].sort());
+    assert.equal(JSON.stringify(await getProject(project.id)), JSON.stringify(before));
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package discovery preserves a newer mdls signal when xattr is stale', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'newer-spotlight.psd');
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+  fs.writeFileSync(candidatePath, 'recent design source');
+  const project = await createProject('Newer Spotlight Signal');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.now() - 1000;
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: encodeLastUsedXattr(storedProject.watchStartedAt - 1000) };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsCalls++;
+        return { stdout: new Date(storedProject.watchStartedAt + 500).toISOString() };
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 1);
+    const updated = await getProject(project.id);
+    assert.equal(updated.files.length, 0);
+    assert.equal(updated.pendingFiles.length, 0);
+    assert.equal(
+      updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(candidatePath)].latest.reason,
+      'broad-observer-outside-session'
+    );
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('pre-package discovery accepts a real macOS last-used timespec without mdls fallback', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'native-timespec.psd');
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+  fs.writeFileSync(candidatePath, 'native timespec design source');
+  const project = await createProject('Native Timespec Signal');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.parse('2026-06-01T00:00:00Z');
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: '26a3346a0000000055ce821e00000000' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsCalls++;
+        return { stdout: '(null)' };
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 0);
+    const updated = await getProject(project.id);
+    assert.equal(updated.files.length, 0);
+    assert.equal(updated.pendingFiles.length, 0);
+    assert.equal(
+      updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(candidatePath)].latest.reason,
+      'broad-observer-outside-session'
+    );
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('real macOS last-used timespec falls back after its exact nanosecond boundary', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'native-timespec-boundary.psd');
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+  fs.writeFileSync(candidatePath, 'native timespec boundary source');
+  const project = await createProject('Native Timespec Boundary');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = 1781834534512;
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: '26a3346a0000000055ce821e00000000' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        mdlsCalls++;
+        return { stdout: '(null)' };
+      }
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 1);
+    const updated = await getProject(project.id);
+    assert.equal(updated.files.length, 0);
+    assert.equal(updated.pendingFiles.length, 0);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        (updated.liveEvidenceLedger && updated.liveEvidenceLedger.candidates) || {},
+        liveEvidenceKeyForTest(candidatePath)
+      ),
+      false
+    );
+  } finally {
     setChildProcessHandler(null);
     fs.rmSync(candidatePath, { force: true });
   }
