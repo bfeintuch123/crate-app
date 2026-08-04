@@ -4406,6 +4406,74 @@ test('pre-package discovery timeout invalidates late work and reports fresh over
   }
 });
 
+test('final package confirmation reports privacy-safe evidence when an input scan is still in flight', async () => {
+  resetTestHomeWorkspace();
+  const tmpRoot = makeTempDir();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Confirmation.ai');
+  const stalledCandidate = path.join(TEST_HOME, 'Documents', 'Pending.ai');
+  const outputDir = path.join(tmpRoot, 'out');
+  const originalDateNow = Date.now;
+  let releaseMdls = () => {};
+  let markMdlsStarted = () => {};
+  try {
+    fs.writeFileSync(sourcePath, 'reviewed source bytes');
+    fs.writeFileSync(stalledCandidate, 'pending discovery bytes');
+    fs.mkdirSync(outputDir);
+    const project = await createProject('In-Flight Confirmation');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.materializable, true);
+    const before = capturePackageSideEffects(stored);
+    const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
+    const mdlsStarted = new Promise(resolve => { markMdlsStarted = resolve; });
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: '' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        markMdlsStarted();
+        return mdlsGate.then(() => ({ stdout: '(null)' }));
+      }
+      return { stdout: '' };
+    });
+
+    const scanPromise = callIpcRaw('projects:pre-package-scan', project.id);
+    await mdlsStarted;
+    let now = originalDateNow();
+    Date.now = () => {
+      now += 31000;
+      return now;
+    };
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    Date.now = originalDateNow;
+
+    assert.equal(result.error, 'package_scan_in_flight');
+    assert.equal(result.diagnostics.failurePhase, 'package-input-scan-wait');
+    assert.ok(Number.isSafeInteger(result.diagnostics.phaseElapsedMs));
+    assert.ok(result.diagnostics.phaseElapsedMs >= 0);
+    assert.deepEqual(Object.keys(result.diagnostics).sort(), ['failurePhase', 'phaseElapsedMs']);
+    assert.equal(JSON.stringify(result.diagnostics).includes(sourcePath), false);
+    assert.equal(JSON.stringify(result.diagnostics).includes(path.basename(sourcePath)), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+
+    releaseMdls();
+    await scanPromise;
+  } finally {
+    Date.now = originalDateNow;
+    releaseMdls();
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(stalledCandidate, { force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('a fresh pre-package retry replaces prior scan metrics', async () => {
   resetTestHomeWorkspace();
   const candidateRoot = path.join(TEST_HOME, 'Desktop', 'fresh-retry-fixtures');
@@ -4563,6 +4631,10 @@ test('pre-package discovery timeout blocks an otherwise materializable project w
     assert.deepEqual(review.diagnostics, scan.diagnostics);
     const packageResult = await callIpcRaw('projects:package', project.id, outputDir, initialReview.token);
     assert.equal(packageResult.error, 'package_scan_incomplete');
+    assert.deepEqual(packageResult.diagnostics, scan.diagnostics);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes(projectRoot), false);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes('Review_Project.ai'), false);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes('relevant-open.ai'), false);
     assert.equal(fs.readdirSync(outputDir).length, 0);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), beforeQuota);
     assert.equal(watcherRecords.length, beforeWatcherCount);

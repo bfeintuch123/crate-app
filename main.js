@@ -12858,8 +12858,16 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   // Wait for in-flight pre-package and Figma scans to finish before selecting
   // package files. Large Figma pages can still be downloading when the user
   // clicks Package, and selecting too early yields a zero-file package.
-  if (!await waitForPackageInputScans(id)) return { error: 'package_scan_in_flight' };
-  if (incompletePackageScans.has(id)) return { error: 'package_scan_incomplete' };
+  const scanWaitStartedAt = Date.now();
+  if (!await waitForPackageInputScans(id)) {
+    return createPackageReviewErrorResult(id, 'package_scan_in_flight', {
+      failurePhase: 'package-input-scan-wait',
+      phaseElapsedMs: Math.max(0, Date.now() - scanWaitStartedAt),
+    });
+  }
+  if (incompletePackageScans.has(id)) {
+    return createPackageReviewErrorResult(id, 'package_scan_incomplete');
+  }
   if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
 
   const figmaPackageError = figmaPackageTransferBlocks.get(id);

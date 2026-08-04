@@ -786,6 +786,75 @@ test('renderer surfaces typed Package Review scan diagnostics without private va
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
+test('renderer surfaces final package-confirmation diagnostics after Package Now', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'confirmation-diagnostic-project',
+    name: 'Confirmation Diagnostic',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Confirmation.ai', ext: '.ai' }],
+  };
+  const review = {
+    token: '00000000-0000-4000-8000-000000000191',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    materializable: true,
+  };
+  const privatePath = '/Users/synthetic/Private Client/Confirmation.ai';
+  const packageCalls = [];
+  let prepareCalls = 0;
+  const diagnosticFailure = {
+    error: 'package_scan_incomplete',
+    diagnostics: {
+      failurePhase: 'pre-package-discovery',
+      phaseElapsedMs: 8000,
+      candidateCount: 129,
+      xattrResolvedCount: 128,
+      metadataFallbackCount: 1,
+      sourcePath: privatePath,
+      fileName: 'Confirmation.ai',
+    },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => ({ success: true }),
+    preparePackageReview: async () => (++prepareCalls === 1 ? review : diagnosticFailure),
+    getProjects: async () => [project],
+    packageProject: async (...args) => {
+      packageCalls.push(args);
+      return diagnosticFailure;
+    },
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  await renderer.confirmPackage();
+
+  assert.equal(packageCalls.length, 1);
+  assert.equal(prepareCalls, 2);
+  assert.equal(packageCalls[0][2], review.token);
+  assert.equal(
+    elements['modal-package-review-message'].textContent,
+    'Crate could not finish checking project files. No package was created. ' +
+      'Record the diagnostic below before retrying. ' +
+      'Diagnostic: code package_scan_incomplete · phase pre-package-discovery · elapsed 8000 ms · ' +
+      'candidates 129 · xattr resolved 128 · metadata fallback 1.'
+  );
+  assert.equal(elements['modal-package-review-message'].textContent.includes(privatePath), false);
+  assert.equal(elements['modal-package-review-message'].textContent.includes('Confirmation.ai'), false);
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+});
+
 test('renderer disables unavailable Package Review and re-enables only after a fresh materializable review', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
