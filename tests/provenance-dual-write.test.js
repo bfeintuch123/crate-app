@@ -4358,7 +4358,7 @@ test('presentation container mutation during reviewed copy removes staging and s
   }
 });
 
-test('pre-package discovery timeout invalidates and cancels late scan work', async () => {
+test('pre-package discovery timeout invalidates late work and reports fresh overlap evidence', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Stalled Pre-Package Scan');
   const candidatePath = path.join(TEST_HOME, 'Desktop', 'Late.ai');
@@ -4376,18 +4376,177 @@ test('pre-package discovery timeout invalidates and cancels late scan work', asy
     global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 0 : delay, ...args);
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, 'package_scan_incomplete');
-    assert.equal((await callIpcRaw('projects:pre-package-scan', project.id)).error, 'package_scan_incomplete');
+    assert.equal(scan.diagnostics.failurePhase, 'pre-package-discovery');
+    for (const field of ['phaseElapsedMs', 'candidateCount', 'xattrResolvedCount', 'metadataFallbackCount']) {
+      assert.ok(Number.isSafeInteger(scan.diagnostics[field]));
+      assert.ok(scan.diagnostics[field] >= 0);
+    }
+    assert.equal(JSON.stringify(scan.diagnostics).includes(candidatePath), false);
+    assert.equal(JSON.stringify(scan.diagnostics).includes(path.basename(candidatePath)), false);
     releaseMdls();
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'package_scan_incomplete');
+    assert.deepEqual(review.diagnostics, scan.diagnostics);
     assert.deepEqual((await getProject(project.id)).files, []);
     await callIpcRaw('projects:delete', project.id);
+    const deletedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(deletedReview.error, 'not_found');
+    assert.equal(deletedReview.diagnostics.failurePhase, 'prepare-package-review');
+    assert.ok(Number.isSafeInteger(deletedReview.diagnostics.phaseElapsedMs));
+    for (const field of ['candidateCount', 'xattrResolvedCount', 'metadataFallbackCount']) {
+      assert.equal(Object.prototype.hasOwnProperty.call(deletedReview.diagnostics, field), false);
+    }
   } finally {
     global.setTimeout = trackedSetTimeout;
     releaseMdls();
     setChildProcessHandler(null);
     fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('final package confirmation reports privacy-safe evidence when an input scan is still in flight', async () => {
+  resetTestHomeWorkspace();
+  const tmpRoot = makeTempDir();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Confirmation.ai');
+  const stalledCandidate = path.join(TEST_HOME, 'Documents', 'Pending.ai');
+  const outputDir = path.join(tmpRoot, 'out');
+  const originalDateNow = Date.now;
+  let releaseMdls = () => {};
+  let markMdlsStarted = () => {};
+  try {
+    fs.writeFileSync(sourcePath, 'reviewed source bytes');
+    fs.writeFileSync(stalledCandidate, 'pending discovery bytes');
+    fs.mkdirSync(outputDir);
+    const project = await createProject('In-Flight Confirmation');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.materializable, true);
+    const before = capturePackageSideEffects(stored);
+    const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
+    const mdlsStarted = new Promise(resolve => { markMdlsStarted = resolve; });
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: '' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        markMdlsStarted();
+        return mdlsGate.then(() => ({ stdout: '(null)' }));
+      }
+      return { stdout: '' };
+    });
+
+    const scanPromise = callIpcRaw('projects:pre-package-scan', project.id);
+    await mdlsStarted;
+    let now = originalDateNow();
+    Date.now = () => {
+      now += 31000;
+      return now;
+    };
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    Date.now = originalDateNow;
+
+    assert.equal(result.error, 'package_scan_in_flight');
+    assert.equal(result.diagnostics.failurePhase, 'package-input-scan-wait');
+    assert.ok(Number.isSafeInteger(result.diagnostics.phaseElapsedMs));
+    assert.ok(result.diagnostics.phaseElapsedMs >= 0);
+    assert.deepEqual(Object.keys(result.diagnostics).sort(), ['failurePhase', 'phaseElapsedMs']);
+    assert.equal(JSON.stringify(result.diagnostics).includes(sourcePath), false);
+    assert.equal(JSON.stringify(result.diagnostics).includes(path.basename(sourcePath)), false);
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+
+    releaseMdls();
+    await scanPromise;
+  } finally {
+    Date.now = originalDateNow;
+    releaseMdls();
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(stalledCandidate, { force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('a fresh pre-package retry replaces prior scan metrics', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'fresh-retry-fixtures');
+  const retainedCandidate = path.join(candidateRoot, 'retained.ai');
+  const removedCandidate = path.join(candidateRoot, 'removed.ai');
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  fs.writeFileSync(retainedCandidate, 'retained candidate');
+  fs.writeFileSync(removedCandidate, 'removed candidate');
+  const project = await createProject('Fresh Pre-Package Retry');
+  const staleXattr = encodeLastUsedXattr(Date.now() - (24 * 60 * 60 * 1000));
+  const staleMdls = new Date(Date.now() - (24 * 60 * 60 * 1000)).toISOString();
+  const trackedSetTimeout = global.setTimeout;
+  let releaseMdls = () => {};
+  let markMdlsStarted = () => {};
+
+  try {
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: staleXattr };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        return { stdout: staleMdls };
+      }
+      return { stdout: '' };
+    });
+
+    const completedScan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(completedScan.error, undefined);
+    fs.rmSync(removedCandidate, { force: true });
+
+    const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
+    const mdlsStarted = new Promise(resolve => { markMdlsStarted = resolve; });
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
+        return { stdout: '' };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+        markMdlsStarted();
+        return mdlsGate.then(() => ({ stdout: staleMdls }));
+      }
+      return { stdout: '' };
+    });
+    global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 50 : delay, ...args);
+
+    const retryPromise = callIpcRaw('projects:pre-package-scan', project.id);
+    await mdlsStarted;
+    const overlappingRetry = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.deepEqual(overlappingRetry, {
+      error: 'package_scan_incomplete',
+      diagnostics: {
+        failurePhase: 'pre-package-scan-in-flight',
+        phaseElapsedMs: 0,
+      },
+    });
+    const retry = await retryPromise;
+    assert.equal(retry.error, 'package_scan_incomplete');
+    assert.deepEqual(retry.diagnostics, {
+      failurePhase: 'pre-package-discovery',
+      phaseElapsedMs: retry.diagnostics.phaseElapsedMs,
+      candidateCount: 1,
+      xattrResolvedCount: 0,
+      metadataFallbackCount: 1,
+    });
+    assert.ok(Number.isSafeInteger(retry.diagnostics.phaseElapsedMs));
+    releaseMdls();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    releaseMdls();
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
   }
 });
 
@@ -4451,15 +4610,31 @@ test('pre-package discovery timeout blocks an otherwise materializable project w
 
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, 'package_scan_incomplete');
+    assert.deepEqual(scan.diagnostics, {
+      failurePhase: 'pre-package-discovery',
+      phaseElapsedMs: scan.diagnostics.phaseElapsedMs,
+      candidateCount: 129,
+      xattrResolvedCount: 128,
+      metadataFallbackCount: 1,
+    });
+    assert.ok(Number.isSafeInteger(scan.diagnostics.phaseElapsedMs));
+    const safeDiagnosticText = JSON.stringify(scan.diagnostics);
+    assert.equal(safeDiagnosticText.includes(projectRoot), false);
+    assert.equal(safeDiagnosticText.includes('Review_Project.ai'), false);
+    assert.equal(safeDiagnosticText.includes('relevant-open.ai'), false);
     assert.equal(mdlsCalls, 1);
-    assert.equal((await callIpcRaw('projects:pre-package-scan', project.id)).error, 'package_scan_incomplete');
     releaseMdls();
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.error, 'package_scan_incomplete');
+    assert.deepEqual(review.diagnostics, scan.diagnostics);
     const packageResult = await callIpcRaw('projects:package', project.id, outputDir, initialReview.token);
     assert.equal(packageResult.error, 'package_scan_incomplete');
+    assert.deepEqual(packageResult.diagnostics, scan.diagnostics);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes(projectRoot), false);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes('Review_Project.ai'), false);
+    assert.equal(JSON.stringify(packageResult.diagnostics).includes('relevant-open.ai'), false);
     assert.equal(fs.readdirSync(outputDir).length, 0);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), beforeQuota);
     assert.equal(watcherRecords.length, beforeWatcherCount);
