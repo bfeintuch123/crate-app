@@ -1003,6 +1003,14 @@ function showPackageLimitModal(result = {}, opener = document.activeElement || n
 const PACKAGE_REVIEW_CHANGED_MESSAGE = 'Your project changed. Review the updated files before packaging.';
 const PACKAGE_REVIEW_UNAVAILABLE_MESSAGE = 'Some files are unavailable. Resolve them before packaging.';
 const PACKAGE_REVIEW_RECOVERY_MESSAGE = 'Packaging could not finish. Review the files and try again.';
+const PACKAGE_SCAN_INCOMPLETE_MESSAGE = 'Crate could not finish checking project files. No package was created. Record the diagnostic below before retrying.';
+const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
+  'pre-package-discovery',
+  'pre-package-app-scan',
+  'pre-package-scan-in-flight',
+  'package-input-scan-wait',
+  'prepare-package-review',
+]);
 
 function setModalBackgroundState(blocked) {
   for (const id of ['app-sidebar', 'app-main']) {
@@ -1239,10 +1247,41 @@ function createUnavailableRendererReview(project, message) {
   };
 }
 
-function getPackageReviewRecoveryMessage(error) {
-  if (error === 'package_review_changed') return PACKAGE_REVIEW_CHANGED_MESSAGE;
-  if (error === 'package_review_unavailable') return PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
-  return PACKAGE_REVIEW_RECOVERY_MESSAGE;
+function getSafePackageReviewDiagnosticInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function formatPackageReviewDiagnosticSummary(error, diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return '';
+  const errorCode = typeof error === 'string' && /^[a-z0-9_]{1,64}$/.test(error)
+    ? error
+    : null;
+  if (!errorCode) return '';
+
+  const parts = [`code ${errorCode}`];
+  if (PACKAGE_REVIEW_DIAGNOSTIC_PHASES.has(diagnostics.failurePhase)) {
+    parts.push(`phase ${diagnostics.failurePhase}`);
+  }
+  const metrics = [
+    ['phaseElapsedMs', 'elapsed', ' ms'],
+    ['candidateCount', 'candidates', ''],
+    ['xattrResolvedCount', 'xattr resolved', ''],
+    ['metadataFallbackCount', 'metadata fallback', ''],
+  ];
+  for (const [field, label, suffix] of metrics) {
+    const value = getSafePackageReviewDiagnosticInteger(diagnostics[field]);
+    if (value !== null) parts.push(`${label} ${value}${suffix}`);
+  }
+  return `Diagnostic: ${parts.join(' · ')}.`;
+}
+
+function getPackageReviewRecoveryMessage(error, diagnostics = null) {
+  let message = PACKAGE_REVIEW_RECOVERY_MESSAGE;
+  if (error === 'package_review_changed') message = PACKAGE_REVIEW_CHANGED_MESSAGE;
+  else if (error === 'package_review_unavailable') message = PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
+  else if (error === 'package_scan_incomplete') message = PACKAGE_SCAN_INCOMPLETE_MESSAGE;
+  const diagnosticSummary = formatPackageReviewDiagnosticSummary(error, diagnostics);
+  return diagnosticSummary ? `${message} ${diagnosticSummary}` : message;
 }
 
 async function showPackageModal({
@@ -1273,7 +1312,10 @@ async function showPackageModal({
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
     );
     if (!review || review.error) {
-      const failureMessage = message || getPackageReviewRecoveryMessage(review?.error || 'package_review_unavailable');
+      const failureMessage = message || getPackageReviewRecoveryMessage(
+        review?.error || 'package_review_unavailable',
+        review?.diagnostics
+      );
       renderPackageReview(project, createUnavailableRendererReview(project, failureMessage), failureMessage);
       return false;
     }
@@ -1394,7 +1436,7 @@ async function confirmPackage() {
       );
       const recoveryMessage = suppliedReview?.materializable === false
         ? suppliedReview.message || PACKAGE_REVIEW_UNAVAILABLE_MESSAGE
-        : getPackageReviewRecoveryMessage(typedError);
+        : getPackageReviewRecoveryMessage(typedError, result?.diagnostics);
       hidePackageProgressModal();
       await showPackageModal({
         message: recoveryMessage,

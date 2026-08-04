@@ -737,6 +737,55 @@ test('renderer binds the selected destination after generic output drift and pac
   assert.equal(document.activeElement, tabs[0]);
 });
 
+test('renderer surfaces typed Package Review scan diagnostics without private values', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'diagnostic-review-project',
+    name: 'Diagnostic Review',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Private_Project.ai', ext: '.ai' }],
+  };
+  const privatePath = '/Users/synthetic/Private Client/Private_Project.ai';
+  const privateToken = 'private-review-token-should-not-appear';
+  const renderer = loadRendererHelpers(document, { crate: {
+    preparePackageReview: async () => ({
+      error: 'package_scan_incomplete',
+      diagnostics: {
+        failurePhase: 'pre-package-discovery',
+        phaseElapsedMs: 8000,
+        candidateCount: 129,
+        xattrResolvedCount: 128,
+        metadataFallbackCount: 1,
+        sourcePath: privatePath,
+        fileName: 'Private_Project.ai',
+        token: privateToken,
+      },
+    }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
+  const message = elements['modal-package-review-message'].textContent;
+  assert.equal(
+    message,
+    'Crate could not finish checking project files. No package was created. ' +
+      'Record the diagnostic below before retrying. ' +
+      'Diagnostic: code package_scan_incomplete · phase pre-package-discovery · elapsed 8000 ms · ' +
+      'candidates 129 · xattr resolved 128 · metadata fallback 1.'
+  );
+  assert.equal(message.includes(privatePath), false);
+  assert.equal(message.includes('Private_Project.ai'), false);
+  assert.equal(message.includes(privateToken), false);
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
 test('renderer disables unavailable Package Review and re-enables only after a fresh materializable review', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {

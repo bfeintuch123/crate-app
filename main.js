@@ -4509,8 +4509,42 @@ function mutateProject(projectId, fn) {
 const scanInFlight = new Set();
 const packageScanSettlements = new Map();
 const incompletePackageScans = new Set();
+const packageScanDiagnosticState = new Map();
+const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
+  'pre-package-discovery',
+  'pre-package-app-scan',
+  'pre-package-scan-in-flight',
+  'package-input-scan-wait',
+  'prepare-package-review',
+]);
 const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
 const figmaPackageTransferBlocks = new Map();
+
+function safePackageReviewDiagnosticInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function createPackageReviewDiagnosticEvidence(details = {}) {
+  const diagnostics = {};
+  if (PACKAGE_REVIEW_DIAGNOSTIC_PHASES.has(details.failurePhase)) {
+    diagnostics.failurePhase = details.failurePhase;
+  }
+  for (const field of ['phaseElapsedMs', 'candidateCount', 'xattrResolvedCount', 'metadataFallbackCount']) {
+    const value = safePackageReviewDiagnosticInteger(details[field]);
+    if (value !== null) diagnostics[field] = value;
+  }
+  return diagnostics;
+}
+
+function createPackageReviewErrorResult(projectId, errorCode, details = {}, includeStoredScanDetails = true) {
+  const scanDetails = includeStoredScanDetails
+    ? packageScanDiagnosticState.get(projectId) || {}
+    : {};
+  return {
+    error: errorCode,
+    diagnostics: createPackageReviewDiagnosticEvidence({ ...scanDetails, ...details }),
+  };
+}
 
 function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
   const errors = Array.isArray(scanResult && scanResult.errors) ? scanResult.errors : [];
@@ -10307,12 +10341,18 @@ async function runPackageScanPhase(operation, timeoutMs, work, onTimeout = null)
 }
 
 registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) => {
-  if (scanInFlight.has(projectId)) return { error: 'package_scan_incomplete' };
+  if (scanInFlight.has(projectId)) {
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete', {
+      failurePhase: 'pre-package-scan-in-flight',
+      phaseElapsedMs: 0,
+    }, false);
+  }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current, stagePrePackageFile = (project, file, observation) => operationCurrent() ? stageLiveObservedFile(project, file, observation) : null;
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
   incompletePackageScans.delete(projectId);
+  packageScanDiagnosticState.delete(projectId);
   const previousFigmaPackageBlock = figmaPackageTransferBlocks.get(projectId);
   try {
   const projects = getProjects();
@@ -10338,7 +10378,13 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const preScanExistingKeys = getTrackedFileKeySet(project.files);
   const existingPaths = getNormalizedPathSet(project.files);
   const pendingPaths = getNormalizedPathSet(project.pendingFiles);
+  const scanMetrics = {
+    candidateCount: 0,
+    xattrResolvedCount: 0,
+    metadataFallbackCount: 0,
+  };
 
+  const discoveryStartedAt = Date.now();
   const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
@@ -10482,6 +10528,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       const normalizedFullPath = normalizeTrackedFilePath(fullPath);
       if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
       lastUsedCandidates.push({ fullPath, name: entry.name, ext, normalizedFullPath });
+      scanMetrics.candidateCount++;
       if (lastUsedCandidates.length % 256 === 0) {
         await new Promise(resolve => setImmediate(resolve));
         if (!operationCurrent()) return;
@@ -10503,8 +10550,10 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       const candidate = lastUsedCandidates[candidateIndex];
       const xattrTime = await getXattrLastUsedMs(candidate.fullPath);
       if (!operationCurrent()) return;
+      if (xattrTime !== null) scanMetrics.xattrResolvedCount++;
       let lastUsedTime = xattrTime;
       if (lastUsedTime === null || lastUsedTime < watchStart) {
+        scanMetrics.metadataFallbackCount++;
         const mdlsTime = await getMdlsLastUsedMs(candidate.fullPath);
         if (!operationCurrent()) return;
         if (mdlsTime !== null && (lastUsedTime === null || mdlsTime > lastUsedTime)) {
@@ -10541,13 +10590,20 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     newCount++;
   }
   }, settlement => packageScanSettlements.set(projectId, settlement));
+  const discoveryElapsedMs = Math.max(0, Date.now() - discoveryStartedAt);
   if (!discoveryComplete) {
     incompletePackageScans.add(projectId);
-    return { error: 'package_scan_incomplete' };
+    packageScanDiagnosticState.set(projectId, {
+      ...scanMetrics,
+      failurePhase: 'pre-package-discovery',
+      phaseElapsedMs: discoveryElapsedMs,
+    });
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
   }
   if (!operationCurrent()) return null;
 
   // v2.4.2: 30s aggregate timeout wrapping all AppleScript + ag-psd queries
+  const appScanStartedAt = Date.now();
   const appScanComplete = await runPackageScanPhase(operation, PRE_PACKAGE_APP_SCAN_TIMEOUT_MS, async () => {
   const illustratorActivationToken = getActiveWatchingActivationToken(projectId);
   if (illustratorActivationToken !== null) {
@@ -10710,9 +10766,15 @@ end tell`;
     // AppleScript failed or InDesign not responding — fall through to regex
   }
   }, settlement => packageScanSettlements.set(projectId, settlement));
+  const appScanElapsedMs = Math.max(0, Date.now() - appScanStartedAt);
   if (!appScanComplete) {
     incompletePackageScans.add(projectId);
-    return { error: 'package_scan_incomplete' };
+    packageScanDiagnosticState.set(projectId, {
+      ...scanMetrics,
+      failurePhase: 'pre-package-app-scan',
+      phaseElapsedMs: appScanElapsedMs,
+    });
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
   }
   if (!operationCurrent()) return null;
 
@@ -10945,6 +11007,10 @@ end tell`;
   project.files = deduplicateFiles(project.files);
   const finalProject = getProjects().find(item => item.id === projectId);
   incompletePackageScans.delete(projectId);
+  packageScanDiagnosticState.set(projectId, {
+    ...scanMetrics,
+    phaseElapsedMs: discoveryElapsedMs + appScanElapsedMs,
+  });
   return {
     files: getIllustratorScopedProjectView(finalProject).files,
     newCount,
@@ -12019,11 +12085,25 @@ async function refreshedPackageReviewChangedResult(projectId) {
 
 registerTrustedIpcHandler('projects:prepare-package-review', async (event, projectId, outputPath) => {
   if (packageInFlight) return { error: 'package_in_flight' };
-  if (!await waitForPackageInputScans(projectId)) return { error: 'package_scan_in_flight' };
-  if (incompletePackageScans.has(projectId)) return { error: 'package_scan_incomplete' };
+  const scanWaitStartedAt = Date.now();
+  if (!await waitForPackageInputScans(projectId)) {
+    return createPackageReviewErrorResult(projectId, 'package_scan_in_flight', {
+      failurePhase: 'package-input-scan-wait',
+      phaseElapsedMs: Math.max(0, Date.now() - scanWaitStartedAt),
+    });
+  }
+  if (incompletePackageScans.has(projectId)) {
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
+  }
   if (packageInFlight) return { error: 'package_in_flight' };
+  const reviewStartedAt = Date.now();
   const manifest = await buildCanonicalPackageReviewManifest(projectId);
-  if (manifest.error) return { error: manifest.error };
+  if (manifest.error) {
+    return createPackageReviewErrorResult(projectId, manifest.error, {
+      failurePhase: 'prepare-package-review',
+      phaseElapsedMs: Math.max(0, Date.now() - reviewStartedAt),
+    });
+  }
   if (packageInFlight) return { error: 'package_in_flight' };
   if (outputPath !== undefined && manifest.materializable) {
     if (typeof outputPath !== 'string' || !outputPath) return { error: 'package_output_changed' };
@@ -13106,6 +13186,7 @@ registerTrustedIpcHandler('projects:select-output', async () => {
 registerTrustedIpcHandler('projects:delete', (event, id) => {
   invalidatePackageReviewForProject(id);
   incompletePackageScans.delete(id);
+  packageScanDiagnosticState.delete(id);
   stopWatching(id);
   illustratorActivationScopes.delete(id);
   figmaPackageTransferBlocks.delete(id);
@@ -13133,6 +13214,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   currentPackageReviewTokenByProject.clear();
   consumedPackageReviewTokens.clear();
   incompletePackageScans.clear();
+  packageScanDiagnosticState.clear();
   const projectCacheIds = safeStoredProjectCacheIds();
   // Stop all active watchers and lsof pollers
   for (const [id, watcher] of watchers) {
