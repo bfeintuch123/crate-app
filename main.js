@@ -173,32 +173,324 @@ async function runOsascriptInPrivateTemp(buildScripts, entryScriptName, options 
   }
 }
 
+const LAST_USED_XATTR_NAME = 'com.apple.lastuseddate#PS';
+const LAST_USED_XATTR_BATCH_SIZE = 256;
+const LAST_USED_XATTR_CONCURRENCY = 4;
+const LAST_USED_XATTR_TIMEOUT_MS = 2000;
+const LAST_USED_SPOTLIGHT_TIMEOUT_MS = 4000;
+
+function decodeNativeLastUsedTimespec(hexValue) {
+  const hexStr = typeof hexValue === 'string' ? hexValue.replace(/\s+/g, '') : '';
+  if (hexStr.length !== 32 || !/^[0-9a-f]+$/i.test(hexStr)) return null;
+  const bytes = Buffer.from(hexStr, 'hex');
+  // com.apple.lastuseddate#PS stores a native little-endian timespec:
+  // signed Unix seconds followed by signed nanoseconds.
+  const seconds = bytes.readBigInt64LE(0);
+  const nanoseconds = bytes.readBigInt64LE(8);
+  const MAX_JAVASCRIPT_DATE_SECONDS = 8640000000000n;
+  if (
+    seconds <= 0n ||
+    seconds > MAX_JAVASCRIPT_DATE_SECONDS ||
+    (seconds === MAX_JAVASCRIPT_DATE_SECONDS && nanoseconds > 0n) ||
+    nanoseconds < 0n ||
+    nanoseconds >= 1000000000n
+  ) return null;
+  const secondsNumber = Number(seconds);
+  if (!Number.isSafeInteger(secondsNumber)) return null;
+  const lastUsedMs = secondsNumber * 1000 + Number(nanoseconds) / 1000000;
+  return Number.isFinite(lastUsedMs) && lastUsedMs <= 8640000000000000 ? lastUsedMs : null;
+}
+
 async function getXattrLastUsedMs(filePath) {
   try {
-    const { stdout } = await execFileAsync("/usr/bin/xattr", ["-px", "com.apple.lastuseddate#PS", filePath], {
+    const { stdout } = await execFileAsync('/usr/bin/xattr', ['-px', LAST_USED_XATTR_NAME, filePath], {
       timeout: 1000, encoding: 'utf8'
     });
-    const hexStr = stdout.replace(/\s+/g, '');
-    if (hexStr.length !== 32 || !/^[0-9a-f]+$/i.test(hexStr)) return null;
-    const bytes = Buffer.from(hexStr, 'hex');
-    // com.apple.lastuseddate#PS stores a native little-endian timespec:
-    // signed Unix seconds followed by signed nanoseconds.
-    const seconds = bytes.readBigInt64LE(0);
-    const nanoseconds = bytes.readBigInt64LE(8);
-    const MAX_JAVASCRIPT_DATE_SECONDS = 8640000000000n;
-    if (
-      seconds <= 0n ||
-      seconds > MAX_JAVASCRIPT_DATE_SECONDS ||
-      nanoseconds < 0n ||
-      nanoseconds >= 1000000000n
-    ) return null;
-    const secondsNumber = Number(seconds);
-    if (!Number.isSafeInteger(secondsNumber)) return null;
-    const lastUsedMs = secondsNumber * 1000 + Number(nanoseconds) / 1000000;
-    return Number.isFinite(lastUsedMs) ? lastUsedMs : null;
+    return decodeNativeLastUsedTimespec(stdout);
   } catch (e) {
     return null;
   }
+}
+
+function getErrorOutput(error, field) {
+  const value = error && error[field];
+  if (Buffer.isBuffer(value)) return value.toString('utf8');
+  return typeof value === 'string' ? value : '';
+}
+
+function isAbnormalMetadataCommandError(error) {
+  return !error || error.killed || error.signal || error.code === 'ETIMEDOUT';
+}
+
+function parseBulkLastUsedXattrs(stdout, filePaths) {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
+  const output = Buffer.isBuffer(stdout)
+    ? stdout.toString('utf8')
+    : (typeof stdout === 'string' ? stdout : '');
+  const values = new Map();
+  if (!output) return values;
+
+  const outputLines = output.split('\n');
+  const pathHeaders = new Map(paths.map(filePath => [`${filePath}:`, filePath]));
+  const hasKnownHeader = outputLines.some(line => pathHeaders.has(line.trimEnd()));
+  const hasHeaderShapedLine = outputLines.some(line => line.trimEnd().endsWith(':'));
+  if (paths.length === 1 && !hasKnownHeader && !hasHeaderShapedLine) {
+    values.set(paths[0], decodeNativeLastUsedTimespec(output));
+    return values;
+  }
+
+  const seenHeaders = new Set();
+  let currentPath = null;
+  let valueLines = [];
+  const flush = () => {
+    if (currentPath === null) return;
+    values.set(currentPath, decodeNativeLastUsedTimespec(valueLines.join('')));
+    currentPath = null;
+    valueLines = [];
+  };
+
+  for (const line of outputLines) {
+    const headerPath = pathHeaders.get(line.trimEnd());
+    if (headerPath) {
+      flush();
+      if (seenHeaders.has(headerPath)) throw new Error('duplicate xattr path header');
+      seenHeaders.add(headerPath);
+      currentPath = headerPath;
+      continue;
+    }
+    if (currentPath === null) {
+      if (line === '') continue;
+      throw new Error('malformed xattr output');
+    }
+    if (line.trimEnd().endsWith(':')) throw new Error('unknown xattr path header');
+    valueLines.push(line);
+  }
+  flush();
+  return values;
+}
+
+function parseMissingXattrPaths(stderr, filePaths) {
+  const paths = new Set(filePaths);
+  const missing = new Set();
+  const prefix = 'xattr: ';
+  const suffix = `: No such xattr: ${LAST_USED_XATTR_NAME}`;
+  const lines = stderr.split('\n').filter(line => line !== '');
+  if (lines.length === 0) throw new Error('missing xattr error framing');
+  for (const line of lines) {
+    if (!line.startsWith(prefix) || !line.endsWith(suffix)) {
+      throw new Error('abnormal xattr error framing');
+    }
+    const filePath = line.slice(prefix.length, -suffix.length);
+    if (!paths.has(filePath) || missing.has(filePath)) {
+      throw new Error('ambiguous xattr error framing');
+    }
+    missing.add(filePath);
+  }
+  return missing;
+}
+
+async function getBulkXattrLastUsedMs(filePaths) {
+  let stdout = '';
+  let missingPaths = new Set();
+  try {
+    const result = await execFileAsync('/usr/bin/xattr', [
+      '-pvx', LAST_USED_XATTR_NAME, ...filePaths,
+    ], {
+      timeout: LAST_USED_XATTR_TIMEOUT_MS,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    if (isAbnormalMetadataCommandError(error)) throw error;
+    missingPaths = parseMissingXattrPaths(getErrorOutput(error, 'stderr'), filePaths);
+    stdout = getErrorOutput(error, 'stdout');
+  }
+
+  const values = parseBulkLastUsedXattrs(stdout, filePaths);
+  for (const filePath of missingPaths) {
+    if (values.has(filePath)) throw new Error('conflicting xattr result');
+    values.set(filePath, null);
+  }
+  if (values.size !== filePaths.length || filePaths.some(filePath => !values.has(filePath))) {
+    throw new Error('incomplete xattr result');
+  }
+  return values;
+}
+
+async function getStrictSingleXattrLastUsedMs(filePath) {
+  try {
+    const { stdout } = await execFileAsync('/usr/bin/xattr', ['-px', LAST_USED_XATTR_NAME, filePath], {
+      timeout: LAST_USED_XATTR_TIMEOUT_MS,
+      encoding: 'utf8',
+    });
+    return decodeNativeLastUsedTimespec(stdout);
+  } catch (error) {
+    if (isAbnormalMetadataCommandError(error)) throw error;
+    const stderr = getErrorOutput(error, 'stderr');
+    if (!stderr.trimEnd().endsWith(`: No such xattr: ${LAST_USED_XATTR_NAME}`)) throw error;
+    return null;
+  }
+}
+
+async function collectBulkXattrLastUsedMs(candidates, operationCurrent) {
+  const jobs = [];
+  let safeBatch = [];
+  const flushSafeBatch = () => {
+    if (safeBatch.length > 0) jobs.push({ paths: safeBatch, single: false });
+    safeBatch = [];
+  };
+  for (const candidate of candidates) {
+    if (/[\r\n\0]/.test(candidate.fullPath)) {
+      flushSafeBatch();
+      jobs.push({ paths: [candidate.fullPath], single: true });
+      continue;
+    }
+    safeBatch.push(candidate.fullPath);
+    if (safeBatch.length === LAST_USED_XATTR_BATCH_SIZE) flushSafeBatch();
+  }
+  flushSafeBatch();
+
+  const values = new Map();
+  const failures = [];
+  let nextJob = 0;
+  const worker = async () => {
+    while (typeof operationCurrent !== 'function' || operationCurrent()) {
+      const jobIndex = nextJob++;
+      if (jobIndex >= jobs.length) return;
+      const job = jobs[jobIndex];
+      try {
+        if (job.single) {
+          values.set(job.paths[0], await getStrictSingleXattrLastUsedMs(job.paths[0]));
+        } else {
+          const batchValues = await getBulkXattrLastUsedMs(job.paths);
+          for (const [filePath, lastUsedMs] of batchValues) values.set(filePath, lastUsedMs);
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(LAST_USED_XATTR_CONCURRENCY, jobs.length) },
+    () => worker()
+  ));
+  if (failures.length > 0 || values.size !== candidates.length) {
+    throw new Error('incomplete xattr acquisition');
+  }
+  return values;
+}
+
+function parseNulDelimitedSpotlightPaths(stdout, rootPath) {
+  const output = Buffer.isBuffer(stdout)
+    ? stdout
+    : Buffer.from(typeof stdout === 'string' ? stdout : '', 'utf8');
+  if (output.length === 0) return [];
+  if (output[output.length - 1] !== 0) throw new Error('malformed Spotlight output');
+
+  const paths = [];
+  let start = 0;
+  for (let index = 0; index < output.length; index++) {
+    if (output[index] !== 0) continue;
+    if (index === start) throw new Error('malformed Spotlight output');
+    let filePath;
+    try {
+      filePath = new TextDecoder('utf-8', { fatal: true }).decode(output.subarray(start, index));
+    } catch (_) {
+      throw new Error('invalid Spotlight path encoding');
+    }
+    const relative = path.relative(rootPath, filePath);
+    if (
+      /[\r\n\0]/.test(filePath) ||
+      !path.isAbsolute(filePath) ||
+      path.resolve(filePath) !== filePath ||
+      path.isAbsolute(relative) ||
+      relative === '..' ||
+      relative.startsWith(`..${path.sep}`)
+    ) throw new Error('Spotlight path outside requested root');
+    paths.push(filePath);
+    start = index + 1;
+  }
+  return paths;
+}
+
+function getRequiredSpotlightRoots(scanDirs) {
+  const roots = [];
+  const identities = new Set();
+  for (const scanDir of scanDirs) {
+    if (!fs.existsSync(scanDir)) continue;
+    const stat = fs.statSync(scanDir);
+    if (!stat.isDirectory()) throw new Error('invalid Spotlight root');
+    const identity = normalizeTrackedFilePath(scanDir);
+    if (!identity || identities.has(identity)) throw new Error('duplicate Spotlight root');
+    identities.add(identity);
+    roots.push({
+      path: path.resolve(scanDir),
+      device: stat.dev,
+      inode: stat.ino,
+    });
+  }
+  return roots;
+}
+
+function spotlightRootIsUnchanged(root) {
+  try {
+    const stat = fs.statSync(root.path);
+    return stat.isDirectory() && stat.dev === root.device && stat.ino === root.inode;
+  } catch (_) {
+    return false;
+  }
+}
+
+function matchSpotlightPathsToCandidateIndexes(spotlightPaths, candidates) {
+  const candidateIndexByRoute = new Map();
+  for (let index = 0; index < candidates.length; index++) {
+    const route = candidates[index] && candidates[index].fullPath;
+    if (
+      typeof route !== 'string' ||
+      route.includes('\0') ||
+      !path.isAbsolute(route) ||
+      path.resolve(route) !== route
+    ) throw new Error('invalid metadata candidate route');
+    candidateIndexByRoute.set(route, candidateIndexByRoute.has(route) ? null : index);
+  }
+
+  const matchedIndexes = new Set();
+  const orderedPaths = [...spotlightPaths].sort(
+    (left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
+  );
+  for (const spotlightPath of orderedPaths) {
+    const candidateIndex = candidateIndexByRoute.get(spotlightPath);
+    if (Number.isInteger(candidateIndex)) matchedIndexes.add(candidateIndex);
+  }
+  return matchedIndexes;
+}
+
+async function getBulkSpotlightRecentCandidateIndexes(roots, watchStart, candidates, operationCurrent) {
+  const timestamp = `$time.iso(${new Date(watchStart).toISOString()})`;
+  const queryResults = await Promise.allSettled(roots.map(async root => {
+    if (typeof operationCurrent === 'function' && !operationCurrent()) {
+      throw new Error('Spotlight query cancelled');
+    }
+    const { stdout } = await execFileAsync('/usr/bin/mdfind', [
+      '-0', '-onlyin', root.path, `kMDItemLastUsedDate >= ${timestamp}`,
+    ], {
+      timeout: LAST_USED_SPOTLIGHT_TIMEOUT_MS,
+      encoding: 'buffer',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return parseNulDelimitedSpotlightPaths(stdout, root.path);
+  }));
+  if (
+    queryResults.some(result => result.status === 'rejected') ||
+    roots.some(root => !spotlightRootIsUnchanged(root)) ||
+    (typeof operationCurrent === 'function' && !operationCurrent())
+  ) throw new Error('incomplete Spotlight root query');
+
+  return matchSpotlightPathsToCandidateIndexes(
+    queryResults.flatMap(result => result.value),
+    candidates
+  );
 }
 
 async function getMdlsLastUsedMs(filePath) {
@@ -4519,6 +4811,10 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
 ]);
 const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
 const figmaPackageTransferBlocks = new Map();
+function restoreFigmaPackageTransferBlock(projectId, previousBlock) {
+  if (previousBlock === undefined) figmaPackageTransferBlocks.delete(projectId);
+  else figmaPackageTransferBlocks.set(projectId, previousBlock);
+}
 
 function safePackageReviewDiagnosticInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -10383,6 +10679,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     xattrResolvedCount: 0,
     metadataFallbackCount: 0,
   };
+  let metadataDiscoveryFailed = false;
 
   const discoveryStartedAt = Date.now();
   const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
@@ -10542,32 +10839,47 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
 
   const recentLastUsedCandidates = new Array(lastUsedCandidates.length).fill(false);
-  let nextLastUsedCandidate = 0;
-  const scanLastUsedCandidate = async () => {
-    while (operationCurrent()) {
-      const candidateIndex = nextLastUsedCandidate++;
-      if (candidateIndex >= lastUsedCandidates.length) return;
-      const candidate = lastUsedCandidates[candidateIndex];
-      const xattrTime = await getXattrLastUsedMs(candidate.fullPath);
-      if (!operationCurrent()) return;
-      if (xattrTime !== null) scanMetrics.xattrResolvedCount++;
-      let lastUsedTime = xattrTime;
-      if (lastUsedTime === null || lastUsedTime < watchStart) {
-        scanMetrics.metadataFallbackCount++;
-        const mdlsTime = await getMdlsLastUsedMs(candidate.fullPath);
-        if (!operationCurrent()) return;
-        if (mdlsTime !== null && (lastUsedTime === null || mdlsTime > lastUsedTime)) {
-          lastUsedTime = mdlsTime;
-        }
-      }
-      if (lastUsedTime !== null && lastUsedTime >= watchStart) {
-        recentLastUsedCandidates[candidateIndex] = true;
-      }
+  let xattrTimes;
+  let spotlightRecentCandidateIndexes;
+  try {
+    const requiredSpotlightRoots = getRequiredSpotlightRoots(scanDirs);
+    const metadataResults = await Promise.allSettled([
+      collectBulkXattrLastUsedMs(lastUsedCandidates, operationCurrent),
+      getBulkSpotlightRecentCandidateIndexes(
+        requiredSpotlightRoots,
+        watchStart,
+        lastUsedCandidates,
+        operationCurrent
+      ),
+    ]);
+    if (!operationCurrent()) return;
+    if (metadataResults.some(result => result.status === 'rejected')) {
+      metadataDiscoveryFailed = true;
+      return;
     }
-  };
-  const lastUsedWorkerCount = Math.min(16, lastUsedCandidates.length);
-  await Promise.all(Array.from({ length: lastUsedWorkerCount }, () => scanLastUsedCandidate()));
-  if (!operationCurrent()) return;
+    xattrTimes = metadataResults[0].value;
+    spotlightRecentCandidateIndexes = metadataResults[1].value;
+    if (lastUsedCandidates.some(candidate => {
+      try { return !fs.statSync(candidate.fullPath).isFile(); }
+      catch (_) { return true; }
+    })) {
+      metadataDiscoveryFailed = true;
+      return;
+    }
+  } catch (_) {
+    metadataDiscoveryFailed = true;
+    return;
+  }
+
+  for (let candidateIndex = 0; candidateIndex < lastUsedCandidates.length; candidateIndex++) {
+    const candidate = lastUsedCandidates[candidateIndex];
+    const xattrTime = xattrTimes.get(candidate.fullPath);
+    if (xattrTime !== null) scanMetrics.xattrResolvedCount++;
+    if (xattrTime === null || xattrTime < watchStart) scanMetrics.metadataFallbackCount++;
+    recentLastUsedCandidates[candidateIndex] =
+      (xattrTime !== null && xattrTime >= watchStart) ||
+      spotlightRecentCandidateIndexes.has(candidateIndex);
+  }
 
   for (let candidateIndex = 0; candidateIndex < lastUsedCandidates.length; candidateIndex++) {
     if (!recentLastUsedCandidates[candidateIndex]) continue;
@@ -10601,6 +10913,16 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
   }
   if (!operationCurrent()) return null;
+  if (metadataDiscoveryFailed) {
+    restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
+    incompletePackageScans.add(projectId);
+    packageScanDiagnosticState.set(projectId, {
+      ...scanMetrics,
+      failurePhase: 'pre-package-discovery',
+      phaseElapsedMs: discoveryElapsedMs,
+    });
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
+  }
 
   // v2.4.2: 30s aggregate timeout wrapping all AppleScript + ag-psd queries
   const appScanStartedAt = Date.now();
@@ -11017,7 +11339,7 @@ end tell`;
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
-    if (!operation.current()) previousFigmaPackageBlock === undefined ? figmaPackageTransferBlocks.delete(projectId) : figmaPackageTransferBlocks.set(projectId, previousFigmaPackageBlock);
+    if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();
     const settlement = packageScanSettlements.get(projectId);
     if (settlement) {

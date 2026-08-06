@@ -302,14 +302,23 @@ function commandText(command, args = []) {
   return [command, ...(Array.isArray(args) ? args : [])].join(' ');
 }
 
-function getChildProcessResult(kind, command, args = []) {
-  if (!childProcessHandler) return { stdout: '', stderr: '' };
-  return childProcessHandler({
+function getChildProcessResult(kind, command, args = [], options = {}) {
+  const request = {
     kind,
     command,
     args: Array.isArray(args) ? args : [],
+    options: options && typeof options === 'object' ? options : {},
     commandText: commandText(command, args),
-  }) || { stdout: '', stderr: '' };
+  };
+  const result = childProcessHandler ? (childProcessHandler(request) || { stdout: '', stderr: '' }) : { stdout: '', stderr: '' };
+  if (
+    kind === 'execFile' &&
+    command === '/usr/bin/xattr' &&
+    args[0] === '-pvx' &&
+    !result.error &&
+    result.stdout === ''
+  ) return missingXattrError(args.slice(2));
+  return result;
 }
 
 function isOsascriptInvocation({ kind, command, args }, scriptName) {
@@ -420,15 +429,16 @@ execStub[nodePromisify.custom] = async (command) => {
 function execFileStub(...args) {
   const command = args[0];
   const fileArgs = Array.isArray(args[1]) ? args[1] : [];
+  const options = args.find(arg => arg && typeof arg === 'object' && !Array.isArray(arg)) || {};
   const callback = args.find(arg => typeof arg === 'function');
-  const result = getChildProcessResult('execFile', command, fileArgs);
+  const result = getChildProcessResult('execFile', command, fileArgs, options);
   if (callback) {
     queueMicrotask(() => callback(result.error || null, result.stdout || '', result.stderr || ''));
   }
   return createChildProcessStub();
 }
-execFileStub[nodePromisify.custom] = async (command, fileArgs = []) => {
-  const result = await Promise.resolve(getChildProcessResult('execFile', command, fileArgs));
+execFileStub[nodePromisify.custom] = async (command, fileArgs = [], options = {}) => {
+  const result = await Promise.resolve(getChildProcessResult('execFile', command, fileArgs, options));
   if (result.error) throw result.error;
   return { stdout: result.stdout || '', stderr: result.stderr || '' };
 };
@@ -452,7 +462,35 @@ setStub('crypto', () => ({
   randomUUID: () => `00000000-0000-4000-8000-${String(++testUuidCounter).padStart(12, '0')}`,
 }));
 
-require(path.resolve(__dirname, '..', 'main.js'));
+const mainModulePath = path.resolve(__dirname, '..', 'main.js');
+const originalJavaScriptLoader = Module._extensions['.js'];
+Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filename) {
+  if (filename !== mainModulePath) return originalJavaScriptLoader(module, filename);
+  const source = fs.readFileSync(filename, 'utf8');
+  return module._compile(`${source}
+module.exports.__crateMetadataTestHooks = {
+  getFigmaPackageTransferBlock(projectId) {
+    return {
+      present: figmaPackageTransferBlocks.has(projectId),
+      value: figmaPackageTransferBlocks.get(projectId),
+    };
+  },
+  setFigmaPackageTransferBlock(projectId, value) {
+    figmaPackageTransferBlocks.set(projectId, value);
+  },
+  matchSpotlightCandidateRoutes(spotlightPaths, candidates) {
+    return [...matchSpotlightPathsToCandidateIndexes(spotlightPaths, candidates)]
+      .map(index => candidates[index].fullPath);
+  },
+};
+`, filename);
+};
+let metadataTestHooks;
+try {
+  ({ __crateMetadataTestHooks: metadataTestHooks } = require(mainModulePath));
+} finally {
+  Module._extensions['.js'] = originalJavaScriptLoader;
+}
 
 async function callIpcRaw(channel, ...args) {
   const handler = ipcHandlers.get(channel);
@@ -551,6 +589,89 @@ function encodeLastUsedXattr(timestampMs) {
   bytes.writeBigInt64LE(BigInt(seconds), 0);
   bytes.writeBigInt64LE(BigInt(nanoseconds), 8);
   return bytes.toString('hex');
+}
+
+function bulkXattrPaths(request) {
+  return request.kind === 'execFile' &&
+    request.command === '/usr/bin/xattr' &&
+    request.args[0] === '-pvx'
+    ? request.args.slice(2)
+    : [];
+}
+
+function singleXattrPath(request) {
+  return request.kind === 'execFile' &&
+    request.command === '/usr/bin/xattr' &&
+    request.args[0] === '-px'
+    ? request.args[2]
+    : null;
+}
+
+function formatBulkXattrOutput(filePaths, valueForPath) {
+  return filePaths.map(filePath => {
+    const value = valueForPath(filePath);
+    if (typeof value !== 'string' || value === '') return '';
+    return `${filePath}: \n${value.match(/.{1,2}/g).join(' ')} \n`;
+  }).join('');
+}
+
+function missingXattrError(filePaths, stdout = '') {
+  const stderr = filePaths.map(filePath => (
+    `xattr: ${filePath}: No such xattr: com.apple.lastuseddate#PS`
+  )).join('\n');
+  return {
+    error: Object.assign(new Error('xattr returned mixed results'), {
+      code: 1,
+      stdout,
+      stderr: `${stderr}\n`,
+    }),
+  };
+}
+
+function isBulkSpotlightRequest(request) {
+  return request.kind === 'execFile' &&
+    request.command === '/usr/bin/mdfind' &&
+    request.args[0] === '-0' &&
+    request.args[1] === '-onlyin' &&
+    typeof request.args[2] === 'string';
+}
+
+function bulkSpotlightRoot(request) {
+  return isBulkSpotlightRequest(request) ? request.args[2] : null;
+}
+
+function formatBulkSpotlightOutput(filePaths) {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
+  return paths.length === 0 ? Buffer.alloc(0) : Buffer.from(`${paths.join('\0')}\0`, 'utf8');
+}
+
+function formatBulkSpotlightOutputForRoot(request, filePaths) {
+  const root = bulkSpotlightRoot(request);
+  if (!root) return Buffer.alloc(0);
+  return formatBulkSpotlightOutput((Array.isArray(filePaths) ? filePaths : []).filter(filePath => {
+    const relative = path.relative(root, filePath);
+    return relative !== '' && !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`);
+  }));
+}
+
+function expectedBulkSpotlightRoots() {
+  return [
+    path.join(TEST_HOME, 'Desktop'),
+    path.join(TEST_HOME, 'Documents'),
+    path.join(TEST_HOME, 'Downloads'),
+    path.join(TEST_HOME, 'Library', 'Application Support', 'Figma'),
+  ].filter(root => fs.existsSync(root)).map(root => path.resolve(root));
+}
+
+function installBulkMetadataHandler({ xattrForPath = () => null, spotlightPaths = [] } = {}) {
+  setChildProcessHandler(request => {
+    const paths = bulkXattrPaths(request);
+    if (paths.length) return { stdout: formatBulkXattrOutput(paths, xattrForPath) };
+    if (isBulkSpotlightRequest(request)) {
+      return { stdout: formatBulkSpotlightOutputForRoot(request, spotlightPaths) };
+    }
+    return { stdout: '' };
+  });
 }
 
 function presentationCachePaths(projectId) {
@@ -1413,14 +1534,13 @@ async function assertPrePackageAwaitRaceFailsClosed(awaitPoint, race) {
       setStub('./parsers/figma', () => ({ FigmaParser: DeferredFigmaParser }));
       restoreFigmaParser = () => STUBS.delete('./parsers/figma');
     }
-    setChildProcessHandler(({ kind, command, args }) => {
-      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
-      if (
-        awaitPoint === 'metadata' &&
-        kind === 'execFile' &&
-        command === '/usr/bin/mdls'
-      ) {
-        return gateResult({ stdout: new Date(Date.now() + 1000).toISOString() });
+    setChildProcessHandler(({ kind, command, args, options }) => {
+      const request = { kind, command, args, options };
+      if (isIllustratorPgrepCheck(request)) return { stdout: '' };
+      const xattrPaths = bulkXattrPaths(request);
+      if (xattrPaths.length) return missingXattrError(xattrPaths);
+      if (awaitPoint === 'metadata' && isBulkSpotlightRequest(request)) {
+        return gateResult({ stdout: formatBulkSpotlightOutputForRoot(request, [candidatePath]) });
       }
       if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
         return { stdout: awaitPoint === 'photoshop' ? 'Adobe Photoshop\n' : '' };
@@ -4358,6 +4478,471 @@ test('presentation container mutation during reviewed copy removes staging and s
   }
 });
 
+test('metadata failure restores the exact prior Figma transfer block without project side effects', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'figma-block-metadata-failure.ai');
+  fs.writeFileSync(candidatePath, 'candidate');
+  const project = await createProject('Figma Block Metadata Failure');
+  const priorBlock = 'seeded-prior-figma-transfer-block';
+  metadataTestHooks.setFigmaPackageTransferBlock(project.id, priorBlock);
+  const beforeBlock = metadataTestHooks.getFigmaPackageTransferBlock(project.id);
+  const beforeProject = JSON.stringify(await getProject(project.id));
+  const beforeQuota = storeInstance.get('usage.packagesThisMonth');
+  const beforeWatcherCount = watcherRecords.length;
+  const beforeWatcherCloseCount = watcherCloseCount;
+  const beforeRendererEventCount = testRendererEvents.length;
+
+  try {
+    setChildProcessHandler(request => {
+      if (bulkXattrPaths(request).length) {
+        return { error: Object.assign(new Error('xattr failed'), { code: 'EIO', stderr: 'abnormal failure' }) };
+      }
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.equal(scan.diagnostics.failurePhase, 'pre-package-discovery');
+    assert.deepEqual(metadataTestHooks.getFigmaPackageTransferBlock(project.id), beforeBlock);
+    assert.equal(JSON.stringify(await getProject(project.id)), beforeProject);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), beforeQuota);
+    assert.equal(watcherRecords.length, beforeWatcherCount);
+    assert.equal(watcherCloseCount, beforeWatcherCloseCount);
+    assert.equal(testRendererEvents.length, beforeRendererEventCount);
+  } finally {
+    setChildProcessHandler(null);
+    await callIpcRaw('projects:delete', project.id);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('Spotlight alias routes cannot match an enumerated physical candidate', () => {
+  const targetPath = path.join(TEST_HOME, 'Desktop', 'routes', 'target.ai');
+  const aliasPath = path.join(TEST_HOME, 'Desktop', 'routes', 'target-alias.ai');
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, 'target');
+  fs.symlinkSync(targetPath, aliasPath);
+  try {
+    assert.equal(fs.realpathSync(aliasPath), fs.realpathSync(targetPath));
+    assert.deepEqual(
+      metadataTestHooks.matchSpotlightCandidateRoutes([aliasPath], [{ fullPath: targetPath }]),
+      []
+    );
+  } finally {
+    fs.rmSync(aliasPath, { force: true });
+    fs.rmSync(targetPath, { force: true });
+  }
+});
+
+test('Spotlight case-colliding routes remain one-to-one', () => {
+  const upperPath = path.join(TEST_HOME, 'Desktop', 'case-routes', 'Case.ai');
+  const lowerPath = path.join(TEST_HOME, 'Desktop', 'case-routes', 'case.ai');
+  const candidates = [{ fullPath: upperPath }, { fullPath: lowerPath }];
+  assert.deepEqual(
+    metadataTestHooks.matchSpotlightCandidateRoutes([lowerPath], candidates),
+    [lowerPath]
+  );
+});
+
+test('Spotlight Unicode-colliding routes remain one-to-one', () => {
+  const asciiPath = path.join(TEST_HOME, 'Desktop', 'unicode-routes', 'K.ai');
+  const kelvinPath = path.join(TEST_HOME, 'Desktop', 'unicode-routes', '\u212A.ai');
+  const candidates = [{ fullPath: asciiPath }, { fullPath: kelvinPath }];
+  assert.deepEqual(
+    metadataTestHooks.matchSpotlightCandidateRoutes([kelvinPath], candidates),
+    [kelvinPath]
+  );
+});
+
+test('Spotlight route matching is order-independent and ignores ambiguous candidate records', () => {
+  const alphaPath = path.join(TEST_HOME, 'Desktop', 'ordered-routes', 'alpha.ai');
+  const betaPath = path.join(TEST_HOME, 'Desktop', 'ordered-routes', 'beta.ai');
+  const candidates = [{ fullPath: betaPath }, { fullPath: alphaPath }];
+  const forward = metadataTestHooks.matchSpotlightCandidateRoutes([alphaPath, betaPath], candidates);
+  const reverse = metadataTestHooks.matchSpotlightCandidateRoutes([betaPath, alphaPath], candidates);
+  assert.deepEqual(reverse, forward);
+  assert.deepEqual(forward, [alphaPath, betaPath]);
+  assert.deepEqual(
+    metadataTestHooks.matchSpotlightCandidateRoutes(
+      [alphaPath],
+      [{ fullPath: alphaPath }, { fullPath: alphaPath }]
+    ),
+    []
+  );
+});
+
+test('bounded metadata acquires 1668 candidates in seven xattr batches with four workers and zero mdls', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'bulk-1668');
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  for (let index = 0; index < 1668; index++) {
+    fs.writeFileSync(path.join(candidateRoot, `candidate-${String(index).padStart(4, '0')}.ai`), 'fixture');
+  }
+  const project = await createProject('Bulk 1668');
+  const before = JSON.stringify(await getProject(project.id));
+  const staleXattr = encodeLastUsedXattr(Date.now() - 86400000);
+  let xattrCalls = 0;
+  let xattrCandidates = 0;
+  let activeXattrCalls = 0;
+  let maxActiveXattrCalls = 0;
+  let spotlightCalls = 0;
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) {
+        xattrCalls++;
+        xattrCandidates += paths.length;
+        activeXattrCalls++;
+        maxActiveXattrCalls = Math.max(maxActiveXattrCalls, activeXattrCalls);
+        assert.ok(paths.length <= 256);
+        assert.equal(request.options.timeout, 2000);
+        return new Promise(resolve => setImmediate(() => {
+          activeXattrCalls--;
+          resolve({ stdout: formatBulkXattrOutput(paths, () => staleXattr) });
+        }));
+      }
+      if (isBulkSpotlightRequest(request)) {
+        spotlightCalls++;
+        assert.equal(request.options.timeout, 4000);
+        assert.equal(request.options.encoding, 'buffer');
+        return { stdout: Buffer.alloc(0) };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(xattrCalls, 7);
+    assert.equal(xattrCandidates, 1668);
+    assert.equal(maxActiveXattrCalls, 4);
+    assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
+    assert.equal(mdlsCalls, 0);
+    assert.equal(JSON.stringify(await getProject(project.id)), before);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('xattr and Spotlight form a deterministic candidate-only union with newer Spotlight evidence', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'metadata-union');
+  const xattrCandidate = path.join(candidateRoot, 'xattr.ai');
+  const spotlightCandidate = path.join(candidateRoot, 'spotlight.psd');
+  const staleCandidate = path.join(candidateRoot, 'stale.indd');
+  const unenumeratedCandidate = path.join(candidateRoot, 'created-after-enumeration.ai');
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  for (const filePath of [xattrCandidate, spotlightCandidate, staleCandidate]) {
+    fs.writeFileSync(filePath, path.basename(filePath));
+  }
+  const project = await createProject('Deterministic Metadata Union');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.now() - 1000;
+  const recentXattr = encodeLastUsedXattr(storedProject.watchStartedAt + 500);
+  const staleXattr = encodeLastUsedXattr(storedProject.watchStartedAt - 500);
+  let createdUnenumerated = false;
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return {
+        stdout: formatBulkXattrOutput(paths, filePath => filePath === xattrCandidate ? recentXattr : staleXattr),
+      };
+      if (isBulkSpotlightRequest(request)) {
+        if (!createdUnenumerated) {
+          fs.writeFileSync(unenumeratedCandidate, 'not in enumerated candidate universe');
+          createdUnenumerated = true;
+        }
+        return {
+          stdout: formatBulkSpotlightOutputForRoot(request, [
+            unenumeratedCandidate,
+            spotlightCandidate,
+            xattrCandidate,
+          ].reverse()),
+        };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 0);
+    const updated = await getProject(project.id);
+    const evidenceKeys = Object.keys(updated.liveEvidenceLedger.candidates).sort();
+    assert.deepEqual(evidenceKeys, [xattrCandidate, spotlightCandidate].map(liveEvidenceKeyForTest).sort());
+    assert.equal(evidenceKeys.includes(liveEvidenceKeyForTest(staleCandidate)), false);
+    assert.equal(evidenceKeys.includes(liveEvidenceKeyForTest(unenumeratedCandidate)), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('mixed native xattr failure retains partial stdout and treats missing attributes as absent', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'mixed-xattr');
+  const recentCandidate = path.join(candidateRoot, 'recent.ai');
+  const staleCandidate = path.join(candidateRoot, 'stale.psd');
+  const missingCandidate = path.join(candidateRoot, 'missing.indd');
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  for (const filePath of [recentCandidate, staleCandidate, missingCandidate]) fs.writeFileSync(filePath, 'fixture');
+  const project = await createProject('Mixed Xattr Result');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.now() - 1000;
+  const recentXattr = encodeLastUsedXattr(storedProject.watchStartedAt + 500);
+  const staleXattr = encodeLastUsedXattr(storedProject.watchStartedAt - 500);
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) {
+        const stdout = formatBulkXattrOutput(paths, filePath => {
+          if (filePath === recentCandidate) return recentXattr;
+          if (filePath === staleCandidate) return staleXattr;
+          return null;
+        });
+        return missingXattrError([missingCandidate], stdout);
+      }
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 0);
+    const updated = await getProject(project.id);
+    const evidenceKeys = Object.keys(updated.liveEvidenceLedger.candidates);
+    assert.deepEqual(evidenceKeys, [liveEvidenceKeyForTest(recentCandidate)]);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('newline xattr candidates use structured single-file acquisition without batch framing ambiguity', async () => {
+  resetTestHomeWorkspace();
+  const candidateRoot = path.join(TEST_HOME, 'Desktop', 'unsafe-xattr-name');
+  const safeCandidate = path.join(candidateRoot, 'safe.ai');
+  const newlineCandidate = path.join(candidateRoot, 'line\nbreak.psd');
+  fs.mkdirSync(candidateRoot, { recursive: true });
+  fs.writeFileSync(safeCandidate, 'safe');
+  fs.writeFileSync(newlineCandidate, 'newline');
+  const project = await createProject('Unsafe Xattr Framing');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.now() - 1000;
+  const recentXattr = encodeLastUsedXattr(storedProject.watchStartedAt + 500);
+  const staleXattr = encodeLastUsedXattr(storedProject.watchStartedAt - 500);
+  let singleCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) {
+        assert.equal(paths.includes(newlineCandidate), false);
+        return { stdout: formatBulkXattrOutput(paths, () => staleXattr) };
+      }
+      if (singleXattrPath(request)) {
+        singleCalls++;
+        assert.equal(singleXattrPath(request), newlineCandidate);
+        return { stdout: recentXattr };
+      }
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(singleCalls, 1);
+    const updated = await getProject(project.id);
+    assert.ok(updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(newlineCandidate)]);
+    assert.equal(updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(safeCandidate)], undefined);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('failed Spotlight root waits for every independently bounded required root to settle', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'root-settlement.ai');
+  fs.writeFileSync(candidatePath, 'candidate');
+  const project = await createProject('Root Settlement');
+  const before = JSON.stringify(await getProject(project.id));
+  const roots = expectedBulkSpotlightRoots();
+  let releaseDelayedRoot = () => {};
+  const delayedRoot = new Promise(resolve => { releaseDelayedRoot = resolve; });
+  const queriedRoots = [];
+  let scanSettled = false;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return missingXattrError(paths);
+      if (isBulkSpotlightRequest(request)) {
+        const root = bulkSpotlightRoot(request);
+        queriedRoots.push(root);
+        if (root === roots[0]) return { error: Object.assign(new Error('root failed'), { code: 'EIO' }) };
+        if (root === roots[1]) return delayedRoot.then(() => ({ stdout: Buffer.alloc(0) }));
+        return { stdout: Buffer.alloc(0) };
+      }
+      return { stdout: '' };
+    });
+
+    const scanPromise = callIpcRaw('projects:pre-package-scan', project.id).then(result => {
+      scanSettled = true;
+      return result;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(scanSettled, false);
+    releaseDelayedRoot();
+    const scan = await scanPromise;
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.deepEqual([...queriedRoots].sort(), [...roots].sort());
+    assert.equal(JSON.stringify(await getProject(project.id)), before);
+  } finally {
+    releaseDelayedRoot();
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('malformed metadata, root failures, deletion, and abnormal xattr latch incomplete with base side effects', async () => {
+  const scenarios = [
+    ['root failure', request => isBulkSpotlightRequest(request)
+      ? { error: Object.assign(new Error('root failed'), { code: 'EIO' }) }
+      : null],
+    ['root timeout', request => isBulkSpotlightRequest(request)
+      ? { error: Object.assign(new Error('root timed out'), { code: 'ETIMEDOUT', killed: true }) }
+      : null],
+    ['missing final NUL', request => isBulkSpotlightRequest(request)
+      ? { stdout: Buffer.from(path.join(bulkSpotlightRoot(request), 'candidate.ai'), 'utf8') }
+      : null],
+    ['empty NUL record', request => isBulkSpotlightRequest(request)
+      ? { stdout: Buffer.from(`${path.join(bulkSpotlightRoot(request), 'candidate.ai')}\0\0`, 'utf8') }
+      : null],
+    ['invalid UTF-8', request => isBulkSpotlightRequest(request)
+      ? { stdout: Buffer.from([0xff, 0x00]) }
+      : null],
+    ['line feed path', request => isBulkSpotlightRequest(request)
+      ? { stdout: formatBulkSpotlightOutput([path.join(bulkSpotlightRoot(request), 'line\nbreak.ai')]) }
+      : null],
+    ['carriage return path', request => isBulkSpotlightRequest(request)
+      ? { stdout: formatBulkSpotlightOutput([path.join(bulkSpotlightRoot(request), 'carriage\rreturn.ai')]) }
+      : null],
+    ['out of root', request => isBulkSpotlightRequest(request)
+      ? { stdout: formatBulkSpotlightOutput([path.join(TEST_HOME, 'outside-root.ai')]) }
+      : null],
+    ['abnormal xattr failure', request => bulkXattrPaths(request).length
+      ? { error: Object.assign(new Error('xattr failed'), { code: 'EIO', stderr: 'abnormal failure' }) }
+      : null],
+    ['malformed xattr framing', request => bulkXattrPaths(request).length
+      ? { stdout: '/unexpected/path.ai:\n00\n' }
+      : null],
+  ];
+
+  for (const [label, scenarioHandler] of scenarios) {
+    resetTestHomeWorkspace();
+    const fixtureRoot = path.join(TEST_HOME, 'Desktop', `failure-${label.replace(/\s+/g, '-')}`);
+    const sourcePath = path.join(fixtureRoot, 'Review_Project.ai');
+    const candidatePath = path.join(fixtureRoot, 'candidate.ai');
+    const outputDir = path.join(TEST_HOME, 'Documents', `output-${label.replace(/\s+/g, '-')}`);
+    fs.mkdirSync(fixtureRoot, { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(sourcePath, 'source');
+    fs.writeFileSync(candidatePath, 'candidate');
+    const project = await createProject(`Failure ${label}`);
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const initialReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(initialReview.materializable, true);
+    const beforeState = JSON.stringify(await getProject(project.id));
+    const before = capturePackageSideEffects(stored);
+
+    try {
+      setChildProcessHandler(request => {
+        const scenarioResult = scenarioHandler(request);
+        if (scenarioResult) return scenarioResult;
+        const paths = bulkXattrPaths(request);
+        if (paths.length) return { stdout: formatBulkXattrOutput(paths, () => encodeLastUsedXattr(Date.now() - 86400000)) };
+        if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+        return { stdout: '' };
+      });
+      const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+      assert.equal(scan.error, 'package_scan_incomplete', label);
+      assert.equal(scan.diagnostics.failurePhase, 'pre-package-discovery', label);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete', label);
+      assert.equal(
+        (await callIpcRaw('projects:package', project.id, outputDir, initialReview.token)).error,
+        'package_scan_incomplete',
+        label
+      );
+      assert.equal(JSON.stringify(await getProject(project.id)), beforeState, label);
+      assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    } finally {
+      setChildProcessHandler(null);
+      await callIpcRaw('projects:delete', project.id);
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('duplicate required root, deleted root, and deleted candidate fail closed', async () => {
+  const scenarios = ['duplicate root', 'deleted root', 'deleted candidate'];
+  for (const label of scenarios) {
+    resetTestHomeWorkspace();
+    const desktopRoot = path.join(TEST_HOME, 'Desktop');
+    const documentsRoot = path.join(TEST_HOME, 'Documents');
+    const candidatePath = path.join(desktopRoot, `${label.replace(/\s+/g, '-')}.ai`);
+    fs.writeFileSync(candidatePath, 'candidate');
+    if (label === 'duplicate root') {
+      fs.rmSync(documentsRoot, { recursive: true, force: true });
+      fs.symlinkSync(desktopRoot, documentsRoot, 'dir');
+    }
+    const project = await createProject(`Metadata ${label}`);
+    let mutationDone = false;
+
+    try {
+      setChildProcessHandler(request => {
+        const paths = bulkXattrPaths(request);
+        if (paths.length) return missingXattrError(paths);
+        if (isBulkSpotlightRequest(request)) {
+          if (!mutationDone && label === 'deleted root' && bulkSpotlightRoot(request) === desktopRoot) {
+            fs.rmSync(desktopRoot, { recursive: true, force: true });
+            mutationDone = true;
+          } else if (!mutationDone && label === 'deleted candidate') {
+            fs.rmSync(candidatePath, { force: true });
+            mutationDone = true;
+          }
+          return { stdout: Buffer.alloc(0) };
+        }
+        return { stdout: '' };
+      });
+      const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+      assert.equal(scan.error, 'package_scan_incomplete', label);
+      assert.equal(scan.diagnostics.failurePhase, 'pre-package-discovery', label);
+    } finally {
+      setChildProcessHandler(null);
+      if (label === 'duplicate root') fs.rmSync(documentsRoot, { force: true });
+      resetTestHomeWorkspace();
+    }
+  }
+});
+
 test('pre-package discovery timeout invalidates late work and reports fresh overlap evidence', async () => {
   resetTestHomeWorkspace();
   const project = await createProject('Stalled Pre-Package Scan');
@@ -4368,9 +4953,9 @@ test('pre-package discovery timeout invalidates late work and reports fresh over
   const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        return mdlsGate.then(() => ({ stdout: new Date().toISOString() }));
-      }
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return missingXattrError(paths);
+      if (isBulkSpotlightRequest(request)) return mdlsGate.then(() => ({ stdout: Buffer.alloc(0) }));
       return { stdout: '' };
     });
     global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 0 : delay, ...args);
@@ -4433,12 +5018,11 @@ test('final package confirmation reports privacy-safe evidence when an input sca
     const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
     const mdlsStarted = new Promise(resolve => { markMdlsStarted = resolve; });
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: '' };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return missingXattrError(paths);
+      if (isBulkSpotlightRequest(request)) {
         markMdlsStarted();
-        return mdlsGate.then(() => ({ stdout: '(null)' }));
+        return mdlsGate.then(() => ({ stdout: Buffer.alloc(0) }));
       }
       return { stdout: '' };
     });
@@ -4484,19 +5068,15 @@ test('a fresh pre-package retry replaces prior scan metrics', async () => {
   fs.writeFileSync(removedCandidate, 'removed candidate');
   const project = await createProject('Fresh Pre-Package Retry');
   const staleXattr = encodeLastUsedXattr(Date.now() - (24 * 60 * 60 * 1000));
-  const staleMdls = new Date(Date.now() - (24 * 60 * 60 * 1000)).toISOString();
   const trackedSetTimeout = global.setTimeout;
   let releaseMdls = () => {};
   let markMdlsStarted = () => {};
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: staleXattr };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        return { stdout: staleMdls };
-      }
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, () => staleXattr) };
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
       return { stdout: '' };
     });
 
@@ -4507,12 +5087,11 @@ test('a fresh pre-package retry replaces prior scan metrics', async () => {
     const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
     const mdlsStarted = new Promise(resolve => { markMdlsStarted = resolve; });
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: '' };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return missingXattrError(paths);
+      if (isBulkSpotlightRequest(request)) {
         markMdlsStarted();
-        return mdlsGate.then(() => ({ stdout: staleMdls }));
+        return mdlsGate.then(() => ({ stdout: Buffer.alloc(0) }));
       }
       return { stdout: '' };
     });
@@ -4535,7 +5114,7 @@ test('a fresh pre-package retry replaces prior scan metrics', async () => {
       phaseElapsedMs: retry.diagnostics.phaseElapsedMs,
       candidateCount: 1,
       xattrResolvedCount: 0,
-      metadataFallbackCount: 1,
+      metadataFallbackCount: 0,
     });
     assert.ok(Number.isSafeInteger(retry.diagnostics.phaseElapsedMs));
     releaseMdls();
@@ -4590,20 +5169,21 @@ test('pre-package discovery timeout blocks an otherwise materializable project w
   const recentXattr = encodeLastUsedXattr(Date.now() + 1000);
   const trackedSetTimeout = global.setTimeout;
   let mdlsCalls = 0;
+  let spotlightCalls = 0;
   let releaseMdls;
   const mdlsGate = new Promise(resolve => { releaseMdls = resolve; });
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        const candidatePath = request.args[request.args.length - 1];
-        if (candidatePath !== stalledCandidate) return { stdout: recentXattr };
-        return { stdout: '' };
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, candidatePath => (
+        candidatePath === stalledCandidate ? encodeLastUsedXattr(Date.now() - 86400000) : recentXattr
+      )) };
+      if (isBulkSpotlightRequest(request)) {
+        spotlightCalls++;
+        return mdlsGate.then(() => ({ stdout: Buffer.alloc(0) }));
       }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsCalls++;
-        return mdlsGate.then(() => ({ stdout: '(null)' }));
-      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
       return { stdout: '' };
     });
     global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(fn, delay === 8000 ? 100 : delay, ...args);
@@ -4614,15 +5194,16 @@ test('pre-package discovery timeout blocks an otherwise materializable project w
       failurePhase: 'pre-package-discovery',
       phaseElapsedMs: scan.diagnostics.phaseElapsedMs,
       candidateCount: 129,
-      xattrResolvedCount: 128,
-      metadataFallbackCount: 1,
+      xattrResolvedCount: 0,
+      metadataFallbackCount: 0,
     });
     assert.ok(Number.isSafeInteger(scan.diagnostics.phaseElapsedMs));
     const safeDiagnosticText = JSON.stringify(scan.diagnostics);
     assert.equal(safeDiagnosticText.includes(projectRoot), false);
     assert.equal(safeDiagnosticText.includes('Review_Project.ai'), false);
     assert.equal(safeDiagnosticText.includes('relevant-open.ai'), false);
-    assert.equal(mdlsCalls, 1);
+    assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
+    assert.equal(mdlsCalls, 0);
     releaseMdls();
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
@@ -4653,7 +5234,7 @@ test('pre-package discovery timeout blocks an otherwise materializable project w
   }
 });
 
-test('bounded pre-package metadata checks settle accumulated unrelated fixtures concurrently', async () => {
+test('bounded pre-package metadata checks use one batch and one query per existing required root', async () => {
   resetTestHomeWorkspace();
   const projectRoot = path.join(TEST_HOME, 'Desktop', 'Crate-QA', 'v2.7.1-jenna', 'source-copies');
   const sourcePath = path.join(projectRoot, 'Review_Project.ai');
@@ -4686,33 +5267,31 @@ test('bounded pre-package metadata checks settle accumulated unrelated fixtures 
   const beforeWatcherCount = watcherRecords.length;
   const beforeWatcherCloseCount = watcherCloseCount;
   const historicalXattr = encodeLastUsedXattr(Date.now() - (24 * 60 * 60 * 1000));
-  const historicalMdls = new Date(Date.now() - (24 * 60 * 60 * 1000)).toISOString();
+  let xattrCalls = 0;
+  let spotlightCalls = 0;
   let mdlsCalls = 0;
-  let activeMdlsCalls = 0;
-  let maxActiveMdlsCalls = 0;
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: historicalXattr };
+      const paths = bulkXattrPaths(request);
+      if (paths.length) {
+        xattrCalls++;
+        assert.ok(paths.length <= 256);
+        return { stdout: formatBulkXattrOutput(paths, () => historicalXattr) };
       }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsCalls++;
-        activeMdlsCalls++;
-        maxActiveMdlsCalls = Math.max(maxActiveMdlsCalls, activeMdlsCalls);
-        return new Promise(resolve => setTimeout(() => {
-          activeMdlsCalls--;
-          resolve({ stdout: historicalMdls });
-        }, 5));
+      if (isBulkSpotlightRequest(request)) {
+        spotlightCalls++;
+        return { stdout: Buffer.alloc(0) };
       }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
       return { stdout: '' };
     });
 
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, undefined);
-    assert.equal(mdlsCalls, 128);
-    assert.ok(maxActiveMdlsCalls > 1);
-    assert.ok(maxActiveMdlsCalls <= 16);
+    assert.equal(xattrCalls, 1);
+    assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
+    assert.equal(mdlsCalls, 0);
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.materializable, true);
     assert.equal(typeof review.token, 'string');
@@ -4728,15 +5307,21 @@ test('bounded pre-package metadata checks settle accumulated unrelated fixtures 
   }
 });
 
-test('invalid xattr timestamps fall back to mdls without admitting candidates', async () => {
+test('signed native timespec boundaries reconcile against Spotlight without admitting candidates', async () => {
   resetTestHomeWorkspace();
   const candidateRoot = path.join(TEST_HOME, 'Desktop', 'invalid-xattr-fixtures');
   const farFutureTimespec = Buffer.alloc(16);
   farFutureTimespec.writeBigInt64LE(8640000000001n, 0);
+  const maxSecondWithNanoseconds = Buffer.alloc(16);
+  maxSecondWithNanoseconds.writeBigInt64LE(8640000000000n, 0);
+  maxSecondWithNanoseconds.writeBigInt64LE(1n, 8);
   const candidateXattrs = new Map([
     [path.join(candidateRoot, 'malformed.ai'), 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'],
     [path.join(candidateRoot, 'negative-seconds.ai'), 'ffffffffffffffff0000000000000000'],
+    [path.join(candidateRoot, 'zero-seconds.ai'), '00000000000000000000000000000000'],
+    [path.join(candidateRoot, 'negative-nanoseconds.ai'), '00f1536500000000ffffffffffffffff'],
     [path.join(candidateRoot, 'invalid-nanoseconds.ai'), '00f153650000000000ca9a3b00000000'],
+    [path.join(candidateRoot, 'max-second-with-nanoseconds.ai'), maxSecondWithNanoseconds.toString('hex')],
     [path.join(candidateRoot, 'out-of-range-seconds.ai'), farFutureTimespec.toString('hex')],
   ]);
   fs.mkdirSync(candidateRoot, { recursive: true });
@@ -4744,23 +5329,20 @@ test('invalid xattr timestamps fall back to mdls without admitting candidates', 
 
   const project = await createProject('Invalid Xattr Review');
   const before = await getProject(project.id);
-  const mdlsPaths = [];
+  let mdlsCalls = 0;
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: candidateXattrs.get(request.args[request.args.length - 1]) || '' };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsPaths.push(request.args[request.args.length - 1]);
-        return { stdout: '(null)' };
-      }
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, candidatePath => candidateXattrs.get(candidatePath)) };
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
       return { stdout: '' };
     });
 
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, undefined);
-    assert.deepEqual(mdlsPaths.sort(), [...candidateXattrs.keys()].sort());
+    assert.equal(mdlsCalls, 0);
     assert.equal(JSON.stringify(await getProject(project.id)), JSON.stringify(before));
   } finally {
     setChildProcessHandler(null);
@@ -4768,7 +5350,7 @@ test('invalid xattr timestamps fall back to mdls without admitting candidates', 
   }
 });
 
-test('pre-package discovery preserves a newer mdls signal when xattr is stale', async () => {
+test('pre-package discovery preserves a newer Spotlight signal when xattr is stale', async () => {
   resetTestHomeWorkspace();
   const candidatePath = path.join(TEST_HOME, 'Desktop', 'newer-spotlight.psd');
   fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
@@ -4780,51 +5362,12 @@ test('pre-package discovery preserves a newer mdls signal when xattr is stale', 
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: encodeLastUsedXattr(storedProject.watchStartedAt - 1000) };
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, () => encodeLastUsedXattr(storedProject.watchStartedAt - 1000)) };
+      if (isBulkSpotlightRequest(request)) {
+        return { stdout: formatBulkSpotlightOutputForRoot(request, [candidatePath]) };
       }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsCalls++;
-        return { stdout: new Date(storedProject.watchStartedAt + 500).toISOString() };
-      }
-      return { stdout: '' };
-    });
-
-    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
-    assert.equal(scan.error, undefined);
-    assert.equal(mdlsCalls, 1);
-    const updated = await getProject(project.id);
-    assert.equal(updated.files.length, 0);
-    assert.equal(updated.pendingFiles.length, 0);
-    assert.equal(
-      updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(candidatePath)].latest.reason,
-      'broad-observer-outside-session'
-    );
-  } finally {
-    setChildProcessHandler(null);
-    fs.rmSync(candidatePath, { force: true });
-  }
-});
-
-test('pre-package discovery accepts a real macOS last-used timespec without mdls fallback', async () => {
-  resetTestHomeWorkspace();
-  const candidatePath = path.join(TEST_HOME, 'Desktop', 'native-timespec.psd');
-  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
-  fs.writeFileSync(candidatePath, 'native timespec design source');
-  const project = await createProject('Native Timespec Signal');
-  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
-  storedProject.watchStartedAt = Date.parse('2026-06-01T00:00:00Z');
-  let mdlsCalls = 0;
-
-  try {
-    setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: '26a3346a0000000055ce821e00000000' };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsCalls++;
-        return { stdout: '(null)' };
-      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
       return { stdout: '' };
     });
 
@@ -4844,7 +5387,42 @@ test('pre-package discovery accepts a real macOS last-used timespec without mdls
   }
 });
 
-test('real macOS last-used timespec falls back after its exact nanosecond boundary', async () => {
+test('pre-package discovery accepts a real macOS little-endian signed timespec without mdls', async () => {
+  resetTestHomeWorkspace();
+  const candidatePath = path.join(TEST_HOME, 'Desktop', 'native-timespec.psd');
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+  fs.writeFileSync(candidatePath, 'native timespec design source');
+  const project = await createProject('Native Timespec Signal');
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  storedProject.watchStartedAt = Date.parse('2026-06-01T00:00:00Z');
+  let mdlsCalls = 0;
+
+  try {
+    setChildProcessHandler(request => {
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, () => '26a3346a0000000055ce821e00000000') };
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
+      return { stdout: '' };
+    });
+
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, undefined);
+    assert.equal(mdlsCalls, 0);
+    const updated = await getProject(project.id);
+    assert.equal(updated.files.length, 0);
+    assert.equal(updated.pendingFiles.length, 0);
+    assert.equal(
+      updated.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(candidatePath)].latest.reason,
+      'broad-observer-outside-session'
+    );
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(candidatePath, { force: true });
+  }
+});
+
+test('real macOS last-used timespec remains stale after its exact nanosecond boundary', async () => {
   resetTestHomeWorkspace();
   const candidatePath = path.join(TEST_HOME, 'Desktop', 'native-timespec-boundary.psd');
   fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
@@ -4856,19 +5434,16 @@ test('real macOS last-used timespec falls back after its exact nanosecond bounda
 
   try {
     setChildProcessHandler(request => {
-      if (request.kind === 'execFile' && request.command === '/usr/bin/xattr') {
-        return { stdout: '26a3346a0000000055ce821e00000000' };
-      }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') {
-        mdlsCalls++;
-        return { stdout: '(null)' };
-      }
+      const paths = bulkXattrPaths(request);
+      if (paths.length) return { stdout: formatBulkXattrOutput(paths, () => '26a3346a0000000055ce821e00000000') };
+      if (isBulkSpotlightRequest(request)) return { stdout: Buffer.alloc(0) };
+      if (request.kind === 'execFile' && request.command === '/usr/bin/mdls') mdlsCalls++;
       return { stdout: '' };
     });
 
     const scan = await callIpcRaw('projects:pre-package-scan', project.id);
     assert.equal(scan.error, undefined);
-    assert.equal(mdlsCalls, 1);
+    assert.equal(mdlsCalls, 0);
     const updated = await getProject(project.id);
     assert.equal(updated.files.length, 0);
     assert.equal(updated.pendingFiles.length, 0);
@@ -8176,13 +8751,10 @@ test('generic pre-package broad scan quarantines stale Illustrator-extension sou
   fs.writeFileSync(usedTwoPath, 'used image two');
   fs.writeFileSync(unusedPath, 'unused image should stay out');
 
-  setChildProcessHandler(({ kind, command, args }) => {
-    if (kind === 'execFile' && command === '/usr/bin/mdls') {
-      const filePath = Array.isArray(args) ? args[args.length - 1] : '';
-      if (filePath === staleIllustratorPath) {
-        return { stdout: `${new Date(Date.now() + 60000).toISOString()}\n` };
-      }
-      return { stdout: '(null)\n' };
+  setChildProcessHandler(({ kind, command, args, options }) => {
+    const request = { kind, command, args, options };
+    if (isBulkSpotlightRequest(request)) {
+      return { stdout: formatBulkSpotlightOutputForRoot(request, [staleIllustratorPath]) };
     }
     return { stdout: '' };
   });
