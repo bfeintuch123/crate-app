@@ -929,6 +929,17 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
 });
 
+test('responsive shell keeps navigation aligned and Settings surface scroll-complete', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+
+  assert.match(css, /#tab-settings\.active\s*\{(?=[^}]*min-width:\s*800px;)(?=[^}]*grid-template-columns:\s*minmax\(300px, 0\.8fr\)\s+minmax\(420px, 1\.2fr\);)[^}]*\}/);
+  assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*\.app-sidebar\s*\{(?=[^}]*display:\s*grid;)(?=[^}]*grid-template-columns:\s*minmax\(0, 1fr\)\s+auto;)(?=[^}]*"brand brand"\s*"primary support";)[^}]*\}/);
+  assert.match(css, /\.app-tabs,\s*\.app-tabs-secondary\s*\{(?=[^}]*flex-direction:\s*row;)(?=[^}]*flex-wrap:\s*nowrap;)[^}]*\}/);
+  assert.match(css, /\.app-sidebar\s*>\s*\.app-tabs:not\(\.app-tabs-secondary\)\s*\{(?=[^}]*grid-area:\s*primary;)[^}]*\}/);
+  assert.match(css, /\.app-sidebar\s*>\s*\.app-tabs-secondary\s*\{(?=[^}]*grid-area:\s*support;)(?=[^}]*margin-top:\s*0;)[^}]*\}/);
+  assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*#tab-settings\.active\s*\{(?=[^}]*min-width:\s*0;)(?=[^}]*grid-template-columns:\s*1fr;)[^}]*\}/);
+});
+
 test('Package Review traps keyboard focus, cancels with Escape, and restores its opener', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
