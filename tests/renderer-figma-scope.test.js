@@ -138,6 +138,11 @@ function createInteractiveRendererDom() {
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
     'btn-confirm-package': createElementStub('button'),
+    'btn-skip-existing-assets': createElementStub('button'),
+    'btn-include-existing-assets': createElementStub('button'),
+    'modal-existing-assets': createElementStub(),
+    'existing-assets-modal-count': createElementStub(),
+    'existing-assets-modal-list': createElementStub(),
     'modal-package': createElementStub(),
     'modal-progress': createElementStub(),
     'modal-success': createElementStub(),
@@ -153,6 +158,7 @@ function createInteractiveRendererDom() {
     'modal-v2-results': createElementStub(),
   };
   for (const id of [
+    'modal-existing-assets',
     'modal-package',
     'modal-progress',
     'modal-success',
@@ -168,6 +174,10 @@ function createInteractiveRendererDom() {
     elements['btn-change-dest'],
     elements['btn-cancel-package'],
     elements['btn-confirm-package'],
+  ];
+  elements['modal-existing-assets'].focusableElements = [
+    elements['btn-skip-existing-assets'],
+    elements['btn-include-existing-assets'],
   ];
   elements['modal-upgrade'].focusableElements = [elements['btn-dismiss-upgrade']];
   elements['package-details'].classList.add('hidden');
@@ -630,6 +640,401 @@ test('renderer refreshes changed Package Review inline and requires a second Pac
   assert.equal(document.activeElement, elements['btn-package']);
 });
 
+test('renderer presents the required Existing Assets decision with source-safe copy and trapped focus', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'existing-assets-decision-project',
+    name: 'Existing Assets Decision',
+    type: 'branding',
+    status: 'watching',
+    files: [
+      { name: 'Existing Project.ai', path: '/synthetic/Existing Project.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Existing Linked.png', path: '/synthetic/Existing Linked.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+  `, renderer);
+  document.querySelector('#tab-current-project').classList.add('active');
+
+  await renderer.renderFiles();
+
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['existing-assets-modal-count'].textContent, '1 existing asset found');
+  assert.equal(elements['existing-assets-modal-list'].children.length, 1);
+  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /Existing Linked\.png/);
+  assert.equal(document.activeElement, elements['btn-include-existing-assets']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+
+  elements['btn-include-existing-assets'].focus();
+  const forwardTab = {
+    type: 'keydown',
+    key: 'Tab',
+    shiftKey: false,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  elements['modal-existing-assets'].dispatchEvent(forwardTab);
+  assert.equal(forwardTab.defaultPrevented, true);
+  assert.equal(document.activeElement, elements['btn-skip-existing-assets']);
+});
+
+test('renderer restores focus inside the Existing Assets modal when decision persistence fails', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'existing-assets-decision-failure',
+    files: [{ name: 'Existing.png', path: '/synthetic/Existing.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    setExistingAssetsDecision: async () => ({ success: false, error: 'write_failed' }),
+  } });
+
+  renderer.showExistingAssetsDecisionModal(project);
+  elements['btn-skip-existing-assets'].focus();
+  await renderer.submitExistingAssetsDecision('skip');
+
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['btn-skip-existing-assets'].disabled, false);
+  assert.equal(elements['btn-include-existing-assets'].disabled, false);
+  assert.equal(document.activeElement, elements['btn-include-existing-assets']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+});
+
+test('renderer closes a stale Existing Assets decision when the selected project no longer requires it', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  const decisionProject = {
+    id: 'decision-project',
+    files: [
+      { name: 'Existing.png', path: '/synthetic/Existing.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const readyProject = {
+    id: 'ready-project',
+    files: [],
+    pendingFiles: [],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 2 },
+  };
+
+  renderer.syncExistingAssetsDecisionModal(decisionProject);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+
+  renderer.syncExistingAssetsDecisionModal(readyProject);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+});
+
+test('renderer persists Skip Existing and hides excluded assets without removing the project source', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const source = { name: 'Existing Project.ai', path: '/synthetic/Existing Project.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' };
+  const existing = { name: 'Existing Linked.png', path: '/synthetic/Existing Linked.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' };
+  const project = {
+    id: 'skip-existing-assets-project',
+    name: 'Skip Existing Assets',
+    type: 'branding',
+    status: 'watching',
+    files: [source, existing],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const updatedProject = {
+    ...project,
+    excludedAssetKeys: [existing.path],
+    assetBaseline: { ...project.assetBaseline, status: 'skipped', decision: 'skip' },
+  };
+  const decisions = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    setExistingAssetsDecision: async (...args) => {
+      decisions.push(args);
+      return { success: true, project: updatedProject };
+    },
+    getProjects: async () => [updatedProject],
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+  `, renderer);
+  document.querySelector('#tab-current-project').classList.add('active');
+  elements['btn-package'].focus();
+  await renderer.renderFiles();
+
+  await renderer.submitExistingAssetsDecision('skip');
+
+  assert.deepEqual(decisions, [[project.id, 'skip']]);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(document.activeElement, elements['btn-package']);
+  assert.equal(elements['file-list'].children.length, 1);
+  assert.match(elements['file-list'].children[0].innerHTML, /Existing Project\.ai/);
+  assert.doesNotMatch(elements['file-list'].children[0].innerHTML, /Existing Linked\.png/);
+});
+
+test('renderer project counts exclude assets skipped by the Existing Assets decision', () => {
+  const renderer = loadRendererHelpers(createDocumentStub({}));
+  const project = {
+    status: 'paused',
+    files: [
+      { path: '/synthetic/Project.ai', name: 'Project.ai' },
+      { path: '/synthetic/Existing.png', name: 'Existing.png' },
+    ],
+    excludedAssetKeys: ['/synthetic/Existing.png'],
+  };
+
+  assert.equal(renderer.getStatusLabel(project), 'Paused · 1 file so far');
+});
+
+test('renderer blocks Package Review until the Existing Assets decision is recorded', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'blocked-existing-assets-project',
+    name: 'Blocked Existing Assets',
+    type: 'branding',
+    status: 'watching',
+    files: [
+      { name: 'Blocked.ai', path: '/synthetic/Blocked.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Blocked.png', path: '/synthetic/Blocked.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  let prepareCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    preparePackageReview: async () => { prepareCalls++; return null; },
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-package'].click();
+
+  assert.equal(prepareCalls, 0);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+});
+
+test('notification-triggered packaging opens the Existing Assets decision instead of a generic review error', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'notification-existing-assets-project',
+    name: 'Notification Existing Assets',
+    type: 'branding',
+    status: 'watching',
+    files: [
+      { name: 'Notification.ai', path: '/synthetic/Notification.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Notification.png', path: '/synthetic/Notification.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  let packageTrigger;
+  let prepareCalls = 0;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: async () => [project],
+    preparePackageReview: async () => { prepareCalls++; return null; },
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.setupMainProcessListeners();
+
+  await packageTrigger({ projectId: project.id });
+
+  assert.equal(prepareCalls, 0);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+});
+
+test('notification-triggered packaging closes another project existing-assets decision before review', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const decisionProject = {
+    id: 'notification-decision-project',
+    name: 'Pending Existing Assets',
+    type: 'branding',
+    status: 'paused',
+    files: [
+      { name: 'Pending.ai', path: '/synthetic/Pending.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Pending.png', path: '/synthetic/Pending.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const readyProject = {
+    id: 'notification-ready-project',
+    name: 'Ready Project',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Ready.ai', path: '/synthetic/Ready.ai', assetOrigin: 'added', projectRole: 'source' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 2 },
+  };
+  const review = {
+    token: '00000000-0000-4000-8000-000000000222',
+    projectId: readyProject.id,
+    files: readyProject.files,
+    totalFiles: 1,
+    folderName: 'Ready Project_2026-08-08',
+    materializable: true,
+  };
+  let packageTrigger;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: async () => [decisionProject, readyProject],
+    preScanSession: async () => null,
+    preparePackageReview: async () => review,
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.testDecisionProject = decisionProject;
+  vm.runInContext(`
+    state.projects = [testDecisionProject];
+    state.selectedProjectId = testDecisionProject.id;
+  `, renderer);
+  renderer.syncExistingAssetsDecisionModal(decisionProject);
+  renderer.setupMainProcessListeners();
+
+  await packageTrigger({ projectId: readyProject.id });
+
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), readyProject.id);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+});
+
+test('an earlier decision completion cannot dismiss a later project Existing Assets alert', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = {
+    id: 'decision-race-a',
+    name: 'Decision A',
+    status: 'paused',
+    files: [{ name: 'A.png', path: '/synthetic/A.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const projectB = {
+    id: 'decision-race-b',
+    name: 'Decision B',
+    status: 'watching',
+    files: [{ name: 'B.png', path: '/synthetic/B.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 2 },
+  };
+  let resolveDecisionA;
+  let packageTrigger;
+  const decisionA = new Promise(resolve => { resolveDecisionA = resolve; });
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    setExistingAssetsDecision: async projectId => (
+      projectId === projectA.id ? decisionA : { success: true, project: projectB }
+    ),
+    getProjects: async () => [projectA, projectB],
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.showExistingAssetsDecisionModal(projectA);
+  renderer.setupMainProcessListeners();
+  const pendingDecision = renderer.submitExistingAssetsDecision('include');
+
+  await packageTrigger({ projectId: projectB.id });
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /B\.png/);
+  assert.equal(elements['btn-include-existing-assets'].disabled, false);
+
+  resolveDecisionA({ success: true, project: projectA });
+  await pendingDecision;
+
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /B\.png/);
+});
+
+test('Package Review routes a newly settled baseline to the sole Existing Assets decision dialog', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const awaitingProject = {
+    id: 'settling-existing-assets-project',
+    name: 'Settling Existing Assets',
+    type: 'branding',
+    status: 'watching',
+    files: [{ name: 'Settling.ai', path: '/synthetic/Settling.ai', assetOrigin: null, projectRole: 'source' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'awaiting-first-scan', decision: null, establishedAt: null },
+  };
+  const settledProject = {
+    ...awaitingProject,
+    files: [
+      { name: 'Settling.ai', path: '/synthetic/Settling.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Settling.png', path: '/synthetic/Settling.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => null,
+    preparePackageReview: async () => ({ error: 'asset_baseline_decision_required' }),
+    getProjects: async () => [settledProject],
+  } });
+  renderer.testProject = awaitingProject;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+  `, renderer);
+  document.querySelector('#tab-current-project').classList.add('active');
+  elements['btn-package'].focus();
+
+  assert.equal(await renderer.showPackageModal(), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(document.activeElement, elements['btn-include-existing-assets']);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+});
+
 test('renderer binds the selected destination after generic output drift and packages on the second click', async () => {
   const { document, elements, tabs } = createInteractiveRendererDom();
   const outputPath = '/private/tmp/crate-synthetic-output';
@@ -919,6 +1324,9 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
 
+  assert.match(html, /id="modal-existing-assets"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Skip Existing<\/button>/);
+  assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Include Existing<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change &rarr;<\/button>/);
   assert.match(html, /id="modal-package-review-message"[^>]*role="status"[^>]*aria-live="polite"[^>]*tabindex="-1"/);

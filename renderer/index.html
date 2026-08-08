@@ -311,6 +311,26 @@
     </div>
     </main>
 
+    <!-- Existing Assets Decision Modal -->
+    <div class="modal-overlay hidden" id="modal-existing-assets" role="dialog" aria-modal="true" aria-labelledby="existing-assets-modal-title" aria-describedby="existing-assets-modal-copy" tabindex="-1">
+      <div class="modal existing-assets-decision-modal">
+        <div class="modal-header-area">
+          <div class="existing-assets-modal-app">CRATE</div>
+          <div class="modal-title" id="existing-assets-modal-title">Include existing assets?</div>
+          <div class="modal-subtitle" id="existing-assets-modal-copy">Crate found assets already linked to this project file.</div>
+        </div>
+        <div class="modal-body">
+          <div class="existing-assets-modal-count" id="existing-assets-modal-count"></div>
+          <div class="existing-assets-modal-list" id="existing-assets-modal-list" role="list"></div>
+          <div class="existing-assets-modal-note">The project file stays included either way.</div>
+          <div class="modal-actions">
+            <button class="modal-btn-secondary" id="btn-skip-existing-assets">Skip Existing</button>
+            <button class="modal-btn-primary" id="btn-include-existing-assets">Include Existing</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Package Confirmation Modal -->
     <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" aria-describedby="package-review-subtitle" tabindex="-1">
       <div class="modal">

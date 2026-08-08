@@ -30,6 +30,9 @@ let mainProcessListenersBound = false;
 let packageReviewOpener = null;
 let packageReviewConfirmationInFlight = false;
 let upgradeModalOpener = null;
+let existingAssetsDecisionRequest = null;
+let existingAssetsModalProjectId = null;
+let existingAssetsDecisionOpener = null;
 
 function redactRendererPrivatePaths(value) {
   // Delimiters and line breaks may appear in filenames, so redact the value tail.
@@ -268,7 +271,8 @@ function renderProjectRows() {
 }
 
 function getStatusLabel(project) {
-  const fileCount = project.files.length;
+  const excluded = new Set(project.excludedAssetKeys || []);
+  const fileCount = (project.files || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file))).length;
   const filesText = `${fileCount} file${fileCount !== 1 ? 's' : ''}`;
 
   if (project.status === 'watching') {
@@ -594,7 +598,10 @@ async function renderFiles() {
   const statusText = $('#files-status-text');
   const figmaScopeText = $('#files-figma-scope');
   const figmaWarningText = $('#files-figma-warning');
-  const fileCount = project.files.length;
+  const fileCountExcludedKeys = new Set(project.excludedAssetKeys || []);
+  const fileCount = (project.files || []).filter(file => (
+    !fileCountExcludedKeys.has(getAssetReviewExclusionKey(file))
+  )).length;
 
   statusBar.className = `app-status ${project.status !== 'watching' ? project.status : ''}`;
   statusDot.className = `app-dot ${project.status !== 'watching' ? project.status : ''}`;
@@ -629,17 +636,163 @@ async function renderFiles() {
     renderFigmaWarningCard(figmaWarningText, warning);
   }
 
+  const excludedAssetKeys = new Set(project.excludedAssetKeys || []);
+  const visibleFiles = (project.files || []).filter(file => !excludedAssetKeys.has(getAssetReviewExclusionKey(file)));
+  const visiblePendingFiles = (project.pendingFiles || []).filter(file => !excludedAssetKeys.has(getAssetReviewExclusionKey(file)));
+
   // Pending files (Tier 2)
   renderPendingFiles(project);
 
   // File list
-  renderFileList(project.files, {
-    hasActiveCandidates: (project.pendingFiles || []).length > 0,
+  renderFileList(visibleFiles, {
+    hasActiveCandidates: visiblePendingFiles.length > 0,
   });
 
   // Package button — always enabled; click handler shows toast if no files
   const packageBtn = $('#btn-package');
   packageBtn.disabled = false;
+
+  syncExistingAssetsDecisionModal(project);
+}
+
+function getAssetReviewExclusionKey(file) {
+  if (!file || typeof file !== 'object') return null;
+  if (typeof file.fileId === 'string' && file.fileId) return file.fileId;
+  return typeof file.path === 'string' && file.path ? file.path : null;
+}
+
+function getExistingAssetsForDecision(project) {
+  if (!project || typeof project !== 'object') return [];
+  const excluded = new Set(project.excludedAssetKeys || []);
+  return [...(project.files || []), ...(project.pendingFiles || [])].filter(file => {
+    const key = getAssetReviewExclusionKey(file);
+    return file && file.assetOrigin === 'existing' && file.projectRole === 'asset' && !excluded.has(key);
+  });
+}
+
+function getExistingAssetsDecisionFocusableElements() {
+  return ['btn-skip-existing-assets', 'btn-include-existing-assets']
+    .map(id => $(`#${id}`))
+    .filter(element => element && !element.disabled);
+}
+
+function setExistingAssetsDecisionButtonsDisabled(disabled) {
+  for (const id of ['btn-skip-existing-assets', 'btn-include-existing-assets']) {
+    const button = $(`#${id}`);
+    if (button) button.disabled = disabled;
+  }
+}
+
+function handleExistingAssetsDecisionKeydown(event) {
+  const modal = $('#modal-existing-assets');
+  if (!modal || modal.classList.contains('hidden') || event.key !== 'Tab') return;
+  const focusable = getExistingAssetsDecisionFocusableElements();
+  if (focusable.length === 0) {
+    event.preventDefault();
+    modal.focus();
+    return;
+  }
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const movingBeforeFirst = event.shiftKey && activeIndex <= 0;
+  const movingPastLast = !event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1);
+  if (!movingBeforeFirst && !movingPastLast) return;
+  event.preventDefault();
+  focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+}
+
+function hideExistingAssetsDecisionModal() {
+  const modal = $('#modal-existing-assets');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
+  existingAssetsModalProjectId = null;
+  setModalBackgroundState(false);
+  if (existingAssetsDecisionOpener && typeof existingAssetsDecisionOpener.focus === 'function') {
+    existingAssetsDecisionOpener.focus();
+  }
+  existingAssetsDecisionOpener = null;
+}
+
+function showExistingAssetsDecisionModal(project) {
+  const modal = $('#modal-existing-assets');
+  if (!modal || !project) return;
+  const assets = getExistingAssetsForDecision(project);
+  if (assets.length === 0) return;
+
+  if (modal.classList.contains('hidden')) {
+    existingAssetsDecisionOpener = document.activeElement;
+  }
+  existingAssetsModalProjectId = project.id;
+  const decisionInFlightForProject = existingAssetsDecisionRequest &&
+    existingAssetsDecisionRequest.projectId === project.id;
+  $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
+  const list = $('#existing-assets-modal-list');
+  list.innerHTML = '';
+  for (const file of assets.slice(0, 4)) {
+    const item = document.createElement('div');
+    item.className = 'existing-assets-modal-item';
+    item.setAttribute('role', 'listitem');
+    item.innerHTML = `<span class="app-file-icon">${getFileEmoji(getFileExtension(file))}</span><span>${escapeHtml(file.name || 'Untitled asset')}</span>`;
+    list.appendChild(item);
+  }
+  if (assets.length > 4) {
+    const more = document.createElement('div');
+    more.className = 'existing-assets-modal-more';
+    more.textContent = `+ ${assets.length - 4} more`;
+    list.appendChild(more);
+  }
+
+  setModalBackgroundState(true);
+  modal.classList.remove('hidden');
+  modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
+  modal.addEventListener('keydown', handleExistingAssetsDecisionKeydown);
+  setExistingAssetsDecisionButtonsDisabled(!!decisionInFlightForProject);
+  ($('#btn-include-existing-assets') || modal).focus();
+}
+
+function syncExistingAssetsDecisionModal(project) {
+  const requiresDecision = project && project.assetBaseline && project.assetBaseline.status === 'decision-required';
+  if (!requiresDecision) {
+    if (existingAssetsModalProjectId) hideExistingAssetsDecisionModal();
+    return;
+  }
+  if (existingAssetsModalProjectId === project.id && !$('#modal-existing-assets').classList.contains('hidden')) return;
+  showExistingAssetsDecisionModal(project);
+}
+
+async function submitExistingAssetsDecision(decision) {
+  if (!existingAssetsModalProjectId) return;
+  const projectId = existingAssetsModalProjectId;
+  if (existingAssetsDecisionRequest && existingAssetsDecisionRequest.projectId === projectId) return;
+  const request = { projectId };
+  existingAssetsDecisionRequest = request;
+  const buttons = getExistingAssetsDecisionFocusableElements();
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const result = await window.crate.setExistingAssetsDecision(projectId, decision);
+    if (!result || !result.success) {
+      showToast('Crate could not save that choice. Try again.');
+      return;
+    }
+    state.projects = await window.crate.getProjects();
+    if (existingAssetsModalProjectId === projectId) hideExistingAssetsDecisionModal();
+    if (state.selectedProjectId === projectId && isFilesTabActive()) {
+      await renderFiles();
+    } else if (document.querySelector('#tab-projects')?.classList.contains('active')) {
+      renderProjects();
+    }
+  } catch (error) {
+    logRendererError('existing assets decision failed', error);
+    showToast('Crate could not save that choice. Try again.');
+  } finally {
+    if (existingAssetsDecisionRequest === request) {
+      existingAssetsDecisionRequest = null;
+      if (existingAssetsModalProjectId === projectId) {
+        setExistingAssetsDecisionButtonsDisabled(false);
+        ($('#btn-include-existing-assets') || $('#modal-existing-assets'))?.focus();
+      }
+    }
+  }
 }
 
 // v2.5.0: Track expanded state for file list
@@ -676,8 +829,15 @@ function renderFileList(files, options = {}) {
       fileListExpanded = !fileListExpanded;
       // M2: Re-fetch current files from state instead of closing over stale `files` array
       const project = state.projects.find(p => p.id === state.selectedProjectId);
-      renderFileList(project ? project.files : files, {
-        hasActiveCandidates: !!(project && (project.pendingFiles || []).length > 0),
+      const excluded = new Set(project && project.excludedAssetKeys || []);
+      const currentFiles = project
+        ? (project.files || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)))
+        : files;
+      const hasActiveCandidates = !!(project && (project.pendingFiles || []).some(file => (
+        !excluded.has(getAssetReviewExclusionKey(file))
+      )));
+      renderFileList(currentFiles, {
+        hasActiveCandidates,
       });
     });
     container.appendChild(toggle);
@@ -767,7 +927,8 @@ function renderPendingFiles(project) {
   const list = $('#pending-file-list');
   if (!section || !list) return;
 
-  const pending = project.pendingFiles || [];
+  const excluded = new Set(project.excludedAssetKeys || []);
+  const pending = (project.pendingFiles || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)));
 
   if (pending.length === 0) {
     section.classList.add('hidden');
@@ -928,6 +1089,7 @@ function renderFooter() {
 }
 
 const PACKAGE_LIMIT_COMPETING_MODAL_IDS = [
+  'modal-existing-assets',
   'modal-package',
   'modal-success',
   'modal-progress',
@@ -1312,6 +1474,15 @@ async function showPackageModal({
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
     );
     if (!review || review.error) {
+      if (review?.error === 'asset_baseline_decision_required') {
+        state.projects = await window.crate.getProjects();
+        project = state.projects.find(item => item.id === projectId) || project;
+        hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
+        if (project?.assetBaseline?.status === 'decision-required') {
+          showExistingAssetsDecisionModal(project);
+          return false;
+        }
+      }
       const failureMessage = message || getPackageReviewRecoveryMessage(
         review?.error || 'package_review_unavailable',
         review?.diagnostics
@@ -1563,6 +1734,10 @@ function setupEventListeners() {
     if (!projectId) return;
 
     const project = state.projects.find(p => p.id === projectId);
+    if (project && project.assetBaseline && project.assetBaseline.status === 'decision-required') {
+      showExistingAssetsDecisionModal(project);
+      return;
+    }
     if (!project || project.files.length === 0) {
       showToast('No files captured yet. Keep watching or tap + Add files to add manually.');
       return;
@@ -1580,6 +1755,9 @@ function setupEventListeners() {
   $('#modal-package').addEventListener('keydown', handlePackageReviewKeydown);
 
   $('#btn-confirm-package').addEventListener('click', confirmPackage);
+
+  $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include'));
+  $('#btn-skip-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('skip'));
 
   $('#btn-change-dest').addEventListener('click', async () => {
     const folder = await window.crate.selectOutputFolder();
@@ -1937,9 +2115,17 @@ function setupMainProcessListeners() {
 
   // Notification-triggered packaging still requires the same authoritative review.
   window.crate.onPackageTrigger(async (data) => {
+    state.projects = await window.crate.getProjects();
     const project = state.projects.find(p => p.id === data.projectId);
     if (project) {
+      if (existingAssetsModalProjectId && existingAssetsModalProjectId !== data.projectId) {
+        hideExistingAssetsDecisionModal();
+      }
       state.selectedProjectId = data.projectId;
+      if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
+        showExistingAssetsDecisionModal(project);
+        return;
+      }
       await showPackageModal();
     }
   });
