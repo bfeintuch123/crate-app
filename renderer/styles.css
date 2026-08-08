@@ -1985,6 +1985,7 @@ body {
 
 #tab-settings.active {
   display: grid;
+  min-width: 800px;
   grid-template-columns: minmax(300px, 0.8fr) minmax(420px, 1.2fr);
   align-content: start;
   gap: 22px;
@@ -2209,6 +2210,11 @@ body {
   }
 
   .app-sidebar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "brand brand"
+      "primary support";
     width: 100%;
     min-width: 0;
     border-radius: 0;
@@ -2217,13 +2223,24 @@ body {
   }
 
   .sidebar-brand {
+    grid-area: brand;
     padding: 8px 4px;
   }
 
   .app-tabs,
   .app-tabs-secondary {
     flex-direction: row;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+  }
+
+  .app-sidebar > .app-tabs:not(.app-tabs-secondary) {
+    grid-area: primary;
+    min-width: 0;
+  }
+
+  .app-sidebar > .app-tabs-secondary {
+    grid-area: support;
+    margin-top: 0;
   }
 
   .app-tab {
@@ -2244,6 +2261,7 @@ body {
   }
 
   #tab-settings.active {
+    min-width: 0;
     grid-template-columns: 1fr;
   }
 
