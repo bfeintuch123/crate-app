@@ -55,15 +55,6 @@ const EXPECTED_INSTALL_SCRIPTS = Object.freeze([
     implicitInstall: null,
   }),
   Object.freeze({
-    lockPath: 'node_modules/fs-xattr',
-    name: 'fs-xattr',
-    version: '0.3.1',
-    resolved: 'https://registry.npmjs.org/fs-xattr/-/fs-xattr-0.3.1.tgz',
-    integrity: 'sha512-UVqkrEW0GfDabw4C3HOrFlxKfx0eeigfRne69FxSBdHIP8Qt5Sq6Pu3RM9KmMlkygtC4pPKkj5CiPO5USnj2GA==',
-    scripts: Object.freeze({}),
-    implicitInstall: 'node-gyp rebuild',
-  }),
-  Object.freeze({
     lockPath: 'node_modules/fsevents',
     name: 'fsevents',
     version: '2.3.3',
@@ -71,15 +62,6 @@ const EXPECTED_INSTALL_SCRIPTS = Object.freeze([
     integrity: 'sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==',
     scripts: Object.freeze({}),
     implicitInstall: null,
-  }),
-  Object.freeze({
-    lockPath: 'node_modules/macos-alias',
-    name: 'macos-alias',
-    version: '0.2.12',
-    resolved: 'https://registry.npmjs.org/macos-alias/-/macos-alias-0.2.12.tgz',
-    integrity: 'sha512-yiLHa7cfJcGRFq4FrR4tMlpNHb4Vy4mWnpajlSSIFM5k4Lv8/7BbbDLzCAVogWNl0LlLhizRp1drXv0hK9h0Yw==',
-    scripts: Object.freeze({}),
-    implicitInstall: 'node-gyp rebuild',
   }),
 ]);
 const EXPECTED_ROOT_LIFECYCLE_NAMES = Object.freeze([
@@ -330,8 +312,8 @@ test('package-tree symlinks and implicit install drift fail closed', () => {
     fs.unlinkSync(nodeModulesPath);
     fs.renameSync(movedNodeModulesPath, nodeModulesPath);
 
-    const approval = EXPECTED_INSTALL_SCRIPTS.find(item => item.implicitInstall);
-    fs.rmSync(path.join(root, approval.lockPath, 'binding.gyp'));
+    const approval = EXPECTED_INSTALL_SCRIPTS.find(item => item.name === 'fsevents');
+    fs.writeFileSync(path.join(root, approval.lockPath, 'binding.gyp'), '{}');
     const result = inspectInstallScriptPolicy(root);
     assert.equal(result.ok, false);
     assert.equal(
