@@ -9139,40 +9139,21 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
     ).catch(() => ({ stdout: '' }));
 
     if (psCheck.trim()) {
-      const appleScript = `tell application "Adobe InDesign"
-  try
-    set pathList to {}
-    repeat with aDoc in every document
-      repeat with aLink in every link of aDoc
-        try
-          set filePath to POSIX path of (file path of aLink as alias)
-          set end of pathList to filePath
-        end try
-      end repeat
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return pathList as text
-  on error
-    return ""
-  end try
-end tell`;
-
       const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
-        () => ({ 'crate-indd-query.applescript': appleScript }),
+        () => ({ 'crate-indd-query.applescript': INDD_APPLESCRIPT }),
         'crate-indd-query.applescript',
         { timeout: 10000, encoding: 'utf8' }
       ).catch(() => ({ stdout: '' }));
 
       if (inddPaths.trim()) {
-        const results = [];
-        for (const line of inddPaths.trim().split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          if (trimmed === filePath) continue;
-          if (fs.existsSync(trimmed)) results.push(trimmed);
-        }
+        const selectedSourcePath = normalizeTrackedFilePath(filePath);
+        const { links } = parseInDesignActiveSessionOutput(inddPaths);
+        const results = links
+          .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
+          .map(link => link.linkedPath)
+          .filter(linkedPath => linkedPath !== filePath && fs.existsSync(linkedPath));
         if (results.length > 0) {
-          return results;
+          return [...new Set(results)];
         }
       }
     }
@@ -9411,6 +9392,7 @@ function markExistingBaselineAssetMetadata(project, fileEntry) {
     const storedFile = (collection || []).find(file => getTrackedFileDedupKey(file) === candidateKey);
     if (!storedFile) continue;
     if (baselineSourceKeys.has(normalizeTrackedFilePath(storedFile.path))) continue;
+    if (isExplicitUserCapturedFile(storedFile)) continue;
     if (storedFile.assetOrigin !== 'existing') {
       storedFile.assetOrigin = 'existing';
       changed = true;

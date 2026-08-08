@@ -7844,6 +7844,85 @@ test('first scan reclassifies an already accepted dependency into the Existing c
   }
 });
 
+test('first scan preserves a linked asset explicitly selected in the same Add Files action', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-explicit-baseline-asset-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Explicit Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Explicit Linked.png');
+    fs.writeFileSync(linkedPath, 'explicit linked dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    const project = await createProject('Explicit baseline asset');
+    manualDialogFor([sourcePath, linkedPath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+    const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.equal(linkedFile.source, 'manual-browse');
+    assert.equal(linkedFile.assetOrigin, 'added');
+    assert.equal(linkedFile.projectRole, 'asset');
+    assert.deepEqual(fresh.excludedAssetKeys, []);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(
+      review.files.map(file => file.name).sort(),
+      ['Explicit Linked.png', 'Explicit Source.ai']
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan attributes links only from the selected source document', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-baseline-scope-test-'));
+  try {
+    const selectedSourcePath = path.join(fixtureRoot, 'Selected Source.indd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Linked.png');
+    const unrelatedSourcePath = path.join(fixtureRoot, 'Unrelated Open.indd');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Unrelated Linked.png');
+    for (const filePath of [selectedSourcePath, selectedLinkedPath, unrelatedSourcePath, unrelatedLinkedPath]) {
+      fs.writeFileSync(filePath, `synthetic bytes for ${path.basename(filePath)}`);
+    }
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+        return {
+          stdout: [
+            `DOC\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\tfalse\ttrue`,
+            `LINK\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\t${selectedLinkedPath}\tfalse\ttrue`,
+            `DOC\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\tfalse\tfalse`,
+            `LINK\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\t${unrelatedLinkedPath}\tfalse\tfalse`,
+          ].join('\n'),
+          stderr: '',
+        };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const project = await createProject('InDesign baseline source scope');
+    manualDialogFor([selectedSourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.some(file => file.path === selectedLinkedPath), true);
+    assert.equal(fresh.files.some(file => file.path === unrelatedSourcePath), false);
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('Include Existing promotes the displayed existing pending cohort into Package Review', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-include-existing-pending-test-'));
   try {
