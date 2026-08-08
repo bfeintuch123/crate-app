@@ -2716,6 +2716,140 @@ const PRIMARY_DESIGN_EXTENSIONS = new Set([
   '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.ppt', '.pxd',
 ]);
 
+const ASSET_REVIEW_SCHEMA_VERSION = 1;
+const ASSET_BASELINE_STATUSES = new Set([
+  'awaiting-first-scan',
+  'decision-required',
+  'included',
+  'skipped',
+  'empty',
+  'legacy-included',
+]);
+const ASSET_BASELINE_DECISIONS = new Set(['include', 'skip']);
+const ASSET_ORIGINS = new Set(['existing', 'added']);
+const PROJECT_FILE_ROLES = new Set(['source', 'asset']);
+const DEPENDENCY_CAPTURE_SOURCES = new Set([
+  'ai-linked',
+  'indd-poll',
+  'indd-linked',
+  'ps-poll',
+  'psd-linked',
+  'psd-embedded',
+  'scan-on-open',
+  'scan-on-save-linked',
+  'scan-on-save-embedded',
+  'scan-on-save-presentation',
+  'embedded-media',
+  'figma-auto',
+]);
+
+function createAssetBaselineState(status = 'awaiting-first-scan', project = null) {
+  const legacy = status === 'legacy-included';
+  const establishedAt = legacy
+    ? (Number.isFinite(project && project.watchStartedAt)
+      ? project.watchStartedAt
+      : (Number.isFinite(project && project.createdAt) ? project.createdAt : null))
+    : null;
+  return {
+    schemaVersion: ASSET_REVIEW_SCHEMA_VERSION,
+    status,
+    decision: legacy ? 'include' : null,
+    establishedAt,
+  };
+}
+
+function inferProjectFileRole(file) {
+  if (!file || typeof file !== 'object') return 'asset';
+  const source = getFileCaptureSource(file);
+  const evidence = file.captureEvidence && typeof file.captureEvidence === 'object'
+    ? file.captureEvidence
+    : {};
+  if (
+    DEPENDENCY_CAPTURE_SOURCES.has(source) ||
+    typeof evidence.relationshipSourcePath === 'string' ||
+    typeof evidence.sourceDocumentPath === 'string'
+  ) {
+    return 'asset';
+  }
+  const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+  return PRIMARY_DESIGN_EXTENSIONS.has(ext) ? 'source' : 'asset';
+}
+
+function inferAssetOrigin(project, file, baseline) {
+  const baselineStatus = baseline && baseline.status;
+  if (baselineStatus === 'legacy-included') return 'existing';
+  if (isExplicitUserCapturedFile(file)) return 'added';
+  if (baselineStatus === 'awaiting-first-scan') return null;
+  const baselineEstablishedAt = Number.isFinite(baseline && baseline.establishedAt)
+    ? baseline.establishedAt
+    : null;
+  if (baselineEstablishedAt !== null && Number.isFinite(file && file.addedAt)) {
+    return file.addedAt <= baselineEstablishedAt ? 'existing' : 'added';
+  }
+  const sessionStart = Number.isFinite(project && project.watchStartedAt)
+    ? project.watchStartedAt
+    : (Number.isFinite(project && project.createdAt) ? project.createdAt : null);
+  if (sessionStart !== null && Number.isFinite(file && file.addedAt) && file.addedAt >= sessionStart) {
+    return 'added';
+  }
+  return 'existing';
+}
+
+function normalizeProjectAssetReviewState(project) {
+  if (!project || typeof project !== 'object') return false;
+  let changed = false;
+  const baseline = project.assetBaseline && typeof project.assetBaseline === 'object'
+    ? project.assetBaseline
+    : null;
+  const status = baseline && ASSET_BASELINE_STATUSES.has(baseline.status)
+    ? baseline.status
+    : 'legacy-included';
+  const normalizedBaseline = createAssetBaselineState(status, project);
+  if (baseline) {
+    normalizedBaseline.decision = ASSET_BASELINE_DECISIONS.has(baseline.decision)
+      ? baseline.decision
+      : normalizedBaseline.decision;
+    normalizedBaseline.establishedAt = Number.isFinite(baseline.establishedAt)
+      ? baseline.establishedAt
+      : normalizedBaseline.establishedAt;
+  }
+  if (JSON.stringify(project.assetBaseline) !== JSON.stringify(normalizedBaseline)) {
+    project.assetBaseline = normalizedBaseline;
+    changed = true;
+  }
+
+  const normalizedExcludedKeys = [];
+  const seenExcludedKeys = new Set();
+  for (const key of Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : []) {
+    if (typeof key !== 'string' || key.length === 0 || seenExcludedKeys.has(key)) continue;
+    seenExcludedKeys.add(key);
+    normalizedExcludedKeys.push(key);
+  }
+  if (JSON.stringify(project.excludedAssetKeys) !== JSON.stringify(normalizedExcludedKeys)) {
+    project.excludedAssetKeys = normalizedExcludedKeys;
+    changed = true;
+  }
+
+  for (const collection of [project.files, project.pendingFiles]) {
+    if (!Array.isArray(collection)) continue;
+    for (const file of collection) {
+      if (!file || typeof file !== 'object') continue;
+      if (!ASSET_ORIGINS.has(file.assetOrigin)) {
+        const assetOrigin = inferAssetOrigin(project, file, normalizedBaseline);
+        if (ASSET_ORIGINS.has(assetOrigin)) {
+          file.assetOrigin = assetOrigin;
+          changed = true;
+        }
+      }
+      if (!PROJECT_FILE_ROLES.has(file.projectRole)) {
+        file.projectRole = inferProjectFileRole(file);
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 // Package-time confirmation window for source docs that were only observed via lsof.
 // We keep downstream/derived assets intact and only require extra proof for plain
 // source files that could have been admitted because another supported app was open.
@@ -3456,6 +3590,7 @@ function getProjects() {
   let changed = false;
   for (const project of val) {
     if (migrateProjectFigmaLinkPrivacy(project)) changed = true;
+    if (normalizeProjectAssetReviewState(project)) changed = true;
   }
   if (changed) store.set('projects', val);
   return val;
@@ -4792,6 +4927,7 @@ function mutateProject(projectId, fn) {
   if (!project) return null;
   const result = fn(project, projects);
   normalizeAutoCaptureProjectState(project);
+  normalizeProjectAssetReviewState(project);
   safelyEnsureProjectProvenance(project);
   store.set('projects', projects);
   return result;
@@ -10376,6 +10512,8 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
     status: 'paused',
     files: [],
     pendingFiles: [], // Tier 2 candidates awaiting user review
+    assetBaseline: createAssetBaselineState(),
+    excludedAssetKeys: [],
     createdAt: Date.now(),
     packagedAt: null,
     outputPath: null

@@ -1251,6 +1251,7 @@ async function assertStalePsdExtractionLeavesNoInvocationFiles(scenario) {
         source: 'manual-browse',
       }],
     });
+    await getProject(project.id);
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const persistedBefore = structuredClone({
       files: stored.files,
@@ -1992,7 +1993,9 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(Object.hasOwn(extracted, 'assetOrigin'), false);
+    assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — image1.jpeg');
     assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
     assertPresentationCacheDirectoryModes(project.id);
@@ -6235,7 +6238,9 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(Object.hasOwn(extracted, 'assetOrigin'), false);
+    assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — photo.jpeg');
     assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
     assertPresentationCacheDirectoryModes(project.id);
@@ -6899,6 +6904,160 @@ test('Keynote provenance failure does not block package extraction success', asy
   }
 });
 
+test('new projects start with an unresolved first-scan baseline and no exclusions', async () => {
+  const project = await createProject('Asset review baseline');
+
+  assert.deepEqual(project.assetBaseline, {
+    schemaVersion: 1,
+    status: 'awaiting-first-scan',
+    decision: null,
+    establishedAt: null,
+  });
+  assert.deepEqual(project.excludedAssetKeys, []);
+});
+
+test('automatic files remain origin-unresolved until the first dependable scan establishes a baseline', async () => {
+  const project = await createProject('Unresolved first scan origin');
+  const sourcePath = path.join(os.tmpdir(), 'First Scan Source.indd');
+  const linkedPath = path.join(os.tmpdir(), 'First Scan Linked.ai');
+  await setProjectFiles(project.id, {
+    files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.indd',
+      addedAt: Date.now(),
+      source: 'app-opened',
+    }],
+    pendingFiles: [{
+      path: linkedPath,
+      name: path.basename(linkedPath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+    }],
+  });
+
+  const fresh = await getProject(project.id);
+
+  assert.equal(Object.hasOwn(fresh.files[0], 'assetOrigin'), false);
+  assert.equal(Object.hasOwn(fresh.pendingFiles[0], 'assetOrigin'), false);
+  assert.equal(fresh.files[0].projectRole, 'source');
+  assert.equal(fresh.pendingFiles[0].projectRole, 'asset');
+});
+
+test('established first-scan boundary separates existing assets from files added while working', async () => {
+  const project = await createProject('Established first scan boundary');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const establishedAt = stored.watchStartedAt + 1000;
+  stored.assetBaseline = {
+    schemaVersion: 1,
+    status: 'decision-required',
+    decision: null,
+    establishedAt,
+  };
+  stored.files = [
+    {
+      path: path.join(os.tmpdir(), 'Existing Before Boundary.png'),
+      name: 'Existing Before Boundary.png',
+      ext: '.png',
+      addedAt: establishedAt - 1,
+      source: 'scan-on-open',
+    },
+    {
+      path: path.join(os.tmpdir(), 'Existing At Boundary.png'),
+      name: 'Existing At Boundary.png',
+      ext: '.png',
+      addedAt: establishedAt,
+      source: 'scan-on-open',
+    },
+    {
+      path: path.join(os.tmpdir(), 'Added After Boundary.png'),
+      name: 'Added After Boundary.png',
+      ext: '.png',
+      addedAt: establishedAt + 1,
+      source: 'scan-on-open',
+    },
+    {
+      path: path.join(os.tmpdir(), 'Explicit Add Before Boundary.png'),
+      name: 'Explicit Add Before Boundary.png',
+      ext: '.png',
+      addedAt: establishedAt - 1,
+      source: 'manual-browse',
+    },
+  ];
+
+  const fresh = await getProject(project.id);
+
+  assert.deepEqual(
+    fresh.files.map(file => [file.name, file.assetOrigin]),
+    [
+      ['Existing Before Boundary.png', 'existing'],
+      ['Existing At Boundary.png', 'existing'],
+      ['Added After Boundary.png', 'added'],
+      ['Explicit Add Before Boundary.png', 'added'],
+    ]
+  );
+});
+
+test('capture routes distinguish linked primary-format assets from a locally saved Figma source', async () => {
+  const project = await createProject('Capture route roles');
+  const files = [
+    makePendingFile(path.join(os.tmpdir(), 'Photoshop Linked.psd'), 'ps-poll'),
+    makePendingFile(path.join(os.tmpdir(), 'InDesign Linked.ai'), 'indd-poll'),
+    makePendingFile(path.join(os.tmpdir(), 'Local Figma Source.fig'), 'fig-scan'),
+  ];
+  await setProjectFiles(project.id, { files });
+
+  const fresh = await getProject(project.id);
+
+  assert.deepEqual(
+    fresh.files.map(file => [file.source, file.projectRole]),
+    [
+      ['ps-poll', 'asset'],
+      ['indd-poll', 'asset'],
+      ['fig-scan', 'source'],
+    ]
+  );
+  assert.equal(fresh.files.some(file => Object.hasOwn(file, 'assetOrigin')), false);
+});
+
+test('legacy projects preserve accepted files without prompting and retain exact exclusion identities', async () => {
+  const project = await createProject('Legacy asset review migration');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const sourcePath = path.join(os.tmpdir(), 'Legacy Source.ai');
+  const linkedPath = path.join(os.tmpdir(), 'Legacy Linked.png');
+  delete stored.assetBaseline;
+  stored.excludedAssetKeys = [linkedPath, `${linkedPath} `, linkedPath, '', null];
+  stored.files = [{
+    path: sourcePath,
+    name: path.basename(sourcePath),
+    ext: '.ai',
+    addedAt: stored.createdAt,
+    source: 'manual-browse',
+  }];
+  stored.pendingFiles = [{
+    path: linkedPath,
+    name: path.basename(linkedPath),
+    ext: '.png',
+    addedAt: stored.createdAt,
+    source: 'psd-linked',
+  }];
+
+  const fresh = await getProject(project.id);
+
+  assert.deepEqual(fresh.assetBaseline, {
+    schemaVersion: 1,
+    status: 'legacy-included',
+    decision: 'include',
+    establishedAt: stored.watchStartedAt,
+  });
+  assert.deepEqual(fresh.excludedAssetKeys, [linkedPath, `${linkedPath} `]);
+  assert.equal(fresh.files[0].assetOrigin, 'existing');
+  assert.equal(fresh.files[0].projectRole, 'source');
+  assert.equal(fresh.pendingFiles[0].assetOrigin, 'existing');
+  assert.equal(fresh.pendingFiles[0].projectRole, 'asset');
+});
+
 test('manual add preserves file ledger entry and records one session observation', async () => {
   const project = await createProject('Manual provenance');
   const filePath = path.join(os.tmpdir(), 'brand-logo.ai');
@@ -6907,11 +7066,13 @@ test('manual add preserves file ledger entry and records one session observation
   const files = await callIpc('projects:add-files', project.id);
 
   assert.equal(files.length, 1);
-  assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'ext', 'name', 'path', 'source']);
+  assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
   assert.equal(files[0].path, filePath);
   assert.equal(files[0].name, 'brand-logo.ai');
   assert.equal(files[0].ext, '.ai');
   assert.equal(files[0].source, 'manual-browse');
+  assert.equal(files[0].assetOrigin, 'added');
+  assert.equal(files[0].projectRole, 'source');
 
   const fresh = await getProject(project.id);
   assertSessionObservedFile(
@@ -6920,6 +7081,18 @@ test('manual add preserves file ledger entry and records one session observation
     'projects:add-files',
     CONFIDENCE_BANDS.CONFIRMED
   );
+});
+
+test('manual image add is classified as an added asset rather than a project source', async () => {
+  const project = await createProject('Manual image asset');
+  const filePath = path.join(os.tmpdir(), 'campaign-photo.png');
+
+  manualDialogFor([filePath]);
+  const files = await callIpc('projects:add-files', project.id);
+
+  assert.equal(files.length, 1);
+  assert.equal(files[0].assetOrigin, 'added');
+  assert.equal(files[0].projectRole, 'asset');
 });
 
 test('duplicate manual add does not duplicate session observations', async () => {
@@ -6957,6 +7130,24 @@ test('accept pending preserves file ledger entry and records one confirmed sessi
     'projects:accept-pending',
     CONFIDENCE_BANDS.CONFIRMED
   );
+});
+
+test('accept pending preserves an existing dependency origin for the persistent asset panel', async () => {
+  const project = await createProject('Accept existing dependency');
+  const filePath = path.join(os.tmpdir(), 'existing-linked-asset.png');
+  const pendingFile = {
+    ...makePendingFile(filePath, 'psd-linked'),
+    assetOrigin: 'existing',
+    projectRole: 'asset',
+  };
+  await setProjectFiles(project.id, { pendingFiles: [pendingFile] });
+
+  const result = await callIpc('projects:accept-pending', project.id, filePath);
+
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].assetOrigin, 'existing');
+  assert.equal(result.files[0].projectRole, 'asset');
+  assert.deepEqual(result.pendingFiles, []);
 });
 
 test('accept pending source triggers persisted scan-on-open linked asset discovery', async () => {
@@ -10095,6 +10286,7 @@ test('same denied paths preserve explicit non-Illustrator authority while hiding
     forbidden.push(...Object.values(illustratorIds));
   }
   forbidden.push('illustrator-active-session');
+  await getProject(project.id);
   const persistedBeforeViews = structuredClone({
     files: stored.files,
     pendingFiles: stored.pendingFiles,
@@ -10787,6 +10979,7 @@ test('nested hidden Illustrator references are filtered from every scoped record
     cyclicDictionary,
   };
 
+  await getProject(project.id);
   const persistedBeforeViews = structuredClone({
     files: stored.files,
     pendingFiles: stored.pendingFiles,
@@ -12844,6 +13037,7 @@ test('multi-asset PSD extraction error cleans earlier staged output and preserve
         source: 'manual-browse',
       }],
     });
+    await getProject(project.id);
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const persistedBefore = structuredClone({
       files: stored.files,
@@ -12911,6 +13105,7 @@ test('multi-asset PSD extraction partial commit error cleans final and staged ou
         source: 'manual-browse',
       }],
     });
+    await getProject(project.id);
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const persistedBefore = structuredClone({
       files: stored.files,
