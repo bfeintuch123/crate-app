@@ -483,6 +483,9 @@ module.exports.__crateMetadataTestHooks = {
     return [...matchSpotlightPathsToCandidateIndexes(spotlightPaths, candidates)]
       .map(index => candidates[index].fullPath);
   },
+  removeOwnedDirectCacheFiles(records) {
+    return removeOwnedDirectCacheFiles(records);
+  },
 };
 `, filename);
 };
@@ -723,6 +726,35 @@ function presentationCachePaths(projectId) {
 function resetPresentationCacheRoot() {
   fs.rmSync(path.join(TEST_HOME, '.crate'), { recursive: true, force: true });
 }
+
+test('completed presentation cleanup records cannot remove a later file at the same cache path', () => {
+  const cacheDir = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-cleanup-record-test-'));
+  try {
+    const filePath = path.join(cacheDir, 'media.png');
+    fs.writeFileSync(filePath, 'first invocation');
+    const firstStat = fs.lstatSync(filePath);
+    const record = {
+      filePath,
+      cacheDir,
+      dev: firstStat.dev,
+      ino: firstStat.ino,
+    };
+
+    metadataTestHooks.removeOwnedDirectCacheFiles([record]);
+    assert.equal(record.cleanupComplete, true);
+    assert.equal(fs.existsSync(filePath), false);
+
+    fs.writeFileSync(filePath, 'later invocation');
+    const laterStat = fs.lstatSync(filePath);
+    record.dev = laterStat.dev;
+    record.ino = laterStat.ino;
+    metadataTestHooks.removeOwnedDirectCacheFiles([record]);
+
+    assert.equal(fs.readFileSync(filePath, 'utf8'), 'later invocation');
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
 
 async function waitForPathMissing(targetPath, message, timeoutMs = 1500) {
   const startedAt = Date.now();

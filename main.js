@@ -6590,8 +6590,12 @@ function captureOwnedDirectCacheFile(filePath, cacheDir, label = 'cache-file') {
 
 function removeOwnedDirectCacheFiles(records) {
   for (const record of Array.isArray(records) ? records : []) {
+    if (!record || record.cleanupComplete === true) continue;
     try {
-      if (!record || !isDirectCacheChild(record.cacheDir, record.filePath)) continue;
+      if (!isDirectCacheChild(record.cacheDir, record.filePath)) {
+        record.cleanupComplete = true;
+        continue;
+      }
       const stat = fs.lstatSync(record.filePath);
       if (
         stat.isSymbolicLink() ||
@@ -6599,9 +6603,15 @@ function removeOwnedDirectCacheFiles(records) {
         stat.nlink !== 1 ||
         stat.dev !== record.dev ||
         stat.ino !== record.ino
-      ) continue;
+      ) {
+        record.cleanupComplete = true;
+        continue;
+      }
       fs.unlinkSync(record.filePath);
-    } catch (_) {}
+      record.cleanupComplete = true;
+    } catch (error) {
+      if (error && error.code === 'ENOENT') record.cleanupComplete = true;
+    }
   }
 }
 
