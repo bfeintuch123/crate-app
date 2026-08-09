@@ -7942,10 +7942,11 @@ test('InDesign first scan attributes links only from the selected source documen
       if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
         return {
           stdout: [
-            `DOC\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\tfalse\ttrue`,
+            `DOC\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\tfalse\ttrue\t1`,
             `LINK\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\t${selectedLinkedPath}\tfalse\ttrue`,
-            `DOC\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\tfalse\tfalse`,
+            `DOC\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\tfalse\tfalse\t1`,
             `LINK\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\t${unrelatedLinkedPath}\tfalse\tfalse`,
+            'END\t2\t2\t2\t0',
           ].join('\n'),
           stderr: '',
         };
@@ -8030,6 +8031,42 @@ test('InDesign first scan fails closed for unavailable or incomplete structured 
         return { stdout: '', stderr: '' };
       },
     },
+    {
+      name: 'partial link query output',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return {
+            stdout: [
+              `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\t1`,
+              'END\t1\t1\t0\t0',
+            ].join('\n'),
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'invalid boolean fields',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return {
+            stdout: [
+              `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tFalse\ttrue\t0`,
+              'END\t1\t0\t0\t0',
+            ].join('\n'),
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
   ];
 
   try {
@@ -8062,7 +8099,10 @@ test('InDesign first scan accepts a well-formed selected document with no links'
       }
       if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
         return {
-          stdout: `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          stdout: [
+            `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\t0`,
+            'END\t1\t0\t0\t0',
+          ].join('\n'),
           stderr: '',
         };
       }

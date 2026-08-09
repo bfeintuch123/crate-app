@@ -8163,13 +8163,19 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
 }
 
 const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
+  set rowList to {}
   try
-    set rowList to {}
+    set documentCount to 0
+    set expectedLinkCount to 0
+    set emittedLinkCount to 0
+    set queryErrorCount to 0
     repeat with aDoc in every document
+      set documentCount to documentCount + 1
       set docName to ""
       set docPathText to ""
       set docModified to false
       set docCurrent to false
+      set documentLinkCount to 0
       try
         set docName to name of aDoc
       end try
@@ -8186,22 +8192,38 @@ const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
           if docPathText ends with "/" then set docPathText to docPathText & docName
         end if
       end try
-      set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text)
+      try
+        set documentLinkCount to count of every link of aDoc
+      on error
+        set queryErrorCount to queryErrorCount + 1
+      end try
+      set expectedLinkCount to expectedLinkCount + documentLinkCount
+      set end of rowList to "DOC" & tab & docPathText & tab & docName & tab & (docModified as text) & tab & (docCurrent as text) & tab & (documentLinkCount as text)
       repeat with aLink in every link of aDoc
         try
           set fp to file path of aLink
           if fp is not missing value then
             set linkPathText to POSIX path of (fp as alias)
             set end of rowList to "LINK" & tab & docPathText & tab & docName & tab & linkPathText & tab & (docModified as text) & tab & (docCurrent as text)
+            set emittedLinkCount to emittedLinkCount + 1
+          else
+            set queryErrorCount to queryErrorCount + 1
           end if
+        on error
+          set queryErrorCount to queryErrorCount + 1
         end try
       end repeat
     end repeat
-    set AppleScript's text item delimiters to linefeed
-    return rowList as text
   on error
-    return ""
+    set rowList to {"ERROR" & tab & "query-failed"}
+    set documentCount to 0
+    set expectedLinkCount to 0
+    set emittedLinkCount to 0
+    set queryErrorCount to 1
   end try
+  set end of rowList to "END" & tab & (documentCount as text) & tab & (expectedLinkCount as text) & tab & (emittedLinkCount as text) & tab & (queryErrorCount as text)
+  set AppleScript's text item delimiters to linefeed
+  return rowList as text
 end tell`;
 
 function parseInDesignActiveSessionOutput(output) {
@@ -8263,6 +8285,85 @@ function parseInDesignActiveSessionOutput(output) {
   }
 
   return { documents, links, diagnostics };
+}
+
+function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
+  const rows = String(output || '').split('\n').map(line => line.trim()).filter(Boolean);
+  const documents = new Map();
+  const linkCountsByDocument = new Map();
+  let terminal = null;
+
+  const parseCount = value => (/^\d+$/.test(value || '') ? Number(value) : null);
+  const isBooleanText = value => value === 'true' || value === 'false';
+
+  for (const line of rows) {
+    if (terminal) throw new Error('asset_baseline_indesign_snapshot_incomplete');
+    const parts = line.split('\t');
+    if (parts[0] === 'DOC') {
+      const documentPath = normalizeTrackedFilePath(parts[1]);
+      const expectedLinks = parseCount(parts[5]);
+      if (
+        parts.length !== 6 ||
+        !documentPath ||
+        !isBooleanText(parts[3]) ||
+        !isBooleanText(parts[4]) ||
+        expectedLinks === null ||
+        documents.has(documentPath)
+      ) {
+        throw new Error('asset_baseline_indesign_snapshot_incomplete');
+      }
+      documents.set(documentPath, expectedLinks);
+      continue;
+    }
+    if (parts[0] === 'LINK') {
+      const documentPath = normalizeTrackedFilePath(parts[1]);
+      if (
+        parts.length !== 6 ||
+        !documentPath ||
+        !normalizeTrackedFilePath(parts[3]) ||
+        !isBooleanText(parts[4]) ||
+        !isBooleanText(parts[5])
+      ) {
+        throw new Error('asset_baseline_indesign_snapshot_incomplete');
+      }
+      linkCountsByDocument.set(documentPath, (linkCountsByDocument.get(documentPath) || 0) + 1);
+      continue;
+    }
+    if (parts[0] === 'END') {
+      if (parts.length !== 5 || terminal) {
+        throw new Error('asset_baseline_indesign_snapshot_incomplete');
+      }
+      const counts = parts.slice(1).map(parseCount);
+      if (counts.some(value => value === null)) {
+        throw new Error('asset_baseline_indesign_snapshot_incomplete');
+      }
+      terminal = {
+        documentCount: counts[0],
+        expectedLinkCount: counts[1],
+        emittedLinkCount: counts[2],
+        queryErrorCount: counts[3],
+      };
+      continue;
+    }
+    throw new Error('asset_baseline_indesign_snapshot_incomplete');
+  }
+
+  const expectedLinkCount = [...documents.values()].reduce((total, count) => total + count, 0);
+  const emittedLinkCount = [...linkCountsByDocument.values()].reduce((total, count) => total + count, 0);
+  const complete = terminal &&
+    terminal.queryErrorCount === 0 &&
+    terminal.documentCount === documents.size &&
+    terminal.expectedLinkCount === expectedLinkCount &&
+    terminal.emittedLinkCount === emittedLinkCount &&
+    expectedLinkCount === emittedLinkCount &&
+    [...documents].every(([documentPath, expectedLinks]) => (
+      (linkCountsByDocument.get(documentPath) || 0) === expectedLinks
+    )) &&
+    documents.has(selectedSourcePath) &&
+    [...linkCountsByDocument.keys()].every(documentPath => documents.has(documentPath));
+  if (!complete) throw new Error('asset_baseline_indesign_snapshot_incomplete');
+
+  return parseInDesignActiveSessionOutput(output);
 }
 
 function normalizeInDesignDocumentName(value) {
@@ -9152,29 +9253,9 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       { timeout: 10000, encoding: 'utf8' }
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
-    const activeState = parseInDesignActiveSessionOutput(inddPaths);
-
-    if (strict) {
-      const rows = String(inddPaths || '').split('\n').map(line => line.trim()).filter(Boolean);
-      const malformed = rows.length === 0 || rows.some(line => {
-        const parts = line.split('\t');
-        if (parts[0] === 'DOC') {
-          return parts.length < 5 || !normalizeTrackedFilePath(parts[1]);
-        }
-        if (parts[0] === 'LINK') {
-          return parts.length < 6 ||
-            !normalizeTrackedFilePath(parts[1]) ||
-            !normalizeTrackedFilePath(parts[3]);
-        }
-        return true;
-      });
-      const selectedDocumentPresent = activeState.documents.some(
-        document => normalizeTrackedFilePath(document.documentPath) === selectedSourcePath
-      );
-      if (malformed || !selectedDocumentPresent) {
-        throw new Error('asset_baseline_indesign_snapshot_incomplete');
-      }
-    }
+    const activeState = strict
+      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath)
+      : parseInDesignActiveSessionOutput(inddPaths);
 
     const results = activeState.links
       .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
