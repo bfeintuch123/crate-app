@@ -454,6 +454,7 @@ let currentPsdFixture = { children: [], linkedFiles: [] };
 setStub('ag-psd', () => ({
   readPsd: () => {
     if (currentPsdFixture instanceof Error) throw currentPsdFixture;
+    if (typeof currentPsdFixture === 'function') return currentPsdFixture();
     return currentPsdFixture;
   },
 }));
@@ -481,6 +482,9 @@ module.exports.__crateMetadataTestHooks = {
   matchSpotlightCandidateRoutes(spotlightPaths, candidates) {
     return [...matchSpotlightPathsToCandidateIndexes(spotlightPaths, candidates)]
       .map(index => candidates[index].fullPath);
+  },
+  removeOwnedDirectCacheFiles(records) {
+    return removeOwnedDirectCacheFiles(records);
   },
 };
 `, filename);
@@ -557,6 +561,14 @@ function manualDialogFor(filePaths) {
   nextOpenDialogResult = { canceled: false, filePaths };
 }
 
+function writeSyntheticAiFile(filePath, content = '') {
+  fs.writeFileSync(filePath, `%PDF-1.7\n${content}\n%%EOF\n`);
+}
+
+function writeSyntheticPdfFile(filePath, content = '') {
+  fs.writeFileSync(filePath, `%PDF-1.7\n${content}\n%%EOF\n`);
+}
+
 function makePendingFile(filePath, source = 'lastused-scan') {
   return {
     path: filePath,
@@ -567,15 +579,45 @@ function makePendingFile(filePath, source = 'lastused-scan') {
   };
 }
 
-async function setProjectFiles(projectId, { files = [], pendingFiles = [], liveEvidenceLedger } = {}) {
+async function setProjectFiles(projectId, {
+  files = [],
+  pendingFiles = [],
+  liveEvidenceLedger,
+  preserveAwaitingAssetBaseline = false,
+} = {}) {
   const project = storeInstance.data.projects.find(item => item.id === projectId);
   assert.ok(project, 'expected project to exist');
   project.files = files;
   project.pendingFiles = pendingFiles;
+  if (!preserveAwaitingAssetBaseline && project.assetBaseline?.status === 'awaiting-first-scan') {
+    project.assetBaseline = {
+      schemaVersion: 1,
+      status: 'empty',
+      decision: null,
+      establishedAt: project.createdAt,
+    };
+  }
   if (arguments[1] && Object.prototype.hasOwnProperty.call(arguments[1], 'liveEvidenceLedger')) {
     project.liveEvidenceLedger = liveEvidenceLedger;
   }
   return project;
+}
+
+async function settleAssetBaselineForUnrelatedPackageTest(projectId) {
+  const current = await getProject(projectId);
+  if (current.assetBaseline?.status === 'decision-required') {
+    const decision = await callIpcRaw('projects:set-existing-assets-decision', projectId, 'include');
+    assert.equal(decision.success, true);
+    return;
+  }
+  if (current.assetBaseline?.status !== 'awaiting-first-scan') return;
+  const stored = storeInstance.data.projects.find(item => item.id === projectId);
+  stored.assetBaseline = {
+    schemaVersion: 1,
+    status: 'empty',
+    decision: null,
+    establishedAt: stored.createdAt,
+  };
 }
 
 function makeTempDir() {
@@ -684,6 +726,35 @@ function presentationCachePaths(projectId) {
 function resetPresentationCacheRoot() {
   fs.rmSync(path.join(TEST_HOME, '.crate'), { recursive: true, force: true });
 }
+
+test('completed presentation cleanup records cannot remove a later file at the same cache path', () => {
+  const cacheDir = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-cleanup-record-test-'));
+  try {
+    const filePath = path.join(cacheDir, 'media.png');
+    fs.writeFileSync(filePath, 'first invocation');
+    const firstStat = fs.lstatSync(filePath);
+    const record = {
+      filePath,
+      cacheDir,
+      dev: firstStat.dev,
+      ino: firstStat.ino,
+    };
+
+    metadataTestHooks.removeOwnedDirectCacheFiles([record]);
+    assert.equal(record.cleanupComplete, true);
+    assert.equal(fs.existsSync(filePath), false);
+
+    fs.writeFileSync(filePath, 'later invocation');
+    const laterStat = fs.lstatSync(filePath);
+    record.dev = laterStat.dev;
+    record.ino = laterStat.ino;
+    metadataTestHooks.removeOwnedDirectCacheFiles([record]);
+
+    assert.equal(fs.readFileSync(filePath, 'utf8'), 'later invocation');
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
 
 async function waitForPathMissing(targetPath, message, timeoutMs = 1500) {
   const startedAt = Date.now();
@@ -1841,8 +1912,11 @@ function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx', op
         return entryData(entry);
       });
       const result = { stdout: Buffer.concat(buffers), stderr: '' };
-      if (typeof options.onReadStart === 'function') options.onReadStart();
-      return options.readGate ? Promise.resolve(options.readGate).then(() => result) : result;
+      if (typeof options.onReadStart === 'function') options.onReadStart(args[2]);
+      const readGate = typeof options.readGateForPath === 'function'
+        ? options.readGateForPath(args[2])
+        : options.readGate;
+      return readGate ? Promise.resolve(readGate).then(() => result) : result;
     }
     return { stdout: '', stderr: '' };
   });
@@ -1993,8 +2067,8 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'projectRole', 'source']);
-    assert.equal(Object.hasOwn(extracted, 'assetOrigin'), false);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(extracted.assetOrigin, 'added');
     assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — image1.jpeg');
     assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
@@ -6185,6 +6259,7 @@ test('PowerPoint provenance failure does not block package extraction success', 
       evidence: {},
     };
 
+    await settleAssetBaselineForUnrelatedPackageTest(project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(result);
     assert.equal(result.success, true);
@@ -6238,8 +6313,8 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
     let fresh = captured.result;
     const extracted = fresh.files.find(file => file.source === 'scan-on-save-presentation');
     assert.ok(extracted);
-    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'ext', 'name', 'path', 'projectRole', 'source']);
-    assert.equal(Object.hasOwn(extracted, 'assetOrigin'), false);
+    assert.deepEqual(Object.keys(extracted).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(extracted.assetOrigin, 'added');
     assert.equal(extracted.projectRole, 'asset');
     assert.equal(extracted.name, 'Deck — photo.jpeg');
     assert.equal(fs.readFileSync(extracted.path, 'utf8'), mediaBytes);
@@ -6891,6 +6966,7 @@ test('Keynote provenance failure does not block package extraction success', asy
       evidence: {},
     };
 
+    await settleAssetBaselineForUnrelatedPackageTest(project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(result);
     assert.equal(result.success, true);
@@ -6935,6 +7011,7 @@ test('automatic files remain origin-unresolved until the first dependable scan e
       addedAt: Date.now(),
       source: 'scan-on-open',
     }],
+    preserveAwaitingAssetBaseline: true,
   });
 
   const fresh = await getProject(project.id);
@@ -6999,6 +7076,1529 @@ test('established first-scan boundary separates existing assets from files added
   );
 });
 
+test('first dependable source scan requires an existing-assets decision and binds package review to it', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-existing-assets-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Existing Project.ai');
+    const linkedPath = path.join(fixtureRoot, 'Existing Linked.png');
+    fs.writeFileSync(linkedPath, 'existing linked bytes');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    const project = await createProject('Existing assets decision');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.assetBaseline.status, 'decision-required');
+    assert.equal(Number.isFinite(fresh.assetBaseline.establishedAt), true);
+    assert.equal(fresh.assetBaseline.decision, null);
+    const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.ok(linkedFile);
+    assert.equal(linkedFile.assetOrigin, 'existing');
+    assert.equal(fresh.assetBaseline.establishedAt <= linkedFile.addedAt, true);
+    assert.deepEqual(
+      fresh.files.map(file => [file.name, file.assetOrigin, file.projectRole]),
+      [
+        ['Existing Project.ai', 'added', 'source'],
+        ['Existing Linked.png', 'existing', 'asset'],
+      ]
+    );
+
+    const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(blockedReview.error, 'asset_baseline_decision_required');
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'skipped');
+    assert.equal(fresh.assetBaseline.decision, 'skip');
+    assert.deepEqual(fresh.excludedAssetKeys, [linkedPath]);
+    const skippedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(skippedReview.files.map(file => file.name), ['Existing Project.ai']);
+
+    const included = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include');
+    assert.equal(included.success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'included');
+    assert.equal(fresh.assetBaseline.decision, 'include');
+    assert.deepEqual(fresh.excludedAssetKeys, []);
+    const includedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(
+      includedReview.files.map(file => file.name).sort(),
+      ['Existing Linked.png', 'Existing Project.ai']
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Skip Existing excludes baseline PowerPoint media while later saved media remains packageable', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-skip-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Existing Deck.pptx');
+    const outputDir = path.join(fixtureRoot, 'out');
+    const existingMedia = Buffer.from('EXISTING_POWERPOINT_MEDIA'.repeat(40));
+    const addedMedia = Buffer.from('ADDED_POWERPOINT_MEDIA'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: existingMedia,
+    }]);
+
+    const project = await createProject('Presentation baseline skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const baselineMedia = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(baselineMedia);
+    assert.equal(baselineMedia.assetOrigin, 'existing');
+    assert.equal(baselineMedia.projectRole, 'asset');
+    assert.equal(baselineMedia.assetBaselineSourcePath, sourcePath);
+    assert.equal(typeof baselineMedia.presentationContentFingerprint, 'string');
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    let review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Existing Deck.pptx']);
+
+    setPowerPointUnzipFixture([
+      { internalPath: 'ppt/media/image1.png', data: existingMedia },
+      { internalPath: 'ppt/media/image2.png', data: addedMedia },
+    ]);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container after save');
+    await emitWatcher('change', sourcePath);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => (
+        file.source === 'scan-on-save-presentation' &&
+        file.assetOrigin === 'added'
+      )),
+      6000
+    );
+    const addedEntry = fresh.files.find(file => (
+      file.source === 'scan-on-save-presentation' &&
+      file.assetOrigin === 'added'
+    ));
+    assert.ok(addedEntry);
+    assert.equal(fs.readFileSync(addedEntry.path, 'utf8'), addedMedia.toString('utf8'));
+
+    review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(
+      review.files.map(file => file.name).sort(),
+      ['Existing Deck — image2.png', 'Existing Deck.pptx']
+    );
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 2);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'Existing Deck — image2.png',
+      'Existing Deck.pptx',
+    ]);
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Existing Deck — image1.png')), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Skip Existing suppresses only baseline PowerPoint occurrences when later media has identical bytes', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-occurrence-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Occurrence Deck.pptx');
+    const outputDir = path.join(fixtureRoot, 'out');
+    const repeatedMedia = Buffer.from('REPEATED_POWERPOINT_MEDIA'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: repeatedMedia,
+    }]);
+
+    const project = await createProject('Presentation occurrence skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.assetBaseline.presentationMediaOccurrences.length, 1);
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    setPowerPointUnzipFixture([
+      { internalPath: 'ppt/media/image1.png', data: repeatedMedia },
+      { internalPath: 'ppt/media/image2.png', data: repeatedMedia },
+    ]);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container with repeated later media');
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.equal(review.materializable, true);
+    assert.deepEqual(review.files.map(file => file.name), ['Occurrence Deck.pptx']);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'Occurrence Deck — image2.png',
+      'Occurrence Deck.pptx',
+    ]);
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Occurrence Deck — image1.png')), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('failed presentation baseline extraction rolls back files created by that invocation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-rollback-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Partial Baseline.pptx');
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.png',
+        data: Buffer.from('FIRST_BASELINE_MEDIA'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('SECOND_BASELINE_MEDIA'.repeat(40)),
+        error: new Error('forced second-entry extraction failure'),
+      },
+    ]);
+
+    const project = await createProject('Partial presentation baseline');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    const cacheDir = presentationCachePaths(project.id).projectDir;
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], []);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('stale presentation baseline extraction rolls back files created before deactivation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-stale-rollback-test-'));
+  let releaseSecondRead = () => {};
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Stale Baseline.pptx');
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    const secondReadGate = new Promise(resolve => { releaseSecondRead = resolve; });
+    let markSecondReadStarted;
+    const secondReadStarted = new Promise(resolve => { markSecondReadStarted = resolve; });
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.png',
+        data: Buffer.from('FIRST_STALE_BASELINE_MEDIA'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('SECOND_STALE_BASELINE_MEDIA'.repeat(40)),
+      },
+    ], {
+      onReadStart: internalPath => {
+        if (internalPath === 'ppt/media/image2.png') markSecondReadStarted();
+      },
+      readGateForPath: internalPath => (
+        internalPath === 'ppt/media/image2.png' ? secondReadGate : null
+      ),
+    });
+
+    const project = await createProject('Stale presentation baseline');
+    manualDialogFor([sourcePath]);
+    const addPromise = callIpcRaw('projects:add-files', project.id);
+    await secondReadStarted;
+    await callIpcRaw('projects:pause', project.id);
+    releaseSecondRead();
+    await addPromise;
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.status, 'paused');
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    const cacheDir = presentationCachePaths(project.id).projectDir;
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], []);
+  } finally {
+    releaseSecondRead();
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Skip Existing excludes baseline Keynote media from review and physical output', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-keynote-baseline-skip-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Existing Keynote.key');
+    const outputDir = path.join(fixtureRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic Keynote container');
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/existing-photo-1234.jpeg',
+      data: Buffer.from('EXISTING_KEYNOTE_MEDIA'.repeat(40)),
+    }]);
+
+    const project = await createProject('Keynote baseline skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const baselineMedia = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(baselineMedia);
+    assert.equal(baselineMedia.assetOrigin, 'existing');
+    assert.equal(baselineMedia.assetBaselineSourcePath, sourcePath);
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(review.files.map(file => file.name), ['Existing Keynote.key']);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readdirSync(result.folderPath), ['Existing Keynote.key']);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('first dependable scan of a blank source records an empty baseline without prompting', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-empty-baseline-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Blank Project.ai');
+    writeSyntheticAiFile(sourcePath);
+
+    const project = await createProject('Blank source baseline');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+    assert.equal(fresh.assetBaseline.status, 'empty');
+    assert.equal(fresh.assetBaseline.decision, null);
+    assert.equal(Number.isFinite(fresh.assetBaseline.establishedAt), true);
+    assert.deepEqual(fresh.files.map(file => [file.name, file.assetOrigin, file.projectRole]), [
+      ['Blank Project.ai', 'added', 'source'],
+    ]);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Blank Project.ai']);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('an explicitly added PDF establishes a dependable baseline without changing general PDF roles', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-pdf-baseline-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Existing Reference.pdf');
+    const linkedPath = path.join(fixtureRoot, 'Existing PDF Link.png');
+    fs.writeFileSync(linkedPath, 'existing PDF dependency');
+    fs.writeFileSync(sourcePath, `permitted leading bytes\n%PDF-1.7\nsynthetic PDF link ${linkedPath}\n%%EOF\n`);
+
+    const project = await createProject('PDF baseline source');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === sourcePath).projectRole, 'asset');
+    assert.equal(fresh.files.find(file => file.path === sourcePath).assetOrigin, 'added');
+    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+    const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(blockedReview.error, 'asset_baseline_decision_required');
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('malformed AI and PDF sources remain accepted but cannot establish a dependable baseline', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-malformed-ai-pdf-baseline-test-'));
+  try {
+    const cases = [
+      { name: 'Marker Substring.ai', content: 'junk %!PS-Adobe-invalid\n%%EOF\n' },
+      { name: 'Embedded Exact Header.ai', content: 'junk-prefix %!PS-Adobe-3.0\nbody\n%%EOF\n' },
+      { name: 'Invalid Version.pdf', content: '%PDF-invalid\n%%EOF\n' },
+      { name: 'Embedded EOF.pdf', content: '%PDF-1.7\nbody-not-a-marker%%EOF\n' },
+      { name: 'Trailing Junk.pdf', content: '%PDF-1.7\n%%EOF\nnot permitted trailing content' },
+    ];
+    for (const fixture of cases) {
+      const sourcePath = path.join(fixtureRoot, fixture.name);
+      fs.writeFileSync(sourcePath, fixture.content);
+      const project = await createProject(`Malformed baseline ${fixture.name}`);
+      manualDialogFor([sourcePath]);
+      const files = await callIpcRaw('projects:add-files', project.id);
+      assert.equal(files.some(file => file.path === sourcePath), true);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.error, 'asset_baseline_scan_incomplete');
+      await callIpcRaw('projects:delete', project.id);
+    }
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('oversized AI and PDF sources remain accepted but cannot establish a dependable baseline', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-oversized-ai-pdf-baseline-test-'));
+  try {
+    for (const ext of ['.ai', '.pdf']) {
+      const sourcePath = path.join(fixtureRoot, `Oversized Source${ext}`);
+      writeSyntheticPdfFile(sourcePath);
+      fs.truncateSync(sourcePath, 301 * 1024 * 1024);
+      const project = await createProject(`Oversized baseline ${ext}`);
+      manualDialogFor([sourcePath]);
+      const files = await callIpcRaw('projects:add-files', project.id);
+      assert.equal(files.some(file => file.path === sourcePath), true);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.error, 'asset_baseline_scan_incomplete');
+      await callIpcRaw('projects:delete', project.id);
+    }
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('first-scan boundary keeps dependencies existing while concurrent unrelated activity is added', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-first-scan-boundary-test-'));
+  const originalReadFile = fs.promises.readFile;
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+  const readGate = new Promise(resolve => { releaseRead = resolve; });
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Boundary Project.ai');
+    const linkedPath = path.join(fixtureRoot, 'Boundary Existing.png');
+    const concurrentPath = path.join(fixtureRoot, 'Boundary Added.png');
+    fs.writeFileSync(linkedPath, 'existing dependency bytes');
+    fs.writeFileSync(concurrentPath, 'concurrent unrelated bytes');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    fs.promises.readFile = async function deferFirstSourceRead(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        markReadStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('First scan concurrency boundary');
+    manualDialogFor([sourcePath]);
+    const scanPromise = callIpcRaw('projects:add-files', project.id);
+    await readStarted;
+    await new Promise(resolve => originalSetTimeout(resolve, 5));
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files.push({
+      path: concurrentPath,
+      name: path.basename(concurrentPath),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'app-opened',
+      projectRole: 'asset',
+    });
+    releaseRead();
+    await scanPromise;
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+    assert.equal(fresh.files.find(file => file.path === concurrentPath).assetOrigin, 'added');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Package Review waits for the first dependable scan before requiring the existing-assets decision', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-first-scan-package-gate-test-'));
+  const originalReadFile = fs.promises.readFile;
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+  const readGate = new Promise(resolve => { releaseRead = resolve; });
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Gate Project.ai');
+    const linkedPath = path.join(fixtureRoot, 'Gate Existing.png');
+    fs.writeFileSync(linkedPath, 'existing gate dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    fs.promises.readFile = async function deferSourceRead(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        markReadStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('First scan package gate');
+    manualDialogFor([sourcePath]);
+    const scanPromise = callIpcRaw('projects:add-files', project.id);
+    await readStarted;
+    let reviewSettled = false;
+    const reviewPromise = callIpcRaw('projects:prepare-package-review', project.id).then(result => {
+      reviewSettled = true;
+      return result;
+    });
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    assert.equal(reviewSettled, false);
+
+    releaseRead();
+    await scanPromise;
+    const review = await reviewPromise;
+    assert.equal(review.error, 'asset_baseline_decision_required');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('failed first source parsing keeps the baseline unresolved and Package Review unavailable', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-first-scan-failure-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Unreadable Project.ai');
+    fs.mkdirSync(sourcePath);
+
+    const project = await createProject('Failed first scan');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(result.some(file => file.path === sourcePath), true);
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('removing a failed required source reconciles the baseline instead of blocking forever', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-remove-failed-baseline-source-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Failed Source.ai');
+    fs.writeFileSync(sourcePath, 'malformed Illustrator bytes');
+    const project = await createProject('Remove failed baseline source');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+
+    await callIpcRaw('projects:remove-file', project.id, sourcePath);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), false);
+    assert.equal(fresh.assetBaseline.status, 'empty');
+    assert.notEqual(
+      (await callIpcRaw('projects:prepare-package-review', project.id)).error,
+      'asset_baseline_scan_incomplete'
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('concurrent first source scans settle as one existing-assets cohort regardless of completion order', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-multi-source-baseline-test-'));
+  const originalReadFile = fs.promises.readFile;
+  const gates = new Map();
+  try {
+    const sourceA = path.join(fixtureRoot, 'Existing A.ai');
+    const sourceB = path.join(fixtureRoot, 'Existing B.ai');
+    const linkedA = path.join(fixtureRoot, 'Existing A.png');
+    const linkedB = path.join(fixtureRoot, 'Existing B.png');
+    fs.writeFileSync(linkedA, 'existing A dependency');
+    fs.writeFileSync(linkedB, 'existing B dependency');
+    writeSyntheticAiFile(sourceA, `synthetic illustrator links ${linkedA} and ${sourceB}`);
+    writeSyntheticAiFile(sourceB, `synthetic illustrator link ${linkedB}`);
+
+    for (const sourcePath of [sourceA, sourceB]) {
+      let release;
+      let started;
+      const startedPromise = new Promise(resolve => { started = resolve; });
+      const gate = new Promise(resolve => { release = resolve; });
+      gates.set(path.resolve(sourcePath), { started, startedPromise, gate, release });
+    }
+    fs.promises.readFile = async function deferSourceReads(filePath, ...args) {
+      const deferred = gates.get(path.resolve(filePath));
+      if (deferred) {
+        deferred.started();
+        await deferred.gate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Concurrent first sources');
+    manualDialogFor([sourceA, sourceB]);
+    const scans = callIpcRaw('projects:add-files', project.id);
+    await Promise.all([...gates.values()].map(item => item.startedPromise));
+    gates.get(path.resolve(sourceB)).release();
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+    gates.get(path.resolve(sourceA)).release();
+    await scans;
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === linkedA).assetOrigin, 'existing');
+    assert.equal(fresh.files.find(file => file.path === linkedB).assetOrigin, 'existing');
+    assert.equal(fresh.files.find(file => file.path === sourceA).projectRole, 'source');
+    assert.equal(fresh.files.find(file => file.path === sourceB).projectRole, 'source');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    for (const deferred of gates.values()) deferred.release();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('a source accepted during an active first scan joins the required baseline cohort', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-late-baseline-source-test-'));
+  const originalReadFile = fs.promises.readFile;
+  const gates = new Map();
+  try {
+    const sourceA = path.join(fixtureRoot, 'Initial Source.ai');
+    const sourceB = path.join(fixtureRoot, 'Late Source.ai');
+    const linkedA = path.join(fixtureRoot, 'Initial Existing.png');
+    const linkedB = path.join(fixtureRoot, 'Late Existing.png');
+    fs.writeFileSync(linkedA, 'initial dependency');
+    fs.writeFileSync(linkedB, 'late dependency');
+    writeSyntheticAiFile(sourceA, `initial link ${linkedA}`);
+    writeSyntheticAiFile(sourceB, `late link ${linkedB}`);
+
+    for (const sourcePath of [sourceA, sourceB]) {
+      let release;
+      let started;
+      const startedPromise = new Promise(resolve => { started = resolve; });
+      const gate = new Promise(resolve => { release = resolve; });
+      gates.set(path.resolve(sourcePath), { release, started, startedPromise, gate });
+    }
+    fs.promises.readFile = async function deferLateSourceReads(filePath, ...args) {
+      const deferred = gates.get(path.resolve(filePath));
+      if (deferred) {
+        deferred.started();
+        await deferred.gate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Late accepted baseline source');
+    manualDialogFor([sourceA]);
+    const initialScan = callIpcRaw('projects:add-files', project.id);
+    await gates.get(path.resolve(sourceA)).startedPromise;
+
+    manualDialogFor([sourceB]);
+    const lateScan = callIpcRaw('projects:add-files', project.id);
+    await gates.get(path.resolve(sourceB)).startedPromise;
+
+    gates.get(path.resolve(sourceA)).release();
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+
+    gates.get(path.resolve(sourceB)).release();
+    await Promise.all([initialScan, lateScan]);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === linkedA).assetOrigin, 'existing');
+    assert.equal(fresh.files.find(file => file.path === linkedB).assetOrigin, 'existing');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    for (const deferred of gates.values()) deferred.release();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('duplicate first scans of one source remain dependable when a later duplicate fails', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-duplicate-baseline-scan-test-'));
+  const originalReadFile = fs.promises.readFile;
+  const gates = [];
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Duplicate Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Duplicate Existing.png');
+    fs.writeFileSync(linkedPath, 'existing dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    fs.promises.readFile = async function deferDuplicateSourceReads(filePath, ...args) {
+      if (path.resolve(filePath) !== path.resolve(sourcePath)) {
+        return originalReadFile.call(fs.promises, filePath, ...args);
+      }
+      let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      const entry = { release, gate, attempt: gates.length };
+      gates.push(entry);
+      await gate;
+      if (entry.attempt === 1) throw new Error('forced duplicate scan failure');
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Duplicate first source scans');
+    manualDialogFor([sourcePath]);
+    const firstScan = callIpcRaw('projects:add-files', project.id);
+    await waitForCondition(() => gates.length === 1, 'expected manual source scan');
+    const duplicateScan = emitWatcher('change', sourcePath);
+    await waitForCondition(() => gates.length === 2, 'expected two duplicate source scans');
+    gates[0].release();
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+    gates[1].release();
+    await firstScan;
+    await duplicateScan;
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    for (const gate of gates) gate.release();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('readable malformed PSD sources do not establish an empty dependable baseline', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-malformed-psd-baseline-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Malformed Source.psd');
+    fs.writeFileSync(sourcePath, 'readable but not a valid PSD');
+    const project = await createProject('Malformed PSD baseline');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.pendingFiles = [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.psd',
+      addedAt: Date.now(),
+      source: 'app-opened',
+      captureState: 'observed',
+      projectRole: 'source',
+    }];
+    currentPsdFixture = new Error('invalid PSD structure');
+
+    const result = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
+    assert.equal(result.files.some(file => file.path === sourcePath), true);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    currentPsdFixture = previousPsdFixture;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('readable malformed ZIP-based sources do not establish an empty dependable baseline', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-malformed-zip-baseline-test-'));
+  let validationAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Malformed Presentation.pptx');
+    fs.writeFileSync(sourcePath, 'readable but not a valid ZIP presentation');
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'execFile' && command === '/usr/bin/unzip' && args[0] === '-tqq' && args[1] === sourcePath) {
+        validationAttempts++;
+        return { error: new Error('invalid ZIP structure') };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const project = await createProject('Malformed ZIP baseline');
+    manualDialogFor([sourcePath]);
+    const { result, output } = await captureConsoleDuring(() => callIpcRaw('projects:add-files', project.id));
+    assert.equal(result.some(file => file.path === sourcePath), true);
+    assert.equal(output.includes(sourcePath), false);
+    assert.equal(output.includes('invalid ZIP structure'), false);
+    assert.match(output, /asset-baseline-scan-failed/);
+    await waitForCondition(() => validationAttempts > 0, 'expected strict ZIP validation');
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-preflight regex extraction failure keeps the baseline unresolved', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-regex-extraction-failure-test-'));
+  const originalReadFile = fs.promises.readFile;
+  let extractionAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Transient Read Failure.ai');
+    writeSyntheticAiFile(sourcePath, 'valid readable source before extraction');
+    fs.promises.readFile = async function failSourceExtraction(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        extractionAttempts++;
+        throw new Error('forced post-preflight source read failure');
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Regex extraction failure');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(result.some(file => file.path === sourcePath), true);
+    await waitForCondition(() => extractionAttempts > 0, 'expected strict regex extraction attempt');
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Illustrator baseline validation and extraction use one immutable source snapshot', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-immutable-ai-baseline-test-'));
+  const originalReadFile = fs.promises.readFile;
+  let sourceReadCount = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Immutable Snapshot.ai');
+    const linkedPath = path.join(fixtureRoot, 'Immutable Snapshot.png');
+    fs.writeFileSync(linkedPath, 'immutable snapshot dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    fs.promises.readFile = async function mutateAfterSourceRead(filePath, ...args) {
+      const result = await originalReadFile.call(fs.promises, filePath, ...args);
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        sourceReadCount++;
+        if (sourceReadCount === 1) fs.writeFileSync(sourcePath, 'replacement bytes without dependable structure');
+      }
+      return result;
+    };
+
+    const project = await createProject('Immutable Illustrator baseline');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+
+    assert.equal(sourceReadCount, 1);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), true);
+    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Photoshop baseline discovery is scoped to the selected PSD when another document is open', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-photoshop-scoped-baseline-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  let photoshopScriptAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Selected Source.psd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Existing.png');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Other Document.png');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for stubbed parser');
+    fs.writeFileSync(selectedLinkedPath, 'selected PSD dependency');
+    fs.writeFileSync(unrelatedLinkedPath, 'unrelated open PSD dependency');
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: selectedLinkedPath } }],
+      linkedFiles: [],
+    };
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return { stdout: 'Adobe Photoshop\n' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-scan.applescript')) {
+        photoshopScriptAttempts++;
+        return { stdout: `${unrelatedLinkedPath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Scoped Photoshop baseline');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+
+    const selectedLinked = fresh.files.find(file => file.path === selectedLinkedPath);
+    assert.ok(selectedLinked);
+    assert.equal(selectedLinked.assetOrigin, 'existing');
+    assert.equal(selectedLinked.source, 'psd-linked');
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal((fresh.pendingFiles || []).some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(photoshopScriptAttempts, 0);
+  } finally {
+    currentPsdFixture = previousPsdFixture;
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-baseline Photoshop polling cannot promote another open document into Existing assets', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-photoshop-prebaseline-poll-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Selected Source.psd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Existing.png');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Other Open Document.png');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for stubbed parser');
+    fs.writeFileSync(selectedLinkedPath, 'selected PSD dependency');
+    fs.writeFileSync(unrelatedLinkedPath, 'unrelated open PSD dependency');
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: selectedLinkedPath } }],
+      linkedFiles: [],
+    };
+
+    const project = await createProject('Pre-baseline Photoshop polling');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.pendingFiles = [{
+      ...makePendingFile(unrelatedLinkedPath, 'ps-poll'),
+      captureState: 'needs-save',
+      captureReason: 'linked-asset-observed',
+      captureEvidence: {
+        appFamily: 'photoshop',
+        observerMethod: 'photoshop-live-script',
+        evidenceStrength: 'structured-app-link',
+      },
+    }];
+
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+
+    assert.equal(fresh.files.find(file => file.path === selectedLinkedPath).assetOrigin, 'existing');
+    assert.equal(fresh.pendingFiles.find(file => file.path === unrelatedLinkedPath).assetOrigin, 'added');
+    assert.deepEqual(
+      [...fresh.files, ...fresh.pendingFiles]
+        .filter(file => file.assetOrigin === 'existing' && file.projectRole === 'asset')
+        .map(file => file.path),
+      [selectedLinkedPath]
+    );
+
+    const decision = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include');
+    assert.equal(decision.success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.files.some(file => file.path === unrelatedLinkedPath), false);
+  } finally {
+    currentPsdFixture = previousPsdFixture;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-preflight PSD parser failure keeps the baseline unresolved', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-psd-extraction-failure-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  let parseAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Transient Parser Failure.psd');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for stubbed parser');
+    const project = await createProject('PSD extraction failure');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.pendingFiles = [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.psd',
+      addedAt: Date.now(),
+      source: 'app-opened',
+      captureState: 'observed',
+      projectRole: 'source',
+    }];
+    currentPsdFixture = () => {
+      parseAttempts++;
+      if (parseAttempts === 1) return { children: [], linkedFiles: [] };
+      throw new Error('forced post-preflight PSD parser failure');
+    };
+
+    const result = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
+    assert.equal(result.files.some(file => file.path === sourcePath), true);
+    assert.equal(parseAttempts, 2);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    currentPsdFixture = previousPsdFixture;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-preflight PSD size growth keeps the baseline unresolved', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-psd-size-growth-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  const originalStat = fs.promises.stat;
+  let sourceStatAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Growing Source.psd');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for size-growth test');
+    const project = await createProject('PSD size growth');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.pendingFiles = [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.psd',
+      addedAt: Date.now(),
+      source: 'app-opened',
+      captureState: 'observed',
+      projectRole: 'source',
+    }];
+    currentPsdFixture = { children: [], linkedFiles: [] };
+    fs.promises.stat = async function growAfterPreflight(filePath, ...args) {
+      const stat = await originalStat.call(fs.promises, filePath, ...args);
+      if (path.resolve(filePath) !== path.resolve(sourcePath)) return stat;
+      sourceStatAttempts++;
+      if (sourceStatAttempts === 1) return stat;
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === 'size') return 301 * 1024 * 1024;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    };
+
+    const result = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
+    assert.equal(result.files.some(file => file.path === sourcePath), true);
+    assert.equal(sourceStatAttempts, 2);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    fs.promises.stat = originalStat;
+    currentPsdFixture = previousPsdFixture;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-preflight presentation extraction failure keeps the baseline unresolved', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-extraction-failure-test-'));
+  const originalReadFile = fs.promises.readFile;
+  let validationAttempts = 0;
+  let extractionAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Transient Presentation Failure.pptx');
+    fs.writeFileSync(sourcePath, 'synthetic ZIP bytes validated by the command stub');
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'execFile' && command === '/usr/bin/unzip' && args[0] === '-tqq' && args[1] === sourcePath) {
+        validationAttempts++;
+      }
+      return { stdout: '', stderr: '' };
+    });
+    fs.promises.readFile = async function failPresentationExtraction(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        extractionAttempts++;
+        throw new Error('forced post-preflight presentation read failure');
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Presentation extraction failure');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(result.some(file => file.path === sourcePath), true);
+    await waitForCondition(() => extractionAttempts > 0, 'expected strict presentation extraction attempt');
+    assert.equal(validationAttempts, 1);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_scan_incomplete');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-preflight structured ZIP extraction failures keep every baseline format unresolved', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-structured-zip-failure-test-'));
+  const formats = [
+    { ext: '.idml', entry: 'Resources/Links.xml' },
+    { ext: '.sketch', entry: 'document.json' },
+    { ext: '.afdesign', entry: 'metadata.dat' },
+    { ext: '.pxd', entry: 'metadata.info' },
+  ];
+  try {
+    for (const { ext, entry } of formats) {
+      const sourcePath = path.join(fixtureRoot, `Structured Failure${ext}`);
+      fs.writeFileSync(sourcePath, `synthetic ${ext} ZIP bytes`);
+      let validationAttempts = 0;
+      let extractionAttempts = 0;
+      setChildProcessHandler(({ kind, command, args }) => {
+        if (kind !== 'execFile' || command !== '/usr/bin/unzip' || args[1] !== sourcePath) {
+          return { stdout: '', stderr: '' };
+        }
+        if (args[0] === '-tqq') {
+          validationAttempts++;
+          return { stdout: '', stderr: '' };
+        }
+        if (args[0] === '-l') {
+          return { stdout: `       12  01-01-2026  00:00  ${entry}\n`, stderr: '' };
+        }
+        if (args[0] === '-p' && args[2] === entry) {
+          extractionAttempts++;
+          return { error: new Error(`forced ${ext} post-preflight extraction failure`) };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const project = await createProject(`Structured ZIP failure ${ext}`);
+      manualDialogFor([sourcePath]);
+      const result = await callIpcRaw('projects:add-files', project.id);
+      assert.equal(result.some(file => file.path === sourcePath), true);
+      assert.equal(validationAttempts, 1, `${ext} should pass one strict preflight`);
+      assert.equal(extractionAttempts, 1, `${ext} should reach its structured extractor`);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.error, 'asset_baseline_scan_incomplete');
+      await callIpcRaw('projects:delete', project.id);
+    }
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('first scan reclassifies an already accepted dependency into the Existing cohort', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-existing-reclassification-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Reclassification Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Already Accepted.png');
+    fs.writeFileSync(linkedPath, 'already accepted dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    const project = await createProject('Existing dependency reclassification');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files.push({
+      path: linkedPath,
+      name: path.basename(linkedPath),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'chokidar',
+      assetOrigin: 'added',
+      projectRole: 'asset',
+    });
+
+    await emitWatcher('change', sourcePath);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.equal(linkedFile.assetOrigin, 'existing');
+    assert.equal(linkedFile.projectRole, 'asset');
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('first scan preserves a linked asset explicitly selected in the same Add Files action', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-explicit-baseline-asset-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Explicit Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Explicit Linked.png');
+    fs.writeFileSync(linkedPath, 'explicit linked dependency');
+    writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+
+    const project = await createProject('Explicit baseline asset');
+    manualDialogFor([sourcePath, linkedPath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+    const linkedFile = fresh.files.find(file => file.path === linkedPath);
+    assert.equal(linkedFile.source, 'manual-browse');
+    assert.equal(linkedFile.assetOrigin, 'added');
+    assert.equal(linkedFile.projectRole, 'asset');
+    assert.deepEqual(fresh.excludedAssetKeys, []);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(
+      review.files.map(file => file.name).sort(),
+      ['Explicit Linked.png', 'Explicit Source.ai']
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('explicitly re-adding a discovered source promotes it to Added and scans its dependencies', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-explicit-readd-source-test-'));
+  try {
+    const discoveredSourcePath = path.join(fixtureRoot, 'Discovered Source.ai');
+    const nestedLinkedPath = path.join(fixtureRoot, 'Nested Linked.png');
+    fs.writeFileSync(nestedLinkedPath, 'nested linked dependency');
+    writeSyntheticAiFile(discoveredSourcePath, `synthetic illustrator link ${nestedLinkedPath}`);
+
+    const project = await createProject('Explicitly re-added source');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files.push({
+      path: discoveredSourcePath,
+      name: path.basename(discoveredSourcePath),
+      ext: '.ai',
+      addedAt: Date.now() - 1000,
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      captureEvidence: {
+        relationshipSourcePath: path.join(fixtureRoot, 'Earlier Source.ai'),
+      },
+    });
+
+    manualDialogFor([discoveredSourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const readdedSource = fresh.files.find(file => file.path === discoveredSourcePath);
+    const nestedLinked = fresh.files.find(file => file.path === nestedLinkedPath);
+    assert.equal(readdedSource.explicitUserAuthority.granted, true);
+    assert.equal(readdedSource.assetOrigin, 'added');
+    assert.equal(nestedLinked.assetOrigin, 'existing');
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    const afterSkip = await getProject(project.id);
+    assert.equal(afterSkip.excludedAssetKeys.includes(readdedSource.fileId || readdedSource.path), false);
+    assert.equal(afterSkip.excludedAssetKeys.includes(nestedLinked.fileId || nestedLinked.path), true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Discovered Source.ai']);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan attributes links only from the selected source document', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-baseline-scope-test-'));
+  try {
+    const selectedSourcePath = path.join(fixtureRoot, 'Selected Source.indd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Linked.png');
+    const unrelatedSourcePath = path.join(fixtureRoot, 'Unrelated Open.indd');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Unrelated Linked.png');
+    for (const filePath of [selectedSourcePath, selectedLinkedPath, unrelatedSourcePath, unrelatedLinkedPath]) {
+      fs.writeFileSync(filePath, `synthetic bytes for ${path.basename(filePath)}`);
+    }
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+        return {
+          stdout: [
+            `DOC\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\tfalse\ttrue\t1`,
+            `LINK\t${selectedSourcePath}\t${path.basename(selectedSourcePath)}\t${selectedLinkedPath}\tfalse\ttrue`,
+            `DOC\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\tfalse\tfalse\t1`,
+            `LINK\t${unrelatedSourcePath}\t${path.basename(unrelatedSourcePath)}\t${unrelatedLinkedPath}\tfalse\tfalse`,
+            'END\t2\t2\t2\t0',
+          ].join('\n'),
+          stderr: '',
+        };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const project = await createProject('InDesign baseline source scope');
+    manualDialogFor([selectedSourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.some(file => file.path === selectedLinkedPath), true);
+    assert.equal(fresh.files.some(file => file.path === unrelatedSourcePath), false);
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan fails closed for unavailable or incomplete structured snapshots', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-baseline-fail-closed-test-'));
+  const sourcePath = path.join(fixtureRoot, 'Fail Closed Source.indd');
+  fs.writeFileSync(sourcePath, 'synthetic InDesign bytes without dependable link metadata');
+  const scenarios = [
+    {
+      name: 'app unavailable',
+      handler: ({ kind, command }) => (
+        kind === 'exec' && String(command).includes('Adobe InDesign')
+          ? { stdout: '', stderr: '' }
+          : { stdout: '', stderr: '' }
+      ),
+    },
+    {
+      name: 'query failure',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return { error: new Error('forced InDesign query failure') };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'query timeout',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          const error = new Error('forced InDesign query timeout');
+          error.code = 'ETIMEDOUT';
+          return { error };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'empty query output',
+      handler: ({ kind, command }) => (
+        kind === 'exec' && String(command).includes('Adobe InDesign')
+          ? { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' }
+          : { stdout: '', stderr: '' }
+      ),
+    },
+    {
+      name: 'malformed query output',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return { stdout: `DOC\t${sourcePath}`, stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'partial link query output',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return {
+            stdout: [
+              `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\t1`,
+              'END\t1\t1\t0\t0',
+            ].join('\n'),
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'invalid boolean fields',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return {
+            stdout: [
+              `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tFalse\ttrue\t0`,
+              'END\t1\t0\t0\t0',
+            ].join('\n'),
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      setChildProcessHandler(scenario.handler);
+      const project = await createProject(`InDesign fail closed: ${scenario.name}`);
+      manualDialogFor([sourcePath]);
+      const files = await callIpc('projects:add-files', project.id);
+      assert.equal(files.some(file => file.path === sourcePath), true, scenario.name);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan', scenario.name);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.error, 'asset_baseline_scan_incomplete', scenario.name);
+      await callIpcRaw('projects:delete', project.id);
+    }
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan accepts a well-formed selected document with no links', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-empty-baseline-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'No Links Source.indd');
+    fs.writeFileSync(sourcePath, 'synthetic InDesign bytes with a dependable empty snapshot');
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+        return {
+          stdout: [
+            `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue\t0`,
+            'END\t1\t0\t0\t0',
+          ].join('\n'),
+          stderr: '',
+        };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const project = await createProject('InDesign dependable empty baseline');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'empty');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['No Links Source.indd']);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Include Existing promotes the displayed existing pending cohort into Package Review', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-include-existing-pending-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Include Source.ai');
+    const pendingPath = path.join(fixtureRoot, 'Include Pending.png');
+    fs.writeFileSync(sourcePath, 'synthetic source');
+    fs.writeFileSync(pendingPath, 'synthetic pending dependency');
+    const project = await createProject('Include existing pending cohort');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files = [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+      assetOrigin: 'added',
+      projectRole: 'source',
+    }];
+    stored.pendingFiles = [{
+      path: pendingPath,
+      name: path.basename(pendingPath),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      captureState: 'observed',
+    }];
+    stored.assetBaseline = { schemaVersion: 1, status: 'decision-required', decision: null, establishedAt: Date.now() };
+
+    const decision = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include');
+    assert.equal(decision.success, true);
+    const fresh = await getProject(project.id);
+    assert.deepEqual(fresh.pendingFiles, []);
+    assert.equal(fresh.files.some(file => file.path === pendingPath && file.acceptedPending === true), true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name).sort(), ['Include Pending.png', 'Include Source.ai']);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Explicit Add Files restores a file previously excluded by Skip Existing', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-restore-skipped-existing-test-'));
+  try {
+    const assetPath = path.join(fixtureRoot, 'Restore Existing.png');
+    fs.writeFileSync(assetPath, 'restore skipped bytes');
+    const project = await createProject('Restore skipped existing');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files = [{
+      path: assetPath,
+      name: path.basename(assetPath),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+    }];
+    stored.assetBaseline = { schemaVersion: 1, status: 'skipped', decision: 'skip', establishedAt: Date.now() };
+    stored.excludedAssetKeys = [assetPath];
+
+    manualDialogFor([assetPath]);
+    await callIpc('projects:add-files', project.id);
+    const fresh = await getProject(project.id);
+    assert.deepEqual(fresh.excludedAssetKeys, []);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.files[0].explicitUserAuthority.granted, true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Restore Existing.png']);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('invalid or premature existing-assets decisions fail closed without changing project state', async () => {
+  const project = await createProject('Unavailable existing-assets decision');
+  const before = structuredClone(await getProject(project.id));
+
+  assert.deepEqual(
+    await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include'),
+    { success: false, error: 'asset_baseline_decision_unavailable' }
+  );
+  assert.deepEqual(
+    await callIpcRaw('projects:set-existing-assets-decision', project.id, 'invalid'),
+    { success: false, error: 'invalid_asset_baseline_decision' }
+  );
+  assert.deepEqual(await getProject(project.id), before);
+});
+
 test('capture routes distinguish linked primary-format assets from a locally saved Figma source', async () => {
   const project = await createProject('Capture route roles');
   const files = [
@@ -7006,7 +8606,7 @@ test('capture routes distinguish linked primary-format assets from a locally sav
     makePendingFile(path.join(os.tmpdir(), 'InDesign Linked.ai'), 'indd-poll'),
     makePendingFile(path.join(os.tmpdir(), 'Local Figma Source.fig'), 'fig-scan'),
   ];
-  await setProjectFiles(project.id, { files });
+  await setProjectFiles(project.id, { files, preserveAwaitingAssetBaseline: true });
 
   const fresh = await getProject(project.id);
 
@@ -7027,7 +8627,7 @@ test('legacy projects preserve accepted files without prompting and retain exact
   const sourcePath = path.join(os.tmpdir(), 'Legacy Source.ai');
   const linkedPath = path.join(os.tmpdir(), 'Legacy Linked.png');
   delete stored.assetBaseline;
-  stored.excludedAssetKeys = [linkedPath, `${linkedPath} `, linkedPath, '', null];
+  stored.excludedAssetKeys = [sourcePath, linkedPath, `${linkedPath} `, linkedPath, '', null];
   stored.files = [{
     path: sourcePath,
     name: path.basename(sourcePath),
@@ -7058,29 +8658,59 @@ test('legacy projects preserve accepted files without prompting and retain exact
   assert.equal(fresh.pendingFiles[0].projectRole, 'asset');
 });
 
+test('malformed or future asset baseline records fail closed instead of migrating as included', async () => {
+  for (const [name, malformedBaseline] of [
+    ['null value', null],
+    ['string value', 'corrupt'],
+    ['missing status', { schemaVersion: 1, decision: null }],
+    ['future schema', { schemaVersion: 2, status: 'included', decision: 'include' }],
+    ['invalid decision', { schemaVersion: 1, status: 'included', decision: null }],
+  ]) {
+    const project = await createProject(`Malformed baseline ${name}`);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.assetBaseline = malformedBaseline;
+
+    const fresh = await getProject(project.id);
+    assert.deepEqual(fresh.assetBaseline, {
+      schemaVersion: 1,
+      status: 'invalid',
+      decision: null,
+      establishedAt: null,
+    });
+    assert.equal(
+      (await callIpcRaw('projects:prepare-package-review', project.id)).error,
+      'asset_baseline_scan_incomplete'
+    );
+  }
+});
+
 test('manual add preserves file ledger entry and records one session observation', async () => {
   const project = await createProject('Manual provenance');
   const filePath = path.join(os.tmpdir(), 'brand-logo.ai');
+  try {
+    fs.writeFileSync(filePath, 'synthetic blank Illustrator source');
+    manualDialogFor([filePath]);
+    const files = await callIpc('projects:add-files', project.id);
 
-  manualDialogFor([filePath]);
-  const files = await callIpc('projects:add-files', project.id);
+    assert.equal(files.length, 1);
+    assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
+    assert.equal(files[0].path, filePath);
+    assert.equal(files[0].name, 'brand-logo.ai');
+    assert.equal(files[0].ext, '.ai');
+    assert.equal(files[0].source, 'manual-browse');
+    assert.equal(files[0].assetOrigin, 'added');
+    assert.equal(files[0].projectRole, 'source');
 
-  assert.equal(files.length, 1);
-  assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
-  assert.equal(files[0].path, filePath);
-  assert.equal(files[0].name, 'brand-logo.ai');
-  assert.equal(files[0].ext, '.ai');
-  assert.equal(files[0].source, 'manual-browse');
-  assert.equal(files[0].assetOrigin, 'added');
-  assert.equal(files[0].projectRole, 'source');
-
-  const fresh = await getProject(project.id);
-  assertSessionObservedFile(
-    fresh,
-    OBSERVER_KINDS.MANUAL_USER_ACTION,
-    'projects:add-files',
-    CONFIDENCE_BANDS.CONFIRMED
-  );
+    const fresh = await getProject(project.id);
+    assertSessionObservedFile(
+      fresh,
+      OBSERVER_KINDS.MANUAL_USER_ACTION,
+      'projects:add-files',
+      CONFIDENCE_BANDS.CONFIRMED
+    );
+  } finally {
+    fs.rmSync(filePath, { force: true });
+  }
 });
 
 test('manual image add is classified as an added asset rather than a project source', async () => {
@@ -7098,15 +8728,19 @@ test('manual image add is classified as an added asset rather than a project sou
 test('duplicate manual add does not duplicate session observations', async () => {
   const project = await createProject('Duplicate manual provenance');
   const filePath = path.join(os.tmpdir(), 'duplicate-logo.ai');
+  try {
+    fs.writeFileSync(filePath, 'synthetic duplicate Illustrator source');
+    manualDialogFor([filePath]);
+    await callIpc('projects:add-files', project.id);
+    manualDialogFor([filePath]);
+    await callIpc('projects:add-files', project.id);
 
-  manualDialogFor([filePath]);
-  await callIpc('projects:add-files', project.id);
-  manualDialogFor([filePath]);
-  await callIpc('projects:add-files', project.id);
-
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.provenance.observations.length, 1);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.provenance.observations.length, 1);
+  } finally {
+    fs.rmSync(filePath, { force: true });
+  }
 });
 
 test('accept pending preserves file ledger entry and records one confirmed session observation', async () => {
@@ -7118,11 +8752,11 @@ test('accept pending preserves file ledger entry and records one confirmed sessi
   const result = await callIpc('projects:accept-pending', project.id, filePath);
 
   assert.equal(result.files.length, 1);
-  assert.deepEqual(result.files[0], { ...pendingFile, acceptedPending: true });
+  assert.deepEqual(result.files[0], { ...pendingFile, acceptedPending: true, assetOrigin: 'added' });
   assert.deepEqual(result.pendingFiles, []);
 
   const fresh = await getProject(project.id);
-  assert.deepEqual(fresh.files, [{ ...pendingFile, acceptedPending: true }]);
+  assert.deepEqual(fresh.files, [{ ...pendingFile, acceptedPending: true, assetOrigin: 'added' }]);
   assert.deepEqual(fresh.pendingFiles, []);
   assertSessionObservedFile(
     fresh,
@@ -7152,16 +8786,13 @@ test('accept pending preserves an existing dependency origin for the persistent 
 
 test('accept pending source triggers persisted scan-on-open linked asset discovery', async () => {
   resetTestHomeWorkspace();
-  const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-accept-pending-scan');
-  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  const repoTempRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-accept-pending-scan-'));
 
   try {
-    fs.rmSync(repoTempRoot, { recursive: true, force: true });
-    fs.mkdirSync(repoTempRoot, { recursive: true });
     const sourcePath = path.join(repoTempRoot, 'accepted-source.ai');
     const linkedPath = path.join(repoTempRoot, 'accepted-linked.png');
     fs.writeFileSync(linkedPath, 'linked bytes');
-    fs.writeFileSync(sourcePath, `ai persisted link ${linkedPath}`);
+    writeSyntheticAiFile(sourcePath, `ai persisted link ${linkedPath}`);
 
     const project = await createProject('Accept pending scan provenance');
     await setProjectFiles(project.id, {
@@ -7208,6 +8839,147 @@ test('accept pending source triggers persisted scan-on-open linked asset discove
     assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 1);
   } finally {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
+  }
+});
+
+test('accepting a pending PDF establishes its baseline and blocks review for its existing dependency', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-accept-pending-pdf-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Accepted Reference.pdf');
+    const linkedPath = path.join(fixtureRoot, 'Accepted Reference.png');
+    fs.writeFileSync(linkedPath, 'accepted PDF dependency');
+    writeSyntheticPdfFile(sourcePath, `accepted PDF link ${linkedPath}`);
+
+    const project = await createProject('Accepted pending PDF baseline');
+    await setProjectFiles(project.id, {
+      pendingFiles: [{
+        ...makePendingFile(sourcePath, 'app-opened'),
+        captureState: 'observed',
+        projectRole: 'asset',
+      }],
+      preserveAwaitingAssetBaseline: true,
+    });
+
+    const result = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
+    assert.equal(result.files.some(file => file.path === sourcePath && file.acceptedPending === true), true);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.files.find(file => file.path === sourcePath).projectRole, 'asset');
+    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.error, 'asset_baseline_decision_required');
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Explicit Add restores a persisted baseline relationship after its original source is removed', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-explicit-baseline-restore-test-'));
+  try {
+    const missingSource = path.join(fixtureRoot, 'Removed Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Restored Asset.png');
+    fs.writeFileSync(linkedPath, 'restored dependency');
+    const project = await createProject('Explicit relationship restore');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files = [{
+      path: linkedPath,
+      name: path.basename(linkedPath),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      assetBaselineSourcePath: missingSource,
+      captureEvidence: { appFamily: 'illustrator' },
+    }];
+    stored.assetBaseline = { schemaVersion: 1, status: 'included', decision: 'include', establishedAt: Date.now() };
+    assert.equal((await getProject(project.id)).files.some(file => file.path === linkedPath), false);
+
+    manualDialogFor([linkedPath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const restored = await getProject(project.id);
+    assert.equal(restored.files.some(file => file.path === linkedPath), true);
+    assert.equal(Object.hasOwn(restored.files.find(file => file.path === linkedPath), 'assetBaselineSourcePath'), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('explicit and accepted-pending sources settle their baselines while another project is Watching', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-paused-baseline-source-'));
+  try {
+    const manualSource = path.join(fixtureRoot, 'Paused Manual.ai');
+    const manualLinked = path.join(fixtureRoot, 'Paused Manual.png');
+    const acceptedSource = path.join(fixtureRoot, 'Paused Accepted.pdf');
+    const acceptedLinked = path.join(fixtureRoot, 'Paused Accepted.png');
+    fs.writeFileSync(manualLinked, 'paused manual dependency');
+    fs.writeFileSync(acceptedLinked, 'paused accepted dependency');
+    writeSyntheticAiFile(manualSource, `paused manual link ${manualLinked}`);
+    writeSyntheticPdfFile(acceptedSource, `paused accepted link ${acceptedLinked}`);
+
+    const manualProject = await createProject('Paused manual baseline');
+    await createProject('Sole Watching replacement');
+    assert.equal((await getProject(manualProject.id)).status, 'paused');
+    const manualStored = storeInstance.data.projects.find(item => item.id === manualProject.id);
+    manualStored.files.push({
+      path: manualLinked,
+      name: path.basename(manualLinked),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+      assetOrigin: 'added',
+      projectRole: 'asset',
+    });
+
+    manualDialogFor([manualSource]);
+    await callIpcRaw('projects:add-files', manualProject.id);
+    let fresh = await waitForProject(
+      manualProject.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.status, 'paused');
+    assert.equal(fresh.files.find(file => file.path === manualLinked).assetOrigin, 'existing');
+    assert.equal(fresh.files.find(file => file.path === manualLinked).assetBaselineSourcePath, manualSource);
+    assert.equal((await callIpcRaw('projects:prepare-package-review', manualProject.id)).error, 'asset_baseline_decision_required');
+
+    const acceptedProject = await createProject('Paused accepted baseline');
+    await createProject('New sole Watching replacement');
+    const stored = storeInstance.data.projects.find(item => item.id === acceptedProject.id);
+    stored.pendingFiles = [{
+      ...makePendingFile(acceptedSource, 'app-opened'),
+      captureState: 'observed',
+      projectRole: 'asset',
+    }];
+    const result = await callIpcRaw('projects:accept-pending', acceptedProject.id, acceptedSource);
+    assert.equal(result.files.some(file => file.path === acceptedSource), true);
+    fresh = await waitForProject(
+      acceptedProject.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.status, 'paused');
+    assert.equal(fresh.files.find(file => file.path === acceptedLinked).assetOrigin, 'existing');
+    assert.equal((await callIpcRaw('projects:prepare-package-review', acceptedProject.id)).error, 'asset_baseline_decision_required');
+
+    const unrelatedProject = await createProject('Unrelated paused relationship');
+    await createProject('Final sole Watching replacement');
+    const unrelatedStored = storeInstance.data.projects.find(item => item.id === unrelatedProject.id);
+    unrelatedStored.files = [{
+      path: manualLinked,
+      name: path.basename(manualLinked),
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      assetBaselineSourcePath: manualSource,
+      captureEvidence: { appFamily: 'illustrator' },
+    }];
+    unrelatedStored.assetBaseline = { schemaVersion: 1, status: 'included', decision: 'include', establishedAt: Date.now() };
+    assert.equal((await getProject(unrelatedProject.id)).files.some(file => file.path === manualLinked), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -7339,13 +9111,18 @@ test('provenance recording failure does not block manual file capture', async ()
   };
 
   const filePath = path.join(os.tmpdir(), 'failure-still-captures.ai');
-  manualDialogFor([filePath]);
-  const files = await callIpc('projects:add-files', project.id);
+  try {
+    fs.writeFileSync(filePath, 'synthetic provenance-failure Illustrator source');
+    manualDialogFor([filePath]);
+    const files = await callIpc('projects:add-files', project.id);
 
-  assert.equal(files.length, 1);
-  assert.equal(files[0].path, filePath);
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].path, filePath);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+  } finally {
+    fs.rmSync(filePath, { force: true });
+  }
 });
 
 test('chokidar add records session observation only after primary design file add succeeds', async () => {
@@ -7460,7 +9237,7 @@ test('fresh generic change captures B source and discovers its linked asset', as
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'B_Project.ai');
   const linkedPath = '/Users/CrateQA/B_Asset.png';
-  fs.writeFileSync(sourcePath, 'fresh source bytes');
+  writeSyntheticAiFile(sourcePath, 'fresh source bytes');
   let illustratorRows = [];
   let illustratorQueryCount = 0;
   setChildProcessHandler(request => {
@@ -7481,7 +9258,7 @@ test('fresh generic change captures B source and discovers its linked asset', as
   fs.promises.readFile = async function readSyntheticLinkedPath(filePath, ...args) {
     if (path.resolve(filePath) === path.resolve(sourcePath)) {
       sourceReadCount++;
-      return Buffer.from(linkedPath);
+      return Buffer.from(`%PDF-1.7\n${linkedPath}\n%%EOF\n`);
     }
     return originalReadFile.call(fs.promises, filePath, ...args);
   };
@@ -7550,12 +9327,14 @@ test('generic change rescans a file accepted through Add Files while stat is pen
   resetTestHomeWorkspace();
   setChildProcessHandler(() => ({ stdout: '' }));
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Accepted_During_Stat.ai');
-  fs.writeFileSync(sourcePath, 'accepted during stat bytes');
+  writeSyntheticAiFile(sourcePath, 'accepted during stat bytes');
   const project = await createProject('Generic change Add Files race');
   const stored = storeInstance.data.projects.find(item => item.id === project.id);
   const staleStats = {
     mtimeMs: stored.watchStartedAt - 10000,
     birthtimeMs: stored.watchStartedAt - 20000,
+    size: fs.statSync(sourcePath).size,
+    isFile: () => true,
   };
 
   const originalStat = fs.promises.stat;
@@ -7582,10 +9361,10 @@ test('generic change rescans a file accepted through Add Files while stat is pen
     await statStarted;
 
     manualDialogFor([sourcePath]);
-    const manuallyAdded = await callIpc('projects:add-files', project.id);
-    assert.equal(manuallyAdded.filter(file => file.path === sourcePath).length, 1);
-
+    const manuallyAddedPromise = callIpcRaw('projects:add-files', project.id);
     releaseStat(staleStats);
+    const manuallyAdded = await manuallyAddedPromise;
+    assert.equal(manuallyAdded.filter(file => file.path === sourcePath).length, 1);
     await changePromise;
     await waitForCondition(
       () => sourceReadCount > 0,
@@ -8478,6 +10257,7 @@ test('InDesign live save refresh stages saved open document and linked assets wi
     'raw',
   ], 'InDesign save refresh live evidence ledger');
 
+  await settleAssetBaselineForUnrelatedPackageTest(project.id);
   const result = await callIpc('projects:package', project.id, outputDir);
   assertPackageResultShape(result);
   assert.equal(result.success, true);
@@ -9988,6 +11768,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   }
 
   await callIpc('projects:pre-package-scan', project.id);
+  await settleAssetBaselineForUnrelatedPackageTest(project.id);
   const packageResult = await callIpc('projects:package', project.id, outputDir);
   assertPackageResultShape(packageResult);
   assert.equal(packageResult.success, true);
@@ -10076,6 +11857,7 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       getSessionObservedByMethod(fresh, 'projects:accept-pending').length,
       genericPaths.length
     );
+    await settleAssetBaselineForUnrelatedPackageTest(project.id);
 
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
@@ -10172,6 +11954,7 @@ for (const scopeState of ['ready', 'failed']) {
     for (const candidate of candidates) {
       assert.equal(view.files.some(file => file.path === candidate.path), true);
     }
+    await settleAssetBaselineForUnrelatedPackageTest(project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(result);
     assert.equal(result.success, true);
@@ -10386,7 +12169,7 @@ test('current-session watcher save admits a baseline Illustrator source and its 
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Review_Project.ai');
   const linkedPath = '/Users/CrateQA/Review_Initial.png';
-  fs.writeFileSync(sourcePath, `Illustrator linked asset: ${linkedPath}`);
+  writeSyntheticAiFile(sourcePath, `Illustrator linked asset: ${linkedPath}`);
   let illustratorQueryCount = 0;
   let sourceReadCount = 0;
   let linkedAccessCount = 0;
@@ -10529,6 +12312,7 @@ for (const projectState of ['watching', 'paused']) {
     assert.ok(view.provenance.observations.some(observation => observation.id === originalObservationId));
     assert.equal(getSessionObservedByMethod(view, 'projects:add-files').length, 1);
 
+    await settleAssetBaselineForUnrelatedPackageTest(project.id);
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
     assert.equal(packageResult.success, true);

@@ -1065,6 +1065,66 @@ body {
   padding: 20px 28px 28px;
 }
 
+.existing-assets-decision-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.existing-assets-modal-app {
+  margin-bottom: 14px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--gray-400);
+}
+
+.existing-assets-modal-count {
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gray-700);
+}
+
+.existing-assets-modal-list {
+  margin-bottom: 14px;
+  border-top: 1px solid var(--gray-200);
+  border-bottom: 1px solid var(--gray-200);
+}
+
+.existing-assets-modal-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--gray-100);
+  font-size: 13px;
+  color: var(--gray-700);
+  overflow: hidden;
+}
+
+.existing-assets-modal-item:last-child {
+  border-bottom: 0;
+}
+
+.existing-assets-modal-item span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.existing-assets-modal-more {
+  padding: 9px 2px;
+  font-size: 12px;
+  color: var(--gray-500);
+}
+
+.existing-assets-modal-note {
+  margin-bottom: 18px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--gray-500);
+}
+
 .modal-info-row {
   display: flex;
   flex-direction: column;
