@@ -1880,8 +1880,11 @@ function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx', op
         return entryData(entry);
       });
       const result = { stdout: Buffer.concat(buffers), stderr: '' };
-      if (typeof options.onReadStart === 'function') options.onReadStart();
-      return options.readGate ? Promise.resolve(options.readGate).then(() => result) : result;
+      if (typeof options.onReadStart === 'function') options.onReadStart(args[2]);
+      const readGate = typeof options.readGateForPath === 'function'
+        ? options.readGateForPath(args[2])
+        : options.readGate;
+      return readGate ? Promise.resolve(readGate).then(() => result) : result;
     }
     return { stdout: '', stderr: '' };
   });
@@ -7171,6 +7174,137 @@ test('Skip Existing excludes baseline PowerPoint media while later saved media r
     ]);
     assert.equal(fs.existsSync(path.join(result.folderPath, 'Existing Deck — image1.png')), false);
   } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Skip Existing suppresses only baseline PowerPoint occurrences when later media has identical bytes', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-occurrence-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Occurrence Deck.pptx');
+    const outputDir = path.join(fixtureRoot, 'out');
+    const repeatedMedia = Buffer.from('REPEATED_POWERPOINT_MEDIA'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: repeatedMedia,
+    }]);
+
+    const project = await createProject('Presentation occurrence skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    assert.equal(fresh.assetBaseline.presentationMediaOccurrences.length, 1);
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    setPowerPointUnzipFixture([
+      { internalPath: 'ppt/media/image1.png', data: repeatedMedia },
+      { internalPath: 'ppt/media/image2.png', data: repeatedMedia },
+    ]);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container with repeated later media');
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.equal(review.materializable, true);
+    assert.deepEqual(review.files.map(file => file.name), ['Occurrence Deck.pptx']);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 1);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'Occurrence Deck — image2.png',
+      'Occurrence Deck.pptx',
+    ]);
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Occurrence Deck — image1.png')), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('failed presentation baseline extraction rolls back files created by that invocation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-rollback-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Partial Baseline.pptx');
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.png',
+        data: Buffer.from('FIRST_BASELINE_MEDIA'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('SECOND_BASELINE_MEDIA'.repeat(40)),
+        error: new Error('forced second-entry extraction failure'),
+      },
+    ]);
+
+    const project = await createProject('Partial presentation baseline');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    const cacheDir = presentationCachePaths(project.id).projectDir;
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], []);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('stale presentation baseline extraction rolls back files created before deactivation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-stale-rollback-test-'));
+  let releaseSecondRead = () => {};
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Stale Baseline.pptx');
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    const secondReadGate = new Promise(resolve => { releaseSecondRead = resolve; });
+    let markSecondReadStarted;
+    const secondReadStarted = new Promise(resolve => { markSecondReadStarted = resolve; });
+    setPowerPointUnzipFixture([
+      {
+        internalPath: 'ppt/media/image1.png',
+        data: Buffer.from('FIRST_STALE_BASELINE_MEDIA'.repeat(40)),
+      },
+      {
+        internalPath: 'ppt/media/image2.png',
+        data: Buffer.from('SECOND_STALE_BASELINE_MEDIA'.repeat(40)),
+      },
+    ], {
+      onReadStart: internalPath => {
+        if (internalPath === 'ppt/media/image2.png') markSecondReadStarted();
+      },
+      readGateForPath: internalPath => (
+        internalPath === 'ppt/media/image2.png' ? secondReadGate : null
+      ),
+    });
+
+    const project = await createProject('Stale presentation baseline');
+    manualDialogFor([sourcePath]);
+    const addPromise = callIpcRaw('projects:add-files', project.id);
+    await secondReadStarted;
+    await callIpcRaw('projects:pause', project.id);
+    releaseSecondRead();
+    await addPromise;
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.status, 'paused');
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-presentation'), false);
+    const cacheDir = presentationCachePaths(project.id).projectDir;
+    assert.deepEqual(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [], []);
+  } finally {
+    releaseSecondRead();
     setChildProcessHandler(null);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }

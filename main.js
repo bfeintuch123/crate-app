@@ -2761,6 +2761,30 @@ function createAssetBaselineState(status = 'awaiting-first-scan', project = null
   };
 }
 
+function normalizePresentationMediaOccurrences(value) {
+  const occurrences = [];
+  const seen = new Set();
+  for (const occurrence of Array.isArray(value) ? value : []) {
+    if (
+      !occurrence ||
+      typeof occurrence.resourceKey !== 'string' ||
+      !occurrence.resourceKey ||
+      !isPackageContentFingerprint(occurrence.contentFingerprint)
+    ) continue;
+    const key = `${occurrence.resourceKey}:${occurrence.contentFingerprint}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    occurrences.push({
+      resourceKey: occurrence.resourceKey,
+      contentFingerprint: occurrence.contentFingerprint,
+    });
+  }
+  return occurrences.sort((left, right) => (
+    left.resourceKey.localeCompare(right.resourceKey) ||
+    left.contentFingerprint.localeCompare(right.contentFingerprint)
+  ));
+}
+
 function inferProjectFileRole(file) {
   if (!file || typeof file !== 'object') return 'asset';
   const source = getFileCaptureSource(file);
@@ -2862,6 +2886,12 @@ function normalizeProjectAssetReviewState(project) {
     normalizedBaseline.establishedAt = Number.isFinite(baseline.establishedAt)
       ? baseline.establishedAt
       : normalizedBaseline.establishedAt;
+    const presentationMediaOccurrences = normalizePresentationMediaOccurrences(
+      baseline.presentationMediaOccurrences
+    );
+    if (presentationMediaOccurrences.length > 0) {
+      normalizedBaseline.presentationMediaOccurrences = presentationMediaOccurrences;
+    }
   }
   if (JSON.stringify(project.assetBaseline) !== JSON.stringify(normalizedBaseline)) {
     project.assetBaseline = normalizedBaseline;
@@ -2968,6 +2998,7 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
       requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
       completedSourceKeys: new Set(),
       inFlightBySource: new Map(),
+      presentationMediaOccurrencesBySource: new Map(),
     };
     assetBaselineScans.set(projectId, state);
   } else {
@@ -3018,6 +3049,7 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
     state.requiredSourceKeys.delete(key);
     state.completedSourceKeys.delete(key);
     state.inFlightBySource.delete(key);
+    state.presentationMediaOccurrencesBySource?.delete(key);
   }
   if (state.inFlightBySource.size > 0) return;
   if (![...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key))) return;
@@ -3051,6 +3083,12 @@ function establishProjectAssetBaseline(
   scanStartedAt = Date.now(),
   { allowPaused = false } = {}
 ) {
+  const baselineScanState = assetBaselineScans.get(projectId);
+  const presentationMediaOccurrences = normalizePresentationMediaOccurrences(
+    baselineScanState
+      ? [...(baselineScanState.presentationMediaOccurrencesBySource || new Map()).values()].flat()
+      : []
+  );
   const result = mutateProject(projectId, (project) => {
     if (project.status !== 'watching' && !(allowPaused && project.status === 'paused')) return null;
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
@@ -3064,6 +3102,9 @@ function establishProjectAssetBaseline(
       decision: null,
       establishedAt,
     };
+    if (presentationMediaOccurrences.length > 0) {
+      baseline.presentationMediaOccurrences = presentationMediaOccurrences;
+    }
     project.assetBaseline = baseline;
 
     for (const collection of [project.files, project.pendingFiles]) {
@@ -6538,6 +6579,32 @@ function isDirectCacheChild(cacheDir, filePath) {
   return resolvedFilePath !== resolvedCacheDir && path.dirname(resolvedFilePath) === resolvedCacheDir;
 }
 
+function captureOwnedDirectCacheFile(filePath, cacheDir, label = 'cache-file') {
+  if (!isDirectCacheChild(cacheDir, filePath)) throw cacheSafetyError(label, 'outside_root');
+  const stat = fs.lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    throw cacheSafetyError(label, 'unsafe');
+  }
+  return { filePath, cacheDir, dev: stat.dev, ino: stat.ino };
+}
+
+function removeOwnedDirectCacheFiles(records) {
+  for (const record of Array.isArray(records) ? records : []) {
+    try {
+      if (!record || !isDirectCacheChild(record.cacheDir, record.filePath)) continue;
+      const stat = fs.lstatSync(record.filePath);
+      if (
+        stat.isSymbolicLink() ||
+        !stat.isFile() ||
+        stat.nlink !== 1 ||
+        stat.dev !== record.dev ||
+        stat.ino !== record.ino
+      ) continue;
+      fs.unlinkSync(record.filePath);
+    } catch (_) {}
+  }
+}
+
 function captureCacheDirectoryIdentity(cacheDir, label = 'cache-directory') {
   if (typeof cacheDir !== 'string' || !cacheDir) throw cacheSafetyError(label, 'invalid');
   const cachePath = path.resolve(cacheDir);
@@ -9549,75 +9616,102 @@ async function captureExistingPresentationMediaBaseline(
 
   const tempDir = ensurePresentationAssetsDir(projectId);
   const extractionRecords = [];
-  const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
-    source: 'scan-on-save-presentation',
-    logicalPresentationPath: presentationPath,
-    failClosed: true,
-    onExtracted: extraction => extractionRecords.push(extraction),
-  });
-  if (!isCurrent()) return;
+  const discoveredOccurrences = [];
+  const invocationFiles = [];
+  let keepInvocationFiles = false;
+  try {
+    const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
+      source: 'scan-on-save-presentation',
+      logicalPresentationPath: presentationPath,
+      failClosed: true,
+      rollbackOnFailure: true,
+      onCandidate: candidate => {
+        const resource = getPresentationMediaResourceIdentity(presentationPath, candidate.internalPath);
+        if (!resource || !isPackageContentFingerprint(candidate.contentFingerprint)) return;
+        discoveredOccurrences.push({
+          resourceKey: resource.resourceKey,
+          contentFingerprint: candidate.contentFingerprint,
+        });
+      },
+      onMaterialized: materialized => invocationFiles.push(materialized),
+      onExtracted: extraction => extractionRecords.push(extraction),
+    });
+    if (!isCurrent()) return;
 
-  const internalPathByMaterializedPath = new Map(extractionRecords.map(extraction => [
-    normalizeTrackedFilePath(extraction.materializedPath),
-    extraction.internalPath,
-  ]));
-  for (const extractedPath of extractedPaths) {
-    if (!tryHardenPresentationCacheFile(extractedPath, tempDir)) {
-      throw new Error('presentation_baseline_cache_unavailable');
-    }
-  }
-
-  const result = mutateProject(projectId, (proj) => {
-    if (
-      (proj.status !== 'watching' && !(baselineScan.allowPaused && proj.status === 'paused')) ||
-      !isCurrent() ||
-      !isAcceptedProjectFilePath(proj, presentationPath)
-    ) return null;
-
-    let changed = false;
-    const acceptedFiles = [];
-    for (const extractedPath of extractedPaths) {
-      const content = readOwnerOnlyCacheFileSync(
-        extractedPath,
-        tempDir,
-        'presentation-cache-file',
-        PRESENTATION_ASSET_FILE_MODE
+    const scanState = assetBaselineScans.get(projectId);
+    if (scanState && scanState.startedAt === baselineScan.startedAt) {
+      scanState.presentationMediaOccurrencesBySource ||= new Map();
+      scanState.presentationMediaOccurrencesBySource.set(
+        baselineScan.sourceKey,
+        normalizePresentationMediaOccurrences(discoveredOccurrences)
       );
-      const fileEntry = buildAutoCaptureFileEntry(extractedPath, 'scan-on-save-presentation', {
-        assetOrigin: 'existing',
-        projectRole: 'asset',
-        assetBaselineSourcePath: presentationPath,
-        presentationContentFingerprint: getPackageContentFingerprint(content),
-      });
-      const baselineMetadataChanged = markExistingBaselineAssetMetadata(proj, fileEntry);
-      const staged = stageLiveObservedFile(proj, fileEntry, {
-        relationshipSourcePath: presentationPath,
-        appFamily: getPrimaryDesignAppFamilyForExt(ext) || 'generic',
-        reason: 'scan-on-save-presentation',
-        explicitBaselineRelationship: true,
-      });
-      if (!staged.changed && !baselineMetadataChanged) continue;
-      if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) acceptedFiles.push(fileEntry);
-      changed = true;
     }
 
-    if (!changed) return null;
-    proj.files = deduplicateFiles(proj.files);
-    for (const fileEntry of acceptedFiles) {
-      const internalPath = internalPathByMaterializedPath.get(normalizeTrackedFilePath(fileEntry.path));
-      if (!internalPath) continue;
-      recordPowerPointMediaExtractionProvenanceForProject(proj, [{
-        presentationPath,
-        internalPath,
-        materializedPath: fileEntry.path,
-        source: fileEntry.source,
-        observedAt: fileEntry.addedAt,
-      }]);
+    const internalPathByMaterializedPath = new Map(extractionRecords.map(extraction => [
+      normalizeTrackedFilePath(extraction.materializedPath),
+      extraction.internalPath,
+    ]));
+    for (const extractedPath of extractedPaths) {
+      if (!tryHardenPresentationCacheFile(extractedPath, tempDir)) {
+        throw new Error('presentation_baseline_cache_unavailable');
+      }
     }
-    return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
-  });
 
-  if (result && isCurrent()) sendProjectFileStateToRenderer(projectId, baselineScan.activationToken);
+    const result = mutateProject(projectId, (proj) => {
+      if (
+        (proj.status !== 'watching' && !(baselineScan.allowPaused && proj.status === 'paused')) ||
+        !isCurrent() ||
+        !isAcceptedProjectFilePath(proj, presentationPath)
+      ) return null;
+
+      let changed = false;
+      const acceptedFiles = [];
+      for (const extractedPath of extractedPaths) {
+        const content = readOwnerOnlyCacheFileSync(
+          extractedPath,
+          tempDir,
+          'presentation-cache-file',
+          PRESENTATION_ASSET_FILE_MODE
+        );
+        const fileEntry = buildAutoCaptureFileEntry(extractedPath, 'scan-on-save-presentation', {
+          assetOrigin: 'existing',
+          projectRole: 'asset',
+          assetBaselineSourcePath: presentationPath,
+          presentationContentFingerprint: getPackageContentFingerprint(content),
+        });
+        const baselineMetadataChanged = markExistingBaselineAssetMetadata(proj, fileEntry);
+        const staged = stageLiveObservedFile(proj, fileEntry, {
+          relationshipSourcePath: presentationPath,
+          appFamily: getPrimaryDesignAppFamilyForExt(ext) || 'generic',
+          reason: 'scan-on-save-presentation',
+          explicitBaselineRelationship: true,
+        });
+        if (!staged.changed && !baselineMetadataChanged) continue;
+        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) acceptedFiles.push(fileEntry);
+        changed = true;
+      }
+
+      if (!changed) return null;
+      proj.files = deduplicateFiles(proj.files);
+      for (const fileEntry of acceptedFiles) {
+        const internalPath = internalPathByMaterializedPath.get(normalizeTrackedFilePath(fileEntry.path));
+        if (!internalPath) continue;
+        recordPowerPointMediaExtractionProvenanceForProject(proj, [{
+          presentationPath,
+          internalPath,
+          materializedPath: fileEntry.path,
+          source: fileEntry.source,
+          observedAt: fileEntry.addedAt,
+        }]);
+      }
+      return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
+    });
+
+    keepInvocationFiles = !!result;
+    if (result && isCurrent()) sendProjectFileStateToRenderer(projectId, baselineScan.activationToken);
+  } finally {
+    if (!keepInvocationFiles) removeOwnedDirectCacheFiles(invocationFiles);
+  }
 }
 
 /**
@@ -12353,6 +12447,8 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
   const ext = path.extname(logicalPresentationPath).toLowerCase();
   const base = path.basename(logicalPresentationPath, ext);
   const extracted = [];
+  const invocationFiles = [];
+  let extractionCompleted = false;
   let expectedOutputIndex = 0;
   if (ext !== '.pptx' && ext !== '.key') return extracted;
 
@@ -12516,6 +12612,20 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         if (ext === '.pptx' || ext === '.key') {
           const extractedSize = data.length;
           extractedFingerprint = getPackageContentFingerprint(data);
+          if (typeof options.onCandidate === 'function') {
+            options.onCandidate({
+              presentationPath: logicalPresentationPath,
+              internalPath: zipPath,
+              contentFingerprint: extractedFingerprint,
+            });
+          }
+          const resource = getPresentationMediaResourceIdentity(logicalPresentationPath, zipPath);
+          const suppressedOccurrence = resource && (options.suppressedOccurrences || []).some(occurrence => (
+            occurrence &&
+            occurrence.resourceKey === resource.resourceKey &&
+            occurrence.contentFingerprint === extractedFingerprint
+          ));
+          if (suppressedOccurrence) continue;
           if (extractedPresentationFingerprints.has(extractedFingerprint)) {
             if (capturedSizes.has(extractedSize)) {
               console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes)`);
@@ -12557,6 +12667,11 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         if (descriptor && path.basename(destPath) !== descriptor.outputName) throw new PackageReviewChangedError();
         if (typeof options.onBeforeWrite === 'function') options.onBeforeWrite(destPath);
         fs.writeFileSync(destPath, data, { flag: 'wx' });
+        if (options.rollbackOnFailure || typeof options.onMaterialized === 'function') {
+          const materialized = captureOwnedDirectCacheFile(destPath, destFolder, 'presentation-cache-file');
+          if (options.rollbackOnFailure) invocationFiles.push(materialized);
+          if (typeof options.onMaterialized === 'function') options.onMaterialized(materialized);
+        }
         extracted.push(destPath);
         if (typeof options.onExtracted === 'function') {
           try {
@@ -12593,6 +12708,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
     if (Array.isArray(options.expectedOutputs) && expectedOutputIndex !== options.expectedOutputs.length) {
       throw new PackageReviewChangedError();
     }
+    extractionCompleted = true;
   } catch (e) {
     if (e instanceof PackageTransactionInvariantError || e instanceof PackageReviewChangedError) throw e;
     if (options.failClosed) throw new PackageReviewChangedError();
@@ -12607,6 +12723,10 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       } catch (callbackErr) {
         console.warn('[crate] embedded media inspection error callback skipped');
       }
+    }
+  } finally {
+    if (options.rollbackOnFailure && !extractionCompleted) {
+      removeOwnedDirectCacheFiles(invocationFiles);
     }
   }
 
@@ -12882,8 +13002,11 @@ const PACKAGE_PRESENTATION_EXTENSIONS = new Set(['.key', '.pptx']);
 function getSkippedExistingPresentationMediaSuppression(project) {
   const fingerprints = new Set();
   const nameBases = new Set();
+  const occurrences = normalizePresentationMediaOccurrences(
+    project && project.assetBaseline && project.assetBaseline.presentationMediaOccurrences
+  );
   if (!project || project.assetBaseline?.decision !== 'skip') {
-    return { fingerprints: [], nameBases: [] };
+    return { fingerprints: [], nameBases: [], occurrences: [] };
   }
 
   for (const file of project.files || []) {
@@ -12896,7 +13019,9 @@ function getSkippedExistingPresentationMediaSuppression(project) {
     const ext = path.extname(file.path || file.name || '').toLowerCase();
     if (!EMBEDDED_MEDIA_EXTENSIONS.has(ext)) continue;
 
-    if (isPackageContentFingerprint(file.presentationContentFingerprint)) {
+    if (file.source === 'scan-on-save-presentation') {
+      continue;
+    } else if (isPackageContentFingerprint(file.presentationContentFingerprint)) {
       fingerprints.add(file.presentationContentFingerprint);
     } else if (typeof file.path === 'string') {
       const sourceFingerprint = getPackageReviewSourceFingerprint(file.path);
@@ -12918,6 +13043,7 @@ function getSkippedExistingPresentationMediaSuppression(project) {
   return {
     fingerprints: [...fingerprints].sort(),
     nameBases: [...nameBases].sort(),
+    occurrences,
   };
 }
 
@@ -12942,7 +13068,7 @@ async function buildAuthoritativePackagePlan(
   entries,
   packageSettings,
   destinationFolderName,
-  presentationSuppression = { fingerprints: [], nameBases: [] }
+  presentationSuppression = { fingerprints: [], nameBases: [], occurrences: [] }
 ) {
   const allocateOutputName = createPackageNameAllocator();
   const reviewedSourceInputs = [];
@@ -13019,11 +13145,15 @@ async function buildAuthoritativePackagePlan(
   for (const entryIndex of presentationEntryIndexes) {
     const expectedOutputs = [];
     const dedupFingerprints = [...presentationDedupFingerprints].sort();
+    const suppressedOccurrences = normalizePresentationMediaOccurrences(
+      presentationSuppression.occurrences
+    );
     await extractEmbeddedMedia(files[entryIndex].path, null, files, {
       planOnly: true,
       failClosed: true,
       dedupFingerprints,
       dedupNameBases,
+      suppressedOccurrences,
       reserveOutputName: allocateOutputName,
       onPlanned: output => expectedOutputs.push(output),
     });
@@ -13036,6 +13166,7 @@ async function buildAuthoritativePackagePlan(
       materialization: 'presentation-media',
       dedupFingerprints,
       dedupNameBases,
+      suppressedOccurrences,
       expectedOutputs,
     });
   }
@@ -14260,6 +14391,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           failClosed: true,
           dedupFingerprints: generator.dedupFingerprints,
           dedupNameBases: generator.dedupNameBases,
+          suppressedOccurrences: generator.suppressedOccurrences,
           reserveOutputName: allocateOutputName,
           expectedOutputs: generator.expectedOutputs,
           onBeforeMaterialize: packageWrites.assertRoot,
