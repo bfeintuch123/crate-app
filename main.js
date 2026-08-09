@@ -2806,6 +2806,14 @@ function inferAssetOrigin(project, file, baseline) {
   const captureEvidence = file && file.captureEvidence && typeof file.captureEvidence === 'object'
     ? file.captureEvidence
     : {};
+  if (
+    captureSource === 'ps-poll' &&
+    typeof file.assetBaselineSourcePath !== 'string' &&
+    typeof captureEvidence.relationshipSourcePath !== 'string' &&
+    typeof captureEvidence.sourceDocumentPath !== 'string'
+  ) {
+    return 'added';
+  }
   const isDependency = DEPENDENCY_CAPTURE_SOURCES.has(captureSource) ||
     typeof captureEvidence.relationshipSourcePath === 'string' ||
     typeof captureEvidence.sourceDocumentPath === 'string';
@@ -9517,8 +9525,99 @@ function markExistingBaselineAssetMetadata(project, fileEntry) {
       storedFile.assetBaselineSourcePath = fileEntry.assetBaselineSourcePath;
       changed = true;
     }
+    if (
+      isPackageContentFingerprint(fileEntry.presentationContentFingerprint) &&
+      storedFile.presentationContentFingerprint !== fileEntry.presentationContentFingerprint
+    ) {
+      storedFile.presentationContentFingerprint = fileEntry.presentationContentFingerprint;
+      changed = true;
+    }
   }
   return changed;
+}
+
+async function captureExistingPresentationMediaBaseline(
+  projectId,
+  presentationPath,
+  baselineScan,
+  isCurrent
+) {
+  const ext = path.extname(presentationPath).toLowerCase();
+  if (!baselineScan || (ext !== '.pptx' && ext !== '.key')) return;
+  const project = getProjects().find(item => item.id === projectId);
+  if (!project || !isCurrent() || !isAcceptedProjectFilePath(project, presentationPath)) return;
+
+  const tempDir = ensurePresentationAssetsDir(projectId);
+  const extractionRecords = [];
+  const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
+    source: 'scan-on-save-presentation',
+    logicalPresentationPath: presentationPath,
+    failClosed: true,
+    onExtracted: extraction => extractionRecords.push(extraction),
+  });
+  if (!isCurrent()) return;
+
+  const internalPathByMaterializedPath = new Map(extractionRecords.map(extraction => [
+    normalizeTrackedFilePath(extraction.materializedPath),
+    extraction.internalPath,
+  ]));
+  for (const extractedPath of extractedPaths) {
+    if (!tryHardenPresentationCacheFile(extractedPath, tempDir)) {
+      throw new Error('presentation_baseline_cache_unavailable');
+    }
+  }
+
+  const result = mutateProject(projectId, (proj) => {
+    if (
+      (proj.status !== 'watching' && !(baselineScan.allowPaused && proj.status === 'paused')) ||
+      !isCurrent() ||
+      !isAcceptedProjectFilePath(proj, presentationPath)
+    ) return null;
+
+    let changed = false;
+    const acceptedFiles = [];
+    for (const extractedPath of extractedPaths) {
+      const content = readOwnerOnlyCacheFileSync(
+        extractedPath,
+        tempDir,
+        'presentation-cache-file',
+        PRESENTATION_ASSET_FILE_MODE
+      );
+      const fileEntry = buildAutoCaptureFileEntry(extractedPath, 'scan-on-save-presentation', {
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+        assetBaselineSourcePath: presentationPath,
+        presentationContentFingerprint: getPackageContentFingerprint(content),
+      });
+      const baselineMetadataChanged = markExistingBaselineAssetMetadata(proj, fileEntry);
+      const staged = stageLiveObservedFile(proj, fileEntry, {
+        relationshipSourcePath: presentationPath,
+        appFamily: getPrimaryDesignAppFamilyForExt(ext) || 'generic',
+        reason: 'scan-on-save-presentation',
+        explicitBaselineRelationship: true,
+      });
+      if (!staged.changed && !baselineMetadataChanged) continue;
+      if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) acceptedFiles.push(fileEntry);
+      changed = true;
+    }
+
+    if (!changed) return null;
+    proj.files = deduplicateFiles(proj.files);
+    for (const fileEntry of acceptedFiles) {
+      const internalPath = internalPathByMaterializedPath.get(normalizeTrackedFilePath(fileEntry.path));
+      if (!internalPath) continue;
+      recordPowerPointMediaExtractionProvenanceForProject(proj, [{
+        presentationPath,
+        internalPath,
+        materializedPath: fileEntry.path,
+        source: fileEntry.source,
+        observedAt: fileEntry.addedAt,
+      }]);
+    }
+    return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
+  });
+
+  if (result && isCurrent()) sendProjectFileStateToRenderer(projectId, baselineScan.activationToken);
 }
 
 /**
@@ -9698,6 +9797,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         sendProjectFileStateToRenderer(projectId, activationToken);
       }
     }
+  }
+  if (baselineScan && (ext === '.pptx' || ext === '.key')) {
+    await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent);
   }
   dependableScanCompleted = true;
   return { success: true };
@@ -12777,6 +12879,48 @@ function bindEmbeddedPsdPackageReviewResources(files, entries) {
 
 const PACKAGE_PRESENTATION_EXTENSIONS = new Set(['.key', '.pptx']);
 
+function getSkippedExistingPresentationMediaSuppression(project) {
+  const fingerprints = new Set();
+  const nameBases = new Set();
+  if (!project || project.assetBaseline?.decision !== 'skip') {
+    return { fingerprints: [], nameBases: [] };
+  }
+
+  for (const file of project.files || []) {
+    if (
+      !file ||
+      file.assetOrigin !== 'existing' ||
+      file.projectRole !== 'asset' ||
+      !isAssetReviewFileExcluded(project, file)
+    ) continue;
+    const ext = path.extname(file.path || file.name || '').toLowerCase();
+    if (!EMBEDDED_MEDIA_EXTENSIONS.has(ext)) continue;
+
+    if (isPackageContentFingerprint(file.presentationContentFingerprint)) {
+      fingerprints.add(file.presentationContentFingerprint);
+    } else if (typeof file.path === 'string') {
+      const sourceFingerprint = getPackageReviewSourceFingerprint(file.path);
+      if (sourceFingerprint.state === 'present') {
+        fingerprints.add(getStablePackageReviewSourceContentFingerprint(file.path, sourceFingerprint));
+      }
+    }
+
+    if (file.source !== 'scan-on-save-presentation') {
+      const displayName = file.name || path.basename(file.path || '');
+      const base = path.basename(displayName, path.extname(displayName))
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (base) nameBases.add(base);
+    }
+  }
+
+  return {
+    fingerprints: [...fingerprints].sort(),
+    nameBases: [...nameBases].sort(),
+  };
+}
+
 function getPackageReviewEntryStatus(entry) {
   if (entry.sourceFingerprint.state !== 'present') {
     return entry.sourceFingerprint.state === 'virtual' ? 'unmaterializable' : entry.sourceFingerprint.state;
@@ -12793,7 +12937,13 @@ function getPackageReviewEntryStatus(entry) {
   return 'unmaterializable';
 }
 
-async function buildAuthoritativePackagePlan(files, entries, packageSettings, destinationFolderName) {
+async function buildAuthoritativePackagePlan(
+  files,
+  entries,
+  packageSettings,
+  destinationFolderName,
+  presentationSuppression = { fingerprints: [], nameBases: [] }
+) {
   const allocateOutputName = createPackageNameAllocator();
   const reviewedSourceInputs = [];
   const deterministicDerivedOutputs = [];
@@ -12828,7 +12978,9 @@ async function buildAuthoritativePackagePlan(files, entries, packageSettings, de
     presentationEntryIndexes.push(entryIndex);
   }
 
-  const presentationDedupFingerprints = new Set();
+  const presentationDedupFingerprints = new Set(
+    (presentationSuppression.fingerprints || []).filter(isPackageContentFingerprint)
+  );
   const dedupFingerprintBySource = new Map();
   if (presentationEntryIndexes.length > 0) {
     for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
@@ -12853,13 +13005,16 @@ async function buildAuthoritativePackagePlan(files, entries, packageSettings, de
     }
   }
 
-  const dedupNameBases = [...new Set(entries
+  const dedupNameBases = [...new Set([
+    ...(presentationSuppression.nameBases || []),
+    ...entries
     .map((entry, entryIndex) => {
       if (files[entryIndex]?.source === 'scan-on-save-presentation') return null;
       const displayName = entry.displayName || '';
       return path.basename(displayName, path.extname(displayName)).toLowerCase().replace(/\s+/g, ' ').trim();
     })
-    .filter(Boolean))].sort();
+    .filter(Boolean),
+  ])].sort();
 
   for (const entryIndex of presentationEntryIndexes) {
     const expectedOutputs = [];
@@ -12986,7 +13141,8 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         files,
         entries,
         packageSettings,
-        getReviewedPackageFolderName(currentProject, packageSettings)
+        getReviewedPackageFolderName(currentProject, packageSettings),
+        getSkippedExistingPresentationMediaSuppression(currentProject)
       );
     } catch (error) {
       if (error instanceof PackageReviewChangedError) {

@@ -7100,6 +7100,123 @@ test('first dependable source scan requires an existing-assets decision and bind
   }
 });
 
+test('Skip Existing excludes baseline PowerPoint media while later saved media remains packageable', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-baseline-skip-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Existing Deck.pptx');
+    const outputDir = path.join(fixtureRoot, 'out');
+    const existingMedia = Buffer.from('EXISTING_POWERPOINT_MEDIA'.repeat(40));
+    const addedMedia = Buffer.from('ADDED_POWERPOINT_MEDIA'.repeat(40));
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container');
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.png',
+      data: existingMedia,
+    }]);
+
+    const project = await createProject('Presentation baseline skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const baselineMedia = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(baselineMedia);
+    assert.equal(baselineMedia.assetOrigin, 'existing');
+    assert.equal(baselineMedia.projectRole, 'asset');
+    assert.equal(baselineMedia.assetBaselineSourcePath, sourcePath);
+    assert.equal(typeof baselineMedia.presentationContentFingerprint, 'string');
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    let review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Existing Deck.pptx']);
+
+    setPowerPointUnzipFixture([
+      { internalPath: 'ppt/media/image1.png', data: existingMedia },
+      { internalPath: 'ppt/media/image2.png', data: addedMedia },
+    ]);
+    fs.writeFileSync(sourcePath, 'synthetic PowerPoint container after save');
+    await emitWatcher('change', sourcePath);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => (
+        file.source === 'scan-on-save-presentation' &&
+        file.assetOrigin === 'added'
+      )),
+      6000
+    );
+    const addedEntry = fresh.files.find(file => (
+      file.source === 'scan-on-save-presentation' &&
+      file.assetOrigin === 'added'
+    ));
+    assert.ok(addedEntry);
+    assert.equal(fs.readFileSync(addedEntry.path, 'utf8'), addedMedia.toString('utf8'));
+
+    review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(
+      review.files.map(file => file.name).sort(),
+      ['Existing Deck — image2.png', 'Existing Deck.pptx']
+    );
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 2);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'Existing Deck — image2.png',
+      'Existing Deck.pptx',
+    ]);
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'Existing Deck — image1.png')), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Skip Existing excludes baseline Keynote media from review and physical output', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-keynote-baseline-skip-test-'));
+  try {
+    resetPresentationCacheRoot();
+    const sourcePath = path.join(fixtureRoot, 'Existing Keynote.key');
+    const outputDir = path.join(fixtureRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'synthetic Keynote container');
+    setKeynoteUnzipFixture([{
+      internalPath: 'Data/existing-photo-1234.jpeg',
+      data: Buffer.from('EXISTING_KEYNOTE_MEDIA'.repeat(40)),
+    }]);
+
+    const project = await createProject('Keynote baseline skip');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const baselineMedia = fresh.files.find(file => file.source === 'scan-on-save-presentation');
+    assert.ok(baselineMedia);
+    assert.equal(baselineMedia.assetOrigin, 'existing');
+    assert.equal(baselineMedia.assetBaselineSourcePath, sourcePath);
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(review.files.map(file => file.name), ['Existing Keynote.key']);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 1);
+    assert.equal(result.embeddedCount, 0);
+    assert.deepEqual(fs.readdirSync(result.folderPath), ['Existing Keynote.key']);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('first dependable scan of a blank source records an empty baseline without prompting', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-empty-baseline-test-'));
   try {
@@ -7679,6 +7796,63 @@ test('Photoshop baseline discovery is scoped to the selected PSD when another do
   } finally {
     currentPsdFixture = previousPsdFixture;
     setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-baseline Photoshop polling cannot promote another open document into Existing assets', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-photoshop-prebaseline-poll-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Selected Source.psd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Existing.png');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Other Open Document.png');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for stubbed parser');
+    fs.writeFileSync(selectedLinkedPath, 'selected PSD dependency');
+    fs.writeFileSync(unrelatedLinkedPath, 'unrelated open PSD dependency');
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: selectedLinkedPath } }],
+      linkedFiles: [],
+    };
+
+    const project = await createProject('Pre-baseline Photoshop polling');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.pendingFiles = [{
+      ...makePendingFile(unrelatedLinkedPath, 'ps-poll'),
+      captureState: 'needs-save',
+      captureReason: 'linked-asset-observed',
+      captureEvidence: {
+        appFamily: 'photoshop',
+        observerMethod: 'photoshop-live-script',
+        evidenceStrength: 'structured-app-link',
+      },
+    }];
+
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+
+    assert.equal(fresh.files.find(file => file.path === selectedLinkedPath).assetOrigin, 'existing');
+    assert.equal(fresh.pendingFiles.find(file => file.path === unrelatedLinkedPath).assetOrigin, 'added');
+    assert.deepEqual(
+      [...fresh.files, ...fresh.pendingFiles]
+        .filter(file => file.assetOrigin === 'existing' && file.projectRole === 'asset')
+        .map(file => file.path),
+      [selectedLinkedPath]
+    );
+
+    const decision = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include');
+    assert.equal(decision.success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.files.some(file => file.path === unrelatedLinkedPath), false);
+  } finally {
+    currentPsdFixture = previousPsdFixture;
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
