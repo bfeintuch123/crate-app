@@ -913,6 +913,7 @@ function grantExplicitUserAuthority(file, {
     method: sanitizeLiveEvidenceText(method) || 'unknown',
     grantedAt: Number.isFinite(existing.grantedAt) ? existing.grantedAt : grantedAt,
   };
+  file.assetOrigin = 'added';
   delete file.assetBaselineSourcePath;
   return file;
 }
@@ -2785,6 +2786,7 @@ function isProjectAssetBaselineSource(file) {
   const evidence = file.captureEvidence && typeof file.captureEvidence === 'object'
     ? file.captureEvidence
     : {};
+  if (isExplicitUserCapturedFile(file) || file.acceptedPending === true) return true;
   if (
     DEPENDENCY_CAPTURE_SOURCES.has(source) ||
     typeof evidence.relationshipSourcePath === 'string' ||
@@ -2792,9 +2794,7 @@ function isProjectAssetBaselineSource(file) {
   ) {
     return false;
   }
-  return inferProjectFileRole(file) === 'source' ||
-    isExplicitUserCapturedFile(file) ||
-    file.acceptedPending === true;
+  return inferProjectFileRole(file) === 'source';
 }
 
 function inferAssetOrigin(project, file, baseline) {
@@ -9131,37 +9131,60 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
  */
 async function extractLinkedAssetsInDesign(filePath, options = {}) {
   const ext = path.extname(filePath).toLowerCase();
+  const strict = options.strict === true;
+  if (ext === '.idml') return extractLinkedAssetsIdml(filePath, options);
+
   try {
     // Check if InDesign is running
     const { stdout: psCheck } = await execAsync(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
-    ).catch(() => ({ stdout: '' }));
+    );
 
-    if (psCheck.trim()) {
-      const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
-        () => ({ 'crate-indd-query.applescript': INDD_APPLESCRIPT }),
-        'crate-indd-query.applescript',
-        { timeout: 10000, encoding: 'utf8' }
-      ).catch(() => ({ stdout: '' }));
+    if (!psCheck.trim()) {
+      if (strict) throw new Error('asset_baseline_indesign_unavailable');
+      return extractLinkedAssetsRegex(filePath, options);
+    }
 
-      if (inddPaths.trim()) {
-        const selectedSourcePath = normalizeTrackedFilePath(filePath);
-        const { links } = parseInDesignActiveSessionOutput(inddPaths);
-        const results = links
-          .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
-          .map(link => link.linkedPath)
-          .filter(linkedPath => linkedPath !== filePath && fs.existsSync(linkedPath));
-        if (results.length > 0) {
-          return [...new Set(results)];
+    const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
+      () => ({ 'crate-indd-query.applescript': INDD_APPLESCRIPT }),
+      'crate-indd-query.applescript',
+      { timeout: 10000, encoding: 'utf8' }
+    );
+    const selectedSourcePath = normalizeTrackedFilePath(filePath);
+    const activeState = parseInDesignActiveSessionOutput(inddPaths);
+
+    if (strict) {
+      const rows = String(inddPaths || '').split('\n').map(line => line.trim()).filter(Boolean);
+      const malformed = rows.length === 0 || rows.some(line => {
+        const parts = line.split('\t');
+        if (parts[0] === 'DOC') {
+          return parts.length < 5 || !normalizeTrackedFilePath(parts[1]);
         }
+        if (parts[0] === 'LINK') {
+          return parts.length < 6 ||
+            !normalizeTrackedFilePath(parts[1]) ||
+            !normalizeTrackedFilePath(parts[3]);
+        }
+        return true;
+      });
+      const selectedDocumentPresent = activeState.documents.some(
+        document => normalizeTrackedFilePath(document.documentPath) === selectedSourcePath
+      );
+      if (malformed || !selectedDocumentPresent) {
+        throw new Error('asset_baseline_indesign_snapshot_incomplete');
       }
     }
+
+    const results = activeState.links
+      .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
+      .map(link => link.linkedPath)
+      .filter(linkedPath => linkedPath !== filePath && fs.existsSync(linkedPath));
+    if (strict || results.length > 0) return [...new Set(results)];
   } catch (e) {
-    // AppleScript failed — fall through to file-based extractor
+    if (strict) throw e;
   }
-  // Fallback: .idml → zip-based XML parser, .indd → binary regex
-  if (ext === '.idml') return extractLinkedAssetsIdml(filePath, options);
+  // Non-baseline live scans retain the legacy binary fallback.
   return extractLinkedAssetsRegex(filePath, options);
 }
 

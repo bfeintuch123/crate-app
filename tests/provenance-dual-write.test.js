@@ -7876,6 +7876,54 @@ test('first scan preserves a linked asset explicitly selected in the same Add Fi
   }
 });
 
+test('explicitly re-adding a discovered source promotes it to Added and scans its dependencies', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-explicit-readd-source-test-'));
+  try {
+    const discoveredSourcePath = path.join(fixtureRoot, 'Discovered Source.ai');
+    const nestedLinkedPath = path.join(fixtureRoot, 'Nested Linked.png');
+    fs.writeFileSync(nestedLinkedPath, 'nested linked dependency');
+    writeSyntheticAiFile(discoveredSourcePath, `synthetic illustrator link ${nestedLinkedPath}`);
+
+    const project = await createProject('Explicitly re-added source');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files.push({
+      path: discoveredSourcePath,
+      name: path.basename(discoveredSourcePath),
+      ext: '.ai',
+      addedAt: Date.now() - 1000,
+      source: 'scan-on-open',
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      captureEvidence: {
+        relationshipSourcePath: path.join(fixtureRoot, 'Earlier Source.ai'),
+      },
+    });
+
+    manualDialogFor([discoveredSourcePath]);
+    await callIpc('projects:add-files', project.id);
+
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+    const readdedSource = fresh.files.find(file => file.path === discoveredSourcePath);
+    const nestedLinked = fresh.files.find(file => file.path === nestedLinkedPath);
+    assert.equal(readdedSource.explicitUserAuthority.granted, true);
+    assert.equal(readdedSource.assetOrigin, 'added');
+    assert.equal(nestedLinked.assetOrigin, 'existing');
+
+    const skipped = await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(skipped.success, true);
+    const afterSkip = await getProject(project.id);
+    assert.equal(afterSkip.excludedAssetKeys.includes(readdedSource.fileId || readdedSource.path), false);
+    assert.equal(afterSkip.excludedAssetKeys.includes(nestedLinked.fileId || nestedLinked.path), true);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['Discovered Source.ai']);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('InDesign first scan attributes links only from the selected source document', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-baseline-scope-test-'));
   try {
@@ -7917,6 +7965,117 @@ test('InDesign first scan attributes links only from the selected source documen
     assert.equal(fresh.files.some(file => file.path === unrelatedSourcePath), false);
     assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
     assert.equal(fresh.pendingFiles.some(file => file.path === unrelatedLinkedPath), false);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan fails closed for unavailable or incomplete structured snapshots', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-baseline-fail-closed-test-'));
+  const sourcePath = path.join(fixtureRoot, 'Fail Closed Source.indd');
+  fs.writeFileSync(sourcePath, 'synthetic InDesign bytes without dependable link metadata');
+  const scenarios = [
+    {
+      name: 'app unavailable',
+      handler: ({ kind, command }) => (
+        kind === 'exec' && String(command).includes('Adobe InDesign')
+          ? { stdout: '', stderr: '' }
+          : { stdout: '', stderr: '' }
+      ),
+    },
+    {
+      name: 'query failure',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return { error: new Error('forced InDesign query failure') };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'query timeout',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          const error = new Error('forced InDesign query timeout');
+          error.code = 'ETIMEDOUT';
+          return { error };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+    {
+      name: 'empty query output',
+      handler: ({ kind, command }) => (
+        kind === 'exec' && String(command).includes('Adobe InDesign')
+          ? { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' }
+          : { stdout: '', stderr: '' }
+      ),
+    },
+    {
+      name: 'malformed query output',
+      handler: ({ kind, command, args }) => {
+        if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+          return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+        }
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+          return { stdout: `DOC\t${sourcePath}`, stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      setChildProcessHandler(scenario.handler);
+      const project = await createProject(`InDesign fail closed: ${scenario.name}`);
+      manualDialogFor([sourcePath]);
+      const files = await callIpc('projects:add-files', project.id);
+      assert.equal(files.some(file => file.path === sourcePath), true, scenario.name);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan', scenario.name);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.error, 'asset_baseline_scan_incomplete', scenario.name);
+      await callIpcRaw('projects:delete', project.id);
+    }
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('InDesign first scan accepts a well-formed selected document with no links', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-indesign-empty-baseline-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'No Links Source.indd');
+    fs.writeFileSync(sourcePath, 'synthetic InDesign bytes with a dependable empty snapshot');
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && String(command).includes('Adobe InDesign')) {
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign', stderr: '' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+        return {
+          stdout: `DOC\t${sourcePath}\t${path.basename(sourcePath)}\tfalse\ttrue`,
+          stderr: '',
+        };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const project = await createProject('InDesign dependable empty baseline');
+    manualDialogFor([sourcePath]);
+    await callIpc('projects:add-files', project.id);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'empty');
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['No Links Source.indd']);
   } finally {
     setChildProcessHandler(null);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
