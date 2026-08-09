@@ -9128,6 +9128,11 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
  * AppleScript returns nothing.
  */
 async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
+  // A dependable first scan must be scoped to this PSD. The live Photoshop
+  // script reports links from every open document, so baseline discovery
+  // delegates to the file-scoped ag-psd pass below instead.
+  if (options.strict === true) return [];
+
   try {
     // Check if Photoshop is running
     const { stdout: psCheck } = await execAsync(

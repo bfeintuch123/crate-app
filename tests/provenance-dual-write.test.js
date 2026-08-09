@@ -7635,6 +7635,54 @@ test('Illustrator baseline validation and extraction use one immutable source sn
   }
 });
 
+test('Photoshop baseline discovery is scoped to the selected PSD when another document is open', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-photoshop-scoped-baseline-test-'));
+  const previousPsdFixture = currentPsdFixture;
+  let photoshopScriptAttempts = 0;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Selected Source.psd');
+    const selectedLinkedPath = path.join(fixtureRoot, 'Selected Existing.png');
+    const unrelatedLinkedPath = path.join(fixtureRoot, 'Other Document.png');
+    fs.writeFileSync(sourcePath, 'synthetic PSD bytes for stubbed parser');
+    fs.writeFileSync(selectedLinkedPath, 'selected PSD dependency');
+    fs.writeFileSync(unrelatedLinkedPath, 'unrelated open PSD dependency');
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: selectedLinkedPath } }],
+      linkedFiles: [],
+    };
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && command.includes("grep -i 'Adobe Photoshop'")) {
+        return { stdout: 'Adobe Photoshop\n' };
+      }
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-ps-scan.applescript')) {
+        photoshopScriptAttempts++;
+        return { stdout: `${unrelatedLinkedPath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Scoped Photoshop baseline');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
+    );
+
+    const selectedLinked = fresh.files.find(file => file.path === selectedLinkedPath);
+    assert.ok(selectedLinked);
+    assert.equal(selectedLinked.assetOrigin, 'existing');
+    assert.equal(selectedLinked.source, 'psd-linked');
+    assert.equal(fresh.files.some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal((fresh.pendingFiles || []).some(file => file.path === unrelatedLinkedPath), false);
+    assert.equal(photoshopScriptAttempts, 0);
+  } finally {
+    currentPsdFixture = previousPsdFixture;
+    setChildProcessHandler(null);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('post-preflight PSD parser failure keeps the baseline unresolved', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-psd-extraction-failure-test-'));
   const previousPsdFixture = currentPsdFixture;
