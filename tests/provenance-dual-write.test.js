@@ -15068,6 +15068,54 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
   }
 });
 
+test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PSD embedded asset exclusion');
+    const psdPath = path.join(tmpRoot, 'source.psd');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: 'source.psd',
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
+    };
+
+    await emitWatcher('change', psdPath);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'scan-on-save-embedded')
+    );
+    const embeddedEntry = fresh.files.find(file => file.source === 'scan-on-save-embedded');
+    assert.equal(embeddedEntry.assetOrigin, 'added');
+    assert.equal(typeof embeddedEntry.fileId, 'string');
+
+    await callIpcRaw('projects:remove-file', project.id, embeddedEntry.fileId);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.excludedAssetKeys.length, 1);
+    assert.notEqual(fresh.excludedAssetKeys[0], embeddedEntry.fileId);
+
+    await emitWatcher('change', psdPath);
+    await new Promise(resolve => originalSetTimeout(resolve, 2300));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.pendingFiles.some(file => file.source === 'scan-on-save-embedded'), false);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['source.psd']);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('PSD scan-on-save missing linked asset does not record parser relationship edge', async () => {
   const tmpRoot = makeTempDir();
   try {

@@ -2956,6 +2956,7 @@ function normalizeProjectAssetReviewState(project) {
 
 function getAssetReviewExclusionKey(file) {
   if (!file || typeof file !== 'object') return null;
+  if (isScanOnSaveEmbeddedPsdFile(file)) return getEmbeddedPsdDedupKey(file);
   if (typeof file.fileId === 'string' && file.fileId) return file.fileId;
   return typeof file.path === 'string' && file.path ? file.path : null;
 }
