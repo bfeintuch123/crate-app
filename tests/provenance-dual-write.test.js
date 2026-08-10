@@ -7411,6 +7411,71 @@ test('first dependable scan of a blank source records an empty baseline without 
   }
 });
 
+test('Added While Working assets stay included by default and per-file exclusion survives rescans until Explicit Add Files restores them', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-added-assets-exclusion-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Working Project.ai');
+    const addedAssetPath = path.join(fixtureRoot, 'Added While Working.png');
+    const outputDir = path.join(fixtureRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(addedAssetPath, 'added while working bytes');
+    writeSyntheticAiFile(sourcePath);
+
+    const project = await createProject('Added While Working exclusion');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+
+    writeSyntheticAiFile(sourcePath, `synthetic Illustrator link ${addedAssetPath}`);
+    await emitWatcher('change', sourcePath);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === addedAssetPath)
+    );
+    const addedAsset = fresh.files.find(file => file.path === addedAssetPath);
+    assert.equal(addedAsset.assetOrigin, 'added');
+    assert.equal(addedAsset.projectRole, 'asset');
+    assert.equal(fresh.pendingFiles.some(file => file.path === addedAssetPath), false);
+
+    await callIpcRaw('projects:remove-file', project.id, addedAsset.fileId || addedAsset.path);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === addedAssetPath), false);
+    assert.equal(fresh.excludedAssetKeys.includes(addedAsset.fileId || addedAsset.path), true);
+
+    await emitWatcher('change', sourcePath);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === addedAssetPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === addedAssetPath), false);
+    const excludedReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(excludedReview.files.map(file => file.name), ['Working Project.ai']);
+
+    manualDialogFor([addedAssetPath]);
+    await callIpcRaw('projects:add-files', project.id);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.excludedAssetKeys.includes(addedAsset.fileId || addedAsset.path), false);
+    assert.equal(fresh.files.filter(file => file.path === addedAssetPath).length, 1);
+    const restoredReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(
+      restoredReview.files.map(file => file.name).sort(),
+      ['Added While Working.png', 'Working Project.ai']
+    );
+
+    const restoredAsset = fresh.files.find(file => file.path === addedAssetPath);
+    await callIpcRaw('projects:remove-file', project.id, restoredAsset.fileId || restoredAsset.path);
+    const finalReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(finalReview.files.map(file => file.name), ['Working Project.ai']);
+    const packageResult = await callIpcRaw('projects:package', project.id, outputDir, finalReview.token);
+    assert.equal(packageResult.success, true);
+    assert.deepEqual(fs.readdirSync(packageResult.folderPath), ['Working Project.ai']);
+    assert.equal(fs.existsSync(path.join(packageResult.folderPath, 'Added While Working.png')), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('an explicitly added PDF establishes a dependable baseline without changing general PDF roles', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-pdf-baseline-test-'));
   try {
@@ -7618,6 +7683,7 @@ test('removing a failed required source reconciles the baseline instead of block
     await callIpcRaw('projects:remove-file', project.id, sourcePath);
     const fresh = await getProject(project.id);
     assert.equal(fresh.files.some(file => file.path === sourcePath), false);
+    assert.deepEqual(fresh.excludedAssetKeys, []);
     assert.equal(fresh.assetBaseline.status, 'empty');
     assert.notEqual(
       (await callIpcRaw('projects:prepare-package-review', project.id)).error,
@@ -14997,6 +15063,54 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
       item => item.files.some(file => file.source === 'scan-on-save-embedded')
     );
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('PSD embedded asset exclusion');
+    const psdPath = path.join(tmpRoot, 'source.psd');
+    fs.writeFileSync(psdPath, 'psd bytes');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: psdPath,
+        name: 'source.psd',
+        ext: '.psd',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
+    };
+
+    await emitWatcher('change', psdPath);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.source === 'scan-on-save-embedded')
+    );
+    const embeddedEntry = fresh.files.find(file => file.source === 'scan-on-save-embedded');
+    assert.equal(embeddedEntry.assetOrigin, 'added');
+    assert.equal(typeof embeddedEntry.fileId, 'string');
+
+    await callIpcRaw('projects:remove-file', project.id, embeddedEntry.fileId);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.excludedAssetKeys.length, 1);
+    assert.notEqual(fresh.excludedAssetKeys[0], embeddedEntry.fileId);
+
+    await emitWatcher('change', psdPath);
+    await new Promise(resolve => originalSetTimeout(resolve, 2300));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.pendingFiles.some(file => file.source === 'scan-on-save-embedded'), false);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(review.files.map(file => file.name), ['source.psd']);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
