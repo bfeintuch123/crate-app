@@ -75,6 +75,26 @@ function clearTrackedTimers() {
   }
 }
 
+function createTestNativeImage(byteLength = 64, width = 96, height = 72) {
+  const image = {
+    isEmpty: () => false,
+    getSize: () => ({ width, height }),
+    resize: () => image,
+    toPNG: () => Buffer.alloc(byteLength, 1),
+  };
+  return image;
+}
+
+function createSyntheticPngBytes(width = 32, height = 24, marker = 0x41) {
+  const buffer = Buffer.alloc(32, marker);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buffer, 0);
+  buffer.writeUInt32BE(13, 8);
+  buffer.write('IHDR', 12, 'ascii');
+  buffer.writeUInt32BE(width, 16);
+  buffer.writeUInt32BE(height, 20);
+  return buffer;
+}
+
 async function runTrackedIntervalCallbacks(iterations = 1) {
   for (let i = 0; i < iterations; i++) {
     const callbacks = [...activeIntervalCallbacks.values()];
@@ -111,6 +131,11 @@ let nextOpenDialogResult = { canceled: true };
 let testNotificationSupported = false;
 let testAppActive = true;
 let testAppVersion = packageJson.version;
+let testNativeFileVisualImage = null;
+let testNativeFileIconImage = null;
+let testLastNativeImageBuffer = null;
+let testLastFileIconPath = null;
+let testBeforeFileIconResolve = null;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
 const testNotifications = [];
@@ -186,6 +211,11 @@ setStub('electron', () => ({
     isActive: () => testAppActive,
     getVersion: () => testAppVersion,
     getPath: () => path.join(TEST_HOME, 'user-data'),
+    getFileIcon: async filePath => {
+      testLastFileIconPath = filePath;
+      if (typeof testBeforeFileIconResolve === 'function') await testBeforeFileIconResolve(filePath);
+      return testNativeFileIconImage;
+    },
     dock: { setMenu: () => {} },
   },
   BrowserWindow: TestBrowserWindow,
@@ -206,7 +236,14 @@ setStub('electron', () => ({
     showErrorBox: () => {},
   },
   shell: { openPath: () => {} },
-  nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
+  nativeImage: {
+    createFromPath: () => testNativeFileVisualImage || ({ resize: () => ({}) }),
+    createFromBuffer: buffer => {
+      testLastNativeImageBuffer = Buffer.from(buffer);
+      return testNativeFileVisualImage || ({ resize: () => ({}) });
+    },
+    createEmpty: () => ({}),
+  },
   Notification: TestNotification,
   Menu: { buildFromTemplate: () => ({}) },
 }));
@@ -485,6 +522,23 @@ module.exports.__crateMetadataTestHooks = {
   },
   removeOwnedDirectCacheFiles(records) {
     return removeOwnedDirectCacheFiles(records);
+  },
+  clearFileVisualTypeIconCache() {
+    fileVisualTypeIconCache.clear();
+  },
+  getFileVisualRasterLimits() {
+    return {
+      sourceBytes: FILE_VISUAL_MAX_RASTER_SOURCE_BYTES,
+      dimension: FILE_VISUAL_MAX_RASTER_DIMENSION,
+      pixels: FILE_VISUAL_MAX_RASTER_PIXELS,
+      queue: FILE_VISUAL_MAX_RASTER_QUEUE,
+    };
+  },
+  runSerializedFileVisualRasterWork(task) {
+    return runSerializedFileVisualRasterWork(task);
+  },
+  getFileVisualRasterWorkPending() {
+    return fileVisualRasterWorkPending;
   },
 };
 `, filename);
@@ -2015,6 +2069,11 @@ test.afterEach(async () => {
   watcherRecords.length = 0;
   watcherCloseCount = 0;
   testUuidCounter = 0;
+  testNativeFileVisualImage = null;
+  testNativeFileIconImage = null;
+  testLastNativeImageBuffer = null;
+  testLastFileIconPath = null;
+  metadataTestHooks.clearFileVisualTypeIconCache();
   clearTrackedTimers();
 });
 
@@ -3189,7 +3248,11 @@ test('unchanged reviewed manifest packages exactly the reviewed files', async ()
     });
 
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
-    assert.deepEqual(review.files, [{ name: 'Review_Project.ai', ext: '.ai', embedded: false }]);
+    assert.deepEqual(
+      review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'Review_Project.ai', ext: '.ai', embedded: false }]
+    );
+    assert.match(review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(JSON.stringify(review).includes(tmpRoot), false);
 
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
@@ -3219,7 +3282,11 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
     }] });
 
     const initiallyMissing = await callIpcRaw('projects:prepare-package-review', project.id);
-    assert.deepEqual(initiallyMissing.files, [{ name: 'Missing.ai', status: 'missing' }]);
+    assert.deepEqual(
+      initiallyMissing.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'Missing.ai', status: 'missing' }]
+    );
+    assert.match(initiallyMissing.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(initiallyMissing.materializable, false);
     assert.equal(initiallyMissing.token, undefined);
     assert.equal(JSON.stringify(initiallyMissing).includes(tmpRoot), false);
@@ -3234,7 +3301,11 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
     assert.equal(disappeared.error, 'package_review_changed');
     assert.equal(disappeared.review.materializable, false);
     assert.equal(disappeared.review.token, undefined);
-    assert.deepEqual(disappeared.review.files, [{ name: 'Missing.ai', status: 'missing' }]);
+    assert.deepEqual(
+      disappeared.review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'Missing.ai', status: 'missing' }]
+    );
+    assert.match(disappeared.review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal((await callIpcRaw('projects:package', project.id, outputDir, disappeared.review.token)).error, 'package_review_required');
     assert.deepEqual(fs.readdirSync(outputDir), []);
     const stillMissing = await callIpcRaw('projects:prepare-package-review', project.id);
@@ -3257,7 +3328,9 @@ test('unsupported virtual entries are reviewable by safe name but cannot issue a
   }] });
 
   const review = await callIpcRaw('projects:prepare-package-review', project.id);
-  assert.deepEqual(review.files, [{ name: 'Virtual.ai', status: 'unmaterializable' }]);
+  assert.deepEqual(review.files, [{
+    name: 'Virtual.ai', status: 'unmaterializable', visualIdentity: null, visualRevision: null,
+  }]);
   assert.equal(review.materializable, false);
   assert.equal(review.token, undefined);
   await callIpcRaw('projects:delete', project.id);
@@ -3973,7 +4046,11 @@ function assertFailedPackageHasNoSideEffects(project, outputDir, before) {
 function assertUnavailablePackageReview(review, fileName) {
   assert.equal(review.materializable, false);
   assert.equal(review.token, undefined);
-  assert.deepEqual(review.files, [{ name: fileName, status: 'unavailable' }]);
+  assert.deepEqual(
+    review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+    [{ name: fileName, status: 'unavailable' }]
+  );
+  assert.match(review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
 }
 
 function capturePackageSideEffects(project) {
@@ -7081,6 +7158,8 @@ test('first dependable source scan requires an existing-assets decision and bind
   try {
     const sourcePath = path.join(fixtureRoot, 'Existing Project.ai');
     const linkedPath = path.join(fixtureRoot, 'Existing Linked.png');
+    const outputDir = path.join(fixtureRoot, 'output');
+    fs.mkdirSync(outputDir);
     fs.writeFileSync(linkedPath, 'existing linked bytes');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
 
@@ -7129,6 +7208,103 @@ test('first dependable source scan requires an existing-assets decision and bind
     assert.deepEqual(
       includedReview.files.map(file => file.name).sort(),
       ['Existing Linked.png', 'Existing Project.ai']
+    );
+
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const linkedPresentation = workspace.files.find(file => file.name === 'Existing Linked.png');
+    const staleBeforeExclusion = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    await callIpcRaw('projects:remove-file', project.id, linkedPresentation.visualIdentity);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), true);
+    assert.equal(fresh.excludedAssetKeys.includes(linkedPath), true);
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputDir, staleBeforeExclusion.token)).error,
+      'package_review_stale'
+    );
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    const excludedWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(excludedWorkspace.files.find(file => file.name === 'Existing Linked.png').excluded, true);
+    const excludedReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(excludedReview.files.map(file => file.name), ['Existing Project.ai']);
+
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include')).success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), true);
+    assert.deepEqual(fresh.excludedAssetKeys, []);
+    const restoredReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(
+      restoredReview.files.map(file => file.name).sort(),
+      ['Existing Linked.png', 'Existing Project.ai']
+    );
+
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', project.id, 'skip')).success, true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), true);
+    assert.equal(fresh.excludedAssetKeys.includes(linkedPath), true);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('migrated legacy-included projects support Include All and Skip All with authoritative output selection', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-legacy-assets-decision-test-'));
+  try {
+    const makeLegacyProject = async name => {
+      const sourcePath = path.join(fixtureRoot, `${name}.ai`);
+      const assetPath = path.join(fixtureRoot, `${name}.png`);
+      const outputDir = path.join(fixtureRoot, `${name}-out`);
+      writeSyntheticAiFile(sourcePath);
+      fs.writeFileSync(assetPath, createSyntheticPngBytes());
+      fs.mkdirSync(outputDir);
+      const project = await createProject(name);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      stored.assetBaseline = {
+        schemaVersion: 1,
+        status: 'legacy-included',
+        decision: 'include',
+        establishedAt: stored.watchStartedAt || stored.createdAt,
+      };
+      stored.files = [
+        makePendingFile(sourcePath, 'manual-browse'),
+        makePendingFile(assetPath, 'scan-on-open'),
+      ];
+      stored.pendingFiles = [];
+      stored.excludedAssetKeys = [];
+      return { project, sourcePath, assetPath, outputDir };
+    };
+
+    const skipped = await makeLegacyProject('Legacy Skip');
+    const staleSkipReview = await callIpcRaw('projects:prepare-package-review', skipped.project.id, skipped.outputDir);
+    assert.equal(staleSkipReview.materializable, true);
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', skipped.project.id, 'skip')).success, true);
+    assert.equal(
+      (await callIpcRaw('projects:package', skipped.project.id, skipped.outputDir, staleSkipReview.token)).error,
+      'package_review_stale'
+    );
+    assert.deepEqual(fs.readdirSync(skipped.outputDir), []);
+    const skipReview = await callIpcRaw('projects:prepare-package-review', skipped.project.id, skipped.outputDir);
+    assert.deepEqual(skipReview.files.map(file => file.name), ['Legacy Skip.ai']);
+    const skipResult = await callIpcRaw('projects:package', skipped.project.id, skipped.outputDir, skipReview.token);
+    assert.equal(skipResult.success, true);
+    assert.deepEqual(fs.readdirSync(skipResult.folderPath), ['Legacy Skip.ai']);
+
+    const included = await makeLegacyProject('Legacy Include');
+    const staleIncludeReview = await callIpcRaw('projects:prepare-package-review', included.project.id, included.outputDir);
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', included.project.id, 'include')).success, true);
+    assert.equal(
+      (await callIpcRaw('projects:package', included.project.id, included.outputDir, staleIncludeReview.token)).error,
+      'package_review_stale'
+    );
+    const includeReview = await callIpcRaw('projects:prepare-package-review', included.project.id, included.outputDir);
+    assert.deepEqual(
+      includeReview.files.map(file => file.name).sort(),
+      ['Legacy Include.ai', 'Legacy Include.png']
+    );
+    const includeResult = await callIpcRaw('projects:package', included.project.id, included.outputDir, includeReview.token);
+    assert.equal(includeResult.success, true);
+    assert.deepEqual(
+      fs.readdirSync(includeResult.folderPath).sort(),
+      ['Legacy Include.ai', 'Legacy Include.png']
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -7476,12 +7652,313 @@ test('Added While Working assets stay included by default and per-file exclusion
   }
 });
 
+test('project file visuals resolve only owned identities, bound output size, and keep source files protected', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-file-visual-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Visual Project.ai');
+    const assetPath = path.join(fixtureRoot, 'Visual Asset.png');
+    writeSyntheticAiFile(sourcePath);
+    const rasterBytes = createSyntheticPngBytes(32, 24, 0x55);
+    fs.writeFileSync(assetPath, rasterBytes);
+
+    const project = await createProject('Project-owned file visuals');
+    manualDialogFor([sourcePath, assetPath]);
+    await callIpcRaw('projects:add-files', project.id);
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath) && item.files.some(file => file.path === assetPath)
+    );
+
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const sourcePresentation = workspace.files.find(file => file.name === 'Visual Project.ai');
+    const assetPresentation = workspace.files.find(file => file.name === 'Visual Asset.png');
+    assert.equal(sourcePresentation.protectedSource, true);
+    assert.equal(assetPresentation.protectedSource, false);
+    assert.match(assetPresentation.visualIdentity, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(assetPresentation.visualRevision, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(Object.hasOwn(assetPresentation, 'path'), false);
+
+    testNativeFileVisualImage = createTestNativeImage(64);
+    testNativeFileIconImage = createTestNativeImage(64);
+    const thumbnail = await callIpcRaw(
+      'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+    );
+    assert.equal(thumbnail.kind, 'thumbnail');
+    assert.match(thumbnail.dataUrl, /^data:image\/png;base64,/);
+    assert.ok(thumbnail.dataUrl.length < 140000);
+    assert.deepEqual(testLastNativeImageBuffer, rasterBytes);
+
+    testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
+    const icon = await callIpcRaw(
+      'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+    );
+    assert.equal(icon.kind, 'icon');
+    assert.match(icon.dataUrl, /^data:image\/png;base64,/);
+    assert.notEqual(testLastFileIconPath, assetPath);
+    assert.equal(testLastFileIconPath, path.join(path.parse(process.execPath).root, '.crate-file-type.png'));
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    const iconCategoryDir = path.join(TEST_HOME, '.crate', 'file-type-icons');
+    const movedIconCategoryDir = `${iconCategoryDir}-verified`;
+    const attackerIconCategoryDir = `${iconCategoryDir}-attacker`;
+    fs.mkdirSync(iconCategoryDir, { recursive: true });
+    fs.rmSync(movedIconCategoryDir, { recursive: true, force: true });
+    fs.rmSync(attackerIconCategoryDir, { recursive: true, force: true });
+    fs.renameSync(iconCategoryDir, movedIconCategoryDir);
+    fs.mkdirSync(attackerIconCategoryDir);
+    fs.symlinkSync(attackerIconCategoryDir, iconCategoryDir);
+    testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
+    const originalOpenSync = fs.openSync;
+    let writeOpenAttempts = 0;
+    try {
+      fs.openSync = (targetPath, flags, ...args) => {
+        if ((Number(flags) & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT)) !== 0) {
+          writeOpenAttempts += 1;
+        }
+        return originalOpenSync(targetPath, flags, ...args);
+      };
+      const swappedIcon = await callIpcRaw(
+        'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+      );
+      assert.equal(swappedIcon.kind, 'icon');
+      assert.equal(writeOpenAttempts, 0);
+      assert.deepEqual(fs.readdirSync(attackerIconCategoryDir), []);
+      assert.equal(testLastFileIconPath, path.join(path.parse(process.execPath).root, '.crate-file-type.png'));
+      assert.equal(fs.existsSync(testLastFileIconPath), false);
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.rmSync(iconCategoryDir, { recursive: true, force: true });
+      fs.renameSync(movedIconCategoryDir, iconCategoryDir);
+      fs.rmSync(attackerIconCategoryDir, { recursive: true, force: true });
+    }
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(9000, 1));
+    testNativeFileVisualImage = createTestNativeImage(64);
+    testLastNativeImageBuffer = null;
+    const oversizedDimensions = await callIpcRaw(
+      'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
+      (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
+    );
+    assert.equal(oversizedDimensions.kind, 'icon');
+    assert.equal(testLastNativeImageBuffer, null);
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(4001, 3000));
+    testLastNativeImageBuffer = null;
+    const oversizedPixels = await callIpcRaw(
+      'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
+      (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
+    );
+    assert.equal(oversizedPixels.kind, 'icon');
+    assert.equal(testLastNativeImageBuffer, null);
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    fs.writeFileSync(assetPath, rasterBytes);
+    const replacementPath = path.join(fixtureRoot, 'replacement.png');
+    fs.writeFileSync(replacementPath, createSyntheticPngBytes(16, 16, 0x33));
+    const originalReadSync = fs.readSync;
+    let swapped = false;
+    try {
+      fs.readSync = (...args) => {
+        const count = originalReadSync(...args);
+        if (!swapped) {
+          swapped = true;
+          fs.unlinkSync(assetPath);
+          fs.symlinkSync(replacementPath, assetPath);
+        }
+        return count;
+      };
+      testLastNativeImageBuffer = null;
+      const swappedResult = await callIpcRaw(
+        'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
+        (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
+      );
+      assert.equal(swappedResult.kind, 'icon');
+      assert.equal(testLastNativeImageBuffer, null);
+    } finally {
+      fs.readSync = originalReadSync;
+    }
+    fs.unlinkSync(assetPath);
+    fs.writeFileSync(assetPath, rasterBytes);
+
+    assert.deepEqual(
+      await callIpcRaw('projects:get-file-visual', project.id, assetPath, assetPresentation.visualRevision),
+      { error: 'not_found' }
+    );
+    assert.deepEqual(
+      await callIpcRaw('projects:get-file-visual', 'another-project', assetPresentation.visualIdentity, assetPresentation.visualRevision),
+      { error: 'not_found' }
+    );
+    assert.deepEqual(
+      await callIpcRaw(
+        'projects:get-file-visual', project.id, `${assetPresentation.visualIdentity}\0suffix`, assetPresentation.visualRevision
+      ),
+      { error: 'not_found' }
+    );
+
+    await callIpcRaw('projects:remove-file', project.id, sourcePresentation.visualIdentity);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.excludedAssetKeys.includes(sourcePath), false);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const reviewedSource = review.files.find(file => file.name === 'Visual Project.ai');
+    const reviewedAsset = review.files.find(file => file.name === 'Visual Asset.png');
+    assert.equal(reviewedSource.name, 'Visual Project.ai');
+    assert.equal(reviewedAsset.name, 'Visual Asset.png');
+  } finally {
+    testNativeFileVisualImage = null;
+    testNativeFileIconImage = null;
+    testBeforeFileIconResolve = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('raster thumbnail work uses a defensible byte and pixel bound with one bounded decode lane', async () => {
+  assert.deepEqual(metadataTestHooks.getFileVisualRasterLimits(), {
+    sourceBytes: 16 * 1024 * 1024,
+    dimension: 6000,
+    pixels: 12 * 1000 * 1000,
+    queue: 8,
+  });
+
+  let releaseWork;
+  const gate = new Promise(resolve => { releaseWork = resolve; });
+  let active = 0;
+  let maximumActive = 0;
+  let started = 0;
+  const work = () => metadataTestHooks.runSerializedFileVisualRasterWork(async () => {
+    started += 1;
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await gate;
+    active -= 1;
+    return 'decoded';
+  });
+
+  const accepted = Array.from({ length: 8 }, work);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(started, 1);
+  assert.equal(active, 1);
+  assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 8);
+  assert.equal(await work(), null);
+  assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 8);
+
+  releaseWork();
+  assert.deepEqual(await Promise.all(accepted), Array(8).fill('decoded'));
+  assert.equal(maximumActive, 1);
+  assert.equal(active, 0);
+  assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 0);
+});
+
+test('Package Review gives duplicate same-name files distinct opaque visuals bound to exact manifest sources', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-duplicate-review-visual-test-'));
+  try {
+    const firstDir = path.join(fixtureRoot, 'one');
+    const secondDir = path.join(fixtureRoot, 'two');
+    fs.mkdirSync(firstDir);
+    fs.mkdirSync(secondDir);
+    const firstPath = path.join(firstDir, 'Shared.png');
+    const secondPath = path.join(secondDir, 'Shared.png');
+    const firstBytes = createSyntheticPngBytes(20, 20, 0x31);
+    const secondBytes = createSyntheticPngBytes(24, 24, 0x32);
+    fs.writeFileSync(firstPath, firstBytes);
+    fs.writeFileSync(secondPath, secondBytes);
+    const project = await createProject('Duplicate review visuals');
+    await setProjectFiles(project.id, {
+      files: [
+        { ...makePendingFile(firstPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' },
+        { ...makePendingFile(secondPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' },
+      ],
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.files.length, 2);
+    assert.equal(new Set(review.files.map(file => file.visualIdentity)).size, 2);
+    for (const file of review.files) {
+      assert.match(file.visualIdentity, /^[A-Za-z0-9_-]{43}$/);
+      assert.equal(Object.hasOwn(file, 'path'), false);
+    }
+
+    testNativeFileVisualImage = createTestNativeImage(64);
+    await callIpcRaw(
+      'projects:get-file-visual', project.id, review.files[0].visualIdentity, review.files[0].visualRevision
+    );
+    const firstResolvedBytes = Buffer.from(testLastNativeImageBuffer);
+    await callIpcRaw(
+      'projects:get-file-visual', project.id, review.files[1].visualIdentity, review.files[1].visualRevision
+    );
+    const secondResolvedBytes = Buffer.from(testLastNativeImageBuffer);
+    assert.deepEqual(firstResolvedBytes, firstBytes);
+    assert.deepEqual(secondResolvedBytes, secondBytes);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Current Project and Package Review visual revisions change with source bytes and reject stale requests', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-visual-revision-test-'));
+  try {
+    const assetPath = path.join(fixtureRoot, 'Revision.png');
+    const firstBytes = createSyntheticPngBytes(20, 20, 0x21);
+    const secondBytes = createSyntheticPngBytes(20, 20, 0x22);
+    fs.writeFileSync(assetPath, firstBytes);
+    const project = await createProject('Visual revision');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.assetBaseline = {
+      schemaVersion: 1,
+      status: 'included',
+      decision: 'include',
+      establishedAt: stored.watchStartedAt || stored.createdAt,
+    };
+    stored.files = [{
+      ...makePendingFile(assetPath, 'manual-browse'),
+      assetOrigin: 'added',
+      projectRole: 'asset',
+    }];
+    stored.pendingFiles = [];
+
+    const firstWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const firstPresentation = firstWorkspace.files[0];
+    const firstReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(firstReview.files[0].visualRevision, firstPresentation.visualRevision);
+
+    fs.writeFileSync(assetPath, secondBytes);
+    const secondWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const secondPresentation = secondWorkspace.files[0];
+    assert.equal(secondPresentation.visualIdentity, firstPresentation.visualIdentity);
+    assert.notEqual(secondPresentation.visualRevision, firstPresentation.visualRevision);
+    assert.deepEqual(
+      await callIpcRaw(
+        'projects:get-file-visual', project.id, firstPresentation.visualIdentity, firstPresentation.visualRevision
+      ),
+      { error: 'stale_visual' }
+    );
+
+    testNativeFileVisualImage = createTestNativeImage(64);
+    const refreshedVisual = await callIpcRaw(
+      'projects:get-file-visual', project.id, secondPresentation.visualIdentity, secondPresentation.visualRevision
+    );
+    assert.equal(refreshedVisual.kind, 'thumbnail');
+    assert.deepEqual(testLastNativeImageBuffer, secondBytes);
+    const secondReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(secondReview.files[0].visualRevision, secondPresentation.visualRevision);
+    assert.notEqual(secondReview.files[0].visualRevision, firstReview.files[0].visualRevision);
+  } finally {
+    testNativeFileVisualImage = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('an explicitly added PDF establishes a dependable baseline without changing general PDF roles', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-pdf-baseline-test-'));
   try {
     const sourcePath = path.join(fixtureRoot, 'Existing Reference.pdf');
     const linkedPath = path.join(fixtureRoot, 'Existing PDF Link.png');
+    const linkedPdfPath = path.join(fixtureRoot, 'Supporting Reference.pdf');
     fs.writeFileSync(linkedPath, 'existing PDF dependency');
+    writeSyntheticPdfFile(linkedPdfPath);
     fs.writeFileSync(sourcePath, `permitted leading bytes\n%PDF-1.7\nsynthetic PDF link ${linkedPath}\n%%EOF\n`);
 
     const project = await createProject('PDF baseline source');
@@ -7495,6 +7972,29 @@ test('an explicitly added PDF establishes a dependable baseline without changing
     assert.equal(fresh.files.find(file => file.path === sourcePath).projectRole, 'asset');
     assert.equal(fresh.files.find(file => file.path === sourcePath).assetOrigin, 'added');
     assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files.push({
+      ...makePendingFile(linkedPdfPath, 'scan-on-open'),
+      assetOrigin: 'existing',
+      projectRole: 'asset',
+      captureEvidence: { sourceDocumentPath: sourcePath },
+    });
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const pdfSource = workspace.files.find(file => file.name === 'Existing Reference.pdf');
+    const linkedAsset = workspace.files.find(file => file.name === 'Existing PDF Link.png');
+    const linkedPdf = workspace.files.find(file => file.name === 'Supporting Reference.pdf');
+    assert.equal(pdfSource.projectRole, 'asset');
+    assert.equal(pdfSource.protectedSource, true);
+    assert.equal(linkedAsset.protectedSource, false);
+    assert.equal(linkedPdf.projectRole, 'asset');
+    assert.equal(linkedPdf.protectedSource, false);
+    await callIpcRaw('projects:remove-file', project.id, linkedPdf.visualIdentity);
+    let afterRemoval = await getProject(project.id);
+    assert.equal(afterRemoval.files.some(file => file.path === linkedPdfPath), true);
+    assert.equal(afterRemoval.excludedAssetKeys.includes(linkedPdfPath), true);
+    await callIpcRaw('projects:remove-file', project.id, pdfSource.visualIdentity);
+    afterRemoval = await getProject(project.id);
+    assert.equal(afterRemoval.files.some(file => file.path === sourcePath), true);
     const blockedReview = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(blockedReview.error, 'asset_baseline_decision_required');
   } finally {
@@ -7680,7 +8180,10 @@ test('removing a failed required source reconciles the baseline instead of block
     await callIpcRaw('projects:add-files', project.id);
     assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
 
-    await callIpcRaw('projects:remove-file', project.id, sourcePath);
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const failedSource = workspace.files.find(file => file.name === 'Failed Source.ai');
+    assert.equal(failedSource.protectedSource, true);
+    await callIpcRaw('projects:remove-file', project.id, failedSource.visualIdentity);
     const fresh = await getProject(project.id);
     assert.equal(fresh.files.some(file => file.path === sourcePath), false);
     assert.deepEqual(fresh.excludedAssetKeys, []);

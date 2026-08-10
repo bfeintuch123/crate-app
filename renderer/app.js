@@ -1,6 +1,5 @@
 // ===== Constants =====
 const MAX_PROJECTS = 7;
-const MAX_VISIBLE_FILES = 4;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
@@ -22,7 +21,8 @@ let state = {
   figmaSectionExpanded: false,
   figmaScanInFlight: false,
   lastFigmaWarning: null,
-  editFigmaProjectId: null
+  editFigmaProjectId: null,
+  assetWorkspace: null
 };
 
 let rendererEventListenersBound = false;
@@ -33,6 +33,7 @@ let upgradeModalOpener = null;
 let existingAssetsDecisionRequest = null;
 let existingAssetsModalProjectId = null;
 let existingAssetsDecisionOpener = null;
+let fileWorkspaceRenderRequestId = 0;
 
 function redactRendererPrivatePaths(value) {
   // Delimiters and line breaks may appear in filenames, so redact the value tail.
@@ -552,6 +553,7 @@ function updateNamingPreview() {
 
 // ===== Render Files =====
 async function renderFiles() {
+  const renderRequestId = ++fileWorkspaceRenderRequestId;
   const noProject = $('#files-no-project');
   const filesView = $('#files-view');
 
@@ -564,6 +566,7 @@ async function renderFiles() {
   }
 
   if (!state.selectedProjectId) {
+    setActiveFileVisualProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -572,11 +575,14 @@ async function renderFiles() {
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
+    setActiveFileVisualProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
     return;
   }
+
+  setActiveFileVisualProject(project.id);
 
   // Show empty state when project is packaged or not actively watching
   if (project.status === 'packaged') {
@@ -637,22 +643,54 @@ async function renderFiles() {
   }
 
   const excludedAssetKeys = new Set(project.excludedAssetKeys || []);
-  const visibleFiles = (project.files || []).filter(file => !excludedAssetKeys.has(getAssetReviewExclusionKey(file)));
   const visiblePendingFiles = (project.pendingFiles || []).filter(file => !excludedAssetKeys.has(getAssetReviewExclusionKey(file)));
+  let assetWorkspace = null;
+  if (typeof window.crate?.getAssetWorkspace === 'function') {
+    try {
+      assetWorkspace = await window.crate.getAssetWorkspace(project.id);
+    } catch (error) {
+      logRendererError('asset workspace unavailable', error);
+    }
+  }
+  if (renderRequestId !== fileWorkspaceRenderRequestId || state.selectedProjectId !== project.id) return;
+  if (!assetWorkspace || assetWorkspace.projectId !== project.id) {
+    assetWorkspace = {
+      projectId: project.id,
+      files: (project.files || []).map(file => ({
+        name: file.name,
+        ext: getFileExtension(file),
+        assetOrigin: file.assetOrigin,
+        projectRole: file.projectRole,
+        protectedSource: true,
+        excluded: excludedAssetKeys.has(getAssetReviewExclusionKey(file)),
+        visualIdentity: null,
+        visualRevision: null,
+      })),
+      pendingFiles: (project.pendingFiles || []).map(file => ({
+        name: file.name,
+        ext: getFileExtension(file),
+        protectedSource: true,
+        excluded: excludedAssetKeys.has(getAssetReviewExclusionKey(file)),
+        visualIdentity: null,
+        visualRevision: null,
+      })),
+    };
+  }
+  state.assetWorkspace = assetWorkspace;
 
   // Pending files (Tier 2)
-  renderPendingFiles(project);
+  renderPendingFiles(project, assetWorkspace.pendingFiles);
 
-  // File list
-  renderFileList(visibleFiles, {
+  // Persistent project asset workspace
+  renderAssetWorkspace(project, {
     hasActiveCandidates: visiblePendingFiles.length > 0,
-  });
+  }, assetWorkspace.files);
 
   // Package button — always enabled; click handler shows toast if no files
   const packageBtn = $('#btn-package');
   packageBtn.disabled = false;
 
-  syncExistingAssetsDecisionModal(project);
+  await syncExistingAssetsDecisionModal(project);
 }
 
 function getAssetReviewExclusionKey(file) {
@@ -663,11 +701,10 @@ function getAssetReviewExclusionKey(file) {
 
 function getExistingAssetsForDecision(project) {
   if (!project || typeof project !== 'object') return [];
-  const excluded = new Set(project.excludedAssetKeys || []);
-  return [...(project.files || []), ...(project.pendingFiles || [])].filter(file => {
-    const key = getAssetReviewExclusionKey(file);
-    return file && file.assetOrigin === 'existing' && file.projectRole === 'asset' && !excluded.has(key);
-  });
+  const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
+  return [...(workspace?.files || []), ...(workspace?.pendingFiles || [])].filter(file => (
+    file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.excluded !== true
+  ));
 }
 
 function getExistingAssetsDecisionFocusableElements() {
@@ -713,9 +750,25 @@ function hideExistingAssetsDecisionModal() {
   existingAssetsDecisionOpener = null;
 }
 
-function showExistingAssetsDecisionModal(project) {
+async function ensureProjectAssetWorkspace(project) {
+  if (!project || !project.id) return null;
+  if (state.assetWorkspace?.projectId === project.id) return state.assetWorkspace;
+  if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
+  try {
+    const workspace = await window.crate.getAssetWorkspace(project.id);
+    if (!workspace || workspace.projectId !== project.id) return null;
+    state.assetWorkspace = workspace;
+    return workspace;
+  } catch (error) {
+    logRendererError('asset workspace unavailable', error);
+    return null;
+  }
+}
+
+async function showExistingAssetsDecisionModal(project) {
   const modal = $('#modal-existing-assets');
   if (!modal || !project) return;
+  if (!await ensureProjectAssetWorkspace(project)) return;
   const assets = getExistingAssetsForDecision(project);
   if (assets.length === 0) return;
 
@@ -732,7 +785,10 @@ function showExistingAssetsDecisionModal(project) {
     const item = document.createElement('div');
     item.className = 'existing-assets-modal-item';
     item.setAttribute('role', 'listitem');
-    item.innerHTML = `<span class="app-file-icon">${getFileEmoji(getFileExtension(file))}</span><span>${escapeHtml(file.name || 'Untitled asset')}</span>`;
+    item.appendChild(createFileVisual(project.id, file));
+    const name = document.createElement('span');
+    name.textContent = file.name || 'Untitled asset';
+    item.appendChild(name);
     list.appendChild(item);
   }
   if (assets.length > 4) {
@@ -750,14 +806,14 @@ function showExistingAssetsDecisionModal(project) {
   ($('#btn-include-existing-assets') || modal).focus();
 }
 
-function syncExistingAssetsDecisionModal(project) {
+async function syncExistingAssetsDecisionModal(project) {
   const requiresDecision = project && project.assetBaseline && project.assetBaseline.status === 'decision-required';
   if (!requiresDecision) {
     if (existingAssetsModalProjectId) hideExistingAssetsDecisionModal();
     return;
   }
   if (existingAssetsModalProjectId === project.id && !$('#modal-existing-assets').classList.contains('hidden')) return;
-  showExistingAssetsDecisionModal(project);
+  await showExistingAssetsDecisionModal(project);
 }
 
 async function submitExistingAssetsDecision(decision) {
@@ -775,6 +831,7 @@ async function submitExistingAssetsDecision(decision) {
       return;
     }
     state.projects = await window.crate.getProjects();
+    invalidateFileVisualProject(projectId);
     if (existingAssetsModalProjectId === projectId) hideExistingAssetsDecisionModal();
     if (state.selectedProjectId === projectId && isFilesTabActive()) {
       await renderFiles();
@@ -795,63 +852,375 @@ async function submitExistingAssetsDecision(decision) {
   }
 }
 
-// v2.5.0: Track expanded state for file list
-let fileListExpanded = false;
+async function submitExistingAssetsBatchDecision(decision) {
+  const project = state.projects.find(item => item.id === state.selectedProjectId);
+  if (!project || !['include', 'skip'].includes(decision)) return false;
+  const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
+  buttons.forEach(button => { button.disabled = true; });
+  let renderedUpdatedState = false;
+  try {
+    const result = await window.crate.setExistingAssetsDecision(project.id, decision);
+    if (!result || result.success !== true) {
+      showToast('Crate could not update Existing Assets. Try again.');
+      return false;
+    }
+    state.projects = await window.crate.getProjects();
+    invalidateFileVisualProject(project.id);
+    await renderFiles();
+    renderedUpdatedState = true;
+    showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
+    return true;
+  } catch (error) {
+    logRendererError('existing assets batch decision failed', error);
+    showToast('Crate could not update Existing Assets. Try again.');
+    return false;
+  } finally {
+    if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
+  }
+}
 
+const FILE_VISUAL_DATA_URL_PATTERN = /^data:image\/png;base64,[A-Za-z0-9+/=]+$/;
+const FILE_VISUAL_MAX_DATA_URL_LENGTH = 140000;
+const FILE_VISUAL_CACHE_CAPACITY = 128;
+const FILE_VISUAL_CACHE_TTL_MS = 30000;
+const FILE_VISUAL_MAX_CONCURRENCY = 4;
+const FILE_VISUAL_MAX_QUEUE = 128;
+const fileVisualCache = new Map();
+const fileVisualInFlight = new Map();
+const fileVisualQueue = [];
+const fileVisualProjectEpochs = new Map();
+let fileVisualActiveRequests = 0;
+let fileVisualActiveProjectId = null;
+
+function getFileVisualIdentity(file) {
+  if (!file || typeof file !== 'object') return null;
+  return typeof file.visualIdentity === 'string' && file.visualIdentity ? file.visualIdentity : null;
+}
+
+function getFileVisualRevision(file) {
+  if (!file || typeof file !== 'object') return null;
+  return typeof file.visualRevision === 'string' && file.visualRevision ? file.visualRevision : null;
+}
+
+function getFileVisualFallbackLabel(file) {
+  const ext = getFileExtension(file).replace(/^\./, '').toUpperCase();
+  if (!ext) return 'FILE';
+  return ext.length > 5 ? ext.slice(0, 5) : ext;
+}
+
+function applyResolvedFileVisual(container, result) {
+  if (
+    !container ||
+    !result ||
+    !['thumbnail', 'icon'].includes(result.kind) ||
+    typeof result.dataUrl !== 'string' ||
+    result.dataUrl.length > FILE_VISUAL_MAX_DATA_URL_LENGTH ||
+    !FILE_VISUAL_DATA_URL_PATTERN.test(result.dataUrl)
+  ) return false;
+
+  const image = document.createElement('img');
+  image.className = 'file-visual-image';
+  image.alt = '';
+  image.setAttribute('aria-hidden', 'true');
+  image.src = result.dataUrl;
+  container.innerHTML = '';
+  container.appendChild(image);
+  container.classList.add(`is-${result.kind}`);
+  return true;
+}
+
+function normalizeFileVisualResult(result) {
+  if (
+    result && ['thumbnail', 'icon'].includes(result.kind) &&
+    typeof result.dataUrl === 'string' &&
+    result.dataUrl.length <= FILE_VISUAL_MAX_DATA_URL_LENGTH &&
+    FILE_VISUAL_DATA_URL_PATTERN.test(result.dataUrl)
+  ) return { kind: result.kind, dataUrl: result.dataUrl };
+  return { kind: 'fallback' };
+}
+
+function rememberFileVisual(cacheKey, projectId, result, now = Date.now()) {
+  fileVisualCache.delete(cacheKey);
+  fileVisualCache.set(cacheKey, { projectId, result, expiresAt: now + FILE_VISUAL_CACHE_TTL_MS });
+  while (fileVisualCache.size > FILE_VISUAL_CACHE_CAPACITY) {
+    const oldest = fileVisualCache.keys().next().value;
+    if (oldest === undefined) break;
+    fileVisualCache.delete(oldest);
+  }
+}
+
+function getFileVisualProjectEpoch(projectId) {
+  return fileVisualProjectEpochs.get(projectId) || 0;
+}
+
+function settleQueuedFileVisualTask(task, result = { kind: 'fallback' }) {
+  if (!task || task.settled) return;
+  task.settled = true;
+  if (fileVisualInFlight.get(task.cacheKey) === task.request) {
+    fileVisualInFlight.delete(task.cacheKey);
+  }
+  task.resolve(result);
+}
+
+function cancelQueuedFileVisualTasks(predicate) {
+  for (let index = fileVisualQueue.length - 1; index >= 0; index -= 1) {
+    const task = fileVisualQueue[index];
+    if (!predicate(task)) continue;
+    fileVisualQueue.splice(index, 1);
+    settleQueuedFileVisualTask(task);
+  }
+}
+
+function invalidateFileVisualProject(projectId) {
+  if (!projectId) return;
+  fileVisualProjectEpochs.set(projectId, getFileVisualProjectEpoch(projectId) + 1);
+  for (const [cacheKey, cached] of fileVisualCache) {
+    if (cached.projectId === projectId) fileVisualCache.delete(cacheKey);
+  }
+  cancelQueuedFileVisualTasks(task => task.projectId === projectId);
+}
+
+function setActiveFileVisualProject(projectId) {
+  const nextProjectId = typeof projectId === 'string' && projectId ? projectId : null;
+  if (fileVisualActiveProjectId === nextProjectId) return;
+  const previousProjectId = fileVisualActiveProjectId;
+  fileVisualActiveProjectId = nextProjectId;
+  if (previousProjectId) invalidateFileVisualProject(previousProjectId);
+  cancelQueuedFileVisualTasks(task => task.projectId !== nextProjectId);
+  pumpFileVisualQueue();
+}
+
+function takeNextFileVisualTask() {
+  if (fileVisualQueue.length === 0) return null;
+  const prioritizedIndex = fileVisualActiveProjectId
+    ? fileVisualQueue.findIndex(task => task.projectId === fileVisualActiveProjectId)
+    : -1;
+  return fileVisualQueue.splice(prioritizedIndex >= 0 ? prioritizedIndex : 0, 1)[0] || null;
+}
+
+function boundFileVisualQueue() {
+  while (fileVisualQueue.length >= FILE_VISUAL_MAX_QUEUE) {
+    let dropIndex = fileVisualQueue.findIndex(task => task.projectId !== fileVisualActiveProjectId);
+    if (dropIndex < 0) dropIndex = 0;
+    const [dropped] = fileVisualQueue.splice(dropIndex, 1);
+    settleQueuedFileVisualTask(dropped);
+  }
+}
+
+function pumpFileVisualQueue() {
+  while (fileVisualActiveRequests < FILE_VISUAL_MAX_CONCURRENCY && fileVisualQueue.length > 0) {
+    const task = takeNextFileVisualTask();
+    if (!task) return;
+    fileVisualActiveRequests += 1;
+    Promise.resolve()
+      .then(() => window.crate.getFileVisual(task.projectId, task.identity, task.revision))
+      .then(normalizeFileVisualResult)
+      .catch(error => {
+        logRendererError('file visual unavailable', error);
+        return { kind: 'fallback' };
+      })
+      .then(result => {
+        const current = task.epoch === getFileVisualProjectEpoch(task.projectId);
+        if (current) rememberFileVisual(task.cacheKey, task.projectId, result);
+        settleQueuedFileVisualTask(task, current ? result : { kind: 'fallback' });
+      })
+      .finally(() => {
+        fileVisualActiveRequests -= 1;
+        if (fileVisualInFlight.get(task.cacheKey) === task.request) {
+          fileVisualInFlight.delete(task.cacheKey);
+        }
+        pumpFileVisualQueue();
+      });
+  }
+}
+
+function requestFileVisual(projectId, identity, revision) {
+  if (!projectId || !identity || !revision || typeof window.crate?.getFileVisual !== 'function') {
+    return Promise.resolve({ kind: 'fallback' });
+  }
+  const cacheKey = JSON.stringify([projectId, identity, revision]);
+  const cached = fileVisualCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    fileVisualCache.delete(cacheKey);
+    fileVisualCache.set(cacheKey, cached);
+    return Promise.resolve(cached.result);
+  }
+  if (cached) fileVisualCache.delete(cacheKey);
+  if (fileVisualInFlight.has(cacheKey)) return fileVisualInFlight.get(cacheKey);
+  let resolveRequest;
+  const request = new Promise(resolve => { resolveRequest = resolve; });
+  const task = {
+    projectId,
+    identity,
+    revision,
+    cacheKey,
+    epoch: getFileVisualProjectEpoch(projectId),
+    request,
+    resolve: resolveRequest,
+    settled: false,
+  };
+  fileVisualInFlight.set(cacheKey, request);
+  boundFileVisualQueue();
+  fileVisualQueue.push(task);
+  pumpFileVisualQueue();
+  return request;
+}
+
+function createFileVisual(projectId, file) {
+  const container = document.createElement('span');
+  container.className = 'file-visual file-visual-fallback';
+  container.setAttribute('aria-hidden', 'true');
+  const identity = getFileVisualIdentity(file);
+  const revision = getFileVisualRevision(file);
+
+  const badge = document.createElement('span');
+  badge.className = 'file-visual-badge';
+  badge.textContent = getFileVisualFallbackLabel(file);
+  container.appendChild(badge);
+
+  if (!projectId || !identity || !revision) return container;
+  requestFileVisual(projectId, identity, revision).then(result => applyResolvedFileVisual(container, result));
+  return container;
+}
+
+function appendFileStatusBadge(row, label, className, title) {
+  const badge = document.createElement('span');
+  badge.className = `file-status-badge ${className}`;
+  badge.textContent = label;
+  if (title) badge.title = title;
+  row.appendChild(badge);
+}
+
+function createAssetFileRow(project, file, { excluded = false, protectedSource = false } = {}) {
+  const row = document.createElement('div');
+  row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}`;
+  row.setAttribute('role', 'listitem');
+  row.appendChild(createFileVisual(project && project.id, file));
+
+  const name = document.createElement('span');
+  name.className = 'app-file-name';
+  name.textContent = file && file.name ? file.name : 'Untitled file';
+  name.title = name.textContent;
+  row.appendChild(name);
+
+  if (file && file.embedded) {
+    appendFileStatusBadge(row, 'EMB', 'embedded', 'Embedded - extracted at package time');
+  } else if (file && file.linked === true) {
+    appendFileStatusBadge(row, 'LNK', 'linked', 'Linked file - confirmed path');
+  }
+  if (protectedSource) {
+    appendFileStatusBadge(row, 'Protected', 'protected', 'Project source files are always included');
+  } else if (excluded) {
+    appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
+  } else {
+    const removeButton = document.createElement('button');
+    const displayName = file && file.name ? file.name : 'this asset';
+    removeButton.type = 'button';
+    removeButton.className = 'app-file-remove';
+    removeButton.textContent = '\u00D7';
+    removeButton.title = `Exclude ${displayName}`;
+    removeButton.setAttribute('aria-label', `Exclude ${displayName} from this project`);
+    removeButton.addEventListener('click', async event => {
+      event.stopPropagation();
+      removeButton.disabled = true;
+      try {
+        await window.crate.removeFile(project.id, getFileVisualIdentity(file));
+        state.projects = await window.crate.getProjects();
+        invalidateFileVisualProject(project.id);
+        await renderFiles();
+      } catch (error) {
+        logRendererError('asset exclusion failed', error);
+        showToast('Crate could not exclude that asset. Try again.');
+        removeButton.disabled = false;
+      }
+    });
+    row.appendChild(removeButton);
+  }
+  return row;
+}
+
+function setAssetPanelCount(element, includedCount, totalCount = includedCount) {
+  if (!element) return;
+  element.textContent = includedCount === totalCount
+    ? `${includedCount}`
+    : `${includedCount} of ${totalCount}`;
+}
+
+function renderAssetPanelList(list, project, files, options = {}) {
+  if (!list) return;
+  list.innerHTML = '';
+  if (files.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'asset-panel-empty';
+    empty.textContent = options.emptyMessage || 'No assets in this group.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const file of files) {
+    list.appendChild(createAssetFileRow(project, file, {
+      excluded: file.excluded === true,
+      protectedSource: file.protectedSource === true || options.protectedSource === true,
+    }));
+  }
+}
+
+function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
+  if (!project) return;
+  const files = Array.isArray(presentedFiles) ? presentedFiles : (Array.isArray(project.files) ? project.files : []);
+  const sourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
+  const existingAssets = files.filter(file => (
+    file && file.protectedSource !== true && file.projectRole !== 'source' && file.assetOrigin === 'existing'
+  ));
+  const addedAssets = files.filter(file => (
+    file && file.protectedSource !== true && file.projectRole !== 'source' &&
+    file.assetOrigin !== 'existing' && file.excluded !== true
+  ));
+
+  renderAssetPanelList($('#project-file-list'), project, sourceFiles, {
+    protectedSource: true,
+    emptyMessage: 'Add a project file to begin.',
+  });
+  renderAssetPanelList($('#existing-assets-list'), project, existingAssets, {
+    emptyMessage: 'No existing assets found.',
+  });
+  renderAssetPanelList($('#added-assets-list'), project, addedAssets, {
+    emptyMessage: options.hasActiveCandidates
+      ? 'No package-ready assets yet. Review the files Crate observed.'
+      : 'New package-ready assets will appear here as you work.',
+  });
+
+  setAssetPanelCount($('#project-file-count'), sourceFiles.length);
+  const includedExistingCount = existingAssets.filter(file => file.excluded !== true).length;
+  setAssetPanelCount($('#existing-assets-count'), includedExistingCount, existingAssets.length);
+  setAssetPanelCount($('#added-assets-count'), addedAssets.length);
+
+  $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
+  const includeAll = $('#btn-include-all-existing');
+  const skipAll = $('#btn-skip-all-existing');
+  if (includeAll) includeAll.disabled = existingAssets.length === 0 || includedExistingCount === existingAssets.length;
+  if (skipAll) skipAll.disabled = existingAssets.length === 0 || includedExistingCount === 0;
+}
+
+// Compatibility helper retained for focused renderer tests and non-project empty states.
 function renderFileList(files, options = {}) {
   const container = $('#file-list');
+  if (!container) return;
   container.innerHTML = '';
-
-  if (files.length === 0) {
+  if (!Array.isArray(files) || files.length === 0) {
     const message = options.hasActiveCandidates
       ? 'No package-ready files yet. Review the files Crate observed during this session.'
       : 'No files tracked yet. Files will appear as you work.';
     container.innerHTML = `<div class="files-empty">${escapeHtml(message)}</div>`;
     return;
   }
-
-  const previewFiles = files.slice(0, MAX_VISIBLE_FILES);
-  const hasMore = files.length > MAX_VISIBLE_FILES;
-
-  // Render preview files (always visible)
-  for (const file of previewFiles) {
-    container.appendChild(createFileRow(file));
-  }
-
-  if (hasMore) {
-    // Expand/collapse toggle
-    const toggle = document.createElement('div');
-    toggle.className = 'file-list-toggle';
-    toggle.innerHTML = fileListExpanded
-      ? `<span class="file-list-toggle-icon">\u25B4</span> Hide files`
-      : `<span class="file-list-toggle-icon">\u25BE</span> Show all ${files.length} files`;
-    toggle.addEventListener('click', () => {
-      fileListExpanded = !fileListExpanded;
-      // M2: Re-fetch current files from state instead of closing over stale `files` array
-      const project = state.projects.find(p => p.id === state.selectedProjectId);
-      const excluded = new Set(project && project.excludedAssetKeys || []);
-      const currentFiles = project
-        ? (project.files || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)))
-        : files;
-      const hasActiveCandidates = !!(project && (project.pendingFiles || []).some(file => (
-        !excluded.has(getAssetReviewExclusionKey(file))
-      )));
-      renderFileList(currentFiles, {
-        hasActiveCandidates,
-      });
-    });
-    container.appendChild(toggle);
-
-    // Expanded drawer
-    if (fileListExpanded) {
-      const drawer = document.createElement('div');
-      drawer.className = 'file-list-drawer';
-      for (const file of files.slice(MAX_VISIBLE_FILES)) {
-        drawer.appendChild(createFileRow(file));
-      }
-      container.appendChild(drawer);
-    }
-  }
+  const project = state.projects.find(item => item.id === state.selectedProjectId) || {
+    id: state.selectedProjectId,
+    files,
+    excludedAssetKeys: [],
+  };
+  for (const file of files) container.appendChild(createAssetFileRow(project, file, {
+    protectedSource: file?.protectedSource === true || file?.projectRole === 'source',
+  }));
 }
 
 const PENDING_APP_LABELS = {
@@ -894,41 +1263,25 @@ function getPendingFileReason(file) {
 }
 
 function createFileRow(file) {
-  const row = document.createElement('div');
-  row.className = 'app-file';
-  const emoji = getFileEmoji(file.ext);
-  const statusBadge = file.embedded
-    ? '<span class="file-status-badge embedded" title="Embedded — extracted at package time">EMB</span>'
-    : (file.source && file.source.includes('linked')
-      ? '<span class="file-status-badge linked" title="Linked file — confirmed path">LNK</span>'
-      : '');
-
-  row.innerHTML = `
-    <span class="app-file-icon">${emoji}</span>
-    <span class="app-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
-    ${statusBadge}
-    <button class="app-file-remove" title="Remove">&times;</button>
-  `;
-
-  const removeBtn = row.querySelector('.app-file-remove');
-  removeBtn.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    await window.crate.removeFile(state.selectedProjectId, file.fileId || file.path);
-    state.projects = await window.crate.getProjects();
-    renderFiles();
+  const project = state.projects.find(item => item.id === state.selectedProjectId) || {
+    id: state.selectedProjectId,
+  };
+  return createAssetFileRow(project, file, {
+    protectedSource: file && (file.protectedSource === true || file.projectRole === 'source'),
   });
-
-  return row;
 }
 
 // ===== Render Pending (Tier 2) Files =====
-function renderPendingFiles(project) {
+function renderPendingFiles(project, presentedPendingFiles = null) {
   const section = $('#pending-section');
   const list = $('#pending-file-list');
   if (!section || !list) return;
 
   const excluded = new Set(project.excludedAssetKeys || []);
   const pending = (project.pendingFiles || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)));
+  const presentations = Array.isArray(presentedPendingFiles)
+    ? presentedPendingFiles.filter(file => file.excluded !== true)
+    : [];
 
   if (pending.length === 0) {
     section.classList.add('hidden');
@@ -938,60 +1291,70 @@ function renderPendingFiles(project) {
   section.classList.remove('hidden');
   list.innerHTML = '';
 
-  for (const file of pending) {
+  for (const [index, rawFile] of pending.entries()) {
+    const presentation = presentations[index];
+    const file = presentation && presentation.name === rawFile.name
+      ? { ...rawFile, ...presentation }
+      : { ...rawFile, protectedSource: true, visualIdentity: null };
     const row = document.createElement('div');
     row.className = 'pending-file';
+    row.setAttribute('role', 'listitem');
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
       ? 'Needs save'
       : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs review');
 
-    row.innerHTML = `
-      <span class="app-file-icon">${getFileEmoji(file.ext)}</span>
-      <span class="pending-file-copy">
-        <span class="app-file-name pending-file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span>
-        <span class="pending-file-reason">${escapeHtml(reason)}</span>
-      </span>
-      <span class="pending-state-badge">${escapeHtml(stateLabel)}</span>
-      <div class="pending-actions">
-        <button class="btn-accept-pending" data-path="${escapeHtml(file.path)}" title="Add to project">+ Add</button>
-        <button class="btn-reject-pending" data-path="${escapeHtml(file.path)}" title="Skip this file">Skip</button>
-      </div>
-    `;
+    row.appendChild(createFileVisual(project.id, file));
+    const copy = document.createElement('span');
+    copy.className = 'pending-file-copy';
+    const name = document.createElement('span');
+    name.className = 'app-file-name pending-file-name';
+    name.textContent = file.name || 'Untitled file';
+    name.title = name.textContent;
+    const reasonElement = document.createElement('span');
+    reasonElement.className = 'pending-file-reason';
+    reasonElement.textContent = reason;
+    copy.appendChild(name);
+    copy.appendChild(reasonElement);
+    row.appendChild(copy);
 
-    row.querySelector('.btn-accept-pending').addEventListener('click', async () => {
-      await window.crate.acceptPending(project.id, file.path);
+    const stateBadge = document.createElement('span');
+    stateBadge.className = 'pending-state-badge';
+    stateBadge.textContent = stateLabel;
+    row.appendChild(stateBadge);
+
+    const actions = document.createElement('div');
+    actions.className = 'pending-actions';
+    const acceptButton = document.createElement('button');
+    acceptButton.type = 'button';
+    acceptButton.className = 'btn-accept-pending';
+    acceptButton.textContent = '+ Add';
+    acceptButton.title = `Add ${file.name || 'this file'} to the project`;
+    acceptButton.setAttribute('aria-label', acceptButton.title);
+    const rejectButton = document.createElement('button');
+    rejectButton.type = 'button';
+    rejectButton.className = 'btn-reject-pending';
+    rejectButton.textContent = 'Skip';
+    rejectButton.title = `Skip ${file.name || 'this file'}`;
+    rejectButton.setAttribute('aria-label', rejectButton.title);
+    actions.appendChild(acceptButton);
+    actions.appendChild(rejectButton);
+    row.appendChild(actions);
+
+    acceptButton.addEventListener('click', async () => {
+      await window.crate.acceptPending(project.id, getFileVisualIdentity(file) || rawFile.path);
       state.projects = await window.crate.getProjects();
       renderFiles();
     });
 
-    row.querySelector('.btn-reject-pending').addEventListener('click', async () => {
-      await window.crate.rejectPending(project.id, file.path);
+    rejectButton.addEventListener('click', async () => {
+      await window.crate.rejectPending(project.id, getFileVisualIdentity(file) || rawFile.path);
       state.projects = await window.crate.getProjects();
       renderFiles();
     });
 
     list.appendChild(row);
   }
-}
-
-function getFileEmoji(ext) {
-  const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.tiff', '.bmp', '.ico'];
-  const designExts = ['.psd', '.ai', '.sketch', '.fig', '.xd', '.indd', '.eps', '.afdesign'];
-  const pdfExts = ['.pdf'];
-  const docExts = ['.doc', '.docx', '.txt', '.rtf', '.pages', '.odt'];
-  const fontExts = ['.otf', '.ttf', '.woff', '.woff2'];
-  const videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.webm'];
-  const audioExts = ['.mp3', '.wav', '.aac', '.flac', '.ogg'];
-
-  if (imageExts.includes(ext)) return '\uD83D\uDDBC';
-  if (designExts.includes(ext)) return '\uD83D\uDDBC';
-  if (pdfExts.includes(ext)) return '\uD83D\uDCC4';
-  if (docExts.includes(ext)) return '\uD83D\uDCC4';
-  if (fontExts.includes(ext)) return '\uD83D\uDD24';
-  if (videoExts.includes(ext)) return '\uD83C\uDFAC';
-  if (audioExts.includes(ext)) return '\uD83C\uDFB5';
-  return '\uD83D\uDCCE';
 }
 
 // ===== Render Settings =====
@@ -1330,6 +1693,7 @@ function handlePackageReviewKeydown(event) {
 }
 
 function renderPackageReview(project, review, message = '') {
+  setActiveFileVisualProject(project && project.id);
   const canPackage = review.materializable !== false && typeof review.token === 'string';
   state.packageReviewToken = canPackage ? review.token : null;
 
@@ -1371,8 +1735,11 @@ function renderPackageReview(project, review, message = '') {
   for (const file of visibleFiles) {
     const item = document.createElement('div');
     item.className = 'modal-file-item';
-    const emoji = getFileEmoji(file.ext);
-    item.innerHTML = `<span>${emoji}</span>&nbsp;&nbsp;<span>${escapeHtml(file.name)}</span>`;
+    item.appendChild(createFileVisual(project.id, file));
+    const name = document.createElement('span');
+    name.className = 'modal-file-name';
+    name.textContent = file.name || 'Unavailable file';
+    item.appendChild(name);
     fileListEl.appendChild(item);
   }
 
@@ -1401,6 +1768,9 @@ function createUnavailableRendererReview(project, message) {
     projectId: project?.id || state.selectedProjectId,
     files: (project?.files || []).map(file => ({
       name: typeof file?.name === 'string' && file.name ? file.name : 'Unavailable file',
+      ext: getFileExtension(file),
+      visualIdentity: null,
+      visualRevision: null,
       status: 'unavailable',
     })),
     totalFiles: Array.isArray(project?.files) ? project.files.length : 0,
@@ -1479,7 +1849,7 @@ async function showPackageModal({
         project = state.projects.find(item => item.id === projectId) || project;
         hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
         if (project?.assetBaseline?.status === 'decision-required') {
-          showExistingAssetsDecisionModal(project);
+          await showExistingAssetsDecisionModal(project);
           return false;
         }
       }
@@ -1735,7 +2105,7 @@ function setupEventListeners() {
 
     const project = state.projects.find(p => p.id === projectId);
     if (project && project.assetBaseline && project.assetBaseline.status === 'decision-required') {
-      showExistingAssetsDecisionModal(project);
+      await showExistingAssetsDecisionModal(project);
       return;
     }
     if (!project || project.files.length === 0) {
@@ -1758,6 +2128,8 @@ function setupEventListeners() {
 
   $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include'));
   $('#btn-skip-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('skip'));
+  $('#btn-include-all-existing').addEventListener('click', () => submitExistingAssetsBatchDecision('include'));
+  $('#btn-skip-all-existing').addEventListener('click', () => submitExistingAssetsBatchDecision('skip'));
 
   $('#btn-change-dest').addEventListener('click', async () => {
     const folder = await window.crate.selectOutputFolder();
@@ -2085,6 +2457,7 @@ function setupMainProcessListeners() {
 
   // File updates from watcher
   window.crate.onFilesUpdated((data) => {
+    invalidateFileVisualProject(data.projectId);
     window.crate.getProjects().then(projects => {
       state.projects = projects;
       if (state.selectedProjectId === data.projectId && isFilesTabActive()) {
@@ -2096,6 +2469,7 @@ function setupMainProcessListeners() {
 
   // Project updated (e.g. from notification action)
   window.crate.onProjectUpdated(async (data) => {
+    invalidateFileVisualProject(data.projectId);
     state.projects = await window.crate.getProjects();
     renderProjects();
     if (state.selectedProjectId === data.projectId && isFilesTabActive()) {
@@ -2105,6 +2479,7 @@ function setupMainProcessListeners() {
 
   // Tier 2 pending files updated from main process
   window.crate.onPendingFilesUpdated((data) => {
+    invalidateFileVisualProject(data.projectId);
     window.crate.getProjects().then(projects => {
       state.projects = projects;
       if (state.selectedProjectId === data.projectId) {
@@ -2123,7 +2498,7 @@ function setupMainProcessListeners() {
       }
       state.selectedProjectId = data.projectId;
       if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
-        showExistingAssetsDecisionModal(project);
+        await showExistingAssetsDecisionModal(project);
         return;
       }
       await showPackageModal();
