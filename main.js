@@ -1989,6 +1989,19 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
     };
   }
 
+  if (isAssetReviewFileExcluded(project, fileEntry)) {
+    const reason = 'user-excluded-asset';
+    return {
+      decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED,
+      reason,
+      captureReason: reason,
+      captureState: LIVE_CAPTURE_STATES.IGNORED,
+      normalizedPath,
+      evidence,
+      evidenceSummary: getPrivacySafeLiveEvidenceSummary(evidence, LIVE_CAPTURE_STATES.IGNORED, reason),
+    };
+  }
+
   const candidateKey = getTrackedFileDedupKey(fileEntry);
   const acceptedKeys = getTrackedFileKeySet(project.files);
   const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
@@ -11358,17 +11371,36 @@ registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, proje
 });
 
 registerTrustedIpcHandler('projects:remove-file', (event, projectId, fileIdOrPath) => {
+  let removed = false;
   const result = mutateProject(projectId, (project) => {
     // C2: Use fileId for removal when available (embedded files share the parent PSD path).
     // Fall back to path match for non-embedded files.
+    const removedFile = project.files.find(f => {
+      if (f.fileId && f.fileId === fileIdOrPath) return true;
+      return !f.fileId && f.path === fileIdOrPath;
+    });
+    if (removedFile && inferProjectFileRole(removedFile) === 'asset') {
+      const exclusionKey = getAssetReviewExclusionKey(removedFile);
+      if (exclusionKey) {
+        project.excludedAssetKeys = [...new Set([
+          ...(project.excludedAssetKeys || []),
+          exclusionKey,
+        ])];
+      }
+    }
     project.files = project.files.filter(f => {
       if (f.fileId && f.fileId === fileIdOrPath) return false;
       if (!f.fileId && f.path === fileIdOrPath) return false;
       return true;
     });
+    removed = !!removedFile;
     return project.files;
   });
-  if (result) reconcileProjectAssetBaselineScanSources(projectId);
+  if (result && removed) {
+    reconcileProjectAssetBaselineScanSources(projectId);
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
   const project = getProjects().find(item => item.id === projectId);
   return project ? getIllustratorScopedProjectView(project).files : [];
 });
