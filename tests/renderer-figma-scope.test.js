@@ -1804,6 +1804,15 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
 });
 
+test('renderer security policy permits only local and bounded data URL file visuals', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const policy = html.match(/http-equiv="Content-Security-Policy" content="([^"]+)"/)?.[1] || '';
+
+  assert.match(policy, /default-src 'self';/);
+  assert.match(policy, /img-src 'self' data:;/);
+  assert.equal(/(?:script-src|connect-src)[^;]*data:/.test(policy), false);
+});
+
 test('responsive shell keeps navigation aligned and Settings surface scroll-complete', () => {
   const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
 
