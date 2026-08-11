@@ -136,6 +136,7 @@ let testNativeFileIconImage = null;
 let testLastNativeImageBuffer = null;
 let testLastNativeThumbnailPath = null;
 let testLastNativeThumbnailSize = null;
+let testLastNativeThumbnailBytes = null;
 let testNativeThumbnailCalls = 0;
 let testNativeCreateFromBufferCalls = 0;
 let testBeforeNativeThumbnailResolve = null;
@@ -252,6 +253,11 @@ setStub('electron', () => ({
       testNativeThumbnailCalls += 1;
       testLastNativeThumbnailPath = filePath;
       testLastNativeThumbnailSize = size;
+      try {
+        testLastNativeThumbnailBytes = fs.readFileSync(filePath);
+      } catch (_) {
+        testLastNativeThumbnailBytes = null;
+      }
       if (typeof testBeforeNativeThumbnailResolve === 'function') {
         await testBeforeNativeThumbnailResolve(filePath, size);
       }
@@ -2092,6 +2098,7 @@ test.afterEach(async () => {
   testLastNativeImageBuffer = null;
   testLastNativeThumbnailPath = null;
   testLastNativeThumbnailSize = null;
+  testLastNativeThumbnailBytes = null;
   testNativeThumbnailCalls = 0;
   testNativeCreateFromBufferCalls = 0;
   testBeforeNativeThumbnailResolve = null;
@@ -7701,20 +7708,38 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.match(assetPresentation.visualRevision, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(Object.hasOwn(assetPresentation, 'path'), false);
 
+    const originalLstatSync = fs.lstatSync;
+    let synchronousRasterRevisionStats = 0;
+    try {
+      fs.lstatSync = (targetPath, ...args) => {
+        if (targetPath === assetPath) synchronousRasterRevisionStats += 1;
+        return originalLstatSync(targetPath, ...args);
+      };
+      await callIpcRaw('projects:get-asset-workspace', project.id);
+    } finally {
+      fs.lstatSync = originalLstatSync;
+    }
+    assert.equal(synchronousRasterRevisionStats, 0);
+
     testNativeFileVisualImage = createTestNativeImage(64);
     testNativeFileIconImage = createTestNativeImage(64);
     const originalOpenSyncForThumbnail = fs.openSync;
     const originalReadSyncForThumbnail = fs.readSync;
     let synchronousSourceReads = 0;
+    const synchronousSourceFds = new Set();
     let thumbnail;
     try {
       fs.openSync = (targetPath, ...args) => {
-        if (targetPath === assetPath) synchronousSourceReads += 1;
-        return originalOpenSyncForThumbnail(targetPath, ...args);
+        const fd = originalOpenSyncForThumbnail(targetPath, ...args);
+        if (targetPath === assetPath) {
+          synchronousSourceReads += 1;
+          synchronousSourceFds.add(fd);
+        }
+        return fd;
       };
-      fs.readSync = (...args) => {
-        synchronousSourceReads += 1;
-        return originalReadSyncForThumbnail(...args);
+      fs.readSync = (fd, ...args) => {
+        if (synchronousSourceFds.has(fd)) synchronousSourceReads += 1;
+        return originalReadSyncForThumbnail(fd, ...args);
       };
       thumbnail = await callIpcRaw(
         'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
@@ -7728,14 +7753,44 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.ok(thumbnail.dataUrl.length < 140000);
     assert.equal(synchronousSourceReads, 0);
     assert.equal(testNativeCreateFromBufferCalls, 0);
-    assert.equal(testLastNativeThumbnailPath, assetPath);
+    assert.notEqual(testLastNativeThumbnailPath, assetPath);
+    assert.match(path.basename(path.dirname(testLastNativeThumbnailPath)), /^crate-file-visual-/);
+    assert.deepEqual(testLastNativeThumbnailBytes, rasterBytes);
+    assert.equal(fs.existsSync(testLastNativeThumbnailPath), false);
+    assert.equal(fs.existsSync(path.dirname(testLastNativeThumbnailPath)), false);
     assert.deepEqual(testLastNativeThumbnailSize, { width: 48, height: 48 });
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    const snapshotDirectoriesBeforeCaptureFailure = fs.readdirSync(os.tmpdir())
+      .filter(name => name.startsWith('crate-file-visual-'))
+      .sort();
+    const originalRealpath = fs.promises.realpath;
+    fs.promises.realpath = async function failSnapshotDirectoryCapture(targetPath, ...args) {
+      if (path.basename(String(targetPath)).startsWith('crate-file-visual-')) {
+        throw new Error('synthetic snapshot directory capture failure');
+      }
+      return originalRealpath.call(fs.promises, targetPath, ...args);
+    };
+    try {
+      const captureFailure = await callIpcRaw(
+        'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+      );
+      assert.equal(captureFailure.kind, 'icon');
+    } finally {
+      fs.promises.realpath = originalRealpath;
+    }
+    assert.deepEqual(
+      fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('crate-file-visual-')).sort(),
+      snapshotDirectoriesBeforeCaptureFailure
+    );
 
     let releaseSlowThumbnail;
     let reportSlowThumbnailStarted;
     const slowThumbnailStarted = new Promise(resolve => { reportSlowThumbnailStarted = resolve; });
     const slowThumbnailGate = new Promise(resolve => { releaseSlowThumbnail = resolve; });
-    testBeforeNativeThumbnailResolve = async () => {
+    let slowSnapshotPath = null;
+    testBeforeNativeThumbnailResolve = async (snapshotPath) => {
+      slowSnapshotPath = snapshotPath;
       reportSlowThumbnailStarted();
       await slowThumbnailGate;
     };
@@ -7753,6 +7808,8 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.equal(unrelatedFiles.some(file => file.name === 'Visual Project.ai'), true);
     releaseSlowThumbnail();
     assert.equal((await slowThumbnail).kind, 'thumbnail');
+    assert.equal(fs.existsSync(slowSnapshotPath), false);
+    assert.equal(fs.existsSync(path.dirname(slowSnapshotPath)), false);
     testBeforeNativeThumbnailResolve = null;
 
     testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
@@ -7822,11 +7879,16 @@ test('project file visuals resolve only owned identities, bound output size, and
 
     metadataTestHooks.clearFileVisualTypeIconCache();
     fs.writeFileSync(assetPath, rasterBytes);
-    const replacementPath = path.join(fixtureRoot, 'replacement.png');
-    fs.writeFileSync(replacementPath, createSyntheticPngBytes(16, 16, 0x33));
-    testBeforeNativeThumbnailResolve = async () => {
+    const originalDuringAbaPath = path.join(fixtureRoot, 'Visual Asset original.png');
+    const replacementBytes = createSyntheticPngBytes(16, 16, 0x33);
+    let abaSnapshotPath = null;
+    testBeforeNativeThumbnailResolve = async (snapshotPath) => {
+      abaSnapshotPath = snapshotPath;
+      assert.deepEqual(fs.readFileSync(snapshotPath), rasterBytes);
+      fs.renameSync(assetPath, originalDuringAbaPath);
+      fs.writeFileSync(assetPath, replacementBytes);
       fs.unlinkSync(assetPath);
-      fs.symlinkSync(replacementPath, assetPath);
+      fs.renameSync(originalDuringAbaPath, assetPath);
     };
     try {
       const swappedResult = await callIpcRaw(
@@ -7834,12 +7896,54 @@ test('project file visuals resolve only owned identities, bound output size, and
         (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
       );
       assert.equal(swappedResult.kind, 'icon');
-      assert.equal(testLastNativeThumbnailPath, assetPath);
+      assert.notEqual(testLastNativeThumbnailPath, assetPath);
+      assert.deepEqual(testLastNativeThumbnailBytes, rasterBytes);
+      assert.equal(fs.existsSync(abaSnapshotPath), false);
+      assert.equal(fs.existsSync(path.dirname(abaSnapshotPath)), false);
     } finally {
       testBeforeNativeThumbnailResolve = null;
     }
-    fs.unlinkSync(assetPath);
-    fs.writeFileSync(assetPath, rasterBytes);
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    const beforeMidFlightMutation = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const midFlightPresentation = beforeMidFlightMutation.files.find(file => file.name === 'Visual Asset.png');
+    let changedSnapshotPath = null;
+    testBeforeNativeThumbnailResolve = async (snapshotPath) => {
+      changedSnapshotPath = snapshotPath;
+      fs.writeFileSync(assetPath, replacementBytes);
+    };
+    try {
+      const changedResult = await callIpcRaw(
+        'projects:get-file-visual', project.id,
+        midFlightPresentation.visualIdentity, midFlightPresentation.visualRevision
+      );
+      assert.equal(changedResult.kind, 'icon');
+      assert.equal(fs.existsSync(changedSnapshotPath), false);
+      assert.equal(fs.existsSync(path.dirname(changedSnapshotPath)), false);
+    } finally {
+      testBeforeNativeThumbnailResolve = null;
+      fs.writeFileSync(assetPath, rasterBytes);
+    }
+
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    const beforeDecodeFailure = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const failurePresentation = beforeDecodeFailure.files.find(file => file.name === 'Visual Asset.png');
+    let failedSnapshotPath = null;
+    testBeforeNativeThumbnailResolve = async (snapshotPath) => {
+      failedSnapshotPath = snapshotPath;
+      throw new Error('synthetic thumbnail failure');
+    };
+    try {
+      const failedResult = await callIpcRaw(
+        'projects:get-file-visual', project.id,
+        failurePresentation.visualIdentity, failurePresentation.visualRevision
+      );
+      assert.equal(failedResult.kind, 'icon');
+      assert.equal(fs.existsSync(failedSnapshotPath), false);
+      assert.equal(fs.existsSync(path.dirname(failedSnapshotPath)), false);
+    } finally {
+      testBeforeNativeThumbnailResolve = null;
+    }
 
     assert.deepEqual(
       await callIpcRaw('projects:get-file-visual', project.id, assetPath, assetPresentation.visualRevision),
@@ -7946,12 +8050,19 @@ test('Package Review gives duplicate same-name files distinct opaque visuals bou
       'projects:get-file-visual', project.id, review.files[0].visualIdentity, review.files[0].visualRevision
     );
     const firstResolvedPath = testLastNativeThumbnailPath;
+    const firstResolvedBytes = testLastNativeThumbnailBytes;
     await callIpcRaw(
       'projects:get-file-visual', project.id, review.files[1].visualIdentity, review.files[1].visualRevision
     );
     const secondResolvedPath = testLastNativeThumbnailPath;
-    assert.equal(firstResolvedPath, firstPath);
-    assert.equal(secondResolvedPath, secondPath);
+    const secondResolvedBytes = testLastNativeThumbnailBytes;
+    assert.notEqual(firstResolvedPath, firstPath);
+    assert.notEqual(secondResolvedPath, secondPath);
+    assert.notEqual(firstResolvedPath, secondResolvedPath);
+    assert.deepEqual(firstResolvedBytes, firstBytes);
+    assert.deepEqual(secondResolvedBytes, secondBytes);
+    assert.equal(fs.existsSync(firstResolvedPath), false);
+    assert.equal(fs.existsSync(secondResolvedPath), false);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -8001,7 +8112,9 @@ test('Current Project and Package Review visual revisions change with source byt
       'projects:get-file-visual', project.id, secondPresentation.visualIdentity, secondPresentation.visualRevision
     );
     assert.equal(refreshedVisual.kind, 'thumbnail');
-    assert.equal(testLastNativeThumbnailPath, assetPath);
+    assert.notEqual(testLastNativeThumbnailPath, assetPath);
+    assert.deepEqual(testLastNativeThumbnailBytes, secondBytes);
+    assert.equal(fs.existsSync(testLastNativeThumbnailPath), false);
     assert.equal(testNativeCreateFromBufferCalls, 0);
     const secondReview = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(secondReview.files[0].visualRevision, secondPresentation.visualRevision);
@@ -8231,7 +8344,7 @@ test('failed first source parsing keeps the baseline unresolved and Package Revi
   }
 });
 
-test('removing a failed required source reconciles the baseline instead of blocking forever', async () => {
+test('failed-source recovery survives persisted reload for the same physical file and reconciles the baseline', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-remove-failed-baseline-source-test-'));
   try {
     const sourcePath = path.join(fixtureRoot, 'Failed Source.ai');
@@ -8241,11 +8354,21 @@ test('removing a failed required source reconciles the baseline instead of block
     await callIpcRaw('projects:add-files', project.id);
     const failedProject = await getProject(project.id);
     assert.equal(failedProject.assetBaseline.status, 'awaiting-first-scan');
-    assert.equal(failedProject.assetBaseline.failedRequiredSourceKeys.length, 1);
+    assert.equal(failedProject.assetBaseline.failedRequiredSources.length, 1);
+    assert.deepEqual(Object.keys(failedProject.assetBaseline.failedRequiredSources[0]).sort(), [
+      'physicalIdentityHash',
+      'schemaVersion',
+      'sourceKeyHash',
+    ]);
+    assert.equal(failedProject.assetBaseline.failedRequiredSources[0].schemaVersion, 1);
+    assert.match(failedProject.assetBaseline.failedRequiredSources[0].sourceKeyHash, /^[a-f0-9]{64}$/);
+    assert.match(failedProject.assetBaseline.failedRequiredSources[0].physicalIdentityHash, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(failedProject.assetBaseline).includes(sourcePath), false);
 
-    // Simulate a main-process restart: only persisted project state survives.
+    // Simulate save/reload and a main-process restart: only persisted project state survives.
+    storeInstance.set('projects', JSON.parse(JSON.stringify(storeInstance.get('projects', []))));
     metadataTestHooks.clearAssetBaselineScans();
-    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSourceKeys.length, 1);
+    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSources.length, 1);
 
     const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
     const failedSource = workspace.files.find(file => file.name === 'Failed Source.ai');
@@ -8285,6 +8408,42 @@ test('removing a failed required source reconciles the baseline instead of block
   }
 });
 
+test('same-path physical replacement does not inherit failed-source removal eligibility', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-replaced-failed-source-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Replaced Failed Source.ai');
+    const originalPath = path.join(fixtureRoot, 'Original Failed Source.ai');
+    fs.writeFileSync(sourcePath, 'malformed Illustrator bytes');
+    const project = await createProject('Reject replaced failed source recovery');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const failed = await getProject(project.id);
+    assert.equal(failed.assetBaseline.failedRequiredSources.length, 1);
+
+    storeInstance.set('projects', JSON.parse(JSON.stringify(storeInstance.get('projects', []))));
+    metadataTestHooks.clearAssetBaselineScans();
+    fs.renameSync(sourcePath, originalPath);
+    fs.writeFileSync(sourcePath, 'different malformed Illustrator bytes');
+
+    let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    let source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
+    assert.equal(source.protectedSource, true);
+    assert.equal(source.sourceRecoveryAllowed, false);
+    await callIpcRaw('projects:remove-file', project.id, source.visualIdentity);
+    assert.equal((await getProject(project.id)).files.some(file => file.path === sourcePath), true);
+
+    fs.unlinkSync(sourcePath);
+    fs.renameSync(originalPath, sourcePath);
+    storeInstance.set('projects', JSON.parse(JSON.stringify(storeInstance.get('projects', []))));
+    metadataTestHooks.clearAssetBaselineScans();
+    workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
+    assert.equal(source.sourceRecoveryAllowed, true);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('successful first-scan retry clears persisted source recovery eligibility across restart', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-clear-failed-baseline-source-test-'));
   try {
@@ -8293,7 +8452,7 @@ test('successful first-scan retry clears persisted source recovery eligibility a
     const project = await createProject('Clear persisted failed source recovery');
     manualDialogFor([sourcePath]);
     await callIpcRaw('projects:add-files', project.id);
-    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSourceKeys.length, 1);
+    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSources.length, 1);
 
     metadataTestHooks.clearAssetBaselineScans();
     writeSyntheticAiFile(sourcePath);
@@ -8303,7 +8462,7 @@ test('successful first-scan retry clears persisted source recovery eligibility a
       project.id,
       item => item.assetBaseline && item.assetBaseline.status === 'empty'
     );
-    assert.equal(Object.hasOwn(settled.assetBaseline, 'failedRequiredSourceKeys'), false);
+    assert.equal(Object.hasOwn(settled.assetBaseline, 'failedRequiredSources'), false);
 
     metadataTestHooks.clearAssetBaselineScans();
     const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
@@ -8325,19 +8484,27 @@ test('malformed and future failed-source recovery state never makes a source rem
   try {
     writeSyntheticAiFile(sourcePath);
     for (const [name, baseline] of [
-      ['malformed keys', {
+      ['malformed records', {
         schemaVersion: 1,
         status: 'awaiting-first-scan',
         decision: null,
         establishedAt: null,
-        failedRequiredSourceKeys: ['not-a-hash', null, 'a'.repeat(64)],
+        failedRequiredSources: [
+          null,
+          { schemaVersion: 1, sourceKeyHash: 'not-a-hash', physicalIdentityHash: 'b'.repeat(64) },
+          { schemaVersion: 1, sourceKeyHash: 'a'.repeat(64), physicalIdentityHash: 'not-a-hash' },
+        ],
       }],
       ['future schema', {
         schemaVersion: 2,
         status: 'awaiting-first-scan',
         decision: null,
         establishedAt: null,
-        failedRequiredSourceKeys: ['a'.repeat(64)],
+        failedRequiredSources: [{
+          schemaVersion: 2,
+          sourceKeyHash: 'a'.repeat(64),
+          physicalIdentityHash: 'b'.repeat(64),
+        }],
       }],
     ]) {
       const project = await createProject(`Failed source state ${name}`);
@@ -8354,7 +8521,7 @@ test('malformed and future failed-source recovery state never makes a source rem
       metadataTestHooks.clearAssetBaselineScans();
 
       const fresh = await getProject(project.id);
-      assert.equal(Object.hasOwn(fresh.assetBaseline, 'failedRequiredSourceKeys'), false, name);
+      assert.equal(Object.hasOwn(fresh.assetBaseline, 'failedRequiredSources'), false, name);
       const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
       const source = workspace.files.find(file => file.name === path.basename(sourcePath));
       assert.equal(source.protectedSource, true, name);
