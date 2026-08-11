@@ -1091,9 +1091,47 @@ function appendFileStatusBadge(row, label, className, title) {
   row.appendChild(badge);
 }
 
-function createAssetFileRow(project, file, { excluded = false, protectedSource = false } = {}) {
+function appendAssetFileRemovalAction(row, project, file, { recovery = false } = {}) {
+  const removeButton = document.createElement('button');
+  const displayName = file && file.name ? file.name : 'this asset';
+  removeButton.type = 'button';
+  removeButton.className = recovery ? 'app-file-recovery' : 'app-file-remove';
+  removeButton.textContent = recovery ? 'Remove' : '\u00D7';
+  removeButton.title = recovery
+    ? `Remove ${displayName} after its first scan failed`
+    : `Exclude ${displayName}`;
+  removeButton.setAttribute(
+    'aria-label',
+    recovery
+      ? `Remove ${displayName} and recover this project from the failed first scan`
+      : `Exclude ${displayName} from this project`
+  );
+  removeButton.addEventListener('click', async event => {
+    event.stopPropagation();
+    removeButton.disabled = true;
+    try {
+      await window.crate.removeFile(project.id, getFileVisualIdentity(file));
+      state.projects = await window.crate.getProjects();
+      invalidateFileVisualProject(project.id);
+      await renderFiles();
+    } catch (error) {
+      logRendererError(recovery ? 'source recovery failed' : 'asset exclusion failed', error);
+      showToast(recovery
+        ? 'Crate could not remove that failed source. Try again.'
+        : 'Crate could not exclude that asset. Try again.');
+      removeButton.disabled = false;
+    }
+  });
+  row.appendChild(removeButton);
+}
+
+function createAssetFileRow(
+  project,
+  file,
+  { excluded = false, protectedSource = false, sourceRecoveryAllowed = false } = {}
+) {
   const row = document.createElement('div');
-  row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}`;
+  row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
   row.setAttribute('role', 'listitem');
   row.appendChild(createFileVisual(project && project.id, file));
 
@@ -1108,33 +1146,15 @@ function createAssetFileRow(project, file, { excluded = false, protectedSource =
   } else if (file && file.linked === true) {
     appendFileStatusBadge(row, 'LNK', 'linked', 'Linked file - confirmed path');
   }
-  if (protectedSource) {
+  if (protectedSource && sourceRecoveryAllowed) {
+    appendFileStatusBadge(row, 'Scan failed', 'recovery', 'Remove this source to recover the project, then add a valid project file');
+    appendAssetFileRemovalAction(row, project, file, { recovery: true });
+  } else if (protectedSource) {
     appendFileStatusBadge(row, 'Protected', 'protected', 'Project source files are always included');
   } else if (excluded) {
     appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
   } else {
-    const removeButton = document.createElement('button');
-    const displayName = file && file.name ? file.name : 'this asset';
-    removeButton.type = 'button';
-    removeButton.className = 'app-file-remove';
-    removeButton.textContent = '\u00D7';
-    removeButton.title = `Exclude ${displayName}`;
-    removeButton.setAttribute('aria-label', `Exclude ${displayName} from this project`);
-    removeButton.addEventListener('click', async event => {
-      event.stopPropagation();
-      removeButton.disabled = true;
-      try {
-        await window.crate.removeFile(project.id, getFileVisualIdentity(file));
-        state.projects = await window.crate.getProjects();
-        invalidateFileVisualProject(project.id);
-        await renderFiles();
-      } catch (error) {
-        logRendererError('asset exclusion failed', error);
-        showToast('Crate could not exclude that asset. Try again.');
-        removeButton.disabled = false;
-      }
-    });
-    row.appendChild(removeButton);
+    appendAssetFileRemovalAction(row, project, file);
   }
   return row;
 }
@@ -1160,6 +1180,7 @@ function renderAssetPanelList(list, project, files, options = {}) {
     list.appendChild(createAssetFileRow(project, file, {
       excluded: file.excluded === true,
       protectedSource: file.protectedSource === true || options.protectedSource === true,
+      sourceRecoveryAllowed: file.sourceRecoveryAllowed === true,
     }));
   }
 }

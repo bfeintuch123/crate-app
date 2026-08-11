@@ -134,6 +134,11 @@ let testAppVersion = packageJson.version;
 let testNativeFileVisualImage = null;
 let testNativeFileIconImage = null;
 let testLastNativeImageBuffer = null;
+let testLastNativeThumbnailPath = null;
+let testLastNativeThumbnailSize = null;
+let testNativeThumbnailCalls = 0;
+let testNativeCreateFromBufferCalls = 0;
+let testBeforeNativeThumbnailResolve = null;
 let testLastFileIconPath = null;
 let testBeforeFileIconResolve = null;
 let testBrowserWindowCreateCount = 0;
@@ -239,7 +244,17 @@ setStub('electron', () => ({
   nativeImage: {
     createFromPath: () => testNativeFileVisualImage || ({ resize: () => ({}) }),
     createFromBuffer: buffer => {
+      testNativeCreateFromBufferCalls += 1;
       testLastNativeImageBuffer = Buffer.from(buffer);
+      return testNativeFileVisualImage || ({ resize: () => ({}) });
+    },
+    createThumbnailFromPath: async (filePath, size) => {
+      testNativeThumbnailCalls += 1;
+      testLastNativeThumbnailPath = filePath;
+      testLastNativeThumbnailSize = size;
+      if (typeof testBeforeNativeThumbnailResolve === 'function') {
+        await testBeforeNativeThumbnailResolve(filePath, size);
+      }
       return testNativeFileVisualImage || ({ resize: () => ({}) });
     },
     createEmpty: () => ({}),
@@ -2072,6 +2087,11 @@ test.afterEach(async () => {
   testNativeFileVisualImage = null;
   testNativeFileIconImage = null;
   testLastNativeImageBuffer = null;
+  testLastNativeThumbnailPath = null;
+  testLastNativeThumbnailSize = null;
+  testNativeThumbnailCalls = 0;
+  testNativeCreateFromBufferCalls = 0;
+  testBeforeNativeThumbnailResolve = null;
   testLastFileIconPath = null;
   metadataTestHooks.clearFileVisualTypeIconCache();
   clearTrackedTimers();
@@ -7680,13 +7700,57 @@ test('project file visuals resolve only owned identities, bound output size, and
 
     testNativeFileVisualImage = createTestNativeImage(64);
     testNativeFileIconImage = createTestNativeImage(64);
-    const thumbnail = await callIpcRaw(
-      'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
-    );
+    const originalOpenSyncForThumbnail = fs.openSync;
+    const originalReadSyncForThumbnail = fs.readSync;
+    let synchronousSourceReads = 0;
+    let thumbnail;
+    try {
+      fs.openSync = (targetPath, ...args) => {
+        if (targetPath === assetPath) synchronousSourceReads += 1;
+        return originalOpenSyncForThumbnail(targetPath, ...args);
+      };
+      fs.readSync = (...args) => {
+        synchronousSourceReads += 1;
+        return originalReadSyncForThumbnail(...args);
+      };
+      thumbnail = await callIpcRaw(
+        'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+      );
+    } finally {
+      fs.openSync = originalOpenSyncForThumbnail;
+      fs.readSync = originalReadSyncForThumbnail;
+    }
     assert.equal(thumbnail.kind, 'thumbnail');
     assert.match(thumbnail.dataUrl, /^data:image\/png;base64,/);
     assert.ok(thumbnail.dataUrl.length < 140000);
-    assert.deepEqual(testLastNativeImageBuffer, rasterBytes);
+    assert.equal(synchronousSourceReads, 0);
+    assert.equal(testNativeCreateFromBufferCalls, 0);
+    assert.equal(testLastNativeThumbnailPath, assetPath);
+    assert.deepEqual(testLastNativeThumbnailSize, { width: 48, height: 48 });
+
+    let releaseSlowThumbnail;
+    let reportSlowThumbnailStarted;
+    const slowThumbnailStarted = new Promise(resolve => { reportSlowThumbnailStarted = resolve; });
+    const slowThumbnailGate = new Promise(resolve => { releaseSlowThumbnail = resolve; });
+    testBeforeNativeThumbnailResolve = async () => {
+      reportSlowThumbnailStarted();
+      await slowThumbnailGate;
+    };
+    const slowThumbnail = callIpcRaw(
+      'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
+    );
+    await slowThumbnailStarted;
+    let unrelatedTurnCompleted = false;
+    await new Promise(resolve => setImmediate(() => {
+      unrelatedTurnCompleted = true;
+      resolve();
+    }));
+    const unrelatedFiles = await callIpcRaw('projects:get-files', project.id);
+    assert.equal(unrelatedTurnCompleted, true);
+    assert.equal(unrelatedFiles.some(file => file.name === 'Visual Project.ai'), true);
+    releaseSlowThumbnail();
+    assert.equal((await slowThumbnail).kind, 'thumbnail');
+    testBeforeNativeThumbnailResolve = null;
 
     testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
     const icon = await callIpcRaw(
@@ -7735,49 +7799,41 @@ test('project file visuals resolve only owned identities, bound output size, and
     metadataTestHooks.clearFileVisualTypeIconCache();
     fs.writeFileSync(assetPath, createSyntheticPngBytes(9000, 1));
     testNativeFileVisualImage = createTestNativeImage(64);
-    testLastNativeImageBuffer = null;
+    const thumbnailCallsBeforeOversizedDimensions = testNativeThumbnailCalls;
     const oversizedDimensions = await callIpcRaw(
       'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
       (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
     );
     assert.equal(oversizedDimensions.kind, 'icon');
-    assert.equal(testLastNativeImageBuffer, null);
+    assert.equal(testNativeThumbnailCalls, thumbnailCallsBeforeOversizedDimensions);
 
     metadataTestHooks.clearFileVisualTypeIconCache();
     fs.writeFileSync(assetPath, createSyntheticPngBytes(4001, 3000));
-    testLastNativeImageBuffer = null;
+    const thumbnailCallsBeforeOversizedPixels = testNativeThumbnailCalls;
     const oversizedPixels = await callIpcRaw(
       'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
       (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
     );
     assert.equal(oversizedPixels.kind, 'icon');
-    assert.equal(testLastNativeImageBuffer, null);
+    assert.equal(testNativeThumbnailCalls, thumbnailCallsBeforeOversizedPixels);
 
     metadataTestHooks.clearFileVisualTypeIconCache();
     fs.writeFileSync(assetPath, rasterBytes);
     const replacementPath = path.join(fixtureRoot, 'replacement.png');
     fs.writeFileSync(replacementPath, createSyntheticPngBytes(16, 16, 0x33));
-    const originalReadSync = fs.readSync;
-    let swapped = false;
+    testBeforeNativeThumbnailResolve = async () => {
+      fs.unlinkSync(assetPath);
+      fs.symlinkSync(replacementPath, assetPath);
+    };
     try {
-      fs.readSync = (...args) => {
-        const count = originalReadSync(...args);
-        if (!swapped) {
-          swapped = true;
-          fs.unlinkSync(assetPath);
-          fs.symlinkSync(replacementPath, assetPath);
-        }
-        return count;
-      };
-      testLastNativeImageBuffer = null;
       const swappedResult = await callIpcRaw(
         'projects:get-file-visual', project.id, assetPresentation.visualIdentity,
         (await callIpcRaw('projects:get-asset-workspace', project.id)).files.find(file => file.name === 'Visual Asset.png').visualRevision
       );
       assert.equal(swappedResult.kind, 'icon');
-      assert.equal(testLastNativeImageBuffer, null);
+      assert.equal(testLastNativeThumbnailPath, assetPath);
     } finally {
-      fs.readSync = originalReadSync;
+      testBeforeNativeThumbnailResolve = null;
     }
     fs.unlinkSync(assetPath);
     fs.writeFileSync(assetPath, rasterBytes);
@@ -7811,6 +7867,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     testNativeFileVisualImage = null;
     testNativeFileIconImage = null;
     testBeforeFileIconResolve = null;
+    testBeforeNativeThumbnailResolve = null;
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
@@ -7885,13 +7942,13 @@ test('Package Review gives duplicate same-name files distinct opaque visuals bou
     await callIpcRaw(
       'projects:get-file-visual', project.id, review.files[0].visualIdentity, review.files[0].visualRevision
     );
-    const firstResolvedBytes = Buffer.from(testLastNativeImageBuffer);
+    const firstResolvedPath = testLastNativeThumbnailPath;
     await callIpcRaw(
       'projects:get-file-visual', project.id, review.files[1].visualIdentity, review.files[1].visualRevision
     );
-    const secondResolvedBytes = Buffer.from(testLastNativeImageBuffer);
-    assert.deepEqual(firstResolvedBytes, firstBytes);
-    assert.deepEqual(secondResolvedBytes, secondBytes);
+    const secondResolvedPath = testLastNativeThumbnailPath;
+    assert.equal(firstResolvedPath, firstPath);
+    assert.equal(secondResolvedPath, secondPath);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -7941,7 +7998,8 @@ test('Current Project and Package Review visual revisions change with source byt
       'projects:get-file-visual', project.id, secondPresentation.visualIdentity, secondPresentation.visualRevision
     );
     assert.equal(refreshedVisual.kind, 'thumbnail');
-    assert.deepEqual(testLastNativeImageBuffer, secondBytes);
+    assert.equal(testLastNativeThumbnailPath, assetPath);
+    assert.equal(testNativeCreateFromBufferCalls, 0);
     const secondReview = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(secondReview.files[0].visualRevision, secondPresentation.visualRevision);
     assert.notEqual(secondReview.files[0].visualRevision, firstReview.files[0].visualRevision);
@@ -8183,6 +8241,7 @@ test('removing a failed required source reconciles the baseline instead of block
     const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
     const failedSource = workspace.files.find(file => file.name === 'Failed Source.ai');
     assert.equal(failedSource.protectedSource, true);
+    assert.equal(failedSource.sourceRecoveryAllowed, true);
     await callIpcRaw('projects:remove-file', project.id, failedSource.visualIdentity);
     const fresh = await getProject(project.id);
     assert.equal(fresh.files.some(file => file.path === sourcePath), false);
@@ -8191,6 +8250,26 @@ test('removing a failed required source reconciles the baseline instead of block
     assert.notEqual(
       (await callIpcRaw('projects:prepare-package-review', project.id)).error,
       'asset_baseline_scan_incomplete'
+    );
+
+    const healthySourcePath = path.join(fixtureRoot, 'Healthy Source.ai');
+    writeSyntheticAiFile(healthySourcePath);
+    const healthyProject = await createProject('Healthy protected baseline source');
+    manualDialogFor([healthySourcePath]);
+    await callIpcRaw('projects:add-files', healthyProject.id);
+    const healthy = await waitForProject(
+      healthyProject.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+    assert.equal(healthy.files.some(file => file.path === healthySourcePath), true);
+    const healthyWorkspace = await callIpcRaw('projects:get-asset-workspace', healthyProject.id);
+    const healthySource = healthyWorkspace.files.find(file => file.name === 'Healthy Source.ai');
+    assert.equal(healthySource.protectedSource, true);
+    assert.equal(healthySource.sourceRecoveryAllowed, false);
+    await callIpcRaw('projects:remove-file', healthyProject.id, healthySource.visualIdentity);
+    assert.equal(
+      (await getProject(healthyProject.id)).files.some(file => file.path === healthySourcePath),
+      true
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });

@@ -2964,6 +2964,7 @@ function getAssetReviewExclusionKey(file) {
 const FILE_VISUAL_PIXEL_SIZE = 48;
 const FILE_VISUAL_MAX_PNG_BYTES = 96 * 1024;
 const FILE_VISUAL_MAX_RASTER_SOURCE_BYTES = 16 * 1024 * 1024;
+const FILE_VISUAL_MAX_RASTER_HEADER_BYTES = 256 * 1024;
 const FILE_VISUAL_MAX_RASTER_DIMENSION = 6000;
 const FILE_VISUAL_MAX_RASTER_PIXELS = 12 * 1000 * 1000;
 const FILE_VISUAL_MAX_RASTER_QUEUE = 8;
@@ -3031,6 +3032,7 @@ function createRendererFilePresentation(project, file) {
     assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
     projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
     protectedSource: isProjectAssetBaselineSource(file),
+    sourceRecoveryAllowed: isFailedRequiredAssetBaselineSource(project, file),
     excluded: isAssetReviewFileExcluded(project, file),
     visualIdentity: createProjectFileVisualIdentity(project.id, file),
     visualRevision: createProjectFileVisualRevision(project.id, file),
@@ -3144,33 +3146,36 @@ function sameOpenFileStat(before, after) {
   );
 }
 
-function readStableRasterBytes(sourcePath) {
+async function openPreflightedRasterSource(sourcePath) {
   const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
-  let fd = null;
+  let handle = null;
   try {
-    fd = fs.openSync(sourcePath, fs.constants.O_RDONLY | noFollow);
-    const before = fs.fstatSync(fd, { bigint: true });
+    handle = await fs.promises.open(sourcePath, fs.constants.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
     if (
       !before.isFile() || before.nlink !== 1n || before.size <= 0n ||
       before.size > BigInt(FILE_VISUAL_MAX_RASTER_SOURCE_BYTES)
     ) return null;
-    const buffer = Buffer.allocUnsafe(Number(before.size));
+    const buffer = Buffer.allocUnsafe(Math.min(Number(before.size), FILE_VISUAL_MAX_RASTER_HEADER_BYTES));
     let offset = 0;
     while (offset < buffer.length) {
-      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
       if (bytesRead <= 0) return null;
       offset += bytesRead;
     }
-    const after = fs.fstatSync(fd, { bigint: true });
+    const after = await handle.stat({ bigint: true });
     if (!sameOpenFileStat(before, after)) return null;
-    const pathStat = fs.lstatSync(sourcePath, { bigint: true });
+    const pathStat = await fs.promises.lstat(sourcePath, { bigint: true });
     if (pathStat.isSymbolicLink() || !sameOpenFileStat(after, pathStat)) return null;
-    return getSafeRasterDimensions(buffer) ? buffer : null;
+    if (!getSafeRasterDimensions(buffer)) return null;
+    const result = { handle, sourceStat: after };
+    handle = null;
+    return result;
   } catch (_) {
     return null;
   } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch (_) {}
+    if (handle) {
+      try { await handle.close(); } catch (_) {}
     }
   }
 }
@@ -3260,13 +3265,26 @@ function runSerializedFileVisualRasterWork(task) {
 }
 
 function getBoundedRasterThumbnail(sourcePath) {
-  return runSerializedFileVisualRasterWork(() => {
-    const bytes = readStableRasterBytes(sourcePath);
-    if (!bytes) return null;
+  return runSerializedFileVisualRasterWork(async () => {
+    const source = await openPreflightedRasterSource(sourcePath);
+    if (!source) return null;
     try {
-      return encodeBoundedFileVisual(nativeImage.createFromBuffer(bytes));
+      const thumbnail = await nativeImage.createThumbnailFromPath(sourcePath, {
+        width: FILE_VISUAL_PIXEL_SIZE,
+        height: FILE_VISUAL_PIXEL_SIZE,
+      });
+      const descriptorStat = await source.handle.stat({ bigint: true });
+      const pathStat = await fs.promises.lstat(sourcePath, { bigint: true });
+      if (
+        pathStat.isSymbolicLink() ||
+        !sameOpenFileStat(source.sourceStat, descriptorStat) ||
+        !sameOpenFileStat(descriptorStat, pathStat)
+      ) return null;
+      return encodeBoundedFileVisual(thumbnail);
     } catch (_) {
       return null;
+    } finally {
+      try { await source.handle.close(); } catch (_) {}
     }
   });
 }
@@ -3282,7 +3300,7 @@ async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevisi
   if (
     FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext) &&
     typeof file.path === 'string' && path.isAbsolute(file.path) &&
-    typeof nativeImage.createFromBuffer === 'function'
+    typeof nativeImage.createThumbnailFromPath === 'function'
   ) {
     const dataUrl = await getBoundedRasterThumbnail(file.path);
     if (dataUrl) return { kind: 'thumbnail', dataUrl };

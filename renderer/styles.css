@@ -697,7 +697,8 @@ body {
 }
 
 .asset-batch-button:focus-visible,
-.app-file-remove:focus-visible {
+.app-file-remove:focus-visible,
+.app-file-recovery:focus-visible {
   outline: 2px solid var(--black);
   outline-offset: 2px;
 }
@@ -810,6 +811,29 @@ body {
   background: #fef2f2;
 }
 
+.app-file-recovery {
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid #f1b7b7;
+  border-radius: 5px;
+  background: #fff7f7;
+  color: #9f1d1d;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.app-file-recovery:hover:not(:disabled) {
+  border-color: var(--red);
+  background: #fef2f2;
+}
+
+.app-file-recovery:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .file-status-badge.protected {
   color: var(--gray-600);
   background: var(--gray-100);
@@ -820,6 +844,12 @@ body {
   color: var(--gray-500);
   background: var(--gray-50);
   border: 1px solid var(--gray-200);
+}
+
+.file-status-badge.recovery {
+  color: #9f1d1d;
+  background: #fff7f7;
+  border: 1px solid #f1b7b7;
 }
 
 .app-file-divider {

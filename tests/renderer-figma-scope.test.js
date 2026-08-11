@@ -938,6 +938,71 @@ test('per-file Existing Asset exclusion keeps the row available for Include All 
   assert.equal(elements['btn-skip-all-existing'].disabled, true);
 });
 
+test('failed first-scan sources expose accessible recovery while healthy sources remain protected', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const failedSource = {
+    name: 'Failed Source.ai', ext: '.ai', assetOrigin: null, projectRole: 'source',
+    protectedSource: true, sourceRecoveryAllowed: true,
+    visualIdentity: 'failed-source-identity', visualRevision: 'failed-source-revision',
+  };
+  const project = {
+    id: 'failed-source-recovery',
+    name: 'Failed source recovery',
+    type: 'branding',
+    status: 'watching',
+    files: [failedSource],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'awaiting-first-scan', decision: null, establishedAt: null },
+  };
+  const recoveredProject = {
+    ...project,
+    files: [],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 2 },
+  };
+  const removals = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async (...args) => { removals.push(args); },
+    getProjects: async () => [recoveredProject],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: [], pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+
+  const failedRow = elements['project-file-list'].children[0];
+  const recoveryButton = failedRow.children.find(child => child.className === 'app-file-recovery');
+  assert.equal(getElementTreeText(failedRow).includes('Scan failed'), true);
+  assert.equal(recoveryButton.textContent, 'Remove');
+  assert.equal(
+    recoveryButton.getAttribute('aria-label'),
+    'Remove Failed Source.ai and recover this project from the failed first scan'
+  );
+  recoveryButton.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(removals, [[project.id, failedSource.visualIdentity]]);
+  assert.equal(elements['project-file-list'].children[0].className, 'asset-panel-empty');
+
+  const healthySource = {
+    ...failedSource,
+    name: 'Healthy Source.ai',
+    sourceRecoveryAllowed: false,
+    visualIdentity: 'healthy-source-identity',
+    visualRevision: 'healthy-source-revision',
+  };
+  const healthyProject = {
+    ...project,
+    id: 'healthy-source-protection',
+    files: [healthySource],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 3 },
+  };
+  renderer.renderAssetWorkspace(healthyProject, {}, healthyProject.files);
+  const healthyRow = elements['project-file-list'].children[0];
+  assert.equal(getElementTreeText(healthyRow).includes('Protected'), true);
+  assert.equal(healthyRow.children.some(child => child.tagName === 'BUTTON'), false);
+});
+
 test('file visuals prefer raster thumbnails, then native icons, then bounded extension badges', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const pngData = `data:image/png;base64,${Buffer.from('visual').toString('base64')}`;
