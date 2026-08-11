@@ -1061,6 +1061,7 @@ test('deferred project cache cleanup rechecks current projects immediately befor
 });
 
 test('project cache cleanup fails closed when stored project state cannot be read', async () => {
+  await waitForCacheCleanupSettled();
   const project = await callIpc('projects:create', 'Unreadable project state cache');
   const cacheDir = seedProjectCache('figma-assets', project.id);
 
