@@ -3730,14 +3730,16 @@ async function isFailedRequiredAssetBaselineSource(project, file) {
   if (!project || !file || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
   const state = assetBaselineScans.get(project.id);
   const sourceKey = normalizeTrackedFilePath(file.path);
-  if (state) {
-    return !!(
+  if (state && !(
       sourceKey &&
       state.requiredSourceKeys.has(sourceKey) &&
       !state.completedSourceKeys.has(sourceKey) &&
       !state.inFlightBySource.has(sourceKey)
-    );
-  }
+  )) return false;
+
+  // Live scan state identifies which source failed, but path identity alone is
+  // not removal authority. Require the same persisted physical-identity proof
+  // used after restart so a replacement at the failed path cannot inherit it.
   const sourceKeyHash = getAssetBaselineSourceRecoveryRouteKey(project, file);
   const record = sourceKeyHash && normalizeFailedRequiredAssetBaselineSources(project, project.assetBaseline)
     .find(candidate => candidate.sourceKeyHash === sourceKeyHash);

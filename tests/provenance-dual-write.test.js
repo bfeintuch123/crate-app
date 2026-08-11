@@ -8420,13 +8420,31 @@ test('same-path physical replacement does not inherit failed-source removal elig
     const failed = await getProject(project.id);
     assert.equal(failed.assetBaseline.failedRequiredSources.length, 1);
 
+    // Keep the live failed-scan state populated: a replacement must not inherit
+    // recovery authority merely because it occupies the failed source path.
+    fs.renameSync(sourcePath, originalPath);
+    fs.writeFileSync(sourcePath, 'different malformed Illustrator bytes');
+    let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    let source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
+    assert.equal(source.protectedSource, true);
+    assert.equal(source.sourceRecoveryAllowed, false);
+    await callIpcRaw('projects:remove-file', project.id, source.visualIdentity);
+    assert.equal((await getProject(project.id)).files.some(file => file.path === sourcePath), true);
+
+    fs.unlinkSync(sourcePath);
+    fs.renameSync(originalPath, sourcePath);
+    workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
+    assert.equal(source.sourceRecoveryAllowed, true);
+
+    // Repeat the replacement after a persisted reload/main-process restart.
     storeInstance.set('projects', JSON.parse(JSON.stringify(storeInstance.get('projects', []))));
     metadataTestHooks.clearAssetBaselineScans();
     fs.renameSync(sourcePath, originalPath);
     fs.writeFileSync(sourcePath, 'different malformed Illustrator bytes');
 
-    let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
-    let source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
+    workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    source = workspace.files.find(file => file.name === 'Replaced Failed Source.ai');
     assert.equal(source.protectedSource, true);
     assert.equal(source.sourceRecoveryAllowed, false);
     await callIpcRaw('projects:remove-file', project.id, source.visualIdentity);
