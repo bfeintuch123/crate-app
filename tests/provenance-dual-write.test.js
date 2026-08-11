@@ -555,6 +555,9 @@ module.exports.__crateMetadataTestHooks = {
   getFileVisualRasterWorkPending() {
     return fileVisualRasterWorkPending;
   },
+  clearAssetBaselineScans() {
+    assetBaselineScans.clear();
+  },
 };
 `, filename);
 };
@@ -8236,7 +8239,13 @@ test('removing a failed required source reconciles the baseline instead of block
     const project = await createProject('Remove failed baseline source');
     manualDialogFor([sourcePath]);
     await callIpcRaw('projects:add-files', project.id);
-    assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+    const failedProject = await getProject(project.id);
+    assert.equal(failedProject.assetBaseline.status, 'awaiting-first-scan');
+    assert.equal(failedProject.assetBaseline.failedRequiredSourceKeys.length, 1);
+
+    // Simulate a main-process restart: only persisted project state survives.
+    metadataTestHooks.clearAssetBaselineScans();
+    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSourceKeys.length, 1);
 
     const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
     const failedSource = workspace.files.find(file => file.name === 'Failed Source.ai');
@@ -8273,6 +8282,88 @@ test('removing a failed required source reconciles the baseline instead of block
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('successful first-scan retry clears persisted source recovery eligibility across restart', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-clear-failed-baseline-source-test-'));
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Recovered Source.ai');
+    fs.writeFileSync(sourcePath, 'malformed Illustrator bytes');
+    const project = await createProject('Clear persisted failed source recovery');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    assert.equal((await getProject(project.id)).assetBaseline.failedRequiredSourceKeys.length, 1);
+
+    metadataTestHooks.clearAssetBaselineScans();
+    writeSyntheticAiFile(sourcePath);
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const settled = await waitForProject(
+      project.id,
+      item => item.assetBaseline && item.assetBaseline.status === 'empty'
+    );
+    assert.equal(Object.hasOwn(settled.assetBaseline, 'failedRequiredSourceKeys'), false);
+
+    metadataTestHooks.clearAssetBaselineScans();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const source = workspace.files.find(file => file.name === 'Recovered Source.ai');
+    assert.equal(source.protectedSource, true);
+    assert.equal(source.sourceRecoveryAllowed, false);
+    await callIpcRaw('projects:remove-file', project.id, source.visualIdentity);
+    assert.equal(
+      (await getProject(project.id)).files.some(file => file.path === sourcePath),
+      true
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('malformed and future failed-source recovery state never makes a source removable', async () => {
+  const sourcePath = path.join(os.tmpdir(), 'Healthy persisted source.ai');
+  try {
+    writeSyntheticAiFile(sourcePath);
+    for (const [name, baseline] of [
+      ['malformed keys', {
+        schemaVersion: 1,
+        status: 'awaiting-first-scan',
+        decision: null,
+        establishedAt: null,
+        failedRequiredSourceKeys: ['not-a-hash', null, 'a'.repeat(64)],
+      }],
+      ['future schema', {
+        schemaVersion: 2,
+        status: 'awaiting-first-scan',
+        decision: null,
+        establishedAt: null,
+        failedRequiredSourceKeys: ['a'.repeat(64)],
+      }],
+    ]) {
+      const project = await createProject(`Failed source state ${name}`);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      stored.files = [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: stored.createdAt,
+        source: 'manual-browse',
+        projectRole: 'source',
+      }];
+      stored.assetBaseline = baseline;
+      metadataTestHooks.clearAssetBaselineScans();
+
+      const fresh = await getProject(project.id);
+      assert.equal(Object.hasOwn(fresh.assetBaseline, 'failedRequiredSourceKeys'), false, name);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      const source = workspace.files.find(file => file.name === path.basename(sourcePath));
+      assert.equal(source.protectedSource, true, name);
+      assert.equal(source.sourceRecoveryAllowed, false, name);
+      await callIpcRaw('projects:remove-file', project.id, source.visualIdentity);
+      assert.equal((await getProject(project.id)).files.length, 1, name);
+    }
+  } finally {
+    fs.rmSync(sourcePath, { force: true });
   }
 });
 

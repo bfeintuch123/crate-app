@@ -2744,6 +2744,7 @@ const ASSET_BASELINE_STATUSES = new Set([
 const ASSET_BASELINE_DECISIONS = new Set(['include', 'skip']);
 const ASSET_ORIGINS = new Set(['existing', 'added']);
 const PROJECT_FILE_ROLES = new Set(['source', 'asset']);
+const ASSET_BASELINE_SOURCE_RECOVERY_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const DEPENDENCY_CAPTURE_SOURCES = new Set([
   'ai-linked',
   'indd-poll',
@@ -2834,6 +2835,43 @@ function isProjectAssetBaselineSource(file) {
   return inferProjectFileRole(file) === 'source';
 }
 
+function getAssetBaselineSourceRecoveryKey(project, file) {
+  const sourceKey = getTrackedFileDedupKey(file);
+  if (!project || typeof project.id !== 'string' || !project.id || !sourceKey) return null;
+  return crypto.createHash('sha256')
+    .update('asset-baseline-source-recovery')
+    .update('\0')
+    .update(project.id)
+    .update('\0')
+    .update(sourceKey)
+    .digest('hex');
+}
+
+function normalizeFailedRequiredAssetBaselineSourceKeys(project, baseline) {
+  if (!baseline || baseline.status !== 'awaiting-first-scan') return [];
+  const validSourceKeys = new Set(
+    (project.files || [])
+      .filter(isProjectAssetBaselineSource)
+      .map(file => getAssetBaselineSourceRecoveryKey(project, file))
+      .filter(Boolean)
+  );
+  const normalized = [];
+  const seen = new Set();
+  for (const key of Array.isArray(baseline.failedRequiredSourceKeys)
+    ? baseline.failedRequiredSourceKeys
+    : []) {
+    if (
+      typeof key !== 'string' ||
+      !ASSET_BASELINE_SOURCE_RECOVERY_KEY_PATTERN.test(key) ||
+      !validSourceKeys.has(key) ||
+      seen.has(key)
+    ) continue;
+    seen.add(key);
+    normalized.push(key);
+  }
+  return normalized.sort();
+}
+
 function inferAssetOrigin(project, file, baseline) {
   const baselineStatus = baseline && baseline.status;
   if (baselineStatus === 'legacy-included') return 'existing';
@@ -2904,6 +2942,10 @@ function normalizeProjectAssetReviewState(project) {
     );
     if (presentationMediaOccurrences.length > 0) {
       normalizedBaseline.presentationMediaOccurrences = presentationMediaOccurrences;
+    }
+    const failedRequiredSourceKeys = normalizeFailedRequiredAssetBaselineSourceKeys(project, baseline);
+    if (failedRequiredSourceKeys.length > 0) {
+      normalizedBaseline.failedRequiredSourceKeys = failedRequiredSourceKeys;
     }
   }
   if (JSON.stringify(project.assetBaseline) !== JSON.stringify(normalizedBaseline)) {
@@ -3387,7 +3429,31 @@ function completeProjectAssetBaselineScan(scan, dependable) {
 
   if (state.inFlightBySource.size > 0) return;
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
-  if (!complete) return;
+  if (!complete) {
+    const failedSourceKeys = new Set(
+      [...state.requiredSourceKeys].filter(key => !state.completedSourceKeys.has(key))
+    );
+    const persisted = mutateProject(scan.projectId, project => {
+      if (project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+      const recoveryKeys = (project.files || [])
+        .filter(file => (
+          isProjectAssetBaselineSource(file) &&
+          failedSourceKeys.has(normalizeTrackedFilePath(file.path))
+        ))
+        .map(file => getAssetBaselineSourceRecoveryKey(project, file))
+        .filter(Boolean)
+        .sort();
+      const previous = Array.isArray(project.assetBaseline.failedRequiredSourceKeys)
+        ? project.assetBaseline.failedRequiredSourceKeys
+        : [];
+      if (JSON.stringify(previous) === JSON.stringify(recoveryKeys)) return false;
+      if (recoveryKeys.length > 0) project.assetBaseline.failedRequiredSourceKeys = recoveryKeys;
+      else delete project.assetBaseline.failedRequiredSourceKeys;
+      return true;
+    });
+    if (persisted) sendToRenderer('project:updated', { projectId: scan.projectId });
+    return;
+  }
 
   const result = establishProjectAssetBaseline(
     scan.projectId,
@@ -3405,7 +3471,12 @@ function completeProjectAssetBaselineScan(scan, dependable) {
 function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = true } = {}) {
   const state = assetBaselineScans.get(projectId);
   const project = getProjects().find(item => item.id === projectId);
-  if (!state || !project || project.assetBaseline?.status !== 'awaiting-first-scan') return;
+  if (!project || project.assetBaseline?.status !== 'awaiting-first-scan') return;
+  if (!state) {
+    if (normalizeFailedRequiredAssetBaselineSourceKeys(project, project.assetBaseline).length > 0) return;
+    establishProjectAssetBaseline(projectId, null, null, Date.now(), { allowPaused });
+    return;
+  }
   const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   for (const key of [...state.requiredSourceKeys]) {
     if (acceptedKeys.has(key)) continue;
@@ -3427,11 +3498,18 @@ function isFailedRequiredAssetBaselineSource(project, file) {
   if (!project || !file || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
   const state = assetBaselineScans.get(project.id);
   const sourceKey = normalizeTrackedFilePath(file.path);
+  if (state) {
+    return !!(
+      sourceKey &&
+      state.requiredSourceKeys.has(sourceKey) &&
+      !state.completedSourceKeys.has(sourceKey) &&
+      !state.inFlightBySource.has(sourceKey)
+    );
+  }
+  const recoveryKey = getAssetBaselineSourceRecoveryKey(project, file);
   return !!(
-    state && sourceKey &&
-    state.requiredSourceKeys.has(sourceKey) &&
-    !state.completedSourceKeys.has(sourceKey) &&
-    !state.inFlightBySource.has(sourceKey)
+    recoveryKey &&
+    normalizeFailedRequiredAssetBaselineSourceKeys(project, project.assetBaseline).includes(recoveryKey)
   );
 }
 
