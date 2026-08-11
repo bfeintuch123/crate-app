@@ -12880,6 +12880,11 @@ for (const scopeState of ['ready', 'failed']) {
     }
     await settleAssetBaselineForUnrelatedPackageTest(project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
+    assert.equal(
+      result && result.error,
+      undefined,
+      `${scopeState}: unexpected package error ${result && result.error}`
+    );
     assertPackageResultShape(result);
     assert.equal(result.success, true);
     for (const candidate of candidates) {
