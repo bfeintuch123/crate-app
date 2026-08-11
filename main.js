@@ -2744,6 +2744,8 @@ const ASSET_BASELINE_STATUSES = new Set([
 const ASSET_BASELINE_DECISIONS = new Set(['include', 'skip']);
 const ASSET_ORIGINS = new Set(['existing', 'added']);
 const PROJECT_FILE_ROLES = new Set(['source', 'asset']);
+const ASSET_BASELINE_SOURCE_RECOVERY_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const ASSET_BASELINE_SOURCE_RECOVERY_SCHEMA_VERSION = 1;
 const DEPENDENCY_CAPTURE_SOURCES = new Set([
   'ai-linked',
   'indd-poll',
@@ -2834,6 +2836,113 @@ function isProjectAssetBaselineSource(file) {
   return inferProjectFileRole(file) === 'source';
 }
 
+function getAssetBaselineSourceRecoveryRouteKey(project, file) {
+  const sourceKey = getTrackedFileDedupKey(file);
+  if (!project || typeof project.id !== 'string' || !project.id || !sourceKey) return null;
+  return crypto.createHash('sha256')
+    .update('asset-baseline-source-route')
+    .update('\0')
+    .update(project.id)
+    .update('\0')
+    .update(sourceKey)
+    .digest('hex');
+}
+
+function getAssetBaselineSourcePhysicalIdentityHash(project, stat) {
+  if (!project || typeof project.id !== 'string' || !project.id || !stat) return null;
+  const kind = stat.isFile() ? 'file' : (stat.isDirectory() ? 'directory' : null);
+  if (!kind || typeof stat.dev !== 'bigint' || typeof stat.ino !== 'bigint') return null;
+  const birthtimeNs = typeof stat.birthtimeNs === 'bigint'
+    ? stat.birthtimeNs
+    : BigInt(Math.max(0, Math.trunc(Number(stat.birthtimeMs || 0) * 1000000)));
+  return crypto.createHash('sha256')
+    .update('asset-baseline-source-physical-identity')
+    .update('\0')
+    .update(project.id)
+    .update('\0')
+    .update(kind)
+    .update('\0')
+    .update(String(stat.dev))
+    .update('\0')
+    .update(String(stat.ino))
+    .update('\0')
+    .update(String(birthtimeNs))
+    .digest('hex');
+}
+
+function sameAssetBaselineSourcePhysicalIdentity(left, right) {
+  if (!left || !right) return false;
+  const leftKind = left.isFile() ? 'file' : (left.isDirectory() ? 'directory' : null);
+  const rightKind = right.isFile() ? 'file' : (right.isDirectory() ? 'directory' : null);
+  const leftBirthtime = typeof left.birthtimeNs === 'bigint'
+    ? left.birthtimeNs
+    : BigInt(Math.max(0, Math.trunc(Number(left.birthtimeMs || 0) * 1000000)));
+  const rightBirthtime = typeof right.birthtimeNs === 'bigint'
+    ? right.birthtimeNs
+    : BigInt(Math.max(0, Math.trunc(Number(right.birthtimeMs || 0) * 1000000)));
+  return !!(
+    leftKind && leftKind === rightKind &&
+    left.dev === right.dev && left.ino === right.ino && leftBirthtime === rightBirthtime
+  );
+}
+
+async function getAssetBaselineSourceRecoveryRecord(project, file) {
+  const sourceKeyHash = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  if (!sourceKeyHash || typeof file?.path !== 'string' || !path.isAbsolute(file.path)) return null;
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  let handle = null;
+  try {
+    handle = await fs.promises.open(file.path, fs.constants.O_RDONLY | noFollow);
+    const openedStat = await handle.stat({ bigint: true });
+    const pathStat = await fs.promises.lstat(file.path, { bigint: true });
+    if (pathStat.isSymbolicLink() || !sameAssetBaselineSourcePhysicalIdentity(openedStat, pathStat)) return null;
+    const physicalIdentityHash = getAssetBaselineSourcePhysicalIdentityHash(project, openedStat);
+    if (!physicalIdentityHash) return null;
+    return {
+      schemaVersion: ASSET_BASELINE_SOURCE_RECOVERY_SCHEMA_VERSION,
+      sourceKeyHash,
+      physicalIdentityHash,
+    };
+  } catch (_) {
+    return null;
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch (_) {}
+    }
+  }
+}
+
+function normalizeFailedRequiredAssetBaselineSources(project, baseline) {
+  if (!baseline || baseline.status !== 'awaiting-first-scan') return [];
+  const validSourceKeys = new Set(
+    (project.files || [])
+      .filter(isProjectAssetBaselineSource)
+      .map(file => getAssetBaselineSourceRecoveryRouteKey(project, file))
+      .filter(Boolean)
+  );
+  const normalized = [];
+  const seen = new Set();
+  for (const record of Array.isArray(baseline.failedRequiredSources)
+    ? baseline.failedRequiredSources
+    : []) {
+    if (
+      !record || typeof record !== 'object' ||
+      record.schemaVersion !== ASSET_BASELINE_SOURCE_RECOVERY_SCHEMA_VERSION ||
+      !ASSET_BASELINE_SOURCE_RECOVERY_KEY_PATTERN.test(record.sourceKeyHash || '') ||
+      !ASSET_BASELINE_SOURCE_RECOVERY_KEY_PATTERN.test(record.physicalIdentityHash || '') ||
+      !validSourceKeys.has(record.sourceKeyHash) ||
+      seen.has(record.sourceKeyHash)
+    ) continue;
+    seen.add(record.sourceKeyHash);
+    normalized.push({
+      schemaVersion: ASSET_BASELINE_SOURCE_RECOVERY_SCHEMA_VERSION,
+      sourceKeyHash: record.sourceKeyHash,
+      physicalIdentityHash: record.physicalIdentityHash,
+    });
+  }
+  return normalized.sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash));
+}
+
 function inferAssetOrigin(project, file, baseline) {
   const baselineStatus = baseline && baseline.status;
   if (baselineStatus === 'legacy-included') return 'existing';
@@ -2905,6 +3014,10 @@ function normalizeProjectAssetReviewState(project) {
     if (presentationMediaOccurrences.length > 0) {
       normalizedBaseline.presentationMediaOccurrences = presentationMediaOccurrences;
     }
+    const failedRequiredSources = normalizeFailedRequiredAssetBaselineSources(project, baseline);
+    if (failedRequiredSources.length > 0) {
+      normalizedBaseline.failedRequiredSources = failedRequiredSources;
+    }
   }
   if (JSON.stringify(project.assetBaseline) !== JSON.stringify(normalizedBaseline)) {
     project.assetBaseline = normalizedBaseline;
@@ -2913,7 +3026,7 @@ function normalizeProjectAssetReviewState(project) {
 
   const sourceFileKeys = new Set(
     (project.files || [])
-      .filter(file => inferProjectFileRole(file) === 'source')
+      .filter(isProjectAssetBaselineSource)
       .map(getAssetReviewExclusionKey)
       .filter(Boolean)
   );
@@ -2961,10 +3074,510 @@ function getAssetReviewExclusionKey(file) {
   return typeof file.path === 'string' && file.path ? file.path : null;
 }
 
+const FILE_VISUAL_PIXEL_SIZE = 48;
+const FILE_VISUAL_MAX_PNG_BYTES = 96 * 1024;
+const FILE_VISUAL_MAX_RASTER_SOURCE_BYTES = 16 * 1024 * 1024;
+const FILE_VISUAL_MAX_RASTER_HEADER_BYTES = 256 * 1024;
+const FILE_VISUAL_MAX_RASTER_DIMENSION = 6000;
+const FILE_VISUAL_MAX_RASTER_PIXELS = 12 * 1000 * 1000;
+const FILE_VISUAL_MAX_RASTER_QUEUE = 8;
+const FILE_VISUAL_SNAPSHOT_PREFIX = 'crate-file-visual-';
+const FILE_VISUAL_SNAPSHOT_COPY_CHUNK_BYTES = 64 * 1024;
+const FILE_VISUAL_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const FILE_VISUAL_REVISION_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const FILE_VISUAL_TYPE_ICON_CACHE_CAPACITY = 64;
+const FILE_VISUAL_SAFE_RASTER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp']);
+const fileVisualIdentitySecret = crypto.randomBytes(32);
+const fileVisualTypeIconCache = new Map();
+let fileVisualRasterWorkTail = Promise.resolve();
+let fileVisualRasterWorkPending = 0;
+
+function createProjectFileVisualIdentity(projectId, file) {
+  const authoritativeKey = getAssetReviewExclusionKey(file);
+  if (typeof projectId !== 'string' || !projectId || typeof authoritativeKey !== 'string' || !authoritativeKey) {
+    return null;
+  }
+  return crypto.createHmac('sha256', fileVisualIdentitySecret)
+    .update(projectId)
+    .update('\0')
+    .update(authoritativeKey)
+    .digest('base64url');
+}
+
+function createProjectFileVisualRevisionFromStat(projectId, file, stat = null) {
+  const authoritativeKey = getAssetReviewExclusionKey(file);
+  if (typeof projectId !== 'string' || !projectId || typeof authoritativeKey !== 'string' || !authoritativeKey) {
+    return null;
+  }
+  const ext = (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase();
+  const revisionParts = [
+    projectId,
+    authoritativeKey,
+    ext,
+    String(file?.addedAt ?? ''),
+    String(file?.assetOrigin ?? ''),
+    String(file?.projectRole ?? ''),
+  ];
+  if (FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext)) {
+    if (!stat || stat.isSymbolicLink() || !stat.isFile()) revisionParts.push('unavailable');
+    else revisionParts.push(
+      String(stat.dev),
+      String(stat.ino),
+      String(stat.size),
+      String(stat.mtimeNs),
+      String(stat.ctimeNs)
+    );
+  }
+  return crypto.createHmac('sha256', fileVisualIdentitySecret)
+    .update(revisionParts.join('\0'))
+    .digest('base64url');
+}
+
+async function createProjectFileVisualRevision(projectId, file) {
+  const ext = (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase();
+  if (
+    !FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext) ||
+    typeof file?.path !== 'string' ||
+    !path.isAbsolute(file.path)
+  ) return createProjectFileVisualRevisionFromStat(projectId, file);
+  try {
+    const stat = await fs.promises.lstat(file.path, { bigint: true });
+    return createProjectFileVisualRevisionFromStat(projectId, file, stat);
+  } catch (_) {
+    return createProjectFileVisualRevisionFromStat(projectId, file);
+  }
+}
+
+async function createRendererFilePresentation(project, file) {
+  return {
+    name: typeof file?.name === 'string' && file.name ? file.name : 'Untitled file',
+    ext: (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase(),
+    embedded: file?.embedded === true,
+    linked: DEPENDENCY_CAPTURE_SOURCES.has(getFileCaptureSource(file)),
+    assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
+    projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
+    protectedSource: isProjectAssetBaselineSource(file),
+    sourceRecoveryAllowed: await isFailedRequiredAssetBaselineSource(project, file),
+    excluded: isAssetReviewFileExcluded(project, file),
+    visualIdentity: createProjectFileVisualIdentity(project.id, file),
+    visualRevision: await createProjectFileVisualRevision(project.id, file),
+  };
+}
+
+async function getProjectAssetWorkspace(projectId) {
+  if (typeof projectId !== 'string' || !projectId || projectId.length > 128) return null;
+  const project = getProjects().find(item => item && item.id === projectId);
+  const scopedProject = project && getIllustratorScopedProjectView(project);
+  if (!project || !scopedProject) return null;
+  return {
+    projectId,
+    files: await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file))),
+    pendingFiles: await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file))),
+  };
+}
+
+function encodeBoundedFileVisual(image) {
+  if (!image || typeof image.isEmpty !== 'function' || image.isEmpty()) return null;
+  try {
+    let boundedImage = image;
+    if (typeof image.getSize === 'function' && typeof image.resize === 'function') {
+      const size = image.getSize();
+      const width = Math.max(1, Number(size && size.width) || 1);
+      const height = Math.max(1, Number(size && size.height) || 1);
+      const scale = Math.min(1, FILE_VISUAL_PIXEL_SIZE / width, FILE_VISUAL_PIXEL_SIZE / height);
+      boundedImage = image.resize({
+        width: Math.max(1, Math.round(width * scale)),
+        height: Math.max(1, Math.round(height * scale)),
+        quality: 'best',
+      });
+    }
+    if (!boundedImage || typeof boundedImage.toPNG !== 'function') return null;
+    const png = boundedImage.toPNG();
+    if (!Buffer.isBuffer(png) || png.length === 0 || png.length > FILE_VISUAL_MAX_PNG_BYTES) return null;
+    return `data:image/png;base64,${png.toString('base64')}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveProjectOwnedFileVisualRecord(projectId, visualIdentity) {
+  if (
+    typeof projectId !== 'string' || projectId.length === 0 || projectId.length > 128 ||
+    typeof visualIdentity !== 'string' || !FILE_VISUAL_ID_PATTERN.test(visualIdentity)
+  ) return null;
+  const project = getProjects().find(item => item && item.id === projectId);
+  const scopedProject = project && getIllustratorScopedProjectView(project);
+  if (!scopedProject) return null;
+  return [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])].find(file => (
+    createProjectFileVisualIdentity(projectId, file) === visualIdentity
+  )) || null;
+}
+
+function matchesProjectFileIdentity(projectId, file, identity) {
+  if (!file || typeof identity !== 'string' || !identity) return false;
+  if (createProjectFileVisualIdentity(projectId, file) === identity) return true;
+  if (typeof file.fileId === 'string' && file.fileId === identity) return true;
+  return !file.fileId && file.path === identity;
+}
+
+function getSafeRasterDimensions(buffer) {
+  if (!Buffer.isBuffer(buffer)) return null;
+  let width = 0;
+  let height = 0;
+  if (
+    buffer.length >= 24 &&
+    buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) &&
+    buffer.toString('ascii', 12, 16) === 'IHDR'
+  ) {
+    width = buffer.readUInt32BE(16);
+    height = buffer.readUInt32BE(20);
+  } else if (buffer.length >= 10 && ['GIF87a', 'GIF89a'].includes(buffer.toString('ascii', 0, 6))) {
+    width = buffer.readUInt16LE(6);
+    height = buffer.readUInt16LE(8);
+  } else if (buffer.length >= 26 && buffer.toString('ascii', 0, 2) === 'BM') {
+    width = Math.abs(buffer.readInt32LE(18));
+    height = Math.abs(buffer.readInt32LE(22));
+  } else if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    while (offset + 3 < buffer.length) {
+      while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+      if (offset >= buffer.length) break;
+      const marker = buffer[offset++];
+      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (offset + 1 >= buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset);
+      if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+      if (sofMarkers.has(marker) && segmentLength >= 7) {
+        height = buffer.readUInt16BE(offset + 3);
+        width = buffer.readUInt16BE(offset + 5);
+        break;
+      }
+      offset += segmentLength;
+    }
+  }
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return null;
+  if (width > FILE_VISUAL_MAX_RASTER_DIMENSION || height > FILE_VISUAL_MAX_RASTER_DIMENSION) return null;
+  if ((width * height) > FILE_VISUAL_MAX_RASTER_PIXELS) return null;
+  return { width, height };
+}
+
+function sameOpenFileStat(before, after) {
+  return !!(
+    before && after &&
+    before.isFile() && after.isFile() &&
+    before.dev === after.dev && before.ino === after.ino &&
+    before.size === after.size && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs
+  );
+}
+
+async function openPreflightedRasterSource(sourcePath) {
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  let handle = null;
+  try {
+    handle = await fs.promises.open(sourcePath, fs.constants.O_RDONLY | noFollow);
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile() || before.nlink !== 1n || before.size <= 0n ||
+      before.size > BigInt(FILE_VISUAL_MAX_RASTER_SOURCE_BYTES)
+    ) return null;
+    const buffer = Buffer.allocUnsafe(Math.min(Number(before.size), FILE_VISUAL_MAX_RASTER_HEADER_BYTES));
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead <= 0) return null;
+      offset += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (!sameOpenFileStat(before, after)) return null;
+    const pathStat = await fs.promises.lstat(sourcePath, { bigint: true });
+    if (pathStat.isSymbolicLink() || !sameOpenFileStat(after, pathStat)) return null;
+    if (!getSafeRasterDimensions(buffer)) return null;
+    const result = { handle, sourceStat: after };
+    handle = null;
+    return result;
+  } catch (_) {
+    return null;
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch (_) {}
+    }
+  }
+}
+
+async function capturePrivateFileVisualDirectory(tempDir) {
+  const resolvedPath = path.resolve(tempDir);
+  const requestedStat = await fs.promises.lstat(resolvedPath, { bigint: true });
+  const realPath = await fs.promises.realpath(resolvedPath);
+  const stat = await fs.promises.lstat(realPath, { bigint: true });
+  if (
+    requestedStat.isSymbolicLink() || !requestedStat.isDirectory() ||
+    stat.isSymbolicLink() || !stat.isDirectory() ||
+    requestedStat.dev !== stat.dev || requestedStat.ino !== stat.ino ||
+    (Number(stat.mode) & 0o077) !== 0
+  ) throw new Error('unsafe_file_visual_snapshot_directory');
+  return { path: realPath, realPath, dev: stat.dev, ino: stat.ino };
+}
+
+async function assertPrivateFileVisualDirectory(identity) {
+  if (!identity) throw new Error('unsafe_file_visual_snapshot_directory');
+  const current = await capturePrivateFileVisualDirectory(identity.path);
+  if (
+    current.realPath !== identity.realPath ||
+    current.dev !== identity.dev || current.ino !== identity.ino
+  ) throw new Error('unsafe_file_visual_snapshot_directory');
+}
+
+async function cleanupEmptyPrivateFileVisualDirectory(tempDir, expectedStat) {
+  if (typeof tempDir !== 'string' || !tempDir || !expectedStat) return;
+  try {
+    const resolvedPath = path.resolve(tempDir);
+    if (
+      path.dirname(resolvedPath) !== path.resolve(os.tmpdir()) ||
+      !path.basename(resolvedPath).startsWith(FILE_VISUAL_SNAPSHOT_PREFIX)
+    ) return;
+    const stat = await fs.promises.lstat(resolvedPath, { bigint: true });
+    if (
+      stat.isSymbolicLink() || !stat.isDirectory() ||
+      (Number(stat.mode) & 0o077) !== 0 ||
+      stat.dev !== expectedStat.dev || stat.ino !== expectedStat.ino
+    ) return;
+    await fs.promises.rmdir(resolvedPath);
+  } catch (_) {}
+}
+
+async function cleanupPrivateFileVisualSnapshot(snapshot) {
+  if (!snapshot) return;
+  if (snapshot.handle) {
+    try { await snapshot.handle.truncate(0); } catch (_) {}
+    try { await snapshot.handle.sync(); } catch (_) {}
+    try { await snapshot.handle.close(); } catch (_) {}
+    snapshot.handle = null;
+  }
+  try {
+    const stat = await fs.promises.lstat(snapshot.path, { bigint: true });
+    if (
+      snapshot.stat && !stat.isSymbolicLink() && stat.isFile() && stat.nlink === 1n &&
+      stat.dev === snapshot.stat.dev && stat.ino === snapshot.stat.ino
+    ) await fs.promises.unlink(snapshot.path);
+  } catch (_) {}
+  try {
+    await assertPrivateFileVisualDirectory(snapshot.directory);
+    await fs.promises.rmdir(snapshot.directory.path);
+  } catch (_) {}
+}
+
+async function createPrivateFileVisualSnapshot(source, ext) {
+  let snapshot = null;
+  let createdTempDir = null;
+  let createdTempStat = null;
+  try {
+    createdTempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), FILE_VISUAL_SNAPSHOT_PREFIX));
+    createdTempStat = await fs.promises.lstat(createdTempDir, { bigint: true });
+    await fs.promises.chmod(createdTempDir, OWNER_ONLY_DIR_MODE);
+    const directory = await capturePrivateFileVisualDirectory(createdTempDir);
+    const safeExt = FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext) ? ext : '.img';
+    const snapshotPath = path.join(directory.path, `source${safeExt}`);
+    snapshot = { path: snapshotPath, handle: null, stat: null, directory };
+    const flags = fs.constants.O_WRONLY
+      | fs.constants.O_CREAT
+      | fs.constants.O_EXCL
+      | (fs.constants.O_NOFOLLOW || 0);
+    const handle = await fs.promises.open(snapshotPath, flags, OWNER_ONLY_FILE_MODE);
+    snapshot.handle = handle;
+    snapshot.stat = await handle.stat({ bigint: true });
+    await assertPrivateFileVisualDirectory(directory);
+    const pathStat = await fs.promises.lstat(snapshotPath, { bigint: true });
+    if (
+      pathStat.isSymbolicLink() || !pathStat.isFile() || pathStat.nlink !== 1n ||
+      pathStat.dev !== snapshot.stat.dev || pathStat.ino !== snapshot.stat.ino ||
+      path.dirname(await fs.promises.realpath(snapshotPath)) !== directory.realPath
+    ) throw new Error('unsafe_file_visual_snapshot');
+    await handle.chmod(OWNER_ONLY_FILE_MODE);
+
+    const chunk = Buffer.allocUnsafe(FILE_VISUAL_SNAPSHOT_COPY_CHUNK_BYTES);
+    let offset = 0;
+    const sourceSize = Number(source.sourceStat.size);
+    while (offset < sourceSize) {
+      const requested = Math.min(chunk.length, sourceSize - offset);
+      const { bytesRead } = await source.handle.read(chunk, 0, requested, offset);
+      if (bytesRead <= 0) throw new Error('incomplete_file_visual_snapshot');
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await handle.write(chunk, written, bytesRead - written, offset + written);
+        if (result.bytesWritten <= 0) throw new Error('incomplete_file_visual_snapshot');
+        written += result.bytesWritten;
+      }
+      offset += bytesRead;
+    }
+    await handle.sync();
+    const finalSourceStat = await source.handle.stat({ bigint: true });
+    if (!sameOpenFileStat(source.sourceStat, finalSourceStat)) {
+      throw new Error('changed_file_visual_source');
+    }
+    const finalSnapshotStat = await handle.stat({ bigint: true });
+    const finalPathStat = await fs.promises.lstat(snapshotPath, { bigint: true });
+    await assertPrivateFileVisualDirectory(directory);
+    if (
+      !finalSnapshotStat.isFile() || finalSnapshotStat.nlink !== 1n ||
+      finalSnapshotStat.size !== source.sourceStat.size ||
+      finalPathStat.isSymbolicLink() ||
+      finalPathStat.dev !== finalSnapshotStat.dev || finalPathStat.ino !== finalSnapshotStat.ino
+    ) throw new Error('changed_file_visual_snapshot');
+    snapshot.stat = finalSnapshotStat;
+    return snapshot;
+  } catch (_) {
+    await cleanupPrivateFileVisualSnapshot(snapshot);
+    if (!snapshot) await cleanupEmptyPrivateFileVisualDirectory(createdTempDir, createdTempStat);
+    return null;
+  }
+}
+
+function rememberFileVisualTypeIcon(ext, dataUrl) {
+  fileVisualTypeIconCache.delete(ext);
+  fileVisualTypeIconCache.set(ext, dataUrl);
+  while (fileVisualTypeIconCache.size > FILE_VISUAL_TYPE_ICON_CACHE_CAPACITY) {
+    const oldest = fileVisualTypeIconCache.keys().next().value;
+    if (oldest === undefined) break;
+    fileVisualTypeIconCache.delete(oldest);
+  }
+}
+
+function getFileVisualTypeIconHint(ext) {
+  if (!/^\.[a-z0-9]{1,12}$/.test(ext)) return null;
+  try {
+    const rootPath = path.parse(process.execPath || path.sep).root || path.sep;
+    const rootRealPath = safeRealpath(rootPath, 'file-type-icon-root');
+    const rootStat = fs.lstatSync(rootRealPath);
+    if (
+      rootRealPath !== rootPath || rootStat.isSymbolicLink() || !rootStat.isDirectory() ||
+      (Number(rootStat.mode) & 0o022) !== 0
+    ) return null;
+    return {
+      hintPath: path.join(rootRealPath, `.crate-file-type${ext}`),
+      rootRealPath,
+      rootIdentity: { dev: rootStat.dev, ino: rootStat.ino },
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function verifyFileVisualTypeIconHint(hint) {
+  if (!hint || typeof hint !== 'object') return false;
+  try {
+    try {
+      fs.lstatSync(hint.hintPath);
+      return false;
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') return false;
+    }
+    const rootStat = fs.lstatSync(hint.rootRealPath);
+    return !rootStat.isSymbolicLink() && rootStat.isDirectory()
+      && rootStat.dev === hint.rootIdentity.dev
+      && rootStat.ino === hint.rootIdentity.ino
+      && (Number(rootStat.mode) & 0o022) === 0
+      && safeRealpath(hint.rootRealPath, 'file-type-icon-root') === hint.rootRealPath
+      && path.dirname(hint.hintPath) === hint.rootRealPath;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function getBoundedFileTypeIcon(ext) {
+  if (!/^\.[a-z0-9]{1,12}$/.test(ext) || typeof app.getFileIcon !== 'function') return null;
+  if (fileVisualTypeIconCache.has(ext)) {
+    const cached = fileVisualTypeIconCache.get(ext);
+    rememberFileVisualTypeIcon(ext, cached);
+    return cached;
+  }
+  try {
+    const hint = getFileVisualTypeIconHint(ext);
+    if (!hint || !verifyFileVisualTypeIconHint(hint)) return null;
+    const icon = await app.getFileIcon(hint.hintPath, { size: 'normal' });
+    if (!verifyFileVisualTypeIconHint(hint)) return null;
+    const dataUrl = encodeBoundedFileVisual(icon);
+    if (!dataUrl) return null;
+    rememberFileVisualTypeIcon(ext, dataUrl);
+    return dataUrl;
+  } catch (_) {
+    return null;
+  }
+}
+
+function runSerializedFileVisualRasterWork(task) {
+  if (typeof task !== 'function' || fileVisualRasterWorkPending >= FILE_VISUAL_MAX_RASTER_QUEUE) {
+    return Promise.resolve(null);
+  }
+  fileVisualRasterWorkPending += 1;
+  const result = fileVisualRasterWorkTail.then(task, task);
+  fileVisualRasterWorkTail = result.then(() => undefined, () => undefined);
+  return result.finally(() => {
+    fileVisualRasterWorkPending = Math.max(0, fileVisualRasterWorkPending - 1);
+  });
+}
+
+function getBoundedRasterThumbnail(projectId, file, visualRevision) {
+  return runSerializedFileVisualRasterWork(async () => {
+    const source = await openPreflightedRasterSource(file.path);
+    if (!source) return null;
+    let snapshot = null;
+    try {
+      if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
+        return null;
+      }
+      const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
+      snapshot = await createPrivateFileVisualSnapshot(source, ext);
+      if (!snapshot) return null;
+      const thumbnail = await nativeImage.createThumbnailFromPath(snapshot.path, {
+        width: FILE_VISUAL_PIXEL_SIZE,
+        height: FILE_VISUAL_PIXEL_SIZE,
+      });
+      const descriptorStat = await source.handle.stat({ bigint: true });
+      const snapshotStat = await snapshot.handle.stat({ bigint: true });
+      const snapshotPathStat = await fs.promises.lstat(snapshot.path, { bigint: true });
+      await assertPrivateFileVisualDirectory(snapshot.directory);
+      if (
+        !sameOpenFileStat(source.sourceStat, descriptorStat) ||
+        snapshotPathStat.isSymbolicLink() ||
+        !sameOpenFileStat(snapshot.stat, snapshotStat) ||
+        !sameOpenFileStat(snapshotStat, snapshotPathStat)
+      ) return null;
+      return encodeBoundedFileVisual(thumbnail);
+    } catch (_) {
+      return null;
+    } finally {
+      await cleanupPrivateFileVisualSnapshot(snapshot);
+      try { await source.handle.close(); } catch (_) {}
+    }
+  });
+}
+
+async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevision) {
+  const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity);
+  if (!file) return { error: 'not_found' };
+  if (
+    typeof visualRevision !== 'string' || !FILE_VISUAL_REVISION_PATTERN.test(visualRevision) ||
+    await createProjectFileVisualRevision(projectId, file) !== visualRevision
+  ) return { error: 'stale_visual' };
+  const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
+  if (
+    FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext) &&
+    typeof file.path === 'string' && path.isAbsolute(file.path) &&
+    typeof nativeImage.createThumbnailFromPath === 'function'
+  ) {
+    const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision);
+    if (dataUrl) return { kind: 'thumbnail', dataUrl };
+  }
+  const iconDataUrl = await getBoundedFileTypeIcon(ext);
+  if (iconDataUrl) return { kind: 'icon', dataUrl: iconDataUrl };
+  return { kind: 'fallback' };
+}
+
 function getExistingAssetReviewFiles(project) {
   if (!project || typeof project !== 'object') return [];
   return [...(project.files || []), ...(project.pendingFiles || [])].filter(file => (
-    file && file.assetOrigin === 'existing' && file.projectRole === 'asset'
+    file && file.assetOrigin === 'existing' && !isProjectAssetBaselineSource(file)
   ));
 }
 
@@ -3023,7 +3636,7 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   return { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
 }
 
-function completeProjectAssetBaselineScan(scan, dependable) {
+async function completeProjectAssetBaselineScan(scan, dependable) {
   if (!scan) return;
   const state = assetBaselineScans.get(scan.projectId);
   if (!state) return;
@@ -3038,7 +3651,41 @@ function completeProjectAssetBaselineScan(scan, dependable) {
 
   if (state.inFlightBySource.size > 0) return;
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
-  if (!complete) return;
+  if (!complete) {
+    const failedSourceKeys = new Set(
+      [...state.requiredSourceKeys].filter(key => !state.completedSourceKeys.has(key))
+    );
+    const currentProject = getProjects().find(project => project.id === scan.projectId);
+    const recoveryRecords = currentProject
+      ? (await Promise.all(
+          (currentProject.files || [])
+            .filter(file => (
+              isProjectAssetBaselineSource(file) &&
+              failedSourceKeys.has(normalizeTrackedFilePath(file.path))
+            ))
+            .map(file => getAssetBaselineSourceRecoveryRecord(currentProject, file))
+        )).filter(Boolean).sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash))
+      : [];
+    const persisted = mutateProject(scan.projectId, project => {
+      if (project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+      const validRouteKeys = new Set(
+        (project.files || [])
+          .filter(isProjectAssetBaselineSource)
+          .map(file => getAssetBaselineSourceRecoveryRouteKey(project, file))
+          .filter(Boolean)
+      );
+      const applicableRecords = recoveryRecords.filter(record => validRouteKeys.has(record.sourceKeyHash));
+      const previous = Array.isArray(project.assetBaseline.failedRequiredSources)
+        ? project.assetBaseline.failedRequiredSources
+        : [];
+      if (JSON.stringify(previous) === JSON.stringify(applicableRecords)) return false;
+      if (applicableRecords.length > 0) project.assetBaseline.failedRequiredSources = applicableRecords;
+      else delete project.assetBaseline.failedRequiredSources;
+      return true;
+    });
+    if (persisted) sendToRenderer('project:updated', { projectId: scan.projectId });
+    return;
+  }
 
   const result = establishProjectAssetBaseline(
     scan.projectId,
@@ -3056,7 +3703,12 @@ function completeProjectAssetBaselineScan(scan, dependable) {
 function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = true } = {}) {
   const state = assetBaselineScans.get(projectId);
   const project = getProjects().find(item => item.id === projectId);
-  if (!state || !project || project.assetBaseline?.status !== 'awaiting-first-scan') return;
+  if (!project || project.assetBaseline?.status !== 'awaiting-first-scan') return;
+  if (!state) {
+    if (normalizeFailedRequiredAssetBaselineSources(project, project.assetBaseline).length > 0) return;
+    establishProjectAssetBaseline(projectId, null, null, Date.now(), { allowPaused });
+    return;
+  }
   const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   for (const key of [...state.requiredSourceKeys]) {
     if (acceptedKeys.has(key)) continue;
@@ -3072,6 +3724,32 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
   if (result || !current || current.assetBaseline?.status !== 'awaiting-first-scan') {
     assetBaselineScans.delete(projectId);
   }
+}
+
+async function isFailedRequiredAssetBaselineSource(project, file) {
+  if (!project || !file || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+  const state = assetBaselineScans.get(project.id);
+  const sourceKey = normalizeTrackedFilePath(file.path);
+  if (state && !(
+      sourceKey &&
+      state.requiredSourceKeys.has(sourceKey) &&
+      !state.completedSourceKeys.has(sourceKey) &&
+      !state.inFlightBySource.has(sourceKey)
+  )) return false;
+
+  // Live scan state identifies which source failed, but path identity alone is
+  // not removal authority. Require the same persisted physical-identity proof
+  // used after restart so a replacement at the failed path cannot inherit it.
+  const sourceKeyHash = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  const record = sourceKeyHash && normalizeFailedRequiredAssetBaselineSources(project, project.assetBaseline)
+    .find(candidate => candidate.sourceKeyHash === sourceKeyHash);
+  if (!record) return false;
+  const currentRecord = await getAssetBaselineSourceRecoveryRecord(project, file);
+  return !!(
+    currentRecord &&
+    currentRecord.sourceKeyHash === record.sourceKeyHash &&
+    currentRecord.physicalIdentityHash === record.physicalIdentityHash
+  );
 }
 
 function hasInFlightAssetBaselineScan(projectId) {
@@ -3158,7 +3836,7 @@ function setProjectExistingAssetsDecision(projectId, decision) {
 
   const result = mutateProject(projectId, (project) => {
     const baseline = project.assetBaseline;
-    if (!baseline || !['decision-required', 'included', 'skipped'].includes(baseline.status)) {
+    if (!baseline || !['decision-required', 'included', 'skipped', 'legacy-included'].includes(baseline.status)) {
       return { success: false, error: 'asset_baseline_decision_unavailable' };
     }
 
@@ -3177,7 +3855,7 @@ function setProjectExistingAssetsDecision(projectId, decision) {
     if (decision === 'include') {
       const existingPendingKeys = new Set(
         (project.pendingFiles || [])
-          .filter(file => file && file.assetOrigin === 'existing' && file.projectRole === 'asset')
+          .filter(file => file && file.assetOrigin === 'existing' && !isProjectAssetBaselineSource(file))
           .map(getTrackedFileDedupKey)
           .filter(Boolean)
       );
@@ -6188,12 +6866,14 @@ function ensureSafeLocalCacheDir(category, projectId = null, mode = OWNER_ONLY_D
   const crateRealPath = ensureSafeCacheDirectory(crateDir, 'cache-root', mode);
   const categoryDir = path.join(crateDir, safeCategory);
   const categoryRealPath = ensureSafeCacheDirectory(categoryDir, safeCategory, mode, crateRealPath);
-  if (projectId == null) return { crateDir, categoryDir, projectDir: null };
+  if (projectId == null) {
+    return { crateDir, categoryDir, projectDir: null, crateRealPath, categoryRealPath, projectRealPath: null };
+  }
 
   const safeProjectId = ensureSafeCacheSegment(projectId, 'cache-project');
   const projectDir = path.join(categoryDir, safeProjectId);
-  ensureSafeCacheDirectory(projectDir, `${safeCategory}-project`, mode, categoryRealPath);
-  return { crateDir, categoryDir, projectDir };
+  const projectRealPath = ensureSafeCacheDirectory(projectDir, `${safeCategory}-project`, mode, categoryRealPath);
+  return { crateDir, categoryDir, projectDir, crateRealPath, categoryRealPath, projectRealPath };
 }
 
 function ensureFigmaAssetsDir() {
@@ -9928,7 +10608,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
     };
   } finally {
-    completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted && isCurrent());
+    await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted && isCurrent());
   }
 }
 
@@ -11367,38 +12047,65 @@ registerTrustedIpcHandler('projects:get-files', (event, id) => {
   return project ? getIllustratorScopedProjectView(project).files : [];
 });
 
+registerTrustedIpcHandler('projects:get-asset-workspace', async (event, projectId) => {
+  return await getProjectAssetWorkspace(projectId);
+});
+
+registerTrustedIpcHandler('projects:get-file-visual', async (event, projectId, visualIdentity, visualRevision) => {
+  return await getProjectOwnedFileVisual(projectId, visualIdentity, visualRevision);
+});
+
 registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, projectId, decision) => {
   return setProjectExistingAssetsDecision(projectId, decision);
 });
 
-registerTrustedIpcHandler('projects:remove-file', (event, projectId, fileIdOrPath) => {
+registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileIdOrPath) => {
+  const currentProject = getProjects().find(project => project.id === projectId);
+  const currentFile = currentProject && currentProject.files.find(file => (
+    matchesProjectFileIdentity(currentProject.id, file, fileIdOrPath)
+  ));
+  const failedSourceRemovalAllowed = !!(
+    currentProject && currentFile && isProjectAssetBaselineSource(currentFile) &&
+    await isFailedRequiredAssetBaselineSource(currentProject, currentFile)
+  );
   let removed = false;
+  let changed = false;
   const result = mutateProject(projectId, (project) => {
     // C2: Use fileId for removal when available (embedded files share the parent PSD path).
     // Fall back to path match for non-embedded files.
-    const removedFile = project.files.find(f => {
-      if (f.fileId && f.fileId === fileIdOrPath) return true;
-      return !f.fileId && f.path === fileIdOrPath;
-    });
+    const removedFile = project.files.find(file => (
+      matchesProjectFileIdentity(project.id, file, fileIdOrPath)
+    ));
+    if (
+      removedFile &&
+      isProjectAssetBaselineSource(removedFile) &&
+      !failedSourceRemovalAllowed
+    ) {
+      return project.files;
+    }
     if (removedFile && inferProjectFileRole(removedFile) === 'asset') {
       const exclusionKey = getAssetReviewExclusionKey(removedFile);
       if (exclusionKey) {
+        const priorExclusions = new Set(project.excludedAssetKeys || []);
         project.excludedAssetKeys = [...new Set([
           ...(project.excludedAssetKeys || []),
           exclusionKey,
         ])];
+        changed = !priorExclusions.has(exclusionKey);
       }
     }
-    project.files = project.files.filter(f => {
-      if (f.fileId && f.fileId === fileIdOrPath) return false;
-      if (!f.fileId && f.path === fileIdOrPath) return false;
-      return true;
-    });
+    if (removedFile && removedFile.assetOrigin === 'existing') {
+      return project.files;
+    }
+    project.files = project.files.filter(file => (
+      !matchesProjectFileIdentity(project.id, file, fileIdOrPath)
+    ));
     removed = !!removedFile;
+    changed = removed;
     return project.files;
   });
-  if (result && removed) {
-    reconcileProjectAssetBaselineScanSources(projectId);
+  if (result && changed) {
+    if (removed) reconcileProjectAssetBaselineScanSources(projectId);
     invalidatePackageReviewForProject(projectId);
     sendToRenderer('project:updated', { projectId });
   }
@@ -11413,8 +12120,10 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
   let acceptedSourceForScan = null;
   try {
     const result = mutateProject(projectId, (project) => {
-    if (!operation.current()) return null;
-    const idx = (project.pendingFiles || []).findIndex(f => f.path === filePath);
+      if (!operation.current()) return null;
+      const idx = (project.pendingFiles || []).findIndex(f => (
+        f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
+      ));
     if (idx === -1) return null;
     if (!isIllustratorScopedFileAllowed(project, project.pendingFiles[idx])) return null;
 
@@ -11466,8 +12175,10 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
 
 registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath) => {
   const result = mutateProject(projectId, (project) => {
-    const file = (project.pendingFiles || []).find(f => f.path === filePath);
-    project.pendingFiles = (project.pendingFiles || []).filter(f => f.path !== filePath);
+    const file = (project.pendingFiles || []).find(f => (
+      f.path === filePath || createProjectFileVisualIdentity(project.id, f) === filePath
+    ));
+    project.pendingFiles = (project.pendingFiles || []).filter(f => f !== file);
     if (file) {
       recordPendingFileDecision(project, file, 'rejected');
     }
@@ -13390,7 +14101,7 @@ function invalidatePackageReviewForProject(projectId) {
   currentPackageReviewTokenByProject.delete(projectId);
 }
 
-function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = null) {
+async function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = null) {
   if (!manifest.materializable || !manifest.plan || !manifest.manifestKey) {
     throw new Error('Cannot issue an unmaterializable package review');
   }
@@ -13405,13 +14116,18 @@ function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = nu
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
+  const visualRevisions = await Promise.all(
+    manifest.files.map(file => createProjectFileVisualRevision(projectId, file))
+  );
   return {
     token,
     projectId,
-    files: manifest.entries.map(entry => ({
+    files: manifest.entries.map((entry, index) => ({
       name: entry.displayName,
       ext: entry.ext,
       embedded: entry.embedded,
+      visualIdentity: createProjectFileVisualIdentity(projectId, manifest.files[index]),
+      visualRevision: visualRevisions[index],
     })),
     totalFiles: manifest.entries.length,
     materializable: true,
@@ -13425,13 +14141,18 @@ function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = nu
   };
 }
 
-function createUnavailablePackageReview(projectId, manifest) {
+async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
+  const visualRevisions = await Promise.all(
+    manifest.files.map(file => createProjectFileVisualRevision(projectId, file))
+  );
   return {
     projectId,
     files: manifest.entries.map((entry, index) => ({
       name: entry.displayName,
       status: manifest.entryStatuses[index] || 'unavailable',
+      visualIdentity: createProjectFileVisualIdentity(projectId, manifest.files[index]),
+      visualRevision: visualRevisions[index],
     })),
     totalFiles: manifest.entries.length,
     materializable: false,
@@ -13439,10 +14160,10 @@ function createUnavailablePackageReview(projectId, manifest) {
   };
 }
 
-function createPackageReviewResponse(projectId, manifest, destinationBinding = null) {
+async function createPackageReviewResponse(projectId, manifest, destinationBinding = null) {
   return manifest.materializable
-    ? issuePackageReviewSnapshot(projectId, manifest, destinationBinding)
-    : createUnavailablePackageReview(projectId, manifest);
+    ? await issuePackageReviewSnapshot(projectId, manifest, destinationBinding)
+    : await createUnavailablePackageReview(projectId, manifest);
 }
 
 function consumePackageReviewSnapshot(projectId, token) {
@@ -13469,7 +14190,7 @@ async function refreshedPackageReviewChangedResult(projectId) {
   const manifest = await buildCanonicalPackageReviewManifest(projectId);
   return {
     error: 'package_review_changed',
-    ...(manifest.error ? {} : { review: createPackageReviewResponse(projectId, manifest) }),
+    ...(manifest.error ? {} : { review: await createPackageReviewResponse(projectId, manifest) }),
   };
 }
 
@@ -13499,12 +14220,12 @@ registerTrustedIpcHandler('projects:prepare-package-review', async (event, proje
     if (typeof outputPath !== 'string' || !outputPath) return { error: 'package_output_changed' };
     try {
       const destination = inspectPrivatePackageDestination(outputPath, manifest.plan.destinationFolderName);
-      return createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination));
+      return await createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination));
     } catch (_) {
       return { error: 'package_output_changed' };
     }
   }
-  return createPackageReviewResponse(projectId, manifest);
+  return await createPackageReviewResponse(projectId, manifest);
 });
 
 class PackageReviewChangedError extends Error {
@@ -13726,11 +14447,11 @@ function privatePackageDestinationBindingMatches(binding, destination) {
   return packageReviewFingerprintsMatch(binding, getPrivatePackageDestinationBinding(destination));
 }
 
-function createPackageDestinationReviewChangedResult(projectId, manifest, destination) {
+async function createPackageDestinationReviewChangedResult(projectId, manifest, destination) {
   return {
     error: 'package_review_changed',
     reason: 'package_destination_changed',
-    review: createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination)),
+    review: await createPackageReviewResponse(projectId, manifest, getPrivatePackageDestinationBinding(destination)),
   };
 }
 
@@ -13739,7 +14460,7 @@ async function refreshedPackageDestinationReviewChangedResult(projectId, outputP
   if (manifest.error) return { error: manifest.error };
   try {
     const destination = inspectPrivatePackageDestination(outputPath, manifest.plan.destinationFolderName);
-    return createPackageDestinationReviewChangedResult(projectId, manifest, destination);
+    return await createPackageDestinationReviewChangedResult(projectId, manifest, destination);
   } catch (_) {
     return { error: 'package_output_changed' };
   }
@@ -14270,13 +14991,13 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   const manifest = await buildCanonicalPackageReviewManifest(id);
   if (manifest.error) return { error: manifest.error };
   if (!manifest.materializable) {
-    return { error: 'package_review_changed', review: createUnavailablePackageReview(id, manifest) };
+    return { error: 'package_review_changed', review: await createUnavailablePackageReview(id, manifest) };
   }
   if (!isPackageActivationCurrent()) return { error: 'stale_activation' };
   if (manifest.manifestKey !== reviewResult.snapshot.manifestKey) {
     return {
       error: 'package_review_changed',
-      review: createPackageReviewResponse(id, manifest),
+      review: await createPackageReviewResponse(id, manifest),
     };
   }
   let inspectedDestination = inspectPrivatePackageDestination(
@@ -14289,7 +15010,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       ? !privatePackageDestinationBindingMatches(reviewedDestination, inspectedDestination)
       : inspectedDestination.folderName !== manifest.plan.destinationFolderName
   ) {
-    return createPackageDestinationReviewChangedResult(id, manifest, inspectedDestination);
+    return await createPackageDestinationReviewChangedResult(id, manifest, inspectedDestination);
   }
   const project = manifest.project;
   const packageFiles = manifest.files;
@@ -14311,7 +15032,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     getPrivatePackageDestinationBinding(inspectedDestination),
     currentDestination
   )) {
-    return createPackageDestinationReviewChangedResult(id, manifest, currentDestination);
+    return await createPackageDestinationReviewChangedResult(id, manifest, currentDestination);
   }
   inspectedDestination = currentDestination;
 

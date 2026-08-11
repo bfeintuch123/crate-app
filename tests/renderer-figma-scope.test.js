@@ -92,6 +92,11 @@ function createElementStub(tagName = 'div') {
   return element;
 }
 
+function getElementTreeText(element) {
+  if (!element) return '';
+  return [element.textContent || '', ...(element.children || []).map(getElementTreeText)].join(' ');
+}
+
 function createDocumentStub(elements = {}, options = {}) {
   const listeners = {};
   const body = createElementStub('body');
@@ -121,7 +126,7 @@ function createDocumentStub(elements = {}, options = {}) {
       if (selector === '.type-pill') return options.typePills || [];
       return [];
     },
-    createElement: createElementStub,
+    createElement: tagName => attach(createElementStub(tagName)),
     body,
   };
   body.ownerDocument = document;
@@ -232,6 +237,29 @@ function loadRendererHelpers(document = createDocumentStub(), windowOverrides = 
   vm.createContext(context);
   const appJs = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
   vm.runInContext(appJs, context, { filename: 'renderer/app.js' });
+  if (context.window.crate && typeof context.window.crate.getAssetWorkspace !== 'function') {
+    context.window.crate.getAssetWorkspace = async projectId => {
+      const projects = vm.runInContext('state.projects', context);
+      const project = projects.find(item => item.id === projectId) || context.testProject;
+      const present = (file, index) => ({
+        name: file.name,
+        ext: file.ext || path.extname(file.name || ''),
+        embedded: file.embedded === true,
+        linked: file.linked === true,
+        assetOrigin: file.assetOrigin,
+        projectRole: file.projectRole,
+        protectedSource: file.protectedSource === true || file.projectRole === 'source',
+        excluded: (project?.excludedAssetKeys || []).includes(file.fileId || file.path),
+        visualIdentity: file.visualIdentity || `opaque-${index}-${file.name || 'file'}`,
+        visualRevision: file.visualRevision || `revision-${index}-${file.name || 'file'}`,
+      });
+      return {
+        projectId,
+        files: (project?.files || []).map(present),
+        pendingFiles: (project?.pendingFiles || []).map(present),
+      };
+    };
+  }
   return context;
 }
 
@@ -668,7 +696,7 @@ test('renderer presents the required Existing Assets decision with source-safe c
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
   assert.equal(elements['existing-assets-modal-count'].textContent, '1 existing asset found');
   assert.equal(elements['existing-assets-modal-list'].children.length, 1);
-  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /Existing Linked\.png/);
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'Existing Linked.png');
   assert.equal(document.activeElement, elements['btn-include-existing-assets']);
   assert.equal(elements['app-sidebar'].inert, true);
   assert.equal(elements['app-main'].inert, true);
@@ -698,8 +726,10 @@ test('renderer restores focus inside the Existing Assets modal when decision per
   const renderer = loadRendererHelpers(document, { crate: {
     setExistingAssetsDecision: async () => ({ success: false, error: 'write_failed' }),
   } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
 
-  renderer.showExistingAssetsDecisionModal(project);
+  await renderer.showExistingAssetsDecisionModal(project);
   elements['btn-skip-existing-assets'].focus();
   await renderer.submitExistingAssetsDecision('skip');
 
@@ -711,7 +741,7 @@ test('renderer restores focus inside the Existing Assets modal when decision per
   assert.equal(elements['app-main'].inert, true);
 });
 
-test('renderer closes a stale Existing Assets decision when the selected project no longer requires it', () => {
+test('renderer closes a stale Existing Assets decision when the selected project no longer requires it', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const renderer = loadRendererHelpers(document, { crate: {} });
   const decisionProject = {
@@ -729,12 +759,14 @@ test('renderer closes a stale Existing Assets decision when the selected project
     assetBaseline: { status: 'empty', decision: null, establishedAt: 2 },
   };
 
-  renderer.syncExistingAssetsDecisionModal(decisionProject);
+  renderer.testProject = decisionProject;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  await renderer.syncExistingAssetsDecisionModal(decisionProject);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
   assert.equal(elements['app-sidebar'].inert, true);
   assert.equal(elements['app-main'].inert, true);
 
-  renderer.syncExistingAssetsDecisionModal(readyProject);
+  await renderer.syncExistingAssetsDecisionModal(readyProject);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
   assert.equal(elements['app-sidebar'].inert, false);
   assert.equal(elements['app-main'].inert, false);
@@ -783,9 +815,442 @@ test('renderer persists Skip Existing and hides excluded assets without removing
   assert.equal(elements['app-sidebar'].inert, false);
   assert.equal(elements['app-main'].inert, false);
   assert.equal(document.activeElement, elements['btn-package']);
-  assert.equal(elements['file-list'].children.length, 1);
-  assert.match(elements['file-list'].children[0].innerHTML, /Existing Project\.ai/);
-  assert.doesNotMatch(elements['file-list'].children[0].innerHTML, /Existing Linked\.png/);
+  assert.equal(elements['project-file-list'].children.length, 1);
+  assert.equal(elements['project-file-list'].children[0].children[1].textContent, 'Existing Project.ai');
+  assert.equal(elements['existing-assets-list'].children.length, 1);
+  assert.equal(elements['existing-assets-list'].children[0].children[1].textContent, 'Existing Linked.png');
+  assert.equal(elements['existing-assets-list'].children[0].className.includes('is-excluded'), true);
+});
+
+test('Current Project separates protected sources, Existing Assets, and Added While Working without routine Add or Skip controls', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'visual-workspace-groups',
+    files: [
+      { name: 'Workspace.ai', path: '/synthetic/Workspace.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Existing.png', path: '/synthetic/Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' },
+      { name: 'Added.png', path: '/synthetic/Added.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'included', decision: 'include' },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project);
+
+  assert.equal(elements['project-file-list'].children.length, 1);
+  assert.equal(elements['existing-assets-list'].children.length, 1);
+  assert.equal(elements['added-assets-list'].children.length, 1);
+  assert.equal(getElementTreeText(elements['project-file-list']).includes('Protected'), true);
+  assert.equal(getElementTreeText(elements['existing-assets-list']).includes('Existing.png'), true);
+  assert.equal(getElementTreeText(elements['added-assets-list']).includes('Added.png'), true);
+  assert.equal(getElementTreeText(elements['added-assets-list']).includes('+ Add'), false);
+  assert.equal(getElementTreeText(elements['added-assets-list']).includes('Skip'), false);
+  const sourceButtons = elements['project-file-list'].children[0].children.filter(child => child.tagName === 'BUTTON');
+  assert.equal(sourceButtons.length, 0);
+  const removeButton = elements['added-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  assert.equal(removeButton.textContent, '\u00D7');
+  assert.equal(removeButton.getAttribute('aria-label'), 'Exclude Added.png from this project');
+});
+
+test('Existing Assets batch controls use the persisted cohort decision IPC and preserve excluded rows', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const existing = { name: 'Existing.png', path: '/synthetic/Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' };
+  const project = {
+    id: 'visual-workspace-batch',
+    files: [
+      { name: 'Workspace.ai', path: '/synthetic/Workspace.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' },
+      existing,
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'included', decision: 'include' },
+  };
+  const skippedProject = {
+    ...project,
+    excludedAssetKeys: [existing.path],
+    assetBaseline: { status: 'skipped', decision: 'skip' },
+  };
+  const decisions = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    setExistingAssetsDecision: async (...args) => {
+      decisions.push(args);
+      return { success: true, project: skippedProject };
+    },
+    getProjects: async () => [skippedProject],
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+
+  assert.equal(await renderer.submitExistingAssetsBatchDecision('skip'), true);
+
+  assert.deepEqual(decisions, [[project.id, 'skip']]);
+  assert.equal(elements['existing-assets-list'].children.length, 1);
+  assert.equal(elements['existing-assets-list'].children[0].className.includes('is-excluded'), true);
+  assert.equal(elements['btn-include-all-existing'].disabled, false);
+  assert.equal(elements['btn-skip-all-existing'].disabled, true);
+});
+
+test('per-file Existing Asset exclusion keeps the row available for Include All restoration', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const source = {
+    name: 'Workspace.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source',
+    protectedSource: true, visualIdentity: 'source-identity', visualRevision: 'source-revision',
+  };
+  const existing = {
+    name: 'Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset',
+    protectedSource: false, excluded: false,
+    visualIdentity: 'existing-identity', visualRevision: 'existing-revision',
+  };
+  const project = {
+    id: 'existing-x-restoration',
+    name: 'Existing X restoration',
+    type: 'branding',
+    status: 'watching',
+    files: [source, existing],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'included', decision: 'include' },
+  };
+  const updatedProject = {
+    ...project,
+    files: [source, { ...existing, excluded: true }],
+    excludedAssetKeys: ['existing-key'],
+  };
+  const removals = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async (...args) => { removals.push(args); },
+    getProjects: async () => [updatedProject],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: updatedProject.files, pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+  const removeButton = elements['existing-assets-list'].children[0].children.find(child => child.tagName === 'BUTTON');
+  removeButton.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(removals, [[project.id, existing.visualIdentity]]);
+  assert.equal(elements['existing-assets-list'].children.length, 1);
+  assert.equal(elements['existing-assets-list'].children[0].className.includes('is-excluded'), true);
+  assert.equal(elements['btn-include-all-existing'].disabled, false);
+  assert.equal(elements['btn-skip-all-existing'].disabled, true);
+});
+
+test('failed first-scan sources expose accessible recovery while healthy sources remain protected', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const failedSource = {
+    name: 'Failed Source.ai', ext: '.ai', assetOrigin: null, projectRole: 'source',
+    protectedSource: true, sourceRecoveryAllowed: true,
+    visualIdentity: 'failed-source-identity', visualRevision: 'failed-source-revision',
+  };
+  const project = {
+    id: 'failed-source-recovery',
+    name: 'Failed source recovery',
+    type: 'branding',
+    status: 'watching',
+    files: [failedSource],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'awaiting-first-scan', decision: null, establishedAt: null },
+  };
+  const recoveredProject = {
+    ...project,
+    files: [],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 2 },
+  };
+  const removals = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    removeFile: async (...args) => { removals.push(args); },
+    getProjects: async () => [recoveredProject],
+    getAssetWorkspace: async () => ({ projectId: project.id, files: [], pendingFiles: [] }),
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  renderer.renderAssetWorkspace(project, {}, project.files);
+
+  const failedRow = elements['project-file-list'].children[0];
+  const recoveryButton = failedRow.children.find(child => child.className === 'app-file-recovery');
+  assert.equal(getElementTreeText(failedRow).includes('Scan failed'), true);
+  assert.equal(recoveryButton.textContent, 'Remove');
+  assert.equal(
+    recoveryButton.getAttribute('aria-label'),
+    'Remove Failed Source.ai and recover this project from the failed first scan'
+  );
+  recoveryButton.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(removals, [[project.id, failedSource.visualIdentity]]);
+  assert.equal(elements['project-file-list'].children[0].className, 'asset-panel-empty');
+
+  const healthySource = {
+    ...failedSource,
+    name: 'Healthy Source.ai',
+    sourceRecoveryAllowed: false,
+    visualIdentity: 'healthy-source-identity',
+    visualRevision: 'healthy-source-revision',
+  };
+  const healthyProject = {
+    ...project,
+    id: 'healthy-source-protection',
+    files: [healthySource],
+    assetBaseline: { status: 'empty', decision: null, establishedAt: 3 },
+  };
+  renderer.renderAssetWorkspace(healthyProject, {}, healthyProject.files);
+  const healthyRow = elements['project-file-list'].children[0];
+  assert.equal(getElementTreeText(healthyRow).includes('Protected'), true);
+  assert.equal(healthyRow.children.some(child => child.tagName === 'BUTTON'), false);
+});
+
+test('file visuals prefer raster thumbnails, then native icons, then bounded extension badges', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const pngData = `data:image/png;base64,${Buffer.from('visual').toString('base64')}`;
+  const project = {
+    id: 'visual-fallback-order',
+    files: [
+      { name: 'Photo.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset', visualIdentity: 'visual-Photo.png', visualRevision: 'revision-photo' },
+      { name: 'Layout.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'asset', visualIdentity: 'visual-Layout.ai', visualRevision: 'revision-layout' },
+      { name: 'Archive.xyz', ext: '.xyz', assetOrigin: 'added', projectRole: 'asset', visualIdentity: 'visual-Archive.xyz', visualRevision: 'revision-archive' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    getFileVisual: async (projectId, identity, revision) => {
+      assert.equal(projectId, project.id);
+      assert.match(revision, /^revision-/);
+      if (identity.endsWith('Photo.png')) return { kind: 'thumbnail', dataUrl: pngData };
+      if (identity.endsWith('Layout.ai')) return { kind: 'icon', dataUrl: pngData };
+      return { kind: 'fallback' };
+    },
+  } });
+
+  renderer.renderAssetWorkspace(project);
+  await new Promise(resolve => setImmediate(resolve));
+
+  const [photoRow, layoutRow, archiveRow] = elements['added-assets-list'].children;
+  assert.equal(photoRow.children[0].classList.contains('is-thumbnail'), true);
+  assert.equal(photoRow.children[0].dataset.fileIdentity, undefined);
+  assert.equal(layoutRow.children[0].classList.contains('is-icon'), true);
+  assert.equal(archiveRow.children[0].children[0].textContent, 'XYZ');
+});
+
+test('file visual acquisition deduplicates in flight work, caps concurrency, and evicts old cache entries', async () => {
+  const deferred = [];
+  let active = 0;
+  let maxActive = 0;
+  let calls = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: async (projectId, identity) => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      return await new Promise(resolve => deferred.push(() => {
+        active -= 1;
+        resolve({ kind: 'fallback', projectId, identity });
+      }));
+    },
+  } });
+
+  const duplicateA = renderer.requestFileVisual('visual-project', 'shared-identity', 'shared-revision');
+  const duplicateB = renderer.requestFileVisual('visual-project', 'shared-identity', 'shared-revision');
+  const requests = [duplicateA, duplicateB];
+  for (let index = 0; index < 11; index += 1) {
+    requests.push(renderer.requestFileVisual('visual-project', `identity-${index}`, `revision-${index}`));
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 4);
+  while (deferred.length || active > 0) {
+    const batch = deferred.splice(0);
+    batch.forEach(resolve => resolve());
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await Promise.all(requests);
+  assert.equal(maxActive, 4);
+  assert.equal(calls, 12);
+  await renderer.requestFileVisual('visual-project', 'shared-identity', 'shared-revision');
+  assert.equal(calls, 12);
+
+  let evictionCalls = 0;
+  const evictionRenderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: async () => {
+      evictionCalls += 1;
+      return { kind: 'fallback' };
+    },
+  } });
+  for (let index = 0; index < 129; index += 1) {
+    await evictionRenderer.requestFileVisual('eviction-project', `identity-${index}`, `revision-${index}`);
+  }
+  const beforeRevisit = vm.runInContext('fileVisualCache.size', evictionRenderer);
+  assert.equal(beforeRevisit, 128);
+  assert.equal(evictionCalls, 129);
+  await evictionRenderer.requestFileVisual('eviction-project', 'identity-0', 'revision-0');
+  assert.equal(evictionCalls, 130);
+  assert.equal(vm.runInContext('fileVisualCache.size', evictionRenderer), 128);
+});
+
+test('file visual queue stays bounded and cancels stale queued work on project switch', async () => {
+  const deferred = [];
+  const calls = [];
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: (projectId, identity) => {
+      calls.push([projectId, identity]);
+      return new Promise(resolve => deferred.push(resolve));
+    },
+  } });
+  renderer.setActiveFileVisualProject('old-project');
+  const requests = [];
+  for (let index = 0; index < 140; index += 1) {
+    requests.push(renderer.requestFileVisual('old-project', `old-${index}`, `old-revision-${index}`));
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 4);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 132);
+
+  renderer.setActiveFileVisualProject('new-project');
+  const selectedRequest = renderer.requestFileVisual('new-project', 'selected', 'selected-revision');
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 1);
+  deferred.shift()({ kind: 'fallback' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.at(-1), ['new-project', 'selected']);
+
+  while (deferred.length) deferred.shift()({ kind: 'fallback' });
+  await new Promise(resolve => setImmediate(resolve));
+  while (deferred.length) deferred.shift()({ kind: 'fallback' });
+  await Promise.all([...requests, selectedRequest]);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 0);
+});
+
+test('file visual scheduler releases slots after synchronous bridge failures', async () => {
+  let calls = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: () => {
+      calls += 1;
+      if (calls === 1) throw new Error('synthetic synchronous bridge failure');
+      return { kind: 'fallback' };
+    },
+  } });
+  renderer.setActiveFileVisualProject('sync-project');
+  assert.equal(
+    (await renderer.requestFileVisual('sync-project', 'first', 'first-revision')).kind,
+    'fallback'
+  );
+  assert.equal(
+    (await renderer.requestFileVisual('sync-project', 'second', 'second-revision')).kind,
+    'fallback'
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2);
+  assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 0);
+});
+
+test('file visual cache keys source revisions and invalidation clears the current project cache', async () => {
+  let calls = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: async () => {
+      calls += 1;
+      return { kind: 'fallback' };
+    },
+  } });
+  renderer.setActiveFileVisualProject('revision-project');
+  await renderer.requestFileVisual('revision-project', 'same-file', 'revision-one');
+  await renderer.requestFileVisual('revision-project', 'same-file', 'revision-one');
+  assert.equal(calls, 1);
+  await renderer.requestFileVisual('revision-project', 'same-file', 'revision-two');
+  assert.equal(calls, 2);
+  renderer.invalidateFileVisualProject('revision-project');
+  await renderer.requestFileVisual('revision-project', 'same-file', 'revision-two');
+  assert.equal(calls, 3);
+});
+
+test('explicit PDF baseline source is protected while a linked PDF remains removable', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'pdf-source-presentation' };
+  const files = [
+    {
+      name: 'Project Brief.pdf', ext: '.pdf', projectRole: 'asset', assetOrigin: 'added',
+      protectedSource: true, visualIdentity: 'pdf-source-identity', visualRevision: 'pdf-source-revision',
+    },
+    {
+      name: 'Linked Reference.pdf', ext: '.pdf', projectRole: 'asset', assetOrigin: 'existing',
+      protectedSource: false, visualIdentity: 'pdf-linked-identity', visualRevision: 'pdf-linked-revision',
+    },
+  ];
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {}, files);
+
+  assert.equal(elements['project-file-list'].children.length, 1);
+  assert.equal(elements['project-file-list'].children[0].children[1].textContent, 'Project Brief.pdf');
+  assert.equal(elements['project-file-list'].children[0].children.some(child => child.tagName === 'BUTTON'), false);
+  assert.equal(elements['existing-assets-list'].children.length, 1);
+  assert.equal(elements['existing-assets-list'].children[0].children[1].textContent, 'Linked Reference.pdf');
+  assert.equal(elements['existing-assets-list'].children[0].children.some(child => child.tagName === 'BUTTON'), true);
+});
+
+test('Package Review uses the same project-owned visual identity without rendering private paths', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const pngData = `data:image/png;base64,${Buffer.from('review').toString('base64')}`;
+  const project = {
+    id: 'review-visual-project',
+    name: 'Review Visuals',
+    files: [{ name: 'Review.ai', path: 'stable-review-identity' }],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    getFileVisual: async (projectId, identity, revision) => {
+      assert.equal(projectId, project.id);
+      assert.equal(identity, 'stable-review-identity');
+      assert.equal(revision, 'stable-review-revision');
+      return { kind: 'icon', dataUrl: pngData };
+    },
+  } });
+
+  renderer.renderPackageReview(project, {
+    token: '00000000-0000-4000-8000-000000000111',
+    materializable: true,
+    files: [{ name: 'Review.ai', ext: '.ai', visualIdentity: 'stable-review-identity', visualRevision: 'stable-review-revision' }],
+  });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const item = elements['modal-file-list'].children[0];
+  assert.equal(item.children[0].classList.contains('is-icon'), true);
+  assert.equal(getElementTreeText(item).includes('/synthetic/'), false);
+  assert.equal(item.children[1].textContent, 'Review.ai');
+});
+
+test('Package Review binds duplicate display names to distinct authoritative visual identities', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const calls = [];
+  const project = { id: 'duplicate-review-visuals', name: 'Duplicate Review', files: [] };
+  const renderer = loadRendererHelpers(document, { crate: {
+    getFileVisual: async (projectId, identity, revision) => {
+      calls.push([projectId, identity, revision]);
+      return { kind: 'fallback' };
+    },
+  } });
+
+  renderer.renderPackageReview(project, {
+    token: '00000000-0000-4000-8000-000000000112',
+    materializable: true,
+    files: [
+      { name: 'Shared.png', ext: '.png', visualIdentity: 'opaque-directory-a', visualRevision: 'revision-directory-a' },
+      { name: 'Shared.png', ext: '.png', visualIdentity: 'opaque-directory-b', visualRevision: 'revision-directory-b' },
+    ],
+  });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(calls, [
+    [project.id, 'opaque-directory-a', 'revision-directory-a'],
+    [project.id, 'opaque-directory-b', 'revision-directory-b'],
+  ]);
+  assert.equal(elements['modal-file-list'].children.length, 2);
+  assert.equal(getElementTreeText(elements['modal-file-list']).includes('/synthetic/'), false);
 });
 
 test('renderer project counts exclude assets skipped by the Existing Assets decision', () => {
@@ -802,7 +1267,7 @@ test('renderer project counts exclude assets skipped by the Existing Assets deci
   assert.equal(renderer.getStatusLabel(project), 'Paused · 1 file so far');
 });
 
-test('renderer blocks Package Review until the Existing Assets decision is recorded', () => {
+test('renderer blocks Package Review until the Existing Assets decision is recorded', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
     id: 'blocked-existing-assets-project',
@@ -829,6 +1294,7 @@ test('renderer blocks Package Review until the Existing Assets decision is recor
   renderer.setupEventListeners();
 
   elements['btn-package'].click();
+  await new Promise(resolve => setImmediate(resolve));
 
   assert.equal(prepareCalls, 0);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
@@ -927,7 +1393,8 @@ test('notification-triggered packaging closes another project existing-assets de
     state.projects = [testDecisionProject];
     state.selectedProjectId = testDecisionProject.id;
   `, renderer);
-  renderer.syncExistingAssetsDecisionModal(decisionProject);
+  renderer.testProject = decisionProject;
+  await renderer.syncExistingAssetsDecisionModal(decisionProject);
   renderer.setupMainProcessListeners();
 
   await packageTrigger({ projectId: readyProject.id });
@@ -983,7 +1450,7 @@ test('an earlier decision completion cannot dismiss a later project Existing Ass
   await packageTrigger({ projectId: projectB.id });
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /B\.png/);
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'B.png');
   assert.equal(elements['btn-include-existing-assets'].disabled, false);
 
   resolveDecisionA({ success: true, project: projectA });
@@ -991,7 +1458,7 @@ test('an earlier decision completion cannot dismiss a later project Existing Ass
 
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.match(elements['existing-assets-modal-list'].children[0].innerHTML, /B\.png/);
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'B.png');
 });
 
 test('Package Review routes a newly settled baseline to the sole Existing Assets decision dialog', async () => {
@@ -1611,9 +2078,10 @@ test('Pending-only live session renders active review state instead of empty tra
 
   assert.equal(elements['pending-section'].classList.contains('hidden'), false);
   assert.equal(elements['pending-file-list'].children.length, 1);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('Save to make package-ready'), true);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('provenance'), false);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
+  const pendingText = getElementTreeText(elements['pending-file-list'].children[0]);
+  assert.equal(pendingText.includes('Save to make package-ready'), true);
+  assert.equal(pendingText.includes('provenance'), false);
+  assert.equal(pendingText.includes('lsof'), false);
   assert.equal(elements['file-list'].innerHTML.includes('No package-ready files yet'), true);
   assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
 });
@@ -1657,12 +2125,13 @@ test('Needs-save live candidates render when package-ready files already exist',
 
   assert.equal(elements['pending-section'].classList.contains('hidden'), false);
   assert.equal(elements['pending-file-list'].children.length, 1);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('IMG_5331.JPG'), true);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('Save to make package-ready'), true);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('provenance'), false);
-  assert.equal(elements['pending-file-list'].children[0].innerHTML.includes('lsof'), false);
+  const pendingText = getElementTreeText(elements['pending-file-list'].children[0]);
+  assert.equal(pendingText.includes('IMG_5331.JPG'), true);
+  assert.equal(pendingText.includes('Save to make package-ready'), true);
+  assert.equal(pendingText.includes('provenance'), false);
+  assert.equal(pendingText.includes('lsof'), false);
   assert.equal(elements['file-list'].children.length, 1);
-  assert.equal(elements['file-list'].children[0].innerHTML.includes('Bris Invitation-03 copy.ai'), true);
+  assert.equal(getElementTreeText(elements['file-list'].children[0]).includes('Bris Invitation-03 copy.ai'), true);
   assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
 });
 

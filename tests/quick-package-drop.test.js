@@ -61,13 +61,17 @@ test('preload forwards Existing Assets decisions and authoritative Package Revie
   const projectId = 'project-review';
   const outputPath = '/private/tmp/crate-synthetic-output';
   const reviewToken = '00000000-0000-4000-8000-000000000123';
+  const fileIdentity = 'stable-file-identity';
+  const fileRevision = 'stable-file-revision';
 
+  await bridge.getFileVisual(projectId, fileIdentity, fileRevision);
   await bridge.setExistingAssetsDecision(projectId, 'skip');
   await bridge.preparePackageReview(projectId);
   await bridge.preparePackageReview(projectId, outputPath);
   await bridge.packageProject(projectId, outputPath, reviewToken);
 
   assert.deepEqual(invocations, [
+    { channel: 'projects:get-file-visual', args: [projectId, fileIdentity, fileRevision] },
     { channel: 'projects:set-existing-assets-decision', args: [projectId, 'skip'] },
     { channel: 'projects:prepare-package-review', args: [projectId] },
     { channel: 'projects:prepare-package-review', args: [projectId, outputPath] },

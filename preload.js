@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('crate', {
   startWatching: (id) => ipcRenderer.invoke('projects:start-watching', id),
   pauseProject: (id) => ipcRenderer.invoke('projects:pause', id),
   getFiles: (id) => ipcRenderer.invoke('projects:get-files', id),
+  getAssetWorkspace: (projectId) => ipcRenderer.invoke('projects:get-asset-workspace', projectId),
+  getFileVisual: (projectId, visualIdentity, visualRevision) => ipcRenderer.invoke('projects:get-file-visual', projectId, visualIdentity, visualRevision),
   setExistingAssetsDecision: (projectId, decision) => ipcRenderer.invoke('projects:set-existing-assets-decision', projectId, decision),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
   addFiles: (projectId) => ipcRenderer.invoke('projects:add-files', projectId),

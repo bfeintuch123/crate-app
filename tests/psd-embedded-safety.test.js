@@ -465,7 +465,11 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
     const corruptReview = await callIpcRaw('projects:prepare-package-review', projectId);
     assert.equal(corruptReview.materializable, false);
     assert.equal(corruptReview.token, undefined);
-    assert.deepEqual(corruptReview.files, [{ name: 'Embedded.png', status: 'unavailable' }]);
+    assert.deepEqual(
+      corruptReview.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'Embedded.png', status: 'unavailable' }]
+    );
+    assert.match(corruptReview.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
 
     currentPsdFixture = { children: [], linkedFiles: [] };
     const missingReview = await callIpcRaw('projects:prepare-package-review', projectId);
@@ -485,7 +489,11 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
     assert.equal(removed.error, 'package_review_changed');
     assert.equal(removed.review.materializable, false);
     assert.equal(removed.review.token, undefined);
-    assert.deepEqual(removed.review.files, [{ name: 'Embedded.png', status: 'unavailable' }]);
+    assert.deepEqual(
+      removed.review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'Embedded.png', status: 'unavailable' }]
+    );
+    assert.match(removed.review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.deepEqual(fs.readdirSync(outputDir), []);
 
     currentPsdFixture = {
@@ -1205,7 +1213,11 @@ test('package copy fails closed on reviewed symlink sources without copying targ
 
     assert.equal(result.materializable, false);
     assert.equal(result.token, undefined);
-    assert.deepEqual(result.files, [{ name: 'linked-secret.ai', status: 'symlink' }]);
+    assert.deepEqual(
+      result.files.map(({ visualIdentity, visualRevision, ...file }) => file),
+      [{ name: 'linked-secret.ai', status: 'symlink' }]
+    );
+    assert.match(result.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.deepEqual(fs.readdirSync(outputDir), []);
     const project = getStoredProject('package-copy-symlink');
     assert.equal(project.status, 'watching');
