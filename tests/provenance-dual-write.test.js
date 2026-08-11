@@ -12879,6 +12879,7 @@ for (const scopeState of ['ready', 'failed']) {
       assert.equal(view.files.some(file => file.path === candidate.path), true);
     }
     await settleAssetBaselineForUnrelatedPackageTest(project.id);
+    await callIpc('projects:pause', project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
     assert.equal(
       result && result.error,
