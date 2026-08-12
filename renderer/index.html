@@ -20,7 +20,7 @@
       <nav class="app-tabs" aria-label="Primary">
         <button class="app-tab active" data-tab="projects">Projects</button>
         <button class="app-tab" data-tab="quick-package">Quick Package</button>
-        <button class="app-tab" data-tab="current-project">Current Project</button>
+        <button class="app-tab" data-tab="current-project">Project Workspace</button>
       </nav>
 
       <div class="sidebar-spacer"></div>
@@ -125,7 +125,7 @@
         </div>
       </div>
 
-      <!-- Current Project Tab -->
+      <!-- Project Workspace Tab -->
       <div class="tab-content" id="tab-current-project">
         <div id="files-no-project" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
@@ -188,7 +188,7 @@
           </div>
 
           <section class="asset-review-workspace hidden" id="asset-review-workspace" aria-labelledby="asset-review-heading">
-            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Current Project</button>
+            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Project Workspace</button>
             <div class="asset-review-header">
               <div>
                 <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
@@ -323,7 +323,7 @@
               </div>
               <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
               <button class="app-btn outline" id="btn-figma-scan-now" style="width:100%;margin-top:8px;">Scan Now</button>
-              <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Current Project to add or change project Figma assets.</div>
+              <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Project Workspace to add or change project Figma assets.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
             <div id="figma-disconnected">
@@ -339,7 +339,7 @@
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
               <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Reconnect Figma</button>
               <div class="figma-benefit-hint">
-                Once connected, add Figma file URLs inside Current Project.
+                Once connected, add Figma file URLs inside Project Workspace.
               </div>
             </div>
           </div>
@@ -396,7 +396,7 @@
           </div>
           <div class="help-card">
             <div class="help-card-title">Figma</div>
-            <div class="settings-desc">Connect Figma in Settings, then add a Figma link from Current Project. Current Page Only is the default; Entire File is opt-in.</div>
+            <div class="settings-desc">Connect Figma in Settings, then add a Figma link from Project Workspace. Current Page Only is the default; Entire File is opt-in.</div>
           </div>
         </div>
       </div>

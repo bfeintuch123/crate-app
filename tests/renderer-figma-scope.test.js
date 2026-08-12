@@ -2417,6 +2417,17 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
 });
 
+test('navigation uses Projects, Quick Package, and Project Workspace consistently', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const visibleHtml = html.replace(/<!--[\s\S]*?-->/g, '');
+
+  assert.match(visibleHtml, /data-tab="projects">Projects<\/button>/);
+  assert.match(visibleHtml, /data-tab="quick-package">Quick Package<\/button>/);
+  assert.match(visibleHtml, /data-tab="current-project">Project Workspace<\/button>/);
+  assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
+  assert.equal(visibleHtml.includes('Current Project'), false);
+});
+
 test('renderer security policy permits only local and bounded data URL file visuals', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const policy = html.match(/http-equiv="Content-Security-Policy" content="([^"]+)"/)?.[1] || '';

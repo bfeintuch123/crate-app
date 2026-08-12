@@ -254,7 +254,7 @@ function renderProjectRows() {
       <button class="project-delete" data-id="${project.id}" title="Remove project">&times;</button>
     `;
 
-    // Click row -> go to Current Project
+    // Click row -> go to Project Workspace
     row.addEventListener('click', (e) => {
       if (e.target.classList.contains('project-pill') || e.target.classList.contains('project-delete')) return;
       state.selectedProjectId = project.id;
@@ -2541,7 +2541,7 @@ function setupEventListeners() {
     if (e.key === 'Escape') hideNewProjectForm();
   });
 
-  // Current Project tab
+  // Project Workspace tab
   $('#btn-add-files').addEventListener('click', async () => {
     if (!state.selectedProjectId) {
       showToast('Select a project first');
