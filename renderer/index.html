@@ -134,61 +134,121 @@
         </div>
 
         <div id="files-view" class="hidden">
-          <div class="app-label">Current Project</div>
-          <div class="app-project-name" id="files-project-name"></div>
-          <div class="app-status" id="files-status-bar">
-            <div class="app-dot" id="files-status-dot"></div>
-            <span class="app-status-text" id="files-status-text">Watching &middot; 0 files tracked</span>
-          </div>
-          <div class="privacy-hint subtle">
-            Crate only sees files opened by design apps during this session.
-          </div>
-          <div id="files-figma-scope" class="figma-link-row" style="margin-top:8px;" title="Edit Figma link"></div>
-          <div id="files-figma-warning" class="figma-warning-card hidden"></div>
-
-          <!-- Tier 2: files awaiting user review -->
-          <div id="pending-section" class="hidden">
-            <div class="pending-header">Files waiting for review</div>
-            <div id="pending-file-list"></div>
-          </div>
-
-          <div class="asset-workspace" id="file-list" aria-label="Project assets">
-            <section class="asset-panel project-file-panel" id="project-file-section" aria-labelledby="project-file-heading">
-              <div class="asset-panel-header">
-                <div>
-                  <h2 class="asset-panel-title" id="project-file-heading">Project File</h2>
+          <div class="project-dashboard" id="project-dashboard">
+            <header class="project-dashboard-header">
+              <div>
+                <div class="app-project-name" id="files-project-name"></div>
+                <div class="app-status project-dashboard-status" id="files-status-bar">
+                  <div class="app-dot" id="files-status-dot"></div>
+                  <span class="app-status-text" id="files-status-text">Watching</span>
                 </div>
-                <span class="asset-panel-count" id="project-file-count"></span>
               </div>
-              <div class="asset-file-list" id="project-file-list" role="list"></div>
-            </section>
+              <div class="project-dashboard-alert hidden" id="project-linking-alert" role="status"></div>
+            </header>
 
-            <section class="asset-panel" id="existing-assets-section" aria-labelledby="existing-assets-heading">
-              <div class="asset-panel-header">
-                <div>
-                  <h2 class="asset-panel-title" id="existing-assets-heading">Existing Assets</h2>
+            <div class="project-dashboard-controls">
+              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link"></div>
+              <div id="files-figma-warning" class="figma-warning-card hidden"></div>
+            </div>
+
+            <div class="asset-metric-grid" aria-label="Asset summary">
+              <div class="asset-metric existing"><strong id="metric-existing-count">0</strong><span>Existing</span></div>
+              <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added while working</span></div>
+              <div class="asset-metric missing"><strong id="metric-missing-count">0</strong><span>Needs linking</span></div>
+              <div class="asset-metric excluded"><strong id="metric-excluded-count">0</strong><span>Excluded</span></div>
+            </div>
+
+            <div class="project-dashboard-action-row">
+              <section class="recent-assets" aria-labelledby="recent-assets-heading">
+                <h2 id="recent-assets-heading">Recently Found</h2>
+                <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
+              </section>
+              <button type="button" class="app-btn review-assets-button" id="btn-review-assets">Review Assets</button>
+            </div>
+
+            <div class="project-dashboard-grid">
+              <section class="working-files-panel" id="project-file-section" aria-labelledby="project-file-heading">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="project-file-heading">Working Files</h2>
+                  <span class="asset-panel-count" id="project-file-count"></span>
                 </div>
-                <span class="asset-panel-count" id="existing-assets-count"></span>
+                <div class="asset-file-list working-file-list" id="project-file-list" role="list"></div>
+              </section>
+
+              <aside class="asset-origin-summary" aria-labelledby="asset-origin-heading">
+                <h2 id="asset-origin-heading">Where Assets Came From</h2>
+                <dl id="asset-origin-list"></dl>
+              </aside>
+            </div>
+
+            <div class="project-package-actions">
+              <button class="app-btn" id="btn-package">Package Project</button>
+              <button class="app-btn outline" id="btn-add-files">+ Add Files</button>
+            </div>
+          </div>
+
+          <section class="asset-review-workspace hidden" id="asset-review-workspace" aria-labelledby="asset-review-heading">
+            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Current Project</button>
+            <div class="asset-review-header">
+              <div>
+                <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
+                <p>Everything is included automatically. Use &times; only when something does not belong.</p>
               </div>
+              <label class="asset-review-search">
+                <span class="sr-only">Search assets</span>
+                <input type="search" id="asset-review-search" placeholder="Search by name or type">
+              </label>
+            </div>
+
+            <div class="asset-review-filters" id="asset-review-filters" role="group" aria-label="Filter assets">
+              <button type="button" class="asset-filter active" data-asset-filter="all" aria-pressed="true">All <span id="filter-count-all">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="existing" aria-pressed="false">Existing <span id="filter-count-existing">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="added" aria-pressed="false">Added <span id="filter-count-added">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Linking <span id="filter-count-missing">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="excluded" aria-pressed="false">Excluded <span id="filter-count-excluded">0</span></button>
+            </div>
+
+            <div class="asset-review-toolbar">
+              <div id="asset-review-summary">0 assets</div>
               <div class="asset-panel-actions" aria-label="Existing Assets controls">
-                <button type="button" class="asset-batch-button" id="btn-include-all-existing">Include All</button>
-                <button type="button" class="asset-batch-button" id="btn-skip-all-existing">Skip All</button>
+                <button type="button" class="asset-batch-button primary" id="btn-include-all-existing">Include All Existing</button>
+                <button type="button" class="asset-batch-button" id="btn-skip-all-existing">Skip All Existing</button>
               </div>
-              <div class="asset-file-list" id="existing-assets-list" role="list"></div>
-            </section>
+            </div>
 
-            <section class="asset-panel" id="added-assets-section" aria-labelledby="added-assets-heading">
-              <div class="asset-panel-header">
-                <div>
-                  <h2 class="asset-panel-title" id="added-assets-heading">Added While Working</h2>
+            <div class="asset-workspace" id="file-list" aria-label="Project assets">
+              <section class="asset-panel" id="existing-assets-section" aria-labelledby="existing-assets-heading">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="existing-assets-heading">Existing Assets</h2>
+                  <span class="asset-panel-count" id="existing-assets-count"></span>
                 </div>
-                <span class="asset-panel-count" id="added-assets-count"></span>
+                <div class="asset-file-list asset-card-grid" id="existing-assets-list" role="list"></div>
+              </section>
+
+              <section class="asset-panel" id="added-assets-section" aria-labelledby="added-assets-heading">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="added-assets-heading">Added While Working</h2>
+                  <span class="asset-panel-count" id="added-assets-count"></span>
+                </div>
+                <div class="asset-file-list asset-card-grid" id="added-assets-list" role="list"></div>
+              </section>
+
+              <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="pending-header">Needs Linking or Review</h2>
+                </div>
+                <div id="pending-file-list" class="missing-asset-grid"></div>
+              </section>
+            </div>
+
+            <footer class="asset-review-footer">
+              <span id="asset-review-footer-summary">0 assets included</span>
+              <div>
+                <button type="button" class="modal-btn-secondary" id="btn-review-assets-cancel">Back</button>
+                <button type="button" class="modal-btn-primary" id="btn-review-assets-continue">Continue</button>
               </div>
-              <div class="asset-file-list" id="added-assets-list" role="list"></div>
-            </section>
-          </div>
-          <button class="app-btn" id="btn-package">&#x1F4E6; Package Project</button>
-          <button class="app-btn outline" id="btn-add-files" style="margin-top:8px;">+ Add files</button>
+            </footer>
+          </section>
         </div>
       </div>
 
@@ -347,17 +407,17 @@
     <div class="modal-overlay hidden" id="modal-existing-assets" role="dialog" aria-modal="true" aria-labelledby="existing-assets-modal-title" aria-describedby="existing-assets-modal-copy" tabindex="-1">
       <div class="modal existing-assets-decision-modal">
         <div class="modal-header-area">
-          <div class="existing-assets-modal-app">CRATE</div>
-          <div class="modal-title" id="existing-assets-modal-title">Include existing assets?</div>
-          <div class="modal-subtitle" id="existing-assets-modal-copy">Crate found assets already linked to this project file.</div>
+          <div class="existing-assets-modal-app" id="existing-assets-modal-source">WORKING FILE</div>
+          <div class="modal-title" id="existing-assets-modal-title">Existing assets found</div>
+          <div class="modal-subtitle" id="existing-assets-modal-copy">Crate keeps these separate from anything you add while working. They are included automatically unless you remove them later.</div>
         </div>
         <div class="modal-body">
           <div class="existing-assets-modal-count" id="existing-assets-modal-count"></div>
           <div class="existing-assets-modal-list" id="existing-assets-modal-list" role="list"></div>
-          <div class="existing-assets-modal-note">The project file stays included either way.</div>
+          <div class="existing-assets-modal-note">Included by default &middot; no action required now</div>
           <div class="modal-actions">
-            <button class="modal-btn-secondary" id="btn-skip-existing-assets">Skip Existing</button>
-            <button class="modal-btn-primary" id="btn-include-existing-assets">Include Existing</button>
+            <button class="modal-btn-secondary" id="btn-review-existing-assets-later">Review Later</button>
+            <button class="modal-btn-primary" id="btn-include-existing-assets">Review Assets</button>
           </div>
         </div>
       </div>
@@ -365,19 +425,16 @@
 
     <!-- Package Confirmation Modal -->
     <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" aria-describedby="package-review-subtitle" tabindex="-1">
-      <div class="modal">
+      <div class="modal package-review-modal">
         <div class="modal-header-area">
           <div class="modal-title" id="package-review-title">Package Review</div>
-          <div class="modal-subtitle" id="package-review-subtitle">Confirm included files before writing output.</div>
+          <div class="modal-subtitle" id="package-review-subtitle">Confirm the visual summary before Crate creates the folder.</div>
         </div>
         <div class="modal-body">
-          <div class="modal-info-row">
+          <div class="package-review-ready" id="package-review-ready">Ready to package</div>
+          <div class="modal-info-row package-review-project">
             <div class="modal-row-label">Project</div>
             <div class="modal-row-value" id="modal-project-name"></div>
-          </div>
-          <div class="modal-info-row hidden" id="modal-figma-scope-row">
-            <div class="modal-row-label">Figma Scope</div>
-            <div class="modal-row-value" id="modal-figma-scope"></div>
           </div>
           <div id="modal-figma-warning" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
           <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
@@ -386,18 +443,33 @@
             <div class="modal-reminder-copy">Save your PowerPoint or Keynote file before packaging so Crate can include embedded images and media.</div>
             <div class="modal-reminder-note">Unsaved presentation changes may not be visible to Crate until the file is saved.</div>
           </div>
-          <div class="modal-file-list" id="modal-file-list" role="region" aria-label="Files in Package Review" tabindex="-1"></div>
-          <div class="modal-naming-box">
-            <div class="modal-naming-label">Output Folder Name</div>
-            <div class="modal-naming-preview" id="modal-folder-name"></div>
-          </div>
-          <div class="modal-folder-row">
-            <span class="modal-folder-path" id="modal-dest-path">~/Desktop/</span>
-            <button type="button" class="modal-folder-change" id="btn-change-dest">Change &rarr;</button>
+          <div class="package-review-layout">
+            <section class="package-review-assets" aria-labelledby="package-review-assets-heading">
+              <div class="modal-row-label" id="package-review-assets-heading">What Will Be Packaged</div>
+              <div class="package-review-total" id="package-review-total">0 visual assets</div>
+              <div class="package-review-apps" id="package-review-apps"></div>
+              <div class="modal-file-list" id="modal-file-list" role="region" aria-label="Files in Package Review" tabindex="-1"></div>
+            </section>
+            <aside class="package-review-summary" aria-labelledby="package-review-summary-heading">
+              <div class="modal-row-label" id="package-review-summary-heading">Package Summary</div>
+              <dl id="package-review-summary-list"></dl>
+              <div class="modal-info-row hidden" id="modal-figma-scope-row">
+                <div class="modal-row-label">Figma Scope</div>
+                <div class="modal-row-value" id="modal-figma-scope"></div>
+              </div>
+              <div class="modal-naming-box">
+                <div class="modal-naming-label">Output Folder Name</div>
+                <div class="modal-naming-preview" id="modal-folder-name"></div>
+              </div>
+              <div class="modal-folder-row">
+                <span class="modal-folder-path" id="modal-dest-path">~/Desktop/</span>
+                <button type="button" class="modal-folder-change" id="btn-change-dest">Change Folder</button>
+              </div>
+            </aside>
           </div>
           <div class="modal-actions">
-            <button class="modal-btn-secondary" id="btn-cancel-package">Cancel</button>
-            <button class="modal-btn-primary" id="btn-confirm-package">&#x1F4E6; Package Now</button>
+            <button class="modal-btn-secondary" id="btn-cancel-package">Change Selection</button>
+            <button class="modal-btn-primary" id="btn-confirm-package">Package Project</button>
           </div>
         </div>
       </div>

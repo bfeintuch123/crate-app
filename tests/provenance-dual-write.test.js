@@ -141,6 +141,7 @@ let testNativeThumbnailCalls = 0;
 let testNativeCreateFromBufferCalls = 0;
 let testBeforeNativeThumbnailResolve = null;
 let testLastFileIconPath = null;
+let testLastFileIconOptions = null;
 let testBeforeFileIconResolve = null;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
@@ -217,8 +218,9 @@ setStub('electron', () => ({
     isActive: () => testAppActive,
     getVersion: () => testAppVersion,
     getPath: () => path.join(TEST_HOME, 'user-data'),
-    getFileIcon: async filePath => {
+    getFileIcon: async (filePath, options) => {
       testLastFileIconPath = filePath;
+      testLastFileIconOptions = options;
       if (typeof testBeforeFileIconResolve === 'function') await testBeforeFileIconResolve(filePath);
       return testNativeFileIconImage;
     },
@@ -563,6 +565,9 @@ module.exports.__crateMetadataTestHooks = {
   },
   clearAssetBaselineScans() {
     assetBaselineScans.clear();
+  },
+  createRendererFilePresentation(project, file) {
+    return createRendererFilePresentation(project, file);
   },
 };
 `, filename);
@@ -2103,6 +2108,7 @@ test.afterEach(async () => {
   testNativeCreateFromBufferCalls = 0;
   testBeforeNativeThumbnailResolve = null;
   testLastFileIconPath = null;
+  testLastFileIconOptions = null;
   metadataTestHooks.clearFileVisualTypeIconCache();
   clearTrackedTimers();
 });
@@ -3280,7 +3286,20 @@ test('unchanged reviewed manifest packages exactly the reviewed files', async ()
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(
       review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'Review_Project.ai', ext: '.ai', embedded: false }]
+      [{
+        name: 'Review_Project.ai',
+        ext: '.ai',
+        embedded: false,
+        linked: false,
+        appFamily: 'illustrator',
+        sourceName: null,
+        assetOrigin: 'added',
+        projectRole: 'source',
+        protectedSource: true,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'ready',
+      }]
     );
     assert.match(review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(JSON.stringify(review).includes(tmpRoot), false);
@@ -3314,7 +3333,20 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
     const initiallyMissing = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(
       initiallyMissing.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'Missing.ai', status: 'missing' }]
+      [{
+        name: 'Missing.ai',
+        ext: '.ai',
+        embedded: false,
+        linked: false,
+        appFamily: 'illustrator',
+        sourceName: null,
+        assetOrigin: 'added',
+        projectRole: 'source',
+        protectedSource: true,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'missing',
+      }]
     );
     assert.match(initiallyMissing.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(initiallyMissing.materializable, false);
@@ -3333,7 +3365,20 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
     assert.equal(disappeared.review.token, undefined);
     assert.deepEqual(
       disappeared.review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'Missing.ai', status: 'missing' }]
+      [{
+        name: 'Missing.ai',
+        ext: '.ai',
+        embedded: false,
+        linked: false,
+        appFamily: 'illustrator',
+        sourceName: null,
+        assetOrigin: 'added',
+        projectRole: 'source',
+        protectedSource: true,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'missing',
+      }]
     );
     assert.match(disappeared.review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.equal((await callIpcRaw('projects:package', project.id, outputDir, disappeared.review.token)).error, 'package_review_required');
@@ -3359,7 +3404,20 @@ test('unsupported virtual entries are reviewable by safe name but cannot issue a
 
   const review = await callIpcRaw('projects:prepare-package-review', project.id);
   assert.deepEqual(review.files, [{
-    name: 'Virtual.ai', status: 'unmaterializable', visualIdentity: null, visualRevision: null,
+    name: 'Virtual.ai',
+    ext: '.ai',
+    embedded: false,
+    linked: false,
+    appFamily: 'illustrator',
+    sourceName: null,
+    assetOrigin: 'added',
+    projectRole: 'source',
+    protectedSource: true,
+    sourceRecoveryAllowed: false,
+    excluded: false,
+    visualIdentity: null,
+    visualRevision: null,
+    status: 'unmaterializable',
   }]);
   assert.equal(review.materializable, false);
   assert.equal(review.token, undefined);
@@ -4076,11 +4134,22 @@ function assertFailedPackageHasNoSideEffects(project, outputDir, before) {
 function assertUnavailablePackageReview(review, fileName) {
   assert.equal(review.materializable, false);
   assert.equal(review.token, undefined);
-  assert.deepEqual(
-    review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-    [{ name: fileName, status: 'unavailable' }]
-  );
-  assert.match(review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(review.files.length, 1);
+  const file = review.files[0];
+  const ext = path.extname(fileName).toLowerCase();
+  assert.equal(file.name, fileName);
+  assert.equal(file.ext, ext);
+  assert.equal(file.embedded, false);
+  assert.equal(file.linked, false);
+  assert.equal(file.appFamily, ext === '.pptx' ? 'powerpoint' : 'keynote');
+  assert.equal(file.sourceName, null);
+  assert.equal(file.assetOrigin, 'added');
+  assert.equal(file.projectRole, 'source');
+  assert.equal(file.protectedSource, true);
+  assert.equal(file.sourceRecoveryAllowed, false);
+  assert.equal(file.excluded, false);
+  assert.equal(file.status, 'unavailable');
+  assert.match(file.visualIdentity, /^[A-Za-z0-9_-]{43}$/);
 }
 
 function capturePackageSideEffects(project) {
@@ -7239,9 +7308,24 @@ test('first dependable source scan requires an existing-assets decision and bind
       includedReview.files.map(file => file.name).sort(),
       ['Existing Linked.png', 'Existing Project.ai']
     );
+    const reviewedSource = includedReview.files.find(file => file.name === 'Existing Project.ai');
+    const reviewedLinked = includedReview.files.find(file => file.name === 'Existing Linked.png');
+    assert.equal(reviewedSource.projectRole, 'source');
+    assert.equal(reviewedSource.assetOrigin, 'added');
+    assert.equal(reviewedSource.appFamily, 'illustrator');
+    assert.equal(reviewedLinked.projectRole, 'asset');
+    assert.equal(reviewedLinked.assetOrigin, 'existing');
+    assert.equal(reviewedLinked.appFamily, 'illustrator');
+    assert.equal(reviewedLinked.sourceName, 'Existing Project.ai');
 
     const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const sourcePresentation = workspace.files.find(file => file.name === 'Existing Project.ai');
     const linkedPresentation = workspace.files.find(file => file.name === 'Existing Linked.png');
+    assert.equal(sourcePresentation.appFamily, 'illustrator');
+    assert.equal(sourcePresentation.sourceName, null);
+    assert.equal(linkedPresentation.appFamily, 'illustrator');
+    assert.equal(linkedPresentation.sourceName, 'Existing Project.ai');
+    assert.equal(Object.hasOwn(linkedPresentation, 'path'), false);
     const staleBeforeExclusion = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
     await callIpcRaw('projects:remove-file', project.id, linkedPresentation.visualIdentity);
     fresh = await getProject(project.id);
@@ -7271,6 +7355,71 @@ test('first dependable source scan requires an existing-assets decision and bind
     fresh = await getProject(project.id);
     assert.equal(fresh.files.some(file => file.path === linkedPath), true);
     assert.equal(fresh.excludedAssetKeys.includes(linkedPath), true);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('renderer presentation exposes a privacy-safe Figma working-file name', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-figma-presentation-test-'));
+  try {
+    const assetPath = path.join(fixtureRoot, 'Petra_Logo_Asset.png');
+    fs.writeFileSync(assetPath, 'synthetic figma asset');
+    const presentation = await metadataTestHooks.createRendererFilePresentation(
+      { id: 'figma-working-file-presentation', files: [], excludedAssetKeys: [] },
+      {
+        path: assetPath,
+        name: 'Petra_Logo_Asset.png',
+        ext: '.png',
+        source: 'figma-auto',
+        figmaFileName: 'Petra Logo',
+        assetOrigin: 'added',
+        projectRole: 'asset',
+      }
+    );
+
+    assert.equal(presentation.appFamily, 'figma');
+    assert.equal(presentation.sourceName, 'Petra Logo');
+    assert.equal(Object.hasOwn(presentation, 'path'), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('renderer presentation rejects path-shaped and URL-shaped source metadata', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-source-name-privacy-test-'));
+  try {
+    const assetPath = path.join(fixtureRoot, 'Linked.png');
+    fs.writeFileSync(assetPath, createSyntheticPngBytes());
+    const presentation = await metadataTestHooks.createRendererFilePresentation(
+      { id: 'source-name-privacy', files: [], excludedAssetKeys: [] },
+      {
+        path: assetPath,
+        name: 'Linked.png',
+        ext: '.png',
+        source: 'ai-linked',
+        captureEvidence: { sourceName: '/Users/private/Client/Working.ai' },
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+      }
+    );
+
+    assert.equal(presentation.sourceName, null);
+    assert.equal(JSON.stringify(presentation).includes('/Users/private/'), false);
+
+    const urlPresentation = await metadataTestHooks.createRendererFilePresentation(
+      { id: 'source-name-url-privacy', files: [], excludedAssetKeys: [] },
+      {
+        path: assetPath,
+        name: 'Linked.png',
+        ext: '.png',
+        source: 'ai-linked',
+        captureEvidence: { sourceName: 'https://private.example/client/Working.ai' },
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+      }
+    );
+    assert.equal(urlPresentation.sourceName, null);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -7617,7 +7766,7 @@ test('first dependable scan of a blank source records an empty baseline without 
   }
 });
 
-test('Added While Working assets stay included by default and per-file exclusion survives rescans until Explicit Add Files restores them', async () => {
+test('Added While Working exclusions stay reviewable and restore through the same control or Explicit Add Files', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-added-assets-exclusion-test-'));
   try {
     const sourcePath = path.join(fixtureRoot, 'Working Project.ai');
@@ -7648,15 +7797,30 @@ test('Added While Working assets stay included by default and per-file exclusion
 
     await callIpcRaw('projects:remove-file', project.id, addedAsset.fileId || addedAsset.path);
     fresh = await getProject(project.id);
-    assert.equal(fresh.files.some(file => file.path === addedAssetPath), false);
+    assert.equal(fresh.files.some(file => file.path === addedAssetPath), true);
     assert.equal(fresh.excludedAssetKeys.includes(addedAsset.fileId || addedAsset.path), true);
+    let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.files.find(file => file.name === 'Added While Working.png').excluded, true);
 
     await emitWatcher('change', sourcePath);
     fresh = await getProject(project.id);
-    assert.equal(fresh.files.some(file => file.path === addedAssetPath), false);
+    assert.equal(fresh.files.filter(file => file.path === addedAssetPath).length, 1);
     assert.equal(fresh.pendingFiles.some(file => file.path === addedAssetPath), false);
     const excludedReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
     assert.deepEqual(excludedReview.files.map(file => file.name), ['Working Project.ai']);
+
+    await callIpcRaw('projects:remove-file', project.id, addedAsset.fileId || addedAsset.path);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.excludedAssetKeys.includes(addedAsset.fileId || addedAsset.path), false);
+    workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.files.find(file => file.name === 'Added While Working.png').excluded, false);
+    const directlyRestoredReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+    assert.deepEqual(
+      directlyRestoredReview.files.map(file => file.name).sort(),
+      ['Added While Working.png', 'Working Project.ai']
+    );
+
+    await callIpcRaw('projects:remove-file', project.id, addedAsset.fileId || addedAsset.path);
 
     manualDialogFor([addedAssetPath]);
     await callIpcRaw('projects:add-files', project.id);
@@ -7750,7 +7914,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     }
     assert.equal(thumbnail.kind, 'thumbnail');
     assert.match(thumbnail.dataUrl, /^data:image\/png;base64,/);
-    assert.ok(thumbnail.dataUrl.length < 140000);
+    assert.ok(thumbnail.dataUrl.length < 360000);
     assert.equal(synchronousSourceReads, 0);
     assert.equal(testNativeCreateFromBufferCalls, 0);
     assert.notEqual(testLastNativeThumbnailPath, assetPath);
@@ -7758,7 +7922,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.deepEqual(testLastNativeThumbnailBytes, rasterBytes);
     assert.equal(fs.existsSync(testLastNativeThumbnailPath), false);
     assert.equal(fs.existsSync(path.dirname(testLastNativeThumbnailPath)), false);
-    assert.deepEqual(testLastNativeThumbnailSize, { width: 48, height: 48 });
+    assert.deepEqual(testLastNativeThumbnailSize, { width: 192, height: 192 });
 
     metadataTestHooks.clearFileVisualTypeIconCache();
     const snapshotDirectoriesBeforeCaptureFailure = fs.readdirSync(os.tmpdir())
@@ -7812,7 +7976,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.equal(fs.existsSync(path.dirname(slowSnapshotPath)), false);
     testBeforeNativeThumbnailResolve = null;
 
-    testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
+    testNativeFileVisualImage = createTestNativeImage((256 * 1024) + 1);
     const icon = await callIpcRaw(
       'projects:get-file-visual', project.id, assetPresentation.visualIdentity, assetPresentation.visualRevision
     );
@@ -7820,6 +7984,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     assert.match(icon.dataUrl, /^data:image\/png;base64,/);
     assert.notEqual(testLastFileIconPath, assetPath);
     assert.equal(testLastFileIconPath, path.join(path.parse(process.execPath).root, '.crate-file-type.png'));
+    assert.deepEqual(testLastFileIconOptions, { size: 'normal' });
 
     metadataTestHooks.clearFileVisualTypeIconCache();
     const iconCategoryDir = path.join(TEST_HOME, '.crate', 'file-type-icons');
@@ -7831,7 +7996,7 @@ test('project file visuals resolve only owned identities, bound output size, and
     fs.renameSync(iconCategoryDir, movedIconCategoryDir);
     fs.mkdirSync(attackerIconCategoryDir);
     fs.symlinkSync(attackerIconCategoryDir, iconCategoryDir);
-    testNativeFileVisualImage = createTestNativeImage((96 * 1024) + 1);
+    testNativeFileVisualImage = createTestNativeImage((256 * 1024) + 1);
     const originalOpenSync = fs.openSync;
     let writeOpenAttempts = 0;
     try {
@@ -15963,15 +16128,20 @@ test('Added While Working embedded PSD exclusion survives regenerated file IDs o
 
     await callIpcRaw('projects:remove-file', project.id, embeddedEntry.fileId);
     fresh = await getProject(project.id);
-    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
     assert.equal(fresh.excludedAssetKeys.length, 1);
     assert.notEqual(fresh.excludedAssetKeys[0], embeddedEntry.fileId);
+    let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.files.find(file => file.name === 'embedded-logo.png').excluded, true);
 
     await emitWatcher('change', psdPath);
     await new Promise(resolve => originalSetTimeout(resolve, 2300));
     fresh = await getProject(project.id);
-    assert.equal(fresh.files.some(file => file.source === 'scan-on-save-embedded'), false);
+    assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
     assert.equal(fresh.pendingFiles.some(file => file.source === 'scan-on-save-embedded'), false);
+    workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.files.filter(file => file.name === 'embedded-logo.png').length, 1);
+    assert.equal(workspace.files.find(file => file.name === 'embedded-logo.png').excluded, true);
 
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(review.files.map(file => file.name), ['source.psd']);

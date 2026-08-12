@@ -1,6 +1,10 @@
 // ===== Constants =====
 const MAX_PROJECTS = 7;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
+const PRIMARY_WORKING_FILE_EXTS = new Set([
+  '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
+  '.afdesign', '.afphoto', '.afpub', '.key', '.pptx', '.ppt', '.pxd',
+]);
 const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
@@ -22,7 +26,10 @@ let state = {
   figmaScanInFlight: false,
   lastFigmaWarning: null,
   editFigmaProjectId: null,
-  assetWorkspace: null
+  assetWorkspace: null,
+  assetReviewOpen: false,
+  assetReviewFilter: 'all',
+  assetReviewQuery: ''
 };
 
 let rendererEventListenersBound = false;
@@ -92,6 +99,13 @@ function sanitizeRendererLogText(value) {
       text.replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
     )
   );
+}
+
+function sanitizeRendererSourceName(value) {
+  if (typeof value !== 'string') return null;
+  const safe = value.trim();
+  if (!safe || /[\\/]/.test(safe) || /^[a-z][a-z0-9+.-]*:/i.test(safe)) return null;
+  return safe.slice(0, 120);
 }
 
 function logRendererError(scope, error) {
@@ -659,6 +673,8 @@ async function renderFiles() {
       files: (project.files || []).map(file => ({
         name: file.name,
         ext: getFileExtension(file),
+        appFamily: file.captureEvidence?.appFamily || getAppFamilyFromExtension(file),
+        sourceName: sanitizeRendererSourceName(file.captureEvidence?.sourceName),
         assetOrigin: file.assetOrigin,
         projectRole: file.projectRole,
         protectedSource: true,
@@ -669,6 +685,8 @@ async function renderFiles() {
       pendingFiles: (project.pendingFiles || []).map(file => ({
         name: file.name,
         ext: getFileExtension(file),
+        appFamily: file.captureEvidence?.appFamily || getAppFamilyFromExtension(file),
+        sourceName: sanitizeRendererSourceName(file.captureEvidence?.sourceName),
         protectedSource: true,
         excluded: excludedAssetKeys.has(getAssetReviewExclusionKey(file)),
         visualIdentity: null,
@@ -695,6 +713,15 @@ async function renderFiles() {
 
 function getAssetReviewExclusionKey(file) {
   if (!file || typeof file !== 'object') return null;
+  if (file.embedded === true && file.source === 'scan-on-save-embedded') {
+    const parentPsd = typeof file.parentPsd === 'string'
+      ? file.parentPsd.trim().replace(/\/+$/, '').toLowerCase()
+      : '';
+    const embeddedIndex = Number.isInteger(file.embeddedIndex) ? file.embeddedIndex : '';
+    const originalName = typeof file.embeddedOriginalName === 'string' ? file.embeddedOriginalName : '';
+    const fallbackName = typeof file.name === 'string' ? file.name : '';
+    if (parentPsd) return `embedded-psd:${parentPsd}:${embeddedIndex}:${originalName || fallbackName}`;
+  }
   if (typeof file.fileId === 'string' && file.fileId) return file.fileId;
   return typeof file.path === 'string' && file.path ? file.path : null;
 }
@@ -708,13 +735,13 @@ function getExistingAssetsForDecision(project) {
 }
 
 function getExistingAssetsDecisionFocusableElements() {
-  return ['btn-skip-existing-assets', 'btn-include-existing-assets']
+  return ['btn-review-existing-assets-later', 'btn-include-existing-assets']
     .map(id => $(`#${id}`))
     .filter(element => element && !element.disabled);
 }
 
 function setExistingAssetsDecisionButtonsDisabled(disabled) {
-  for (const id of ['btn-skip-existing-assets', 'btn-include-existing-assets']) {
+  for (const id of ['btn-review-existing-assets-later', 'btn-include-existing-assets']) {
     const button = $(`#${id}`);
     if (button) button.disabled = disabled;
   }
@@ -778,7 +805,16 @@ async function showExistingAssetsDecisionModal(project) {
   existingAssetsModalProjectId = project.id;
   const decisionInFlightForProject = existingAssetsDecisionRequest &&
     existingAssetsDecisionRequest.projectId === project.id;
-  $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
+  const sourceFile = (state.assetWorkspace?.files || []).find(file => file.protectedSource === true || file.projectRole === 'source');
+  const sourcePresentation = getFileAppPresentation(sourceFile, project);
+  const sourceLabel = $('#existing-assets-modal-source');
+  if (sourceLabel) {
+    sourceLabel.textContent = sourceFile
+      ? `${sourcePresentation.label} · ${sourceFile.name}`
+      : 'Working file';
+  }
+  $('#existing-assets-modal-title').textContent = `${assets.length} asset${assets.length === 1 ? ' was' : 's were'} already in this file`;
+  $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} included by default`;
   const list = $('#existing-assets-modal-list');
   list.innerHTML = '';
   for (const file of assets.slice(0, 4)) {
@@ -787,8 +823,11 @@ async function showExistingAssetsDecisionModal(project) {
     item.setAttribute('role', 'listitem');
     item.appendChild(createFileVisual(project.id, file));
     const name = document.createElement('span');
+    name.className = 'existing-assets-modal-name';
     name.textContent = file.name || 'Untitled asset';
+    name.title = name.textContent;
     item.appendChild(name);
+    item.appendChild(createAppOriginLabel(file, project));
     list.appendChild(item);
   }
   if (assets.length > 4) {
@@ -816,7 +855,7 @@ async function syncExistingAssetsDecisionModal(project) {
   await showExistingAssetsDecisionModal(project);
 }
 
-async function submitExistingAssetsDecision(decision) {
+async function submitExistingAssetsDecision(decision, { openReview = false } = {}) {
   if (!existingAssetsModalProjectId) return;
   const projectId = existingAssetsModalProjectId;
   if (existingAssetsDecisionRequest && existingAssetsDecisionRequest.projectId === projectId) return;
@@ -835,6 +874,7 @@ async function submitExistingAssetsDecision(decision) {
     if (existingAssetsModalProjectId === projectId) hideExistingAssetsDecisionModal();
     if (state.selectedProjectId === projectId && isFilesTabActive()) {
       await renderFiles();
+      if (openReview) openAssetReviewWorkspace();
     } else if (document.querySelector('#tab-projects')?.classList.contains('active')) {
       renderProjects();
     }
@@ -880,8 +920,8 @@ async function submitExistingAssetsBatchDecision(decision) {
 }
 
 const FILE_VISUAL_DATA_URL_PATTERN = /^data:image\/png;base64,[A-Za-z0-9+/=]+$/;
-const FILE_VISUAL_MAX_DATA_URL_LENGTH = 140000;
-const FILE_VISUAL_CACHE_CAPACITY = 128;
+const FILE_VISUAL_MAX_DATA_URL_LENGTH = 360000;
+const FILE_VISUAL_CACHE_CAPACITY = 96;
 const FILE_VISUAL_CACHE_TTL_MS = 30000;
 const FILE_VISUAL_MAX_CONCURRENCY = 4;
 const FILE_VISUAL_MAX_QUEUE = 128;
@@ -1125,6 +1165,31 @@ function appendAssetFileRemovalAction(row, project, file, { recovery = false } =
   row.appendChild(removeButton);
 }
 
+function appendAssetFileRestorationAction(row, project, file) {
+  const restoreButton = document.createElement('button');
+  const displayName = file && file.name ? file.name : 'this asset';
+  restoreButton.type = 'button';
+  restoreButton.className = 'app-file-restore';
+  restoreButton.textContent = 'Include';
+  restoreButton.title = `Include ${displayName}`;
+  restoreButton.setAttribute('aria-label', `Include ${displayName} in this project`);
+  restoreButton.addEventListener('click', async event => {
+    event.stopPropagation();
+    restoreButton.disabled = true;
+    try {
+      await window.crate.removeFile(project.id, getFileVisualIdentity(file));
+      state.projects = await window.crate.getProjects();
+      invalidateFileVisualProject(project.id);
+      await renderFiles();
+    } catch (error) {
+      logRendererError('asset restoration failed', error);
+      showToast('Crate could not include that asset. Try again.');
+      restoreButton.disabled = false;
+    }
+  });
+  row.appendChild(restoreButton);
+}
+
 function createAssetFileRow(
   project,
   file,
@@ -1133,13 +1198,21 @@ function createAssetFileRow(
   const row = document.createElement('div');
   row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
   row.setAttribute('role', 'listitem');
+  row.dataset.assetCategory = excluded
+    ? 'excluded'
+    : (file?.assetOrigin === 'existing' ? 'existing' : 'added');
+  row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
   row.appendChild(createFileVisual(project && project.id, file));
 
-  const name = document.createElement('span');
+  const copy = document.createElement('div');
+  copy.className = 'asset-file-copy';
+  const name = document.createElement('div');
   name.className = 'app-file-name';
   name.textContent = file && file.name ? file.name : 'Untitled file';
   name.title = name.textContent;
-  row.appendChild(name);
+  copy.appendChild(name);
+  copy.appendChild(createAppOriginLabel(file, project, { includeSource: !protectedSource }));
+  row.appendChild(copy);
 
   if (file && file.embedded) {
     appendFileStatusBadge(row, 'EMB', 'embedded', 'Embedded - extracted at package time');
@@ -1150,9 +1223,10 @@ function createAssetFileRow(
     appendFileStatusBadge(row, 'Scan failed', 'recovery', 'Remove this source to recover the project, then add a valid project file');
     appendAssetFileRemovalAction(row, project, file, { recovery: true });
   } else if (protectedSource) {
-    appendFileStatusBadge(row, 'Protected', 'protected', 'Project source files are always included');
+    appendFileStatusBadge(row, 'Ready', 'protected', 'Working files are always included');
   } else if (excluded) {
     appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
+    appendAssetFileRestorationAction(row, project, file);
   } else {
     appendAssetFileRemovalAction(row, project, file);
   }
@@ -1185,16 +1259,185 @@ function renderAssetPanelList(list, project, files, options = {}) {
   }
 }
 
+function createRecentAssetCard(project, file) {
+  const card = document.createElement('div');
+  card.className = 'recent-asset-card';
+  card.setAttribute('role', 'listitem');
+  card.appendChild(createFileVisual(project.id, file));
+  const name = document.createElement('span');
+  name.textContent = file?.name || 'Untitled asset';
+  name.title = name.textContent;
+  card.appendChild(name);
+  card.appendChild(createAppOriginLabel(file, project));
+  return card;
+}
+
+function appendDefinitionRow(list, label, value, className = '') {
+  if (!list) return;
+  const row = document.createElement('div');
+  row.className = `asset-origin-row${className ? ` ${className}` : ''}`;
+  const term = document.createElement('dt');
+  term.textContent = label;
+  const description = document.createElement('dd');
+  description.textContent = String(value);
+  row.appendChild(term);
+  row.appendChild(description);
+  list.appendChild(row);
+}
+
+function setCountText(id, value) {
+  const element = $(`#${id}`);
+  if (element) element.textContent = String(value);
+}
+
+function applyAssetReviewFilter() {
+  const filter = state.assetReviewFilter || 'all';
+  const query = String(state.assetReviewQuery || '').trim().toLowerCase();
+  for (const listId of ['existing-assets-list', 'added-assets-list']) {
+    const list = $(`#${listId}`);
+    if (!list) continue;
+    for (const row of list.children || []) {
+      const category = row.dataset?.assetCategory || (listId.startsWith('existing') ? 'existing' : 'added');
+      const matchesFilter = filter === 'all' || filter === category;
+      const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
+      row.classList.toggle('filtered-out', !matchesFilter || !matchesQuery);
+    }
+    const section = list.parentElement || null;
+    if (section && typeof section.classList?.toggle === 'function') {
+      const category = listId.startsWith('existing') ? 'existing' : 'added';
+      section.classList.toggle('filtered-out', !['all', category, 'excluded'].includes(filter));
+    }
+  }
+  const pending = $('#pending-section');
+  const pendingList = $('#pending-file-list');
+  if (pending && pendingList) {
+    let visiblePendingCount = 0;
+    for (const row of pendingList.children || []) {
+      const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
+      const visible = ['all', 'missing'].includes(filter) && matchesQuery;
+      row.classList.toggle('filtered-out', !visible);
+      if (visible) visiblePendingCount += 1;
+    }
+    pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
+  }
+  $$('.asset-filter').forEach(button => {
+    const active = button.dataset.assetFilter === filter;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles) {
+  const includedExisting = existingAssets.filter(file => file.excluded !== true);
+  const excluded = [...existingAssets, ...addedAssets].filter(file => file.excluded === true);
+  const includedAdded = addedAssets.filter(file => file.excluded !== true);
+  setCountText('metric-existing-count', includedExisting.length);
+  setCountText('metric-added-count', includedAdded.length);
+  setCountText('metric-missing-count', pendingFiles.length);
+  setCountText('metric-excluded-count', excluded.length);
+  setCountText('filter-count-all', existingAssets.length + addedAssets.length + pendingFiles.length);
+  setCountText('filter-count-existing', includedExisting.length);
+  setCountText('filter-count-added', includedAdded.length);
+  setCountText('filter-count-missing', pendingFiles.length);
+  setCountText('filter-count-excluded', excluded.length);
+
+  const alert = $('#project-linking-alert');
+  if (alert) {
+    alert.textContent = pendingFiles.length
+      ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} linking or review`
+      : '';
+    alert.classList.toggle('hidden', pendingFiles.length === 0);
+  }
+
+  const recentList = $('#recent-assets-list');
+  if (recentList) {
+    recentList.innerHTML = '';
+    const recent = [...includedExisting, ...includedAdded].slice(-5).reverse();
+    for (const file of recent) recentList.appendChild(createRecentAssetCard(project, file));
+    const remaining = Math.max(0, includedExisting.length + includedAdded.length - recent.length);
+    if (remaining > 0) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'recent-assets-more';
+      more.textContent = `+${remaining}`;
+      more.setAttribute('aria-label', `Review ${remaining} more assets`);
+      more.addEventListener('click', openAssetReviewWorkspace);
+      recentList.appendChild(more);
+    }
+  }
+
+  const originList = $('#asset-origin-list');
+  if (originList) {
+    originList.innerHTML = '';
+    const originCounts = new Map();
+    for (const file of [...includedExisting, ...includedAdded]) {
+      const label = getFileAppPresentation(file, project).label;
+      originCounts.set(label, (originCounts.get(label) || 0) + 1);
+    }
+    for (const [label, count] of [...originCounts.entries()].sort((a, b) => b[1] - a[1])) {
+      appendDefinitionRow(originList, label, count);
+    }
+    if (pendingFiles.length) appendDefinitionRow(originList, 'Needs linking or review', pendingFiles.length, 'warning');
+  }
+
+  const totalIncludedAssets = includedExisting.length + includedAdded.length;
+  const summary = `${totalIncludedAssets} asset${totalIncludedAssets === 1 ? '' : 's'} included` +
+    ` · ${sourceFiles.length} Working File${sourceFiles.length === 1 ? '' : 's'} ready` +
+    `${pendingFiles.length ? ` · ${pendingFiles.length} need attention` : ''}`;
+  const reviewSummary = $('#asset-review-summary');
+  const reviewFooter = $('#asset-review-footer-summary');
+  if (reviewSummary) reviewSummary.textContent = summary;
+  if (reviewFooter) reviewFooter.textContent = summary;
+}
+
+function openAssetReviewWorkspace() {
+  state.assetReviewOpen = true;
+  $('#project-dashboard')?.classList.add('hidden');
+  $('#asset-review-workspace')?.classList.remove('hidden');
+  $('#asset-review-heading')?.focus?.();
+  applyAssetReviewFilter();
+}
+
+function closeAssetReviewWorkspace() {
+  state.assetReviewOpen = false;
+  $('#asset-review-workspace')?.classList.add('hidden');
+  $('#project-dashboard')?.classList.remove('hidden');
+  $('#btn-review-assets')?.focus?.();
+}
+
 function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   if (!project) return;
   const files = Array.isArray(presentedFiles) ? presentedFiles : (Array.isArray(project.files) ? project.files : []);
-  const sourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
+  const physicalSourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
+  const figmaSourceNames = new Set();
+  const figmaSourceFiles = [];
+  for (const file of files) {
+    if (file?.appFamily !== 'figma' || typeof file.sourceName !== 'string' || !file.sourceName.trim()) continue;
+    const sourceName = file.sourceName.trim();
+    const identity = sourceName.toLowerCase();
+    if (figmaSourceNames.has(identity)) continue;
+    figmaSourceNames.add(identity);
+    figmaSourceFiles.push({
+      name: sourceName,
+      ext: '',
+      appFamily: 'figma',
+      sourceName: null,
+      assetOrigin: 'added',
+      projectRole: 'source',
+      protectedSource: true,
+      sourceRecoveryAllowed: false,
+      excluded: false,
+      visualIdentity: `figma-source:${identity}`,
+      visualRevision: `figma-source:${identity}`,
+    });
+  }
+  const sourceFiles = [...physicalSourceFiles, ...figmaSourceFiles];
   const existingAssets = files.filter(file => (
     file && file.protectedSource !== true && file.projectRole !== 'source' && file.assetOrigin === 'existing'
   ));
   const addedAssets = files.filter(file => (
     file && file.protectedSource !== true && file.projectRole !== 'source' &&
-    file.assetOrigin !== 'existing' && file.excluded !== true
+    file.assetOrigin !== 'existing'
   ));
 
   renderAssetPanelList($('#project-file-list'), project, sourceFiles, {
@@ -1213,13 +1456,22 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   setAssetPanelCount($('#project-file-count'), sourceFiles.length);
   const includedExistingCount = existingAssets.filter(file => file.excluded !== true).length;
   setAssetPanelCount($('#existing-assets-count'), includedExistingCount, existingAssets.length);
-  setAssetPanelCount($('#added-assets-count'), addedAssets.length);
+  const includedAddedCount = addedAssets.filter(file => file.excluded !== true).length;
+  setAssetPanelCount($('#added-assets-count'), includedAddedCount, addedAssets.length);
+
+  const pendingFiles = state.assetWorkspace?.projectId === project.id
+    ? (state.assetWorkspace.pendingFiles || []).filter(file => file.excluded !== true)
+    : [];
+  renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles);
+  applyAssetReviewFilter();
 
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
   const includeAll = $('#btn-include-all-existing');
   const skipAll = $('#btn-skip-all-existing');
   if (includeAll) includeAll.disabled = existingAssets.length === 0 || includedExistingCount === existingAssets.length;
   if (skipAll) skipAll.disabled = existingAssets.length === 0 || includedExistingCount === 0;
+  $('#project-dashboard')?.classList.toggle('hidden', state.assetReviewOpen === true);
+  $('#asset-review-workspace')?.classList.toggle('hidden', state.assetReviewOpen !== true);
 }
 
 // Compatibility helper retained for focused renderer tests and non-project empty states.
@@ -1250,8 +1502,82 @@ const PENDING_APP_LABELS = {
   indesign: 'InDesign',
   figma: 'Figma',
   powerpoint: 'PowerPoint',
+  presentation: 'Presentation',
   keynote: 'Keynote',
+  sketch: 'Sketch',
+  'adobe-xd': 'Adobe XD',
+  affinity: 'Affinity',
 };
+
+const FILE_APP_PRESENTATION = {
+  illustrator: { label: 'Illustrator', mark: 'Ai', className: 'illustrator' },
+  photoshop: { label: 'Photoshop', mark: 'Ps', className: 'photoshop' },
+  indesign: { label: 'InDesign', mark: 'Id', className: 'indesign' },
+  figma: { label: 'Figma', mark: 'F', className: 'figma' },
+  powerpoint: { label: 'PowerPoint', mark: 'P', className: 'powerpoint' },
+  presentation: { label: 'Presentation', mark: 'P', className: 'powerpoint' },
+  keynote: { label: 'Keynote', mark: 'K', className: 'keynote' },
+  sketch: { label: 'Sketch', mark: 'S', className: 'sketch' },
+  'adobe-xd': { label: 'Adobe XD', mark: 'Xd', className: 'adobe-xd' },
+  affinity: { label: 'Affinity', mark: 'Af', className: 'affinity' },
+  generic: { label: 'File', mark: '•', className: 'generic' },
+};
+
+function getAppFamilyFromExtension(file) {
+  const ext = getFileExtension(file);
+  if (['.ai', '.eps', '.svg'].includes(ext)) return 'illustrator';
+  if (['.psd', '.psb', '.pxd'].includes(ext)) return 'photoshop';
+  if (['.indd', '.idml'].includes(ext)) return 'indesign';
+  if (ext === '.fig') return 'figma';
+  if (['.ppt', '.pptx', '.pptm'].includes(ext)) return 'powerpoint';
+  if (['.key', '.keynote'].includes(ext)) return 'keynote';
+  if (ext === '.sketch') return 'sketch';
+  if (ext === '.xd') return 'adobe-xd';
+  if (['.afdesign', '.afphoto', '.afpub'].includes(ext)) return 'affinity';
+  return null;
+}
+
+function getFileAppPresentation(file, project = null) {
+  let family = file && typeof file.appFamily === 'string' ? file.appFamily : null;
+  if (family === 'presentation') {
+    const sourceFamily = getAppFamilyFromExtension({
+      name: sanitizeRendererSourceName(file?.sourceName),
+    });
+    const fileFamily = getAppFamilyFromExtension(file);
+    family = ['keynote', 'powerpoint'].includes(sourceFamily)
+      ? sourceFamily
+      : (['keynote', 'powerpoint'].includes(fileFamily) ? fileFamily : 'presentation');
+  }
+  if (!family && projectHasFigmaContext(project) && file?.projectRole === 'asset' && file?.assetOrigin) {
+    family = file.sourceName ? null : getAppFamilyFromExtension(file);
+  }
+  family = family || getAppFamilyFromExtension(file) || 'generic';
+  return { family, ...(FILE_APP_PRESENTATION[family] || FILE_APP_PRESENTATION.generic) };
+}
+
+function createAppOriginLabel(file, project, { includeSource = true } = {}) {
+  const app = getFileAppPresentation(file, project);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'file-origin';
+  const mark = document.createElement('span');
+  mark.className = `file-origin-mark ${app.className}`;
+  mark.textContent = app.mark;
+  mark.setAttribute('aria-hidden', 'true');
+  const label = document.createElement('span');
+  label.className = 'file-origin-label';
+  const safeSourceName = sanitizeRendererSourceName(file?.sourceName);
+  const sourceName = includeSource && app.family !== 'figma' && safeSourceName
+    ? ` · ${safeSourceName}`
+    : '';
+  const figmaScope = app.family === 'figma' && projectHasFigmaContext(project)
+    ? ` · ${getProjectFigmaScopeMode(project) === 'entire-file' ? 'Entire File' : 'Current Page'}`
+    : '';
+  label.textContent = `${app.label}${sourceName || figmaScope}`;
+  label.title = label.textContent;
+  wrapper.appendChild(mark);
+  wrapper.appendChild(label);
+  return wrapper;
+}
 
 function getPendingCaptureState(file) {
   const stateValue = file && typeof file.captureState === 'string' ? file.captureState : '';
@@ -1271,7 +1597,8 @@ function getPendingFileReason(file) {
   const appLabel = getPendingAppLabel(file);
 
   if (stateValue === 'needs-save') {
-    if (evidence.sourceName) return `Linked asset observed from ${evidence.sourceName}. Save to make package-ready.`;
+    const safeSourceName = sanitizeRendererSourceName(evidence.sourceName);
+    if (safeSourceName) return `Linked asset observed from ${safeSourceName}. Save to make package-ready.`;
     if (appLabel) return `Observed in ${appLabel}. Save to make package-ready.`;
     return 'Save to make package-ready.';
   }
@@ -1320,6 +1647,8 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     const row = document.createElement('div');
     row.className = 'pending-file';
     row.setAttribute('role', 'listitem');
+    row.dataset.assetCategory = 'missing';
+    row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
       ? 'Needs save'
@@ -1581,16 +1910,18 @@ function getPackageReviewFocusableElements() {
 }
 
 function focusPackageReviewDialog() {
+  const reviewDialog = document.querySelector('.package-review-modal');
+  if (reviewDialog) reviewDialog.scrollTop = 0;
   const reviewMessage = $('#modal-package-review-message');
   if (reviewMessage && !reviewMessage.classList.contains('hidden')) {
-    reviewMessage.focus();
+    reviewMessage.focus({ preventScroll: true });
     return;
   }
   const cancelButton = $('#btn-cancel-package');
   const focusTarget = cancelButton && !cancelButton.disabled
     ? cancelButton
     : getPackageReviewFocusableElements()[0] || $('#modal-package');
-  focusTarget?.focus();
+  focusTarget?.focus?.({ preventScroll: true });
 }
 
 function openPackageReviewDialog() {
@@ -1688,6 +2019,15 @@ function cancelPackageReview() {
   hidePackageReviewDialog({ restoreFocus: true });
 }
 
+function changePackageReviewSelection() {
+  if (packageReviewConfirmationInFlight) return;
+  state.packageReviewToken = null;
+  state.assetReviewOpen = true;
+  hidePackageReviewDialog();
+  switchTab('current-project');
+  openAssetReviewWorkspace();
+}
+
 function handlePackageReviewKeydown(event) {
   const modal = $('#modal-package');
   if (!modal || modal.classList.contains('hidden')) return;
@@ -1711,6 +2051,10 @@ function handlePackageReviewKeydown(event) {
   if (!movingBeforeFirst && !movingPastLast) return;
   event.preventDefault();
   focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+}
+
+function getPackageDestinationLabel(outputPath) {
+  return typeof outputPath === 'string' && outputPath ? 'Selected output folder' : '~/Desktop/';
 }
 
 function renderPackageReview(project, review, message = '') {
@@ -1746,32 +2090,75 @@ function renderPackageReview(project, review, message = '') {
   }
   const confirmButton = $('#btn-confirm-package');
   if (confirmButton) confirmButton.disabled = !canPackage;
+  const ready = $('#package-review-ready');
+  if (ready) {
+    ready.textContent = canPackage ? 'Ready to package' : 'Review required';
+    ready.classList.toggle('is-blocked', !canPackage);
+  }
 
   // File list
   const fileListEl = $('#modal-file-list');
   fileListEl.innerHTML = '';
 
   const reviewFiles = Array.isArray(review.files) ? review.files : [];
-  const visibleFiles = reviewFiles.slice(0, 4);
+  const presentedReviewFiles = reviewFiles;
+  const visibleFiles = presentedReviewFiles.slice(0, 8);
   for (const file of visibleFiles) {
     const item = document.createElement('div');
-    item.className = 'modal-file-item';
+    item.className = 'modal-file-item package-review-file-card';
     item.appendChild(createFileVisual(project.id, file));
-    const name = document.createElement('span');
+    const name = document.createElement('div');
     name.className = 'modal-file-name';
     name.textContent = file.name || 'Unavailable file';
     item.appendChild(name);
+    item.appendChild(createAppOriginLabel(file, project));
     fileListEl.appendChild(item);
   }
 
-  if (reviewFiles.length > 4) {
+  if (reviewFiles.length > visibleFiles.length) {
     const more = document.createElement('div');
-    more.className = 'modal-file-item';
-    more.style.color = '#9ca3af';
-    more.style.fontSize = '11px';
-    more.style.paddingTop = '6px';
-    more.textContent = `+ ${reviewFiles.length - 4} more files \u00B7 ${reviewFiles.length} total`;
+    more.className = 'modal-file-item package-review-more';
+    more.textContent = `+${Math.max(0, reviewFiles.length - visibleFiles.length)} more`;
     fileListEl.appendChild(more);
+  }
+
+  const total = $('#package-review-total');
+  if (total) total.textContent = `${reviewFiles.length} visual asset${reviewFiles.length === 1 ? '' : 's'}`;
+  const appChips = $('#package-review-apps');
+  if (appChips) {
+    appChips.innerHTML = '';
+    const seenApps = new Set();
+    for (const file of presentedReviewFiles) {
+      const app = getFileAppPresentation(file, project);
+      if (app.family === 'generic' || seenApps.has(app.family)) continue;
+      seenApps.add(app.family);
+      const chip = document.createElement('span');
+      chip.className = `package-app-chip ${app.className}`;
+      chip.textContent = app.label;
+      appChips.appendChild(chip);
+    }
+    if (hasFigmaContext && !seenApps.has('figma')) {
+      const chip = document.createElement('span');
+      chip.className = 'package-app-chip figma';
+      chip.textContent = `Figma · ${getProjectFigmaScopeLabel(project)}`;
+      appChips.appendChild(chip);
+    }
+  }
+
+  const summaryList = $('#package-review-summary-list');
+  if (summaryList) {
+    summaryList.innerHTML = '';
+    const existingCount = presentedReviewFiles.filter(file => file.assetOrigin === 'existing' && file.projectRole !== 'source').length;
+    const addedCount = presentedReviewFiles.filter(file => file.assetOrigin === 'added' && file.projectRole !== 'source').length;
+    const workingCount = presentedReviewFiles.filter(file => file.projectRole === 'source').length;
+    const needsLinkingCount = presentedReviewFiles.filter(file => file.status && file.status !== 'ready').length;
+    appendDefinitionRow(summaryList, 'Working files', workingCount);
+    appendDefinitionRow(summaryList, 'Existing assets', existingCount);
+    appendDefinitionRow(summaryList, 'Added while working', addedCount);
+    appendDefinitionRow(summaryList, 'Needs linking', needsLinkingCount, needsLinkingCount ? 'warning' : '');
+    if (!canPackage && needsLinkingCount === 0) {
+      appendDefinitionRow(summaryList, 'Package status', 'Review required', 'warning');
+    }
   }
 
   // Folder name preview
@@ -1779,22 +2166,69 @@ function renderPackageReview(project, review, message = '') {
   $('#modal-folder-name').textContent = review.folderName || folderName;
 
   // Destination
-  $('#modal-dest-path').textContent = state.packageOutputPath || '~/Desktop/';
+  $('#modal-dest-path').textContent = getPackageDestinationLabel(state.packageOutputPath);
 
   openPackageReviewDialog();
 }
 
-function createUnavailableRendererReview(project, message) {
+async function getUnavailableRendererReviewFiles(project) {
+  const cachedWorkspace = state.assetWorkspace?.projectId === project?.id ? state.assetWorkspace : null;
+  if (Array.isArray(cachedWorkspace?.files)) return cachedWorkspace.files;
+  if (typeof window.crate?.getAssetWorkspace === 'function' && project?.id) {
+    try {
+      const workspace = await window.crate.getAssetWorkspace(project.id);
+      if (workspace?.projectId === project.id && Array.isArray(workspace.files)) return workspace.files;
+    } catch (error) {
+      logRendererError('Package Review asset workspace unavailable', error);
+    }
+  }
+  // A raw project record cannot reliably reproduce stable exclusion identities.
+  // Show no guessed inventory when the authoritative workspace is unavailable.
+  return [];
+}
+
+async function createUnavailableRendererReview(project, message) {
+  const excludedKeys = new Set(project?.excludedAssetKeys || []);
+  const reviewFiles = await getUnavailableRendererReviewFiles(project);
+  const includedFiles = reviewFiles.filter(file => {
+    if (file?.excluded === true) return false;
+    const exclusionKey = getAssetReviewExclusionKey(file);
+    return !(exclusionKey && excludedKeys.has(exclusionKey));
+  });
   return {
     projectId: project?.id || state.selectedProjectId,
-    files: (project?.files || []).map(file => ({
-      name: typeof file?.name === 'string' && file.name ? file.name : 'Unavailable file',
-      ext: getFileExtension(file),
-      visualIdentity: null,
-      visualRevision: null,
-      status: 'unavailable',
-    })),
-    totalFiles: Array.isArray(project?.files) ? project.files.length : 0,
+    files: includedFiles.map(file => {
+      const evidence = file?.captureEvidence && typeof file.captureEvidence === 'object'
+        ? file.captureEvidence
+        : {};
+      const dependency = typeof evidence.relationshipSourcePath === 'string' ||
+        typeof evidence.sourceDocumentPath === 'string';
+      const projectRole = ['source', 'asset'].includes(file?.projectRole)
+        ? file.projectRole
+        : (dependency || !PRIMARY_WORKING_FILE_EXTS.has(getFileExtension(file)) ? 'asset' : 'source');
+      const sourceName = [file?.sourceName, evidence.sourceName, projectRole === 'source' ? file?.name : null]
+        .map(sanitizeRendererSourceName)
+        .find(Boolean) || null;
+      return {
+        name: typeof file?.name === 'string' && file.name ? file.name : 'Unavailable file',
+        ext: getFileExtension(file),
+        embedded: file?.embedded === true,
+        linked: dependency,
+        appFamily: evidence.appFamily || file?.appFamily || getAppFamilyFromExtension(file),
+        sourceName,
+        assetOrigin: ['existing', 'added'].includes(file?.assetOrigin)
+          ? file.assetOrigin
+          : (projectRole === 'source' ? 'added' : 'existing'),
+        projectRole,
+        protectedSource: file?.protectedSource === true || projectRole === 'source',
+        sourceRecoveryAllowed: file?.sourceRecoveryAllowed === true,
+        excluded: false,
+        visualIdentity: null,
+        visualRevision: null,
+        status: 'unavailable',
+      };
+    }),
+    totalFiles: includedFiles.length,
     materializable: false,
     message,
   };
@@ -1878,7 +2312,7 @@ async function showPackageModal({
         review?.error || 'package_review_unavailable',
         review?.diagnostics
       );
-      renderPackageReview(project, createUnavailableRendererReview(project, failureMessage), failureMessage);
+      renderPackageReview(project, await createUnavailableRendererReview(project, failureMessage), failureMessage);
       return false;
     }
 
@@ -1890,7 +2324,7 @@ async function showPackageModal({
   } catch (error) {
     logRendererError('Package Review recovery failed', error);
     const failureMessage = message || PACKAGE_REVIEW_RECOVERY_MESSAGE;
-    if (project) renderPackageReview(project, createUnavailableRendererReview(project, failureMessage), failureMessage);
+    if (project) renderPackageReview(project, await createUnavailableRendererReview(project, failureMessage), failureMessage);
     return false;
   }
 }
@@ -2142,21 +2576,36 @@ function setupEventListeners() {
   });
 
   // Package modal
-  $('#btn-cancel-package').addEventListener('click', cancelPackageReview);
+  $('#btn-cancel-package').addEventListener('click', changePackageReviewSelection);
   $('#modal-package').addEventListener('keydown', handlePackageReviewKeydown);
 
   $('#btn-confirm-package').addEventListener('click', confirmPackage);
 
-  $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include'));
-  $('#btn-skip-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('skip'));
+  $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include', { openReview: true }));
+  $('#btn-review-existing-assets-later').addEventListener('click', () => submitExistingAssetsDecision('include'));
   $('#btn-include-all-existing').addEventListener('click', () => submitExistingAssetsBatchDecision('include'));
   $('#btn-skip-all-existing').addEventListener('click', () => submitExistingAssetsBatchDecision('skip'));
+
+  $('#btn-review-assets').addEventListener('click', openAssetReviewWorkspace);
+  $('#btn-review-assets-back').addEventListener('click', closeAssetReviewWorkspace);
+  $('#btn-review-assets-cancel').addEventListener('click', closeAssetReviewWorkspace);
+  $('#btn-review-assets-continue').addEventListener('click', closeAssetReviewWorkspace);
+  $$('.asset-filter').forEach(button => {
+    button.addEventListener('click', () => {
+      state.assetReviewFilter = button.dataset.assetFilter || 'all';
+      applyAssetReviewFilter();
+    });
+  });
+  $('#asset-review-search').addEventListener('input', event => {
+    state.assetReviewQuery = event.target.value || '';
+    applyAssetReviewFilter();
+  });
 
   $('#btn-change-dest').addEventListener('click', async () => {
     const folder = await window.crate.selectOutputFolder();
     if (folder) {
       state.packageOutputPath = folder;
-      $('#modal-dest-path').textContent = folder;
+      $('#modal-dest-path').textContent = getPackageDestinationLabel(folder);
     }
   });
 

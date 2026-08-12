@@ -467,7 +467,20 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
     assert.equal(corruptReview.token, undefined);
     assert.deepEqual(
       corruptReview.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'Embedded.png', status: 'unavailable' }]
+      [{
+        name: 'Embedded.png',
+        ext: '.png',
+        embedded: true,
+        linked: true,
+        appFamily: 'photoshop',
+        sourceName: null,
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+        protectedSource: false,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'unavailable',
+      }]
     );
     assert.match(corruptReview.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
 
@@ -491,7 +504,20 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
     assert.equal(removed.review.token, undefined);
     assert.deepEqual(
       removed.review.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'Embedded.png', status: 'unavailable' }]
+      [{
+        name: 'Embedded.png',
+        ext: '.png',
+        embedded: true,
+        linked: true,
+        appFamily: 'photoshop',
+        sourceName: null,
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+        protectedSource: false,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'unavailable',
+      }]
     );
     assert.match(removed.review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.deepEqual(fs.readdirSync(outputDir), []);
@@ -1215,7 +1241,20 @@ test('package copy fails closed on reviewed symlink sources without copying targ
     assert.equal(result.token, undefined);
     assert.deepEqual(
       result.files.map(({ visualIdentity, visualRevision, ...file }) => file),
-      [{ name: 'linked-secret.ai', status: 'symlink' }]
+      [{
+        name: 'linked-secret.ai',
+        ext: '.ai',
+        embedded: false,
+        linked: false,
+        appFamily: 'illustrator',
+        sourceName: null,
+        assetOrigin: 'existing',
+        projectRole: 'source',
+        protectedSource: true,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        status: 'symlink',
+      }]
     );
     assert.match(result.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
     assert.deepEqual(fs.readdirSync(outputDir), []);
