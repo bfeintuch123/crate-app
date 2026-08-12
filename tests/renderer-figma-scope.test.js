@@ -124,6 +124,7 @@ function createDocumentStub(elements = {}, options = {}) {
     },
     querySelectorAll: selector => {
       if (selector === '.app-tab') return options.tabs || [];
+      if (selector === '.tab-content') return options.tabContents || [];
       if (selector === '.type-pill') return options.typePills || [];
       if (selector === '.asset-filter') return options.assetFilters || [];
       return [];
@@ -135,6 +136,7 @@ function createDocumentStub(elements = {}, options = {}) {
   for (const element of Object.values(elements)) attach(element);
   for (const element of [
     ...(options.tabs || []),
+    ...(options.tabContents || []),
     ...(options.typePills || []),
     ...(options.assetFilters || []),
   ]) attach(element);
@@ -145,6 +147,9 @@ function createInteractiveRendererDom() {
   const elements = {
     'app-sidebar': createElementStub('aside'),
     'app-main': createElementStub('main'),
+    'tab-projects': createElementStub('section'),
+    'tab-current-project': createElementStub('section'),
+    'tab-settings': createElementStub('section'),
     'btn-package': createElementStub('button'),
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
@@ -202,11 +207,17 @@ function createInteractiveRendererDom() {
     elements['btn-success-done'],
     elements['btn-open-folder'],
   ];
-  const tabs = ['projects', 'files', 'settings'].map(tabName => {
+  const tabs = ['projects', 'current-project', 'settings'].map(tabName => {
     const tab = createElementStub('button');
     tab.dataset.tab = tabName;
     if (tabName === 'projects') tab.classList.add('active');
     return tab;
+  });
+  const tabContents = ['projects', 'current-project', 'settings'].map(tabName => {
+    const tabContent = elements[`tab-${tabName}`];
+    tabContent.id = `tab-${tabName}`;
+    if (tabName === 'projects') tabContent.classList.add('active');
+    return tabContent;
   });
   const typePills = ['branding', 'print', 'presentation', 'web'].map(type => {
     const pill = createElementStub('button');
@@ -229,11 +240,12 @@ function createInteractiveRendererDom() {
   const document = createDocumentStub(elements, {
     createMissingIds: true,
     tabs,
+    tabContents,
     typePills,
     assetFilters,
     packageReviewDialog,
   });
-  return { document, elements, tabs, typePills, assetFilters, packageReviewDialog };
+  return { document, elements, tabs, tabContents, typePills, assetFilters, packageReviewDialog };
 }
 
 function createPackageDetailsDom() {
@@ -975,6 +987,49 @@ test('Current Project dashboard uses Working Files and privacy-safe mixed-app or
   assert.equal(recentText.includes('Illustrator · Brand-System.ai'), true);
   assert.equal(recentText.includes('PowerPoint · Launch-Deck.pptx'), true);
   assert.equal(recentText.includes('Figma · Current Page'), true);
+});
+
+test('generic presentation assets preserve Keynote and PowerPoint source application labels', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'presentation-source-labels',
+    name: 'Presentation Source Labels',
+    files: [],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const files = [
+    {
+      name: 'keynote-image.png', ext: '.png', appFamily: 'presentation', sourceName: 'Launch.key',
+      projectRole: 'asset', assetOrigin: 'added', visualIdentity: 'keynote', visualRevision: 'keynote-r1',
+    },
+    {
+      name: 'powerpoint-image.png', ext: '.png', appFamily: 'presentation', sourceName: 'Pitch.pptx',
+      projectRole: 'asset', assetOrigin: 'added', visualIdentity: 'powerpoint', visualRevision: 'powerpoint-r1',
+    },
+  ];
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {}, files);
+
+  const workspaceText = getElementTreeText(elements['added-assets-list']);
+  assert.equal(workspaceText.includes('Keynote · Launch.key'), true);
+  assert.equal(workspaceText.includes('PowerPoint · Pitch.pptx'), true);
+  assert.equal(workspaceText.includes('PowerPoint · Launch.key'), false);
+
+  renderer.renderPackageReview(project, {
+    token: '00000000-0000-4000-8000-000000000305',
+    materializable: true,
+    files,
+  });
+
+  const reviewText = getElementTreeText(elements['modal-file-list']);
+  const appText = getElementTreeText(elements['package-review-apps']);
+  assert.equal(reviewText.includes('Keynote · Launch.key'), true);
+  assert.equal(reviewText.includes('PowerPoint · Pitch.pptx'), true);
+  assert.equal(reviewText.includes('PowerPoint · Launch.key'), false);
+  assert.equal(appText.includes('Keynote'), true);
+  assert.equal(appText.includes('PowerPoint'), true);
 });
 
 test('Current Project linking alert uses correct singular and plural copy', () => {
@@ -2465,8 +2520,8 @@ test('Package Review traps keyboard focus, cancels with Escape, and restores its
   assert.equal(document.activeElement, elements['btn-cancel-package']);
 });
 
-test('Package Review Change Selection returns directly to Review Assets', async () => {
-  const { document, elements } = createInteractiveRendererDom();
+test('notification Package Review Change Selection activates Current Project and opens Review Assets', async () => {
+  const { document, elements, tabs } = createInteractiveRendererDom();
   const project = {
     id: 'package-review-change-selection',
     name: 'Package Review Change Selection',
@@ -2481,10 +2536,20 @@ test('Package Review Change Selection returns directly to Review Assets', async 
     totalFiles: 1,
     materializable: true,
   };
+  let packageTrigger;
+  const noOp = () => {};
   const renderer = loadRendererHelpers(document, { crate: {
     preScanSession: async () => ({ success: true }),
     preparePackageReview: async () => review,
     getProjects: async () => [project],
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
   } });
   renderer.testProject = project;
   vm.runInContext(`
@@ -2493,18 +2558,28 @@ test('Package Review Change Selection returns directly to Review Assets', async 
     state.settings = { namingTemplate: '{Project}_{Date}' };
   `, renderer);
   renderer.setupEventListeners();
+  renderer.setupMainProcessListeners();
   const assetReviewWorkspace = document.querySelector('#asset-review-workspace');
   const projectDashboard = document.querySelector('#project-dashboard');
   const assetReviewHeading = document.querySelector('#asset-review-heading');
   assetReviewWorkspace.classList.add('hidden');
+  tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === 'settings'));
+  document.querySelector('#tab-projects').classList.remove('active');
+  document.querySelector('#tab-settings').classList.add('active');
+  document.querySelector('#tab-current-project').classList.remove('active');
 
-  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  await packageTrigger({ projectId: project.id });
   assert.equal(elements['modal-package'].classList.contains('hidden'), false);
   assert.equal(assetReviewWorkspace.classList.contains('hidden'), true);
 
   elements['btn-cancel-package'].click();
+  await new Promise(resolve => setImmediate(resolve));
 
   assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(tabs.find(tab => tab.dataset.tab === 'current-project').classList.contains('active'), true);
+  assert.equal(tabs.find(tab => tab.dataset.tab === 'settings').classList.contains('active'), false);
+  assert.equal(document.querySelector('#tab-current-project').classList.contains('active'), true);
+  assert.equal(document.querySelector('#tab-settings').classList.contains('active'), false);
   assert.equal(projectDashboard.classList.contains('hidden'), true);
   assert.equal(assetReviewWorkspace.classList.contains('hidden'), false);
   assert.equal(document.activeElement, assetReviewHeading);

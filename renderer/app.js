@@ -1529,8 +1529,8 @@ function getAppFamilyFromExtension(file) {
   if (['.psd', '.psb', '.pxd'].includes(ext)) return 'photoshop';
   if (['.indd', '.idml'].includes(ext)) return 'indesign';
   if (ext === '.fig') return 'figma';
-  if (['.ppt', '.pptx'].includes(ext)) return 'powerpoint';
-  if (ext === '.key') return 'keynote';
+  if (['.ppt', '.pptx', '.pptm'].includes(ext)) return 'powerpoint';
+  if (['.key', '.keynote'].includes(ext)) return 'keynote';
   if (ext === '.sketch') return 'sketch';
   if (ext === '.xd') return 'adobe-xd';
   if (['.afdesign', '.afphoto', '.afpub'].includes(ext)) return 'affinity';
@@ -1540,7 +1540,13 @@ function getAppFamilyFromExtension(file) {
 function getFileAppPresentation(file, project = null) {
   let family = file && typeof file.appFamily === 'string' ? file.appFamily : null;
   if (family === 'presentation') {
-    family = getFileExtension(file) === '.key' ? 'keynote' : 'powerpoint';
+    const sourceFamily = getAppFamilyFromExtension({
+      name: sanitizeRendererSourceName(file?.sourceName),
+    });
+    const fileFamily = getAppFamilyFromExtension(file);
+    family = ['keynote', 'powerpoint'].includes(sourceFamily)
+      ? sourceFamily
+      : (['keynote', 'powerpoint'].includes(fileFamily) ? fileFamily : 'presentation');
   }
   if (!family && projectHasFigmaContext(project) && file?.projectRole === 'asset' && file?.assetOrigin) {
     family = file.sourceName ? null : getAppFamilyFromExtension(file);
@@ -2016,7 +2022,9 @@ function cancelPackageReview() {
 function changePackageReviewSelection() {
   if (packageReviewConfirmationInFlight) return;
   state.packageReviewToken = null;
+  state.assetReviewOpen = true;
   hidePackageReviewDialog();
+  switchTab('current-project');
   openAssetReviewWorkspace();
 }
 
