@@ -1223,6 +1223,12 @@ function sanitizeLiveEvidenceText(value) {
   return safe ? safe.slice(0, 120) : null;
 }
 
+function sanitizeRendererSourceName(value) {
+  const safe = sanitizeLiveEvidenceText(value);
+  if (!safe || /[\\/]/.test(safe) || /^[a-z][a-z0-9+.-]*:/i.test(safe)) return null;
+  return safe;
+}
+
 function getLiveAppDisplayName(appFamily) {
   const normalized = normalizeLiveCaptureReason(appFamily, 'app');
   const displayNames = {
@@ -3074,8 +3080,8 @@ function getAssetReviewExclusionKey(file) {
   return typeof file.path === 'string' && file.path ? file.path : null;
 }
 
-const FILE_VISUAL_PIXEL_SIZE = 48;
-const FILE_VISUAL_MAX_PNG_BYTES = 96 * 1024;
+const FILE_VISUAL_PIXEL_SIZE = 192;
+const FILE_VISUAL_MAX_PNG_BYTES = 256 * 1024;
 const FILE_VISUAL_MAX_RASTER_SOURCE_BYTES = 16 * 1024 * 1024;
 const FILE_VISUAL_MAX_RASTER_HEADER_BYTES = 256 * 1024;
 const FILE_VISUAL_MAX_RASTER_DIMENSION = 6000;
@@ -3149,11 +3155,33 @@ async function createProjectFileVisualRevision(projectId, file) {
 }
 
 async function createRendererFilePresentation(project, file) {
+  const ext = (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase();
+  const captureEvidence = file?.captureEvidence && typeof file.captureEvidence === 'object'
+    ? file.captureEvidence
+    : {};
+  const evidenceKey = typeof file?.path === 'string' && file.path
+    ? getLiveEvidenceKeyHash(normalizeTrackedFilePath(file.path))
+    : null;
+  const ledgerEvidence = evidenceKey && project?.liveEvidenceLedger?.candidates?.[evidenceKey]?.latest;
+  const scopedAppFamily = getScopedFileAppFamily(project, file);
+  const appFamily = (scopedAppFamily && scopedAppFamily !== 'generic' ? scopedAppFamily : null)
+    || getPrimaryDesignAppFamilyForExt(ext)
+    || scopedAppFamily
+    || null;
+  const sourceDocumentName = captureEvidence.sourceName || captureEvidence.sourceDocumentName ||
+    ledgerEvidence?.sourceName || ledgerEvidence?.sourceDocumentName || (
+    typeof captureEvidence.sourceDocumentPath === 'string' && captureEvidence.sourceDocumentPath
+      ? path.basename(captureEvidence.sourceDocumentPath)
+      : null
+  );
+  const sourceName = sanitizeRendererSourceName(sourceDocumentName || file?.figmaFileName) || null;
   return {
     name: typeof file?.name === 'string' && file.name ? file.name : 'Untitled file',
-    ext: (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase(),
+    ext,
     embedded: file?.embedded === true,
     linked: DEPENDENCY_CAPTURE_SOURCES.has(getFileCaptureSource(file)),
+    appFamily,
+    sourceName,
     assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
     projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
     protectedSource: isProjectAssetBaselineSource(file),
@@ -12087,14 +12115,14 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
       const exclusionKey = getAssetReviewExclusionKey(removedFile);
       if (exclusionKey) {
         const priorExclusions = new Set(project.excludedAssetKeys || []);
-        project.excludedAssetKeys = [...new Set([
-          ...(project.excludedAssetKeys || []),
-          exclusionKey,
-        ])];
-        changed = !priorExclusions.has(exclusionKey);
+        if (priorExclusions.has(exclusionKey)) {
+          priorExclusions.delete(exclusionKey);
+        } else {
+          priorExclusions.add(exclusionKey);
+        }
+        project.excludedAssetKeys = [...priorExclusions];
+        changed = true;
       }
-    }
-    if (removedFile && removedFile.assetOrigin === 'existing') {
       return project.files;
     }
     project.files = project.files.filter(file => (
@@ -14116,18 +14144,18 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
-  const visualRevisions = await Promise.all(
-    manifest.files.map(file => createProjectFileVisualRevision(projectId, file))
+  const presentations = await Promise.all(
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file))
   );
   return {
     token,
     projectId,
     files: manifest.entries.map((entry, index) => ({
+      ...presentations[index],
       name: entry.displayName,
       ext: entry.ext,
       embedded: entry.embedded,
-      visualIdentity: createProjectFileVisualIdentity(projectId, manifest.files[index]),
-      visualRevision: visualRevisions[index],
+      status: 'ready',
     })),
     totalFiles: manifest.entries.length,
     materializable: true,
@@ -14143,16 +14171,17 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
 
 async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
-  const visualRevisions = await Promise.all(
-    manifest.files.map(file => createProjectFileVisualRevision(projectId, file))
+  const presentations = await Promise.all(
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file))
   );
   return {
     projectId,
     files: manifest.entries.map((entry, index) => ({
+      ...presentations[index],
       name: entry.displayName,
+      ext: entry.ext,
+      embedded: entry.embedded,
       status: manifest.entryStatuses[index] || 'unavailable',
-      visualIdentity: createProjectFileVisualIdentity(projectId, manifest.files[index]),
-      visualRevision: visualRevisions[index],
     })),
     totalFiles: manifest.entries.length,
     materializable: false,
