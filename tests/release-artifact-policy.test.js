@@ -607,7 +607,7 @@ function safeEvidence(version = packageJson.version) {
     },
     electronRuntime: {
       valid: true,
-      lockedVersion: '39.8.10',
+      lockedVersion: '42.9.0',
       archiveVerified: true,
       payloadMatches: true,
     },
@@ -1589,7 +1589,7 @@ test('source binding requires a canonical Git root and regular committed source 
     const sourceManifest = {
       dependencies: { 'runtime-dep': '^1.0.0' },
       description: 'safe',
-      devDependencies: { electron: '^39.8.10' },
+      devDependencies: { electron: '^42.9.0' },
       main: 'main.js',
       name: 'crate-app',
       overrides: packageJson.overrides,
@@ -1616,7 +1616,7 @@ test('source binding requires a canonical Git root and regular committed source 
           devDependencies: sourceManifest.devDependencies,
         },
         'node_modules/electron': {
-          version: '39.8.10',
+          version: '42.9.0',
           dev: true,
           resolved: 'https://registry.npmjs.org/electron/-/electron-safe.tgz',
           integrity: SAFE_INTEGRITY,
@@ -2336,7 +2336,7 @@ test('Electron runtime proof binds the dev dependency archive and packaged paylo
   const sourceRoot = path.join(fixtureRoot, 'source');
   const appPath = path.join(fixtureRoot, 'Crate.app');
   const archivePath = path.join(fixtureRoot, 'electron.zip');
-  const electronVersion = '39.8.10';
+  const electronVersion = '42.9.0';
   const archiveBytes = Buffer.from('authenticated Electron archive');
   const archiveChecksum = crypto.createHash('sha256').update(archiveBytes).digest('hex');
   const packagedMain = path.join(appPath, 'Contents', 'MacOS', 'Crate');
@@ -3033,7 +3033,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     const sourceManifest = {
       dependencies: { 'runtime-dep': '^1.0.0' },
       description: 'safe',
-      devDependencies: { electron: '^39.8.10' },
+      devDependencies: { electron: '^42.9.0' },
       main: 'main.js',
       name: 'crate-app',
       overrides: packageJson.overrides,
@@ -3060,7 +3060,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
           devDependencies: sourceManifest.devDependencies,
         },
         'node_modules/electron': {
-          version: '39.8.10',
+          version: '42.9.0',
           dev: true,
           resolved: 'https://registry.npmjs.org/electron/-/electron-safe.tgz',
           integrity: SAFE_INTEGRITY,
@@ -3477,7 +3477,7 @@ test('CLI requires notarization by default and makes QA bypass explicit', () => 
   const revision = 'b'.repeat(40);
   const proofRoot = '/tmp/crate-release-proof-source';
   const canvasPrebuild = '/tmp/canvas-v3.2.1-napi-v7-darwin-arm64.tar.gz';
-  const electronArchive = '/tmp/electron-v39.8.10-darwin-arm64.zip';
+  const electronArchive = '/tmp/electron-v42.9.0-darwin-arm64.zip';
   assert.equal(require('../package.json').build.appId, PUBLIC_APP_ID);
   assert.equal(expectedTeamIdentifier(), PUBLIC_TEAM_ID);
   assert.throws(
