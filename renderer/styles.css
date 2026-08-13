@@ -2795,7 +2795,7 @@ body {
   margin-top: 8px;
 }
 
-/* Figma link row in Current Project (clickable) */
+/* Figma link row in Project Workspace (clickable) */
 .figma-link-row {
   display: flex;
   align-items: center;
