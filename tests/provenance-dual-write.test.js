@@ -10905,12 +10905,18 @@ test('initial mixed-app detection preserves presentation workspace restrictions 
     return { stdout: '' };
   });
 
-  const project = await createProject('Initial mixed app path preservation');
+  const project = await callIpc(
+    'projects:create',
+    'Initial mixed app path preservation',
+    'automatic',
+    'current-page',
+    null
+  );
   const fresh = await getProject(project.id);
   const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
 
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'sketch'), true);
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
+  assert.equal(fresh.type, 'automatic');
+  assert.deepEqual(candidates.map(entry => entry.latest?.appFamily).sort(), ['sketch']);
 });
 
 test('legacy presentation projects no longer narrow ongoing detection to presentation apps', async () => {
@@ -10974,7 +10980,13 @@ test('ongoing mixed-app detection preserves presentation workspace restrictions 
     return { stdout: '' };
   });
 
-  const project = await createProject('Ongoing mixed app path preservation');
+  const project = await callIpc(
+    'projects:create',
+    'Ongoing mixed app path preservation',
+    'automatic',
+    'current-page',
+    null
+  );
   pollReady = true;
   const fresh = await waitForProject(
     project.id,
@@ -10984,8 +10996,8 @@ test('ongoing mixed-app detection preserves presentation workspace restrictions 
   );
   const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
 
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'sketch'), true);
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
+  assert.equal(fresh.type, 'automatic');
+  assert.deepEqual(candidates.map(entry => entry.latest?.appFamily).sort(), ['sketch']);
 });
 
 test('ongoing lsof poll quarantines broad observations outside session scope', async () => {
