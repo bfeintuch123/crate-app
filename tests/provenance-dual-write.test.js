@@ -10839,6 +10839,155 @@ test('initial lsof snapshot quarantines stale open files outside session scope',
   assert.equal(provenanceText.includes('stdout'), false);
 });
 
+test('new projects default to automatic app detection across mixed supported apps', async () => {
+  const lsofRequests = [];
+  const supportedProcesses = [
+    'Adobe Illustrator',
+    'Adobe Photoshop',
+    'Adobe InDesign',
+    'Adobe XD',
+    'Figma',
+    'Sketch',
+    'Affinity Designer',
+    'Affinity Photo',
+    'Affinity Publisher',
+    'Pixelmator Pro',
+    'Acrobat',
+    'Keynote',
+    'Microsoft PowerPoint',
+    'Visual Studio Code',
+  ];
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'execFile' && command === '/bin/ps' && args.includes('command=')) {
+      return {
+        stdout: supportedProcesses
+          .map((processName, index) => `${index + 101} /Applications/${processName}.app/Contents/MacOS/${processName}`)
+          .join('\n') + '\n',
+      };
+    }
+    if (kind === 'execFile' && command === '/usr/sbin/lsof') {
+      lsofRequests.push(args);
+      return { stdout: '' };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await callIpc('projects:create', 'Automatic Mixed App');
+  const stored = await getProject(project.id);
+
+  assert.equal(stored.type, 'automatic');
+  const expectedPidList = supportedProcesses.map((_, index) => index + 101).join(',');
+  assert.equal(lsofRequests.some(args => args.includes(expectedPidList)), true);
+});
+
+test('initial mixed-app detection preserves presentation workspace restrictions per app', async () => {
+  const illustratorPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.ai');
+  const powerpointPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.pptx');
+  fs.mkdirSync(path.dirname(illustratorPath), { recursive: true });
+  fs.writeFileSync(illustratorPath, 'Illustrator bytes');
+  fs.writeFileSync(powerpointPath, 'PowerPoint bytes');
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'execFile' && command === '/bin/ps') {
+      return {
+        stdout:
+          '301 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' +
+          '302 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n',
+      };
+    }
+    if (kind === 'execFile' && command === '/usr/sbin/lsof') {
+      return {
+        stdout:
+          `p301\nf10\ntREG\nn${illustratorPath}\n` +
+          `p302\nf11\ntREG\nn${powerpointPath}\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Initial mixed app path preservation');
+  const fresh = await getProject(project.id);
+  const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
+
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'illustrator'), true);
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
+});
+
+test('legacy presentation projects no longer narrow ongoing detection to presentation apps', async () => {
+  let ongoingPollReady = false;
+  const lsofCommands = [];
+  setChildProcessHandler(({ kind, command }) => {
+    if (ongoingPollReady && kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return {
+        stdout:
+          '303 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' +
+          '404 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n',
+      };
+    }
+    if (ongoingPollReady && kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      lsofCommands.push(command);
+      return { stdout: '' };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await callIpc(
+    'projects:create',
+    'Legacy Presentation Mixed App',
+    'presentation',
+    'current-page',
+    null
+  );
+  ongoingPollReady = true;
+  await runTrackedIntervalCallbacks();
+  await new Promise(resolve => originalSetTimeout(resolve, 20));
+
+  const stored = await getProject(project.id);
+  assert.equal(stored.type, 'presentation');
+  assert.equal(lsofCommands.some(command => command.includes('-p 303,404')), true);
+});
+
+test('ongoing mixed-app detection preserves presentation workspace restrictions per app', async () => {
+  const illustratorPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'ongoing-outside-workspace.ai');
+  const powerpointPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'ongoing-outside-workspace.pptx');
+  fs.mkdirSync(path.dirname(illustratorPath), { recursive: true });
+  fs.writeFileSync(illustratorPath, 'Illustrator bytes');
+  fs.writeFileSync(powerpointPath, 'PowerPoint bytes');
+  let pollReady = false;
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (!pollReady) return { stdout: '' };
+    if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+      return {
+        stdout:
+          '401 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' +
+          '402 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n',
+      };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+      return {
+        stdout:
+          `p401\nf10\ntREG\nn${illustratorPath}\n` +
+          `p402\nf11\ntREG\nn${powerpointPath}\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Ongoing mixed app path preservation');
+  pollReady = true;
+  const fresh = await waitForProject(
+    project.id,
+    item => Object.values(item.liveEvidenceLedger?.candidates || {})
+      .some(entry => entry.latest?.appFamily === 'illustrator'),
+    5000
+  );
+  const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
+
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'illustrator'), true);
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
+});
+
 test('ongoing lsof poll quarantines broad observations outside session scope', async () => {
   const filePath = path.join(TEST_HOME, 'Desktop', 'poll-logo.ai');
   let pollReady = false;

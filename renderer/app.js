@@ -20,7 +20,6 @@ let state = {
   packageReviewToken: null,
   lastPackagedPath: null,
   pendingDeleteId: null,
-  projectType: 'branding',
   figmaScopeMode: 'current-page',
   figmaSectionExpanded: false,
   figmaScanInFlight: false,
@@ -338,12 +337,7 @@ function showNewProjectForm() {
   input.value = '';
   input.focus();
 
-  // Reset project type to default
-  state.projectType = 'branding';
   state.figmaScopeMode = 'current-page';
-  $$('.type-pill').forEach(p => p.classList.remove('active'));
-  const defaultPill = document.querySelector('.type-pill[data-type="branding"]');
-  if (defaultPill) defaultPill.classList.add('active');
   const figmaScopeInput = $('#input-figma-scope');
   if (figmaScopeInput) {
     figmaScopeInput.value = 'current-page';
@@ -405,7 +399,7 @@ async function createProject() {
     figmaError.textContent = '';
   }
 
-  const result = await window.crate.createProject(name, state.projectType, state.figmaScopeMode, figmaUrl);
+  const result = await window.crate.createProject(name, 'automatic', state.figmaScopeMode, figmaUrl);
   // FIX 6 (M3): Guard against null/error IPC response
   if (!result || result.error) {
     if (result && result.error === 'invalid_figma_url' && figmaError) {
@@ -2522,15 +2516,6 @@ function setupEventListeners() {
   $('#btn-add-project').addEventListener('click', showNewProjectForm);
   $('#btn-cancel-project').addEventListener('click', hideNewProjectForm);
   $('#btn-create-project').addEventListener('click', createProject);
-
-  // Project type selector
-  $$('.type-pill').forEach(pill => {
-    pill.addEventListener('click', () => {
-      $$('.type-pill').forEach(p => p.classList.remove('active'));
-      pill.classList.add('active');
-      state.projectType = pill.dataset.type;
-    });
-  });
 
   // Project name input -> update preview
   $('#input-project-name').addEventListener('input', updateNamingPreview);

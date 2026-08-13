@@ -529,33 +529,6 @@ body {
   margin-bottom: 16px;
 }
 
-/* ===== Project Type Selector ===== */
-.project-type-selector {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.type-pill {
-  padding: 4px 12px;
-  border-radius: 20px;
-  border: 1.5px solid var(--gray-300);
-  background: transparent;
-  color: var(--gray-500);
-  font-size: 11px;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.type-pill.active,
-.type-pill:hover {
-  border-color: var(--black);
-  background: var(--black);
-  color: var(--white);
-}
-
 /* ===== Privacy Hint ===== */
 .privacy-hint {
   font-size: 10px;
