@@ -10881,24 +10881,24 @@ test('new projects default to automatic app detection across mixed supported app
 });
 
 test('initial mixed-app detection preserves presentation workspace restrictions per app', async () => {
-  const illustratorPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.ai');
+  const sketchPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.sketch');
   const powerpointPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.pptx');
-  fs.mkdirSync(path.dirname(illustratorPath), { recursive: true });
-  fs.writeFileSync(illustratorPath, 'Illustrator bytes');
+  fs.mkdirSync(path.dirname(sketchPath), { recursive: true });
+  fs.writeFileSync(sketchPath, 'Sketch bytes');
   fs.writeFileSync(powerpointPath, 'PowerPoint bytes');
 
   setChildProcessHandler(({ kind, command }) => {
     if (kind === 'execFile' && command === '/bin/ps') {
       return {
         stdout:
-          '301 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' +
+          '301 /Applications/Sketch.app/Contents/MacOS/Sketch\n' +
           '302 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n',
       };
     }
     if (kind === 'execFile' && command === '/usr/sbin/lsof') {
       return {
         stdout:
-          `p301\nf10\ntREG\nn${illustratorPath}\n` +
+          `p301\nf10\ntREG\nn${sketchPath}\n` +
           `p302\nf11\ntREG\nn${powerpointPath}\n`,
       };
     }
@@ -10909,7 +10909,7 @@ test('initial mixed-app detection preserves presentation workspace restrictions 
   const fresh = await getProject(project.id);
   const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
 
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'illustrator'), true);
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'sketch'), true);
   assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
 });
 
@@ -10948,10 +10948,10 @@ test('legacy presentation projects no longer narrow ongoing detection to present
 });
 
 test('ongoing mixed-app detection preserves presentation workspace restrictions per app', async () => {
-  const illustratorPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'ongoing-outside-workspace.ai');
+  const sketchPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'ongoing-outside-workspace.sketch');
   const powerpointPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'ongoing-outside-workspace.pptx');
-  fs.mkdirSync(path.dirname(illustratorPath), { recursive: true });
-  fs.writeFileSync(illustratorPath, 'Illustrator bytes');
+  fs.mkdirSync(path.dirname(sketchPath), { recursive: true });
+  fs.writeFileSync(sketchPath, 'Sketch bytes');
   fs.writeFileSync(powerpointPath, 'PowerPoint bytes');
   let pollReady = false;
 
@@ -10960,14 +10960,14 @@ test('ongoing mixed-app detection preserves presentation workspace restrictions 
     if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
       return {
         stdout:
-          '401 /Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' +
+          '401 /Applications/Sketch.app/Contents/MacOS/Sketch\n' +
           '402 /Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n',
       };
     }
     if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
       return {
         stdout:
-          `p401\nf10\ntREG\nn${illustratorPath}\n` +
+          `p401\nf10\ntREG\nn${sketchPath}\n` +
           `p402\nf11\ntREG\nn${powerpointPath}\n`,
       };
     }
@@ -10979,12 +10979,12 @@ test('ongoing mixed-app detection preserves presentation workspace restrictions 
   const fresh = await waitForProject(
     project.id,
     item => Object.values(item.liveEvidenceLedger?.candidates || {})
-      .some(entry => entry.latest?.appFamily === 'illustrator'),
+      .some(entry => entry.latest?.appFamily === 'sketch'),
     5000
   );
   const candidates = Object.values(fresh.liveEvidenceLedger?.candidates || {});
 
-  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'illustrator'), true);
+  assert.equal(candidates.some(entry => entry.latest?.appFamily === 'sketch'), true);
   assert.equal(candidates.some(entry => entry.latest?.appFamily === 'powerpoint'), false);
 });
 
