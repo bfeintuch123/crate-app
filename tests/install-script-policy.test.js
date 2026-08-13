@@ -37,15 +37,6 @@ const EXPECTED_INSTALL_SCRIPTS = Object.freeze([
     implicitInstall: null,
   }),
   Object.freeze({
-    lockPath: 'node_modules/electron',
-    name: 'electron',
-    version: '39.8.10',
-    resolved: 'https://registry.npmjs.org/electron/-/electron-39.8.10.tgz',
-    integrity: 'sha512-zbYtGPYUI7PzqLAzkk21Rk6j67WN0hxn0Mq/njErZo1d0HSf33is4f8ICI5fMLy5vYe0JtCtM5sYunNOaochSQ==',
-    scripts: Object.freeze({ postinstall: 'node install.js' }),
-    implicitInstall: null,
-  }),
-  Object.freeze({
     lockPath: 'node_modules/electron-winstaller',
     name: 'electron-winstaller',
     version: '5.4.0',
@@ -328,7 +319,7 @@ test('package-tree symlinks and implicit install drift fail closed', () => {
 test('untargeted registry prepare metadata is inert while Canvas rebuild prepare fails closed', () => {
   const root = createFixture();
   try {
-    const approved = EXPECTED_INSTALL_SCRIPTS.find(item => item.name === 'electron');
+    const approved = EXPECTED_INSTALL_SCRIPTS.find(item => item.name === 'electron-winstaller');
     const approvedManifestPath = path.join(root, approved.lockPath, 'package.json');
     const approvedManifest = JSON.parse(fs.readFileSync(approvedManifestPath, 'utf8'));
     approvedManifest.scripts.prepare = 'node unreviewed-prepare.js';
