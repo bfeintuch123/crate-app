@@ -5957,16 +5957,25 @@ test('visible inactivity reminder waits the full three hours before showing its 
     await runTrackedIntervalCallbacks();
     assert.equal(testMessageBoxes.length + testNotifications.length, 0);
 
-    now += 2;
+    now += 1;
     await runTrackedIntervalCallbacks();
     assert.equal(testMessageBoxes.length, 1);
     assert.equal(testNotifications.length, 0);
     assert.equal(testMessageBoxes[0].title, 'Crate — Still working?');
+    assert.equal(testMessageBoxes[0].message, '⏸ Still working on "Three Hour Inactivity Reminder"?');
     assert.equal(
       testMessageBoxes[0].detail,
       "Crate hasn't detected any new design files in 3 hours. Would you like to keep watching or pause?"
     );
     assert.deepEqual(testMessageBoxes[0].buttons, ['Keep Watching', 'Pause', 'Package Now']);
+
+    now += 180 * 60 * 1000 - 1;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length, 1);
+    now += 1;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length, 2);
+    assert.equal(testMessageBoxes[1].title, 'Crate — Still working?');
   } finally {
     Date.now = originalDateNow;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -6002,7 +6011,7 @@ test('hidden inactivity reminder waits the full three hours before showing its n
     await runTrackedIntervalCallbacks();
     assert.equal(testMessageBoxes.length + testNotifications.length, 0);
 
-    now += 2;
+    now += 1;
     await runTrackedIntervalCallbacks();
     assert.equal(testMessageBoxes.length, 0);
     assert.equal(testNotifications.length, 1);
@@ -6017,9 +6026,14 @@ test('hidden inactivity reminder waits the full three hours before showing its n
 
     testNotifications[0].handlers.get('click')();
     assert.equal(testMainWindowShowCount, 1);
-    now += 60 * 1000;
+    now += 180 * 60 * 1000 - 1;
     await runTrackedIntervalCallbacks();
     assert.equal(testNotifications.length, 1);
+    now += 1;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testNotifications.length, 2);
+    assert.equal(testNotifications[1].options.title, 'Crate — Still working?');
+    assert.equal(testNotifications[1].shown, true);
   } finally {
     Date.now = originalDateNow;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
