@@ -146,6 +146,7 @@ let testBeforeFileIconResolve = null;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
 const testNotifications = [];
+const testMessageBoxes = [];
 const testRendererEvents = [];
 const trustedRendererMainFrame = {
   url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
@@ -240,7 +241,10 @@ setStub('electron', () => ({
   dialog: {
     showOpenDialog: async () => nextOpenDialogResult,
     showSaveDialog: async () => ({ canceled: true }),
-    showMessageBox: async () => ({ response: 0 }),
+    showMessageBox: async options => {
+      testMessageBoxes.push(options);
+      return { response: 0 };
+    },
     showErrorBox: () => {},
   },
   shell: { openPath: () => {} },
@@ -565,6 +569,9 @@ module.exports.__crateMetadataTestHooks = {
   },
   clearAssetBaselineScans() {
     assetBaselineScans.clear();
+  },
+  startInactivityChecker() {
+    startInactivityChecker();
   },
   createRendererFilePresentation(project, file) {
     return createRendererFilePresentation(project, file);
@@ -2095,6 +2102,7 @@ test.afterEach(async () => {
   testBrowserWindowCreateCount = 0;
   testMainWindowShowCount = 0;
   testNotifications.length = 0;
+  testMessageBoxes.length = 0;
   watcherRecords.length = 0;
   watcherCloseCount = 0;
   testUuidCounter = 0;
@@ -5915,6 +5923,48 @@ test('background project package leaves app hidden when native notification is s
     assert.equal(testBrowserWindowCreateCount, 0);
     assert.equal(testMainWindowShowCount, 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('inactivity reminder waits the full three hours before prompting', async () => {
+  const tmpRoot = makeTempDir();
+  const originalDateNow = Date.now;
+  let now = originalDateNow();
+  try {
+    Date.now = () => now;
+    const project = await createProject('Three Hour Inactivity Reminder');
+    const sourcePath = path.join(tmpRoot, 'Reminder.ai');
+    fs.writeFileSync(sourcePath, Buffer.from('three hour reminder bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Reminder.ai',
+        ext: '.ai',
+        addedAt: now,
+        source: 'manual-browse',
+      }],
+    });
+
+    metadataTestHooks.startInactivityChecker();
+    testMessageBoxes.length = 0;
+    testNotifications.length = 0;
+    now += 180 * 60 * 1000 - 1;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length + testNotifications.length, 0);
+
+    now += 2;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length + testNotifications.length, 1);
+    if (testMessageBoxes.length === 1) {
+      assert.equal(testMessageBoxes[0].title, 'Crate — Still working?');
+      assert.match(testMessageBoxes[0].detail, /3 hours/);
+    } else {
+      assert.equal(testNotifications[0].options.title, 'Crate — Still working?');
+      assert.match(testNotifications[0].options.body, /3 hours/);
+    }
+  } finally {
+    Date.now = originalDateNow;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

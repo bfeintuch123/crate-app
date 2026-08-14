@@ -4448,7 +4448,7 @@ async function isFileOpenByDesignApp(filePath) {
 }
 
 // Inactivity threshold — configurable constant
-const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const INACTIVITY_TIMEOUT_MS = 180 * 60 * 1000; // 3 hours
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024; // 300MB — guard against OOM on huge PSD/AI files
 const MAX_PROJECTS = 7;
 
@@ -11860,7 +11860,7 @@ function startInactivityChecker() {
           if (Notification.isSupported()) {
             const notif = new Notification({
               title: 'Crate — Still working?',
-              body: `No new design files for "${project.name}" in 10 minutes. Click to open Crate.`,
+              body: `No new design files for "${project.name}" in 3 hours. Click to open Crate.`,
               silent: false,
             });
             notif.on('click', () => {
@@ -11880,7 +11880,7 @@ function startInactivityChecker() {
           type: 'question',
           title: 'Crate — Still working?',
           message: `⏸ Still working on "${project.name}"?`,
-          detail: `Crate hasn't detected any new design files in 10 minutes. Would you like to keep watching or pause?`,
+          detail: `Crate hasn't detected any new design files in 3 hours. Would you like to keep watching or pause?`,
           buttons: ['Keep Watching', 'Pause', 'Package Now'],
           defaultId: 0,
           cancelId: 0
