@@ -3952,39 +3952,6 @@ const LSOF_IMAGE_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.heic',
 ]);
 
-// Project type → relevant bundle IDs (for isDesignAppFile type-aware filtering)
-const PROJECT_TYPE_APPS = {
-  branding: new Set([
-    'com.figma.Desktop', 'com.adobe.Photoshop', 'com.adobe.illustrator',
-    'com.adobe.InDesign', 'com.bohemiancoding.sketch3',
-    'com.affinity.designer', 'com.affinity.designer2',
-    'com.affinity.photo', 'com.affinity.photo2',
-    'com.affinity.publisher2', 'com.pixelmator.pro',
-  ]),
-  print: new Set([
-    'com.adobe.InDesign', 'com.adobe.illustrator', 'com.adobe.Photoshop',
-    'com.adobe.acrobat.pro', 'com.adobe.Acrobat.Pro', 'com.adobe.reader',
-    'com.affinity.publisher2',
-  ]),
-  presentation: new Set([
-    'com.microsoft.Powerpoint', 'com.apple.iWork.Keynote',
-  ]),
-  web: new Set([
-    'com.figma.Desktop', 'com.bohemiancoding.sketch3',
-    'com.affinity.designer', 'com.affinity.designer2',
-    'com.adobe.xd',
-    'com.microsoft.VSCode',
-  ]),
-};
-
-// Process name keywords used to find design app PIDs via `ps` (for lsof polling)
-const DESIGN_APP_PROCESS_NAMES = {
-  branding: ['Adobe Illustrator', 'Adobe Photoshop', 'Adobe InDesign', 'Figma', 'Sketch', 'Affinity Designer', 'Affinity Photo', 'Affinity Publisher', 'Pixelmator Pro'],
-  print:    ['Adobe InDesign', 'Adobe Illustrator', 'Adobe Photoshop', 'Acrobat', 'Affinity Publisher'],
-  presentation: ['Keynote', 'Microsoft PowerPoint'],
-  web:      ['Figma', 'Sketch', 'Adobe XD', 'Affinity Designer', 'Visual Studio Code'],
-};
-
 const DESIGN_APP_PROCESS_IDENTITIES = Object.freeze([
   { keyword: 'Adobe Illustrator', name: 'Adobe Illustrator', appFamily: 'illustrator', bundleId: 'com.adobe.illustrator' },
   { keyword: 'Adobe Photoshop', name: 'Adobe Photoshop', appFamily: 'photoshop', bundleId: 'com.adobe.Photoshop' },
@@ -4002,6 +3969,12 @@ const DESIGN_APP_PROCESS_IDENTITIES = Object.freeze([
   { keyword: 'Visual Studio Code', name: 'Visual Studio Code', appFamily: 'vscode', bundleId: 'com.microsoft.VSCode' },
 ]);
 
+const DESIGN_APP_PROCESS_KEYWORDS = Object.freeze(
+  DESIGN_APP_PROCESS_IDENTITIES.map(identity => identity.keyword)
+);
+
+const PRESENTATION_PROCESS_APP_FAMILIES = new Set(['powerpoint', 'keynote']);
+
 function getDesignAppProcessIdentity(commandText) {
   if (typeof commandText !== 'string' || !commandText.trim()) return null;
   const match = DESIGN_APP_PROCESS_IDENTITIES.find(identity => commandText.includes(identity.keyword));
@@ -4011,6 +3984,14 @@ function getDesignAppProcessIdentity(commandText) {
     appFamily: match.appFamily,
     bundleId: match.bundleId || null,
   };
+}
+
+function isAllowedLsofPathForApp(filePath, commandText, home) {
+  const appIdentity = getDesignAppProcessIdentity(commandText);
+  if (!appIdentity || !PRESENTATION_PROCESS_APP_FAMILIES.has(appIdentity.appFamily)) return true;
+  return filePath.startsWith(home + '/Desktop/') ||
+    filePath.startsWith(home + '/Documents/') ||
+    filePath.startsWith(home + '/Downloads/');
 }
 
 function getFileCreatorApp(filePath) {
@@ -4396,8 +4377,8 @@ async function selectProjectFilesForPackaging(project) {
   return deduplicateFiles(deduplicatePackageSourceMastersForOutput(project, packageFiles));
 }
 
-// projectType: optional — if provided, Check 1 is scoped to that type's app list.
-// Extension fallback (Check 2) always applies regardless of type.
+// projectType remains accepted for compatibility with persisted and older callers,
+// but app recognition is automatic and never narrows a multi-app project.
 // Renderer-callable utility — may be invoked via IPC from the renderer process
 function isDesignAppFile(filePath, projectType = null) {
   const ext = path.extname(filePath).toLowerCase();
@@ -4405,11 +4386,7 @@ function isDesignAppFile(filePath, projectType = null) {
   // Check 1: Was this file created/modified by a known design app?
   const creatorApp = getFileCreatorApp(filePath);
   if (creatorApp) {
-    // Use type-specific app list if available, otherwise accept any design app
-    const relevantApps = (projectType && PROJECT_TYPE_APPS[projectType])
-      ? PROJECT_TYPE_APPS[projectType]
-      : DESIGN_APP_BUNDLE_IDS;
-    if (relevantApps.has(creatorApp)) return true;
+    if (DESIGN_APP_BUNDLE_IDS.has(creatorApp)) return true;
   }
 
   // Check 2: Fallback — unambiguous design format extension.
@@ -4431,10 +4408,7 @@ async function isCreatedByDesignApp(filePath, projectType = null) {
     });
     const creatorApp = stdout.trim();
     if (!creatorApp || creatorApp === '(null)') return false;
-    const relevantApps = (projectType && PROJECT_TYPE_APPS[projectType])
-      ? PROJECT_TYPE_APPS[projectType]
-      : DESIGN_APP_BUNDLE_IDS;
-    return relevantApps.has(creatorApp);
+    return DESIGN_APP_BUNDLE_IDS.has(creatorApp);
   } catch (e) {
     return false;
   }
@@ -4459,7 +4433,7 @@ async function isFileOpenByDesignApp(filePath) {
       timeout: 5000, encoding: 'utf8'
     });
     if (!psOut) return false;
-    const allKeywords = Object.values(DESIGN_APP_PROCESS_NAMES).flat();
+    const allKeywords = DESIGN_APP_PROCESS_KEYWORDS;
     for (const line of psOut.trim().split('\n')) {
       const m = line.trim().match(/^\s*(\d+)\s+(.+)$/);
       if (!m) continue;
@@ -6348,13 +6322,9 @@ const scanOnSavePresentationTimers = new Map(); // key -> setTimeout id
 const lastUsedPollers = new Map();    // projectId -> intervalId
 const LAST_USED_POLL_MS = 10000;      // 10 seconds
 
-// Get PIDs of running design apps relevant to a project type.
+// Get PIDs of all running supported design apps so one project can span apps.
 // Uses `ps ax -o pid= -o command=` which gives full app paths (not truncated like lsof COMMAND).
-function getRunningDesignAppPids(projectType, callback) {
-  const keywords = DESIGN_APP_PROCESS_NAMES[projectType]
-    // Fallback: all known keywords if type not recognized
-    || Object.values(DESIGN_APP_PROCESS_NAMES).flat();
-
+function getRunningDesignAppPids(callback) {
   exec('/bin/ps ax -o pid= -o command= 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
     if (err && !stdout) { callback([], new Map()); return; }
     const pids = [];
@@ -6364,7 +6334,7 @@ function getRunningDesignAppPids(projectType, callback) {
       if (!m) continue;
       const pid = parseInt(m[1]);
       const cmd = m[2];
-      if (keywords.some(kw => cmd.includes(kw))) {
+      if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
         pids.push(pid);
         pidToCmd.set(pid, cmd);
       }
@@ -6384,7 +6354,7 @@ function pollLsofForProject(projectId, activationToken = null) {
 
   lsofInProgress.add(projectId);
 
-  getRunningDesignAppPids(project.type, (pids, pidToCmd) => {
+  getRunningDesignAppPids((pids, pidToCmd) => {
     if (!getFreshActiveWatchingProject(projectId, activationToken)) {
       lsofInProgress.delete(projectId);
       return;
@@ -6567,13 +6537,8 @@ function pollLsofForProject(projectId, activationToken = null) {
           if (filePath.includes('/.')) continue;
           if (filePath.includes('.app/Contents/')) continue;
 
-          const RESTRICTED_LSOF_TYPES = new Set(['presentation']);
-          if (RESTRICTED_LSOF_TYPES.has(proj.type)) {
-            const isInWatchedDir = filePath.startsWith(home + '/Desktop/') ||
-                                   filePath.startsWith(home + '/Documents/') ||
-                                   filePath.startsWith(home + '/Downloads/');
-            if (!isInWatchedDir) continue;
-          }
+          const processCommand = currentPid ? pidToCmd.get(currentPid) || '' : '';
+          if (!isAllowedLsofPathForApp(filePath, processCommand, home)) continue;
 
           // Presentation source files are broad lsof evidence, not package-ready proof.
           // Let them reach the central policy as pending/observed candidates so an
@@ -6630,7 +6595,7 @@ function pollLsofForProject(projectId, activationToken = null) {
           // mid-session should be captured when opened by a design app.
 
           const processIdentity = currentPid
-            ? getDesignAppProcessIdentity(pidToCmd.get(currentPid) || '')
+            ? getDesignAppProcessIdentity(processCommand)
             : null;
           const isPrimarySource = PRIMARY_DESIGN_EXTENSIONS.has(ext);
           const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
@@ -6646,7 +6611,7 @@ function pollLsofForProject(projectId, activationToken = null) {
             recordLsofAcceptedFileProvenance(proj, fileEntry, {
               method: 'poll',
               pid: currentPid,
-              command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+              command: processCommand,
             });
             existingPaths.add(normalizedFilePath);
           } else if (staged.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -11428,8 +11393,6 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   // v1.3.38: One-time lsof snapshot to capture files already open in design apps
   // BEFORE the polling loop begins.
   try {
-    const keywords = DESIGN_APP_PROCESS_NAMES[projectSnapshot.type]
-      || Object.values(DESIGN_APP_PROCESS_NAMES).flat();
     const { stdout: psOut } = await execFileAsync('/bin/ps', ['ax', '-o', 'pid=', '-o', 'command='], {
       timeout: 5000, encoding: 'utf8'
     });
@@ -11441,7 +11404,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       if (!m) continue;
       const pid = parseInt(m[1]);
       const cmd = m[2];
-      if (keywords.some(kw => cmd.includes(kw))) {
+      if (DESIGN_APP_PROCESS_KEYWORDS.some(kw => cmd.includes(kw))) {
         pids.push(pid);
         pidToCmd.set(pid, cmd);
       }
@@ -11492,13 +11455,8 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
             if (filePath.includes('/.')) continue;
             if (filePath.includes('.app/Contents/')) continue;
 
-            const RESTRICTED_LSOF_TYPES = new Set(['presentation']);
-            if (RESTRICTED_LSOF_TYPES.has(project.type)) {
-              const isInWatchedDir = filePath.startsWith(home + '/Desktop/') ||
-                                     filePath.startsWith(home + '/Documents/') ||
-                                     filePath.startsWith(home + '/Downloads/');
-              if (!isInWatchedDir) continue;
-            }
+            const processCommand = currentPid ? pidToCmd.get(currentPid) || '' : '';
+            if (!isAllowedLsofPathForApp(filePath, processCommand, home)) continue;
 
             if (path.basename(filePath).startsWith('~$')) continue;
 
@@ -11542,7 +11500,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
             if (pendingPaths.has(normalizedFilePath)) continue;
 
             const processIdentity = currentPid
-              ? getDesignAppProcessIdentity(pidToCmd.get(currentPid) || '')
+              ? getDesignAppProcessIdentity(processCommand)
               : null;
             const fileEntry = buildAutoCaptureFileEntry(filePath, 'lsof', { ext });
             const staged = stageLiveObservedFile(project, fileEntry, {
@@ -11557,7 +11515,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
               recordLsofAcceptedFileProvenance(project, fileEntry, {
                 method: 'initial-snapshot',
                 pid: currentPid,
-                command: currentPid ? pidToCmd.get(currentPid) || '' : '',
+                command: processCommand,
               });
               existingPaths.add(normalizedFilePath);
               if (SCAN_ON_OPEN_EXTENSIONS.has(ext)) {
@@ -11964,7 +11922,7 @@ registerTrustedIpcHandler('projects:get-all', () => {
   return projects.map(getIllustratorScopedProjectView);
 });
 
-registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'branding', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
+registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'automatic', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
   const projects = getProjects();
 
   // Enforce project cap

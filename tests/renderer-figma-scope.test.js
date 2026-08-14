@@ -117,15 +117,11 @@ function createDocumentStub(elements = {}, options = {}) {
     querySelector: selector => {
       if (selector.startsWith('#')) return getElementById(selector.slice(1));
       if (selector === '.package-review-modal') return attach(options.packageReviewDialog || null);
-      if (selector === '.type-pill[data-type="branding"]') {
-        return (options.typePills || []).find(pill => pill.dataset.type === 'branding') || null;
-      }
       return null;
     },
     querySelectorAll: selector => {
       if (selector === '.app-tab') return options.tabs || [];
       if (selector === '.tab-content') return options.tabContents || [];
-      if (selector === '.type-pill') return options.typePills || [];
       if (selector === '.asset-filter') return options.assetFilters || [];
       return [];
     },
@@ -137,7 +133,6 @@ function createDocumentStub(elements = {}, options = {}) {
   for (const element of [
     ...(options.tabs || []),
     ...(options.tabContents || []),
-    ...(options.typePills || []),
     ...(options.assetFilters || []),
   ]) attach(element);
   return document;
@@ -219,12 +214,6 @@ function createInteractiveRendererDom() {
     if (tabName === 'projects') tabContent.classList.add('active');
     return tabContent;
   });
-  const typePills = ['branding', 'print', 'presentation', 'web'].map(type => {
-    const pill = createElementStub('button');
-    pill.dataset.type = type;
-    if (type === 'branding') pill.classList.add('active');
-    return pill;
-  });
   const assetFilters = ['all', 'existing', 'added', 'missing', 'excluded'].map(filter => {
     const button = createElementStub('button');
     button.dataset.assetFilter = filter;
@@ -241,11 +230,10 @@ function createInteractiveRendererDom() {
     createMissingIds: true,
     tabs,
     tabContents,
-    typePills,
     assetFilters,
     packageReviewDialog,
   });
-  return { document, elements, tabs, tabContents, typePills, assetFilters, packageReviewDialog };
+  return { document, elements, tabs, tabContents, assetFilters, packageReviewDialog };
 }
 
 function createPackageDetailsDom() {
@@ -2426,6 +2414,34 @@ test('navigation uses Projects, Quick Package, and Project Workspace consistentl
   assert.match(visibleHtml, /data-tab="current-project">Project Workspace<\/button>/);
   assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
   assert.equal(visibleHtml.includes('Current Project'), false);
+});
+
+test('new project creation removes category pills and requests automatic app detection', async () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const visibleHtml = html.replace(/<!--[\s\S]*?-->/g, '');
+  const { document, elements } = createInteractiveRendererDom();
+  const createCalls = [];
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async (...args) => {
+        createCalls.push(args);
+        return { error: 'test_stop_after_request' };
+      },
+    },
+  });
+
+  document.querySelector('#input-project-name').value = 'Mixed App Campaign';
+  document.querySelector('#input-figma-scope').value = 'current-page';
+  await renderer.createProject();
+
+  assert.equal(visibleHtml.includes('Project Type'), false);
+  assert.equal(visibleHtml.includes('type-pill'), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(createCalls)), [[
+    'Mixed App Campaign',
+    'automatic',
+    'current-page',
+    null,
+  ]]);
 });
 
 test('renderer security policy permits only local and bounded data URL file visuals', () => {
