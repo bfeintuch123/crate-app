@@ -508,7 +508,41 @@ function getProjectFigmaWarning(project) {
   return warnings[0] || '';
 }
 
-function renderFigmaWarningCard(container, warning) {
+function getProjectFigmaRateLimitRetryAt(project) {
+  const retryAt = project && project.figmaSession && project.figmaSession.rateLimitRetryAt;
+  return Number.isSafeInteger(retryAt) && retryAt > Date.now() && retryAt <= Date.now() + (31 * 24 * 60 * 60 * 1000)
+    ? retryAt
+    : null;
+}
+
+function formatFigmaRetryTime(retryAt) {
+  if (
+    !Number.isSafeInteger(retryAt) ||
+    retryAt <= Date.now() ||
+    retryAt > Date.now() + (31 * 24 * 60 * 60 * 1000)
+  ) return '';
+  const retryDate = new Date(retryAt);
+  if (!Number.isFinite(retryDate.getTime())) return '';
+  const today = new Date();
+  const sameDay = retryDate.getFullYear() === today.getFullYear() &&
+    retryDate.getMonth() === today.getMonth() &&
+    retryDate.getDate() === today.getDate();
+  const formatted = retryDate.toLocaleString([], sameDay
+    ? { hour: 'numeric', minute: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `Try again after ${formatted}.`;
+}
+
+function getFigmaWarningDisplayText(warning, retryAt = null) {
+  const message = typeof warning === 'string' ? warning.trim() : '';
+  if (!message) return '';
+  const lowerMessage = message.toLowerCase();
+  const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
+  const retryText = isRateLimited ? formatFigmaRetryTime(retryAt) : '';
+  return retryText ? `${message} ${retryText}` : message;
+}
+
+function renderFigmaWarningCard(container, warning, retryAt = null) {
   if (!container) return;
   const message = typeof warning === 'string' ? warning.trim() : '';
   container.innerHTML = '';
@@ -521,7 +555,7 @@ function renderFigmaWarningCard(container, warning) {
   const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
   const title = isRateLimited ? 'Figma rate limiting' : 'File cannot be read';
   const action = isRateLimited
-    ? 'Crate will retry after Figma allows the request.'
+    ? (formatFigmaRetryTime(retryAt) || 'Crate will retry after Figma allows the request.')
     : 'Reconnect Figma or check file access.';
 
   container.classList.remove('hidden');
@@ -647,7 +681,7 @@ async function renderFiles() {
   }
   if (figmaWarningText) {
     const warning = getProjectFigmaWarning(project);
-    renderFigmaWarningCard(figmaWarningText, warning);
+    renderFigmaWarningCard(figmaWarningText, warning, getProjectFigmaRateLimitRetryAt(project));
   }
 
   const excludedAssetKeys = new Set(project.excludedAssetKeys || []);
@@ -2069,7 +2103,7 @@ function renderPackageReview(project, review, message = '') {
   const modalWarning = $('#modal-figma-warning');
   if (modalWarning) {
     const warning = hasFigmaContext ? getProjectFigmaWarning(project) : '';
-    modalWarning.textContent = warning;
+    modalWarning.textContent = getFigmaWarningDisplayText(warning, getProjectFigmaRateLimitRetryAt(project));
     modalWarning.style.display = warning ? 'block' : 'none';
   }
   const presentationReminder = $('#modal-presentation-reminder');
@@ -2972,10 +3006,11 @@ function setupMainProcessListeners() {
 
   // Figma scan complete notification
   window.crate.onFigmaScanComplete((data) => {
-    if (data.warning) {
-      if (state.lastFigmaWarning !== data.warning) {
-        showToast(data.warning);
-        state.lastFigmaWarning = data.warning;
+    const displayWarning = getFigmaWarningDisplayText(data.warning, data.retryAt);
+    if (displayWarning) {
+      if (state.lastFigmaWarning !== displayWarning) {
+        showToast(displayWarning);
+        state.lastFigmaWarning = displayWarning;
       }
     } else if (data.addedCount > 0) {
       state.lastFigmaWarning = null;
@@ -3004,7 +3039,7 @@ function updateFigmaScanStatus(data) {
     return;
   }
 
-  const warning = data.warning || '';
+  const warning = getFigmaWarningDisplayText(data.warning, data.retryAt);
   const errors = data.errors || [];
   const candidateSummary = formatFigmaCandidateDiagnostics(data.candidateDiagnostics);
   const candidateSuffix = candidateSummary ? ` ${candidateSummary}` : '';

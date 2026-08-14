@@ -1596,6 +1596,54 @@ test('Package Review shows privacy-safe source context for visual assets', () =>
   assert.equal(reviewText.includes('/Users/'), false);
 });
 
+test('Figma rate-limit warning card shows the server retry time when available', () => {
+  const document = createDocumentStub();
+  const renderer = loadRendererHelpers(document);
+  const container = createElementStub();
+  container.ownerDocument = document;
+  container.append = (...children) => children.forEach(child => container.appendChild(child));
+  const retryAt = Date.now() + 90_000;
+
+  renderer.renderFigmaWarningCard(
+    container,
+    'Figma is temporarily rate limiting this scan.',
+    retryAt
+  );
+
+  const text = getElementTreeText(container);
+  assert.equal(text.includes('Figma rate limiting'), true);
+  assert.equal(text.includes('Try again after'), true);
+  assert.equal(text.includes('Crate will retry after Figma allows the request.'), false);
+});
+
+test('Figma retry copy falls back safely for expired or invalid timestamps', () => {
+  const renderer = loadRendererHelpers();
+  const warning = 'Figma is temporarily rate limiting this scan.';
+
+  assert.equal(renderer.getFigmaWarningDisplayText(warning, Date.now() - 1), warning);
+  assert.equal(renderer.getFigmaWarningDisplayText(warning, 'Retry-After: SECRET'), warning);
+  assert.equal(renderer.formatFigmaRetryTime(Number.MAX_SAFE_INTEGER), '');
+});
+
+test('Package Review shows the persisted Figma retry time', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const retryAt = Date.now() + 120_000;
+  const warning = 'Figma is temporarily rate limiting this scan.';
+  const project = {
+    id: 'figma-rate-limit-review',
+    name: 'Figma Rate Limit Review',
+    files: [],
+    figmaTrackedFiles: [{ key: 'safe-key' }],
+    figmaSession: { warnings: [warning], rateLimitRetryAt: retryAt, trackedFiles: [] },
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderPackageReview(project, { materializable: false, files: [] });
+
+  assert.equal(elements['modal-figma-warning'].textContent.includes('Try again after'), true);
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+});
+
 test('Package Review reports authoritative unavailable counts and resets blocked-review scrolling', () => {
   const { document, elements, packageReviewDialog } = createInteractiveRendererDom();
   const project = { id: 'unavailable-review-summary', name: 'Unavailable Review', files: [] };

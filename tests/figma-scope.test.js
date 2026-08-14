@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { FigmaParser } = require('../parsers/figma');
+const { FigmaParser, parseFigmaRetryAfterMs } = require('../parsers/figma');
 
 const FILE_KEY = 'FILE123';
 
@@ -179,11 +179,39 @@ class RateLimitedFileFetchFigmaParser extends FigmaParser {
 
   async _fetchAPI(endpoint) {
     if (endpoint === `/files/${FILE_KEY}`) {
-      throw new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+      const error = new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+      error._crateFigmaApiFailureReason = 'rate-limited';
+      error._crateFigmaApiRetryAfterMs = 90_000;
+      throw error;
     }
     throw new Error(`Unexpected endpoint: ${endpoint}`);
   }
+
+  async verifyToken() {
+    return { valid: true };
+  }
+
+  async getFileMetadata(fileKey, diagnostic) {
+    diagnostic.metadataStatus = 'success';
+    return {
+      key: fileKey,
+      name: 'Rate Limited Fixture',
+      lastModified: new Date().toISOString(),
+      lastModifiedMs: Date.now()
+    };
+  }
 }
+
+test('Retry-After parsing accepts bounded integer seconds only', () => {
+  assert.equal(parseFigmaRetryAfterMs('90'), 90_000);
+  assert.equal(parseFigmaRetryAfterMs(' 120 '), 120_000);
+  assert.equal(parseFigmaRetryAfterMs('0'), null);
+  assert.equal(parseFigmaRetryAfterMs('-1'), null);
+  assert.equal(parseFigmaRetryAfterMs('1.5'), null);
+  assert.equal(parseFigmaRetryAfterMs('Wed, 21 Oct 2030 07:28:00 GMT'), null);
+  assert.equal(parseFigmaRetryAfterMs('999999999999999999999999'), null);
+  assert.equal(parseFigmaRetryAfterMs(String(60 * 60 * 24 * 365)), 31 * 24 * 60 * 60 * 1000);
+});
 
 class AllCandidateFailureFigmaParser extends FigmaParser {
   async getStoredToken() {
@@ -813,6 +841,7 @@ test('current-page rate-limited file fetch surfaces a safe retry warning', async
   assert.equal(result.scope.lockStatus, 'unresolved');
   assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
   assert.equal(result.scope.fileFetchFailureReason, 'rate-limited');
+  assert.equal(result.scope.retryAfterMs, 90_000);
   assert.match(result.scope.warning || '', /rate limiting/i);
   assert.match(result.scope.warning || '', /retry after a cooldown/i);
 
@@ -820,6 +849,21 @@ test('current-page rate-limited file fetch surfaces a safe retry warning', async
   assert.equal(serialized.includes('https://figma.example'), false);
   assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
   assert.equal(serialized.includes('Bearer'), false);
+});
+
+test('rate-limit retry timing survives the aggregate scan without raw response data', async () => {
+  const parser = new RateLimitedFileFetchFigmaParser();
+  const { result, output } = await captureConsole(() => parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [{ key: FILE_KEY, scopeMode: 'current-page', requestedNodeId: '2:1' }]
+  }));
+
+  assert.equal(result.retryAfterMs, 90_000);
+  assert.equal(result.candidateDiagnostics.retryAfterMs, 90_000);
+  assert.equal(result.scopeEntries[0].retryAfterMs, 90_000);
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
 });
 
 test('current-page locked page with no exportable image refs reports zero image refs safely', async () => {

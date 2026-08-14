@@ -750,7 +750,7 @@ function figmaScanResult(assets, scopeEntries = []) {
   };
 }
 
-function figmaRateLimitedScanResult() {
+function figmaRateLimitedScanResult(retryAfterMs = 60_000) {
   return {
     files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
     assets: [],
@@ -768,6 +768,7 @@ function figmaRateLimitedScanResult() {
       warning: 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.',
       fileFetchStatus: 'failed',
       fileFetchFailureReason: 'rate-limited',
+      retryAfterMs,
     }],
     candidateDiagnostics: {
       candidateCount: 1,
@@ -781,7 +782,9 @@ function figmaRateLimitedScanResult() {
       lockStatusCounts: { unresolved: 1 },
       statusReasonCounts: { 'figma-current-page-file-fetch-failed': 1 },
       assetResultCounts: { withAssets: 0, withoutAssets: 1 },
+      retryAfterMs,
     },
+    retryAfterMs,
   };
 }
 
@@ -1605,12 +1608,14 @@ test('legacy persisted Figma URLs migrate without reconnecting or losing page sc
     null
   );
   const legacyUrl = 'https://www.figma.com/design/LEGACY22/Private-Project?page-id=7%3A9';
+  const retryAt = Date.now() + 60_000;
   const legacy = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   legacy.figmaTrackedFiles = [{ key: 'LEGACY22', url: legacyUrl }];
   legacy.figmaSession = {
     scopeMode: 'current-page',
     startedAt: legacy.watchStartedAt,
     teamIds: ['LEGACY_PRIVATE_TEAM'],
+    rateLimitRetryAt: retryAt,
     trackedFiles: [{
       key: 'LEGACY22',
       url: legacyUrl,
@@ -1633,6 +1638,7 @@ test('legacy persisted Figma URLs migrate without reconnecting or losing page sc
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Private Page');
   assert.equal(fresh.figmaSession.trackedFiles[0].url, undefined);
   assert.deepEqual(fresh.figmaSession.teamIds, []);
+  assert.equal(fresh.figmaSession.rateLimitRetryAt, retryAt);
   assert.equal(JSON.stringify(fresh).includes(legacyUrl), false);
   assert.equal(JSON.stringify(fresh).includes('LEGACY_PRIVATE_TEAM'), false);
 });
@@ -1652,6 +1658,7 @@ test('legacy session-only locator migration preserves the connection and valid U
     scopeMode: 'current-page',
     startedAt: legacy.watchStartedAt,
     teamIds: [],
+    rateLimitRetryAt: Date.now() + (365 * 24 * 60 * 60 * 1000),
     trackedFiles: [{
       key: 'SESSION44',
       url: legacyUrl,
@@ -1670,6 +1677,7 @@ test('legacy session-only locator migration preserves the connection and valid U
   assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '8:4');
   assert.equal(fresh.figmaSession.trackedFiles[0].requestedPageId, '8:4');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageName, 'Private Page');
+  assert.equal(fresh.figmaSession.rateLimitRetryAt, undefined);
   assert.equal(JSON.stringify(fresh).includes(legacyUrl), false);
 });
 
@@ -2062,6 +2070,7 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   assert.equal(tracked.warning.includes('figma.com'), false);
   assert.equal(tracked.warning.includes('token'), false);
   assert.equal(rateLimitedProject.files.length, 0);
+  assert.ok(rateLimitedProject.figmaSession.rateLimitRetryAt > Date.now());
 
   setFigmaDownloadResponse('should not download during cooldown');
   nextFigmaScanResult = figmaScanResult([{
@@ -2087,8 +2096,79 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   const secondScan = await callIpc('figma:scan-project', project.id);
   assert.equal(secondScan.success, true);
   assert.equal(figmaScanInvocationCount, 1, 'cooldown should prevent an immediate second API scan');
+  const cooldownMessage = [...rendererMessages].reverse().find(message => message.channel === 'figma:scan-complete');
+  assert.ok(cooldownMessage.data.retryAfterMs > 0);
+  assert.equal(cooldownMessage.data.retryAt, rateLimitedProject.figmaSession.rateLimitRetryAt);
   const afterCooldownSkip = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   assert.equal(afterCooldownSkip.files.length, 0);
+});
+
+test('Figma cooldown survives pause and restart until package-time recovery succeeds', async () => {
+  const project = await createLinkedFigmaProject('Figma Restart Cooldown');
+  nextFigmaScanResult = figmaRateLimitedScanResult(1_000);
+
+  const firstScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(firstScan.success, true);
+  assert.equal(figmaScanInvocationCount, 1);
+
+  const rateLimitedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const retryAt = rateLimitedProject.figmaSession.rateLimitRetryAt;
+  const usageBeforeRecovery = fakeStoreInstance.get('usage.packagesThisMonth');
+  assert.ok(retryAt > Date.now());
+
+  await callIpc('projects:pause', project.id);
+  await callIpc('projects:start-watching', project.id);
+  await new Promise(resolve => originalSetTimeout(resolve, 30));
+
+  const restartedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(restartedProject.status, 'watching');
+  assert.equal(restartedProject.figmaSession.rateLimitRetryAt, retryAt);
+  assert.match(restartedProject.figmaSession.warnings.join(' '), /rate limiting/i);
+  assert.equal(figmaScanInvocationCount, 1, 'restart must not bypass the persisted cooldown');
+
+  const callsBeforeBlockedPackageScan = figmaScanInvocationCount;
+  const blockedPackageScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.match(blockedPackageScan.error, /could not securely retrieve all Figma assets/i);
+  assert.equal(figmaScanInvocationCount, callsBeforeBlockedPackageScan);
+  assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBeforeRecovery);
+
+  const successfulScopeEntries = [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }];
+  nextFigmaScanResult = figmaScanResult([], successfulScopeEntries);
+  await new Promise(resolve => originalSetTimeout(resolve, Math.max(0, retryAt - Date.now()) + 30));
+
+  const callsBeforeRecovery = figmaScanInvocationCount;
+  const recoveredPackageScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(recoveredPackageScan.error, undefined);
+  assert.equal(figmaScanInvocationCount, callsBeforeRecovery + 1);
+  assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBeforeRecovery);
+
+  const recoveredProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(recoveredProject.figmaSession.rateLimitRetryAt, undefined);
+  assert.equal(recoveredProject.figmaSession.warnings.some(warning => /rate limiting/i.test(warning)), false);
+});
+
+test('Figma rate limiting without a usable retry duration uses the bounded fallback', async () => {
+  const project = await createLinkedFigmaProject('Figma Rate Limit Fallback');
+  nextFigmaScanResult = figmaRateLimitedScanResult(null);
+  const scan = await callIpc('figma:scan-project', project.id);
+  assert.equal(scan.success, true);
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  const retryDelay = fresh.figmaSession.rateLimitRetryAt - Date.now();
+  assert.ok(retryDelay <= (10 * 60 * 1000));
+  assert.ok(retryDelay >= (10 * 60 * 1000) - 1000);
 });
 
 test('figmaSession snapshot reads tracked files from the project, not settings', async () => {
@@ -2525,12 +2605,25 @@ test('pre-package Figma download failure blocks output until a clean retry succe
     assert.match(blocked.error, /could not securely retrieve all Figma assets/i);
     assert.equal(fs.existsSync(outputDir), false);
 
-    nextFigmaScanResult = figmaRateLimitedScanResult();
+    nextFigmaScanResult = figmaRateLimitedScanResult(100);
+    const usageBeforeRateLimit = fakeStoreInstance.get('usage.packagesThisMonth');
+    const callsBeforeRateLimit = figmaScanInvocationCount;
     const rateLimitedRetry = await callIpc('projects:pre-package-scan', project.id);
     assert.match(rateLimitedRetry.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(figmaScanInvocationCount, callsBeforeRateLimit + 1);
+    const projectDuringCooldown = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.ok(projectDuringCooldown.figmaSession.rateLimitRetryAt > Date.now());
+
+    const callsBeforeCooldownRetry = figmaScanInvocationCount;
+    const cooldownRetry = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(cooldownRetry.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(figmaScanInvocationCount, callsBeforeCooldownRetry, 'active cooldown should prevent another package-time API scan');
     const stillBlocked = await callIpc('projects:package', project.id, outputDir);
     assert.match(stillBlocked.error, /could not securely retrieve all Figma assets/i);
     assert.equal(fs.existsSync(outputDir), false);
+    assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBeforeRateLimit);
+
+    await new Promise(resolve => originalSetTimeout(resolve, 120));
 
     nextFigmaScanResult = figmaScanResult([], [{
       ...successfulScopeEntries[0],
@@ -2547,6 +2640,9 @@ test('pre-package Figma download failure blocks output until a clean retry succe
     setFigmaDownloadResponse('recovered asset');
     const retryScan = await callIpc('projects:pre-package-scan', project.id);
     assert.equal(retryScan.error, undefined);
+    const recoveredProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(recoveredProject.figmaSession.rateLimitRetryAt, undefined);
+    assert.equal(recoveredProject.figmaSession.warnings.some(warning => /rate limiting/i.test(warning)), false);
 
     const packaged = await callIpc('projects:package', project.id, outputDir);
     assert.equal(packaged.success, true);

@@ -42,7 +42,24 @@ if (!fetch && typeof globalThis.fetch === 'function') {
 }
 
 const FIGMA_API_BASE = 'https://api.figma.com/v1';
+const FIGMA_MAX_RETRY_AFTER_MS = 31 * 24 * 60 * 60 * 1000;
 let configuredCredentialStore = null;
+
+function parseFigmaRetryAfterMs(value) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value.trim())) return null;
+  const seconds = Number(value.trim());
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return null;
+  return Math.min(seconds * 1000, FIGMA_MAX_RETRY_AFTER_MS);
+}
+
+function getFigmaParserRetryAfterMs(value) {
+  const retryAfterMs = value && typeof value === 'object'
+    ? value._crateFigmaApiRetryAfterMs
+    : null;
+  return Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0
+    ? Math.min(retryAfterMs, FIGMA_MAX_RETRY_AFTER_MS)
+    : null;
+}
 
 function figmaParserText(value) {
   if (value instanceof Error) return value.message || '';
@@ -114,6 +131,9 @@ function safeFigmaParserError(message, details = {}) {
     if (details.status != null) error._crateFigmaApiStatus = details.status;
     if (details.endpointCategory) error._crateFigmaApiEndpointCategory = details.endpointCategory;
     if (details.reason) error._crateFigmaApiFailureReason = details.reason;
+    if (Number.isSafeInteger(details.retryAfterMs) && details.retryAfterMs > 0) {
+      error._crateFigmaApiRetryAfterMs = Math.min(details.retryAfterMs, FIGMA_MAX_RETRY_AFTER_MS);
+    }
   }
   return error;
 }
@@ -235,7 +255,13 @@ function summarizeFigmaCandidateDiagnostics({
     assetResultCounts: {
       withAssets: 0,
       withoutAssets: 0
-    }
+    },
+    retryAfterMs: null
+  };
+
+  const includeRetryAfter = (value) => {
+    if (!Number.isSafeInteger(value) || value <= 0) return;
+    summary.retryAfterMs = Math.max(summary.retryAfterMs || 0, Math.min(value, FIGMA_MAX_RETRY_AFTER_MS));
   };
 
   for (const entry of Array.isArray(scopeEntries) ? scopeEntries : []) {
@@ -253,6 +279,7 @@ function summarizeFigmaCandidateDiagnostics({
     if (diagnostic && diagnostic.metadataStatus === 'failed') {
       incrementCount(summary.metadataFailureReasonCounts, diagnostic.metadataFailureReason || 'unknown');
     }
+    includeRetryAfter(diagnostic && diagnostic.retryAfterMs);
   }
 
   for (const diagnostic of Array.isArray(extractionDiagnostics) ? extractionDiagnostics : []) {
@@ -264,6 +291,7 @@ function summarizeFigmaCandidateDiagnostics({
     incrementCount(summary.statusReasonCounts, diagnostic && diagnostic.statusReason ? diagnostic.statusReason : 'none');
     if (diagnostic && diagnostic.assetCount > 0) summary.assetResultCounts.withAssets += 1;
     else summary.assetResultCounts.withoutAssets += 1;
+    includeRetryAfter(diagnostic && diagnostic.retryAfterMs);
   }
 
   return summary;
@@ -532,7 +560,17 @@ class FigmaParser extends BaseParser {
         } else if (status === 404) {
           throw safeFigmaParserError('Figma file not found. Check that the file URL is correct and the file still exists.', { status, reason, endpointCategory });
         } else if (status === 429) {
-          throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.', { status, reason, endpointCategory });
+          const retryAfterMs = parseFigmaRetryAfterMs(
+            response.headers && typeof response.headers.get === 'function'
+              ? response.headers.get('retry-after')
+              : null
+          );
+          throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.', {
+            status,
+            reason,
+            endpointCategory,
+            retryAfterMs
+          });
         } else {
           throw safeFigmaParserError(figmaApiFailureMessage(endpoint, status), { status, reason, endpointCategory });
         }
@@ -1113,7 +1151,12 @@ class FigmaParser extends BaseParser {
         }
       };
     } catch (e) {
-      return { valid: false, error: redactFigmaParserText(e.message) };
+      return {
+        valid: false,
+        error: redactFigmaParserText(e.message),
+        reason: classifyFigmaParserFailure(e),
+        retryAfterMs: getFigmaParserRetryAfterMs(e)
+      };
     }
   }
 
@@ -1240,6 +1283,10 @@ class FigmaParser extends BaseParser {
       } catch (e) {
         if (diagnostic && typeof diagnostic === 'object') {
           diagnostic.metadataFailureReason = classifyFigmaParserFailure(e);
+          diagnostic.retryAfterMs = Math.max(
+            getFigmaParserRetryAfterMs(metaErr) || 0,
+            getFigmaParserRetryAfterMs(e) || 0
+          ) || null;
         }
         console.error(
           `[crate][figma] getFileMetadata error identifierPresent=${!!fileKey}:`,
@@ -1484,6 +1531,7 @@ class FigmaParser extends BaseParser {
       const errors = [];
       const warnings = [];
       let assetFetchFailed = false;
+      let retryAfterMs = null;
       const scope = this._resolveScopeRoot(fileData.document, scopeEntry);
       const scopedRoot = scope.rootNode || fileData.document;
 
@@ -1564,6 +1612,7 @@ class FigmaParser extends BaseParser {
           }
         } catch (err) {
           assetFetchFailed = true;
+          retryAfterMs = Math.max(retryAfterMs || 0, getFigmaParserRetryAfterMs(err) || 0) || null;
           errors.push(`Image-fill recovery failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
@@ -1587,7 +1636,8 @@ class FigmaParser extends BaseParser {
             statusReason: scope.statusReason,
             warning: scope.warning,
             fileFetchStatus: 'success',
-            assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
+            assetFetchStatus: assetFetchFailed ? 'failed' : 'success',
+            retryAfterMs
           }
         });
       }
@@ -1614,7 +1664,8 @@ class FigmaParser extends BaseParser {
             statusReason: scope.statusReason,
             warning: scope.warning,
             fileFetchStatus: 'success',
-            assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
+            assetFetchStatus: assetFetchFailed ? 'failed' : 'success',
+            retryAfterMs
           }
         });
       }
@@ -1656,6 +1707,7 @@ class FigmaParser extends BaseParser {
           }
         } catch (err) {
           assetFetchFailed = true;
+          retryAfterMs = Math.max(retryAfterMs || 0, getFigmaParserRetryAfterMs(err) || 0) || null;
           errors.push(`Batch image export failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
         }
       }
@@ -1677,7 +1729,8 @@ class FigmaParser extends BaseParser {
           statusReason: scope.statusReason,
           warning: scope.warning,
           fileFetchStatus: 'success',
-          assetFetchStatus: assetFetchFailed ? 'failed' : 'success'
+          assetFetchStatus: assetFetchFailed ? 'failed' : 'success',
+          retryAfterMs
         }
       });
     } catch (e) {
@@ -1687,6 +1740,7 @@ class FigmaParser extends BaseParser {
         ? FIGMA_SCOPE_REASONS.PROTOTYPE_FILE_FETCH_FAILED
         : FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED;
       const fileFetchFailureReason = classifyFigmaParserFailure(e);
+      const retryAfterMs = getFigmaParserRetryAfterMs(e);
       const warning = isCurrentPage ? currentPageScopeWarning(statusReason, fileFetchFailureReason) : null;
       return this._figmaExtractionResult({
         assets: [],
@@ -1701,7 +1755,8 @@ class FigmaParser extends BaseParser {
           warning,
           fileFetchStatus: 'failed',
           fileFetchFailureReason,
-          assetFetchStatus: 'not-attempted'
+          assetFetchStatus: 'not-attempted',
+          retryAfterMs
         }
       });
     }
@@ -1729,7 +1784,23 @@ class FigmaParser extends BaseParser {
     // Verify token first
     const tokenStatus = await this.verifyToken(apiBudget);
     if (!tokenStatus.valid) {
-      result.errors.push({ type: 'auth', message: 'Figma token invalid or not set' });
+      const failureReason = tokenStatus.reason || 'invalid-token';
+      result.errors.push({
+        type: failureReason === 'invalid-token' ? 'auth' : 'request',
+        message: failureReason === 'rate-limited'
+          ? 'Figma is temporarily rate limiting this scan.'
+          : 'Figma token invalid or not set'
+      });
+      result.retryAfterMs = tokenStatus.retryAfterMs || null;
+      result.candidateDiagnostics = summarizeFigmaCandidateDiagnostics({
+        fileKeys: options.fileKeys || [],
+        scopeEntries: options.scopeEntries || [],
+        metadataDiagnostics: [{
+          metadataStatus: 'failed',
+          metadataFailureReason: failureReason,
+          retryAfterMs: tokenStatus.retryAfterMs || null
+        }]
+      });
       return result;
     }
 
@@ -1789,7 +1860,8 @@ class FigmaParser extends BaseParser {
             statusReason: extractResult.scope.statusReason || null,
             candidateSource: scopeEntry && scopeEntry.candidateSource,
             assetFetchStatus: extractResult.scope.assetFetchStatus || 'unknown',
-            assetCount: Array.isArray(extractResult.assets) ? extractResult.assets.length : 0
+            assetCount: Array.isArray(extractResult.assets) ? extractResult.assets.length : 0,
+            retryAfterMs: extractResult.scope.retryAfterMs || null
           });
           result.scopeEntries.push({
             fileKey: file.key,
@@ -1806,7 +1878,8 @@ class FigmaParser extends BaseParser {
             warning: extractResult.scope.warning ? redactFigmaParserText(extractResult.scope.warning) : null,
             fileFetchStatus: extractResult.scope.fileFetchStatus || null,
             fileFetchFailureReason: extractResult.scope.fileFetchFailureReason || null,
-            assetFetchStatus: extractResult.scope.assetFetchStatus || null
+            assetFetchStatus: extractResult.scope.assetFetchStatus || null,
+            retryAfterMs: extractResult.scope.retryAfterMs || null
           });
         }
         for (const asset of extractResult.assets) {
@@ -1825,10 +1898,11 @@ class FigmaParser extends BaseParser {
       metadataDiagnostics,
       extractionDiagnostics
     });
+    result.retryAfterMs = result.candidateDiagnostics.retryAfterMs || null;
     result.errors = redactFigmaParserIssues(result.errors);
     result.warnings = redactFigmaParserIssues(result.warnings);
     return result;
   }
 }
 
-module.exports = { FigmaParser };
+module.exports = { FigmaParser, parseFigmaRetryAfterMs };
