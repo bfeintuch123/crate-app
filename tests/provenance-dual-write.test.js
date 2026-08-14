@@ -130,6 +130,7 @@ const ipcHandlers = new Map();
 let nextOpenDialogResult = { canceled: true };
 let testNotificationSupported = false;
 let testAppActive = true;
+let testMainWindowVisible = true;
 let testAppVersion = packageJson.version;
 let testNativeFileVisualImage = null;
 let testNativeFileIconImage = null;
@@ -154,7 +155,7 @@ const trustedRendererMainFrame = {
 const trustedRendererWindow = {
   handlers: new Map(),
   isDestroyed: () => false,
-  isVisible: () => true,
+  isVisible: () => testMainWindowVisible,
   isMinimized: () => false,
   restore: () => {},
   show: () => { testMainWindowShowCount += 1; },
@@ -2098,6 +2099,7 @@ test.afterEach(async () => {
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   testNotificationSupported = false;
   testAppActive = true;
+  testMainWindowVisible = true;
   testAppVersion = packageJson.version;
   testBrowserWindowCreateCount = 0;
   testMainWindowShowCount = 0;
@@ -5927,7 +5929,7 @@ test('background project package leaves app hidden when native notification is s
   }
 });
 
-test('inactivity reminder waits the full three hours before prompting', async () => {
+test('visible inactivity reminder waits the full three hours before showing its dialog', async () => {
   const tmpRoot = makeTempDir();
   const originalDateNow = Date.now;
   let now = originalDateNow();
@@ -5947,6 +5949,8 @@ test('inactivity reminder waits the full three hours before prompting', async ()
     });
 
     metadataTestHooks.startInactivityChecker();
+    testMainWindowVisible = true;
+    testNotificationSupported = true;
     testMessageBoxes.length = 0;
     testNotifications.length = 0;
     now += 180 * 60 * 1000 - 1;
@@ -5955,14 +5959,67 @@ test('inactivity reminder waits the full three hours before prompting', async ()
 
     now += 2;
     await runTrackedIntervalCallbacks();
-    assert.equal(testMessageBoxes.length + testNotifications.length, 1);
-    if (testMessageBoxes.length === 1) {
-      assert.equal(testMessageBoxes[0].title, 'Crate — Still working?');
-      assert.match(testMessageBoxes[0].detail, /3 hours/);
-    } else {
-      assert.equal(testNotifications[0].options.title, 'Crate — Still working?');
-      assert.match(testNotifications[0].options.body, /3 hours/);
-    }
+    assert.equal(testMessageBoxes.length, 1);
+    assert.equal(testNotifications.length, 0);
+    assert.equal(testMessageBoxes[0].title, 'Crate — Still working?');
+    assert.equal(
+      testMessageBoxes[0].detail,
+      "Crate hasn't detected any new design files in 3 hours. Would you like to keep watching or pause?"
+    );
+    assert.deepEqual(testMessageBoxes[0].buttons, ['Keep Watching', 'Pause', 'Package Now']);
+  } finally {
+    Date.now = originalDateNow;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('hidden inactivity reminder waits the full three hours before showing its native notification', async () => {
+  const tmpRoot = makeTempDir();
+  const originalDateNow = Date.now;
+  let now = originalDateNow();
+  try {
+    Date.now = () => now;
+    const project = await createProject('Three Hour Background Reminder');
+    const sourcePath = path.join(tmpRoot, 'Background-Reminder.ai');
+    fs.writeFileSync(sourcePath, Buffer.from('three hour background reminder bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Background-Reminder.ai',
+        ext: '.ai',
+        addedAt: now,
+        source: 'manual-browse',
+      }],
+    });
+
+    metadataTestHooks.startInactivityChecker();
+    testMainWindowVisible = false;
+    testNotificationSupported = true;
+    testMainWindowShowCount = 0;
+    testMessageBoxes.length = 0;
+    testNotifications.length = 0;
+    now += 180 * 60 * 1000 - 1;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length + testNotifications.length, 0);
+
+    now += 2;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testMessageBoxes.length, 0);
+    assert.equal(testNotifications.length, 1);
+    assert.equal(testNotifications[0].options.title, 'Crate — Still working?');
+    assert.equal(
+      testNotifications[0].options.body,
+      'No new design files for "Three Hour Background Reminder" in 3 hours. Click to open Crate.'
+    );
+    assert.equal(testNotifications[0].options.silent, false);
+    assert.equal(testNotifications[0].shown, true);
+    assert.equal(typeof testNotifications[0].handlers.get('click'), 'function');
+
+    testNotifications[0].handlers.get('click')();
+    assert.equal(testMainWindowShowCount, 1);
+    now += 60 * 1000;
+    await runTrackedIntervalCallbacks();
+    assert.equal(testNotifications.length, 1);
   } finally {
     Date.now = originalDateNow;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
