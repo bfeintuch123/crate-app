@@ -43,6 +43,7 @@ if (!fetch && typeof globalThis.fetch === 'function') {
 
 const FIGMA_API_BASE = 'https://api.figma.com/v1';
 const FIGMA_MAX_RETRY_AFTER_MS = 31 * 24 * 60 * 60 * 1000;
+const FIGMA_RATE_LIMIT_STATE = Symbol('crateFigmaRateLimitState');
 let configuredCredentialStore = null;
 
 function parseFigmaRetryAfterMs(value) {
@@ -59,6 +60,39 @@ function getFigmaParserRetryAfterMs(value) {
   return Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0
     ? Math.min(retryAfterMs, FIGMA_MAX_RETRY_AFTER_MS)
     : null;
+}
+
+function markFigmaScanRateLimited(apiBudget, retryAfterMs = null) {
+  if (!apiBudget || typeof apiBudget !== 'object') return;
+  const current = apiBudget[FIGMA_RATE_LIMIT_STATE] || { active: false, retryAfterMs: null };
+  const safeRetryAfterMs = Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0
+    ? Math.min(retryAfterMs, FIGMA_MAX_RETRY_AFTER_MS)
+    : null;
+  current.active = true;
+  current.retryAfterMs = Math.max(current.retryAfterMs || 0, safeRetryAfterMs || 0) || null;
+  apiBudget[FIGMA_RATE_LIMIT_STATE] = current;
+}
+
+function isFigmaScanRateLimited(apiBudget) {
+  return !!(apiBudget && apiBudget[FIGMA_RATE_LIMIT_STATE] && apiBudget[FIGMA_RATE_LIMIT_STATE].active);
+}
+
+function getFigmaScanRetryAfterMs(apiBudget) {
+  if (!isFigmaScanRateLimited(apiBudget)) return null;
+  const retryAfterMs = apiBudget[FIGMA_RATE_LIMIT_STATE].retryAfterMs;
+  return Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0
+    ? Math.min(retryAfterMs, FIGMA_MAX_RETRY_AFTER_MS)
+    : null;
+}
+
+function assertFigmaScanNotRateLimited(apiBudget, endpoint = '') {
+  if (!isFigmaScanRateLimited(apiBudget)) return;
+  throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.', {
+    status: 429,
+    reason: 'rate-limited',
+    endpointCategory: figmaEndpointCategory(endpoint),
+    retryAfterMs: getFigmaScanRetryAfterMs(apiBudget)
+  });
 }
 
 function figmaParserText(value) {
@@ -534,6 +568,7 @@ class FigmaParser extends BaseParser {
    * @private
    */
   async _fetchAPI(endpoint, token, apiBudget = null) {
+    assertFigmaScanNotRateLimited(apiBudget, endpoint);
     const url = `${FIGMA_API_BASE}${endpoint}`;
     try {
       const { response, buffer } = await fetchBufferWithLimits({
@@ -565,6 +600,7 @@ class FigmaParser extends BaseParser {
               ? response.headers.get('retry-after')
               : null
           );
+          markFigmaScanRateLimited(apiBudget, retryAfterMs);
           throw safeFigmaParserError('Rate limit exceeded. Please wait a moment and try again.', {
             status,
             reason,
@@ -1268,6 +1304,16 @@ class FigmaParser extends BaseParser {
         teamName: 'Manual'
       };
     } catch (metaErr) {
+      if (getFigmaParserRetryAfterMs(metaErr) || isFigmaScanRateLimited(apiBudget)) {
+        if (diagnostic && typeof diagnostic === 'object') {
+          diagnostic.metadataFailureReason = 'rate-limited';
+          diagnostic.retryAfterMs = Math.max(
+            getFigmaParserRetryAfterMs(metaErr) || 0,
+            getFigmaScanRetryAfterMs(apiBudget) || 0
+          ) || null;
+        }
+        return null;
+      }
       // Fallback: /files/{key} with minimal depth (metadata endpoint may not exist on older API)
       try {
         const data = await this._fetchAPI(`/files/${fileKey}?depth=1`, token, apiBudget);
@@ -1376,6 +1422,7 @@ class FigmaParser extends BaseParser {
     try {
       // --- Method 1: Team-based discovery (Professional+ plan) ---
       for (const teamId of teamIds) {
+        if (isFigmaScanRateLimited(apiBudget)) break;
         let teamName = 'Team';
         try {
           const teamData = await this._fetchAPI(`/teams/${teamId}`, token, apiBudget);
@@ -1388,6 +1435,7 @@ class FigmaParser extends BaseParser {
           const msg = `Cannot access the configured Figma team: ${hint}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
+          if (isFigmaScanRateLimited(apiBudget)) break;
           continue;
         }
 
@@ -1399,10 +1447,12 @@ class FigmaParser extends BaseParser {
           const msg = `Cannot list projects for the configured Figma team: ${redactFigmaParserText(e.message)}`;
           console.warn(`[crate][figma] ${msg}`);
           errors.push(msg);
+          if (isFigmaScanRateLimited(apiBudget)) break;
           continue;
         }
 
         for (const project of projects) {
+          if (isFigmaScanRateLimited(apiBudget)) break;
           try {
             const filesData = await this._fetchAPI(`/projects/${project.id}/files`, token, apiBudget);
             const files = filesData.files || [];
@@ -1429,12 +1479,14 @@ class FigmaParser extends BaseParser {
             }
           } catch (e) {
             errors.push(`Error listing files in a Figma project: ${redactFigmaParserText(e.message)}`);
+            if (isFigmaScanRateLimited(apiBudget)) break;
           }
         }
       }
 
       // --- Method 2: Direct file tracking (ALL plans, authoritative) ---
       for (const [trackedIndex, fileKey] of fileKeys.entries()) {
+        if (isFigmaScanRateLimited(apiBudget)) break;
         const candidateDiagnostic = {
           metadataStatus: 'not-attempted'
         };
@@ -1474,6 +1526,7 @@ class FigmaParser extends BaseParser {
         console.log(
           `[crate][figma] tracked file identifierPresent=${!!fileKey}: lastModifiedMs=unknown included=yes reason=metadata unavailable; forcing scan`
         );
+        if (candidateDiagnostic.retryAfterMs || isFigmaScanRateLimited(apiBudget)) break;
       }
 
       // Sort tracked files first (authoritative), then most-recent non-tracked files.
@@ -1487,11 +1540,21 @@ class FigmaParser extends BaseParser {
         return bLastModified - aLastModified;
       });
 
-      return { recentFiles, errors: redactFigmaParserIssues(errors), candidateDiagnostics };
+      return {
+        recentFiles,
+        errors: redactFigmaParserIssues(errors),
+        candidateDiagnostics,
+        retryAfterMs: getFigmaScanRetryAfterMs(apiBudget)
+      };
     } catch (e) {
       console.error('[crate][figma] discoverRecentFiles error:', redactFigmaParserText(e.message));
       errors.push(`discoverRecentFiles failed: ${redactFigmaParserText(e.message)}`);
-      return { recentFiles, errors: redactFigmaParserIssues(errors), candidateDiagnostics };
+      return {
+        recentFiles,
+        errors: redactFigmaParserIssues(errors),
+        candidateDiagnostics,
+        retryAfterMs: getFigmaScanRetryAfterMs(apiBudget)
+      };
     }
   }
 
@@ -1614,6 +1677,24 @@ class FigmaParser extends BaseParser {
           assetFetchFailed = true;
           retryAfterMs = Math.max(retryAfterMs || 0, getFigmaParserRetryAfterMs(err) || 0) || null;
           errors.push(`Image-fill recovery failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
+          if (retryAfterMs || isFigmaScanRateLimited(apiBudget)) {
+            return this._figmaExtractionResult({
+              assets: [],
+              errors,
+              warnings,
+              scope: {
+                scopeMode: scope.scopeMode,
+                lockStatus: scope.lockStatus,
+                lockedPageId: scope.lockedPageId,
+                lockedPageName: scope.lockedPageName,
+                statusReason: scope.statusReason,
+                warning: scope.warning,
+                fileFetchStatus: 'success',
+                assetFetchStatus: 'failed',
+                retryAfterMs: Math.max(retryAfterMs || 0, getFigmaScanRetryAfterMs(apiBudget) || 0) || null
+              }
+            });
+          }
         }
       }
 
@@ -1709,6 +1790,7 @@ class FigmaParser extends BaseParser {
           assetFetchFailed = true;
           retryAfterMs = Math.max(retryAfterMs || 0, getFigmaParserRetryAfterMs(err) || 0) || null;
           errors.push(`Batch image export failed for a tracked Figma file: ${redactFigmaParserText(err.message)}`);
+          if (retryAfterMs || isFigmaScanRateLimited(apiBudget)) break;
         }
       }
 
@@ -1785,6 +1867,9 @@ class FigmaParser extends BaseParser {
     const tokenStatus = await this.verifyToken(apiBudget);
     if (!tokenStatus.valid) {
       const failureReason = tokenStatus.reason || 'invalid-token';
+      if (failureReason === 'rate-limited' || isFigmaScanRateLimited(apiBudget)) {
+        result.rateLimited = true;
+      }
       result.errors.push({
         type: failureReason === 'invalid-token' ? 'auth' : 'request',
         message: failureReason === 'rate-limited'
@@ -1845,6 +1930,29 @@ class FigmaParser extends BaseParser {
       `[crate][figma] autoTrackScan final file count=${result.files.length}`
     );
 
+    const discoveryRetryAfterMs = Math.max(
+      discovery && Number.isSafeInteger(discovery.retryAfterMs) ? discovery.retryAfterMs : 0,
+      getFigmaScanRetryAfterMs(apiBudget) || 0
+    ) || null;
+    if (discoveryRetryAfterMs || isFigmaScanRateLimited(apiBudget)) {
+      result.rateLimited = true;
+      result.retryAfterMs = discoveryRetryAfterMs;
+      result.assets = [];
+      result.candidateDiagnostics = summarizeFigmaCandidateDiagnostics({
+        fileKeys,
+        scopeEntries,
+        metadataDiagnostics,
+        extractionDiagnostics
+      });
+      result.candidateDiagnostics.retryAfterMs = Math.max(
+        result.candidateDiagnostics.retryAfterMs || 0,
+        discoveryRetryAfterMs || 0
+      ) || null;
+      result.errors = redactFigmaParserIssues(result.errors);
+      result.warnings = redactFigmaParserIssues(result.warnings);
+      return result;
+    }
+
     // Extract assets from each file
     for (const file of result.files) {
       try {
@@ -1882,6 +1990,18 @@ class FigmaParser extends BaseParser {
             retryAfterMs: extractResult.scope.retryAfterMs || null
           });
         }
+        const extractionRetryAfterMs = Math.max(
+          extractResult.scope && Number.isSafeInteger(extractResult.scope.retryAfterMs)
+            ? extractResult.scope.retryAfterMs
+            : 0,
+          getFigmaScanRetryAfterMs(apiBudget) || 0
+        ) || null;
+        if (extractionRetryAfterMs || isFigmaScanRateLimited(apiBudget)) {
+          result.rateLimited = true;
+          result.retryAfterMs = Math.max(result.retryAfterMs || 0, extractionRetryAfterMs || 0) || null;
+          result.assets = [];
+          break;
+        }
         for (const asset of extractResult.assets) {
           asset.figmaFileName = file.name;
           asset.figmaFileKey = file.key;
@@ -1898,7 +2018,15 @@ class FigmaParser extends BaseParser {
       metadataDiagnostics,
       extractionDiagnostics
     });
-    result.retryAfterMs = result.candidateDiagnostics.retryAfterMs || null;
+    result.retryAfterMs = Math.max(
+      result.retryAfterMs || 0,
+      result.candidateDiagnostics.retryAfterMs || 0,
+      getFigmaScanRetryAfterMs(apiBudget) || 0
+    ) || null;
+    if (result.retryAfterMs || isFigmaScanRateLimited(apiBudget)) {
+      result.rateLimited = true;
+      result.assets = [];
+    }
     result.errors = redactFigmaParserIssues(result.errors);
     result.warnings = redactFigmaParserIssues(result.warnings);
     return result;

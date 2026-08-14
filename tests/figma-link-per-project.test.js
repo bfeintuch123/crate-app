@@ -750,10 +750,11 @@ function figmaScanResult(assets, scopeEntries = []) {
   };
 }
 
-function figmaRateLimitedScanResult(retryAfterMs = 60_000) {
+function figmaRateLimitedScanResult(retryAfterMs = 60_000, assets = []) {
   return {
     files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
-    assets: [],
+    assets,
+    rateLimited: true,
     errors: [],
     warnings: [],
     scopeEntries: [{
@@ -2056,7 +2057,22 @@ test('figma:status counts linked watching projects separately from active poller
 
 test('Figma rate-limit diagnostics enter cooldown and surface a safe project warning', async () => {
   const project = await createLinkedFigmaProject('Figma Rate Limit Cooldown');
-  nextFigmaScanResult = figmaRateLimitedScanResult();
+  let downloadRequests = 0;
+  fetchHandler = async () => {
+    downloadRequests += 1;
+    return { ok: true, status: 200, buffer: async () => Buffer.from('must not download') };
+  };
+  nextFigmaScanResult = figmaRateLimitedScanResult(60_000, [{
+    url: 'https://cdn.figma.example/partial-rate-limit.png?token=SHOULD_NOT_APPEAR_TOKEN',
+    nodeId: 'partial-rate-limit',
+    imageRef: 'partial-rate-limit-ref',
+    name: 'Partial Rate Limit',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }]);
 
   const firstScan = await callIpc('figma:scan-project', project.id);
   assert.equal(firstScan.success, true);
@@ -2070,6 +2086,7 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   assert.equal(tracked.warning.includes('figma.com'), false);
   assert.equal(tracked.warning.includes('token'), false);
   assert.equal(rateLimitedProject.files.length, 0);
+  assert.equal(downloadRequests, 0, 'a rate-limited live scan must discard partial assets before download');
   assert.ok(rateLimitedProject.figmaSession.rateLimitRetryAt > Date.now());
 
   setFigmaDownloadResponse('should not download during cooldown');
@@ -2605,12 +2622,21 @@ test('pre-package Figma download failure blocks output until a clean retry succe
     assert.match(blocked.error, /could not securely retrieve all Figma assets/i);
     assert.equal(fs.existsSync(outputDir), false);
 
-    nextFigmaScanResult = figmaRateLimitedScanResult(100);
+    let mixedRateLimitDownloadRequests = 0;
+    fetchHandler = async () => {
+      mixedRateLimitDownloadRequests += 1;
+      return { ok: true, status: 200, buffer: async () => Buffer.from('must not download') };
+    };
+    nextFigmaScanResult = figmaRateLimitedScanResult(100, [asset]);
+    nextFigmaScanResult.scopeEntries.unshift(successfulScopeEntries[0]);
+    nextFigmaScanResult.candidateDiagnostics.fileFetchStatusCounts.success = 1;
+    nextFigmaScanResult.candidateDiagnostics.assetResultCounts.withAssets = 1;
     const usageBeforeRateLimit = fakeStoreInstance.get('usage.packagesThisMonth');
     const callsBeforeRateLimit = figmaScanInvocationCount;
     const rateLimitedRetry = await callIpc('projects:pre-package-scan', project.id);
     assert.match(rateLimitedRetry.error, /could not securely retrieve all Figma assets/i);
     assert.equal(figmaScanInvocationCount, callsBeforeRateLimit + 1);
+    assert.equal(mixedRateLimitDownloadRequests, 0, 'mixed package scan must discard partial assets before download');
     const projectDuringCooldown = (await callIpc('projects:get-all')).find(item => item.id === project.id);
     assert.ok(projectDuringCooldown.figmaSession.rateLimitRetryAt > Date.now());
 

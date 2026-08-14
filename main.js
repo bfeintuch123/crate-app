@@ -6133,6 +6133,12 @@ function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
   const scopeEntries = Array.isArray(scanResult && scanResult.scopeEntries) ? scanResult.scopeEntries : [];
   const trackedFiles = Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [];
 
+  if (
+    (scanResult && scanResult.rateLimited === true) ||
+    getFigmaScanRetryAfterMs(scanResult) !== null ||
+    hasFigmaRateLimitDiagnostic(scanResult && scanResult.candidateDiagnostics)
+  ) return false;
+
   if (trackedFiles.length === 0) return errors.length === 0;
 
   return trackedFiles.every((trackedFile) => {
@@ -7936,9 +7942,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       console.log(`[crate][figma] candidate diagnostics: ${JSON.stringify(candidateDiagnostics)}`);
     }
     const retryAfterMs = getFigmaScanRetryAfterMs(scanResult);
-    const isRateLimited = hasFigmaRateLimitDiagnostic(candidateDiagnostics) || retryAfterMs !== null;
+    const isRateLimited = scanResult.rateLimited === true ||
+      hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
+      retryAfterMs !== null;
     let rateLimitRetryAt = 0;
     if (isRateLimited) {
+      scanResult.assets = [];
       rateLimitRetryAt = setFigmaRateLimitBackoff(projectId, retryAfterMs);
       const rateLimitScopeUpdate = updateFigmaSessionRateLimitWarning(projectId, rateLimitRetryAt);
       if (rateLimitScopeUpdate) {
@@ -13073,7 +13082,9 @@ end tell`;
         mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
         const candidateDiagnostics = summarizeFigmaCandidateDiagnosticsForLog(figmaScanResult.candidateDiagnostics);
         const retryAfterMs = getFigmaScanRetryAfterMs(figmaScanResult);
-        const isRateLimited = hasFigmaRateLimitDiagnostic(candidateDiagnostics) || retryAfterMs !== null;
+        const isRateLimited = figmaScanResult.rateLimited === true ||
+          hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
+          retryAfterMs !== null;
 
         if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
           console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
@@ -13085,7 +13096,7 @@ end tell`;
           sendToRenderer('project:updated', { projectId });
         }
 
-        if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
+        if (!isRateLimited && figmaScanResult.assets && figmaScanResult.assets.length > 0) {
           const scopedAssets = figmaScanResult.assets.map((asset) => ({
             ...asset,
             figmaScopeMode: getProjectFigmaScopeMode(latestProject)

@@ -202,6 +202,116 @@ class RateLimitedFileFetchFigmaParser extends FigmaParser {
   }
 }
 
+function createRateLimitedParserError(retryAfterMs) {
+  const error = new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+  error._crateFigmaApiFailureReason = 'rate-limited';
+  error._crateFigmaApiRetryAfterMs = retryAfterMs;
+  return error;
+}
+
+class MetadataRateLimitRequestRecorderParser extends FigmaParser {
+  constructor() {
+    super();
+    this.requests = [];
+  }
+
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async _fetchAPI(endpoint) {
+    this.requests.push(endpoint);
+    if (endpoint === `/files/${FILE_KEY}/metadata`) throw createRateLimitedParserError(120_000);
+    if (endpoint === `/files/${FILE_KEY}?depth=1`) return { name: 'must-not-run' };
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+class AssetRateLimitRequestRecorderParser extends FigmaParser {
+  constructor() {
+    super();
+    this.requests = [];
+  }
+
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async _fetchAPI(endpoint) {
+    this.requests.push(endpoint);
+    if (endpoint === `/files/${FILE_KEY}`) return { document: DOCUMENT_FIXTURE };
+    if (endpoint === `/files/${FILE_KEY}/images`) throw createRateLimitedParserError(180_000);
+    if (endpoint.startsWith(`/images/${FILE_KEY}?`)) return { images: {} };
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  }
+}
+
+class MultiCandidateRateLimitRequestRecorderParser extends FigmaParser {
+  constructor() {
+    super();
+    this.extractions = [];
+  }
+
+  async getStoredToken() {
+    return 'token';
+  }
+
+  async verifyToken() {
+    return { valid: true };
+  }
+
+  async getFileMetadata(fileKey, diagnostic) {
+    diagnostic.metadataStatus = 'success';
+    return {
+      key: fileKey,
+      name: `Tracked ${fileKey}`,
+      lastModified: new Date().toISOString(),
+      lastModifiedMs: Date.now()
+    };
+  }
+
+  async extractAssetsFromFileKey(fileKey, scopeEntry) {
+    this.extractions.push(fileKey);
+    if (fileKey === 'RATE_SECOND') {
+      return {
+        assets: [],
+        errors: ['Figma is temporarily rate limiting this scan.'],
+        warnings: [],
+        scope: {
+          scopeMode: 'current-page',
+          lockStatus: 'unresolved',
+          lockedPageId: null,
+          lockedPageName: null,
+          statusReason: 'figma-current-page-file-fetch-failed',
+          warning: null,
+          fileFetchStatus: 'failed',
+          fileFetchFailureReason: 'rate-limited',
+          assetFetchStatus: 'not-attempted',
+          retryAfterMs: 240_000
+        }
+      };
+    }
+    if (fileKey === 'MUST_NOT_RUN') throw new Error('third candidate must not run');
+    return {
+      assets: [{ url: 'https://cdn.example.com/partial.png', nodeId: 'partial', name: 'Partial', format: 'png' }],
+      errors: [],
+      warnings: [],
+      scope: {
+        scopeMode: scopeEntry.scopeMode,
+        lockStatus: 'locked',
+        lockedPageId: scopeEntry.requestedPageId,
+        lockedPageName: 'Page One',
+        statusReason: null,
+        warning: null,
+        fileFetchStatus: 'success',
+        fileFetchFailureReason: null,
+        assetFetchStatus: 'success',
+        retryAfterMs: null
+      }
+    };
+  }
+}
+
 test('Retry-After parsing accepts bounded integer seconds only', () => {
   assert.equal(parseFigmaRetryAfterMs('90'), 90_000);
   assert.equal(parseFigmaRetryAfterMs(' 120 '), 120_000);
@@ -211,6 +321,52 @@ test('Retry-After parsing accepts bounded integer seconds only', () => {
   assert.equal(parseFigmaRetryAfterMs('Wed, 21 Oct 2030 07:28:00 GMT'), null);
   assert.equal(parseFigmaRetryAfterMs('999999999999999999999999'), null);
   assert.equal(parseFigmaRetryAfterMs(String(60 * 60 * 24 * 365)), 31 * 24 * 60 * 60 * 1000);
+});
+
+test('metadata rate limiting skips the depth fallback request', async () => {
+  const parser = new MetadataRateLimitRequestRecorderParser();
+  const diagnostic = { metadataStatus: 'not-attempted' };
+
+  const result = await parser.getFileMetadata(FILE_KEY, diagnostic, {});
+
+  assert.equal(result, null);
+  assert.deepEqual(parser.requests, [`/files/${FILE_KEY}/metadata`]);
+  assert.equal(diagnostic.metadataFailureReason, 'rate-limited');
+  assert.equal(diagnostic.retryAfterMs, 120_000);
+});
+
+test('image-map rate limiting skips rendered-image fallback requests', async () => {
+  const parser = new AssetRateLimitRequestRecorderParser();
+  const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  }, {});
+
+  assert.deepEqual(parser.requests, [`/files/${FILE_KEY}`, `/files/${FILE_KEY}/images`]);
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.assetFetchStatus, 'failed');
+  assert.equal(result.scope.retryAfterMs, 180_000);
+});
+
+test('multi-candidate scan stops after the first rate limit and discards partial assets', async () => {
+  const parser = new MultiCandidateRateLimitRequestRecorderParser();
+  const fileKeys = ['SUCCESS_FIRST', 'RATE_SECOND', 'MUST_NOT_RUN'];
+  const result = await parser.autoTrackScan({
+    fileKeys,
+    scopeEntries: fileKeys.map((key, index) => ({
+      key,
+      primaryKey: key,
+      scopeMode: 'current-page',
+      requestedPageId: `${index + 1}:1`
+    }))
+  });
+
+  assert.deepEqual(parser.extractions, ['SUCCESS_FIRST', 'RATE_SECOND']);
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.retryAfterMs, 240_000);
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries.length, 2);
 });
 
 class AllCandidateFailureFigmaParser extends FigmaParser {
@@ -858,6 +1014,7 @@ test('rate-limit retry timing survives the aggregate scan without raw response d
     scopeEntries: [{ key: FILE_KEY, scopeMode: 'current-page', requestedNodeId: '2:1' }]
   }));
 
+  assert.equal(result.rateLimited, true);
   assert.equal(result.retryAfterMs, 90_000);
   assert.equal(result.candidateDiagnostics.retryAfterMs, 90_000);
   assert.equal(result.scopeEntries[0].retryAfterMs, 90_000);
