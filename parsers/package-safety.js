@@ -157,6 +157,15 @@ function getPackageExtensionFolderName(rawOutputName) {
   return extension.toUpperCase();
 }
 
+function makeOrganizedPackageLeafPortable(outputName) {
+  let portableName = outputName.replace(/[. ]+$/g, suffix => '_'.repeat(suffix.length));
+  const deviceStem = portableName.split('.')[0];
+  if (WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN.test(deviceStem)) {
+    portableName = sanitizePackageFileName(`_${portableName}`, 'file');
+  }
+  return portableName;
+}
+
 function getPackageOutputRelativePath(rawOutputName, layoutMode) {
   const inputName = typeof rawOutputName === 'string' ? rawOutputName : '';
   const portableLeafName = getPortablePackageOutputLeafName(inputName)
@@ -165,7 +174,10 @@ function getPackageOutputRelativePath(rawOutputName, layoutMode) {
   if (normalizePackageOutputLayoutMode(layoutMode) === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT) {
     return outputName;
   }
-  return path.posix.join(getPackageExtensionFolderName(inputName), outputName);
+  return path.posix.join(
+    getPackageExtensionFolderName(inputName),
+    makeOrganizedPackageLeafPortable(outputName)
+  );
 }
 
 function packageCollisionKey(rawName) {

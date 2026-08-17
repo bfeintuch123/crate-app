@@ -132,6 +132,30 @@ test('flat mode preserves the current sanitized filename-only layout', () => {
   assert.equal(getPackageOutputRelativePath('../unsafe/Logo.png', 'flat'), 'Logo.png');
   assert.equal(getPackageOutputRelativePath('nested\\Deck.pptx', 'flat'), 'Deck.pptx');
   assert.equal(getPackageOutputRelativePath('C:Deck.pptx', 'flat'), 'C_Deck.pptx');
+  assert.equal(getPackageOutputRelativePath('CON', 'flat'), 'CON');
+  assert.equal(getPackageOutputRelativePath('aux.png', 'flat'), 'aux.png');
+  assert.equal(getPackageOutputRelativePath('LPT1.pdf', 'flat'), 'LPT1.pdf');
+  assert.equal(getPackageOutputRelativePath('name.', 'flat'), 'name.');
+});
+
+test('organized mode makes Windows-reserved and trailing-dot leaves portable', () => {
+  const cases = [
+    ['CON', 'OTHER/_CON'],
+    ['aux.png', 'PNG/_aux.png'],
+    ['LPT1.pdf', 'PDF/_LPT1.pdf'],
+    ['com9.ai', 'AI/_com9.ai'],
+    ['con.backup.ai', 'AI/_con.backup.ai'],
+    ['name.', 'OTHER/name_'],
+    ['name... ', 'OTHER/name___'],
+  ];
+
+  for (const [fileName, expected] of cases) {
+    assert.equal(
+      getPackageOutputRelativePath(fileName, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION),
+      expected,
+      fileName
+    );
+  }
 });
 
 test('organized mode returns a safe folder and filename relative path', () => {
@@ -188,7 +212,7 @@ test('organized paths satisfy the cross-platform relative-path contract', () => 
     ['.env.local', 'LOCAL', '.env.local'],
     ['archive.tar.gz', 'GZ', 'archive.tar.gz'],
     ['trailing-space.txt ', FALLBACK_EXTENSION_FOLDER, 'trailing-space.txt'],
-    ['trailing-dot.txt. ', FALLBACK_EXTENSION_FOLDER, 'trailing-dot.txt.'],
+    ['trailing-dot.txt. ', FALLBACK_EXTENSION_FOLDER, 'trailing-dot.txt_'],
     ['bad\0name.png', 'PNG', 'bad_name.png'],
     ['bad\nname.png', 'PNG', 'bad_name.png'],
     ['Cafe\u0301.PNG', 'PNG', 'Cafe\u0301.PNG'],
