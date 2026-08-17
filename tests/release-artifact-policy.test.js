@@ -7,7 +7,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const debug = require('debug');
-const { FuseV1Options } = require('@electron/fuses');
 
 const {
   APPROVED_CANVAS_PREBUILD,
@@ -41,6 +40,7 @@ const {
   collectSourceBinding,
   createPrivateAppSnapshot,
   dependencyPackageInventoriesMatch,
+  electronRuntimePayloadMatches,
   evaluateReleaseEvidence,
   expectedTeamIdentifier,
   installedPackageMatchesLockArchive,
@@ -73,6 +73,7 @@ const REVIEWED_FUSES = Object.freeze({
   OnlyLoadAppFromAsar: true,
   LoadBrowserProcessSpecificV8Snapshot: false,
   GrantFileProtocolExtraPrivileges: true,
+  WasmTrapHandlers: true,
 });
 const REVIEWED_MAIN_ENTITLEMENTS = Object.freeze([
   'com.apple.security.automation.apple-events',
@@ -536,7 +537,7 @@ function safeHelper(name, version = packageJson.version) {
 function safeNestedBundle(name) {
   const identifiers = {
     'Electron Framework.framework': 'com.github.Electron.framework',
-    'Mantle.framework': 'org.mantle.Mantle',
+    'Mantle.framework': 'com.electron.mantle',
     'ReactiveObjC.framework': 'com.electron.reactive',
     'Squirrel.framework': 'com.github.Squirrel',
   };
@@ -578,7 +579,7 @@ function safeEvidence(version = packageJson.version) {
       failedFileCount: 0,
     },
     fuseVersion: '1',
-    fuseIndices: [0, 1, 2, 3, 4, 5, 6, 7],
+    fuseIndices: [0, 1, 2, 3, 4, 5, 6, 7, 8],
     fuses: { ...EXPECTED_FUSES },
     mainEntitlements: Object.fromEntries(EXPECTED_MAIN_ENTITLEMENTS.map(key => [key, true])),
     helpers: [
@@ -1283,12 +1284,32 @@ test('release evidence rejects every Electron fuse policy regression', () => {
     assert.equal(result.failures.includes(`Electron fuse policy changed: ${name}.`), true, name);
   }
 
+  const legacyWire = safeEvidence();
+  legacyWire.fuseIndices.pop();
+  assert.equal(
+    evaluateReleaseEvidence(legacyWire, releaseOptions()).failures.includes(
+      'Electron fuse wire version or shape changed.'
+    ),
+    true
+  );
+
   const futureWire = safeEvidence();
-  futureWire.fuseVersion = '2';
-  futureWire.fuseIndices.push(8);
-  const result = evaluateReleaseEvidence(futureWire, releaseOptions());
-  assert.equal(result.ok, false);
-  assert.equal(result.failures.includes('Electron fuse wire version or shape changed.'), true);
+  futureWire.fuseIndices.push(9);
+  assert.equal(
+    evaluateReleaseEvidence(futureWire, releaseOptions()).failures.includes(
+      'Electron fuse wire version or shape changed.'
+    ),
+    true
+  );
+
+  const futureVersion = safeEvidence();
+  futureVersion.fuseVersion = '2';
+  assert.equal(
+    evaluateReleaseEvidence(futureVersion, releaseOptions()).failures.includes(
+      'Electron fuse wire version or shape changed.'
+    ),
+    true
+  );
 });
 
 test('release evidence requires exact main and helper entitlements', () => {
@@ -1327,6 +1348,18 @@ test('release evidence requires exact main and helper entitlements', () => {
   const foreignFramework = safeEvidence();
   foreignFramework.nestedBundles[0].signature.identifier = 'com.example.replacement';
   assert.equal(evaluateReleaseEvidence(foreignFramework, releaseOptions()).failures.includes('Nested code-signature policy changed.'), true);
+
+  const legacyMantleIdentifier = safeEvidence();
+  legacyMantleIdentifier.nestedBundles.find(bundle => (
+    bundle.name === 'Mantle.framework'
+  )).signature.identifier = 'org.mantle.Mantle';
+  assert.equal(evaluateReleaseEvidence(legacyMantleIdentifier, releaseOptions()).failures.includes('Nested code-signature policy changed.'), true);
+
+  const foreignMantleIdentifier = safeEvidence();
+  foreignMantleIdentifier.nestedBundles.find(bundle => (
+    bundle.name === 'Mantle.framework'
+  )).signature.identifier = 'com.example.mantle';
+  assert.equal(evaluateReleaseEvidence(foreignMantleIdentifier, releaseOptions()).failures.includes('Nested code-signature policy changed.'), true);
 
   const unknownNestedBundle = safeEvidence();
   unknownNestedBundle.nestedBundles.push(safeNestedBundle('Unexpected Login Item.app'));
@@ -2331,6 +2364,78 @@ test('installed dependency bytes are authenticated against the lockfile tarball'
   }
 });
 
+test('Electron runtime comparison normalizes the complete nine-state fuse wire', () => {
+  const fixtureRoot = fs.mkdtempSync('/tmp/crate-electron-fuse-wire-');
+  const packagedApp = path.join(fixtureRoot, 'Crate.app');
+  const sourceApp = path.join(fixtureRoot, 'Electron.app');
+  const frameworkPath = path.join(
+    'Contents',
+    'Frameworks',
+    'Electron Framework.framework',
+    'Versions',
+    'A',
+    'Electron Framework'
+  );
+  const sentinel = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX');
+  const runtimeBytes = states => Buffer.concat([
+    Buffer.from('mach-o-prefix'),
+    sentinel,
+    Buffer.from([1, states.length]),
+    Buffer.from(states.map(value => value ? 49 : 48)),
+    Buffer.from('mach-o-suffix'),
+  ]);
+  const commandRunner = (command, args) => {
+    if (command === '/usr/bin/file') {
+      return { ok: true, stdout: 'Mach-O 64-bit executable arm64', stderr: '' };
+    }
+    if (command === '/usr/bin/codesign' || command === '/usr/bin/strip') {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    return { ok: false, stdout: '', stderr: '' };
+  };
+
+  try {
+    for (const [appPath, executableName] of [
+      [packagedApp, 'Crate'],
+      [sourceApp, 'Electron'],
+    ]) {
+      const mainPath = path.join(appPath, 'Contents', 'MacOS', executableName);
+      fs.mkdirSync(path.dirname(mainPath), { recursive: true });
+      fs.writeFileSync(mainPath, 'identical-main-runtime');
+      fs.chmodSync(mainPath, 0o755);
+      fs.mkdirSync(path.dirname(path.join(appPath, frameworkPath)), { recursive: true });
+    }
+
+    fs.writeFileSync(
+      path.join(packagedApp, frameworkPath),
+      runtimeBytes([false, false, false, false, true, true, false, true, true])
+    );
+    fs.writeFileSync(
+      path.join(sourceApp, frameworkPath),
+      runtimeBytes([false, false, false, false, true, true, false, true, false])
+    );
+    assert.equal(electronRuntimePayloadMatches(
+      packagedApp,
+      sourceApp,
+      'Crate',
+      { commandRunner }
+    ), true);
+
+    fs.writeFileSync(
+      path.join(packagedApp, frameworkPath),
+      runtimeBytes([false, false, false, false, true, true, false, true])
+    );
+    assert.equal(electronRuntimePayloadMatches(
+      packagedApp,
+      sourceApp,
+      'Crate',
+      { commandRunner }
+    ), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('Electron runtime proof binds the dev dependency archive and packaged payload', () => {
   const fixtureRoot = fs.mkdtempSync('/tmp/crate-electron-runtime-proof-');
   const sourceRoot = path.join(fixtureRoot, 'source');
@@ -3100,7 +3205,7 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       'Crate Helper (Plugin).app': `${PUBLIC_APP_ID}.helper.Plugin`,
       'Crate Helper (Renderer).app': `${PUBLIC_APP_ID}.helper.Renderer`,
       'Electron Framework.framework': 'com.github.Electron.framework',
-      'Mantle.framework': 'org.mantle.Mantle',
+      'Mantle.framework': 'com.electron.mantle',
       'ReactiveObjC.framework': 'com.electron.reactive',
       'Squirrel.framework': 'com.github.Squirrel',
     };
@@ -3151,8 +3256,8 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
       return { ok: false, stdout: '', stderr: '' };
     };
     const fuseWire = { version: 1 };
-    for (const [name, value] of Object.entries(EXPECTED_FUSES)) {
-      fuseWire[FuseV1Options[name]] = value;
+    for (const [index, value] of Object.values(EXPECTED_FUSES).entries()) {
+      fuseWire[index] = value;
     }
     const electronRuntime = safeEvidence().electronRuntime;
 
@@ -3181,6 +3286,37 @@ test('artifact collector exercises macOS metadata, signatures, fuses, and source
     assert.equal(evidence.helpers.length, 4);
     assert.equal(evidence.nestedBundles.length, 4);
     assert.equal(evaluateReleaseEvidence(evidence, releaseOptions()).ok, true);
+
+    const recordedCommandCallCount = commandCalls.length;
+    const disabledWasmWire = { ...fuseWire, 8: false };
+    const disabledWasmEvidence = await collectReleaseEvidence(appPath, {
+      archiveVerifier: () => true,
+      asar,
+      commandRunner,
+      createAppSnapshot: passThroughAppSnapshot,
+      expectedExecutableName: executableName,
+      getFuseWire: async () => disabledWasmWire,
+      inspectArchitectures: () => ({
+        valid: true,
+        expected: EXPECTED_ARCHITECTURE,
+        main: [EXPECTED_ARCHITECTURE],
+        machOBinaryCount: 12,
+      }),
+      requireNotarization: true,
+      sourceRoot,
+      expectedRevision: 'b'.repeat(40),
+      verifyVerifierSource: () => true,
+      verifyElectronRuntime: () => electronRuntime,
+      verifyPackagedContents: () => ({ asarEntryCount: 100, unpackedEntryCount: 10 }),
+    });
+    assert.equal(disabledWasmEvidence.fuses.WasmTrapHandlers, false);
+    assert.equal(
+      evaluateReleaseEvidence(disabledWasmEvidence, releaseOptions()).failures.includes(
+        'Electron fuse policy changed: WasmTrapHandlers.'
+      ),
+      true
+    );
+    commandCalls.splice(recordedCommandCallCount);
     const trustRequirementCalls = commandCalls.filter(call => (
       call.command === '/usr/bin/codesign' &&
       call.args.some(argument => argument.startsWith('-R=anchor apple generic'))

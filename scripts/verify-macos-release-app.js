@@ -28,6 +28,7 @@ const EXPECTED_FUSES = Object.freeze({
   OnlyLoadAppFromAsar: true,
   LoadBrowserProcessSpecificV8Snapshot: false,
   GrantFileProtocolExtraPrivileges: true,
+  WasmTrapHandlers: true,
 });
 
 const PUBLIC_APP_ID = 'com.crate.app';
@@ -131,7 +132,7 @@ const BUILD_METADATA_KEYS = Object.freeze([
 
 const EXPECTED_HELPER_COUNT = 4;
 const EXPECTED_FUSE_VERSION = '1';
-const EXPECTED_FUSE_INDICES = Object.freeze([0, 1, 2, 3, 4, 5, 6, 7]);
+const EXPECTED_FUSE_INDICES = Object.freeze([0, 1, 2, 3, 4, 5, 6, 7, 8]);
 const FUSE_INDEX_BY_NAME = Object.freeze({
   RunAsNode: 0,
   EnableCookieEncryption: 1,
@@ -141,6 +142,7 @@ const FUSE_INDEX_BY_NAME = Object.freeze({
   OnlyLoadAppFromAsar: 5,
   LoadBrowserProcessSpecificV8Snapshot: 6,
   GrantFileProtocolExtraPrivileges: 7,
+  WasmTrapHandlers: 8,
 });
 const EXPECTED_NESTED_BUNDLE_NAMES = Object.freeze([
   'Electron Framework.framework',
@@ -150,7 +152,7 @@ const EXPECTED_NESTED_BUNDLE_NAMES = Object.freeze([
 ]);
 const EXPECTED_NESTED_BUNDLE_IDENTIFIERS = Object.freeze({
   'Electron Framework.framework': 'com.github.Electron.framework',
-  'Mantle.framework': 'org.mantle.Mantle',
+  'Mantle.framework': 'com.electron.mantle',
   'ReactiveObjC.framework': 'com.electron.reactive',
   'Squirrel.framework': 'com.github.Squirrel',
 });
