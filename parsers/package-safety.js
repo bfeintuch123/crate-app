@@ -8,6 +8,15 @@ const MAX_PACKAGE_COMPONENT_BYTES = 255;
 const MAX_PACKAGE_EXTENSION_LENGTH = 32;
 const MAX_PACKAGE_NAME_ALLOCATION_ATTEMPTS = 10000;
 const UNSAFE_FILENAME_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
+const PACKAGE_OUTPUT_LAYOUT_MODES = Object.freeze({
+  FLAT: 'flat',
+  BY_EXTENSION: 'by-extension-v1',
+});
+const FALLBACK_EXTENSION_FOLDER = 'OTHER';
+const SAFE_EXTENSION_PATTERN = new RegExp(
+  `^[a-z0-9][a-z0-9_+-]{0,${MAX_PACKAGE_EXTENSION_LENGTH - 2}}$`
+);
+const WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 class PackageNameAllocationError extends Error {
   constructor() {
@@ -120,6 +129,55 @@ function sanitizePackageRelativePath(rawPath, fallbackName = 'file') {
     .map((part, index, allParts) => sanitizePackageFileName(part, index === allParts.length - 1 ? fallbackName : 'folder'));
 
   return parts.length > 0 ? path.join(...parts) : sanitizePackageFileName(fallbackName);
+}
+
+function normalizePackageOutputLayoutMode(value) {
+  return value === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
+}
+
+function getPortablePackageOutputLeafName(rawOutputName) {
+  const inputName = typeof rawOutputName === 'string' ? rawOutputName : '';
+  return path.posix.basename(inputName.replace(/\\/g, '/'));
+}
+
+function getPackageExtensionFolderName(rawOutputName) {
+  const rawExtension = path.posix.extname(getPortablePackageOutputLeafName(rawOutputName));
+  const extension = rawExtension.startsWith('.')
+    ? rawExtension.slice(1).toLowerCase()
+    : '';
+
+  if (
+    !SAFE_EXTENSION_PATTERN.test(extension) ||
+    WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN.test(extension)
+  ) {
+    return FALLBACK_EXTENSION_FOLDER;
+  }
+  return extension.toUpperCase();
+}
+
+function makeOrganizedPackageLeafPortable(outputName) {
+  let portableName = outputName.replace(/[. ]+$/g, suffix => '_'.repeat(suffix.length));
+  const deviceStem = portableName.split('.')[0];
+  if (WINDOWS_RESERVED_PACKAGE_COMPONENT_PATTERN.test(deviceStem)) {
+    portableName = sanitizePackageFileName(`_${portableName}`, 'file');
+  }
+  return portableName;
+}
+
+function getPackageOutputRelativePath(rawOutputName, layoutMode) {
+  const inputName = typeof rawOutputName === 'string' ? rawOutputName : '';
+  const portableLeafName = getPortablePackageOutputLeafName(inputName)
+    .replace(UNSAFE_FILENAME_CHARS, '_');
+  const outputName = sanitizePackageFileName(portableLeafName, 'file');
+  if (normalizePackageOutputLayoutMode(layoutMode) === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT) {
+    return outputName;
+  }
+  return path.posix.join(
+    getPackageExtensionFolderName(inputName),
+    makeOrganizedPackageLeafPortable(outputName)
+  );
 }
 
 function packageCollisionKey(rawName) {
@@ -420,10 +478,15 @@ function removeCreatedPackageFiles(destFolder, filePaths) {
 }
 
 module.exports = {
+  FALLBACK_EXTENSION_FOLDER,
+  PACKAGE_OUTPUT_LAYOUT_MODES,
   PackageNameAllocationError,
   truncatePackageComponent,
   sanitizePackageFileName,
   sanitizePackageRelativePath,
+  getPackageExtensionFolderName,
+  getPackageOutputRelativePath,
+  normalizePackageOutputLayoutMode,
   packageCollisionKey,
   createPackageNameAllocator,
   isPathInsideDirectory,
