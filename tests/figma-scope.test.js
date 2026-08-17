@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const Module = require('node:module');
 
-const { FigmaParser } = require('../parsers/figma');
+const { FigmaParser, parseFigmaRetryAfterMs } = require('../parsers/figma');
+const { FIGMA_NETWORK_LIMITS, createByteBudget } = require('../parsers/figma-network');
 
 const FILE_KEY = 'FILE123';
 
@@ -23,6 +25,59 @@ async function captureConsole(fn) {
     console.warn = originalWarn;
     console.error = originalError;
   }
+}
+
+function figmaApiResponse(status, payload = {}, headers = {}) {
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [String(key).toLowerCase(), String(value)])
+  );
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return normalizedHeaders[String(name).toLowerCase()] || null;
+      },
+    },
+    buffer: async () => Buffer.from(JSON.stringify(payload)),
+  };
+}
+
+function createRequestRecordingParser(responseForRequest) {
+  const parserPath = require.resolve('../parsers/figma');
+  const cachedParserModule = require.cache[parserPath];
+  const originalLoad = Module._load;
+  const requests = [];
+  const fetchRecorder = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    const endpoint = `${url.pathname}${url.search}`;
+    requests.push(endpoint);
+    return responseForRequest(endpoint, options);
+  };
+
+  delete require.cache[parserPath];
+  Module._load = function(request, parent, isMain) {
+    if (request === 'node-fetch') return fetchRecorder;
+    return originalLoad.call(this, request, parent, isMain);
+  };
+
+  let RecordedFigmaParser;
+  try {
+    RecordedFigmaParser = require('../parsers/figma').FigmaParser;
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[parserPath];
+    if (cachedParserModule) require.cache[parserPath] = cachedParserModule;
+  }
+
+  return {
+    parser: new class extends RecordedFigmaParser {
+      async getStoredToken() {
+        return 'token';
+      }
+    }(),
+    requests,
+  };
 }
 
 const DOCUMENT_FIXTURE = {
@@ -179,11 +234,210 @@ class RateLimitedFileFetchFigmaParser extends FigmaParser {
 
   async _fetchAPI(endpoint) {
     if (endpoint === `/files/${FILE_KEY}`) {
-      throw new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+      const error = new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
+      error._crateFigmaApiFailureReason = 'rate-limited';
+      error._crateFigmaApiRetryAfterMs = 90_000;
+      throw error;
     }
     throw new Error(`Unexpected endpoint: ${endpoint}`);
   }
+
+  async verifyToken() {
+    return { valid: true };
+  }
+
+  async getFileMetadata(fileKey, diagnostic) {
+    diagnostic.metadataStatus = 'success';
+    return {
+      key: fileKey,
+      name: 'Rate Limited Fixture',
+      lastModified: new Date().toISOString(),
+      lastModifiedMs: Date.now()
+    };
+  }
 }
+
+test('Retry-After parsing accepts bounded integer seconds only', () => {
+  assert.equal(parseFigmaRetryAfterMs('90'), 90_000);
+  assert.equal(parseFigmaRetryAfterMs(' 120 '), 120_000);
+  assert.equal(parseFigmaRetryAfterMs('0'), null);
+  assert.equal(parseFigmaRetryAfterMs('-1'), null);
+  assert.equal(parseFigmaRetryAfterMs('1.5'), null);
+  assert.equal(parseFigmaRetryAfterMs('Wed, 21 Oct 2030 07:28:00 GMT'), null);
+  assert.equal(parseFigmaRetryAfterMs('999999999999999999999999'), null);
+  assert.equal(parseFigmaRetryAfterMs(String(60 * 60 * 24 * 365)), 31 * 24 * 60 * 60 * 1000);
+});
+
+test('metadata rate limiting skips the depth fallback request', async () => {
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === `/v1/files/${FILE_KEY}/metadata`) {
+      return figmaApiResponse(429, {}, { 'retry-after': '120' });
+    }
+    if (endpoint === `/v1/files/${FILE_KEY}?depth=1`) {
+      return figmaApiResponse(200, { name: 'must-not-run' });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+  const diagnostic = { metadataStatus: 'not-attempted' };
+  const apiBudget = createByteBudget(
+    FIGMA_NETWORK_LIMITS.apiOperationBytes,
+    FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+  );
+
+  const result = await parser.getFileMetadata(FILE_KEY, diagnostic, apiBudget);
+
+  assert.equal(result, null);
+  assert.deepEqual(requests, [`/v1/files/${FILE_KEY}/metadata`]);
+  assert.equal(diagnostic.metadataFailureReason, 'rate-limited');
+  assert.equal(diagnostic.retryAfterMs, 120_000);
+});
+
+test('image-map rate limiting skips rendered-image fallback requests', async () => {
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === `/v1/files/${FILE_KEY}`) {
+      return figmaApiResponse(200, { document: DOCUMENT_FIXTURE });
+    }
+    if (endpoint === `/v1/files/${FILE_KEY}/images`) {
+      return figmaApiResponse(429, {}, { 'retry-after': '180' });
+    }
+    if (endpoint.startsWith(`/v1/images/${FILE_KEY}?`)) {
+      return figmaApiResponse(200, { images: {} });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+  const apiBudget = createByteBudget(
+    FIGMA_NETWORK_LIMITS.apiOperationBytes,
+    FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+  );
+  const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
+    key: FILE_KEY,
+    scopeMode: 'current-page',
+    requestedNodeId: '2:1'
+  }, apiBudget);
+
+  assert.deepEqual(requests, [`/v1/files/${FILE_KEY}`, `/v1/files/${FILE_KEY}/images`]);
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scope.assetFetchStatus, 'failed');
+  assert.equal(result.scope.retryAfterMs, 180_000);
+});
+
+test('rendered-export rate limiting stops later batches and discards partial assets', async () => {
+  const fileKey = 'BATCH_FILE';
+  const exportableNodes = Array.from({ length: 1001 }, (_, index) => ({
+    id: `2:${index + 1}`,
+    type: 'RECTANGLE',
+    name: `Export ${index + 1}`,
+    exportSettings: [{ format: 'PNG' }],
+  }));
+  const document = {
+    id: '0:0',
+    type: 'DOCUMENT',
+    name: 'Batch Fixture',
+    children: [{
+      id: '1:1',
+      type: 'CANVAS',
+      name: 'Batch Page',
+      children: exportableNodes,
+    }],
+  };
+  let renderedBatchCount = 0;
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    if (endpoint === `/v1/files/${fileKey}/metadata`) {
+      return figmaApiResponse(200, {
+        name: 'Batch Fixture',
+        lastModified: new Date().toISOString(),
+      });
+    }
+    if (endpoint === `/v1/files/${fileKey}`) {
+      return figmaApiResponse(200, { document });
+    }
+    if (endpoint.startsWith(`/v1/images/${fileKey}?`)) {
+      renderedBatchCount += 1;
+      if (renderedBatchCount === 2) {
+        return figmaApiResponse(429, {}, { 'retry-after': '360' });
+      }
+      if (renderedBatchCount > 2) {
+        throw new Error('Rendered export request continued after rate limiting.');
+      }
+      const ids = new URLSearchParams(endpoint.split('?')[1]).get('ids').split(',');
+      return figmaApiResponse(200, {
+        images: Object.fromEntries(
+          ids.map((id) => [id, `https://cdn.example.com/${encodeURIComponent(id)}.png`])
+        ),
+      });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [fileKey],
+    scopeEntries: [{
+      key: fileKey,
+      primaryKey: fileKey,
+      scopeMode: 'entire-file',
+    }],
+  });
+
+  const renderedRequests = requests.filter((endpoint) => endpoint.startsWith(`/v1/images/${fileKey}?`));
+  assert.equal(renderedRequests.length, 2);
+  assert.equal(renderedBatchCount, 2);
+  assert.deepEqual(requests.slice(requests.indexOf(renderedRequests[1]) + 1), []);
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.retryAfterMs, 360_000);
+  assert.equal(result.assets.length, 0);
+});
+
+test('multi-candidate scan stops after the first rate limit and discards partial assets', async () => {
+  const fileKeys = ['SUCCESS_FIRST', 'RATE_SECOND', 'MUST_NOT_RUN'];
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    const metadataMatch = endpoint.match(/^\/v1\/files\/([^/?]+)\/metadata$/);
+    if (metadataMatch) {
+      return figmaApiResponse(200, {
+        name: `Tracked ${metadataMatch[1]}`,
+        lastModified: new Date().toISOString(),
+      });
+    }
+    if (endpoint === '/v1/files/SUCCESS_FIRST') {
+      return figmaApiResponse(200, { document: DOCUMENT_FIXTURE });
+    }
+    if (endpoint === '/v1/files/SUCCESS_FIRST/images') {
+      return figmaApiResponse(200, {
+        images: {
+          'img-ref-page-one': 'https://cdn.example.com/partial.png',
+        },
+      });
+    }
+    if (endpoint === '/v1/files/RATE_SECOND') {
+      return figmaApiResponse(429, {}, { 'retry-after': '240' });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+  const result = await parser.autoTrackScan({
+    fileKeys,
+    scopeEntries: fileKeys.map((key) => ({
+      key,
+      primaryKey: key,
+      scopeMode: 'current-page',
+      requestedPageId: '1:1',
+      requestedNodeId: '1:1',
+    }))
+  });
+
+  const rateLimitRequestIndex = requests.indexOf('/v1/files/RATE_SECOND');
+  assert.ok(rateLimitRequestIndex >= 0);
+  assert.deepEqual(requests.slice(rateLimitRequestIndex + 1), []);
+  assert.equal(requests.includes('/v1/files/MUST_NOT_RUN'), false);
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.retryAfterMs, 240_000);
+  assert.equal(result.assets.length, 0);
+  assert.equal(result.scopeEntries.length, 2);
+});
 
 class AllCandidateFailureFigmaParser extends FigmaParser {
   async getStoredToken() {
@@ -813,6 +1067,7 @@ test('current-page rate-limited file fetch surfaces a safe retry warning', async
   assert.equal(result.scope.lockStatus, 'unresolved');
   assert.equal(result.scope.statusReason, 'figma-current-page-file-fetch-failed');
   assert.equal(result.scope.fileFetchFailureReason, 'rate-limited');
+  assert.equal(result.scope.retryAfterMs, 90_000);
   assert.match(result.scope.warning || '', /rate limiting/i);
   assert.match(result.scope.warning || '', /retry after a cooldown/i);
 
@@ -820,6 +1075,22 @@ test('current-page rate-limited file fetch surfaces a safe retry warning', async
   assert.equal(serialized.includes('https://figma.example'), false);
   assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
   assert.equal(serialized.includes('Bearer'), false);
+});
+
+test('rate-limit retry timing survives the aggregate scan without raw response data', async () => {
+  const parser = new RateLimitedFileFetchFigmaParser();
+  const { result, output } = await captureConsole(() => parser.autoTrackScan({
+    fileKeys: [FILE_KEY],
+    scopeEntries: [{ key: FILE_KEY, scopeMode: 'current-page', requestedNodeId: '2:1' }]
+  }));
+
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.retryAfterMs, 90_000);
+  assert.equal(result.candidateDiagnostics.retryAfterMs, 90_000);
+  assert.equal(result.scopeEntries[0].retryAfterMs, 90_000);
+  const serialized = `${JSON.stringify(result)}\n${output}`;
+  assert.equal(serialized.includes('https://figma.example'), false);
+  assert.equal(serialized.includes('SHOULD_NOT_APPEAR'), false);
 });
 
 test('current-page locked page with no exportable image refs reports zero image refs safely', async () => {

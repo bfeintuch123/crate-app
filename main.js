@@ -2150,6 +2150,7 @@ function pruneExcludedAutoCapturedFiles(project) {
 
 const FIGMA_SCOPE_CURRENT_PAGE = 'current-page';
 const FIGMA_SCOPE_ENTIRE_FILE = 'entire-file';
+const FIGMA_MAX_RATE_LIMIT_BACKOFF_MS = 31 * 24 * 60 * 60 * 1000;
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
 
 function getProjectFigmaScopeMode(project) {
@@ -2169,6 +2170,12 @@ function normalizeStoredFigmaScopeId(value) {
 function sanitizeStoredFigmaSessionText(value, maxLength) {
   if (typeof value !== 'string' || !value.trim()) return null;
   return redactFigmaLogText(value.trim()).slice(0, maxLength);
+}
+
+function normalizeFigmaRateLimitRetryAt(value) {
+  const now = Date.now();
+  if (!Number.isSafeInteger(value) || value <= now) return null;
+  return value <= now + FIGMA_MAX_RATE_LIMIT_BACKOFF_MS ? value : null;
 }
 
 function normalizeTrackedFigmaFiles(rawTrackedFiles) {
@@ -2340,6 +2347,7 @@ function migrateProjectFigmaLinkPrivacy(project) {
   project.figmaTrackedFiles = mergedProjectLocators;
 
   if (session) {
+    const persistedRateLimitRetryAt = normalizeFigmaRateLimitRetryAt(session.rateLimitRetryAt);
     const rebuiltSession = buildFigmaSessionSnapshot(project);
     session.scopeMode = rebuiltSession.scopeMode;
     session.teamIds = rebuiltSession.teamIds;
@@ -2410,6 +2418,8 @@ function migrateProjectFigmaLinkPrivacy(project) {
     session.sessionWarnings = (Array.isArray(session.sessionWarnings) ? session.sessionWarnings : [])
       .map(warning => sanitizeStoredFigmaSessionText(warning, 500))
       .filter(Boolean);
+    if (persistedRateLimitRetryAt) session.rateLimitRetryAt = persistedRateLimitRetryAt;
+    else delete session.rateLimitRetryAt;
     session.warnings = rebuildFigmaSessionWarnings(session);
   }
 
@@ -2454,6 +2464,9 @@ function rebuildFigmaSessionWarnings(session) {
 function buildFigmaSessionSnapshot(project, _settings = {}) {
   const scopeMode = getProjectFigmaScopeMode(project);
   const trackedFiles = normalizeTrackedFigmaFiles((project && project.figmaTrackedFiles) || []);
+  const rateLimitRetryAt = normalizeFigmaRateLimitRetryAt(
+    project && project.figmaSession && project.figmaSession.rateLimitRetryAt
+  );
   const sessionWarnings = [];
 
   const snapshot = {
@@ -2498,6 +2511,16 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
     }),
     sessionWarnings,
   };
+
+  if (rateLimitRetryAt) {
+    const warning = figmaRateLimitWarning();
+    snapshot.rateLimitRetryAt = rateLimitRetryAt;
+    for (const trackedFile of snapshot.trackedFiles) {
+      trackedFile.lockStatus = 'unresolved';
+      trackedFile.statusReason = 'figma-current-page-rate-limited';
+      trackedFile.warning = warning;
+    }
+  }
 
   snapshot.warnings = rebuildFigmaSessionWarnings(snapshot);
   return snapshot;
@@ -4138,7 +4161,8 @@ function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
       withoutAssets: Number.isFinite(diagnostics.assetResultCounts && diagnostics.assetResultCounts.withoutAssets)
         ? diagnostics.assetResultCounts.withoutAssets
         : 0
-    }
+    },
+    retryAfterMs: normalizeFigmaRateLimitDuration(diagnostics.retryAfterMs)
   };
 }
 
@@ -4154,14 +4178,47 @@ function figmaRateLimitWarning() {
   return 'Figma is temporarily rate limiting this scan. Crate will retry after a cooldown; no Figma assets will be captured for this file in this session until Figma allows the request.';
 }
 
-function setFigmaRateLimitBackoff(projectId) {
-  const retryAt = Date.now() + FIGMA_RATE_LIMIT_BACKOFF_MS;
+function normalizeFigmaRateLimitDuration(value) {
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, FIGMA_MAX_RATE_LIMIT_BACKOFF_MS)
+    : null;
+}
+
+function getFigmaScanRetryAfterMs(scanResult) {
+  if (!scanResult || typeof scanResult !== 'object') return null;
+  const candidates = [
+    scanResult.retryAfterMs,
+    scanResult.candidateDiagnostics && scanResult.candidateDiagnostics.retryAfterMs,
+    ...(Array.isArray(scanResult.scopeEntries)
+      ? scanResult.scopeEntries.map(entry => entry && entry.retryAfterMs)
+      : [])
+  ].map(normalizeFigmaRateLimitDuration).filter(Boolean);
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
+function setFigmaRateLimitBackoff(projectId, retryAfterMs = null) {
+  const duration = normalizeFigmaRateLimitDuration(retryAfterMs) || FIGMA_RATE_LIMIT_BACKOFF_MS;
+  const retryAt = Date.now() + duration;
   figmaRateLimitBackoffs.set(projectId, retryAt);
   return retryAt;
 }
 
 function clearFigmaRateLimitBackoff(projectId) {
   figmaRateLimitBackoffs.delete(projectId);
+}
+
+function getFigmaRateLimitRetryAt(projectId, project = null) {
+  const inMemory = normalizeFigmaRateLimitRetryAt(figmaRateLimitBackoffs.get(projectId));
+  const persisted = normalizeFigmaRateLimitRetryAt(
+    project && project.figmaSession && project.figmaSession.rateLimitRetryAt
+  );
+  const retryAt = Math.max(inMemory || 0, persisted || 0);
+  if (retryAt > Date.now()) {
+    figmaRateLimitBackoffs.set(projectId, retryAt);
+    return retryAt;
+  }
+  figmaRateLimitBackoffs.delete(projectId);
+  return 0;
 }
 
 function getFigmaTrackingProjects() {
@@ -4182,11 +4239,16 @@ function getActiveFigmaPollerProjectCount() {
   return activeProjectIds.size;
 }
 
-function updateFigmaSessionRateLimitWarning(projectId) {
+function updateFigmaSessionRateLimitWarning(projectId, retryAt) {
   return mutateProject(projectId, (project) => {
     if (!project.figmaSession || !Array.isArray(project.figmaSession.trackedFiles)) return null;
     let changed = false;
     const warning = figmaRateLimitWarning();
+    const safeRetryAt = normalizeFigmaRateLimitRetryAt(retryAt);
+    if (project.figmaSession.rateLimitRetryAt !== safeRetryAt) {
+      project.figmaSession.rateLimitRetryAt = safeRetryAt;
+      changed = true;
+    }
     for (const trackedFile of project.figmaSession.trackedFiles) {
       if (trackedFile.lockStatus !== 'unresolved') {
         trackedFile.lockStatus = 'unresolved';
@@ -4204,6 +4266,36 @@ function updateFigmaSessionRateLimitWarning(projectId) {
     if (!changed) return null;
     project.figmaSession.warnings = rebuildFigmaSessionWarnings(project.figmaSession);
     return { figmaSession: project.figmaSession };
+  });
+}
+
+function clearFigmaRateLimitState(projectId) {
+  clearFigmaRateLimitBackoff(projectId);
+  return mutateProject(projectId, (project) => {
+    const session = project.figmaSession;
+    if (!session || !Array.isArray(session.trackedFiles)) return null;
+    let changed = false;
+    if (session.rateLimitRetryAt != null) {
+      delete session.rateLimitRetryAt;
+      changed = true;
+    }
+    const warning = figmaRateLimitWarning();
+    for (const trackedFile of session.trackedFiles) {
+      if (trackedFile.statusReason === 'figma-current-page-rate-limited') {
+        trackedFile.statusReason = null;
+        changed = true;
+      }
+      if (trackedFile.warning === warning) {
+        trackedFile.warning = null;
+        changed = true;
+      }
+    }
+    const nextWarnings = rebuildFigmaSessionWarnings(session);
+    if (JSON.stringify(session.warnings || []) !== JSON.stringify(nextWarnings)) {
+      session.warnings = nextWarnings;
+      changed = true;
+    }
+    return changed ? { figmaSession: session } : null;
   });
 }
 
@@ -6041,6 +6133,12 @@ function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
   const scopeEntries = Array.isArray(scanResult && scanResult.scopeEntries) ? scanResult.scopeEntries : [];
   const trackedFiles = Array.isArray(rawTrackedFiles) ? rawTrackedFiles : [];
 
+  if (
+    (scanResult && scanResult.rateLimited === true) ||
+    getFigmaScanRetryAfterMs(scanResult) !== null ||
+    hasFigmaRateLimitDiagnostic(scanResult && scanResult.candidateDiagnostics)
+  ) return false;
+
   if (trackedFiles.length === 0) return errors.length === 0;
 
   return trackedFiles.every((trackedFile) => {
@@ -7754,9 +7852,10 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
     return { skipped: true, reason: 'not-watching' };
   }
   const scanStartedAt = Date.now();
-  const rateLimitRetryAt = figmaRateLimitBackoffs.get(projectId) || 0;
+  const rateLimitRetryAt = getFigmaRateLimitRetryAt(projectId, project);
   if (rateLimitRetryAt > scanStartedAt) {
     const warning = figmaRateLimitWarning();
+    updateFigmaSessionRateLimitWarning(projectId, rateLimitRetryAt);
     sendToRenderer('figma:scan-complete', {
       projectId,
       filesFound: 0,
@@ -7765,9 +7864,17 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       errors: [],
       timestamp: Date.now(),
       warning,
+      retryAt: rateLimitRetryAt,
       retryAfterMs: rateLimitRetryAt - scanStartedAt
     });
-    return { skipped: true, reason: 'rate-limited-backoff', retryAfterMs: rateLimitRetryAt - scanStartedAt, warning };
+    return {
+      skipped: true,
+      rateLimited: true,
+      reason: 'rate-limited-backoff',
+      retryAt: rateLimitRetryAt,
+      retryAfterMs: rateLimitRetryAt - scanStartedAt,
+      warning
+    };
   }
 
   // Check if Figma is connected
@@ -7835,17 +7942,23 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
     if (candidateDiagnostics) {
       console.log(`[crate][figma] candidate diagnostics: ${JSON.stringify(candidateDiagnostics)}`);
     }
-    const isRateLimited = hasFigmaRateLimitDiagnostic(candidateDiagnostics);
+    const retryAfterMs = getFigmaScanRetryAfterMs(scanResult);
+    const isRateLimited = scanResult.rateLimited === true ||
+      hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
+      retryAfterMs !== null;
+    let rateLimitRetryAt = 0;
     if (isRateLimited) {
-      setFigmaRateLimitBackoff(projectId);
-      const rateLimitScopeUpdate = updateFigmaSessionRateLimitWarning(projectId);
+      scanResult.assets = [];
+      rateLimitRetryAt = setFigmaRateLimitBackoff(projectId, retryAfterMs);
+      const rateLimitScopeUpdate = updateFigmaSessionRateLimitWarning(projectId, rateLimitRetryAt);
       if (rateLimitScopeUpdate) {
         sendToRenderer('project:updated', { projectId });
       }
       const refreshedProject = getProjects().find(p => p.id === projectId) || activeProject;
       activeWarnings = (((refreshedProject || {}).figmaSession || {}).warnings) || activeWarnings;
     } else {
-      clearFigmaRateLimitBackoff(projectId);
+      const clearedRateLimit = clearFigmaRateLimitState(projectId);
+      if (clearedRateLimit) sendToRenderer('project:updated', { projectId });
     }
 
     if (scanResult.errors.length > 0) {
@@ -7887,16 +8000,20 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       if (scanResult.files.length === 0 && (teamIds.length > 0 || fileKeys.length > 0)) {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
+          ...(isRateLimited ? { rateLimited: true } : {}),
           errors: scanErrors, timestamp: Date.now(),
           warning: sessionWarning || 'No recent Figma files found. Make sure your file was modified recently.',
-          candidateDiagnostics
+          candidateDiagnostics,
+          ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
         });
       } else {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0,
+          ...(isRateLimited ? { rateLimited: true } : {}),
           errors: scanErrors, timestamp: Date.now(),
           warning: sessionWarning,
-          candidateDiagnostics
+          candidateDiagnostics,
+          ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
         });
       }
       if (scopeStateResult) {
@@ -7910,7 +8027,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
         addedCount: 0,
         errors: scanErrors,
         warning: sessionWarning,
-        candidateDiagnostics
+        candidateDiagnostics,
+        ...(isRateLimited ? { rateLimited: true } : {}),
+        ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
       };
     }
 
@@ -7959,7 +8078,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       errors,
       timestamp: Date.now(),
       warning,
-      candidateDiagnostics
+      candidateDiagnostics,
+      ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
     });
 
     figmaScanTimestamps.set(projectId, scanStartedAt);
@@ -7970,7 +8090,8 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       addedCount,
       errors,
       warning,
-      candidateDiagnostics
+      candidateDiagnostics,
+      ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
     };
   } catch (e) {
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) {
@@ -12936,49 +13057,69 @@ end tell`;
     if (teamIds.length > 0 || fileKeys.length > 0) {
       if (!operationCurrent()) return null;
       figmaPackageTransferBlocks.set(projectId, FIGMA_PACKAGE_TRANSFER_ERROR);
-      const { FigmaParser } = require('./parsers/figma');
-      const parser = new FigmaParser();
-      console.log(
-        `[crate][figma] scan config (pre-package): ` +
-        `trackedFileCount=${safeTrackedFileSummaries.length} ` +
-        `trackedFiles=${JSON.stringify(safeTrackedFileSummaries)} ` +
-        `trackedCandidateCount=${trackedCandidateCount} ` +
-        `teamCount=${teamIds.length} ` +
-        `sinceMs=${watchStart} lastScanMs=null watchStart=${watchStart}`
-      );
-      const figmaScanResult = await parser.autoTrackScan({
-        sinceMs: watchStart,
-        maxAgeDays: 30,
-        maxFiles: 20,
-        teamIds,
-        fileKeys,
-        scopeEntries: scanTrackedFiles
-      });
-      if (!operationCurrent()) return null;
-
-      mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
-
-      if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
-        console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
-      }
-
-      if (figmaScanResult.assets && figmaScanResult.assets.length > 0) {
-        const scopedAssets = figmaScanResult.assets.map((asset) => ({
-          ...asset,
-          figmaScopeMode: getProjectFigmaScopeMode(latestProject)
-        }));
-        const figmaAdded = await ingestFigmaAssetsIntoProject(
-          projectId, project, scopedAssets, 'pre-package', operation.activationToken, operationCurrent
-        );
-        if (!operationCurrent()) return null;
-        newCount += figmaAdded;
-      }
-      if (!operationCurrent()) return null;
-      if (didFigmaPrePackageScanSucceed(figmaScanResult, rawTrackedFiles)) {
-        figmaPackageTransferBlocks.delete(projectId);
-      } else {
+      const activeRetryAt = getFigmaRateLimitRetryAt(projectId, latestProject);
+      if (activeRetryAt > Date.now()) {
+        updateFigmaSessionRateLimitWarning(projectId, activeRetryAt);
         figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
-        figmaPackageTransferBlocks.set(projectId, figmaPackageError);
+        sendToRenderer('project:updated', { projectId });
+      } else {
+        const { FigmaParser } = require('./parsers/figma');
+        const parser = new FigmaParser();
+        console.log(
+          `[crate][figma] scan config (pre-package): ` +
+          `trackedFileCount=${safeTrackedFileSummaries.length} ` +
+          `trackedFiles=${JSON.stringify(safeTrackedFileSummaries)} ` +
+          `trackedCandidateCount=${trackedCandidateCount} ` +
+          `teamCount=${teamIds.length} ` +
+          `sinceMs=${watchStart} lastScanMs=null watchStart=${watchStart}`
+        );
+        const figmaScanResult = await parser.autoTrackScan({
+          sinceMs: watchStart,
+          maxAgeDays: 30,
+          maxFiles: 20,
+          teamIds,
+          fileKeys,
+          scopeEntries: scanTrackedFiles
+        });
+        if (!operationCurrent()) return null;
+
+        mergeFigmaScopeEntriesIntoSession(projectId, figmaScanResult.scopeEntries || []);
+        const candidateDiagnostics = summarizeFigmaCandidateDiagnosticsForLog(figmaScanResult.candidateDiagnostics);
+        const retryAfterMs = getFigmaScanRetryAfterMs(figmaScanResult);
+        const isRateLimited = figmaScanResult.rateLimited === true ||
+          hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
+          retryAfterMs !== null;
+
+        if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
+          console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
+        }
+
+        if (isRateLimited) {
+          const retryAt = setFigmaRateLimitBackoff(projectId, retryAfterMs);
+          updateFigmaSessionRateLimitWarning(projectId, retryAt);
+          sendToRenderer('project:updated', { projectId });
+        }
+
+        if (!isRateLimited && figmaScanResult.assets && figmaScanResult.assets.length > 0) {
+          const scopedAssets = figmaScanResult.assets.map((asset) => ({
+            ...asset,
+            figmaScopeMode: getProjectFigmaScopeMode(latestProject)
+          }));
+          const figmaAdded = await ingestFigmaAssetsIntoProject(
+            projectId, project, scopedAssets, 'pre-package', operation.activationToken, operationCurrent
+          );
+          if (!operationCurrent()) return null;
+          newCount += figmaAdded;
+        }
+        if (!operationCurrent()) return null;
+        if (didFigmaPrePackageScanSucceed(figmaScanResult, rawTrackedFiles)) {
+          figmaPackageTransferBlocks.delete(projectId);
+          const clearedRateLimit = clearFigmaRateLimitState(projectId);
+          if (clearedRateLimit) sendToRenderer('project:updated', { projectId });
+        } else {
+          figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
+          figmaPackageTransferBlocks.set(projectId, figmaPackageError);
+        }
       }
     }
   } catch (e) {
@@ -15536,7 +15677,16 @@ registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
   }
 
   try {
-    await pollFigmaForProject(projectId, true, activationToken);
+    const result = await pollFigmaForProject(projectId, true, activationToken);
+    if (result && result.rateLimited === true) {
+      return {
+        success: false,
+        rateLimited: true,
+        error: result.warning || figmaRateLimitWarning(),
+        ...(result.retryAt ? { retryAt: result.retryAt } : {}),
+        ...(result.retryAfterMs ? { retryAfterMs: result.retryAfterMs } : {})
+      };
+    }
     return { success: true };
   } catch (e) {
     return { success: false, error: sanitizeFigmaRendererIssue(e) };
@@ -15608,8 +15758,16 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
   );
 
   const totalAddedCount = scanResults.reduce((sum, result) => sum + (result?.addedCount || 0), 0);
+  const rateLimitedCount = scanResults.filter(result => result && result.rateLimited === true).length;
 
-  return { triggered: scannableProjects.length, skipped, totalAddedCount };
+  return {
+    success: rateLimitedCount === 0,
+    triggered: scannableProjects.length,
+    skipped,
+    totalAddedCount,
+    rateLimitedCount,
+    ...(rateLimitedCount > 0 ? { error: figmaRateLimitWarning() } : {})
+  };
 });
 
 registerTrustedIpcHandler('settings:get', () => {
