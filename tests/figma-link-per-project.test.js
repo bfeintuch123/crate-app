@@ -393,6 +393,7 @@ let nextFigmaScanError = null;
 let lastFigmaScanOptions = null;
 let figmaScanInvocationCount = 0;
 let figmaScanDelayMs = 0;
+let useRealFigmaAutoTrackScan = false;
 class TestFigmaParser extends RealFigmaParser {
   async getStoredToken() {
     return storedFigmaToken;
@@ -418,6 +419,7 @@ class TestFigmaParser extends RealFigmaParser {
   async autoTrackScan(options = {}) {
     figmaScanInvocationCount += 1;
     lastFigmaScanOptions = JSON.parse(JSON.stringify(options));
+    if (useRealFigmaAutoTrackScan) return super.autoTrackScan(options);
     if (nextFigmaScanError) throw nextFigmaScanError;
     if (figmaScanDelayMs > 0) {
       await new Promise(resolve => originalSetTimeout(resolve, figmaScanDelayMs));
@@ -561,6 +563,7 @@ async function cleanupProjectsAndTimers() {
   lastFigmaScanOptions = null;
   figmaScanInvocationCount = 0;
   figmaScanDelayMs = 0;
+  useRealFigmaAutoTrackScan = false;
   rendererMessages.length = 0;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
@@ -613,6 +616,23 @@ function setFigmaDownloadResponse(body = 'figma asset bytes') {
     buffer: async () => Buffer.from(body),
     json: async () => ({}),
   });
+}
+
+function figmaApiResponse(status, payload = {}, headers = {}) {
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [String(key).toLowerCase(), String(value)])
+  );
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return normalizedHeaders[String(name).toLowerCase()] || null;
+      },
+    },
+    buffer: async () => Buffer.from(JSON.stringify(payload)),
+    json: async () => payload,
+  };
 }
 
 function setDelayedFigmaDownloadResponse(body = 'figma asset bytes', delayMs = 50) {
@@ -2075,7 +2095,8 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   }]);
 
   const firstScan = await callIpc('figma:scan-project', project.id);
-  assert.equal(firstScan.success, true);
+  assert.equal(firstScan.success, false);
+  assert.equal(firstScan.rateLimited, true);
   assert.equal(figmaScanInvocationCount, 1);
 
   const rateLimitedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
@@ -2111,13 +2132,72 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   }]);
 
   const secondScan = await callIpc('figma:scan-project', project.id);
-  assert.equal(secondScan.success, true);
+  assert.equal(secondScan.success, false);
+  assert.equal(secondScan.rateLimited, true);
   assert.equal(figmaScanInvocationCount, 1, 'cooldown should prevent an immediate second API scan');
   const cooldownMessage = [...rendererMessages].reverse().find(message => message.channel === 'figma:scan-complete');
   assert.ok(cooldownMessage.data.retryAfterMs > 0);
   assert.equal(cooldownMessage.data.retryAt, rateLimitedProject.figmaSession.rateLimitRetryAt);
   const afterCooldownSkip = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   assert.equal(afterCooldownSkip.files.length, 0);
+
+  const scanNow = await callIpc('figma:scan-now');
+  assert.equal(scanNow.success, false);
+  assert.equal(scanNow.rateLimitedCount, 1);
+  assert.equal(figmaScanInvocationCount, 1, 'scan-now must honor the active cooldown without another API scan');
+});
+
+test('live scan stops real Figma API requests after an image-map rate limit', async () => {
+  const project = await createLinkedFigmaProject('Figma Live Request Latch');
+  const apiRequests = [];
+  useRealFigmaAutoTrackScan = true;
+  fetchHandler = async (rawUrl) => {
+    const url = new URL(rawUrl);
+    const endpoint = `${url.pathname}${url.search}`;
+    apiRequests.push(endpoint);
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    if (endpoint === '/v1/files/FIG22/metadata') {
+      return figmaApiResponse(200, { name: 'Brand Cloud', lastModified: new Date().toISOString() });
+    }
+    if (endpoint === '/v1/files/FIG22') {
+      return figmaApiResponse(200, {
+        document: {
+          id: '0:0',
+          type: 'DOCUMENT',
+          children: [{
+            id: '1:1',
+            type: 'CANVAS',
+            name: 'Page One',
+            children: [{
+              id: '2:1',
+              type: 'RECTANGLE',
+              name: 'Hero',
+              fills: [{ type: 'IMAGE', imageRef: 'img-live-rate-limit' }],
+            }],
+          }],
+        },
+      });
+    }
+    if (endpoint === '/v1/files/FIG22/images') {
+      return figmaApiResponse(429, {}, { 'retry-after': '90' });
+    }
+    throw new Error(`Unexpected Figma API request after rate limit: ${endpoint}`);
+  };
+
+  const scan = await callIpc('figma:scan-project', project.id);
+
+  assert.equal(scan.success, false);
+  assert.equal(scan.rateLimited, true);
+  assert.deepEqual(apiRequests, [
+    '/v1/me',
+    '/v1/files/FIG22/metadata',
+    '/v1/files/FIG22',
+    '/v1/files/FIG22/images',
+  ]);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
 });
 
 test('Figma cooldown survives pause and restart until package-time recovery succeeds', async () => {
@@ -2125,7 +2205,8 @@ test('Figma cooldown survives pause and restart until package-time recovery succ
   nextFigmaScanResult = figmaRateLimitedScanResult(1_000);
 
   const firstScan = await callIpc('figma:scan-project', project.id);
-  assert.equal(firstScan.success, true);
+  assert.equal(firstScan.success, false);
+  assert.equal(firstScan.rateLimited, true);
   assert.equal(figmaScanInvocationCount, 1);
 
   const rateLimitedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
@@ -2180,7 +2261,8 @@ test('Figma rate limiting without a usable retry duration uses the bounded fallb
   const project = await createLinkedFigmaProject('Figma Rate Limit Fallback');
   nextFigmaScanResult = figmaRateLimitedScanResult(null);
   const scan = await callIpc('figma:scan-project', project.id);
-  assert.equal(scan.success, true);
+  assert.equal(scan.success, false);
+  assert.equal(scan.rateLimited, true);
 
   const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   const retryDelay = fresh.figmaSession.rateLimitRetryAt - Date.now();
@@ -2680,6 +2762,33 @@ test('pre-package Figma download failure blocks output until a clean retry succe
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
+});
+
+test('pre-package scan stops real Figma API requests after a metadata rate limit', async () => {
+  const project = await createLinkedFigmaProject('Figma Package Request Latch');
+  const apiRequests = [];
+  const usageBefore = fakeStoreInstance.get('usage.packagesThisMonth');
+  useRealFigmaAutoTrackScan = true;
+  fetchHandler = async (rawUrl) => {
+    const url = new URL(rawUrl);
+    const endpoint = `${url.pathname}${url.search}`;
+    apiRequests.push(endpoint);
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    if (endpoint === '/v1/files/FIG22/metadata') {
+      return figmaApiResponse(429, {}, { 'retry-after': '75' });
+    }
+    throw new Error(`Unexpected Figma API request after rate limit: ${endpoint}`);
+  };
+
+  const result = await callIpc('projects:pre-package-scan', project.id);
+
+  assert.match(result.error, /could not securely retrieve all Figma assets/i);
+  assert.deepEqual(apiRequests, ['/v1/me', '/v1/files/FIG22/metadata']);
+  assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBefore);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
 });
 
 test('pre-package recovery requires one successful candidate for every tracked Figma link', async () => {

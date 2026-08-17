@@ -7869,6 +7869,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
     });
     return {
       skipped: true,
+      rateLimited: true,
       reason: 'rate-limited-backoff',
       retryAt: rateLimitRetryAt,
       retryAfterMs: rateLimitRetryAt - scanStartedAt,
@@ -7999,6 +8000,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       if (scanResult.files.length === 0 && (teamIds.length > 0 || fileKeys.length > 0)) {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: 0, assetsFound: 0, addedCount: 0,
+          ...(isRateLimited ? { rateLimited: true } : {}),
           errors: scanErrors, timestamp: Date.now(),
           warning: sessionWarning || 'No recent Figma files found. Make sure your file was modified recently.',
           candidateDiagnostics,
@@ -8007,6 +8009,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       } else {
         sendToRenderer('figma:scan-complete', {
           projectId, filesFound: scanResult.files.length, assetsFound: 0, addedCount: 0,
+          ...(isRateLimited ? { rateLimited: true } : {}),
           errors: scanErrors, timestamp: Date.now(),
           warning: sessionWarning,
           candidateDiagnostics,
@@ -8025,6 +8028,7 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
         errors: scanErrors,
         warning: sessionWarning,
         candidateDiagnostics,
+        ...(isRateLimited ? { rateLimited: true } : {}),
         ...(rateLimitRetryAt ? { retryAt: rateLimitRetryAt, retryAfterMs: rateLimitRetryAt - Date.now() } : {})
       };
     }
@@ -15673,7 +15677,16 @@ registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
   }
 
   try {
-    await pollFigmaForProject(projectId, true, activationToken);
+    const result = await pollFigmaForProject(projectId, true, activationToken);
+    if (result && result.rateLimited === true) {
+      return {
+        success: false,
+        rateLimited: true,
+        error: result.warning || figmaRateLimitWarning(),
+        ...(result.retryAt ? { retryAt: result.retryAt } : {}),
+        ...(result.retryAfterMs ? { retryAfterMs: result.retryAfterMs } : {})
+      };
+    }
     return { success: true };
   } catch (e) {
     return { success: false, error: sanitizeFigmaRendererIssue(e) };
@@ -15745,8 +15758,16 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
   );
 
   const totalAddedCount = scanResults.reduce((sum, result) => sum + (result?.addedCount || 0), 0);
+  const rateLimitedCount = scanResults.filter(result => result && result.rateLimited === true).length;
 
-  return { triggered: scannableProjects.length, skipped, totalAddedCount };
+  return {
+    success: rateLimitedCount === 0,
+    triggered: scannableProjects.length,
+    skipped,
+    totalAddedCount,
+    rateLimitedCount,
+    ...(rateLimitedCount > 0 ? { error: figmaRateLimitWarning() } : {})
+  };
 });
 
 registerTrustedIpcHandler('settings:get', () => {

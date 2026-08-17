@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const Module = require('node:module');
 
 const { FigmaParser, parseFigmaRetryAfterMs } = require('../parsers/figma');
+const { FIGMA_NETWORK_LIMITS, createByteBudget } = require('../parsers/figma-network');
 
 const FILE_KEY = 'FILE123';
 
@@ -23,6 +25,59 @@ async function captureConsole(fn) {
     console.warn = originalWarn;
     console.error = originalError;
   }
+}
+
+function figmaApiResponse(status, payload = {}, headers = {}) {
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [String(key).toLowerCase(), String(value)])
+  );
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return normalizedHeaders[String(name).toLowerCase()] || null;
+      },
+    },
+    buffer: async () => Buffer.from(JSON.stringify(payload)),
+  };
+}
+
+function createRequestRecordingParser(responseForRequest) {
+  const parserPath = require.resolve('../parsers/figma');
+  const cachedParserModule = require.cache[parserPath];
+  const originalLoad = Module._load;
+  const requests = [];
+  const fetchRecorder = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    const endpoint = `${url.pathname}${url.search}`;
+    requests.push(endpoint);
+    return responseForRequest(endpoint, options);
+  };
+
+  delete require.cache[parserPath];
+  Module._load = function(request, parent, isMain) {
+    if (request === 'node-fetch') return fetchRecorder;
+    return originalLoad.call(this, request, parent, isMain);
+  };
+
+  let RecordedFigmaParser;
+  try {
+    RecordedFigmaParser = require('../parsers/figma').FigmaParser;
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[parserPath];
+    if (cachedParserModule) require.cache[parserPath] = cachedParserModule;
+  }
+
+  return {
+    parser: new class extends RecordedFigmaParser {
+      async getStoredToken() {
+        return 'token';
+      }
+    }(),
+    requests,
+  };
 }
 
 const DOCUMENT_FIXTURE = {
@@ -202,116 +257,6 @@ class RateLimitedFileFetchFigmaParser extends FigmaParser {
   }
 }
 
-function createRateLimitedParserError(retryAfterMs) {
-  const error = new Error('Figma API rate limit exceeded at https://figma.example/SHOULD_NOT_APPEAR?token=SHOULD_NOT_APPEAR');
-  error._crateFigmaApiFailureReason = 'rate-limited';
-  error._crateFigmaApiRetryAfterMs = retryAfterMs;
-  return error;
-}
-
-class MetadataRateLimitRequestRecorderParser extends FigmaParser {
-  constructor() {
-    super();
-    this.requests = [];
-  }
-
-  async getStoredToken() {
-    return 'token';
-  }
-
-  async _fetchAPI(endpoint) {
-    this.requests.push(endpoint);
-    if (endpoint === `/files/${FILE_KEY}/metadata`) throw createRateLimitedParserError(120_000);
-    if (endpoint === `/files/${FILE_KEY}?depth=1`) return { name: 'must-not-run' };
-    throw new Error(`Unexpected endpoint: ${endpoint}`);
-  }
-}
-
-class AssetRateLimitRequestRecorderParser extends FigmaParser {
-  constructor() {
-    super();
-    this.requests = [];
-  }
-
-  async getStoredToken() {
-    return 'token';
-  }
-
-  async _fetchAPI(endpoint) {
-    this.requests.push(endpoint);
-    if (endpoint === `/files/${FILE_KEY}`) return { document: DOCUMENT_FIXTURE };
-    if (endpoint === `/files/${FILE_KEY}/images`) throw createRateLimitedParserError(180_000);
-    if (endpoint.startsWith(`/images/${FILE_KEY}?`)) return { images: {} };
-    throw new Error(`Unexpected endpoint: ${endpoint}`);
-  }
-}
-
-class MultiCandidateRateLimitRequestRecorderParser extends FigmaParser {
-  constructor() {
-    super();
-    this.extractions = [];
-  }
-
-  async getStoredToken() {
-    return 'token';
-  }
-
-  async verifyToken() {
-    return { valid: true };
-  }
-
-  async getFileMetadata(fileKey, diagnostic) {
-    diagnostic.metadataStatus = 'success';
-    return {
-      key: fileKey,
-      name: `Tracked ${fileKey}`,
-      lastModified: new Date().toISOString(),
-      lastModifiedMs: Date.now()
-    };
-  }
-
-  async extractAssetsFromFileKey(fileKey, scopeEntry) {
-    this.extractions.push(fileKey);
-    if (fileKey === 'RATE_SECOND') {
-      return {
-        assets: [],
-        errors: ['Figma is temporarily rate limiting this scan.'],
-        warnings: [],
-        scope: {
-          scopeMode: 'current-page',
-          lockStatus: 'unresolved',
-          lockedPageId: null,
-          lockedPageName: null,
-          statusReason: 'figma-current-page-file-fetch-failed',
-          warning: null,
-          fileFetchStatus: 'failed',
-          fileFetchFailureReason: 'rate-limited',
-          assetFetchStatus: 'not-attempted',
-          retryAfterMs: 240_000
-        }
-      };
-    }
-    if (fileKey === 'MUST_NOT_RUN') throw new Error('third candidate must not run');
-    return {
-      assets: [{ url: 'https://cdn.example.com/partial.png', nodeId: 'partial', name: 'Partial', format: 'png' }],
-      errors: [],
-      warnings: [],
-      scope: {
-        scopeMode: scopeEntry.scopeMode,
-        lockStatus: 'locked',
-        lockedPageId: scopeEntry.requestedPageId,
-        lockedPageName: 'Page One',
-        statusReason: null,
-        warning: null,
-        fileFetchStatus: 'success',
-        fileFetchFailureReason: null,
-        assetFetchStatus: 'success',
-        retryAfterMs: null
-      }
-    };
-  }
-}
-
 test('Retry-After parsing accepts bounded integer seconds only', () => {
   assert.equal(parseFigmaRetryAfterMs('90'), 90_000);
   assert.equal(parseFigmaRetryAfterMs(' 120 '), 120_000);
@@ -324,45 +269,101 @@ test('Retry-After parsing accepts bounded integer seconds only', () => {
 });
 
 test('metadata rate limiting skips the depth fallback request', async () => {
-  const parser = new MetadataRateLimitRequestRecorderParser();
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === `/v1/files/${FILE_KEY}/metadata`) {
+      return figmaApiResponse(429, {}, { 'retry-after': '120' });
+    }
+    if (endpoint === `/v1/files/${FILE_KEY}?depth=1`) {
+      return figmaApiResponse(200, { name: 'must-not-run' });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
   const diagnostic = { metadataStatus: 'not-attempted' };
+  const apiBudget = createByteBudget(
+    FIGMA_NETWORK_LIMITS.apiOperationBytes,
+    FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+  );
 
-  const result = await parser.getFileMetadata(FILE_KEY, diagnostic, {});
+  const result = await parser.getFileMetadata(FILE_KEY, diagnostic, apiBudget);
 
   assert.equal(result, null);
-  assert.deepEqual(parser.requests, [`/files/${FILE_KEY}/metadata`]);
+  assert.deepEqual(requests, [`/v1/files/${FILE_KEY}/metadata`]);
   assert.equal(diagnostic.metadataFailureReason, 'rate-limited');
   assert.equal(diagnostic.retryAfterMs, 120_000);
 });
 
 test('image-map rate limiting skips rendered-image fallback requests', async () => {
-  const parser = new AssetRateLimitRequestRecorderParser();
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === `/v1/files/${FILE_KEY}`) {
+      return figmaApiResponse(200, { document: DOCUMENT_FIXTURE });
+    }
+    if (endpoint === `/v1/files/${FILE_KEY}/images`) {
+      return figmaApiResponse(429, {}, { 'retry-after': '180' });
+    }
+    if (endpoint.startsWith(`/v1/images/${FILE_KEY}?`)) {
+      return figmaApiResponse(200, { images: {} });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+  const apiBudget = createByteBudget(
+    FIGMA_NETWORK_LIMITS.apiOperationBytes,
+    FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+  );
   const result = await parser.extractAssetsFromFileKey(FILE_KEY, {
     key: FILE_KEY,
     scopeMode: 'current-page',
     requestedNodeId: '2:1'
-  }, {});
+  }, apiBudget);
 
-  assert.deepEqual(parser.requests, [`/files/${FILE_KEY}`, `/files/${FILE_KEY}/images`]);
+  assert.deepEqual(requests, [`/v1/files/${FILE_KEY}`, `/v1/files/${FILE_KEY}/images`]);
   assert.equal(result.assets.length, 0);
   assert.equal(result.scope.assetFetchStatus, 'failed');
   assert.equal(result.scope.retryAfterMs, 180_000);
 });
 
 test('multi-candidate scan stops after the first rate limit and discards partial assets', async () => {
-  const parser = new MultiCandidateRateLimitRequestRecorderParser();
   const fileKeys = ['SUCCESS_FIRST', 'RATE_SECOND', 'MUST_NOT_RUN'];
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    const metadataMatch = endpoint.match(/^\/v1\/files\/([^/?]+)\/metadata$/);
+    if (metadataMatch) {
+      return figmaApiResponse(200, {
+        name: `Tracked ${metadataMatch[1]}`,
+        lastModified: new Date().toISOString(),
+      });
+    }
+    if (endpoint === '/v1/files/SUCCESS_FIRST') {
+      return figmaApiResponse(200, { document: DOCUMENT_FIXTURE });
+    }
+    if (endpoint === '/v1/files/SUCCESS_FIRST/images') {
+      return figmaApiResponse(200, {
+        images: {
+          'img-ref-page-one': 'https://cdn.example.com/partial.png',
+        },
+      });
+    }
+    if (endpoint === '/v1/files/RATE_SECOND') {
+      return figmaApiResponse(429, {}, { 'retry-after': '240' });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
   const result = await parser.autoTrackScan({
     fileKeys,
-    scopeEntries: fileKeys.map((key, index) => ({
+    scopeEntries: fileKeys.map((key) => ({
       key,
       primaryKey: key,
       scopeMode: 'current-page',
-      requestedPageId: `${index + 1}:1`
+      requestedPageId: '1:1',
+      requestedNodeId: '1:1',
     }))
   });
 
-  assert.deepEqual(parser.extractions, ['SUCCESS_FIRST', 'RATE_SECOND']);
+  const rateLimitRequestIndex = requests.indexOf('/v1/files/RATE_SECOND');
+  assert.ok(rateLimitRequestIndex >= 0);
+  assert.deepEqual(requests.slice(rateLimitRequestIndex + 1), []);
+  assert.equal(requests.includes('/v1/files/MUST_NOT_RUN'), false);
   assert.equal(result.rateLimited, true);
   assert.equal(result.retryAfterMs, 240_000);
   assert.equal(result.assets.length, 0);
