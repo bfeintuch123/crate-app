@@ -321,6 +321,75 @@ test('image-map rate limiting skips rendered-image fallback requests', async () 
   assert.equal(result.scope.retryAfterMs, 180_000);
 });
 
+test('rendered-export rate limiting stops later batches and discards partial assets', async () => {
+  const fileKey = 'BATCH_FILE';
+  const exportableNodes = Array.from({ length: 1001 }, (_, index) => ({
+    id: `2:${index + 1}`,
+    type: 'RECTANGLE',
+    name: `Export ${index + 1}`,
+    exportSettings: [{ format: 'PNG' }],
+  }));
+  const document = {
+    id: '0:0',
+    type: 'DOCUMENT',
+    name: 'Batch Fixture',
+    children: [{
+      id: '1:1',
+      type: 'CANVAS',
+      name: 'Batch Page',
+      children: exportableNodes,
+    }],
+  };
+  let renderedBatchCount = 0;
+  const { parser, requests } = createRequestRecordingParser((endpoint) => {
+    if (endpoint === '/v1/me') {
+      return figmaApiResponse(200, { id: 'tester', handle: 'tester', email: 'tester@example.com' });
+    }
+    if (endpoint === `/v1/files/${fileKey}/metadata`) {
+      return figmaApiResponse(200, {
+        name: 'Batch Fixture',
+        lastModified: new Date().toISOString(),
+      });
+    }
+    if (endpoint === `/v1/files/${fileKey}`) {
+      return figmaApiResponse(200, { document });
+    }
+    if (endpoint.startsWith(`/v1/images/${fileKey}?`)) {
+      renderedBatchCount += 1;
+      if (renderedBatchCount === 2) {
+        return figmaApiResponse(429, {}, { 'retry-after': '360' });
+      }
+      if (renderedBatchCount > 2) {
+        throw new Error('Rendered export request continued after rate limiting.');
+      }
+      const ids = new URLSearchParams(endpoint.split('?')[1]).get('ids').split(',');
+      return figmaApiResponse(200, {
+        images: Object.fromEntries(
+          ids.map((id) => [id, `https://cdn.example.com/${encodeURIComponent(id)}.png`])
+        ),
+      });
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+
+  const result = await parser.autoTrackScan({
+    fileKeys: [fileKey],
+    scopeEntries: [{
+      key: fileKey,
+      primaryKey: fileKey,
+      scopeMode: 'entire-file',
+    }],
+  });
+
+  const renderedRequests = requests.filter((endpoint) => endpoint.startsWith(`/v1/images/${fileKey}?`));
+  assert.equal(renderedRequests.length, 2);
+  assert.equal(renderedBatchCount, 2);
+  assert.deepEqual(requests.slice(requests.indexOf(renderedRequests[1]) + 1), []);
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.retryAfterMs, 360_000);
+  assert.equal(result.assets.length, 0);
+});
+
 test('multi-candidate scan stops after the first rate limit and discards partial assets', async () => {
   const fileKeys = ['SUCCESS_FIRST', 'RATE_SECOND', 'MUST_NOT_RUN'];
   const { parser, requests } = createRequestRecordingParser((endpoint) => {
