@@ -56,7 +56,13 @@ function createElementStub(tagName = 'div') {
     getAttribute: name => attributes[name],
     removeAttribute: name => { delete attributes[name]; },
     querySelector: selector => {
-      if (selector === '.btn-accept-pending' || selector === '.btn-reject-pending' || selector === '.app-file-remove') {
+      if (
+        selector === '.btn-accept-pending'
+        || selector === '.btn-reject-pending'
+        || selector === '.app-file-remove'
+        || selector === '.project-pill'
+        || selector === '.project-delete'
+      ) {
         return { addEventListener: () => {} };
       }
       return null;
@@ -97,6 +103,20 @@ function getElementTreeText(element) {
   return [element.textContent || '', ...(element.children || []).map(getElementTreeText)].join(' ');
 }
 
+function createNodeList(items = []) {
+  const nodeList = {
+    length: items.length,
+    item: index => items[index] || null,
+    entries: () => items.entries(),
+    forEach: callback => items.forEach(callback),
+    keys: () => items.keys(),
+    values: () => items.values(),
+    [Symbol.iterator]: () => items[Symbol.iterator](),
+  };
+  items.forEach((item, index) => { nodeList[index] = item; });
+  return nodeList;
+}
+
 function createDocumentStub(elements = {}, options = {}) {
   const listeners = {};
   const body = createElementStub('body');
@@ -117,13 +137,16 @@ function createDocumentStub(elements = {}, options = {}) {
     querySelector: selector => {
       if (selector.startsWith('#')) return getElementById(selector.slice(1));
       if (selector === '.package-review-modal') return attach(options.packageReviewDialog || null);
+      if (selector === '.app-tab[data-tab="projects"]') {
+        return attach((options.tabs || []).find(tab => tab.dataset.tab === 'projects') || null);
+      }
       return null;
     },
     querySelectorAll: selector => {
-      if (selector === '.app-tab') return options.tabs || [];
-      if (selector === '.tab-content') return options.tabContents || [];
-      if (selector === '.asset-filter') return options.assetFilters || [];
-      return [];
+      if (selector === '.app-tab') return createNodeList(options.tabs || []);
+      if (selector === '.tab-content') return createNodeList(options.tabContents || []);
+      if (selector === '.asset-filter') return createNodeList(options.assetFilters || []);
+      return createNodeList();
     },
     createElement: tagName => attach(createElementStub(tagName)),
     body,
@@ -2268,6 +2291,65 @@ test('renderer binds the selected destination after generic output drift and pac
   assert.equal(elements['modal-success'].classList.contains('hidden'), true);
   assert.equal(elements['app-sidebar'].inert, false);
   assert.equal(elements['app-main'].inert, false);
+  assert.equal(document.activeElement, tabs[0]);
+});
+
+test('Done closes package success and restores every populated Projects row', () => {
+  const { document, elements, tabs } = createInteractiveRendererDom();
+  const projects = [
+    {
+      id: 'packaged-one',
+      name: 'Packaged One',
+      status: 'packaged',
+      files: [{ name: 'Packaged-One.ai', path: '/synthetic/Packaged-One.ai' }],
+      pendingFiles: [],
+      excludedAssetKeys: [],
+      packagedAt: Date.UTC(2026, 7, 18),
+    },
+    {
+      id: 'paused-two',
+      name: 'Paused Two',
+      status: 'paused',
+      files: [{ name: 'Paused-Two.psd', path: '/synthetic/Paused-Two.psd' }],
+      pendingFiles: [],
+      excludedAssetKeys: [],
+    },
+    {
+      id: 'packaged-three',
+      name: 'Packaged Three',
+      status: 'packaged',
+      files: [{ name: 'Packaged-Three.pdf', path: '/synthetic/Packaged-Three.pdf' }],
+      pendingFiles: [],
+      excludedAssetKeys: [],
+      packagedAt: Date.UTC(2026, 7, 18),
+    },
+  ];
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  renderer.testProjects = projects;
+  vm.runInContext('state.projects = testProjects', renderer);
+  renderer.setupEventListeners();
+  renderer.showPackageSuccessModal();
+
+  assert.equal(elements['modal-success'].classList.contains('hidden'), false);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
+  assert.equal(document.activeElement, elements['btn-success-done']);
+  assert.doesNotThrow(() => elements['btn-success-done'].click());
+
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(elements['app-sidebar'].getAttribute('aria-hidden'), undefined);
+  assert.equal(elements['app-main'].getAttribute('aria-hidden'), undefined);
+  assert.equal(tabs[0].classList.contains('active'), true);
+  assert.equal(elements['tab-projects'].classList.contains('active'), true);
+  assert.equal(elements['projects-empty'].classList.contains('hidden'), true);
+  assert.equal(elements['projects-list'].classList.contains('hidden'), false);
+  assert.equal(elements['project-rows'].children.length, 3);
+  assert.deepEqual(
+    elements['project-rows'].children.map(row => row.dataset.id),
+    projects.map(project => project.id),
+  );
   assert.equal(document.activeElement, tabs[0]);
 });
 

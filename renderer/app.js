@@ -1998,7 +1998,7 @@ function hidePackageSuccessModal() {
   const opener = packageReviewOpener;
   packageReviewOpener = null;
   switchTab('projects');
-  const projectsTab = $$('.app-tab').find(tab => tab.dataset.tab === 'projects');
+  const projectsTab = document.querySelector('.app-tab[data-tab="projects"]');
   const focusTarget = projectsTab || opener;
   if (focusTarget && typeof focusTarget.focus === 'function') focusTarget.focus();
 }
