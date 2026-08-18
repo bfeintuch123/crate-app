@@ -9,6 +9,10 @@ const DEFAULT_NAMING_TEMPLATE = '{Project}_{Date}';
 const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
 const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
+const PACKAGE_OUTPUT_LAYOUT_MODES = Object.freeze({
+  FLAT: 'flat',
+  BY_EXTENSION: 'by-extension-v1',
+});
 
 // ===== State =====
 let state = {
@@ -1741,6 +1745,7 @@ function renderSettingsControls() {
   $('#toggle-notifications').checked = state.settings.notifications || false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
+  $('#toggle-package-folders').checked = getPackageOutputLayoutMode() === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
 
   const used = Number(state.usage.packagesThisMonth) || 0;
   const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
@@ -1907,6 +1912,7 @@ const PACKAGE_REVIEW_CHANGED_MESSAGE = 'Your project changed. Review the updated
 const PACKAGE_REVIEW_UNAVAILABLE_MESSAGE = 'Some files are unavailable. Resolve them before packaging.';
 const PACKAGE_REVIEW_RECOVERY_MESSAGE = 'Packaging could not finish. Review the files and try again.';
 const PACKAGE_SCAN_INCOMPLETE_MESSAGE = 'Crate could not finish checking project files. No package was created. Record the diagnostic below before retrying.';
+const PACKAGE_LAYOUT_CHANGED_MESSAGE = 'Package organization changed. Review the updated destinations before packaging.';
 const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
   'pre-package-discovery',
   'pre-package-app-scan',
@@ -2085,6 +2091,59 @@ function getPackageDestinationLabel(outputPath) {
   return typeof outputPath === 'string' && outputPath ? 'Selected output folder' : '~/Desktop/';
 }
 
+function getPackageOutputLayoutMode(settings = state.settings) {
+  return settings?.packageOutputLayoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
+}
+
+function syncPackageOutputLayoutControls(layoutMode = getPackageOutputLayoutMode()) {
+  const organized = layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
+  const settingsToggle = $('#toggle-package-folders');
+  const reviewToggle = $('#toggle-package-review-folders');
+  const reviewStatus = $('#package-review-organization-status');
+  if (settingsToggle) settingsToggle.checked = organized;
+  if (reviewToggle) reviewToggle.checked = organized;
+  if (reviewStatus) reviewStatus.textContent = organized ? 'Folders by file type' : 'Keep files together';
+}
+
+async function updatePackageOutputLayoutMode(organized, { refreshReview = false } = {}) {
+  const previousMode = getPackageOutputLayoutMode();
+  const nextMode = organized ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
+  const controls = [$('#toggle-package-folders'), $('#toggle-package-review-folders')].filter(Boolean);
+  const confirmButton = $('#btn-confirm-package');
+  controls.forEach(control => { control.disabled = true; });
+  if (refreshReview) {
+    state.packageReviewToken = null;
+    if (confirmButton) confirmButton.disabled = true;
+  }
+  try {
+    const updatedSettings = await window.crate.updateSetting('packageOutputLayoutMode', nextMode);
+    state.settings = updatedSettings && typeof updatedSettings === 'object'
+      ? updatedSettings
+      : { ...state.settings, packageOutputLayoutMode: nextMode };
+    const savedMode = getPackageOutputLayoutMode();
+    syncPackageOutputLayoutControls(savedMode);
+    if (savedMode !== nextMode) throw new Error('Package organization preference was not saved');
+    if (refreshReview) {
+      await showPackageModal({
+        successMessage: PACKAGE_LAYOUT_CHANGED_MESSAGE,
+        runPreScan: false,
+        outputPath: state.packageOutputPath || undefined,
+      });
+    }
+  } catch (error) {
+    logRendererError('Package organization update failed', error);
+    state.settings.packageOutputLayoutMode = previousMode;
+    syncPackageOutputLayoutControls(previousMode);
+    if (refreshReview) {
+      await showPackageModal({ message: PACKAGE_REVIEW_RECOVERY_MESSAGE, runPreScan: false });
+    }
+  } finally {
+    controls.forEach(control => { control.disabled = false; });
+  }
+}
+
 function renderPackageReview(project, review, message = '') {
   setActiveFileVisualProject(project && project.id);
   const canPackage = review.materializable !== false && typeof review.token === 'string';
@@ -2140,6 +2199,14 @@ function renderPackageReview(project, review, message = '') {
     name.textContent = file.name || 'Unavailable file';
     item.appendChild(name);
     item.appendChild(createAppOriginLabel(file, project));
+    if (typeof file.packageFolder === 'string' && file.packageFolder) {
+      const destination = document.createElement('div');
+      destination.className = 'package-review-file-destination';
+      destination.textContent = file.packageFolder === 'Package root'
+        ? 'Package root'
+        : `${file.packageFolder} folder`;
+      item.appendChild(destination);
+    }
     fileListEl.appendChild(item);
   }
 
@@ -2188,6 +2255,13 @@ function renderPackageReview(project, review, message = '') {
       appendDefinitionRow(summaryList, 'Package status', 'Review required', 'warning');
     }
   }
+
+  const reviewLayoutMode = review.planSummary?.outputLayoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    : review.planSummary?.outputLayoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT
+      ? PACKAGE_OUTPUT_LAYOUT_MODES.FLAT
+      : getPackageOutputLayoutMode();
+  syncPackageOutputLayoutControls(reviewLayoutMode);
 
   // Folder name preview
   const folderName = resolveNamingTemplate(state.settings.namingTemplate, project.name);
@@ -2301,6 +2375,7 @@ function getPackageReviewRecoveryMessage(error, diagnostics = null) {
 
 async function showPackageModal({
   message = '',
+  successMessage = '',
   runPreScan = true,
   review: suppliedReview = null,
   outputPath: reviewedOutputPath,
@@ -2347,7 +2422,7 @@ async function showPackageModal({
     state.projects = await window.crate.getProjects();
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
-    renderPackageReview(project, review, message);
+    renderPackageReview(project, review, successMessage || message);
     return true;
   } catch (error) {
     logRendererError('Package Review recovery failed', error);
@@ -2668,6 +2743,14 @@ function setupEventListeners() {
     const checked = $('#toggle-package-details').checked;
     window.crate.updateSetting('showPackageDetails', checked);
     state.settings.showPackageDetails = checked;
+  });
+
+  $('#toggle-package-folders').addEventListener('change', event => {
+    updatePackageOutputLayoutMode(event.target.checked);
+  });
+
+  $('#toggle-package-review-folders').addEventListener('change', event => {
+    updatePackageOutputLayoutMode(event.target.checked, { refreshReview: true });
   });
 
   // Clear all projects

@@ -287,6 +287,16 @@
               <span class="toggle-slider"></span>
             </label>
           </div>
+          <div class="settings-row">
+            <div class="settings-label-wrap">
+              <div class="settings-label">Organize packages by file type</div>
+              <div class="settings-desc">Creates folders such as AI, PNG, and PDF. Turn this off to keep all files together.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="toggle-package-folders" aria-label="Organize packages by file type">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
         </div>
 
         <div class="settings-section">
@@ -447,6 +457,16 @@
               <div class="modal-info-row hidden" id="modal-figma-scope-row">
                 <div class="modal-row-label">Figma Scope</div>
                 <div class="modal-row-value" id="modal-figma-scope"></div>
+              </div>
+              <div class="package-review-organization">
+                <div class="settings-label-wrap">
+                  <div class="modal-naming-label" id="package-review-organization-label">Organize by file type</div>
+                  <div class="package-review-organization-status" id="package-review-organization-status">Keep files together</div>
+                </div>
+                <label class="toggle">
+                  <input type="checkbox" id="toggle-package-review-folders" aria-labelledby="package-review-organization-label" aria-describedby="package-review-organization-status">
+                  <span class="toggle-slider"></span>
+                </label>
               </div>
               <div class="modal-naming-box">
                 <div class="modal-naming-label">Output Folder Name</div>

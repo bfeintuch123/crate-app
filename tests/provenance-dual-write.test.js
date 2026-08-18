@@ -3764,6 +3764,7 @@ test('unchanged reviewed manifest packages exactly the reviewed files', async ()
         sourceRecoveryAllowed: false,
         excluded: false,
         status: 'ready',
+        packageFolder: 'Package root',
       }]
     );
     assert.match(review.files[0].visualIdentity, /^[A-Za-z0-9_-]{43}$/);
@@ -3924,7 +3925,11 @@ test('authoritative plan binds reviewed sources, PSD and presentation derivative
       visibleDerivedDesignCount: 1,
       derivedDesignGeneratorCount: 1,
       diagnosticsMetadataIncluded: false,
+      outputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.FLAT,
     });
+    assert.deepEqual(firstReview.files.map(file => file.packageFolder), [
+      'Package root', 'Package root', 'Package root',
+    ]);
     assert.equal(JSON.stringify(firstReview).includes(tmpRoot), false);
     assert.equal(JSON.stringify(firstReview).includes('Unrelated.ai'), false);
 
@@ -3996,6 +4001,16 @@ test('organized authoritative plan materializes every reviewed output at its bou
     storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
 
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(review.planSummary.outputLayoutMode, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    assert.deepEqual(
+      review.files.map(file => [file.name, file.packageFolder]),
+      [
+        ['Brand-System.ai', 'AI'],
+        ['Launch-Deck.pptx', 'PPTX'],
+        ['aux.png', 'PNG'],
+        ['_aux.png', 'PNG'],
+      ]
+    );
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
     assert.equal(result.success, true);
@@ -4646,6 +4661,48 @@ test('changing the package layout mode invalidates flat review authority before 
     assert.equal(fs.readFileSync(path.join(result.folderPath, 'AI', 'Layout.ai'), 'utf8'), 'layout authority bytes');
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('settings layout toggle immediately invalidates the prior review token and issues authoritative folder labels', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Layout Settings Token');
+    const sourcePath = path.join(tmpRoot, 'Layout.ai');
+    const pngPath = path.join(tmpRoot, 'Layout.png');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'layout source bytes');
+    fs.writeFileSync(pngPath, 'layout asset bytes');
+    const stored = await setProjectFiles(project.id, { files: [
+      { path: sourcePath, name: 'Layout.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+      { path: pngPath, name: 'Layout.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+    ] });
+    await callIpc('settings:update', 'packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    const flatReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    const settings = await callIpc(
+      'settings:update',
+      'packageOutputLayoutMode',
+      PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+    );
+    assert.equal(settings.packageOutputLayoutMode, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+
+    const stale = await callIpcRaw('projects:package', project.id, outputDir, flatReview.token);
+    assert.equal(stale.error, 'package_review_stale');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+
+    const organizedReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(organizedReview.planSummary.outputLayoutMode, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    assert.deepEqual(
+      organizedReview.files.map(file => [file.name, file.packageFolder]),
+      [['Layout.ai', 'AI'], ['Layout.png', 'PNG']]
+    );
+  } finally {
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

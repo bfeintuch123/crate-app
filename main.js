@@ -4582,7 +4582,8 @@ try {
         namingTemplate: DEFAULT_NAMING_TEMPLATE,
         notifications: true,
         includeDiagnosticReport: false,
-        showPackageDetails: true
+        showPackageDetails: true,
+        packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.FLAT
       },
       usage: {
         packagesThisMonth: 0,
@@ -4639,6 +4640,10 @@ function migrateSettings() {
   }
   if (settings.showPackageDetails === undefined) {
     store.set('settings.showPackageDetails', true);
+  }
+  const packageOutputLayoutMode = normalizePackageOutputLayoutMode(settings.packageOutputLayoutMode);
+  if (packageOutputLayoutMode !== settings.packageOutputLayoutMode) {
+    store.set('settings.packageOutputLayoutMode', packageOutputLayoutMode);
   }
 
   // v2.7.0 (Phase 2): Figma link moved per-project. Drop deprecated global
@@ -14324,6 +14329,26 @@ function invalidatePackageReviewForProject(projectId) {
   currentPackageReviewTokenByProject.delete(projectId);
 }
 
+function invalidateAllPackageReviews() {
+  packageReviewSnapshots.clear();
+  currentPackageReviewTokenByProject.clear();
+}
+
+function getPackageReviewEntryFolder(plan, entryIndex) {
+  const reviewedSource = plan.reviewedSourceInputs.find(item => item.entryIndex === entryIndex);
+  let relativePath = reviewedSource?.relativePath || null;
+  if (!relativePath) {
+    const derivedOutput = plan.deterministicDerivedOutputs
+      .find(item => item.sourceEntryIndex === entryIndex && item.materialization === 'psd-embedded-resource')
+      ?.expectedOutputs?.[0];
+    relativePath = derivedOutput?.relativePath || null;
+  }
+  if (!relativePath) return null;
+  if (plan.layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.FLAT) return 'Package root';
+  const directory = path.posix.dirname(relativePath);
+  return directory && directory !== '.' ? directory : 'Package root';
+}
+
 async function issuePackageReviewSnapshot(projectId, manifest, destinationBinding = null) {
   if (!manifest.materializable || !manifest.plan || !manifest.manifestKey) {
     throw new Error('Cannot issue an unmaterializable package review');
@@ -14350,6 +14375,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
       name: entry.displayName,
       ext: entry.ext,
       embedded: entry.embedded,
+      packageFolder: getPackageReviewEntryFolder(manifest.plan, index),
       status: 'ready',
     })),
     totalFiles: manifest.entries.length,
@@ -14360,6 +14386,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
       visibleDerivedDesignCount: manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'psd-embedded-resource').length,
       derivedDesignGeneratorCount: manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'presentation-media').length,
       diagnosticsMetadataIncluded: !!manifest.plan.diagnosticsMetadata,
+      outputLayoutMode: manifest.plan.layoutMode,
     },
   };
 }
@@ -16666,10 +16693,17 @@ registerTrustedIpcHandler('settings:get', () => {
 
 registerTrustedIpcHandler('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   if (key === 'namingTemplate') {
     store.set(`settings.${key}`, sanitizeNamingTemplate(value));
+    return store.get('settings');
+  }
+  if (key === 'packageOutputLayoutMode') {
+    const previousMode = normalizePackageOutputLayoutMode(store.get(`settings.${key}`));
+    const nextMode = normalizePackageOutputLayoutMode(value);
+    store.set(`settings.${key}`, nextMode);
+    if (previousMode !== nextMode) invalidateAllPackageReviews();
     return store.get('settings');
   }
   store.set(`settings.${key}`, value);

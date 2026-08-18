@@ -149,6 +149,9 @@ function createInteractiveRendererDom() {
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
     'btn-confirm-package': createElementStub('button'),
+    'toggle-package-folders': createElementStub('input'),
+    'toggle-package-review-folders': createElementStub('input'),
+    'package-review-organization-status': createElementStub(),
     'btn-review-existing-assets-later': createElementStub('button'),
     'btn-include-existing-assets': createElementStub('button'),
     'modal-existing-assets': createElementStub(),
@@ -183,6 +186,7 @@ function createInteractiveRendererDom() {
   }
   elements['modal-package'].focusableElements = [
     elements['btn-change-dest'],
+    elements['toggle-package-review-folders'],
     elements['btn-cancel-package'],
     elements['btn-confirm-package'],
   ];
@@ -1596,6 +1600,121 @@ test('Package Review shows privacy-safe source context for visual assets', () =>
   assert.equal(reviewText.includes('/Users/'), false);
 });
 
+test('Package Review shows authoritative file-type destinations and the saved organization mode', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'review-organized-destinations', name: 'Organized Review', files: [] };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderPackageReview(project, {
+    token: '00000000-0000-4000-8000-000000000114',
+    materializable: true,
+    planSummary: { outputLayoutMode: 'by-extension-v1' },
+    files: [
+      { name: 'Brand.ai', ext: '.ai', packageFolder: 'AI', projectRole: 'source', status: 'ready' },
+      { name: 'Logo.png', ext: '.png', packageFolder: 'PNG', projectRole: 'asset', status: 'ready' },
+    ],
+  });
+
+  const reviewText = getElementTreeText(elements['modal-file-list']);
+  assert.equal(reviewText.includes('AI folder'), true);
+  assert.equal(reviewText.includes('PNG folder'), true);
+  assert.equal(elements['toggle-package-review-folders'].checked, true);
+  assert.equal(elements['toggle-package-folders'].checked, true);
+  assert.equal(elements['package-review-organization-status'].textContent, 'Folders by file type');
+  assert.equal(reviewText.includes('/Users/'), false);
+});
+
+test('changing Package Review organization refreshes authority before packaging', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const calls = [];
+  const project = { id: 'review-layout-refresh', name: 'Layout Refresh', files: [] };
+  const renderer = loadRendererHelpers(document, { crate: {
+    updateSetting: async (key, value) => {
+      calls.push(['setting', key, value]);
+      return { namingTemplate: '{Project}_{Date}', packageOutputLayoutMode: value };
+    },
+    preparePackageReview: async projectId => {
+      calls.push(['review', projectId]);
+      return {
+        token: '00000000-0000-4000-8000-000000000115',
+        materializable: true,
+        planSummary: { outputLayoutMode: 'by-extension-v1' },
+        files: [{
+          name: 'Layout.ai', ext: '.ai', packageFolder: 'AI', projectRole: 'source', status: 'ready',
+        }],
+      };
+    },
+    getProjects: async () => [project],
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}', packageOutputLayoutMode: 'flat' };
+    state.packageReviewToken = '00000000-0000-4000-8000-000000000099';
+  `, renderer);
+
+  await renderer.updatePackageOutputLayoutMode(true, { refreshReview: true });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ['setting', 'packageOutputLayoutMode', 'by-extension-v1'],
+    ['review', project.id],
+  ]);
+  assert.equal(
+    vm.runInContext('state.packageReviewToken', renderer),
+    '00000000-0000-4000-8000-000000000115'
+  );
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  assert.equal(elements['toggle-package-review-folders'].checked, true);
+  assert.equal(elements['package-review-organization-status'].textContent, 'Folders by file type');
+  assert.equal(
+    elements['modal-package-review-message'].textContent,
+    'Package organization changed. Review the updated destinations before packaging.'
+  );
+  assert.equal(getElementTreeText(elements['modal-file-list']).includes('AI folder'), true);
+});
+
+test('failed organization refresh keeps the saved mode but shows the authoritative scan failure', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'review-layout-refresh-failure', name: 'Layout Refresh Failure', files: [] };
+  const renderer = loadRendererHelpers(document, { crate: {
+    updateSetting: async (key, value) => ({
+      namingTemplate: '{Project}_{Date}',
+      packageOutputLayoutMode: value,
+    }),
+    preparePackageReview: async () => ({
+      error: 'package_scan_incomplete',
+      diagnostics: {
+        failurePhase: 'pre-package-discovery',
+        phaseElapsedMs: 8001,
+        candidateCount: 42,
+        xattrResolvedCount: 3,
+        metadataFallbackCount: 7,
+      },
+    }),
+    getProjects: async () => [project],
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}', packageOutputLayoutMode: 'flat' };
+    state.packageReviewToken = '00000000-0000-4000-8000-000000000116';
+  `, renderer);
+
+  await renderer.updatePackageOutputLayoutMode(true, { refreshReview: true });
+
+  const message = elements['modal-package-review-message'].textContent;
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+  assert.equal(vm.runInContext('state.settings.packageOutputLayoutMode', renderer), 'by-extension-v1');
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  assert.equal(elements['toggle-package-review-folders'].checked, true);
+  assert.match(message, /Crate could not finish checking project files/);
+  assert.match(message, /code package_scan_incomplete/);
+  assert.match(message, /phase pre-package-discovery/);
+  assert.equal(message.includes('Package organization changed'), false);
+});
+
 test('Figma rate-limit warning card shows the server retry time when available', () => {
   const document = createDocumentStub();
   const renderer = loadRendererHelpers(document);
@@ -2446,8 +2565,11 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /id="asset-review-heading"[^>]*tabindex="-1"/);
   assert.match(html, /data-asset-filter="all"[^>]*aria-pressed="true"/);
   assert.match(html, /data-asset-filter="existing"[^>]*aria-pressed="false"/);
+  assert.match(html, /id="toggle-package-folders"[^>]*aria-label="Organize packages by file type"/);
+  assert.match(html, /id="toggle-package-review-folders"[^>]*aria-labelledby="package-review-organization-label"[^>]*aria-describedby="package-review-organization-status"/);
   assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
   assert.match(css, /\.package-review-modal\s*\{(?=[^}]*position:\s*relative;)(?=[^}]*overflow-x:\s*hidden;)(?=[^}]*overflow-y:\s*auto;)[^}]*\}/);
+  assert.match(css, /\.toggle input:focus-visible \+ \.toggle-slider\s*\{(?=[^}]*outline:\s*2px solid var\(--black\);)(?=[^}]*outline-offset:\s*3px;)[^}]*\}/);
   assert.match(html, /id="modal-upgrade"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-describedby="upgrade-subtitle"/);
   assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Maybe later[\s\S]*<\/button>/);
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
