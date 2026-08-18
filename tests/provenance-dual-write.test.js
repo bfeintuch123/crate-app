@@ -328,19 +328,48 @@ class TestUtilityProcess extends EventEmitter {
         stat.dev !== identity.dev ||
         stat.ino !== identity.ino
       ) return false;
-      const fd = fs.openSync(candidate, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+      const quarantineDirectory = fs.mkdtempSync(path.join(workingPath, '.crate-cleanup-'));
+      fs.chmodSync(quarantineDirectory, 0o700);
+      const quarantineDirectoryStat = fs.lstatSync(quarantineDirectory, { bigint: true });
+      if (
+        quarantineDirectoryStat.isSymbolicLink() ||
+        !quarantineDirectoryStat.isDirectory() ||
+        (quarantineDirectoryStat.mode & 0o777n) !== 0o700n
+      ) return false;
+      const quarantinePath = path.join(quarantineDirectory, 'owned-output');
+      if (fs.existsSync(quarantinePath)) return false;
+      fs.renameSync(candidate, quarantinePath);
+      const currentQuarantineDirectory = fs.lstatSync(quarantineDirectory, { bigint: true });
+      if (
+        currentQuarantineDirectory.isSymbolicLink() ||
+        !currentQuarantineDirectory.isDirectory() ||
+        currentQuarantineDirectory.dev !== quarantineDirectoryStat.dev ||
+        currentQuarantineDirectory.ino !== quarantineDirectoryStat.ino
+      ) return false;
+      const quarantined = fs.lstatSync(quarantinePath, { bigint: true });
+      if (quarantined.dev !== identity.dev || quarantined.ino !== identity.ino) return false;
+      const fd = fs.openSync(quarantinePath, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
       try {
         const opened = fs.fstatSync(fd, { bigint: true });
-        if (opened.dev !== stat.dev || opened.ino !== stat.ino) return false;
+        if (opened.dev !== identity.dev || opened.ino !== identity.ino) return false;
         fs.ftruncateSync(fd, 0);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
-      const finalStat = fs.lstatSync(candidate, { bigint: true });
-      if (finalStat.dev !== stat.dev || finalStat.ino !== stat.ino) return false;
-      fs.unlinkSync(candidate);
-      return true;
+      const finalStat = fs.lstatSync(quarantinePath, { bigint: true });
+      if (finalStat.dev !== identity.dev || finalStat.ino !== identity.ino) return false;
+      fs.unlinkSync(quarantinePath);
+      const finalQuarantineDirectory = fs.lstatSync(quarantineDirectory, { bigint: true });
+      if (
+        finalQuarantineDirectory.isSymbolicLink() ||
+        !finalQuarantineDirectory.isDirectory() ||
+        finalQuarantineDirectory.dev !== quarantineDirectoryStat.dev ||
+        finalQuarantineDirectory.ino !== quarantineDirectoryStat.ino ||
+        fs.readdirSync(quarantineDirectory).length !== 0
+      ) return false;
+      fs.rmdirSync(quarantineDirectory);
+      return !fs.existsSync(quarantineDirectory);
     };
     const fallbackIdentities = new Map();
     for (const [leafName, identities] of recordsByLeaf) {
@@ -408,14 +437,22 @@ class TestUtilityProcess extends EventEmitter {
     };
     if (matches(this.options.cwd)) return this.options.cwd;
     const parent = path.dirname(this.options.cwd);
-    const candidates = [parent];
+    const anchorParent = path.dirname(parent);
+    const candidates = [parent, anchorParent];
     try {
-      for (const firstName of fs.readdirSync(parent)) {
-        const first = path.join(parent, firstName);
+      for (const firstName of fs.readdirSync(anchorParent)) {
+        const first = path.join(anchorParent, firstName);
         candidates.push(first);
         try {
           if (!fs.statSync(first).isDirectory()) continue;
-          for (const secondName of fs.readdirSync(first)) candidates.push(path.join(first, secondName));
+          for (const secondName of fs.readdirSync(first)) {
+            const second = path.join(first, secondName);
+            candidates.push(second);
+            try {
+              if (!fs.statSync(second).isDirectory()) continue;
+              for (const thirdName of fs.readdirSync(second)) candidates.push(path.join(second, thirdName));
+            } catch (_) {}
+          }
         } catch (_) {}
       }
     } catch (_) {}
@@ -465,10 +502,11 @@ class TestUtilityProcess extends EventEmitter {
           this.fail();
           return;
         }
-        for (const childName of fs.readdirSync(workingPath)) {
-          fs.rmSync(path.join(workingPath, childName), { recursive: true, force: false });
-        }
-        if (!utilityProcessAncestriesMatch(workingPath, this.ancestries)) return this.fail();
+        this.removeOwnedOutputs();
+        if (
+          !utilityProcessAncestriesMatch(workingPath, this.ancestries) ||
+          fs.readdirSync(workingPath).length !== 0
+        ) return this.fail();
         this.respond({ type: 'complete', bytesWritten: '0' });
         return;
       }
@@ -1604,7 +1642,7 @@ function isExpectedStagedPackageWrite(filePath, outputDir, outputName) {
 
 async function assertPackageActivationDriftFailsClosed(scenario, mutateActivation) {
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   let releaseWrite = () => {};
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
@@ -1642,16 +1680,22 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     let deferred = true;
     const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
     const writeGate = new Promise(resolve => { releaseWrite = resolve; });
-    fs.promises.writeFile = async function deferredPackageWrite(filePath, ...args) {
+    fs.promises.open = async function deferredPackageWrite(filePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
       if (
         deferred &&
+        flags === 'wx' &&
         isExpectedStagedPackageWrite(filePath, outputDir, `${scenario}.png`)
       ) {
-        deferred = false;
-        markWriteStarted();
-        await writeGate;
+        const originalHandleWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          deferred = false;
+          markWriteStarted();
+          await writeGate;
+          return originalHandleWriteFile(...writeArgs);
+        };
       }
-      return originalWriteFile.call(fs.promises, filePath, ...args);
+      return handle;
     };
 
     const packagePromise = callIpc('projects:package', project.id, outputDir);
@@ -1685,14 +1729,14 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     );
   } finally {
     releaseWrite();
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 }
 
 async function assertPackageScopePollBehavior(semanticChange) {
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   let releaseWrite = () => {};
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
@@ -1728,13 +1772,18 @@ async function assertPackageScopePollBehavior(semanticChange) {
     let deferred = true;
     const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
     const writeGate = new Promise(resolve => { releaseWrite = resolve; });
-    fs.promises.writeFile = async function deferredScopeWrite(filePath, ...args) {
-      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'scope-poll.png')) {
-        deferred = false;
-        markWriteStarted();
-        await writeGate;
+    fs.promises.open = async function deferredScopeWrite(filePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
+      if (deferred && flags === 'wx' && isExpectedStagedPackageWrite(filePath, outputDir, 'scope-poll.png')) {
+        const originalHandleWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          deferred = false;
+          markWriteStarted();
+          await writeGate;
+          return originalHandleWriteFile(...writeArgs);
+        };
       }
-      return originalWriteFile.call(fs.promises, filePath, ...args);
+      return handle;
     };
 
     const packagePromise = callIpc('projects:package', project.id, outputDir);
@@ -1772,7 +1821,7 @@ async function assertPackageScopePollBehavior(semanticChange) {
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
     assert.equal(stored.status, 'packaged');
   } finally {
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     releaseWrite();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1868,7 +1917,7 @@ async function assertStalePsdExtractionLeavesNoInvocationFiles(scenario) {
 async function assertPackageRootReplacementFailsClosed(lane, replacement) {
   resetTestHomeWorkspace();
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   let releaseWrite = () => {};
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
@@ -1912,16 +1961,20 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
         fileId: 'deferred-root-embedded',
       });
       let deferred = true;
-      fs.promises.writeFile = async function deferredPsdWrite(filePath, ...args) {
+      fs.promises.open = async function deferredPsdWrite(filePath, flags, ...args) {
+        const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
         const stagingRoot = getPrivateStagedPackageRoot(filePath, outputDir);
-        if (deferred && stagingRoot && path.basename(filePath) === 'deferred.png') {
-          deferred = false;
-          await originalWriteFile.call(fs.promises, filePath, ...args);
-          markWriteStarted(stagingRoot);
-          await writeGate;
-          return;
+        if (deferred && flags === 'wx' && stagingRoot && path.basename(filePath) === 'deferred.png') {
+          const originalHandleWriteFile = handle.writeFile.bind(handle);
+          handle.writeFile = async (...writeArgs) => {
+            deferred = false;
+            const result = await originalHandleWriteFile(...writeArgs);
+            markWriteStarted(stagingRoot);
+            await writeGate;
+            return result;
+          };
         }
-        return originalWriteFile.call(fs.promises, filePath, ...args);
+        return handle;
       };
       setChildProcessHandler(() => ({ stdout: '' }));
     } else {
@@ -2002,7 +2055,7 @@ async function assertPackageRootReplacementFailsClosed(lane, replacement) {
     assert.equal(stored.outputPath == null, true);
     assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
   } finally {
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     releaseWrite();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -4335,6 +4388,7 @@ test('organized package fails closed when an acknowledged output leaf is renamed
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const before = capturePackageSideEffects(stored);
     let renamed = false;
+    let sentinelPath = null;
 
     setUtilityProcessHandler(({ phase, message, child }) => {
       if (phase !== 'response' || renamed || message.type !== 'ready') return;
@@ -4343,16 +4397,19 @@ test('organized package fails closed when an acknowledged output leaf is renamed
         path.join(workingPath, 'Reviewed.ai'),
         path.join(workingPath, 'Renamed.ai')
       );
-      fs.writeFileSync(path.join(workingPath, 'sentinel.txt'), 'unrelated sentinel');
+      sentinelPath = path.join(workingPath, 'sentinel.txt');
+      fs.writeFileSync(sentinelPath, 'unrelated sentinel');
       renamed = true;
     });
 
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
     assert.equal(renamed, true);
-    assert.equal(result.error, 'package_output_changed');
+    assert.equal(result.error, 'package_cleanup_failed');
     assertFailedPackageHasNoSideEffects(stored, outputDir, before);
-    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.equal(fs.existsSync(path.join(outputDir, review.folderName)), false);
+    assert.ok(sentinelPath);
+    assert.equal(fs.readFileSync(sentinelPath, 'utf8'), 'unrelated sentinel');
   } finally {
     setUtilityProcessHandler(null);
     storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
@@ -4730,8 +4787,7 @@ test('destination occupancy drift refreshes again with zero package side effects
 
 test('late destination occupancy refreshes once and the second confirmation publishes the bound folder', async () => {
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
-  let releaseWrite = () => {};
+  const originalOpen = fs.promises.open;
   try {
     const project = await createProject('Late Destination Occupancy');
     const parentPsd = path.join(tmpRoot, 'Deferred.psd');
@@ -4757,30 +4813,32 @@ test('late destination occupancy refreshes once and the second confirmation publ
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     const before = capturePackageSideEffects(stored);
 
-    let deferred = true;
-    let markWriteStarted;
-    const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
-    const writeGate = new Promise(resolve => { releaseWrite = resolve; });
-    fs.promises.writeFile = async function occupyDestinationDuringStaging(filePath, ...args) {
-      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'Deferred.png')) {
-        deferred = false;
-        await originalWriteFile.call(fs.promises, filePath, ...args);
-        markWriteStarted(getPrivateStagedPackageRoot(filePath, outputDir));
-        await writeGate;
-        return;
+    let stagingRoot = null;
+    let destinationOccupied = false;
+    const occupiedFolder = path.join(outputDir, review.folderName);
+    fs.promises.open = async function occupyDestinationAfterPsdWrite(candidatePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, candidatePath, flags, ...args);
+      if (
+        flags === 'wx' &&
+        !destinationOccupied &&
+        isExpectedStagedPackageWrite(candidatePath, outputDir, 'Deferred.png')
+      ) {
+        const originalWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          const result = await originalWriteFile(...writeArgs);
+          stagingRoot = findPrivateStagedPackageRoot(outputDir);
+          fs.mkdirSync(occupiedFolder);
+          destinationOccupied = true;
+          return result;
+        };
       }
-      return originalWriteFile.call(fs.promises, filePath, ...args);
+      return handle;
     };
 
     testRendererEvents.length = 0;
-    const firstConfirmation = callIpcRaw('projects:package', project.id, outputDir, review.token);
-    const stagingRoot = await writeStarted;
-    const occupiedFolder = path.join(outputDir, review.folderName);
-    fs.mkdirSync(occupiedFolder);
-    releaseWrite();
-    const refreshed = await firstConfirmation;
-    fs.promises.writeFile = originalWriteFile;
+    const refreshed = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
+    assert.equal(destinationOccupied, true);
     assert.equal(refreshed.error, 'package_review_changed');
     assert.equal(refreshed.reason, 'package_destination_changed');
     assert.equal(refreshed.review.folderName, `${review.folderName}_1`);
@@ -4800,8 +4858,7 @@ test('late destination occupancy refreshes once and the second confirmation publ
       'late destination bytes'
     );
   } finally {
-    fs.promises.writeFile = originalWriteFile;
-    releaseWrite();
+    fs.promises.open = originalOpen;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -5306,13 +5363,13 @@ async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) 
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     const before = capturePackageSideEffects(stored);
 
-    if (options.organized === true) {
-      setUtilityProcessHandler(({ phase, message }) => {
-        if (phase !== 'message' || message.type !== 'write-start' || stagingRoot) return;
-        stagingRoot = findPrivateStagedPackageRoot(outputDir);
-        stagedFilePath = stagingRoot ? path.join(stagingRoot, 'AI', 'Reviewed.ai') : null;
-      });
-    }
+    setUtilityProcessHandler(({ phase, message }) => {
+      if (phase !== 'message' || message.type !== 'write-start' || stagingRoot) return;
+      stagingRoot = findPrivateStagedPackageRoot(outputDir);
+      stagedFilePath = stagingRoot
+        ? path.join(stagingRoot, ...(options.organized === true ? ['AI', 'Reviewed.ai'] : ['Reviewed.ai']))
+        : null;
+    });
 
     fs.promises.open = async function captureStagedDestination(candidatePath, flags, ...args) {
       const handle = await originalOpen.call(fs.promises, candidatePath, flags, ...args);
@@ -5338,10 +5395,19 @@ async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) 
     fs.readdirSync = originalReaddirSync;
 
     assert.equal(hookReached, true, `${label} must reach the final staged-tree verification boundary`);
-    assert.equal(result.error, 'package_review_changed');
-    assert.equal(result.review.materializable, true);
+    if (options.expectCleanupFailure === true) {
+      assert.equal(result.error, 'package_cleanup_failed');
+    } else {
+      assert.equal(result.error, 'package_review_changed');
+      assert.equal(result.review.materializable, true);
+    }
     assertFailedPackageHasNoSideEffects(stored, outputDir, before);
-    assertNoPrivatePackageStaging(outputDir, stagingRoot);
+    if (options.expectCleanupFailure === true) {
+      assert.equal(fs.existsSync(stagingRoot), true, `${label} must preserve the unknown staged object`);
+      assert.equal(fs.existsSync(path.join(outputDir, review.folderName)), false);
+    } else {
+      assertNoPrivatePackageStaging(outputDir, stagingRoot);
+    }
   } finally {
     setUtilityProcessHandler(null);
     fs.promises.open = originalOpen;
@@ -5363,6 +5429,7 @@ const STAGED_TREE_MUTATION_SCENARIOS = [
   },
   {
     label: 'file replacement',
+    expectCleanupFailure: true,
     mutate: ({ stagedFilePath }) => {
       const bytes = fs.readFileSync(stagedFilePath);
       fs.unlinkSync(stagedFilePath);
@@ -5371,6 +5438,7 @@ const STAGED_TREE_MUTATION_SCENARIOS = [
   },
   {
     label: 'symlink replacement',
+    expectCleanupFailure: true,
     mutate: ({ stagedFilePath, tmpRoot }) => {
       const outsidePath = path.join(tmpRoot, 'outside-target');
       fs.writeFileSync(outsidePath, 'outside bytes');
@@ -5380,6 +5448,7 @@ const STAGED_TREE_MUTATION_SCENARIOS = [
   },
   {
     label: 'extra child',
+    expectCleanupFailure: true,
     mutate: ({ stagingRoot }) => {
       const extraDir = path.join(stagingRoot, 'unexpected');
       fs.mkdirSync(extraDir);
@@ -5400,22 +5469,79 @@ const STAGED_TREE_MUTATION_SCENARIOS = [
   },
   {
     label: 'hard-linked child',
+    expectCleanupFailure: true,
     mutate: ({ stagingRoot, stagedFilePath }) => fs.linkSync(stagedFilePath, path.join(stagingRoot, 'hard-link.bin')),
   },
 ];
 
 for (const scenario of STAGED_TREE_MUTATION_SCENARIOS) {
-  test(`final staged tree rejects ${scenario.label} and removes all private staging`, async () => {
+  const cleanupExpectation = scenario.expectCleanupFailure === true
+    ? 'without deleting the unknown object'
+    : 'and removes all private staging';
+  test(`final staged tree rejects ${scenario.label} ${cleanupExpectation}`, async () => {
     await assertStagedTreeMutationFailsClosed(scenario.label, scenario.mutate, scenario);
   });
 }
 
-test('organized nested staged tree rejects an extra child and removes every private directory', async () => {
+test('organized nested staged tree rejects an extra child without deleting the unknown directory', async () => {
   await assertStagedTreeMutationFailsClosed('organized nested extra child', ({ stagingRoot }) => {
     const extraDir = path.join(stagingRoot, 'AI', 'unexpected');
     fs.mkdirSync(extraDir);
     fs.writeFileSync(path.join(extraDir, 'extra.bin'), 'unexpected nested staged bytes');
-  }, { organized: true });
+  }, { organized: true, expectCleanupFailure: true });
+});
+
+test('post-verification staged mutation rolls the exact package directory back before side effects', async () => {
+  const tmpRoot = makeTempDir();
+  const originalRenameSync = fs.renameSync;
+  let mutationReached = false;
+  let retainedStaging = null;
+  try {
+    const project = await createProject('Post Verification Publication Mutation');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed publication bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.renameSync = function mutateAfterVerification(source, destination, ...args) {
+      if (
+        !mutationReached &&
+        path.basename(source).startsWith('.crate-package-staging-') &&
+        path.dirname(destination) === outputDir
+      ) {
+        mutationReached = true;
+        retainedStaging = source;
+        fs.mkdirSync(path.join(source, 'unknown'));
+        fs.writeFileSync(path.join(source, 'unknown', 'sentinel.bin'), 'unrelated publication bytes');
+      }
+      return originalRenameSync.call(fs, source, destination, ...args);
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+    fs.renameSync = originalRenameSync;
+
+    assert.equal(mutationReached, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.equal(fs.existsSync(path.join(outputDir, review.folderName)), false);
+    assert.equal(fs.existsSync(retainedStaging), true);
+    assert.equal(
+      fs.readFileSync(path.join(retainedStaging, 'unknown', 'sentinel.bin'), 'utf8'),
+      'unrelated publication bytes'
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 const ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS = [
@@ -5513,13 +5639,14 @@ for (const scenario of ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS) {
       const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
       assert.equal(substituted, true);
-      assert.equal(result.error, scenario.expectedError || 'package_output_changed');
+      assert.equal(result.error, 'package_cleanup_failed');
       assertFailedPackageHasNoSideEffects(stored, outputDir, before);
       assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
       assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), `${scenario.label} sentinel`);
       assert.equal(
         fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
-        false
+        true,
+        'cleanup must preserve private staging when a substituted group path remains'
       );
     } finally {
       setUtilityProcessHandler(null);
@@ -5560,7 +5687,7 @@ for (const scenario of ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS) {
       const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
       assert.notEqual(fifoPath, null);
-      assert.equal(result.error, scenario.expectedError || 'package_output_changed');
+      assert.equal(result.error, 'package_cleanup_failed');
       assertFailedPackageHasNoSideEffects(stored, outputDir, before);
       const observed = Buffer.alloc(256);
       let bytesRead = 0;
@@ -5570,9 +5697,11 @@ for (const scenario of ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS) {
         assert.equal(error.code, 'EAGAIN');
       }
       assert.equal(bytesRead, 0, `${scenario.label} must not write private bytes to the substituted FIFO`);
+      assert.equal(fs.existsSync(fifoPath), true);
       assert.equal(
         fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
-        false
+        true,
+        'cleanup must retain private staging when an unowned special file prevents exact cleanup'
       );
     } finally {
       if (fifoReadFd !== null) fs.closeSync(fifoReadFd);
@@ -5618,13 +5747,14 @@ test('organized group rename substitution retains cleanup ownership until identi
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
     assert.equal(substituted, true);
-    assert.equal(result.error, 'package_output_changed');
+    assert.equal(result.error, 'package_cleanup_failed');
     assertFailedPackageHasNoSideEffects(stored, outputDir, before);
     assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
     assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), 'rename sentinel');
     assert.equal(
       fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
-      false
+      true,
+      'cleanup must preserve the unowned replacement inside private staging'
     );
   } finally {
     fs.renameSync = originalRenameSync;
@@ -5633,7 +5763,7 @@ test('organized group rename substitution retains cleanup ownership until identi
   }
 });
 
-test('organized finalized group movement is reclaimed after successful identity verification', async () => {
+test('organized finalized group movement preserves an unowned replacement while reclaiming owned files', async () => {
   const tmpRoot = makeTempDir();
   const originalLstatSync = fs.lstatSync;
   try {
@@ -5673,17 +5803,104 @@ test('organized finalized group movement is reclaimed after successful identity 
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
     assert.notEqual(movedGroupPath, null);
-    assert.equal(result.error, 'package_review_changed');
+    assert.equal(result.error, 'package_cleanup_failed');
     assertFailedPackageHasNoSideEffects(stored, outputDir, before);
     assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
     assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), 'post-finalization sentinel');
     assert.equal(fs.existsSync(movedGroupPath), false);
+    const replacementPath = path.join(path.dirname(movedGroupPath), 'AI');
+    assert.equal(fs.lstatSync(replacementPath).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(path.join(replacementPath, 'sentinel.txt'), 'utf8'), 'post-finalization sentinel');
     assert.equal(
       fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
-      false
+      true,
+      'cleanup must retain private staging when an unowned replacement remains'
     );
   } finally {
     fs.lstatSync = originalLstatSync;
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('final staging cleanup preserves a directory replacement introduced after worker cleanup', async () => {
+  const tmpRoot = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  const originalRenameSync = fs.renameSync;
+  try {
+    const project = await createProject('Final Staging Cleanup Replacement');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'final cleanup replacement bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let stagingRoot = null;
+    let cleanupArmed = false;
+    let retainedRoot = null;
+    let replacementRoot = null;
+
+    const captureWriter = utilityProcessHandler;
+    setUtilityProcessHandler(request => {
+      const { phase, message, options } = request;
+      if (phase === 'message' && message.type === 'write-start' && !stagingRoot) {
+        stagingRoot = findPrivateStagedPackageRoot(outputDir);
+      }
+      if (phase === 'message' && message.type === 'cleanup' && options.cwd === stagingRoot) {
+        cleanupArmed = true;
+      }
+      captureWriter?.(request);
+    });
+    fs.renameSync = function blockPublication(source, destination, ...args) {
+      if (
+        stagingRoot &&
+        path.resolve(source) === path.resolve(stagingRoot) &&
+        path.dirname(destination) === outputDir
+      ) {
+        const error = new Error('synthetic publication failure');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return originalRenameSync.call(fs, source, destination, ...args);
+    };
+    fs.openSync = function replaceRootAfterCleanupWorker(candidatePath, flags, ...args) {
+      if (
+        cleanupArmed &&
+        !replacementRoot &&
+        stagingRoot &&
+        path.resolve(candidatePath) === path.resolve(stagingRoot) &&
+        (flags & fs.constants.O_DIRECTORY) === fs.constants.O_DIRECTORY
+      ) {
+        const fd = originalOpenSync.call(fs, candidatePath, flags, ...args);
+        retainedRoot = `${stagingRoot}-retained`;
+        replacementRoot = stagingRoot;
+        originalRenameSync.call(fs, stagingRoot, retainedRoot);
+        fs.mkdirSync(replacementRoot, { mode: 0o700 });
+        return fd;
+      }
+      return originalOpenSync.call(fs, candidatePath, flags, ...args);
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.notEqual(stagingRoot, null);
+    assert.equal(cleanupArmed, true);
+    assert.notEqual(replacementRoot, null);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.equal(fs.lstatSync(replacementRoot).isDirectory(), true);
+    assert.equal(fs.lstatSync(retainedRoot).isDirectory(), true);
+    assert.deepEqual(fs.readdirSync(replacementRoot), []);
+    assert.deepEqual(fs.readdirSync(retainedRoot), []);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.renameSync = originalRenameSync;
+    setUtilityProcessHandler(null);
     storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -6095,7 +6312,7 @@ test('final verification locates and cleans staging after its parent is renamed'
 
 async function assertLateStagingInputChangeRefreshes(scenario, mutate, verifyReview) {
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   let releaseWrite = () => {};
   try {
     const project = await createProject(`Late staging ${scenario}`);
@@ -6135,15 +6352,19 @@ async function assertLateStagingInputChangeRefreshes(scenario, mutate, verifyRev
     let markWriteStarted;
     const writeStarted = new Promise(resolve => { markWriteStarted = resolve; });
     const writeGate = new Promise(resolve => { releaseWrite = resolve; });
-    fs.promises.writeFile = async function deferredPsdWrite(filePath, ...args) {
-      if (deferred && isExpectedStagedPackageWrite(filePath, outputDir, 'Deferred.png')) {
-        deferred = false;
-        await originalWriteFile.call(fs.promises, filePath, ...args);
-        markWriteStarted();
-        await writeGate;
-        return;
+    fs.promises.open = async function deferredPsdWrite(filePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
+      if (deferred && flags === 'wx' && isExpectedStagedPackageWrite(filePath, outputDir, 'Deferred.png')) {
+        const originalHandleWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          deferred = false;
+          const result = await originalHandleWriteFile(...writeArgs);
+          markWriteStarted();
+          await writeGate;
+          return result;
+        };
       }
-      return originalWriteFile.call(fs.promises, filePath, ...args);
+      return handle;
     };
 
     const packagePromise = callIpcRaw('projects:package', project.id, outputDir, review.token);
@@ -6163,7 +6384,7 @@ async function assertLateStagingInputChangeRefreshes(scenario, mutate, verifyRev
   } finally {
     storeInstance.set('settings.includeDiagnosticReport', false);
     storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     releaseWrite();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -8049,8 +8270,7 @@ test('PowerPoint provenance stays internal when diagnostic report is disabled', 
 
 test('diagnostic manifest package transaction preserves normal modes and fails closed after a partial write', async () => {
   const tmpRoot = makeTempDir();
-  const originalOpenSync = fs.openSync;
-  const originalWriteFileSync = fs.writeFileSync;
+  const originalOpen = fs.promises.open;
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
     const sourcePath = path.join(tmpRoot, 'diagnostic-source.ai');
@@ -8116,24 +8336,25 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
     const failingManifestPath = manifestPath(outputDir, failingName);
-    let manifestFd = null;
     let injectedFailure = false;
-    fs.openSync = function captureManifestFd(filePath, ...args) {
-      const fd = originalOpenSync.call(fs, filePath, ...args);
+    fs.promises.open = async function partialManifestWrite(filePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
       if (
         typeof filePath === 'string' &&
+        flags === 'wx' &&
         path.basename(filePath) === 'crate-provenance.json' &&
         path.basename(path.dirname(filePath)) === 'Crate Diagnostics'
-      ) manifestFd = fd;
-      return fd;
-    };
-    fs.writeFileSync = function partialManifestWrite(file, ...args) {
-      if (!injectedFailure && typeof file === 'number' && file === manifestFd) {
-        injectedFailure = true;
-        originalWriteFileSync.call(fs, file, '{"schemaVersion":');
-        throw new Error('forced diagnostic manifest partial write');
+      ) {
+        const originalHandleWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async () => {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            await originalHandleWriteFile('{"schemaVersion":');
+            throw new Error('forced diagnostic manifest partial write');
+          }
+        };
       }
-      return originalWriteFileSync.call(fs, file, ...args);
+      return handle;
     };
 
     testRendererEvents.length = 0;
@@ -8142,8 +8363,7 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     try {
       failureResult = await callIpc('projects:package', failingProject.id, outputDir);
     } finally {
-      fs.openSync = originalOpenSync;
-      fs.writeFileSync = originalWriteFileSync;
+      fs.promises.open = originalOpen;
     }
 
     assert.equal(injectedFailure, true);
@@ -8161,8 +8381,7 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
     assert.equal(testNotifications.length, 0);
   } finally {
-    fs.openSync = originalOpenSync;
-    fs.writeFileSync = originalWriteFileSync;
+    fs.promises.open = originalOpen;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -16107,7 +16326,7 @@ test('unchanged Illustrator poll does not abort a long package', async () => {
 
 test('package removes partial writer output and leaves no success side effects', async () => {
   const tmpRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   try {
     setChildProcessHandler(() => ({ stdout: '' }));
     const project = await createProject('Package partial rejection');
@@ -16136,16 +16355,21 @@ test('package removes partial writer output and leaves no success side effects',
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     const packagePath = packageFolder(outputDir, 'Package partial rejection');
     let injectedFailure = false;
-    fs.promises.writeFile = async function partialThenReject(filePath) {
+    fs.promises.open = async function partialThenReject(filePath, flags, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, flags, ...args);
       if (
         !injectedFailure &&
+        flags === 'wx' &&
         isExpectedStagedPackageWrite(filePath, outputDir, 'partial.png')
       ) {
-        injectedFailure = true;
-        await originalWriteFile.call(fs.promises, filePath, Buffer.from('partial bytes'), { flag: 'wx' });
-        throw new Error('forced partial write rejection');
+        const originalHandleWriteFile = handle.writeFile.bind(handle);
+        handle.writeFile = async () => {
+          injectedFailure = true;
+          await originalHandleWriteFile(Buffer.from('partial bytes'));
+          throw new Error('forced partial write rejection');
+        };
       }
-      return originalWriteFile.apply(fs.promises, arguments);
+      return handle;
     };
 
     const result = await callIpc('projects:package', project.id, outputDir);
@@ -16158,7 +16382,7 @@ test('package removes partial writer output and leaves no success side effects',
     assert.equal(stored.packagedAt == null, true);
     assert.equal(stored.outputPath == null, true);
   } finally {
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

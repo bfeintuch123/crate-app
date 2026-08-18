@@ -44,6 +44,27 @@ function currentDirectoryMatches(identity, ancestries) {
   ));
 }
 
+function exactDirectoryMatches(candidatePath, identity) {
+  try {
+    const stat = fs.lstatSync(candidatePath, { bigint: true });
+    return !stat.isSymbolicLink() &&
+      stat.isDirectory() &&
+      stat.dev === identity.dev &&
+      stat.ino === identity.ino;
+  } catch (_) {
+    return false;
+  }
+}
+
+function pathIsMissing(candidatePath) {
+  try {
+    fs.lstatSync(candidatePath);
+    return false;
+  } catch (error) {
+    return error?.code === 'ENOENT';
+  }
+}
+
 function parseOwnedOutputs(value) {
   if (!Array.isArray(value)) return { valid: false, outputs: [] };
   const seen = new Set();
@@ -144,14 +165,46 @@ function startPackageTransactionWorker(port = process.parentPort, options = {}) 
       stat.dev !== identity.dev ||
       stat.ino !== identity.ino
     ) return false;
+    let quarantineDirectory = null;
+    let quarantineIdentity = null;
+    let quarantinePath = null;
     let fd = null;
     try {
-      fd = fs.openSync(childName, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+      quarantineDirectory = fs.mkdtempSync('.crate-cleanup-');
+      fs.chmodSync(quarantineDirectory, 0o700);
+      const quarantineStat = fs.lstatSync(quarantineDirectory, { bigint: true });
+      if (
+        quarantineStat.isSymbolicLink() ||
+        !quarantineStat.isDirectory() ||
+        (quarantineStat.mode & 0o777n) !== 0o700n
+      ) return false;
+      quarantineIdentity = { dev: quarantineStat.dev, ino: quarantineStat.ino };
+      quarantinePath = path.join(quarantineDirectory, 'owned-output');
+      options.beforeOwnedQuarantineRename?.({
+        childName,
+        quarantineDirectory,
+        quarantinePath,
+        identity,
+      });
+      if (
+        !exactDirectoryMatches(quarantineDirectory, quarantineIdentity) ||
+        !pathIsMissing(quarantinePath)
+      ) return false;
+      fs.renameSync(childName, quarantinePath);
+      if (!exactDirectoryMatches(quarantineDirectory, quarantineIdentity)) return false;
+      const quarantinedStat = fs.lstatSync(quarantinePath, { bigint: true });
+      if (
+        quarantinedStat.isSymbolicLink() ||
+        !quarantinedStat.isFile() ||
+        quarantinedStat.dev !== identity.dev ||
+        quarantinedStat.ino !== identity.ino
+      ) return false;
+      fd = fs.openSync(quarantinePath, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
       const openedStat = fs.fstatSync(fd, { bigint: true });
       if (
         !openedStat.isFile() ||
-        openedStat.dev !== stat.dev ||
-        openedStat.ino !== stat.ino
+        openedStat.dev !== identity.dev ||
+        openedStat.ino !== identity.ino
       ) return false;
       fs.ftruncateSync(fd, 0);
       fs.fsyncSync(fd);
@@ -163,15 +216,33 @@ function startPackageTransactionWorker(port = process.parentPort, options = {}) 
       }
     }
     try {
-      const finalStat = fs.lstatSync(childName, { bigint: true });
+      options.beforeOwnedQuarantineUnlink?.({
+        childName,
+        quarantineDirectory,
+        quarantinePath,
+        identity,
+      });
+      if (!exactDirectoryMatches(quarantineDirectory, quarantineIdentity)) return false;
+      const finalStat = fs.lstatSync(quarantinePath, { bigint: true });
       if (
         !finalStat.isSymbolicLink() &&
         finalStat.isFile() &&
-        finalStat.dev === stat.dev &&
-        finalStat.ino === stat.ino
+        finalStat.dev === identity.dev &&
+        finalStat.ino === identity.ino
       ) {
-        fs.unlinkSync(childName);
-        return true;
+        fs.unlinkSync(quarantinePath);
+        options.beforeOwnedQuarantineDirectoryRemove?.({
+          childName,
+          quarantineDirectory,
+          quarantinePath,
+          identity,
+        });
+        if (
+          !exactDirectoryMatches(quarantineDirectory, quarantineIdentity) ||
+          fs.readdirSync(quarantineDirectory).length !== 0
+        ) return false;
+        fs.rmdirSync(quarantineDirectory);
+        return pathIsMissing(quarantineDirectory);
       }
     } catch (_) {}
     return false;
@@ -367,9 +438,7 @@ function startPackageTransactionWorker(port = process.parentPort, options = {}) 
       fail();
       return;
     }
-    for (const childName of fs.readdirSync('.')) {
-      fs.rmSync(childName, { recursive: true, force: false });
-    }
+    removeOwnedOutputs();
     if (!currentDirectoryMatches(transactionIdentity, ancestries) || fs.readdirSync('.').length !== 0) {
       fail();
       return;

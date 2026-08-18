@@ -252,20 +252,144 @@ test('utility worker refuses a mismatched directory identity without creating ou
   assert.deepEqual(fs.readdirSync(directory), []);
 });
 
-test('utility worker cleanup removes only children of the pinned directory', async t => {
+test('utility worker cleanup removes only exact owned files and preserves unknown children', async t => {
   const directory = withTemporaryWorkingDirectory(t);
-  fs.mkdirSync(path.join(directory, 'AI'));
-  fs.writeFileSync(path.join(directory, 'AI', 'working.ai'), 'bytes');
-  fs.writeFileSync(path.join(directory, 'preview.png'), 'bytes');
+  const ownedPath = path.join(directory, 'preview.png');
+  fs.writeFileSync(ownedPath, 'private bytes', { mode: 0o600 });
+  const ownedStat = fs.statSync(ownedPath, { bigint: true });
+  fs.mkdirSync(path.join(directory, 'unknown'));
+  fs.writeFileSync(path.join(directory, 'unknown', 'sentinel.txt'), 'unrelated bytes');
   const { port, exits } = startTestWorker();
-  initializeSession(port);
+  initializeSession(port, { ownedOutputs: [{
+    leafName: 'preview.png',
+    identity: { dev: `${ownedStat.dev}`, ino: `${ownedStat.ino}` },
+  }] });
   port.messages.length = 0;
   port.send({ type: 'cleanup' });
 
-  assert.deepEqual(port.messages, [{ type: 'complete', bytesWritten: '0' }]);
+  assert.deepEqual(port.messages, [{ type: 'failed' }]);
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(exits, [0]);
-  assert.deepEqual(fs.readdirSync(directory), []);
+  assert.deepEqual(exits, [72]);
+  assert.equal(fs.existsSync(ownedPath), false);
+  assert.deepEqual(fs.readdirSync(directory), ['unknown']);
+  assert.equal(fs.readFileSync(path.join(directory, 'unknown', 'sentinel.txt'), 'utf8'), 'unrelated bytes');
+});
+
+test('utility worker quarantines its owned file before a final original-name swap', async t => {
+  const directory = withTemporaryWorkingDirectory(t);
+  const ownedPath = path.join(directory, 'reviewed.ai');
+  fs.writeFileSync(ownedPath, 'private bytes', { mode: 0o600 });
+  const ownedStat = fs.statSync(ownedPath, { bigint: true });
+  let swapped = false;
+  const { port, exits } = startTestWorker({
+    beforeOwnedQuarantineUnlink({ childName }) {
+      if (swapped || childName !== 'reviewed.ai') return;
+      swapped = true;
+      fs.writeFileSync(childName, 'unrelated replacement', { mode: 0o600 });
+    },
+  });
+  initializeSession(port, { ownedOutputs: [{
+    leafName: 'reviewed.ai',
+    identity: { dev: `${ownedStat.dev}`, ino: `${ownedStat.ino}` },
+  }] });
+  port.messages.length = 0;
+  port.send({ type: 'cleanup' });
+
+  assert.deepEqual(port.messages, [{ type: 'failed' }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(exits, [72]);
+  assert.equal(swapped, true);
+  assert.equal(fs.readFileSync(ownedPath, 'utf8'), 'unrelated replacement');
+  assert.deepEqual(fs.readdirSync(directory), ['reviewed.ai']);
+});
+
+test('utility worker refuses a preexisting quarantine target without overwriting either file', async t => {
+  const directory = withTemporaryWorkingDirectory(t);
+  const ownedPath = path.join(directory, 'reviewed.ai');
+  fs.writeFileSync(ownedPath, 'private bytes', { mode: 0o600 });
+  const ownedStat = fs.statSync(ownedPath, { bigint: true });
+  let quarantineDirectory = null;
+  let quarantinePath = null;
+  const { port, exits } = startTestWorker({
+    beforeOwnedQuarantineRename(event) {
+      quarantineDirectory = event.quarantineDirectory;
+      quarantinePath = event.quarantinePath;
+      fs.writeFileSync(quarantinePath, 'unowned quarantine target', { mode: 0o600 });
+    },
+  });
+  initializeSession(port, { ownedOutputs: [{
+    leafName: 'reviewed.ai',
+    identity: { dev: `${ownedStat.dev}`, ino: `${ownedStat.ino}` },
+  }] });
+  port.messages.length = 0;
+  port.send({ type: 'cleanup' });
+
+  assert.deepEqual(port.messages, [{ type: 'failed' }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(exits, [72]);
+  assert.equal(fs.readFileSync(ownedPath, 'utf8'), 'private bytes');
+  assert.equal(fs.readFileSync(quarantinePath, 'utf8'), 'unowned quarantine target');
+  assert.equal(fs.lstatSync(quarantineDirectory).isDirectory(), true);
+});
+
+test('utility worker preserves a quarantine-leaf replacement after ownership changes', async t => {
+  const directory = withTemporaryWorkingDirectory(t);
+  const ownedPath = path.join(directory, 'reviewed.ai');
+  fs.writeFileSync(ownedPath, 'private bytes', { mode: 0o600 });
+  const ownedStat = fs.statSync(ownedPath, { bigint: true });
+  let retainedOwnedPath = null;
+  let replacementPath = null;
+  const { port, exits } = startTestWorker({
+    beforeOwnedQuarantineUnlink({ quarantinePath }) {
+      retainedOwnedPath = `${quarantinePath}-retained`;
+      replacementPath = quarantinePath;
+      fs.renameSync(quarantinePath, retainedOwnedPath);
+      fs.writeFileSync(replacementPath, 'unowned quarantine replacement', { mode: 0o600 });
+    },
+  });
+  initializeSession(port, { ownedOutputs: [{
+    leafName: 'reviewed.ai',
+    identity: { dev: `${ownedStat.dev}`, ino: `${ownedStat.ino}` },
+  }] });
+  port.messages.length = 0;
+  port.send({ type: 'cleanup' });
+
+  assert.deepEqual(port.messages, [{ type: 'failed' }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(exits, [72]);
+  assert.equal(fs.readFileSync(replacementPath, 'utf8'), 'unowned quarantine replacement');
+  assert.equal(fs.existsSync(retainedOwnedPath), true);
+  assert.equal(fs.statSync(retainedOwnedPath).size, 0);
+});
+
+test('utility worker preserves a replacement quarantine directory before final removal', async t => {
+  const directory = withTemporaryWorkingDirectory(t);
+  const ownedPath = path.join(directory, 'reviewed.ai');
+  fs.writeFileSync(ownedPath, 'private bytes', { mode: 0o600 });
+  const ownedStat = fs.statSync(ownedPath, { bigint: true });
+  let retainedDirectory = null;
+  let replacementSentinel = null;
+  const { port, exits } = startTestWorker({
+    beforeOwnedQuarantineDirectoryRemove({ quarantineDirectory }) {
+      retainedDirectory = `${quarantineDirectory}-retained`;
+      fs.renameSync(quarantineDirectory, retainedDirectory);
+      fs.mkdirSync(quarantineDirectory, { mode: 0o700 });
+      replacementSentinel = path.join(quarantineDirectory, 'sentinel.txt');
+      fs.writeFileSync(replacementSentinel, 'unowned directory replacement');
+    },
+  });
+  initializeSession(port, { ownedOutputs: [{
+    leafName: 'reviewed.ai',
+    identity: { dev: `${ownedStat.dev}`, ino: `${ownedStat.ino}` },
+  }] });
+  port.messages.length = 0;
+  port.send({ type: 'cleanup' });
+
+  assert.deepEqual(port.messages, [{ type: 'failed' }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(exits, [72]);
+  assert.equal(fs.existsSync(retainedDirectory), true);
+  assert.equal(fs.readFileSync(replacementSentinel, 'utf8'), 'unowned directory replacement');
 });
 
 test('utility worker rejects a moved-directory alias before starting a session', async t => {

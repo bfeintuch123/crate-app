@@ -14564,7 +14564,13 @@ async function openReviewedPackageSources(files, entries) {
   };
 }
 
-async function copyReviewedPackageSource(reviewedSource, finalPath, verifyWrite, materializeSource = null) {
+async function copyReviewedPackageSource(
+  reviewedSource,
+  finalPath,
+  verifyWrite,
+  materializeSource = null,
+  rememberDestination = null
+) {
   return withStableReviewedPackageSource(reviewedSource, async (sourceHandle, sourceStat) => {
     verifyWrite(finalPath);
     const destinationMode = Number(sourceStat.mode & 0o777n) || OWNER_ONLY_FILE_MODE;
@@ -14575,6 +14581,9 @@ async function copyReviewedPackageSource(reviewedSource, finalPath, verifyWrite,
     }
     const destinationHandle = await fs.promises.open(finalPath, 'wx', destinationMode);
     try {
+      if (typeof rememberDestination === 'function') {
+        rememberDestination(finalPath, await destinationHandle.stat({ bigint: true }));
+      }
       const buffer = Buffer.allocUnsafe(1024 * 1024);
       let position = 0;
       while (true) {
@@ -14613,7 +14622,8 @@ async function writeEmbeddedPsdAssetToPackage(
   expectedResource,
   finalPath,
   verifyWrite,
-  materializeBuffer = null
+  materializeBuffer = null,
+  rememberDestination = null
 ) {
   const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
     if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
@@ -14630,7 +14640,15 @@ async function writeEmbeddedPsdAssetToPackage(
   if (typeof materializeBuffer === 'function') {
     await materializeBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
   } else {
-    await fs.promises.writeFile(finalPath, data, { flag: 'wx' });
+    const destinationHandle = await fs.promises.open(finalPath, 'wx', OWNER_ONLY_FILE_MODE);
+    try {
+      if (typeof rememberDestination === 'function') {
+        rememberDestination(finalPath, await destinationHandle.stat({ bigint: true }));
+      }
+      await destinationHandle.writeFile(data);
+    } finally {
+      await destinationHandle.close().catch(() => {});
+    }
   }
   verifyWrite(finalPath);
 }
@@ -14934,11 +14952,18 @@ function capturePrivateStagedPackageTree(stagingFolder, intendedFiles) {
   return inspectPrivateStagedPackageTree(stagingFolder, expected, true);
 }
 
-function assertPrivateStagedPackageTree(stagingFolder, snapshot) {
+function assertPrivateStagedPackageTree(stagingFolder, snapshot, options = {}) {
   if (!Array.isArray(snapshot)) throw new PackageReviewChangedError();
   const expected = new Map(snapshot.map(entry => [entry.relativePath, entry.type]));
   if (expected.size !== snapshot.length) throw new PackageReviewChangedError();
   const actual = inspectPrivateStagedPackageTree(stagingFolder, expected, false);
+  if (options.allowRootRename === true) {
+    const snapshotRoot = snapshot.find(entry => entry.relativePath === '' && entry.type === 'directory');
+    const actualRoot = actual.find(entry => entry.relativePath === '' && entry.type === 'directory');
+    if (snapshotRoot && actualRoot) {
+      actualRoot.stat.ctimeNs = snapshotRoot.stat.ctimeNs;
+    }
+  }
   if (!packageReviewFingerprintsMatch(snapshot, actual)) throw new PackageReviewChangedError();
 }
 
@@ -15285,9 +15310,7 @@ async function removePrivateStagedPackageTree(
     workerGroup.path = stagingFolder;
     if (!workerGroup.ancestries) workerGroup.ancestries = ancestries;
     await runPackageTransactionWorker(workerGroup, 'cleanup');
-    if (!privatePackageDirectoryMatches(stagingFolder, identity)) return false;
-    fs.rmdirSync(stagingFolder);
-    return !lstatPackagePath(stagingFolder);
+    return removeEmptyPrivatePackageDirectory(stagingFolder, identity);
   } catch (_) {
     return false;
   }
@@ -15304,6 +15327,39 @@ function privatePackageDirectoryMatches(candidatePath, identity) {
       stat.ino === identity.ino;
   } catch (_) {
     return false;
+  }
+}
+
+function removeEmptyPrivatePackageDirectory(candidatePath, identity) {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const directoryOnly = fs.constants.O_DIRECTORY;
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  if (!Number.isInteger(noFollow) || !Number.isInteger(directoryOnly)) return false;
+  let fd = null;
+  try {
+    fd = fs.openSync(candidatePath, fs.constants.O_RDONLY | noFollow | directoryOnly | nonBlock);
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      opened.dev !== identity.dev ||
+      opened.ino !== identity.ino ||
+      fs.readdirSync(candidatePath).length !== 0
+    ) return false;
+    const current = fs.lstatSync(candidatePath, { bigint: true });
+    if (
+      current.isSymbolicLink() ||
+      !current.isDirectory() ||
+      current.dev !== opened.dev ||
+      current.ino !== opened.ino
+    ) return false;
+    fs.rmdirSync(candidatePath);
+    return !lstatPackagePath(candidatePath);
+  } catch (_) {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
   }
 }
 
@@ -15477,8 +15533,18 @@ function publishPrivatePackageDestination(destination, stagedTreeSnapshot) {
       path.dirname(realpathSync(destination.destFolder)) !== destination.outputRootReal ||
       path.dirname(destination.destFolder) !== destination.outputRoot
     ) throw new PackageTransactionInvariantError();
+    assertPrivateStagedPackageTree(destination.destFolder, stagedTreeSnapshot, { allowRootRename: true });
   } catch (error) {
+    try {
+      if (
+        privatePackageDirectoryMatches(destination.destFolder, destination.stagingStat) &&
+        !lstatPackagePath(destination.stagingFolder)
+      ) {
+        fs.renameSync(destination.destFolder, destination.stagingFolder);
+      }
+    } catch (_) {}
     if (error instanceof PackageTransactionInvariantError) throw error;
+    if (error instanceof PackageReviewChangedError) throw error;
     throw new PackageTransactionInvariantError();
   }
 }
@@ -15487,11 +15553,28 @@ function createPackageWriteTransaction(destFolder) {
   const root = path.resolve(destFolder);
   const parent = path.dirname(root);
   const parentReal = realpathSync(parent);
+  const parentIdentity = fs.lstatSync(parent, { bigint: true });
+  const anchorParent = path.dirname(parent);
+  const anchorParentReal = realpathSync(anchorParent);
+  const anchorParentIdentity = fs.lstatSync(anchorParent, { bigint: true });
   const identity = fs.lstatSync(root, { bigint: true });
   const rootAncestry = capturePackageTransactionAncestry(root, identity);
   const intended = new Set();
   const logicalByPhysicalPath = new Map();
   const groups = new Map();
+  const legacyGroups = new Map();
+  const rootGroup = {
+    folderName: null,
+    path: root,
+    identity,
+    ancestries: [rootAncestry],
+    ownedOutputs: new Map(),
+    transactionSession: null,
+    transactionSessionPromise: null,
+    finalized: true,
+    renameAttempted: false,
+    knownPaths: new Set([root]),
+  };
   const isOriginal = candidate => {
     try {
       const stat = fs.lstatSync(candidate, { bigint: true });
@@ -15502,15 +15585,45 @@ function createPackageWriteTransaction(destFolder) {
   };
   const locate = () => {
     if (isOriginal(root)) return root;
+    let locatedParent = null;
     try {
       const stat = fs.lstatSync(parent, { bigint: true });
-      if (!stat.isSymbolicLink() && stat.isDirectory() && realpathSync(parent) === parentReal) {
-        for (const name of fs.readdirSync(parent)) {
-          const candidate = path.join(parent, name);
+      if (
+        !stat.isSymbolicLink() &&
+        stat.isDirectory() &&
+        stat.dev === parentIdentity.dev &&
+        stat.ino === parentIdentity.ino &&
+        realpathSync(parent) === parentReal
+      ) locatedParent = parent;
+    } catch (_) {}
+    if (!locatedParent) {
+      try {
+        const anchorStat = fs.lstatSync(anchorParent, { bigint: true });
+        if (
+          !anchorStat.isSymbolicLink() &&
+          anchorStat.isDirectory() &&
+          anchorStat.dev === anchorParentIdentity.dev &&
+          anchorStat.ino === anchorParentIdentity.ino &&
+          realpathSync(anchorParent) === anchorParentReal
+        ) {
+          for (const name of fs.readdirSync(anchorParent)) {
+            const candidate = path.join(anchorParent, name);
+            if (privatePackageDirectoryMatches(candidate, parentIdentity)) {
+              locatedParent = candidate;
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    if (locatedParent) {
+      try {
+        for (const name of fs.readdirSync(locatedParent)) {
+          const candidate = path.join(locatedParent, name);
           if (isOriginal(candidate)) return candidate;
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
     return null;
   };
   const assertRoot = () => {
@@ -15606,8 +15719,17 @@ function createPackageWriteTransaction(destFolder) {
       if (path.dirname(physicalPath) !== root) throw new PackageTransactionInvariantError();
     } else {
       const group = groups.get(parts[0]);
-      if (!group || group.finalized || !groupMatches(group) || path.dirname(physicalPath) !== group.path) {
-        throw new PackageTransactionInvariantError();
+      if (group) {
+        if (group.finalized || !groupMatches(group) || path.dirname(physicalPath) !== group.path) {
+          throw new PackageTransactionInvariantError();
+        }
+      } else {
+        const legacyGroup = legacyGroups.get(parts[0]);
+        if (
+          !legacyGroup ||
+          !groupMatches(legacyGroup) ||
+          path.dirname(physicalPath) !== legacyGroup.path
+        ) throw new PackageTransactionInvariantError();
       }
     }
     const existing = lstatPackagePath(physicalPath);
@@ -15619,16 +15741,13 @@ function createPackageWriteTransaction(destFolder) {
     const parts = relative.split(path.sep);
     return parts.length === 2 ? groups.get(parts[0]) : null;
   };
-  const removeKnownGroupImpostors = group => {
-    let clean = true;
+  const knownGroupPathsAreUnoccupied = group => {
     for (const candidate of group.knownPaths) {
       const stat = lstatPackagePath(candidate);
       if (!stat || privatePackageDirectoryMatches(candidate, group.identity)) continue;
-      if (stat.isSymbolicLink()) {
-        try { fs.unlinkSync(candidate); } catch (_) { clean = false; }
-      }
+      return false;
     }
-    return clean;
+    return true;
   };
   const finalizeGroups = () => {
     assertRoot();
@@ -15653,7 +15772,7 @@ function createPackageWriteTransaction(destFolder) {
   };
   const cleanupAuxiliary = async () => {
     let clean = true;
-    for (const group of groups.values()) {
+    for (const group of [...groups.values(), ...legacyGroups.values()]) {
       const located = locateGroup(group) || [...group.knownPaths].find(candidate => {
         try {
           const stat = fs.statSync(candidate, { bigint: true });
@@ -15673,7 +15792,7 @@ function createPackageWriteTransaction(destFolder) {
         ) ||
         locateGroup(group)
       ) clean = false;
-      if (!removeKnownGroupImpostors(group)) clean = false;
+      if (!knownGroupPathsAreUnoccupied(group)) clean = false;
     }
     return clean;
   };
@@ -15700,6 +15819,23 @@ function createPackageWriteTransaction(destFolder) {
         fallbackName: 'file',
         preserveRelativePath: true,
       });
+      const parts = relative.split(path.sep);
+      if (parts.length === 2 && !legacyGroups.has(parts[0])) {
+        const directoryPath = path.dirname(physicalPath);
+        const directoryIdentity = fs.lstatSync(directoryPath, { bigint: true });
+        legacyGroups.set(parts[0], {
+          folderName: parts[0],
+          path: directoryPath,
+          identity: directoryIdentity,
+          ancestries: [capturePackageTransactionAncestry(directoryPath, directoryIdentity)],
+          ownedOutputs: new Map(),
+          transactionSession: null,
+          transactionSessionPromise: null,
+          finalized: true,
+          renameAttempted: false,
+          knownPaths: new Set([directoryPath]),
+        });
+      }
       intended.add(relative);
       logicalByPhysicalPath.set(path.resolve(physicalPath), relative);
       return physicalPath;
@@ -15730,6 +15866,26 @@ function createPackageWriteTransaction(destFolder) {
       });
       assertPhysicalDestination(filePath);
     },
+    rememberOwned(filePath, knownIdentity = null) {
+      const relative = assertPhysicalDestination(filePath);
+      const parts = relative.split(path.sep);
+      const group = parts.length === 1 ? rootGroup : legacyGroups.get(parts[0]);
+      if (!group) return;
+      const stat = knownIdentity || fs.lstatSync(filePath, { bigint: true });
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new PackageTransactionInvariantError();
+      group.ownedOutputs.set(path.basename(filePath), { dev: stat.dev, ino: stat.ino });
+    },
+    async materializeDirectBuffer(filePath, data, mode = OWNER_ONLY_FILE_MODE) {
+      assertPhysicalDestination(filePath);
+      const destinationHandle = await fs.promises.open(filePath, 'wx', mode);
+      try {
+        this.rememberOwned(filePath, await destinationHandle.stat({ bigint: true }));
+        await destinationHandle.writeFile(data);
+      } finally {
+        await destinationHandle.close().catch(() => {});
+      }
+      assertPhysicalDestination(filePath);
+    },
     relativeFor(filePath) {
       return assertPhysicalDestination(filePath);
     },
@@ -15739,7 +15895,7 @@ function createPackageWriteTransaction(destFolder) {
       return capturePrivateStagedPackageTree(root, intended);
     },
     dispose() {
-      for (const group of groups.values()) {
+      for (const group of [rootGroup, ...groups.values(), ...legacyGroups.values()]) {
         try { group.transactionSession?.dispose(); } catch (_) {}
         group.transactionSession = null;
         group.transactionSessionPromise = null;
@@ -15750,7 +15906,14 @@ function createPackageWriteTransaction(destFolder) {
       const auxiliaryClean = await cleanupAuxiliary();
       const located = locate();
       if (!located) return false;
-      const rootClean = await removePrivateStagedPackageTree(located, identity, [rootAncestry]) && !locate();
+      rootGroup.path = located;
+      const rootClean = await removePrivateStagedPackageTree(
+        located,
+        identity,
+        [rootAncestry],
+        rootGroup.ownedOutputs,
+        rootGroup
+      ) && !locate();
       return auxiliaryClean && rootClean;
     },
   };
@@ -15766,9 +15929,8 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
   const cleanupStaging = async () => {
     if (packagePublished) return false;
     if (packageDestination) {
-      const auxiliaryClean = packageWrites ? await packageWrites.cleanupAuxiliary() : true;
-      const destinationClean = await cleanupPrivatePackageDestination(packageDestination);
-      return auxiliaryClean && destinationClean;
+      if (packageWrites) return await packageWrites.cleanup();
+      return await cleanupPrivatePackageDestination(packageDestination);
     }
     if (packageWrites) return await packageWrites.cleanup();
     return true;
@@ -15932,7 +16094,8 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
             plannedOutput.resourceFingerprint,
             finalPath,
             packageWrites.verify,
-            packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeBuffer : null
+            packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeBuffer : null,
+            packageWrites.rememberOwned
           );
           stagedSourceByFile.set(file, finalPath);
           const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
@@ -15952,7 +16115,8 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           reviewedPackageSources.get(plannedOutput.entryIndex),
           finalPath,
           packageWrites.verify,
-          packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeSource : null
+          packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeSource : null,
+          packageWrites.rememberOwned
         );
         stagedSourceByFile.set(file, finalPath);
         packageProvenanceEvents.push({
@@ -15992,11 +16156,14 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           resolveOutputPath: relativePath => packageWrites.prepare(relativePath),
           onBeforeMaterialize: packageWrites.assertRoot,
           onBeforeWrite: packageWrites.verify,
-          onAfterWrite: packageWrites.verify,
+          onAfterWrite: filePath => {
+            packageWrites.verify(filePath);
+            packageWrites.rememberOwned(filePath);
+          },
           materializeBuffer: (filePath, data, mode) => (
             packageWrites.isDescriptorBound(filePath)
               ? packageWrites.materializeBuffer(filePath, data, mode)
-              : fs.promises.writeFile(filePath, data, { flag: 'wx', mode })
+              : packageWrites.materializeDirectBuffer(filePath, data, mode)
           ),
           onExtracted: (extraction) => {
             const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
@@ -16041,24 +16208,24 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     if (manifest.plan.diagnosticsMetadata) {
       let manifestProject; try { manifestProject = structuredClone(project); recordPresentationMediaExtractionProvenanceForProject(manifestProject, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents, manifestProject); } catch (_) { manifestProject = project; }
       const organizedDiagnostics = manifest.plan.layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
+      let legacyDiagnosticPath = null;
       if (!organizedDiagnostics) {
-        packageWrites.prepareLegacyNested(manifest.plan.diagnosticsMetadata.relativePath);
+        legacyDiagnosticPath = packageWrites.prepareLegacyNested(manifest.plan.diagnosticsMetadata.relativePath);
       }
       await writePackageProvenanceManifest(id, packageProvenanceInfo, {
         copiedCount,
         embeddedCount,
         totalFiles: packageFiles.length,
         errors,
-      }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath, organizedDiagnostics ? (relativePath, data) => {
-        const diagnosticPath = packageWrites.prepare(relativePath);
+      }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath, (relativePath, data) => {
+        const diagnosticPath = organizedDiagnostics
+          ? packageWrites.prepare(relativePath)
+          : legacyDiagnosticPath;
         packageWrites.verify(diagnosticPath);
-        if (packageWrites.isDescriptorBound(diagnosticPath)) {
-          return packageWrites.materializeBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE);
-        }
-        fs.writeFileSync(diagnosticPath, data, { flag: 'wx' });
-        packageWrites.verify(diagnosticPath);
-        return undefined;
-      } : null);
+        return organizedDiagnostics
+          ? packageWrites.materializeBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE)
+          : packageWrites.materializeDirectBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE);
+      });
     }
     const stagedTreeSnapshot = packageWrites.captureTree();
     const finalManifest = await buildCanonicalPackageReviewManifest(id);
