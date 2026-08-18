@@ -154,6 +154,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/indesign.js',
   'parsers/index.js',
   'parsers/package-safety.js',
+  'parsers/package-transaction-worker.js',
   'parsers/powerpoint.js',
   'parsers/premiere.js',
   'parsers/psd.js',
@@ -412,6 +413,19 @@ test('release policy allowlists match the independent reviewed snapshot', () => 
     [...APPROVED_CANVAS_PREBUILD_ENTRIES].sort(),
     [...REVIEWED_CANVAS_PREBUILD_OUTPUTS, ...REVIEWED_CANVAS_PREBUILD_METADATA].sort()
   );
+});
+
+test('package transaction worker preserves the disabled RunAsNode boundary', () => {
+  const mainSource = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
+  const workerSource = fs.readFileSync(
+    path.join(ROOT, 'parsers', 'package-transaction-worker.js'),
+    'utf8'
+  );
+
+  assert.equal(packageJson.build.electronFuses.runAsNode, false);
+  assert.equal(mainSource.includes('ELECTRON_RUN_AS_NODE'), false);
+  assert.match(mainSource, /utilityProcess\.fork\(PACKAGE_TRANSACTION_WORKER_PATH/gu);
+  assert.doesNotMatch(workerSource, /child_process|execFile|spawn|ELECTRON_RUN_AS_NODE/gu);
 });
 
 test('packaged manifest policy accepts exact source overrides', () => {
@@ -4060,6 +4074,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          node --check parsers/figma-redaction.js',
     '          node --check parsers/figma.js',
     '          node --check parsers/package-safety.js',
+    '          node --check parsers/package-transaction-worker.js',
     '          node --check scripts/install-approved-canvas-prebuild.js',
     '          node --check scripts/verify-app-contents.js',
     '          node --check scripts/verify-install-scripts.js',

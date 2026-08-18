@@ -1,4 +1,14 @@
-const { app, BrowserWindow, Tray, ipcMain, dialog, shell, nativeImage, Notification } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  Tray,
+  ipcMain,
+  dialog,
+  shell,
+  nativeImage,
+  Notification,
+  utilityProcess,
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const Store = require('electron-store');
@@ -27,11 +37,15 @@ const {
   upsertEvidence,
 } = require('./provenance');
 const {
+  PACKAGE_OUTPUT_LAYOUT_MODES,
   sanitizePackageFileName,
   truncatePackageComponent,
   createPackageNameAllocator,
+  getPackageOutputRelativePath,
+  normalizePackageOutputLayoutMode,
   ensureSafePackageDirectory,
   resolveUniquePackagePath: resolveSafeUniquePackagePath,
+  resolveExactPackagePath,
   assertSafeCopySource,
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
@@ -51,6 +65,9 @@ const TEMP_SCRIPT_DIR_MODE = 0o700;
 const TEMP_SCRIPT_FILE_MODE = 0o600;
 const OWNER_ONLY_DIR_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
+const PACKAGE_TRANSACTION_WORKER_PATH = path.join(__dirname, 'parsers', 'package-transaction-worker.js');
+const PACKAGE_TRANSACTION_CHUNK_BYTES = 1024 * 1024;
+const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -60,6 +77,7 @@ const DEFAULT_PACKAGE_FOLDER_NAME = 'Untitled';
 const FREE_PACKAGE_LIMIT = 10;
 const CLOSED_BETA_PACKAGE_LIMIT = 25;
 const MAX_PACKAGE_FOLDER_NAME_LENGTH = 180;
+const MAX_PACKAGE_PLAN_PATH_ALLOCATION_ATTEMPTS = 100000;
 const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
 const RENDERER_ENTRY_PATH = path.join(__dirname, 'renderer', 'index.html');
 const RENDERER_ENTRY_URL = pathToFileURL(RENDERER_ENTRY_PATH).href;
@@ -6044,21 +6062,25 @@ function buildPackageProvenanceManifest(project, packageInfo, packageResult) {
   };
 }
 
-function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)) { const filePath = path.join(destFolder, relativePath), directoryPath = path.dirname(filePath), lstat = target => { try { return fs.lstatSync(target); } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } }, directory = lstat(directoryPath); if (directory && (directory.isSymbolicLink() || !directory.isDirectory())) return false; const file = directory && lstat(filePath); return !file || (!file.isSymbolicLink() && file.isFile()); } function writePackageProvenanceManifest(projectId, packageInfo, packageResult, targetProject = null, fatal = false, writeDestFolder = null, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)) {
+function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME)) { const filePath = path.join(destFolder, relativePath), directoryPath = path.dirname(filePath), lstat = target => { try { return fs.lstatSync(target); } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } }, directory = lstat(directoryPath); if (directory && (directory.isSymbolicLink() || !directory.isDirectory())) return false; const file = directory && lstat(filePath); return !file || (!file.isSymbolicLink() && file.isFile()); } async function writePackageProvenanceManifest(projectId, packageInfo, packageResult, targetProject = null, fatal = false, writeDestFolder = null, relativePath = path.join(DIAGNOSTICS_FOLDER_NAME, PROVENANCE_MANIFEST_FILENAME), materializeFile = null) {
   try {
     const destination = writeDestFolder || packageInfo.destFolder;
     if (!isDiagnosticManifestDestinationSafe(destination, relativePath)) throw new Error('Unsafe diagnostic manifest destination'); const project = targetProject || getProjects().find(p => p.id === projectId) || null;
     const manifest = buildPackageProvenanceManifest(project, packageInfo, packageResult);
-    writeFileIntoPackageExact(
-      destination,
-      relativePath,
-      `${JSON.stringify(manifest, null, 2)}\n`,
-      {
-        preserveRelativePath: true,
-        fallbackName: PROVENANCE_MANIFEST_FILENAME,
-        overwrite: true,
-      }
-    );
+    const data = `${JSON.stringify(manifest, null, 2)}\n`;
+    if (typeof materializeFile === 'function') await materializeFile(relativePath, data);
+    else {
+      writeFileIntoPackageExact(
+        destination,
+        relativePath,
+        data,
+        {
+          preserveRelativePath: true,
+          fallbackName: PROVENANCE_MANIFEST_FILENAME,
+          overwrite: true,
+        }
+      );
+    }
   } catch (e) {
     if (fatal) throw Object.assign(new Error('diagnostic_manifest_write_failed'), { code: 'diagnostic_manifest_write_failed' });
     const message = e && typeof e.message === 'string' ? e.message : '';
@@ -13527,9 +13549,13 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         outputName = `${base} — ${outputName}`;
 
         const usesPackagePlan = options.planOnly || Array.isArray(options.expectedOutputs);
+        const reservedOutputName = usesPackagePlan ? options.reserveOutputName(outputName) : null;
         const descriptor = usesPackagePlan ? {
           internalPath: zipPath,
-          outputName: options.reserveOutputName(outputName),
+          outputName: reservedOutputName,
+          relativePath: typeof options.getOutputRelativePath === 'function'
+            ? options.getOutputRelativePath(reservedOutputName)
+            : reservedOutputName,
           size: data.length,
           sha256: crypto.createHash('sha256').update(data).digest('hex'),
           contentFingerprint: extractedFingerprint,
@@ -13544,10 +13570,26 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         if (options.planOnly) continue;
 
         if (typeof options.onBeforeMaterialize === 'function') options.onBeforeMaterialize();
-        const destPath = resolveUniquePackagePath(destFolder, descriptor ? descriptor.outputName : outputName);
-        if (descriptor && path.basename(destPath) !== descriptor.outputName) throw new PackageReviewChangedError();
+        const destPath = descriptor
+          ? (typeof options.resolveOutputPath === 'function'
+              ? options.resolveOutputPath(descriptor.relativePath)
+              : resolveExactPackagePath(destFolder, descriptor.relativePath, {
+                  fallbackName: 'file',
+                  preserveRelativePath: true,
+                }))
+          : resolveUniquePackagePath(destFolder, outputName);
+        if (
+          descriptor &&
+          typeof options.resolveOutputPath !== 'function' &&
+          path.relative(destFolder, destPath).split(path.sep).join('/') !== descriptor.relativePath
+        ) throw new PackageReviewChangedError();
         if (typeof options.onBeforeWrite === 'function') options.onBeforeWrite(destPath);
-        fs.writeFileSync(destPath, data, { flag: 'wx' });
+        if (typeof options.materializeBuffer === 'function') {
+          await options.materializeBuffer(destPath, data, OWNER_ONLY_FILE_MODE);
+        } else {
+          fs.writeFileSync(destPath, data, { flag: 'wx' });
+        }
+        if (typeof options.onAfterWrite === 'function') options.onAfterWrite(destPath);
         if (options.rollbackOnFailure || typeof options.onMaterialized === 'function') {
           const materialized = captureOwnedDirectCacheFile(destPath, destFolder, 'presentation-cache-file');
           if (options.rollbackOnFailure) invocationFiles.push(materialized);
@@ -13944,6 +13986,45 @@ function getPackageReviewEntryStatus(entry) {
   return 'unmaterializable';
 }
 
+function packagePlanRelativePathCollisionKey(relativePath) {
+  return `${relativePath || ''}`
+    .normalize('NFC')
+    .toUpperCase()
+    .toLowerCase()
+    .normalize('NFC');
+}
+
+function createAuthoritativePackageOutputAllocator(layoutMode) {
+  const normalizedLayoutMode = normalizePackageOutputLayoutMode(layoutMode);
+  const allocateName = createPackageNameAllocator();
+  const relativePathByOutputName = new Map();
+  const usedRelativePathKeys = new Set();
+
+  const reserveNameOnly = rawName => allocateName(rawName);
+  const reserveOutputName = rawName => {
+    for (let attempt = 0; attempt < MAX_PACKAGE_PLAN_PATH_ALLOCATION_ATTEMPTS; attempt++) {
+      const outputName = allocateName(rawName);
+      const relativePath = getPackageOutputRelativePath(outputName, normalizedLayoutMode);
+      const relativePathKey = packagePlanRelativePathCollisionKey(relativePath);
+      if (usedRelativePathKeys.has(relativePathKey)) continue;
+      usedRelativePathKeys.add(relativePathKey);
+      relativePathByOutputName.set(outputName, relativePath);
+      return outputName;
+    }
+    throw new PackageReviewChangedError();
+  };
+
+  return {
+    reserveNameOnly,
+    reserveOutputName,
+    getOutputRelativePath(outputName) {
+      const relativePath = relativePathByOutputName.get(outputName);
+      if (!relativePath) throw new PackageReviewChangedError();
+      return relativePath;
+    },
+  };
+}
+
 async function buildAuthoritativePackagePlan(
   files,
   entries,
@@ -13951,14 +14032,17 @@ async function buildAuthoritativePackagePlan(
   destinationFolderName,
   presentationSuppression = { fingerprints: [], nameBases: [], occurrences: [] }
 ) {
-  const allocateOutputName = createPackageNameAllocator();
+  const layoutMode = normalizePackageOutputLayoutMode(packageSettings.outputLayoutMode);
+  const outputAllocator = createAuthoritativePackageOutputAllocator(layoutMode);
+  const allocateOutputName = outputAllocator.reserveOutputName;
+  const getOutputRelativePath = outputAllocator.getOutputRelativePath;
   const reviewedSourceInputs = [];
   const deterministicDerivedOutputs = [];
   const outputNamesByEntryIndex = [];
   const diagnosticsMetadata = packageSettings.includeDiagnosticReport ? {
     materialization: 'crate-provenance-v2',
     schemaVersion: DIAGNOSTIC_MANIFEST_SCHEMA_VERSION,
-    relativePath: path.posix.join(allocateOutputName(DIAGNOSTICS_FOLDER_NAME), PROVENANCE_MANIFEST_FILENAME),
+    relativePath: path.posix.join(outputAllocator.reserveNameOnly(DIAGNOSTICS_FOLDER_NAME), PROVENANCE_MANIFEST_FILENAME),
   } : null;
   entries.forEach((entry, entryIndex) => {
     const outputName = allocateOutputName(entry.displayName);
@@ -13967,10 +14051,19 @@ async function buildAuthoritativePackagePlan(
       deterministicDerivedOutputs.push({
         sourceEntryIndex: entryIndex,
         materialization: 'psd-embedded-resource',
-        expectedOutputs: [{ outputName, resourceFingerprint: entry.embeddedResource }],
+        expectedOutputs: [{
+          outputName,
+          relativePath: getOutputRelativePath(outputName),
+          resourceFingerprint: entry.embeddedResource,
+        }],
       });
     } else {
-      reviewedSourceInputs.push({ entryIndex, materialization: 'source-copy', expectedOutputName: outputName });
+      reviewedSourceInputs.push({
+        entryIndex,
+        materialization: 'source-copy',
+        expectedOutputName: outputName,
+        relativePath: getOutputRelativePath(outputName),
+      });
     }
   });
 
@@ -14036,6 +14129,7 @@ async function buildAuthoritativePackagePlan(
       dedupNameBases,
       suppressedOccurrences,
       reserveOutputName: allocateOutputName,
+      getOutputRelativePath,
       onPlanned: output => expectedOutputs.push(output),
     });
     for (const output of expectedOutputs) {
@@ -14052,8 +14146,9 @@ async function buildAuthoritativePackagePlan(
     });
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     collisionPolicy: 'stable-macos-nfc-casefold-v1',
+    layoutMode,
     packageSettings,
     destinationFolderName,
     reviewedSourceInputs,
@@ -14067,6 +14162,7 @@ function getRelevantPackageReviewSettings() {
   return {
     includeDiagnosticReport: settings.includeDiagnosticReport === true,
     namingTemplate: sanitizeNamingTemplate(settings.namingTemplate),
+    outputLayoutMode: normalizePackageOutputLayoutMode(settings.packageOutputLayoutMode),
   };
 }
 
@@ -14468,12 +14564,26 @@ async function openReviewedPackageSources(files, entries) {
   };
 }
 
-async function copyReviewedPackageSource(reviewedSource, finalPath, verifyWrite) {
+async function copyReviewedPackageSource(
+  reviewedSource,
+  finalPath,
+  verifyWrite,
+  materializeSource = null,
+  rememberDestination = null
+) {
   return withStableReviewedPackageSource(reviewedSource, async (sourceHandle, sourceStat) => {
     verifyWrite(finalPath);
     const destinationMode = Number(sourceStat.mode & 0o777n) || OWNER_ONLY_FILE_MODE;
+    if (typeof materializeSource === 'function') {
+      await materializeSource(finalPath, sourceHandle.fd, sourceStat.size, destinationMode);
+      verifyWrite(finalPath);
+      return;
+    }
     const destinationHandle = await fs.promises.open(finalPath, 'wx', destinationMode);
     try {
+      if (typeof rememberDestination === 'function') {
+        rememberDestination(finalPath, await destinationHandle.stat({ bigint: true }));
+      }
       const buffer = Buffer.allocUnsafe(1024 * 1024);
       let position = 0;
       while (true) {
@@ -14489,6 +14599,7 @@ async function copyReviewedPackageSource(reviewedSource, finalPath, verifyWrite)
     } finally {
       await destinationHandle.close().catch(() => {});
     }
+    verifyWrite(finalPath);
   });
 }
 
@@ -14505,7 +14616,15 @@ async function readReviewedPackageSourceBuffer(sourceHandle, size) {
   return buffer;
 }
 
-async function writeEmbeddedPsdAssetToPackage(file, reviewedSource, expectedResource, finalPath, verifyWrite) {
+async function writeEmbeddedPsdAssetToPackage(
+  file,
+  reviewedSource,
+  expectedResource,
+  finalPath,
+  verifyWrite,
+  materializeBuffer = null,
+  rememberDestination = null
+) {
   const buf = await withStableReviewedPackageSource(reviewedSource, async (sourceHandle, stat) => {
     if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
     return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
@@ -14517,7 +14636,21 @@ async function writeEmbeddedPsdAssetToPackage(file, reviewedSource, expectedReso
   }
 
   verifyWrite(finalPath);
-  await fs.promises.writeFile(finalPath, Buffer.from(match.linkedFile.data), { flag: 'wx' });
+  const data = Buffer.from(match.linkedFile.data);
+  if (typeof materializeBuffer === 'function') {
+    await materializeBuffer(finalPath, data, OWNER_ONLY_FILE_MODE);
+  } else {
+    const destinationHandle = await fs.promises.open(finalPath, 'wx', OWNER_ONLY_FILE_MODE);
+    try {
+      if (typeof rememberDestination === 'function') {
+        rememberDestination(finalPath, await destinationHandle.stat({ bigint: true }));
+      }
+      await destinationHandle.writeFile(data);
+    } finally {
+      await destinationHandle.close().catch(() => {});
+    }
+  }
+  verifyWrite(finalPath);
 }
 
 function lstatPackagePath(targetPath) {
@@ -14533,9 +14666,9 @@ function inspectPrivatePackageDestination(outputPath, rawFolderName) {
   const outputRoot = ensureSafePackageDirectory(outputPath);
   const outputParent = path.dirname(outputRoot);
   const outputParentReal = realpathSync(outputParent);
-  const outputParentStat = fs.lstatSync(outputParent);
+  const outputParentStat = fs.lstatSync(outputParent, { bigint: true });
   const outputRootReal = realpathSync(outputRoot);
-  const outputRootStat = fs.lstatSync(outputRoot);
+  const outputRootStat = fs.lstatSync(outputRoot, { bigint: true });
   const baseName = sanitizePackageFolderName(rawFolderName);
   let folderName = baseName;
   for (let counter = 1; lstatPackagePath(path.join(outputRoot, folderName)); counter++) {
@@ -14598,11 +14731,11 @@ function createPrivatePackageStagingFolder(stagingParent) {
   const stagingFolder = fs.mkdtempSync(path.join(stagingParent, '.crate-package-staging-'));
   try {
     fs.chmodSync(stagingFolder, OWNER_ONLY_DIR_MODE);
-    const stagingStat = fs.lstatSync(stagingFolder);
+    const stagingStat = fs.lstatSync(stagingFolder, { bigint: true });
     if (
       stagingStat.isSymbolicLink() ||
       !stagingStat.isDirectory() ||
-      (stagingStat.mode & 0o777) !== OWNER_ONLY_DIR_MODE ||
+      (stagingStat.mode & 0o777n) !== BigInt(OWNER_ONLY_DIR_MODE) ||
       path.dirname(stagingFolder) !== stagingParent
     ) {
       throw new PackageTransactionInvariantError();
@@ -14643,7 +14776,7 @@ function createPrivatePackageDestination(inspectedDestination) {
         : inspectedDestination.outputParentStat,
       stagingAnchorParent,
       stagingAnchorParentReal: realpathSync(stagingAnchorParent),
-      stagingAnchorParentStat: fs.lstatSync(stagingAnchorParent),
+      stagingAnchorParentStat: fs.lstatSync(stagingAnchorParent, { bigint: true }),
       stagingFolder,
       stagingStat,
     };
@@ -14819,63 +14952,449 @@ function capturePrivateStagedPackageTree(stagingFolder, intendedFiles) {
   return inspectPrivateStagedPackageTree(stagingFolder, expected, true);
 }
 
-function assertPrivateStagedPackageTree(stagingFolder, snapshot) {
+function assertPrivateStagedPackageTree(stagingFolder, snapshot, options = {}) {
   if (!Array.isArray(snapshot)) throw new PackageReviewChangedError();
   const expected = new Map(snapshot.map(entry => [entry.relativePath, entry.type]));
   if (expected.size !== snapshot.length) throw new PackageReviewChangedError();
   const actual = inspectPrivateStagedPackageTree(stagingFolder, expected, false);
+  if (options.allowRootRename === true) {
+    const snapshotRoot = snapshot.find(entry => entry.relativePath === '' && entry.type === 'directory');
+    const actualRoot = actual.find(entry => entry.relativePath === '' && entry.type === 'directory');
+    if (snapshotRoot && actualRoot) {
+      actualRoot.stat.ctimeNs = snapshotRoot.stat.ctimeNs;
+    }
+  }
   if (!packageReviewFingerprintsMatch(snapshot, actual)) throw new PackageReviewChangedError();
 }
 
-function removePrivateStagedPackageTree(stagingFolder, identity) {
-  const removeNode = (targetPath, isRoot = false) => {
-    let stat;
+function getPackageTransactionIdentity(identity) {
+  return { dev: `${identity.dev}`, ino: `${identity.ino}` };
+}
+
+function capturePackageTransactionAncestry(candidatePath, identity) {
+  const ancestry = [];
+  const requestedPath = path.resolve(candidatePath);
+  const requestedStat = fs.lstatSync(requestedPath, { bigint: true });
+  if (
+    requestedStat.isSymbolicLink() ||
+    !requestedStat.isDirectory() ||
+    requestedStat.dev !== identity.dev ||
+    requestedStat.ino !== identity.ino
+  ) {
+    throw new PackageTransactionInvariantError();
+  }
+  let currentPath = realpathSync(requestedPath);
+  let first = true;
+  while (true) {
+    const stat = fs.lstatSync(currentPath, { bigint: true });
+    if (
+      stat.isSymbolicLink() ||
+      !stat.isDirectory() ||
+      (first && (stat.dev !== identity.dev || stat.ino !== identity.ino))
+    ) {
+      throw new PackageTransactionInvariantError();
+    }
+    ancestry.push(getPackageTransactionIdentity(stat));
+    first = false;
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) break;
+    currentPath = parentPath;
+  }
+  return ancestry;
+}
+
+function serializePackageTransactionOwnedOutputs(ownedOutputs) {
+  return [...(ownedOutputs || new Map()).entries()].map(([leafName, ownedIdentity]) => ({
+    leafName,
+    identity: getPackageTransactionIdentity(ownedIdentity),
+  }));
+}
+
+function createPackageTransactionWorkerSession(group) {
+  if (!utilityProcess || typeof utilityProcess.fork !== 'function') {
+    return Promise.reject(new PackageTransactionInvariantError());
+  }
+  return new Promise((resolve, reject) => {
+    let child;
+    let spawned = false;
+    let initialized = false;
+    let dead = false;
+    let closing = false;
+    let activeOperation = null;
+    let session = null;
+    let idleTimer = null;
+    let ancestries;
     try {
-      stat = fs.lstatSync(targetPath);
-    } catch (error) {
-      return !!(error && error.code === 'ENOENT');
-    }
-    if (isRoot && (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== identity.dev || stat.ino !== identity.ino)) {
-      return false;
-    }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      try {
-        fs.unlinkSync(targetPath);
-        return true;
-      } catch (_) {
-        return false;
-      }
+      ancestries = Array.isArray(group.ancestries) && group.ancestries.length > 0
+        ? group.ancestries
+        : [capturePackageTransactionAncestry(group.path, group.identity)];
+    } catch (_) {
+      reject(new PackageTransactionInvariantError());
+      return;
     }
 
-    let clean = true;
-    let childNames;
+    const clearIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+    };
+    const armIdleTimer = () => {
+      clearIdleTimer();
+      idleTimer = setTimeout(() => fail(), PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS);
+    };
+    const stopChild = () => {
+      try { child?.kill(); } catch (_) {}
+    };
+    const fail = () => {
+      if (dead) return;
+      dead = true;
+      clearIdleTimer();
+      const operation = activeOperation;
+      activeOperation = null;
+      stopChild();
+      const error = new PackageTransactionInvariantError();
+      if (!initialized) reject(error);
+      if (operation) operation.reject(error);
+    };
+    const finishOperation = (message, terminal = false) => {
+      const operation = activeOperation;
+      if (!operation) return fail();
+      activeOperation = null;
+      clearIdleTimer();
+      if (terminal) closing = true;
+      operation.resolve(message);
+    };
+    const sendNextChunk = () => {
+      try {
+        const operation = activeOperation;
+        if (!operation || operation.type !== 'write') return fail();
+        if (BigInt(operation.sourceOffset) === operation.sourceLength) {
+          child.postMessage({ type: 'end', sequence: operation.sequence });
+          armIdleTimer();
+          return;
+        }
+        const remaining = operation.sourceLength - BigInt(operation.sourceOffset);
+        const chunkLength = Number(remaining > BigInt(PACKAGE_TRANSACTION_CHUNK_BYTES)
+          ? BigInt(PACKAGE_TRANSACTION_CHUNK_BYTES)
+          : remaining);
+        let chunk;
+        if (operation.dataInput) {
+          chunk = Buffer.from(operation.inputData.subarray(
+            operation.sourceOffset,
+            operation.sourceOffset + chunkLength
+          ));
+        } else {
+          chunk = Buffer.allocUnsafe(chunkLength);
+          const bytesRead = fs.readSync(
+            operation.source.fd,
+            chunk,
+            0,
+            chunkLength,
+            operation.sourceOffset
+          );
+          if (bytesRead !== chunkLength) {
+            fail();
+            return;
+          }
+        }
+        child.postMessage({ type: 'chunk', sequence: operation.sequence, data: chunk });
+        operation.sourceOffset += chunkLength;
+        armIdleTimer();
+      } catch (_) {
+        fail();
+      }
+    };
+
     try {
-      childNames = fs.readdirSync(targetPath);
+      child = utilityProcess.fork(PACKAGE_TRANSACTION_WORKER_PATH, [], {
+        cwd: group.path,
+        env: {},
+        execArgv: [],
+        stdio: 'ignore',
+        serviceName: 'Crate Package Transaction',
+        allowLoadingUnsignedLibraries: false,
+        disclaim: false,
+      });
     } catch (_) {
-      return false;
+      fail();
+      return;
     }
-    for (const childName of childNames) {
-      if (!removeNode(path.join(targetPath, childName))) clean = false;
-    }
-    try {
-      fs.rmdirSync(targetPath);
-    } catch (_) {
-      clean = false;
-    }
-    return clean;
-  };
-  return removeNode(stagingFolder, true);
+    child.once('error', fail);
+    child.once('exit', () => {
+      if (!dead && !closing) fail();
+      dead = true;
+      clearIdleTimer();
+    });
+    child.on('message', message => {
+      if (dead || !spawned || !message || typeof message !== 'object') return fail();
+      if (!initialized && message.type === 'session-ready') {
+        if (!session) return fail();
+        initialized = true;
+        clearIdleTimer();
+        resolve(session);
+        return;
+      }
+      const operation = activeOperation;
+      if (!initialized || !operation) return fail();
+      if (
+        operation.type === 'write' &&
+        message.type === 'opened' &&
+        !operation.outputIdentity &&
+        message.outputIdentity &&
+        /^\d+$/u.test(message.outputIdentity.dev) &&
+        /^\d+$/u.test(message.outputIdentity.ino)
+      ) {
+        const outputIdentity = {
+          dev: BigInt(message.outputIdentity.dev),
+          ino: BigInt(message.outputIdentity.ino),
+        };
+        operation.outputIdentity = message.outputIdentity;
+        group.ownedOutputs.set(operation.leafName, outputIdentity);
+        child.postMessage({ type: 'ownership-ack', outputIdentity: operation.outputIdentity });
+        armIdleTimer();
+        return;
+      }
+      if (
+        operation.type === 'write' &&
+        message.type === 'ready' &&
+        operation.outputIdentity &&
+        operation.sequence === 0 &&
+        operation.sourceOffset === 0
+      ) {
+        sendNextChunk();
+        return;
+      }
+      if (
+        operation.type === 'write' &&
+        message.type === 'ack' &&
+        Number.isSafeInteger(message.sequence) &&
+        message.sequence === operation.sequence
+      ) {
+        operation.sequence++;
+        sendNextChunk();
+        return;
+      }
+      if (
+        message.type === 'complete' &&
+        typeof message.bytesWritten === 'string' &&
+        message.bytesWritten === `${operation.sourceLength}`
+      ) {
+        if (
+          operation.type === 'write' &&
+          (!message.outputIdentity ||
+            !/^\d+$/u.test(message.outputIdentity.dev) ||
+            !/^\d+$/u.test(message.outputIdentity.ino) ||
+            !operation.outputIdentity ||
+            message.outputIdentity.dev !== operation.outputIdentity.dev ||
+            message.outputIdentity.ino !== operation.outputIdentity.ino)
+        ) return fail();
+        finishOperation(message, operation.type === 'cleanup');
+        return;
+      }
+      if (operation.type === 'release' && message.type === 'released') {
+        finishOperation(message, true);
+        return;
+      }
+      fail();
+    });
+    child.once('spawn', () => {
+      if (dead) return;
+      spawned = true;
+      child.postMessage({
+        type: 'init-session',
+        identity: getPackageTransactionIdentity(group.identity),
+        ancestries,
+        ownedOutputs: serializePackageTransactionOwnedOutputs(group.ownedOutputs),
+      });
+      armIdleTimer();
+    });
+    armIdleTimer();
+
+    const beginOperation = (type, message, source = null) => new Promise((operationResolve, operationReject) => {
+      if (dead || closing || !initialized || activeOperation) {
+        operationReject(new PackageTransactionInvariantError());
+        return;
+      }
+      try {
+        const dataInput = type === 'write' && Object.prototype.hasOwnProperty.call(source, 'data');
+        const inputData = dataInput
+          ? (Buffer.isBuffer(source.data) ? source.data : Buffer.from(source.data))
+          : null;
+        const sourceLength = type === 'write'
+          ? (dataInput ? BigInt(inputData.length) : BigInt(source.size))
+          : 0n;
+        activeOperation = {
+          type,
+          leafName: type === 'write' ? message.leafName : null,
+          source,
+          dataInput,
+          inputData,
+          sourceLength,
+          sourceOffset: 0,
+          sequence: 0,
+          outputIdentity: null,
+          resolve: operationResolve,
+          reject: operationReject,
+        };
+        child.postMessage({ ...message, expectedLength: type === 'write' ? `${sourceLength}` : undefined });
+        armIdleTimer();
+      } catch (_) {
+        if (activeOperation) fail();
+        else operationReject(new PackageTransactionInvariantError());
+      }
+    });
+    session = {
+      isDead: () => dead || closing,
+      write: (leafName, source) => beginOperation('write', { type: 'write-start', leafName }, source),
+      cleanup: () => beginOperation('cleanup', { type: 'cleanup' }),
+      release: () => beginOperation('release', { type: 'release' }),
+      dispose: stopChild,
+    };
+  });
+}
+
+async function getPackageTransactionWorkerSession(group) {
+  if (group.transactionSession && !group.transactionSession.isDead()) return group.transactionSession;
+  if (!group.transactionSessionPromise) {
+    group.transactionSessionPromise = createPackageTransactionWorkerSession(group)
+      .then(session => {
+        group.transactionSession = session;
+        return session;
+      })
+      .finally(() => {
+        group.transactionSessionPromise = null;
+      });
+  }
+  return await group.transactionSessionPromise;
+}
+
+async function runPackageTransactionWorker(group, operation, source = null) {
+  const session = await getPackageTransactionWorkerSession(group);
+  if (operation === 'cleanup') return await session.cleanup();
+  if (operation === 'release') return await session.release();
+  const leafName = path.basename(group.filePath || '');
+  if (
+    operation !== 'write' ||
+    !source ||
+    !leafName ||
+    leafName === '.' ||
+    leafName === '..' ||
+    leafName.includes('/') ||
+    leafName.includes('\0')
+  ) throw new PackageTransactionInvariantError();
+  return await session.write(leafName, source);
+}
+
+async function runDescriptorBoundPackageWriter(group, filePath, source) {
+  const leafName = path.basename(filePath || '');
+  if (
+    !source ||
+    !leafName ||
+    leafName === '.' ||
+    leafName === '..' ||
+    leafName.includes('/') ||
+    leafName.includes('\0')
+  ) throw new PackageTransactionInvariantError();
+  const session = await getPackageTransactionWorkerSession(group);
+  return await session.write(leafName, source);
+}
+
+async function removePrivateStagedPackageTree(
+  stagingFolder,
+  identity,
+  ancestries = null,
+  ownedOutputs = null,
+  liveGroup = null
+) {
+  try {
+    const workerGroup = liveGroup || { identity, ownedOutputs };
+    workerGroup.path = stagingFolder;
+    if (!workerGroup.ancestries) workerGroup.ancestries = ancestries;
+    await runPackageTransactionWorker(workerGroup, 'cleanup');
+    return removeEmptyPrivatePackageDirectory(stagingFolder, identity);
+  } catch (_) {
+    return false;
+  }
 }
 
 function privatePackageDirectoryMatches(candidatePath, identity) {
   try {
-    const stat = fs.lstatSync(candidatePath);
+    const stat = fs.lstatSync(candidatePath, { bigint: true });
     return !stat.isSymbolicLink() &&
       stat.isDirectory() &&
+      typeof identity?.dev === 'bigint' &&
+      typeof identity?.ino === 'bigint' &&
       stat.dev === identity.dev &&
       stat.ino === identity.ino;
   } catch (_) {
     return false;
+  }
+}
+
+function removeEmptyPrivatePackageDirectory(candidatePath, identity) {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const directoryOnly = fs.constants.O_DIRECTORY;
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  if (!Number.isInteger(noFollow) || !Number.isInteger(directoryOnly)) return false;
+  let fd = null;
+  try {
+    fd = fs.openSync(candidatePath, fs.constants.O_RDONLY | noFollow | directoryOnly | nonBlock);
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      opened.dev !== identity.dev ||
+      opened.ino !== identity.ino ||
+      fs.readdirSync(candidatePath).length !== 0
+    ) return false;
+    const current = fs.lstatSync(candidatePath, { bigint: true });
+    if (
+      current.isSymbolicLink() ||
+      !current.isDirectory() ||
+      current.dev !== opened.dev ||
+      current.ino !== opened.ino
+    ) return false;
+    fs.rmdirSync(candidatePath);
+    return !lstatPackagePath(candidatePath);
+  } catch (_) {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+}
+
+function hardenPrivatePackageDirectory(candidatePath, identity) {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const directoryOnly = fs.constants.O_DIRECTORY;
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  if (!Number.isInteger(noFollow) || !Number.isInteger(directoryOnly)) {
+    throw new PackageTransactionInvariantError();
+  }
+  let fd = null;
+  try {
+    fd = fs.openSync(candidatePath, fs.constants.O_RDONLY | noFollow | directoryOnly | nonBlock);
+    const before = fs.fstatSync(fd, { bigint: true });
+    if (!before.isDirectory() || before.dev !== identity.dev || before.ino !== identity.ino) {
+      throw new PackageTransactionInvariantError();
+    }
+    fs.fchmodSync(fd, OWNER_ONLY_DIR_MODE);
+    const after = fs.fstatSync(fd, { bigint: true });
+    const pathStat = fs.lstatSync(candidatePath, { bigint: true });
+    if (
+      !after.isDirectory() ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      (after.mode & 0o777n) !== BigInt(OWNER_ONLY_DIR_MODE) ||
+      pathStat.isSymbolicLink() ||
+      !pathStat.isDirectory() ||
+      pathStat.dev !== before.dev ||
+      pathStat.ino !== before.ino ||
+      (pathStat.mode & 0o777n) !== BigInt(OWNER_ONLY_DIR_MODE)
+    ) {
+      throw new PackageTransactionInvariantError();
+    }
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
   }
 }
 
@@ -14894,12 +15413,21 @@ class PackageDestinationOccupiedError extends PackageTransactionInvariantError {
   }
 }
 
+class PackageCleanupError extends PackageTransactionInvariantError {
+  constructor() {
+    super();
+    this.name = 'PackageCleanupError';
+    this.message = 'package_cleanup_failed';
+    this.code = 'package_cleanup_failed';
+  }
+}
+
 function assertPrivatePackageDestinationCurrent(destination) {
   try {
-    const currentParent = fs.lstatSync(destination.outputParent);
-    const currentRoot = fs.lstatSync(destination.outputRoot);
-    const currentStagingParent = fs.lstatSync(destination.stagingParent);
-    const currentStaging = fs.lstatSync(destination.stagingFolder);
+    const currentParent = fs.lstatSync(destination.outputParent, { bigint: true });
+    const currentRoot = fs.lstatSync(destination.outputRoot, { bigint: true });
+    const currentStagingParent = fs.lstatSync(destination.stagingParent, { bigint: true });
+    const currentStaging = fs.lstatSync(destination.stagingFolder, { bigint: true });
     if (
       currentParent.isSymbolicLink() ||
       !currentParent.isDirectory() ||
@@ -14964,10 +15492,10 @@ function locatePrivatePackageStaging(destination) {
   return null;
 }
 
-function cleanupPrivatePackageDestination(destination) {
+async function cleanupPrivatePackageDestination(destination) {
   const stagingFolder = locatePrivatePackageStaging(destination);
   if (!stagingFolder) return false;
-  return removePrivateStagedPackageTree(stagingFolder, destination.stagingStat) &&
+  return await removePrivateStagedPackageTree(stagingFolder, destination.stagingStat) &&
     !locatePrivatePackageStaging(destination);
 }
 
@@ -14982,15 +15510,15 @@ function publishPrivatePackageDestination(destination, stagedTreeSnapshot) {
     throw new PackageTransactionInvariantError();
   }
   try {
-    const finalStat = fs.lstatSync(destination.destFolder);
-    const currentParent = fs.lstatSync(destination.outputParent);
-    const currentRoot = fs.lstatSync(destination.outputRoot);
+    const finalStat = fs.lstatSync(destination.destFolder, { bigint: true });
+    const currentParent = fs.lstatSync(destination.outputParent, { bigint: true });
+    const currentRoot = fs.lstatSync(destination.outputRoot, { bigint: true });
     if (
       finalStat.isSymbolicLink() ||
       !finalStat.isDirectory() ||
       finalStat.dev !== destination.stagingStat.dev ||
       finalStat.ino !== destination.stagingStat.ino ||
-      (finalStat.mode & 0o777) !== OWNER_ONLY_DIR_MODE ||
+      (finalStat.mode & 0o777n) !== BigInt(OWNER_ONLY_DIR_MODE) ||
       lstatPackagePath(destination.stagingFolder) ||
       currentParent.isSymbolicLink() ||
       !currentParent.isDirectory() ||
@@ -15005,8 +15533,18 @@ function publishPrivatePackageDestination(destination, stagedTreeSnapshot) {
       path.dirname(realpathSync(destination.destFolder)) !== destination.outputRootReal ||
       path.dirname(destination.destFolder) !== destination.outputRoot
     ) throw new PackageTransactionInvariantError();
+    assertPrivateStagedPackageTree(destination.destFolder, stagedTreeSnapshot, { allowRootRename: true });
   } catch (error) {
+    try {
+      if (
+        privatePackageDirectoryMatches(destination.destFolder, destination.stagingStat) &&
+        !lstatPackagePath(destination.stagingFolder)
+      ) {
+        fs.renameSync(destination.destFolder, destination.stagingFolder);
+      }
+    } catch (_) {}
     if (error instanceof PackageTransactionInvariantError) throw error;
+    if (error instanceof PackageReviewChangedError) throw error;
     throw new PackageTransactionInvariantError();
   }
 }
@@ -15015,11 +15553,31 @@ function createPackageWriteTransaction(destFolder) {
   const root = path.resolve(destFolder);
   const parent = path.dirname(root);
   const parentReal = realpathSync(parent);
-  const identity = fs.lstatSync(root);
+  const parentIdentity = fs.lstatSync(parent, { bigint: true });
+  const anchorParent = path.dirname(parent);
+  const anchorParentReal = realpathSync(anchorParent);
+  const anchorParentIdentity = fs.lstatSync(anchorParent, { bigint: true });
+  const identity = fs.lstatSync(root, { bigint: true });
+  const rootAncestry = capturePackageTransactionAncestry(root, identity);
   const intended = new Set();
+  const logicalByPhysicalPath = new Map();
+  const groups = new Map();
+  const legacyGroups = new Map();
+  const rootGroup = {
+    folderName: null,
+    path: root,
+    identity,
+    ancestries: [rootAncestry],
+    ownedOutputs: new Map(),
+    transactionSession: null,
+    transactionSessionPromise: null,
+    finalized: true,
+    renameAttempted: false,
+    knownPaths: new Set([root]),
+  };
   const isOriginal = candidate => {
     try {
-      const stat = fs.lstatSync(candidate);
+      const stat = fs.lstatSync(candidate, { bigint: true });
       return !stat.isSymbolicLink() && stat.isDirectory() && stat.dev === identity.dev && stat.ino === identity.ino;
     } catch (_) {
       return false;
@@ -15027,48 +15585,336 @@ function createPackageWriteTransaction(destFolder) {
   };
   const locate = () => {
     if (isOriginal(root)) return root;
+    let locatedParent = null;
     try {
-      const stat = fs.lstatSync(parent);
-      if (!stat.isSymbolicLink() && stat.isDirectory() && realpathSync(parent) === parentReal) {
-        for (const name of fs.readdirSync(parent)) {
-          const candidate = path.join(parent, name);
+      const stat = fs.lstatSync(parent, { bigint: true });
+      if (
+        !stat.isSymbolicLink() &&
+        stat.isDirectory() &&
+        stat.dev === parentIdentity.dev &&
+        stat.ino === parentIdentity.ino &&
+        realpathSync(parent) === parentReal
+      ) locatedParent = parent;
+    } catch (_) {}
+    if (!locatedParent) {
+      try {
+        const anchorStat = fs.lstatSync(anchorParent, { bigint: true });
+        if (
+          !anchorStat.isSymbolicLink() &&
+          anchorStat.isDirectory() &&
+          anchorStat.dev === anchorParentIdentity.dev &&
+          anchorStat.ino === anchorParentIdentity.ino &&
+          realpathSync(anchorParent) === anchorParentReal
+        ) {
+          for (const name of fs.readdirSync(anchorParent)) {
+            const candidate = path.join(anchorParent, name);
+            if (privatePackageDirectoryMatches(candidate, parentIdentity)) {
+              locatedParent = candidate;
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    if (locatedParent) {
+      try {
+        for (const name of fs.readdirSync(locatedParent)) {
+          const candidate = path.join(locatedParent, name);
           if (isOriginal(candidate)) return candidate;
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
     return null;
   };
   const assertRoot = () => {
     if (!isOriginal(root)) throw new PackageTransactionInvariantError();
   };
-  const relativeFor = filePath => {
-    const relative = path.relative(root, path.resolve(filePath));
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+  const normalizeRelativePath = rawRelativePath => {
+    const relative = path.normalize(`${rawRelativePath || ''}`.split('/').join(path.sep));
+    const parts = relative.split(path.sep);
+    if (
+      !relative ||
+      relative === '.' ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative) ||
+      parts.length > 2 ||
+      parts.some(part => !part || part === '.' || part === '..')
+    ) {
       throw new PackageTransactionInvariantError();
     }
     return relative;
   };
+  const groupMatches = group => privatePackageDirectoryMatches(group.path, group.identity);
+  const locateGroup = group => {
+    for (const candidate of group.knownPaths) {
+      if (privatePackageDirectoryMatches(candidate, group.identity)) return candidate;
+    }
+    const locatedRoot = locate();
+    for (const searchRoot of new Set([parent, root, locatedRoot].filter(Boolean))) {
+      try {
+        if (searchRoot === parent) {
+          const parentStat = fs.lstatSync(parent, { bigint: true });
+          if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || realpathSync(parent) !== parentReal) continue;
+        } else if (!isOriginal(searchRoot)) {
+          continue;
+        }
+        for (const childName of fs.readdirSync(searchRoot)) {
+          const candidate = path.join(searchRoot, childName);
+          if (privatePackageDirectoryMatches(candidate, group.identity)) return candidate;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    return null;
+  };
+  const getOrCreateGroup = folderName => {
+    const existing = groups.get(folderName);
+    if (existing) return existing;
+    assertRoot();
+    const groupPath = fs.mkdtempSync(path.join(parent, '.crate-package-group-'));
+    let group = null;
+    try {
+      const groupIdentity = fs.lstatSync(groupPath, { bigint: true });
+      group = {
+        folderName,
+        path: groupPath,
+        identity: groupIdentity,
+        ancestries: [
+          capturePackageTransactionAncestry(groupPath, groupIdentity),
+          [getPackageTransactionIdentity(groupIdentity), ...rootAncestry],
+        ],
+        ownedOutputs: new Map(),
+        transactionSession: null,
+        transactionSessionPromise: null,
+        finalized: false,
+        renameAttempted: false,
+        knownPaths: new Set([groupPath]),
+      };
+      groups.set(folderName, group);
+      hardenPrivatePackageDirectory(groupPath, groupIdentity);
+      const verifiedIdentity = fs.lstatSync(groupPath, { bigint: true });
+      if (
+        verifiedIdentity.isSymbolicLink() ||
+        !verifiedIdentity.isDirectory() ||
+        verifiedIdentity.dev !== groupIdentity.dev ||
+        verifiedIdentity.ino !== groupIdentity.ino ||
+        verifiedIdentity.dev !== identity.dev ||
+        (verifiedIdentity.mode & 0o777n) !== BigInt(OWNER_ONLY_DIR_MODE) ||
+        path.dirname(groupPath) !== parent
+      ) throw new PackageTransactionInvariantError();
+      return group;
+    } catch (error) {
+      if (!group) throw new PackageCleanupError();
+      throw error;
+    }
+  };
+  const assertPhysicalDestination = filePath => {
+    assertRoot();
+    const physicalPath = path.resolve(filePath);
+    const relative = logicalByPhysicalPath.get(physicalPath);
+    if (!relative) throw new PackageTransactionInvariantError();
+    const parts = relative.split(path.sep);
+    if (parts.length === 1) {
+      if (path.dirname(physicalPath) !== root) throw new PackageTransactionInvariantError();
+    } else {
+      const group = groups.get(parts[0]);
+      if (group) {
+        if (group.finalized || !groupMatches(group) || path.dirname(physicalPath) !== group.path) {
+          throw new PackageTransactionInvariantError();
+        }
+      } else {
+        const legacyGroup = legacyGroups.get(parts[0]);
+        if (
+          !legacyGroup ||
+          !groupMatches(legacyGroup) ||
+          path.dirname(physicalPath) !== legacyGroup.path
+        ) throw new PackageTransactionInvariantError();
+      }
+    }
+    const existing = lstatPackagePath(physicalPath);
+    if (existing && (existing.isSymbolicLink() || !existing.isFile())) throw new PackageTransactionInvariantError();
+    return relative;
+  };
+  const getDescriptorBoundGroup = filePath => {
+    const relative = assertPhysicalDestination(filePath);
+    const parts = relative.split(path.sep);
+    return parts.length === 2 ? groups.get(parts[0]) : null;
+  };
+  const knownGroupPathsAreUnoccupied = group => {
+    for (const candidate of group.knownPaths) {
+      const stat = lstatPackagePath(candidate);
+      if (!stat || privatePackageDirectoryMatches(candidate, group.identity)) continue;
+      return false;
+    }
+    return true;
+  };
+  const finalizeGroups = () => {
+    assertRoot();
+    for (const group of [...groups.values()].sort((left, right) => left.folderName.localeCompare(right.folderName))) {
+      if (group.finalized) continue;
+      if (!groupMatches(group)) throw new PackageTransactionInvariantError();
+      const finalGroupPath = path.join(root, group.folderName);
+      group.renameAttempted = true;
+      group.knownPaths.add(finalGroupPath);
+      if (lstatPackagePath(finalGroupPath)) throw new PackageTransactionInvariantError();
+      try {
+        fs.renameSync(group.path, finalGroupPath);
+      } catch (_) {
+        throw new PackageTransactionInvariantError();
+      }
+      if (!privatePackageDirectoryMatches(finalGroupPath, group.identity) || path.dirname(finalGroupPath) !== root) {
+        throw new PackageTransactionInvariantError();
+      }
+      group.path = finalGroupPath;
+      group.finalized = true;
+    }
+  };
+  const cleanupAuxiliary = async () => {
+    let clean = true;
+    for (const group of [...groups.values(), ...legacyGroups.values()]) {
+      const located = locateGroup(group) || [...group.knownPaths].find(candidate => {
+        try {
+          const stat = fs.statSync(candidate, { bigint: true });
+          return stat.isDirectory() && stat.dev === group.identity.dev && stat.ino === group.identity.ino;
+        } catch (_) {
+          return false;
+        }
+      });
+      if (
+        !located ||
+        !await removePrivateStagedPackageTree(
+          located,
+          group.identity,
+          group.ancestries,
+          group.ownedOutputs,
+          group
+        ) ||
+        locateGroup(group)
+      ) clean = false;
+      if (!knownGroupPathsAreUnoccupied(group)) clean = false;
+    }
+    return clean;
+  };
 
   return {
     assertRoot,
-    track(filePath) {
+    prepare(relativePath) {
       assertRoot();
-      const relative = relativeFor(filePath);
+      const relative = normalizeRelativePath(relativePath);
+      if (intended.has(relative)) throw new PackageReviewChangedError();
+      const parts = relative.split(path.sep);
+      const physicalPath = parts.length === 1
+        ? path.join(root, parts[0])
+        : path.join(getOrCreateGroup(parts[0]).path, parts[1]);
       intended.add(relative);
-      return path.join(root, relative);
+      logicalByPhysicalPath.set(path.resolve(physicalPath), relative);
+      return physicalPath;
+    },
+    prepareLegacyNested(relativePath) {
+      assertRoot();
+      const relative = normalizeRelativePath(relativePath);
+      if (intended.has(relative)) throw new PackageReviewChangedError();
+      const physicalPath = resolveExactPackagePath(root, relative, {
+        fallbackName: 'file',
+        preserveRelativePath: true,
+      });
+      const parts = relative.split(path.sep);
+      if (parts.length === 2 && !legacyGroups.has(parts[0])) {
+        const directoryPath = path.dirname(physicalPath);
+        const directoryIdentity = fs.lstatSync(directoryPath, { bigint: true });
+        legacyGroups.set(parts[0], {
+          folderName: parts[0],
+          path: directoryPath,
+          identity: directoryIdentity,
+          ancestries: [capturePackageTransactionAncestry(directoryPath, directoryIdentity)],
+          ownedOutputs: new Map(),
+          transactionSession: null,
+          transactionSessionPromise: null,
+          finalized: true,
+          renameAttempted: false,
+          knownPaths: new Set([directoryPath]),
+        });
+      }
+      intended.add(relative);
+      logicalByPhysicalPath.set(path.resolve(physicalPath), relative);
+      return physicalPath;
     },
     verify(filePath) {
-      assertRoot();
-      if (!intended.has(relativeFor(filePath))) throw new PackageTransactionInvariantError();
+      assertPhysicalDestination(filePath);
+    },
+    isDescriptorBound(filePath) {
+      return !!getDescriptorBoundGroup(filePath);
+    },
+    async materializeSource(filePath, sourceFd, sourceSize, mode) {
+      const group = getDescriptorBoundGroup(filePath);
+      if (!group) throw new PackageTransactionInvariantError();
+      const result = await runDescriptorBoundPackageWriter(group, filePath, { fd: sourceFd, size: sourceSize, mode });
+      group.ownedOutputs.set(path.basename(filePath), {
+        dev: BigInt(result.outputIdentity.dev),
+        ino: BigInt(result.outputIdentity.ino),
+      });
+      assertPhysicalDestination(filePath);
+    },
+    async materializeBuffer(filePath, data, mode = OWNER_ONLY_FILE_MODE) {
+      const group = getDescriptorBoundGroup(filePath);
+      if (!group) throw new PackageTransactionInvariantError();
+      const result = await runDescriptorBoundPackageWriter(group, filePath, { data, mode });
+      group.ownedOutputs.set(path.basename(filePath), {
+        dev: BigInt(result.outputIdentity.dev),
+        ino: BigInt(result.outputIdentity.ino),
+      });
+      assertPhysicalDestination(filePath);
+    },
+    rememberOwned(filePath, knownIdentity = null) {
+      const relative = assertPhysicalDestination(filePath);
+      const parts = relative.split(path.sep);
+      const group = parts.length === 1 ? rootGroup : legacyGroups.get(parts[0]);
+      if (!group) return;
+      const stat = knownIdentity || fs.lstatSync(filePath, { bigint: true });
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new PackageTransactionInvariantError();
+      group.ownedOutputs.set(path.basename(filePath), { dev: stat.dev, ino: stat.ino });
+    },
+    async materializeDirectBuffer(filePath, data, mode = OWNER_ONLY_FILE_MODE) {
+      assertPhysicalDestination(filePath);
+      const destinationHandle = await fs.promises.open(filePath, 'wx', mode);
+      try {
+        this.rememberOwned(filePath, await destinationHandle.stat({ bigint: true }));
+        await destinationHandle.writeFile(data);
+      } finally {
+        await destinationHandle.close().catch(() => {});
+      }
+      assertPhysicalDestination(filePath);
+    },
+    relativeFor(filePath) {
+      return assertPhysicalDestination(filePath);
     },
     captureTree() {
+      finalizeGroups();
       assertRoot();
       return capturePrivateStagedPackageTree(root, intended);
     },
-    cleanup() {
+    dispose() {
+      for (const group of [rootGroup, ...groups.values(), ...legacyGroups.values()]) {
+        try { group.transactionSession?.dispose(); } catch (_) {}
+        group.transactionSession = null;
+        group.transactionSessionPromise = null;
+      }
+    },
+    cleanupAuxiliary,
+    async cleanup() {
+      const auxiliaryClean = await cleanupAuxiliary();
       const located = locate();
       if (!located) return false;
-      return removePrivateStagedPackageTree(located, identity) && !locate();
+      rootGroup.path = located;
+      const rootClean = await removePrivateStagedPackageTree(
+        located,
+        identity,
+        [rootAncestry],
+        rootGroup.ownedOutputs,
+        rootGroup
+      ) && !locate();
+      return auxiliaryClean && rootClean;
     },
   };
 }
@@ -15080,14 +15926,17 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
 
   let packageActivation = null, packageWrites = null, packageDestination = null, packagePublished = false;
   let reviewedPackageSources = null;
-  const cleanupStaging = () => {
+  const cleanupStaging = async () => {
     if (packagePublished) return false;
-    if (packageDestination) return cleanupPrivatePackageDestination(packageDestination);
-    if (packageWrites) return packageWrites.cleanup();
+    if (packageDestination) {
+      if (packageWrites) return await packageWrites.cleanup();
+      return await cleanupPrivatePackageDestination(packageDestination);
+    }
+    if (packageWrites) return await packageWrites.cleanup();
     return true;
   };
-  const failPackage = error => ({
-    error: cleanupStaging() ? (error?.code || error?.message || error) : 'package_cleanup_failed'
+  const failPackage = async error => ({
+    error: await cleanupStaging() ? (error?.code || error?.message || error) : 'package_cleanup_failed'
   });
   try {
   const reviewResult = consumePackageReviewSnapshot(id, reviewToken);
@@ -15175,20 +16024,29 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     const errors = [];
     const packageProvenanceEvents = [];
     const stagedSourceByFile = new Map();
-    const allocateOutputName = createPackageNameAllocator();
-    const toPublishedPath = stagedPath => path.join(destFolder, path.relative(stagingFolder, stagedPath));
+    const layoutMode = normalizePackageOutputLayoutMode(manifest.plan.layoutMode);
+    const outputAllocator = createAuthoritativePackageOutputAllocator(layoutMode);
+    const allocateOutputName = outputAllocator.reserveOutputName;
+    const getOutputRelativePath = outputAllocator.getOutputRelativePath;
+    const toPublishedPath = stagedPath => path.join(destFolder, packageWrites.relativeFor(stagedPath));
     const packageProvenanceInfo = {
       destFolder,
       createdAt: Date.now(),
     };
     packageWrites = createPackageWriteTransaction(stagingFolder);
-    const abortStalePackage = () => isPackageActivationCurrent() ? null : failPackage('stale_activation');
+    const abortStalePackage = async () => isPackageActivationCurrent()
+      ? null
+      : await failPackage('stale_activation');
+    if (
+      layoutMode !== manifest.plan.layoutMode ||
+      layoutMode !== manifest.plan.packageSettings?.outputLayoutMode
+    ) throw new PackageReviewChangedError();
     if (manifest.plan.diagnosticsMetadata) {
       const diagnosticsDirectory = path.posix.dirname(manifest.plan.diagnosticsMetadata.relativePath);
       if (
         manifest.plan.diagnosticsMetadata.materialization !== 'crate-provenance-v2' ||
         path.posix.basename(manifest.plan.diagnosticsMetadata.relativePath) !== PROVENANCE_MANIFEST_FILENAME ||
-        allocateOutputName(DIAGNOSTICS_FOLDER_NAME) !== diagnosticsDirectory
+        outputAllocator.reserveNameOnly(DIAGNOSTICS_FOLDER_NAME) !== diagnosticsDirectory
       ) throw new PackageReviewChangedError();
     }
     const plannedDesignOutputs = [
@@ -15196,6 +16054,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         entryIndex: item.entryIndex,
         materialization: item.materialization,
         outputName: item.expectedOutputName,
+        relativePath: item.relativePath,
       })),
       ...manifest.plan.deterministicDerivedOutputs
         .filter(item => item.materialization === 'psd-embedded-resource')
@@ -15203,6 +16062,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           entryIndex: item.sourceEntryIndex,
           materialization: item.materialization,
           outputName: item.expectedOutputs[0]?.outputName,
+          relativePath: item.expectedOutputs[0]?.relativePath,
           resourceFingerprint: item.expectedOutputs[0]?.resourceFingerprint,
         })),
     ].sort((left, right) => left.entryIndex - right.entryIndex);
@@ -15211,17 +16071,20 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       const file = packageFiles[plannedOutput.entryIndex];
       const manifestEntry = manifest.entries[plannedOutput.entryIndex];
       if (!file || !manifestEntry) throw new PackageReviewChangedError();
-      const staleResult = abortStalePackage(); if (staleResult) return staleResult;
+      const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
       const packageFileName = getPackageFileDisplayName(file);
       const plannedRawName = plannedOutput.materialization === 'psd-embedded-resource'
         ? sanitizeEmbeddedPsdAssetName(file.name || file.embeddedOriginalName)
         : packageFileName;
-      if (allocateOutputName(plannedRawName) !== plannedOutput.outputName) throw new PackageReviewChangedError();
+      const allocatedOutputName = allocateOutputName(plannedRawName);
+      if (
+        allocatedOutputName !== plannedOutput.outputName ||
+        getOutputRelativePath(allocatedOutputName) !== plannedOutput.relativePath
+      ) throw new PackageReviewChangedError();
       try {
         if (plannedOutput.materialization === 'psd-embedded-resource') {
           if (!isScanOnSaveEmbeddedPsdFile(file)) throw new PackageReviewChangedError();
-          const finalPath = packageWrites.track(resolveUniquePackagePath(stagingFolder, plannedOutput.outputName));
-          if (path.basename(finalPath) !== plannedOutput.outputName) throw new PackageReviewChangedError();
+          const finalPath = packageWrites.prepare(plannedOutput.relativePath);
           if (!packageReviewFingerprintsMatch(manifestEntry.embeddedResource, plannedOutput.resourceFingerprint)) {
             throw new PackageReviewChangedError();
           }
@@ -15230,10 +16093,12 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
             reviewedPackageSources.get(plannedOutput.entryIndex),
             plannedOutput.resourceFingerprint,
             finalPath,
-            packageWrites.verify
+            packageWrites.verify,
+            packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeBuffer : null,
+            packageWrites.rememberOwned
           );
           stagedSourceByFile.set(file, finalPath);
-          const staleResult = abortStalePackage(); if (staleResult) return staleResult;
+          const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
           packageProvenanceEvents.push({
             relationType: EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE,
             file,
@@ -15245,12 +16110,13 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
 
         if (plannedOutput.materialization !== 'source-copy') throw new PackageReviewChangedError();
         if (!file.path) throw new PackageReviewChangedError();
-        const finalPath = packageWrites.track(resolveUniquePackagePath(stagingFolder, plannedOutput.outputName));
-        if (path.basename(finalPath) !== plannedOutput.outputName) throw new PackageReviewChangedError();
+        const finalPath = packageWrites.prepare(plannedOutput.relativePath);
         await copyReviewedPackageSource(
           reviewedPackageSources.get(plannedOutput.entryIndex),
           finalPath,
-          packageWrites.verify
+          packageWrites.verify,
+          packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeSource : null,
+          packageWrites.rememberOwned
         );
         stagedSourceByFile.set(file, finalPath);
         packageProvenanceEvents.push({
@@ -15261,8 +16127,8 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         copiedCount++;
       } catch (err) {
         if (err instanceof PackageReviewChangedError) throw err;
-        if (err instanceof PackageTransactionInvariantError) return failPackage(err);
-        return failPackage('package_write_failed');
+        if (err instanceof PackageTransactionInvariantError) return await failPackage(err);
+        return await failPackage('package_write_failed');
       }
     }
 
@@ -15285,9 +16151,20 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           dedupNameBases: generator.dedupNameBases,
           suppressedOccurrences: generator.suppressedOccurrences,
           reserveOutputName: allocateOutputName,
+          getOutputRelativePath,
           expectedOutputs: generator.expectedOutputs,
+          resolveOutputPath: relativePath => packageWrites.prepare(relativePath),
           onBeforeMaterialize: packageWrites.assertRoot,
-          onBeforeWrite: materializedPath => packageWrites.track(materializedPath),
+          onBeforeWrite: packageWrites.verify,
+          onAfterWrite: filePath => {
+            packageWrites.verify(filePath);
+            packageWrites.rememberOwned(filePath);
+          },
+          materializeBuffer: (filePath, data, mode) => (
+            packageWrites.isDescriptorBound(filePath)
+              ? packageWrites.materializeBuffer(filePath, data, mode)
+              : packageWrites.materializeDirectBuffer(filePath, data, mode)
+          ),
           onExtracted: (extraction) => {
             const resource = getPresentationMediaResourceIdentity(extraction.presentationPath, extraction.internalPath);
             if (!resource) return;
@@ -15318,25 +16195,37 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
           },
         });
         if (extractionFailures.length > 0) throw new PackageReviewChangedError();
-        const staleResult = abortStalePackage(); if (staleResult) return staleResult;
+        const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
         embeddedCount += embeddedFiles.length;
       } catch (embedErr) {
         if (embedErr instanceof PackageReviewChangedError) throw embedErr;
-        if (embedErr instanceof PackageTransactionInvariantError) return failPackage(embedErr);
-        return failPackage('package_write_failed');
+        if (embedErr instanceof PackageTransactionInvariantError) return await failPackage(embedErr);
+        return await failPackage('package_write_failed');
       }
     }
 
-    const staleResult = abortStalePackage(); if (staleResult) return staleResult;
+    const staleResult = await abortStalePackage(); if (staleResult) return staleResult;
     if (manifest.plan.diagnosticsMetadata) {
       let manifestProject; try { manifestProject = structuredClone(project); recordPresentationMediaExtractionProvenanceForProject(manifestProject, presentationExtractionEvents); recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents, manifestProject); } catch (_) { manifestProject = project; }
-      packageWrites.track(path.join(stagingFolder, ...manifest.plan.diagnosticsMetadata.relativePath.split('/'))); packageWrites.assertRoot();
-      writePackageProvenanceManifest(id, packageProvenanceInfo, {
+      const organizedDiagnostics = manifest.plan.layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
+      let legacyDiagnosticPath = null;
+      if (!organizedDiagnostics) {
+        legacyDiagnosticPath = packageWrites.prepareLegacyNested(manifest.plan.diagnosticsMetadata.relativePath);
+      }
+      await writePackageProvenanceManifest(id, packageProvenanceInfo, {
         copiedCount,
         embeddedCount,
         totalFiles: packageFiles.length,
         errors,
-      }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath);
+      }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath, (relativePath, data) => {
+        const diagnosticPath = organizedDiagnostics
+          ? packageWrites.prepare(relativePath)
+          : legacyDiagnosticPath;
+        packageWrites.verify(diagnosticPath);
+        return organizedDiagnostics
+          ? packageWrites.materializeBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE)
+          : packageWrites.materializeDirectBuffer(diagnosticPath, data, OWNER_ONLY_FILE_MODE);
+      });
     }
     const stagedTreeSnapshot = packageWrites.captureTree();
     const finalManifest = await buildCanonicalPackageReviewManifest(id);
@@ -15353,6 +16242,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     packageWrites.assertRoot();
     publishPrivatePackageDestination(packageDestination, stagedTreeSnapshot);
     packagePublished = true;
+    packageWrites.dispose();
     packageWrites = null;
     recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents);
     recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
@@ -15395,14 +16285,14 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     };
   } catch (err) {
     if (err instanceof PackageDestinationOccupiedError) {
-      if (!cleanupStaging()) return { error: 'package_cleanup_failed' };
+      if (!await cleanupStaging()) return { error: 'package_cleanup_failed' };
       return refreshedPackageDestinationReviewChangedResult(id, outputPath);
     }
     if (err instanceof PackageReviewChangedError) {
-      if (!cleanupStaging()) return { error: 'package_cleanup_failed' };
+      if (!await cleanupStaging()) return { error: 'package_cleanup_failed' };
       return refreshedPackageReviewChangedResult(id);
     }
-    if (!packagePublished) return failPackage(err);
+    if (!packagePublished) return await failPackage(err);
     clearPackageAutoForegroundSuppression();
     showTrayWindow();
     return { error: err?.code || 'package_failed' };
