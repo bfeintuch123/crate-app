@@ -87,6 +87,7 @@ jobs:
           node --check parsers/figma-redaction.js
           node --check parsers/figma.js
           node --check parsers/package-safety.js
+          node --check parsers/package-transaction-worker.js
           node --check scripts/install-approved-canvas-prebuild.js
           node --check scripts/verify-app-contents.js
           node --check scripts/verify-install-scripts.js

@@ -15,6 +15,7 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'indesign.js',
   'index.js',
   'package-safety.js',
+  'package-transaction-worker.js',
   'powerpoint.js',
   'premiere.js',
   'psd.js'

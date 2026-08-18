@@ -5,12 +5,17 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { EventEmitter } = require('events');
+const { spawn: realSpawn, spawnSync: realSpawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
 const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
 const packageJson = require('../package.json');
 const helperPlistPatch = require('../scripts/patch-helper-info-plists');
-const { packageCollisionKey } = require('../parsers/package-safety');
+const {
+  PACKAGE_OUTPUT_LAYOUT_MODES,
+  packageCollisionKey,
+} = require('../parsers/package-safety');
 
 const {
   NODE_TYPES,
@@ -208,6 +213,376 @@ class TestNotification {
   on(channel, handler) { this.handlers.set(channel, handler); }
 }
 
+let utilityProcessHandler = null;
+
+function setUtilityProcessHandler(handler) {
+  utilityProcessHandler = handler;
+}
+
+function utilityProcessAncestryMatches(candidatePath, ancestry) {
+  if (!Array.isArray(ancestry) || ancestry.length === 0) return false;
+  let currentPath = fs.realpathSync(candidatePath);
+  for (const identity of ancestry) {
+    const stat = fs.statSync(currentPath, { bigint: true });
+    if (stat.dev !== BigInt(identity.dev) || stat.ino !== BigInt(identity.ino)) return false;
+    currentPath = path.dirname(currentPath);
+  }
+  return true;
+}
+
+function utilityProcessAncestriesMatch(candidatePath, ancestries) {
+  return Array.isArray(ancestries) && ancestries.some(ancestry => (
+    utilityProcessAncestryMatches(candidatePath, ancestry)
+  ));
+}
+
+class TestUtilityProcess extends EventEmitter {
+  constructor(modulePath, args, options) {
+    super();
+    this.modulePath = modulePath;
+    this.args = args;
+    this.options = options;
+    this.outputFd = null;
+    this.outputIdentity = null;
+    this.outputLeafName = null;
+    this.expectedLength = 0n;
+    this.bytesWritten = 0n;
+    this.sequence = 0;
+    this.ancestries = null;
+    this.ownedOutputs = [];
+    this.identity = null;
+    this.initialized = false;
+    this.ownershipAcknowledged = false;
+    this.killed = false;
+    this.autoSpawn = true;
+    this.suppressedMessages = new Set();
+    this.suppressedResponses = new Set();
+    if (utilityProcessHandler) {
+      utilityProcessHandler({ phase: 'fork', modulePath, args, options, child: this });
+    }
+    queueMicrotask(() => {
+      if (!this.killed && this.autoSpawn) this.emit('spawn');
+    });
+  }
+
+  respond(message) {
+    if (utilityProcessHandler) {
+      utilityProcessHandler({
+        phase: 'response',
+        modulePath: this.modulePath,
+        args: this.args,
+        options: this.options,
+        message,
+        child: this,
+      });
+    }
+    if (this.suppressedResponses.has(message.type)) return;
+    queueMicrotask(() => this.emit('message', message));
+  }
+
+  fail() {
+    if (this.killed) return;
+    if (this.outputFd !== null) {
+      try {
+        const stat = fs.fstatSync(this.outputFd, { bigint: true });
+        if (
+          this.outputIdentity &&
+          stat.isFile() &&
+          stat.dev === this.outputIdentity.dev &&
+          stat.ino === this.outputIdentity.ino
+        ) {
+          fs.ftruncateSync(this.outputFd, 0);
+          fs.fsyncSync(this.outputFd);
+        }
+      } catch (_) {}
+      try { fs.closeSync(this.outputFd); } catch (_) {}
+      this.outputFd = null;
+    }
+    this.removeOwnedOutputs(this.outputIdentity && this.outputLeafName ? [{
+      leafName: this.outputLeafName,
+      identity: this.outputIdentity,
+    }] : []);
+    this.respond({ type: 'failed' });
+  }
+
+  removeOwnedOutputs(additionalRecords = []) {
+    const workingPath = this.currentWorkingPath();
+    const records = [
+      ...additionalRecords,
+      ...this.ownedOutputs.map(owned => ({
+        leafName: owned.leafName,
+        identity: { dev: BigInt(owned.identity.dev), ino: BigInt(owned.identity.ino) },
+      })),
+    ];
+    const recordsByLeaf = new Map();
+    for (const record of records) {
+      const entries = recordsByLeaf.get(record.leafName) || [];
+      entries.push(record.identity);
+      recordsByLeaf.set(record.leafName, entries);
+    }
+    const sanitizeAndUnlink = (candidate, identity) => {
+      const stat = fs.lstatSync(candidate, { bigint: true });
+      if (
+        stat.isSymbolicLink() ||
+        !stat.isFile() ||
+        stat.dev !== identity.dev ||
+        stat.ino !== identity.ino
+      ) return false;
+      const fd = fs.openSync(candidate, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const opened = fs.fstatSync(fd, { bigint: true });
+        if (opened.dev !== stat.dev || opened.ino !== stat.ino) return false;
+        fs.ftruncateSync(fd, 0);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const finalStat = fs.lstatSync(candidate, { bigint: true });
+      if (finalStat.dev !== stat.dev || finalStat.ino !== stat.ino) return false;
+      fs.unlinkSync(candidate);
+      return true;
+    };
+    const fallbackIdentities = new Map();
+    for (const [leafName, identities] of recordsByLeaf) {
+      let matched = false;
+      for (const identity of identities) {
+        try {
+          if (sanitizeAndUnlink(path.join(workingPath, leafName), identity)) {
+            matched = true;
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!matched && identities.length === 1) {
+        const [identity] = identities;
+        fallbackIdentities.set(`${identity.dev}\0${identity.ino}`, identity);
+      }
+    }
+    let childNames = [];
+    try { childNames = fs.readdirSync(workingPath); } catch (_) {}
+    for (const childName of childNames) {
+      try {
+        const candidate = path.join(workingPath, childName);
+        const stat = fs.lstatSync(candidate, { bigint: true });
+        const identity = fallbackIdentities.get(`${stat.dev}\0${stat.ino}`);
+        if (identity && sanitizeAndUnlink(candidate, identity)) {
+          fallbackIdentities.delete(`${identity.dev}\0${identity.ino}`);
+        }
+      } catch (_) {}
+    }
+  }
+
+  currentOutputMatches() {
+    if (this.outputFd === null || !this.outputIdentity || !this.outputLeafName) return false;
+    try {
+      const descriptorStat = fs.fstatSync(this.outputFd, { bigint: true });
+      const pathStat = fs.lstatSync(
+        path.join(this.currentWorkingPath(), this.outputLeafName),
+        { bigint: true }
+      );
+      return descriptorStat.isFile() &&
+        pathStat.isFile() &&
+        !pathStat.isSymbolicLink() &&
+        descriptorStat.dev === this.outputIdentity.dev &&
+        descriptorStat.ino === this.outputIdentity.ino &&
+        pathStat.dev === this.outputIdentity.dev &&
+        pathStat.ino === this.outputIdentity.ino &&
+        descriptorStat.nlink === 1n &&
+        pathStat.nlink === 1n &&
+        (descriptorStat.mode & 0o777n) === 0o600n &&
+        (pathStat.mode & 0o777n) === 0o600n;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  currentWorkingPath() {
+    const matches = candidate => {
+      try {
+        const stat = fs.statSync(candidate, { bigint: true });
+        return !this.identity ||
+          (stat.dev === BigInt(this.identity.dev) && stat.ino === BigInt(this.identity.ino));
+      } catch (_) {
+        return false;
+      }
+    };
+    if (matches(this.options.cwd)) return this.options.cwd;
+    const parent = path.dirname(this.options.cwd);
+    const candidates = [parent];
+    try {
+      for (const firstName of fs.readdirSync(parent)) {
+        const first = path.join(parent, firstName);
+        candidates.push(first);
+        try {
+          if (!fs.statSync(first).isDirectory()) continue;
+          for (const secondName of fs.readdirSync(first)) candidates.push(path.join(first, secondName));
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return candidates.find(matches) || this.options.cwd;
+  }
+
+  postMessage(message) {
+    if (this.killed) return;
+    try {
+      if (utilityProcessHandler) {
+        utilityProcessHandler({
+          phase: 'message',
+          modulePath: this.modulePath,
+          args: this.args,
+          options: this.options,
+          message,
+          child: this,
+        });
+      }
+      if (this.suppressedMessages.has(message.type)) return;
+      if (message.type === 'init-session') {
+        this.ownedOutputs = message.ownedOutputs || [];
+        this.identity = message.identity;
+        this.ancestries = message.ancestries;
+        const stat = fs.statSync(this.options.cwd, { bigint: true });
+        if (
+          stat.dev !== BigInt(message.identity.dev) ||
+          stat.ino !== BigInt(message.identity.ino) ||
+          !utilityProcessAncestriesMatch(this.options.cwd, message.ancestries)
+        ) {
+          this.fail();
+          return;
+        }
+        this.initialized = true;
+        this.respond({ type: 'session-ready' });
+        return;
+      }
+      if (message.type === 'cleanup') {
+        const workingPath = this.currentWorkingPath();
+        const stat = fs.statSync(workingPath, { bigint: true });
+        if (
+          !this.initialized ||
+          stat.dev !== BigInt(this.identity.dev) ||
+          stat.ino !== BigInt(this.identity.ino) ||
+          !utilityProcessAncestriesMatch(workingPath, this.ancestries)
+        ) {
+          this.fail();
+          return;
+        }
+        for (const childName of fs.readdirSync(workingPath)) {
+          fs.rmSync(path.join(workingPath, childName), { recursive: true, force: false });
+        }
+        if (!utilityProcessAncestriesMatch(workingPath, this.ancestries)) return this.fail();
+        this.respond({ type: 'complete', bytesWritten: '0' });
+        return;
+      }
+      if (message.type === 'write-start') {
+        const workingPath = this.currentWorkingPath();
+        const stat = fs.statSync(workingPath, { bigint: true });
+        if (
+          !this.initialized ||
+          stat.dev !== BigInt(this.identity.dev) ||
+          stat.ino !== BigInt(this.identity.ino) ||
+          !utilityProcessAncestriesMatch(workingPath, this.ancestries)
+        ) {
+          this.fail();
+          return;
+        }
+        this.expectedLength = BigInt(message.expectedLength);
+        this.outputLeafName = message.leafName;
+        this.bytesWritten = 0n;
+        this.sequence = 0;
+        this.ownershipAcknowledged = false;
+        const outputPath = path.join(workingPath, message.leafName);
+        this.outputFd = fs.openSync(
+          outputPath,
+          fs.constants.O_WRONLY |
+            fs.constants.O_CREAT |
+            fs.constants.O_EXCL |
+            fs.constants.O_NOFOLLOW,
+          0o600
+        );
+        const opened = fs.fstatSync(this.outputFd, { bigint: true });
+        this.outputIdentity = { dev: opened.dev, ino: opened.ino };
+        fs.fchmodSync(this.outputFd, 0o600);
+        this.respond({
+          type: 'opened',
+          outputIdentity: { dev: `${opened.dev}`, ino: `${opened.ino}` },
+        });
+        return;
+      }
+      if (message.type === 'ownership-ack') {
+        if (
+          !this.outputIdentity ||
+          message.outputIdentity?.dev !== `${this.outputIdentity.dev}` ||
+          message.outputIdentity?.ino !== `${this.outputIdentity.ino}` ||
+          !utilityProcessAncestriesMatch(this.currentWorkingPath(), this.ancestries)
+        ) return this.fail();
+        this.ownershipAcknowledged = true;
+        this.respond({ type: 'ready' });
+        return;
+      }
+      if (message.type === 'chunk') {
+        if (!this.ownershipAcknowledged || message.sequence !== this.sequence) return this.fail();
+        if (!utilityProcessAncestriesMatch(this.currentWorkingPath(), this.ancestries)) return this.fail();
+        if (!this.currentOutputMatches()) return this.fail();
+        const chunk = Buffer.from(message.data);
+        let offset = 0;
+        while (offset < chunk.length) {
+          offset += fs.writeSync(this.outputFd, chunk, offset, chunk.length - offset, null);
+        }
+        this.bytesWritten += BigInt(chunk.length);
+        if (!this.currentOutputMatches()) return this.fail();
+        this.respond({ type: 'ack', sequence: this.sequence++ });
+        return;
+      }
+      if (message.type === 'end') {
+        if (message.sequence !== this.sequence || this.bytesWritten !== this.expectedLength) {
+          this.fail();
+          return;
+        }
+        if (!utilityProcessAncestriesMatch(this.currentWorkingPath(), this.ancestries)) return this.fail();
+        fs.fsyncSync(this.outputFd);
+        fs.closeSync(this.outputFd);
+        this.outputFd = null;
+        this.ownedOutputs.push({
+          leafName: this.outputLeafName,
+          identity: {
+            dev: `${this.outputIdentity.dev}`,
+            ino: `${this.outputIdentity.ino}`,
+          },
+        });
+        this.respond({
+          type: 'complete',
+          bytesWritten: `${this.bytesWritten}`,
+          outputIdentity: {
+            dev: `${this.outputIdentity.dev}`,
+            ino: `${this.outputIdentity.ino}`,
+          },
+        });
+        return;
+      }
+      if (message.type === 'release') {
+        queueMicrotask(() => {
+          this.respond({ type: 'released' });
+          this.kill();
+        });
+        return;
+      }
+      this.fail();
+    } catch (_) {
+      this.fail();
+    }
+  }
+
+  kill() {
+    if (this.killed) return false;
+    this.killed = true;
+    if (this.outputFd !== null) {
+      try { fs.closeSync(this.outputFd); } catch (_) {}
+      this.outputFd = null;
+    }
+    queueMicrotask(() => this.emit('exit', 0));
+    return true;
+  }
+}
+
 setStub('electron', () => ({
   app: {
     requestSingleInstanceLock: () => true,
@@ -273,6 +648,9 @@ setStub('electron', () => ({
     createEmpty: () => ({}),
   },
   Notification: TestNotification,
+  utilityProcess: {
+    fork: (modulePath, args, options) => new TestUtilityProcess(modulePath, args, options),
+  },
   Menu: { buildFromTemplate: () => ({}) },
 }));
 
@@ -513,6 +891,8 @@ setStub('child_process', () => ({
   execFileSync: () => '',
   exec: execStub,
   execFile: execFileStub,
+  spawn: realSpawn,
+  spawnSync: realSpawnSync,
 }));
 
 let currentPsdFixture = { children: [], linkedFiles: [] };
@@ -1198,6 +1578,22 @@ function getPrivateStagedPackageRoot(filePath, outputDir) {
     const [stagingName, ...rest] = relative.split(path.sep);
     if (!stagingName.startsWith('.crate-package-staging-') || !rest.length) continue;
     return path.join(stagingParent, stagingName);
+  }
+  return null;
+}
+
+function findPrivateStagedPackageRoot(outputDir) {
+  const outputRoot = path.resolve(outputDir);
+  for (const stagingParent of [path.dirname(outputRoot), outputRoot]) {
+    if (!fs.existsSync(stagingParent)) continue;
+    const match = fs.readdirSync(stagingParent)
+      .filter(name => name.startsWith('.crate-package-staging-'))
+      .map(name => path.join(stagingParent, name))
+      .find(candidatePath => {
+        const stat = fs.lstatSync(candidatePath);
+        return !stat.isSymbolicLink() && stat.isDirectory();
+      });
+    if (match) return match;
   }
   return null;
 }
@@ -2083,6 +2479,8 @@ function assertPsdParserEdge(project, relationType, objectType, source) {
 
 test.afterEach(async () => {
   childProcessHandler = null;
+  childProcessSpawnHandler = null;
+  childProcessSpawnSyncHandler = null;
   testFetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   nextOpenDialogResult = { canceled: true };
   currentPsdFixture = { children: [], linkedFiles: [] };
@@ -2096,6 +2494,7 @@ test.afterEach(async () => {
     await waitForProjectCacheCleanup(projectIds);
   }
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
+  if (storeInstance) storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
   testNotificationSupported = false;
   testAppActive = true;
@@ -3041,6 +3440,7 @@ test('Quick Package consumes package quota only after successful packaging', asy
       data: Buffer.from('QUICK_PACKAGE_QUOTA_IMAGE_BYTES'.repeat(40)),
     }]);
 
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
     storeInstance.set('usage.packagesThisMonth', 2);
     const result = await callIpc('v2:package-file', deckPath);
     assert.equal(result.success, true);
@@ -3048,6 +3448,8 @@ test('Quick Package consumes package quota only after successful packaging', asy
     assert.equal(result.assetsCopied, 1);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 3);
     assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'Quick Quota Deck.pptx')), true);
+    assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'PPTX')), false);
+    assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'JPEG')), false);
     assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'Crate Diagnostics', 'crate-provenance.json')), false);
     assert.equal(fs.existsSync(path.join(quickPackageFolder(deckPath), 'crate-provenance.json')), false);
 
@@ -3494,6 +3896,698 @@ test('authoritative plan binds reviewed sources, PSD and presentation derivative
     assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1_1.png'), 'utf8'), 'PSD derived bytes');
     assert.equal(fs.readFileSync(path.join(result.folderPath, 'Deck — image1_2.png'), 'utf8'), 'PRESENTATION_DERIVED_BYTES'.repeat(40));
     assert.equal(fs.existsSync(path.join(result.folderPath, 'Unrelated.ai')), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized authoritative plan materializes every reviewed output at its bound extension path', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Authoritative Plan');
+    const sourcePath = path.join(tmpRoot, 'Brand-System.ai');
+    const deckPath = path.join(tmpRoot, 'Launch-Deck.pptx');
+    const pngPath = path.join(tmpRoot, 'source.png');
+    const parentPsd = path.join(tmpRoot, 'Parent.psd');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('organized source bytes'));
+    fs.writeFileSync(deckPath, Buffer.from('organized presentation bytes'));
+    fs.writeFileSync(pngPath, Buffer.from('organized reserved-name bytes'));
+    fs.writeFileSync(parentPsd, Buffer.from('organized PSD bytes'));
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: '_aux.png', data: Buffer.from('organized PSD resource bytes') }],
+    };
+    setPowerPointUnzipFixture([{
+      internalPath: 'ppt/media/image1.jpg',
+      data: Buffer.from('ORGANIZED_PRESENTATION_MEDIA'.repeat(40)),
+    }]);
+    await setProjectFiles(project.id, { files: [
+      { path: sourcePath, name: 'Brand-System.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+      { path: deckPath, name: 'Launch-Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse' },
+      { path: pngPath, name: 'aux.png', ext: '.png', addedAt: Date.now(), source: 'manual-browse' },
+      {
+        path: parentPsd,
+        parentPsd,
+        name: '_aux.png',
+        ext: '.png',
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        embeddedOriginalName: '_aux.png',
+        embeddedIndex: 0,
+        fileId: 'organized-psd-resource',
+      },
+    ] });
+    storeInstance.set('settings.includeDiagnosticReport', true);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 4);
+    assert.equal(result.embeddedCount, 1);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), [
+      'AI', 'Crate Diagnostics', 'JPG', 'PNG', 'PPTX',
+    ]);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'AI')), ['Brand-System.ai']);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'PPTX')), ['Launch-Deck.pptx']);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'PNG')).sort(), ['_aux.png', '_aux_1.png']);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'JPG')), ['Launch-Deck — image1.jpg']);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'AI', 'Brand-System.ai'), 'utf8'), 'organized source bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'PNG', '_aux.png'), 'utf8'), 'organized reserved-name bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'PNG', '_aux_1.png'), 'utf8'), 'organized PSD resource bytes');
+    assert.equal(
+      fs.readFileSync(path.join(result.folderPath, 'JPG', 'Launch-Deck — image1.jpg'), 'utf8'),
+      'ORGANIZED_PRESENTATION_MEDIA'.repeat(40)
+    );
+    assert.equal(
+      fs.existsSync(path.join(result.folderPath, 'Crate Diagnostics', 'crate-provenance.json')),
+      true
+    );
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+
+    const fresh = await getProject(project.id);
+    const outputPaths = [
+      ...getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE),
+      ...getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE),
+    ].map(edge => edge.payload.outputPath);
+    assert.equal(outputPaths.some(outputPath => outputPath.endsWith(path.join('AI', 'Brand-System.ai'))), true);
+    assert.equal(outputPaths.some(outputPath => outputPath.endsWith(path.join('PNG', '_aux.png'))), true);
+    assert.equal(outputPaths.some(outputPath => outputPath.endsWith(path.join('PNG', '_aux_1.png'))), true);
+    assert.equal(outputPaths.some(outputPath => outputPath.endsWith(path.join('JPG', 'Launch-Deck — image1.jpg'))), true);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized authoritative plan reallocates collisions introduced by portable leaf rewriting', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Portable Collisions');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    const fixtures = [
+      ['aux.png', 'reserved device bytes'],
+      ['_aux.png', 'literal underscore bytes'],
+      ['name.', 'trailing dot bytes'],
+      ['name_', 'literal underscore name bytes'],
+    ].map(([name, bytes]) => {
+      const sourcePath = path.join(tmpRoot, name);
+      fs.writeFileSync(sourcePath, bytes);
+      return { path: sourcePath, name, ext: path.extname(name).toLowerCase(), addedAt: Date.now(), source: 'manual-browse' };
+    });
+    await setProjectFiles(project.id, { files: fixtures });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'PNG')).sort(), ['_aux.png', '_aux_1.png']);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'OTHER')).sort(), ['name_', 'name__1']);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'PNG', '_aux.png'), 'utf8'), 'reserved device bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'PNG', '_aux_1.png'), 'utf8'), 'literal underscore bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'OTHER', 'name_'), 'utf8'), 'trailing dot bytes');
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'OTHER', 'name__1'), 'utf8'), 'literal underscore name bytes');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+
+    const fresh = await getProject(project.id);
+    const outputPaths = getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE)
+      .map(edge => edge.payload.outputPath);
+    assert.equal(new Set(outputPaths.map(outputPath => outputPath.normalize('NFC').toLowerCase())).size, 4);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized descriptor writer keeps shell metacharacter filenames out of direct and descendant process arguments', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Writer Quoting');
+    const sourceName = "client'$(touch crate-writer-injected).png";
+    const sourcePath = path.join(tmpRoot, sourceName);
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'quoted filename bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: sourceName,
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    let writerObserved = false;
+    setUtilityProcessHandler(({ phase, modulePath, args, options, message }) => {
+      if (phase !== 'message' || message.type !== 'write-start') return;
+      writerObserved = true;
+      assert.equal(args.join(' ').includes(sourceName), false);
+      assert.equal(modulePath.includes(sourceName), false);
+      assert.equal(options.cwd.includes(sourceName), false);
+      assert.deepEqual(options.env, {});
+      assert.deepEqual(options.execArgv, []);
+      assert.equal(options.allowLoadingUnsignedLibraries, false);
+      assert.equal(options.disclaim, false);
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.equal(writerObserved, true);
+    assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'PNG')), [sourceName]);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'PNG', sourceName), 'utf8'), 'quoted filename bytes');
+    assert.equal(fs.existsSync(path.join(result.folderPath, 'PNG', 'crate-writer-injected')), false);
+    assert.equal(fs.statSync(path.join(result.folderPath, 'PNG', sourceName)).mode & 0o777, 0o600);
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized high-count same-extension packaging uses one incremental utility session', async () => {
+  const tmpRoot = makeTempDir();
+  const fileCount = 512;
+  try {
+    const project = await createProject('Organized Bounded Utility Work');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    const files = Array.from({ length: fileCount }, (_, index) => {
+      const name = `Reviewed-${`${index}`.padStart(4, '0')}.ai`;
+      const sourcePath = path.join(tmpRoot, name);
+      fs.writeFileSync(sourcePath, `private-${index}`);
+      return {
+        path: sourcePath,
+        name,
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      };
+    });
+    await setProjectFiles(project.id, { files });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    let forkCount = 0;
+    let initCount = 0;
+    let writeCount = 0;
+    let ownershipAckCount = 0;
+    setUtilityProcessHandler(({ phase, message }) => {
+      if (phase === 'fork') forkCount++;
+      if (phase !== 'message') return;
+      if (message.type === 'init-session') {
+        initCount++;
+        assert.deepEqual(message.ownedOutputs, []);
+      }
+      if (message.type === 'write-start') writeCount++;
+      if (message.type === 'ownership-ack') ownershipAckCount++;
+    });
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.equal(forkCount, 1);
+    assert.equal(initCount, 1);
+    assert.equal(writeCount, fileCount);
+    assert.equal(ownershipAckCount, fileCount);
+    assert.equal(fs.readdirSync(path.join(result.folderPath, 'AI')).length, fileCount);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized utility process failures settle before spawn and across stalled protocol phases', async () => {
+  const scenarios = [
+    {
+      label: 'no spawn',
+      configure(child) { child.autoSpawn = false; },
+    },
+    {
+      label: 'pre-spawn error',
+      configure(child) {
+        child.autoSpawn = false;
+        queueMicrotask(() => child.emit('error', new Error('forced pre-spawn error')));
+      },
+    },
+    {
+      label: 'pre-spawn exit',
+      configure(child) {
+        child.autoSpawn = false;
+        queueMicrotask(() => child.emit('exit', 1));
+      },
+    },
+    {
+      label: 'stalled acknowledgement',
+      configure(child) { child.suppressedMessages.add('chunk'); },
+    },
+    {
+      label: 'stalled completion',
+      configure(child) { child.suppressedMessages.add('end'); },
+    },
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const tmpRoot = makeTempDir();
+    try {
+      const project = await createProject(`Organized Utility ${scenario.label}`);
+      const sourcePath = path.join(tmpRoot, `Reviewed-${index}.ai`);
+      const outputDir = path.join(tmpRoot, 'out');
+      fs.mkdirSync(outputDir);
+      fs.writeFileSync(sourcePath, `${scenario.label} private bytes`);
+      await setProjectFiles(project.id, { files: [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }] });
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const before = capturePackageSideEffects(stored);
+      let faultInjected = false;
+      setUtilityProcessHandler(({ phase, child }) => {
+        if (phase !== 'fork' || faultInjected) return;
+        faultInjected = true;
+        scenario.configure(child);
+      });
+      const trackedTimeout = global.setTimeout;
+      global.setTimeout = (fn, delay, ...args) => trackedTimeout(
+        fn,
+        delay === 30_000 ? 0 : delay,
+        ...args
+      );
+
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+      assert.equal(faultInjected, true, scenario.label);
+      assert.equal(result.error, 'package_output_changed', scenario.label);
+      assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    } finally {
+      global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
+        let timer;
+        const wrapped = (...wrappedArgs) => {
+          activeTimeouts.delete(timer);
+          return fn(...wrappedArgs);
+        };
+        timer = originalSetTimeout(wrapped, delay, ...args);
+        activeTimeouts.add(timer);
+        return timer;
+      };
+      setUtilityProcessHandler(null);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('organized cleanup retains exact ownership when a completed response is lost after directory movement', async () => {
+  const tmpRoot = makeTempDir();
+  const trackedTimeout = global.setTimeout;
+  try {
+    const project = await createProject('Organized Lost Completion Ownership');
+    const outputDir = path.join(tmpRoot, 'out');
+    const firstPath = path.join(tmpRoot, 'First.ai');
+    const secondPath = path.join(tmpRoot, 'Second.ai');
+    const outsideParent = path.join(tmpRoot, 'outside-parent');
+    const movedGroup = path.join(outsideParent, 'moved-ai-group');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsideParent);
+    fs.writeFileSync(firstPath, 'first private source bytes');
+    fs.writeFileSync(secondPath, 'second private source bytes');
+    await setProjectFiles(project.id, { files: [
+      { path: firstPath, name: 'First.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+      { path: secondPath, name: 'Second.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+    ] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let completionSuppressed = false;
+
+    setUtilityProcessHandler(({ phase, message, options, child }) => {
+      if (
+        phase !== 'response' ||
+        completionSuppressed ||
+        message.type !== 'complete' ||
+        child.outputLeafName !== 'Second.ai'
+      ) return;
+      const workingPath = child.currentWorkingPath();
+      fs.renameSync(workingPath, movedGroup);
+      fs.symlinkSync(movedGroup, options.cwd, 'dir');
+      fs.writeFileSync(path.join(movedGroup, 'sentinel.txt'), 'unrelated sentinel');
+      child.suppressedResponses.add('complete');
+      completionSuppressed = true;
+    });
+    global.setTimeout = (fn, delay, ...args) => trackedTimeout(
+      fn,
+      delay === 30_000 ? 0 : delay,
+      ...args
+    );
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(completionSuppressed, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(movedGroup), ['sentinel.txt']);
+    assert.equal(fs.readFileSync(path.join(movedGroup, 'sentinel.txt'), 'utf8'), 'unrelated sentinel');
+  } finally {
+    global.setTimeout = function trackedSetTimeout(fn, delay, ...args) {
+      let timer;
+      const wrapped = (...wrappedArgs) => {
+        activeTimeouts.delete(timer);
+        return fn(...wrappedArgs);
+      };
+      timer = originalSetTimeout(wrapped, delay, ...args);
+      activeTimeouts.add(timer);
+      return timer;
+    };
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized parent rejects a completed identity that differs from acknowledged ownership', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Completion Identity Mismatch');
+    const outputDir = path.join(tmpRoot, 'out');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed private source bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let identityChanged = false;
+
+    setUtilityProcessHandler(({ phase, message, child }) => {
+      if (
+        phase !== 'response' ||
+        identityChanged ||
+        message.type !== 'complete' ||
+        child.outputLeafName !== 'Reviewed.ai'
+      ) return;
+      message.outputIdentity.ino = `${BigInt(message.outputIdentity.ino) + 1n}`;
+      identityChanged = true;
+    });
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(identityChanged, true);
+    assert.equal(result.error, 'package_output_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized package fails closed when an acknowledged output leaf is renamed before writing', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Renamed Acknowledged Output');
+    const outputDir = path.join(tmpRoot, 'out');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'reviewed private source bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let renamed = false;
+
+    setUtilityProcessHandler(({ phase, message, child }) => {
+      if (phase !== 'response' || renamed || message.type !== 'ready') return;
+      const workingPath = child.currentWorkingPath();
+      fs.renameSync(
+        path.join(workingPath, 'Reviewed.ai'),
+        path.join(workingPath, 'Renamed.ai')
+      );
+      fs.writeFileSync(path.join(workingPath, 'sentinel.txt'), 'unrelated sentinel');
+      renamed = true;
+    });
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(renamed, true);
+    assert.equal(result.error, 'package_output_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized package truncates an outside hard link inserted after the first chunk', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Midstream Hard Link');
+    const outputDir = path.join(tmpRoot, 'out');
+    const outsideDir = path.join(tmpRoot, 'outside');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(path.join(outsideDir, 'sentinel.txt'), 'unrelated sentinel');
+    fs.writeFileSync(sourcePath, Buffer.alloc((1024 * 1024) + 64, 0x52));
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    const outsideLink = path.join(outsideDir, 'Captured.ai');
+    let linked = false;
+
+    setUtilityProcessHandler(({ phase, message, child }) => {
+      if (
+        phase !== 'response' ||
+        linked ||
+        message.type !== 'ack' ||
+        message.sequence !== 0
+      ) return;
+      fs.linkSync(path.join(child.currentWorkingPath(), 'Reviewed.ai'), outsideLink);
+      linked = true;
+    });
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(linked, true);
+    assert.equal(result.error, 'package_output_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.equal(fs.readFileSync(outsideLink).length, 0);
+    assert.equal(fs.readFileSync(path.join(outsideDir, 'sentinel.txt'), 'utf8'), 'unrelated sentinel');
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+for (const movementPhase of ['before second initialization', 'during second chunk']) {
+  test(`organized cleanup removes earlier same-extension bytes after movement ${movementPhase}`, async () => {
+    const tmpRoot = makeTempDir();
+    try {
+      const project = await createProject(`Organized Ownership ${movementPhase}`);
+      const outputDir = path.join(tmpRoot, 'out');
+      const firstPath = path.join(tmpRoot, 'First.ai');
+      const secondPath = path.join(tmpRoot, 'Second.ai');
+      const outsideParent = path.join(tmpRoot, 'outside-parent');
+      const movedGroup = path.join(outsideParent, 'moved-ai-group');
+      fs.mkdirSync(outputDir);
+      fs.mkdirSync(outsideParent);
+      fs.writeFileSync(firstPath, 'first private source bytes');
+      fs.writeFileSync(secondPath, 'second private source bytes');
+      await setProjectFiles(project.id, { files: [
+        { path: firstPath, name: 'First.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+        { path: secondPath, name: 'Second.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' },
+      ] });
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const before = capturePackageSideEffects(stored);
+      let movementInjected = false;
+
+      setUtilityProcessHandler(({ phase, message, options, child }) => {
+        if (phase !== 'message' || movementInjected) return;
+        const secondInit = message.type === 'write-start' && message.leafName === 'Second.ai';
+        const secondChunk = message.type === 'chunk' && child.outputLeafName === 'Second.ai';
+        if (
+          (movementPhase === 'before second initialization' && !secondInit) ||
+          (movementPhase === 'during second chunk' && !secondChunk)
+        ) return;
+        if (secondInit) assert.deepEqual(child.ownedOutputs.map(item => item.leafName), ['First.ai']);
+        fs.renameSync(options.cwd, movedGroup);
+        fs.symlinkSync(movedGroup, options.cwd, 'dir');
+        fs.writeFileSync(path.join(movedGroup, 'sentinel.txt'), 'unrelated sentinel');
+        movementInjected = true;
+      });
+
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+      assert.equal(movementInjected, true);
+      assert.equal(result.error, 'package_cleanup_failed');
+      assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+      assert.deepEqual(fs.readdirSync(movedGroup), ['sentinel.txt']);
+      assert.equal(fs.readFileSync(path.join(movedGroup, 'sentinel.txt'), 'utf8'), 'unrelated sentinel');
+    } finally {
+      setUtilityProcessHandler(null);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test('organized writer rejects an ancestor moved before immutable ancestry validation', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Organized Immutable Ancestry');
+    const container = path.join(tmpRoot, 'container');
+    const outsideParent = path.join(tmpRoot, 'outside-parent');
+    const movedContainer = path.join(outsideParent, 'moved-container');
+    const outputDir = path.join(container, 'out');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.mkdirSync(outsideParent);
+    fs.writeFileSync(sourcePath, 'immutable ancestry private bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Reviewed.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let movementInjected = false;
+
+    setUtilityProcessHandler(({ phase }) => {
+      if (phase !== 'fork' || movementInjected) return;
+      fs.renameSync(container, movedContainer);
+      fs.symlinkSync(movedContainer, container, 'dir');
+      fs.writeFileSync(path.join(movedContainer, 'sentinel.txt'), 'unrelated sentinel');
+      movementInjected = true;
+    });
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(movementInjected, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assert.equal(storeInstance.get('usage.packagesThisMonth', 0), before.packagesThisMonth || 0);
+    assert.equal(stored.status, before.status);
+    assert.equal(stored.packagedAt, before.packagedAt);
+    assert.equal(stored.outputPath, before.outputPath);
+    assert.equal(fs.readFileSync(path.join(movedContainer, 'sentinel.txt'), 'utf8'), 'unrelated sentinel');
+    const remainingFiles = [];
+    const visit = candidate => {
+      for (const entry of fs.readdirSync(candidate, { withFileTypes: true })) {
+        const entryPath = path.join(candidate, entry.name);
+        if (entry.isDirectory()) visit(entryPath);
+        else if (!entry.isSymbolicLink()) remainingFiles.push(entryPath);
+      }
+    };
+    visit(movedContainer);
+    assert.deepEqual(remainingFiles, [path.join(movedContainer, 'sentinel.txt')]);
+  } finally {
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('absent and invalid layout settings preserve exact legacy flat Project Workspace output', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const cases = [
+      { label: 'Absent Layout', value: undefined },
+      { label: 'Invalid Layout', value: 'organized-someday' },
+    ];
+    for (const [index, scenario] of cases.entries()) {
+      const project = await createProject(scenario.label);
+      const sourceName = `${scenario.label}.ai`;
+      const sourcePath = path.join(tmpRoot, sourceName);
+      const outputDir = path.join(tmpRoot, `out-${index}`);
+      fs.mkdirSync(outputDir);
+      fs.writeFileSync(sourcePath, `${scenario.label} bytes`);
+      await setProjectFiles(project.id, { files: [{
+        path: sourcePath,
+        name: sourceName,
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }] });
+      if (scenario.value === undefined) storeInstance.delete('settings.packageOutputLayoutMode');
+      else storeInstance.set('settings.packageOutputLayoutMode', scenario.value);
+
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+      assert.equal(result.success, true, scenario.label);
+      assert.deepEqual(fs.readdirSync(result.folderPath), [sourceName], scenario.label);
+      assert.equal(fs.readFileSync(path.join(result.folderPath, sourceName), 'utf8'), `${scenario.label} bytes`);
+      assert.equal(fs.existsSync(path.join(result.folderPath, 'AI')), false, scenario.label);
+    }
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('changing the package layout mode invalidates flat review authority before any output or quota use', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Layout Review Authority');
+    const sourcePath = path.join(tmpRoot, 'Layout.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'layout authority bytes');
+    const stored = await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: 'Layout.ai',
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    const flatReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    const before = capturePackageSideEffects(stored);
+
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const changed = await callIpcRaw('projects:package', project.id, outputDir, flatReview.token);
+
+    assert.equal(changed.error, 'package_review_changed');
+    assert.equal(typeof changed.review.token, 'string');
+    assert.deepEqual(fs.readdirSync(outputDir), []);
+    assert.deepEqual(capturePackageSideEffects(stored), before);
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, changed.review.token);
+    assert.equal(result.success, true);
+    assert.equal(fs.readFileSync(path.join(result.folderPath, 'AI', 'Layout.ai'), 'utf8'), 'layout authority bytes');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -4198,6 +5292,10 @@ async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) 
     fs.mkdirSync(outputDir);
     fs.writeFileSync(sourcePath, 'reviewed staged tree bytes');
     storeInstance.set('settings.includeDiagnosticReport', options.diagnostics === true);
+    storeInstance.set(
+      'settings.packageOutputLayoutMode',
+      options.organized === true ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT
+    );
     const stored = await setProjectFiles(project.id, { files: [{
       path: sourcePath,
       name: 'Reviewed.ai',
@@ -4208,10 +5306,18 @@ async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) 
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     const before = capturePackageSideEffects(stored);
 
+    if (options.organized === true) {
+      setUtilityProcessHandler(({ phase, message }) => {
+        if (phase !== 'message' || message.type !== 'write-start' || stagingRoot) return;
+        stagingRoot = findPrivateStagedPackageRoot(outputDir);
+        stagedFilePath = stagingRoot ? path.join(stagingRoot, 'AI', 'Reviewed.ai') : null;
+      });
+    }
+
     fs.promises.open = async function captureStagedDestination(candidatePath, flags, ...args) {
       const handle = await originalOpen.call(fs.promises, candidatePath, flags, ...args);
-      if (flags === 'wx' && isExpectedStagedPackageWrite(candidatePath, outputDir, 'Reviewed.ai')) {
-        stagingRoot = getPrivateStagedPackageRoot(candidatePath, outputDir);
+      if (flags === 'wx' && path.basename(candidatePath) === 'Reviewed.ai') {
+        stagingRoot = getPrivateStagedPackageRoot(candidatePath, outputDir) || findPrivateStagedPackageRoot(outputDir);
         stagedFilePath = candidatePath;
       }
       return handle;
@@ -4237,9 +5343,11 @@ async function assertStagedTreeMutationFailsClosed(label, mutate, options = {}) 
     assertFailedPackageHasNoSideEffects(stored, outputDir, before);
     assertNoPrivatePackageStaging(outputDir, stagingRoot);
   } finally {
+    setUtilityProcessHandler(null);
     fs.promises.open = originalOpen;
     fs.readdirSync = originalReaddirSync;
     storeInstance.set('settings.includeDiagnosticReport', false);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 }
@@ -4301,6 +5409,485 @@ for (const scenario of STAGED_TREE_MUTATION_SCENARIOS) {
     await assertStagedTreeMutationFailsClosed(scenario.label, scenario.mutate, scenario);
   });
 }
+
+test('organized nested staged tree rejects an extra child and removes every private directory', async () => {
+  await assertStagedTreeMutationFailsClosed('organized nested extra child', ({ stagingRoot }) => {
+    const extraDir = path.join(stagingRoot, 'AI', 'unexpected');
+    fs.mkdirSync(extraDir);
+    fs.writeFileSync(path.join(extraDir, 'extra.bin'), 'unexpected nested staged bytes');
+  }, { organized: true });
+});
+
+const ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS = [
+  {
+    label: 'source copy',
+    targetSpawn: 1,
+    targetLeaf: 'Reviewed.ai',
+    setup(tmpRoot) {
+      const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+      fs.writeFileSync(sourcePath, 'organized reviewed source bytes');
+      return [{ path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' }];
+    },
+  },
+  {
+    label: 'PSD embedded resource',
+    targetSpawn: 1,
+    targetLeaf: 'Embedded.png',
+    setup(tmpRoot) {
+      const parentPsd = path.join(tmpRoot, 'Parent.psd');
+      fs.writeFileSync(parentPsd, 'organized parent PSD bytes');
+      currentPsdFixture = {
+        children: [],
+        linkedFiles: [{ name: 'Embedded.png', data: Buffer.from('organized embedded PSD bytes') }],
+      };
+      return [{
+        path: parentPsd,
+        parentPsd,
+        name: 'Embedded.png',
+        ext: '.png',
+        source: 'scan-on-save-embedded',
+        embedded: true,
+        embeddedOriginalName: 'Embedded.png',
+        embeddedIndex: 0,
+        fileId: 'organized-tamper-psd-resource',
+      }];
+    },
+  },
+  {
+    label: 'presentation media',
+    targetSpawn: 2,
+    targetLeaf: 'Deck — image1.jpg',
+    setup(tmpRoot) {
+      const deckPath = path.join(tmpRoot, 'Deck.pptx');
+      fs.writeFileSync(deckPath, 'organized presentation source bytes');
+      setPowerPointUnzipFixture([{
+        internalPath: 'ppt/media/image1.jpg',
+        data: Buffer.from('ORGANIZED_TAMPER_PRESENTATION'.repeat(40)),
+      }]);
+      return [{ path: deckPath, name: 'Deck.pptx', ext: '.pptx', addedAt: Date.now(), source: 'manual-browse' }];
+    },
+  },
+  {
+    label: 'diagnostics manifest',
+    targetSpawn: 2,
+    targetLeaf: 'crate-provenance.json',
+    includeDiagnosticReport: true,
+    expectedError: 'diagnostic_manifest_write_failed',
+    setup(tmpRoot) {
+      const sourcePath = path.join(tmpRoot, 'Diagnostics.ai');
+      fs.writeFileSync(sourcePath, 'organized diagnostics source bytes');
+      return [{ path: sourcePath, name: 'Diagnostics.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse' }];
+    },
+  },
+];
+
+for (const scenario of ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS) {
+  test(`organized ${scenario.label} writer rejects physical group substitution without outside writes`, async () => {
+    const tmpRoot = makeTempDir();
+    try {
+      const project = await createProject(`Organized ${scenario.label} Substitution`);
+      const outputDir = path.join(tmpRoot, 'out');
+      const outsidePath = path.join(tmpRoot, 'outside');
+      fs.mkdirSync(outputDir);
+      fs.mkdirSync(outsidePath);
+      fs.writeFileSync(path.join(outsidePath, 'sentinel.txt'), `${scenario.label} sentinel`);
+      await setProjectFiles(project.id, { files: scenario.setup(tmpRoot) });
+      storeInstance.set('settings.includeDiagnosticReport', scenario.includeDiagnosticReport === true);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const before = capturePackageSideEffects(stored);
+      let packageWriterSpawnCount = 0;
+      let substituted = false;
+
+      setUtilityProcessHandler(({ phase, options, message }) => {
+        if (phase !== 'message' || message.type !== 'write-start') return;
+        packageWriterSpawnCount++;
+        if (packageWriterSpawnCount !== scenario.targetSpawn) return;
+        const movedGroup = `${options.cwd}-moved`;
+        fs.renameSync(options.cwd, movedGroup);
+        fs.symlinkSync(outsidePath, options.cwd, 'dir');
+        substituted = true;
+      });
+
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+      assert.equal(substituted, true);
+      assert.equal(result.error, scenario.expectedError || 'package_output_changed');
+      assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+      assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
+      assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), `${scenario.label} sentinel`);
+      assert.equal(
+        fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
+        false
+      );
+    } finally {
+      setUtilityProcessHandler(null);
+      storeInstance.set('settings.includeDiagnosticReport', false);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const scenario of ORGANIZED_PHYSICAL_GROUP_SWAP_SCENARIOS) {
+  test(`organized ${scenario.label} writer rejects a FIFO leaf before copying private bytes`, async () => {
+    const tmpRoot = makeTempDir();
+    let fifoReadFd = null;
+    try {
+      const project = await createProject(`Organized ${scenario.label} FIFO`);
+      const outputDir = path.join(tmpRoot, 'out');
+      fs.mkdirSync(outputDir);
+      await setProjectFiles(project.id, { files: scenario.setup(tmpRoot) });
+      storeInstance.set('settings.includeDiagnosticReport', scenario.includeDiagnosticReport === true);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const before = capturePackageSideEffects(stored);
+      let packageWriterSpawnCount = 0;
+      let fifoPath = null;
+
+      setUtilityProcessHandler(({ phase, options, message }) => {
+        if (phase !== 'message' || message.type !== 'write-start') return;
+        packageWriterSpawnCount++;
+        if (packageWriterSpawnCount !== scenario.targetSpawn) return;
+        fifoPath = path.join(options.cwd, scenario.targetLeaf);
+        const mkfifo = realSpawnSync('mkfifo', [fifoPath], { encoding: 'utf8' });
+        assert.equal(mkfifo.status, 0, mkfifo.stderr || `${scenario.label} FIFO creation failed`);
+        fifoReadFd = fs.openSync(fifoPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+      });
+
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+      assert.notEqual(fifoPath, null);
+      assert.equal(result.error, scenario.expectedError || 'package_output_changed');
+      assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+      const observed = Buffer.alloc(256);
+      let bytesRead = 0;
+      try {
+        bytesRead = fs.readSync(fifoReadFd, observed, 0, observed.length, null);
+      } catch (error) {
+        assert.equal(error.code, 'EAGAIN');
+      }
+      assert.equal(bytesRead, 0, `${scenario.label} must not write private bytes to the substituted FIFO`);
+      assert.equal(
+        fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
+        false
+      );
+    } finally {
+      if (fifoReadFd !== null) fs.closeSync(fifoReadFd);
+      setUtilityProcessHandler(null);
+      storeInstance.set('settings.includeDiagnosticReport', false);
+      storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test('organized group rename substitution retains cleanup ownership until identity is proven', async () => {
+  const tmpRoot = makeTempDir();
+  const originalRenameSync = fs.renameSync;
+  try {
+    const project = await createProject('Organized Rename Substitution');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    const outsidePath = path.join(tmpRoot, 'outside');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsidePath);
+    fs.writeFileSync(sourcePath, 'organized rename source bytes');
+    fs.writeFileSync(path.join(outsidePath, 'sentinel.txt'), 'rename sentinel');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let substituted = false;
+
+    fs.renameSync = function substituteGroupDuringFinalize(source, destination) {
+      if (!substituted && path.basename(source).startsWith('.crate-package-group-')) {
+        const movedGroup = `${source}-moved`;
+        originalRenameSync.call(fs, source, movedGroup);
+        fs.symlinkSync(outsidePath, source, 'dir');
+        substituted = true;
+      }
+      return originalRenameSync.call(fs, source, destination);
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(substituted, true);
+    assert.equal(result.error, 'package_output_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
+    assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), 'rename sentinel');
+    assert.equal(
+      fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
+      false
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized finalized group movement is reclaimed after successful identity verification', async () => {
+  const tmpRoot = makeTempDir();
+  const originalLstatSync = fs.lstatSync;
+  try {
+    const project = await createProject('Organized Post Finalization Movement');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    const outsidePath = path.join(tmpRoot, 'outside');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsidePath);
+    fs.writeFileSync(sourcePath, 'organized post-finalization bytes');
+    fs.writeFileSync(path.join(outsidePath, 'sentinel.txt'), 'post-finalization sentinel');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let movedGroupPath = null;
+
+    fs.lstatSync = function moveFinalizedGroupAfterIdentityRead(candidatePath, ...args) {
+      const stat = originalLstatSync.call(fs, candidatePath, ...args);
+      if (
+        !movedGroupPath &&
+        path.basename(candidatePath) === 'AI' &&
+        path.basename(path.dirname(candidatePath)).startsWith('.crate-package-staging-') &&
+        !stat.isSymbolicLink() &&
+        stat.isDirectory()
+      ) {
+        movedGroupPath = path.join(path.dirname(candidatePath), '.crate-package-group-retained');
+        fs.renameSync(candidatePath, movedGroupPath);
+        fs.symlinkSync(outsidePath, candidatePath, 'dir');
+      }
+      return stat;
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.notEqual(movedGroupPath, null);
+    assert.equal(result.error, 'package_review_changed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
+    assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), 'post-finalization sentinel');
+    assert.equal(fs.existsSync(movedGroupPath), false);
+    assert.equal(
+      fs.readdirSync(tmpRoot).some(name => name.startsWith('.crate-package-staging-') || name.startsWith('.crate-package-group-')),
+      false
+    );
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+async function assertCleanupAncestorSubstitutionFailsClosed(target) {
+  const tmpRoot = makeTempDir();
+  const originalReaddirSync = fs.readdirSync;
+  try {
+    const project = await createProject(`Organized ${target} Cleanup Race`);
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    const outsidePath = path.join(tmpRoot, 'outside');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsidePath);
+    fs.writeFileSync(sourcePath, `${target} cleanup source bytes`);
+    fs.writeFileSync(path.join(outsidePath, 'sentinel.txt'), `${target} cleanup sentinel`);
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let stagingRoot = null;
+    let stagingEnumerations = 0;
+    let failureInjected = false;
+    let cleanupSubstituted = false;
+    let movedPath = null;
+
+    setUtilityProcessHandler(({ phase, message }) => {
+      if (phase !== 'message' || message.type !== 'write-start' || stagingRoot) return;
+      stagingRoot = findPrivateStagedPackageRoot(outputDir);
+    });
+    fs.readdirSync = function injectFailureAfterGroupFinalization(candidatePath, ...args) {
+      if (stagingRoot && path.resolve(candidatePath) === path.resolve(stagingRoot)) {
+        stagingEnumerations++;
+        if (stagingEnumerations === 2) {
+          fs.writeFileSync(path.join(stagingRoot, 'unexpected.bin'), 'force final verification failure');
+          failureInjected = true;
+        }
+      }
+      return originalReaddirSync.call(fs, candidatePath, ...args);
+    };
+    const captureWriter = utilityProcessHandler;
+    setUtilityProcessHandler(request => {
+      captureWriter(request);
+      const { phase, message, options } = request;
+      if (
+        cleanupSubstituted ||
+        phase !== 'message' ||
+        message.type !== 'cleanup'
+      ) return;
+      const currentGroupPath = stagingRoot ? path.join(stagingRoot, 'AI') : null;
+      const isGroupCleanup = !!currentGroupPath && fs.existsSync(currentGroupPath);
+      const isRootCleanup = path.basename(options.cwd).startsWith('.crate-package-staging-');
+      if ((target === 'group' && !isGroupCleanup) || (target === 'staging root' && !isRootCleanup)) return;
+      const targetPath = target === 'group' ? currentGroupPath : options.cwd;
+      movedPath = path.join(
+        tmpRoot,
+        target === 'group' ? '.crate-package-group-cleanup-race' : '.crate-package-staging-cleanup-race'
+      );
+      fs.renameSync(targetPath, movedPath);
+      fs.symlinkSync(outsidePath, targetPath, 'dir');
+      cleanupSubstituted = true;
+    });
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(failureInjected, true);
+    assert.equal(cleanupSubstituted, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
+    assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), `${target} cleanup sentinel`);
+    assert.equal(fs.existsSync(movedPath), true);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    setUtilityProcessHandler(null);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+test('organized finalized-group cleanup refuses an ancestor substitution before recursive removal', async () => {
+  await assertCleanupAncestorSubstitutionFailsClosed('group');
+});
+
+test('organized staging-root cleanup refuses an ancestor substitution before recursive removal', async () => {
+  await assertCleanupAncestorSubstitutionFailsClosed('staging root');
+});
+
+test('organized group constructor cleanup refuses an unprovable ancestor substitution', async () => {
+  const tmpRoot = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  try {
+    const project = await createProject('Organized Group Constructor Cleanup Race');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    const outsidePath = path.join(tmpRoot, 'outside');
+    const retentionRoot = path.join(tmpRoot, 'retained');
+    const retainedGroupPath = path.join(retentionRoot, '.crate-package-group-constructor-retained');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(outsidePath);
+    fs.chmodSync(outsidePath, 0o755);
+    fs.mkdirSync(retentionRoot);
+    fs.writeFileSync(sourcePath, 'constructor cleanup source bytes');
+    fs.writeFileSync(path.join(outsidePath, 'sentinel.txt'), 'constructor cleanup sentinel');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+    let substituted = false;
+
+    const outsideMode = fs.statSync(outsidePath).mode & 0o777;
+    fs.openSync = function substituteGroupBeforeConstructorValidation(candidatePath, ...args) {
+      if (!substituted && path.basename(candidatePath).startsWith('.crate-package-group-')) {
+        fs.renameSync(candidatePath, retainedGroupPath);
+        fs.symlinkSync(outsidePath, candidatePath, 'dir');
+        substituted = true;
+      }
+      return originalOpenSync.call(fs, candidatePath, ...args);
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(substituted, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+    assert.deepEqual(fs.readdirSync(outsidePath), ['sentinel.txt']);
+    assert.equal(fs.readFileSync(path.join(outsidePath, 'sentinel.txt'), 'utf8'), 'constructor cleanup sentinel');
+    assert.equal(fs.statSync(outsidePath).mode & 0o777, outsideMode);
+    assert.equal(fs.existsSync(retainedGroupPath), true);
+    assert.equal(
+      fs.readdirSync(outputDir).some(name => name.startsWith('.crate-package-group-')),
+      false
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized directory ownership compares above-safe-integer inode identities exactly', async () => {
+  const tmpRoot = makeTempDir();
+  const originalLstatSync = fs.lstatSync;
+  const firstIno = 9007199254740992n;
+  const secondIno = 9007199254740993n;
+  let bigintReads = 0;
+  let numberReads = 0;
+  let legacyNumberCreationSeen = false;
+  const withIno = (stat, ino) => new Proxy(stat, {
+    get(target, property) {
+      if (property === 'ino') return ino;
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  try {
+    assert.notEqual(firstIno, secondIno);
+    assert.equal(Number(firstIno), Number(secondIno));
+    const project = await createProject('Organized Exact Directory Identity');
+    const sourcePath = path.join(tmpRoot, 'Reviewed.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'exact directory identity bytes');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath, name: 'Reviewed.ai', ext: '.ai', addedAt: Date.now(), source: 'manual-browse',
+    }] });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const before = capturePackageSideEffects(stored);
+
+    fs.lstatSync = function substituteRoundedGroupIdentity(candidatePath, options, ...args) {
+      const stat = originalLstatSync.call(fs, candidatePath, options, ...args);
+      if (!path.basename(`${candidatePath}`).startsWith('.crate-package-group-')) return stat;
+      if (options?.bigint === true) {
+        if (legacyNumberCreationSeen) return stat;
+        bigintReads++;
+        return withIno(stat, bigintReads === 1 ? firstIno : secondIno);
+      }
+      if (!/getOrCreateGroup|privatePackageDirectoryMatches|isOriginal/.test(new Error().stack || '')) return stat;
+      legacyNumberCreationSeen = true;
+      numberReads++;
+      return withIno(stat, Number(numberReads === 1 ? firstIno : secondIno));
+    };
+
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(numberReads, 0, 'package directory ownership must never use rounded Number identities');
+    assert.equal(bigintReads >= 2, true);
+    assert.equal(result.error, 'package_cleanup_failed');
+    assertFailedPackageHasNoSideEffects(stored, outputDir, before);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
 
 test('final verification cleans staging when the selected root moves outside its original parent', async () => {
   const tmpRoot = makeTempDir();
@@ -4575,6 +6162,7 @@ async function assertLateStagingInputChangeRefreshes(scenario, mutate, verifyRev
     );
   } finally {
     storeInstance.set('settings.includeDiagnosticReport', false);
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     fs.promises.writeFile = originalWriteFile;
     releaseWrite();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -4608,6 +6196,17 @@ test('diagnostics setting mutation during slow staging refreshes review and leav
     review => {
       assert.equal(review.materializable, true);
       assert.equal(review.planSummary.diagnosticsMetadataIncluded, true);
+      assert.equal(typeof review.token, 'string');
+    }
+  );
+});
+
+test('layout setting mutation during slow staging refreshes review and removes staging', async () => {
+  await assertLateStagingInputChangeRefreshes(
+    'layout-settings',
+    () => storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION),
+    review => {
+      assert.equal(review.materializable, true);
       assert.equal(typeof review.token, 'string');
     }
   );
@@ -6448,7 +8047,7 @@ test('PowerPoint provenance stays internal when diagnostic report is disabled', 
   }
 });
 
-test('diagnostic manifest package transaction preserves normal modes and fails closed after a partial FD write', async () => {
+test('diagnostic manifest package transaction preserves normal modes and fails closed after a partial write', async () => {
   const tmpRoot = makeTempDir();
   const originalOpenSync = fs.openSync;
   const originalWriteFileSync = fs.writeFileSync;
@@ -6524,18 +8123,15 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
       if (
         typeof filePath === 'string' &&
         path.basename(filePath) === 'crate-provenance.json' &&
-        path.basename(path.dirname(filePath)) === 'Crate Diagnostics' &&
-        !!getPrivateStagedPackageRoot(filePath, outputDir)
-      ) {
-        manifestFd = fd;
-      }
+        path.basename(path.dirname(filePath)) === 'Crate Diagnostics'
+      ) manifestFd = fd;
       return fd;
     };
-    fs.writeFileSync = function partialManifestFdWrite(file, ...args) {
+    fs.writeFileSync = function partialManifestWrite(file, ...args) {
       if (!injectedFailure && typeof file === 'number' && file === manifestFd) {
         injectedFailure = true;
         originalWriteFileSync.call(fs, file, '{"schemaVersion":');
-        throw new Error('forced diagnostic manifest partial FD write');
+        throw new Error('forced diagnostic manifest partial write');
       }
       return originalWriteFileSync.call(fs, file, ...args);
     };
