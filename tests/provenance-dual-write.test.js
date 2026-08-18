@@ -7808,6 +7808,71 @@ test('normal project package quota survives UTC rollover before local reset day'
   }
 });
 
+test('normal project package completion resets quota when packaging crosses the local month boundary', async () => {
+  const tmpRoot = makeTempDir();
+  const RealDate = global.Date;
+  const originalRenameSync = fs.renameSync;
+  let now = new RealDate(2026, 5, 30, 23, 59, 59).getTime();
+  class MutableDate extends RealDate {
+    constructor(...args) {
+      if (args.length === 0) {
+        super(now);
+      } else {
+        super(...args);
+      }
+    }
+    static now() { return now; }
+    static parse(value) { return RealDate.parse(value); }
+    static UTC(...args) { return RealDate.UTC(...args); }
+  }
+
+  try {
+    global.Date = MutableDate;
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject('Normal Package Completion Rollover');
+    const sourcePath = path.join(tmpRoot, 'Rollover.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, Buffer.from('normal package completion rollover bytes'));
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: 'Rollover.ai',
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    storeInstance.set('usage', {
+      packagesThisMonth: 2,
+      resetDate: '2026-07-01',
+    });
+
+    let crossedBoundaryDuringPackage = false;
+    fs.renameSync = function advanceClockAtPackagePublication(source, destination, ...args) {
+      if (
+        path.basename(source).startsWith('.crate-package-staging-') &&
+        path.dirname(path.resolve(destination)) === path.resolve(outputDir)
+      ) {
+        crossedBoundaryDuringPackage = true;
+        now = new RealDate(2026, 6, 1, 0, 0, 1).getTime();
+      }
+      return originalRenameSync.call(fs, source, destination, ...args);
+    };
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(crossedBoundaryDuringPackage, true);
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+    assert.equal(storeInstance.get('usage.resetDate'), '2026-08-01');
+  } finally {
+    fs.renameSync = originalRenameSync;
+    global.Date = RealDate;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('background project package leaves app hidden when native notification is shown', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -8321,6 +8386,135 @@ test('PowerPoint provenance stays internal when diagnostic report is disabled', 
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package completion persists provenance, status, output history, and quota in one store write', async () => {
+  const tmpRoot = makeTempDir();
+  const originalStoreSet = storeInstance.set;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const project = await createProject('Atomic package completion');
+    const sourcePath = path.join(tmpRoot, 'atomic.ai');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    fs.writeFileSync(sourcePath, 'atomic package bytes');
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+    });
+    const beforeOutputPaths = structuredClone(storeInstance.get('quickPackageOutputPaths', []));
+
+    const completionWrites = [];
+    storeInstance.set = function recordCompletionWrite(key, value) {
+      if (
+        key &&
+        typeof key === 'object' &&
+        Object.prototype.hasOwnProperty.call(key, 'projects') &&
+        Object.prototype.hasOwnProperty.call(key, 'usage') &&
+        Object.prototype.hasOwnProperty.call(key, 'quickPackageOutputPaths')
+      ) completionWrites.push(structuredClone(key));
+      return originalStoreSet.call(this, key, value);
+    };
+
+    const result = await callIpc('projects:package', project.id, outputDir);
+    assertPackageResultShape(result);
+    assert.equal(result.success, true);
+    assert.equal(completionWrites.length, 1);
+
+    const destFolder = packageFolder(outputDir, 'Atomic package completion');
+    const completion = completionWrites[0];
+    const completedProject = completion.projects.find(item => item.id === project.id);
+    assert.equal(completedProject.status, 'packaged');
+    assert.equal(typeof completedProject.packagedAt, 'number');
+    assert.equal(completedProject.outputPath, destFolder);
+    assert.equal(
+      getProvenanceEdges(completedProject, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
+      1
+    );
+    assert.equal(completion.usage.packagesThisMonth, 1);
+    assert.deepEqual(
+      completion.quickPackageOutputPaths,
+      [...beforeOutputPaths, destFolder].slice(-50)
+    );
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.status, 'packaged');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
+    assert.deepEqual(
+      storeInstance.get('quickPackageOutputPaths'),
+      [...beforeOutputPaths, destFolder].slice(-50)
+    );
+    assert.equal(fs.readFileSync(path.join(destFolder, 'atomic.ai'), 'utf8'), 'atomic package bytes');
+  } finally {
+    storeInstance.set = originalStoreSet;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package completion store failure removes published output and preserves all prior state', async () => {
+  const tmpRoot = makeTempDir();
+  const originalStoreSet = storeInstance.set;
+  try {
+    setChildProcessHandler(() => ({ stdout: '' }));
+    for (const [label, layoutMode] of [
+      ['flat', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT],
+      ['organized', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION],
+    ]) {
+      storeInstance.set = originalStoreSet;
+      storeInstance.set('settings.packageOutputLayoutMode', layoutMode);
+      const projectName = `Atomic completion failure ${label}`;
+      const project = await createProject(projectName);
+      const sourcePath = path.join(tmpRoot, `${label}.ai`);
+      const outputDir = path.join(tmpRoot, `out-${label}`);
+      fs.mkdirSync(outputDir);
+      fs.writeFileSync(sourcePath, `${label} completion failure bytes`);
+      await setProjectFiles(project.id, {
+        files: [{
+          path: sourcePath,
+          name: path.basename(sourcePath),
+          ext: '.ai',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        }],
+      });
+      const beforeProject = structuredClone(await getProject(project.id));
+      const beforeUsage = structuredClone(storeInstance.get('usage'));
+      const beforeOutputPaths = structuredClone(storeInstance.get('quickPackageOutputPaths', []));
+      let completionWriteAttempts = 0;
+      storeInstance.set = function failCompletionWrite(key, value) {
+        if (
+          key &&
+          typeof key === 'object' &&
+          Object.prototype.hasOwnProperty.call(key, 'projects') &&
+          Object.prototype.hasOwnProperty.call(key, 'usage') &&
+          Object.prototype.hasOwnProperty.call(key, 'quickPackageOutputPaths')
+        ) {
+          completionWriteAttempts++;
+          throw new Error('forced package completion persistence failure');
+        }
+        return originalStoreSet.call(this, key, value);
+      };
+      testNotificationSupported = true;
+      testNotifications.length = 0;
+
+      const result = await callIpc('projects:package', project.id, outputDir);
+      assert.deepEqual(result, { error: 'forced package completion persistence failure' });
+      assert.equal(completionWriteAttempts, 1);
+      assert.equal(fs.existsSync(packageFolder(outputDir, projectName)), false);
+      assert.deepEqual(await getProject(project.id), beforeProject);
+      assert.deepEqual(storeInstance.get('usage'), beforeUsage);
+      assert.deepEqual(storeInstance.get('quickPackageOutputPaths', []), beforeOutputPaths);
+      assert.equal(testNotifications.length, 0);
+    }
+  } finally {
+    storeInstance.set = originalStoreSet;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

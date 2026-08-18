@@ -4692,20 +4692,28 @@ function formatLocalDateForUsage(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
-function getNextMonthReset() {
-  const now = new Date();
+function getNextMonthReset(now = new Date()) {
   const next = new Date(now.getFullYear(), now.getMonth() + 1, 1);
   return formatLocalDateForUsage(next);
 }
 
+function getResetAwareUsageSnapshot(usage, now = new Date()) {
+  if (formatLocalDateForUsage(now) < usage.resetDate) return { ...usage };
+  return {
+    ...usage,
+    packagesThisMonth: 0,
+    resetDate: getNextMonthReset(now),
+  };
+}
+
 function checkAndResetUsage() {
   const usage = store.get('usage');
-  const now = formatLocalDateForUsage();
-  if (now >= usage.resetDate) {
-    store.set('usage', {
-      packagesThisMonth: 0,
-      resetDate: getNextMonthReset()
-    });
+  const nextUsage = getResetAwareUsageSnapshot(usage);
+  if (
+    nextUsage.packagesThisMonth !== usage.packagesThisMonth ||
+    nextUsage.resetDate !== usage.resetDate
+  ) {
+    store.set('usage', nextUsage);
   }
 }
 
@@ -5858,6 +5866,82 @@ function recordPackageProvenance(projectId, packageInfo, events = [], targetProj
   } catch (e) {
     console.warn('[crate][provenance] package provenance skipped:', e.message);
   }
+}
+
+function clonePackageCompletionValue(value, seen = new Map()) {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);
+  if (Buffer.isBuffer(value)) return Buffer.from(value);
+
+  const clone = Array.isArray(value) ? [] : {};
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) {
+    clone[key] = clonePackageCompletionValue(value[key], seen);
+  }
+  return clone;
+}
+
+function persistPackageCompletion(projectId, {
+  destFolder,
+  packagedAt,
+  packageInfo,
+  packageEvents,
+  presentationExtractionEvents,
+}) {
+  const currentProjects = store.get('projects', []);
+  if (!Array.isArray(currentProjects)) throw new Error('package_state_invalid');
+
+  const nextProjects = clonePackageCompletionValue(currentProjects);
+  const nextProject = nextProjects.find(project => project && project.id === projectId);
+  if (!nextProject) throw new Error('not_found');
+
+  recordPresentationMediaExtractionProvenanceForProject(
+    nextProject,
+    presentationExtractionEvents
+  );
+  recordPackageProvenance(projectId, packageInfo, packageEvents, nextProject);
+  nextProject.status = 'packaged';
+  nextProject.packagedAt = packagedAt;
+  nextProject.outputPath = destFolder;
+  normalizeAutoCaptureProjectState(nextProject);
+  normalizeProjectAssetReviewState(nextProject);
+  safelyEnsureProjectProvenance(nextProject);
+
+  const currentUsage = store.get('usage');
+  if (
+    !currentUsage ||
+    !Number.isSafeInteger(currentUsage.packagesThisMonth) ||
+    currentUsage.packagesThisMonth < 0 ||
+    typeof currentUsage.resetDate !== 'string'
+  ) throw new Error('package_state_invalid');
+  const nextUsage = getResetAwareUsageSnapshot(currentUsage);
+  nextUsage.packagesThisMonth++;
+
+  const resolvedOutput = path.resolve(destFolder);
+  const currentOutputPaths = store.get('quickPackageOutputPaths', []);
+  const nextOutputPaths = Array.isArray(currentOutputPaths)
+    ? currentOutputPaths.slice()
+    : [];
+  if (!nextOutputPaths.some(existing => (
+    typeof existing === 'string' && path.resolve(existing) === resolvedOutput
+  ))) {
+    nextOutputPaths.push(resolvedOutput);
+  }
+
+  store.set({
+    projects: nextProjects,
+    usage: nextUsage,
+    quickPackageOutputPaths: nextOutputPaths.slice(-50),
+  });
+
+  // Preserve existing in-process references after the durable state commit.
+  const currentProject = currentProjects.find(project => project && project.id === projectId);
+  if (currentProject) {
+    const completedProject = clonePackageCompletionValue(nextProject);
+    for (const key of Object.keys(currentProject)) delete currentProject[key];
+    Object.assign(currentProject, completedProject);
+  }
+  return nextProject;
 }
 
 function getCrateVersion() {
@@ -15578,6 +15662,7 @@ function publishPrivatePackageDestination(destination, stagedTreeSnapshot) {
 
 function createPackageWriteTransaction(destFolder) {
   const root = path.resolve(destFolder);
+  let publishedRoot = null;
   const parent = path.dirname(root);
   const parentReal = realpathSync(parent);
   const parentIdentity = fs.lstatSync(parent, { bigint: true });
@@ -15612,6 +15697,7 @@ function createPackageWriteTransaction(destFolder) {
   };
   const locate = () => {
     if (isOriginal(root)) return root;
+    if (publishedRoot && isOriginal(publishedRoot)) return publishedRoot;
     let locatedParent = null;
     try {
       const stat = fs.lstatSync(parent, { bigint: true });
@@ -15920,6 +16006,37 @@ function createPackageWriteTransaction(destFolder) {
       finalizeGroups();
       assertRoot();
       return capturePrivateStagedPackageTree(root, intended);
+    },
+    adoptPublishedRoot(publishedPath) {
+      const nextRoot = path.resolve(publishedPath);
+      const nextRootAncestry = capturePackageTransactionAncestry(nextRoot, identity);
+      const relocatedGroups = [];
+      for (const group of [...groups.values(), ...legacyGroups.values()]) {
+        const nextGroupPath = path.join(nextRoot, group.folderName);
+        if (!privatePackageDirectoryMatches(nextGroupPath, group.identity)) {
+          throw new PackageTransactionInvariantError();
+        }
+        relocatedGroups.push({
+          group,
+          path: nextGroupPath,
+          ancestry: capturePackageTransactionAncestry(nextGroupPath, group.identity),
+        });
+      }
+
+      for (const group of [rootGroup, ...groups.values(), ...legacyGroups.values()]) {
+        try { group.transactionSession?.dispose(); } catch (_) {}
+        group.transactionSession = null;
+        group.transactionSessionPromise = null;
+      }
+      publishedRoot = nextRoot;
+      rootGroup.path = nextRoot;
+      rootGroup.knownPaths.add(nextRoot);
+      rootGroup.ancestries.push(nextRootAncestry);
+      for (const relocated of relocatedGroups) {
+        relocated.group.path = relocated.path;
+        relocated.group.knownPaths.add(relocated.path);
+        relocated.group.ancestries.push(relocated.ancestry);
+      }
     },
     dispose() {
       for (const group of [rootGroup, ...groups.values(), ...legacyGroups.values()]) {
@@ -16268,24 +16385,21 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
     reviewedPackageSources.assertCurrent();
     packageWrites.assertRoot();
     publishPrivatePackageDestination(packageDestination, stagedTreeSnapshot);
+    packageWrites.adoptPublishedRoot(packageDestination.destFolder);
+
+    persistPackageCompletion(id, {
+      destFolder,
+      packagedAt: Date.now(),
+      packageInfo: packageProvenanceInfo,
+      packageEvents: packageProvenanceEvents,
+      presentationExtractionEvents,
+    });
     packagePublished = true;
     packageWrites.dispose();
     packageWrites = null;
-    recordPresentationMediaExtractionProvenance(id, presentationExtractionEvents);
-    recordPackageProvenance(id, packageProvenanceInfo, packageProvenanceEvents);
 
     // Auto-stop watcher — SECURITY REQUIREMENT
     stopWatching(id);
-
-    // FIX 1: Use mutateProject to atomically update project status
-    mutateProject(id, (proj) => {
-      proj.status = 'packaged';
-      proj.packagedAt = Date.now();
-      proj.outputPath = destFolder;
-    });
-    rememberGeneratedPackageOutputPath(destFolder);
-
-    incrementPackageUsage();
 
     const preferBackgroundNotification = settings.notifications === true && isPackageAutoForegroundSuppressed();
     const packageWindowWasForeground = preferBackgroundNotification ? false : isMainWindowForegroundVisible();
