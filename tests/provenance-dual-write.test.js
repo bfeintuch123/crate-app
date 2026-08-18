@@ -4851,6 +4851,17 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
   let maxActiveXattrCalls = 0;
   let spotlightCalls = 0;
   let mdlsCalls = 0;
+  let releaseXattrCalls;
+  let markXattrStarted;
+  let xattrStarted = false;
+  const xattrRelease = new Promise(resolve => {
+    releaseXattrCalls = resolve;
+  });
+  const firstXattrStarted = new Promise(resolve => {
+    markXattrStarted = resolve;
+  });
+  let scanPromise = null;
+  let scanSettled = false;
 
   try {
     setChildProcessHandler(request => {
@@ -4862,10 +4873,14 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
         maxActiveXattrCalls = Math.max(maxActiveXattrCalls, activeXattrCalls);
         assert.ok(paths.length <= 256);
         assert.equal(request.options.timeout, 2000);
-        return new Promise(resolve => setImmediate(() => {
+        if (!xattrStarted) {
+          xattrStarted = true;
+          markXattrStarted();
+        }
+        return xattrRelease.then(() => new Promise(resolve => setImmediate(() => {
           activeXattrCalls--;
           resolve({ stdout: formatBulkXattrOutput(paths, () => staleXattr) });
-        }));
+        })));
       }
       if (isBulkSpotlightRequest(request)) {
         spotlightCalls++;
@@ -4877,15 +4892,49 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
       return { stdout: '' };
     });
 
-    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    scanPromise = callIpcRaw('projects:pre-package-scan', project.id).finally(() => {
+      scanSettled = true;
+    });
+    const xattrStartResult = await Promise.race([
+      firstXattrStarted.then(() => 'xattr-started'),
+      scanPromise.then(() => 'scan-settled')
+    ]);
+    assert.equal(xattrStartResult, 'xattr-started', 'metadata scan settled before xattr work started');
+    const duringPoll = await waitForProject(
+      project.id,
+      item => ['illustrator', 'photoshop', 'indesign'].every(appFamily => (
+        getLiveAppStatusEntries(item, appFamily).some(entry => (
+          entry.pollFired === true &&
+          entry.appRunning === false &&
+          entry.errorCategory === 'app-not-running'
+        ))
+      )),
+      5000
+    );
+    assert.equal(scanSettled, false);
+    releaseXattrCalls();
+    const scan = await scanPromise;
     assert.equal(scan.error, undefined);
     assert.equal(xattrCalls, 7);
     assert.equal(xattrCandidates, 1668);
     assert.equal(maxActiveXattrCalls, 4);
     assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
     assert.equal(mdlsCalls, 0);
-    assert.equal(JSON.stringify(await getProject(project.id)), before);
+    const after = await getProject(project.id);
+    const { liveAppEvidenceStatus: beforeLiveStatus, ...beforeStableState } = JSON.parse(before);
+    const { liveAppEvidenceStatus: afterLiveStatus, ...afterStableState } = after;
+    assert.deepEqual(afterStableState, beforeStableState);
+    assert.notDeepEqual(afterLiveStatus, beforeLiveStatus);
+    for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
+      assert.ok(getLiveAppStatusEntries(duringPoll, appFamily).some(entry => (
+        entry.pollFired === true &&
+        entry.appRunning === false &&
+        entry.errorCategory === 'app-not-running'
+      )));
+    }
   } finally {
+    releaseXattrCalls();
+    if (scanPromise) await scanPromise.catch(() => {});
     setChildProcessHandler(null);
     fs.rmSync(candidateRoot, { recursive: true, force: true });
   }
