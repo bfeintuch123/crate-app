@@ -3,7 +3,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { Readable } = require('node:stream');
+const { Readable, Writable } = require('node:stream');
+const { finished } = require('node:stream/promises');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
 const {
@@ -24,6 +25,57 @@ function sha256(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
+async function waitForArchiveStream(stream) {
+  await finished(stream, { cleanup: true });
+  return stream;
+}
+
+test('archive stream completion follows terminal stream events', async t => {
+  await t.test('waits for a successful finish', async () => {
+    let releaseWrite;
+    let settled = false;
+    const stream = new Writable({
+      write(_chunk, _encoding, callback) {
+        releaseWrite = callback;
+      },
+    });
+    const completion = waitForArchiveStream(stream).finally(() => {
+      settled = true;
+    });
+
+    stream.end('payload');
+    await Promise.resolve();
+    assert.equal(settled, false);
+    releaseWrite();
+    await completion;
+    assert.equal(settled, true);
+  });
+
+  await t.test('rejects a stream error', async () => {
+    const stream = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const completion = waitForArchiveStream(stream);
+    stream.destroy(new Error('synthetic archive write failure'));
+
+    await assert.rejects(completion, /synthetic archive write failure/);
+  });
+
+  await t.test('rejects a premature close', async () => {
+    const stream = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const completion = waitForArchiveStream(stream);
+    stream.destroy();
+
+    await assert.rejects(completion, { code: 'ERR_STREAM_PREMATURE_CLOSE' });
+  });
+});
+
 test('Electron Builder ASAR stream packaging hashes the transformed archived bytes', async () => {
   const builderManifestPath = require.resolve('app-builder-lib/package.json');
   const builderManifest = JSON.parse(fs.readFileSync(builderManifestPath, 'utf8'));
@@ -38,7 +90,7 @@ test('Electron Builder ASAR stream packaging hashes the transformed archived byt
   const archivePath = path.join(temporaryRoot, 'app.asar');
   const transformedManifest = Buffer.from('{"name":"crate-app","version":"transformed"}');
   try {
-    await asar.createPackageFromStreams(archivePath, [{
+    const archiveStream = await asar.createPackageFromStreams(archivePath, [{
       path: 'package.json',
       streamGenerator: () => Readable.from(transformedManifest),
       unpacked: false,
@@ -57,6 +109,7 @@ test('Electron Builder ASAR stream packaging hashes the transformed archived byt
         size: 0,
       },
     }]);
+    await waitForArchiveStream(archiveStream);
 
     const archivedBytes = Buffer.from(asar.extractFile(archivePath, 'package.json'));
     const metadata = asar.statFile(archivePath, 'package.json', false);
