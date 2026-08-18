@@ -1601,6 +1601,11 @@ body {
   background: var(--black);
 }
 
+.toggle input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--black);
+  outline-offset: 3px;
+}
+
 .toggle input:checked + .toggle-slider::after {
   transform: translateX(14px);
 }
@@ -1870,7 +1875,7 @@ body {
 
 .modal-file-item.package-review-file-card {
   display: grid;
-  grid-template-rows: 82px auto auto;
+  grid-template-rows: 82px auto auto auto;
   align-items: stretch;
   min-width: 0;
   padding: 0;
@@ -1890,6 +1895,31 @@ body {
 
 .package-review-file-card .file-origin {
   margin-top: 2px;
+}
+
+.package-review-file-destination {
+  margin-top: 4px;
+  color: var(--gray-500);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.package-review-organization {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 14px 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--gray-100);
+  border-bottom: 1px solid var(--gray-100);
+}
+
+.package-review-organization-status {
+  margin-top: 3px;
+  color: var(--gray-500);
+  font-size: 10px;
+  font-weight: 600;
 }
 
 .package-review-more {
