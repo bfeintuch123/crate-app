@@ -341,18 +341,10 @@ function updateAddProjectButton() {
 
 // ===== New Project Form =====
 let projectCreationPhase = 'idle';
-let projectCreationGeneration = 0;
-let projectCreationReconciliationToken = 0;
-let projectCreationReconciliation = null;
-let projectCreationReconciliationTimer = null;
-let projectCreationReconciliationInFlight = null;
+let projectListReadEpoch = 0;
 
 function isProjectCreationLocked() {
   return projectCreationPhase !== 'idle';
-}
-
-function isProjectCreationBusy() {
-  return projectCreationPhase === 'creating' || projectCreationPhase === 'reconciling';
 }
 
 function getProjectCreationStatus() {
@@ -378,7 +370,7 @@ function setProjectCreationStatus(message) {
 function setProjectCreationPhase(phase) {
   projectCreationPhase = phase;
   const locked = isProjectCreationLocked();
-  const busy = isProjectCreationBusy();
+  const busy = phase === 'creating';
 
   const createButton = $('#btn-create-project');
   if (createButton) {
@@ -386,9 +378,7 @@ function setProjectCreationPhase(phase) {
     createButton.disabled = locked || atCap;
     createButton.textContent = phase === 'creating'
       ? 'Starting\u2026'
-      : (phase === 'reconciling'
-        ? 'Confirming\u2026'
-        : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching'));
+      : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching');
     createButton.setAttribute('aria-busy', busy ? 'true' : 'false');
   }
 
@@ -410,39 +400,16 @@ function setProjectCreationPhase(phase) {
   if (phase === 'creating') setProjectCreationStatus('Starting project. Please wait.');
 }
 
-function clearProjectCreationReconciliation(generation) {
-  if (
-    generation !== undefined
-    && projectCreationReconciliation
-    && projectCreationReconciliation.generation !== generation
-  ) return false;
-  if (projectCreationReconciliationTimer) clearTimeout(projectCreationReconciliationTimer);
-  projectCreationReconciliationTimer = null;
-  projectCreationReconciliation = null;
-  projectCreationReconciliationInFlight = null;
-  return true;
-}
-
-function finishProjectCreationAttempt(generation) {
-  if (generation !== projectCreationGeneration) return false;
-  if (!clearProjectCreationReconciliation(generation)) return false;
-  projectCreationGeneration += 1;
+function finishProjectCreationAttempt() {
+  projectListReadEpoch += 1;
   setProjectCreationPhase('idle');
-  return true;
 }
 
-function enterProjectCreationUnresolved(generation, message) {
-  if (generation !== projectCreationGeneration) return false;
-  if (!clearProjectCreationReconciliation(generation)) return false;
-  projectCreationGeneration += 1;
+function enterProjectCreationUnresolved(message) {
+  projectListReadEpoch += 1;
   setProjectCreationPhase('unresolved');
   setProjectCreationStatus(message);
   showToast(message);
-  return true;
-}
-
-function getNewProjectsSince(projectIdsBeforeCreate) {
-  return state.projects.filter(project => !projectIdsBeforeCreate.has(project.id));
 }
 
 function mergeCreatedProjectIntoState(project) {
@@ -453,8 +420,8 @@ function mergeCreatedProjectIntoState(project) {
   ];
 }
 
-function completeProjectCreation(project, generation) {
-  if (!finishProjectCreationAttempt(generation)) return false;
+function completeProjectCreation(project) {
+  finishProjectCreationAttempt();
   mergeCreatedProjectIntoState(project);
   state.selectedProjectId = project.id;
   setProjectCreationStatus('Project started.');
@@ -463,109 +430,6 @@ function completeProjectCreation(project, generation) {
   renderProjects();
   switchTab('current-project');
   return true;
-}
-
-function applyProjectCreationReconciliation(projects, generation, token) {
-  if (
-    !projectCreationReconciliation
-    || projectCreationReconciliation.generation !== generation
-    || projectCreationReconciliation.token !== token
-    || projectCreationGeneration !== generation
-    || !Array.isArray(projects)
-  ) return false;
-
-  state.projects = projects;
-  const newProjects = getNewProjectsSince(projectCreationReconciliation.projectIdsBeforeCreate);
-  if (newProjects.length === 1) {
-    return completeProjectCreation(newProjects[0], generation);
-  }
-
-  if (!finishProjectCreationAttempt(generation)) return false;
-  if (newProjects.length === 0) {
-    const message = 'Crate confirmed the project did not start. You can try again.';
-    setProjectCreationStatus(message);
-    showToast(message);
-    return true;
-  }
-
-  const message = 'Crate found multiple new projects. Review Projects before trying again.';
-  setProjectCreationStatus(message);
-  showToast(message);
-  hideNewProjectForm();
-  renderProjects();
-  return true;
-}
-
-async function reconcileProjectCreationState(generation = projectCreationReconciliation?.generation) {
-  if (
-    !projectCreationReconciliation
-    || projectCreationReconciliation.generation !== generation
-    || projectCreationGeneration !== generation
-  ) return false;
-  const token = projectCreationReconciliation.token;
-  if (
-    projectCreationReconciliationInFlight
-    && projectCreationReconciliationInFlight.token === token
-  ) return projectCreationReconciliationInFlight.promise;
-
-  if (projectCreationReconciliationTimer) clearTimeout(projectCreationReconciliationTimer);
-  projectCreationReconciliationTimer = null;
-  setProjectCreationPhase('reconciling');
-  const promise = Promise.resolve().then(async () => {
-    try {
-      const projects = await window.crate.getProjects();
-      if (!Array.isArray(projects)) throw new Error('Project list unavailable');
-      return applyProjectCreationReconciliation(projects, generation, token);
-    } catch (error) {
-      if (
-        !projectCreationReconciliation
-        || projectCreationReconciliation.generation !== generation
-        || projectCreationReconciliation.token !== token
-        || projectCreationGeneration !== generation
-      ) return false;
-      logRendererError('Project creation reconciliation failed', error);
-      const message = 'Crate could not confirm whether the project started. Restart Crate before trying again.';
-      enterProjectCreationUnresolved(generation, message);
-      return false;
-    } finally {
-      if (projectCreationReconciliationInFlight?.token === token) {
-        projectCreationReconciliationInFlight = null;
-      }
-    }
-  });
-  projectCreationReconciliationInFlight = { token, promise };
-  return promise;
-}
-
-function beginProjectCreationReconciliation(projectIdsBeforeCreate, generation) {
-  if (generation !== projectCreationGeneration) return false;
-  const token = projectCreationReconciliationToken + 1;
-  projectCreationReconciliationToken = token;
-  projectCreationReconciliation = { projectIdsBeforeCreate, generation, token };
-  projectCreationReconciliationInFlight = null;
-  setProjectCreationPhase('reconciling');
-  const message = 'Crate is confirming whether the project started. Do not try again yet.';
-  setProjectCreationStatus(message);
-  showToast(message);
-  projectCreationReconciliationTimer = setTimeout(() => {
-    projectCreationReconciliationTimer = null;
-    reconcileProjectCreationState(generation);
-  }, 500);
-  return true;
-}
-
-async function refreshProjectsAfterCreation() {
-  let lastError = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const projects = await window.crate.getProjects();
-      if (!Array.isArray(projects)) throw new Error('Project list unavailable');
-      return { projects, error: null };
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  return { projects: null, error: lastError };
 }
 
 function showNewProjectForm() {
@@ -653,9 +517,7 @@ async function createProject() {
     figmaError.textContent = '';
   }
 
-  const projectIdsBeforeCreate = new Set(state.projects.map(project => project.id));
-  const generation = projectCreationGeneration + 1;
-  projectCreationGeneration = generation;
+  projectListReadEpoch += 1;
   setProjectCreationPhase('creating');
   let createRequestTimer = null;
 
@@ -681,7 +543,7 @@ async function createProject() {
     ]);
     if (createOutcome === timeoutResult) {
       const message = 'Crate could not confirm whether the project started. Restart Crate before trying again.';
-      enterProjectCreationUnresolved(generation, message);
+      enterProjectCreationUnresolved(message);
       return;
     }
     result = createOutcome.result;
@@ -689,25 +551,17 @@ async function createProject() {
     clearTimeout(createRequestTimer);
     createRequestTimer = null;
 
-    const refresh = await refreshProjectsAfterCreation();
-    if (refresh.projects) state.projects = refresh.projects;
-    else if (refresh.error) logRendererError('Project creation state could not refresh', refresh.error);
-
-    if (generation !== projectCreationGeneration) return;
-
     const hasTypedError = !!result && typeof result.error === 'string';
     const typedError = hasTypedError ? result.error : null;
     const knownNonPersistingError = typedError === 'invalid_figma_url' || typedError === 'max_projects_reached';
-    const newProjects = getNewProjectsSince(projectIdsBeforeCreate);
-    let createdProject = null;
     if (!hasTypedError && result && result.id) {
-      createdProject = state.projects.find(project => project.id === result.id) || result;
-    } else if (!hasTypedError && refresh.projects && newProjects.length === 1) {
-      createdProject = newProjects[0];
-    }
-
-    if (createdProject) {
-      completeProjectCreation(createdProject, generation);
+      try {
+        const projects = await window.crate.getProjects();
+        if (Array.isArray(projects)) state.projects = projects;
+      } catch (refreshError) {
+        logRendererError('Project creation state could not refresh', refreshError);
+      }
+      completeProjectCreation(state.projects.find(project => project.id === result.id) || result);
       return;
     }
 
@@ -720,29 +574,17 @@ async function createProject() {
       showToast('Maximum projects reached. Package or delete a project first.');
     } else if (hasTypedError && !knownNonPersistingError) {
       const message = 'Crate could not verify which project started. Restart Crate before trying again.';
-      enterProjectCreationUnresolved(generation, message);
+      enterProjectCreationUnresolved(message);
       return;
-    } else if (!hasTypedError && newProjects.length === 0) {
-      beginProjectCreationReconciliation(projectIdsBeforeCreate, generation);
-      return;
-    } else if (newProjects.length > 1) {
-      showToast('Crate created more than one project. Return to Projects before trying again.');
-      setProjectCreationStatus('Crate created more than one project. Return to Projects before trying again.');
-      finishProjectCreationAttempt(generation);
-      hideNewProjectForm();
-      renderProjects();
     } else {
       if (createError) logRendererError('Project creation failed', createError);
-      const message = 'Crate could not start that project. Try again.';
-      setProjectCreationStatus(message);
-      showToast(message);
-      finishProjectCreationAttempt(generation);
+      const message = 'Crate could not confirm whether the project started. Restart Crate before trying again.';
+      enterProjectCreationUnresolved(message);
+      return;
     }
   } finally {
     if (createRequestTimer) clearTimeout(createRequestTimer);
-    if (projectCreationGeneration === generation && projectCreationPhase === 'creating') {
-      finishProjectCreationAttempt(generation);
-    }
+    if (projectCreationPhase === 'creating') finishProjectCreationAttempt();
   }
 }
 
@@ -3356,17 +3198,9 @@ function setupMainProcessListeners() {
   }
   mainProcessListenersBound = true;
 
-  const captureProjectListRead = () => ({
-    generation: projectCreationGeneration,
-    phase: projectCreationPhase,
-    reconciliationToken: projectCreationReconciliation?.token ?? null,
-  });
-  const projectListReadIsCurrent = context => (
-    context.generation === projectCreationGeneration
-    && context.phase === 'idle'
-    && context.phase === projectCreationPhase
-    && context.reconciliationToken === (projectCreationReconciliation?.token ?? null)
-    && context.reconciliationToken === null
+  const captureProjectListRead = () => projectListReadEpoch;
+  const projectListReadIsCurrent = epoch => (
+    epoch === projectListReadEpoch && projectCreationPhase === 'idle'
   );
 
   // File updates from watcher
