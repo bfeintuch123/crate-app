@@ -117,6 +117,16 @@ function createNodeList(items = []) {
   return nodeList;
 }
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function createDocumentStub(elements = {}, options = {}) {
   const listeners = {};
   const body = createElementStub('body');
@@ -2679,6 +2689,7 @@ test('new project creation removes category pills and requests automatic app det
         createCalls.push(args);
         return { error: 'test_stop_after_request' };
       },
+      getProjects: async () => [],
     },
   });
 
@@ -2695,6 +2706,834 @@ test('new project creation removes category pills and requests automatic app det
     null,
   ]]);
 });
+
+test('project creation locks click and Enter submissions until delayed startup refreshes successfully', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let resolveCreate;
+  const delayedCreate = new Promise(resolve => { resolveCreate = resolve; });
+  const createCalls = [];
+  const projects = [{ id: 'created-project', name: 'QA project', status: 'watching', files: [] }];
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async (...args) => {
+        createCalls.push(args);
+        return delayedCreate;
+      },
+      getProjects: async () => projects,
+    },
+  });
+  renderer.setupEventListeners();
+  elements['input-project-name'].value = 'QA project';
+
+  elements['btn-create-project'].click();
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+
+  assert.equal(createCalls.length, 1);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Starting\u2026');
+  assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'true');
+  assert.equal(elements['btn-cancel-project'].disabled, true);
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'true');
+  assert.equal(elements['project-creation-status'].getAttribute('role'), 'status');
+  assert.equal(elements['project-creation-status'].getAttribute('aria-live'), 'polite');
+  assert.equal(elements['project-creation-status'].textContent, 'Starting project. Please wait.');
+
+  resolveCreate(projects[0]);
+  await delayedCreate;
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(createCalls.length, 1);
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.equal(elements['btn-create-project'].textContent, '\u25B6 Start Watching');
+  assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['btn-cancel-project'].disabled, false);
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['tab-current-project'].classList.contains('active'), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'created-project');
+});
+
+test('project creation accepts double Enter as exactly one delayed startup request', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let resolveCreate;
+  const delayedCreate = new Promise(resolve => { resolveCreate = resolve; });
+  let createCalls = 0;
+  const projects = [{ id: 'enter-project', name: 'Enter project', status: 'watching', files: [] }];
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => {
+        createCalls += 1;
+        return delayedCreate;
+      },
+      getProjects: async () => projects,
+    },
+  });
+  renderer.setupEventListeners();
+  elements['input-project-name'].value = 'Enter project';
+  const enterEvent = () => ({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+
+  elements['input-project-name'].dispatchEvent(enterEvent());
+  elements['input-project-name'].dispatchEvent(enterEvent());
+
+  assert.equal(createCalls, 1);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Starting\u2026');
+
+  resolveCreate(projects[0]);
+  await delayedCreate;
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(createCalls, 1);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'enter-project');
+  assert.equal(elements['btn-create-project'].disabled, false);
+});
+
+test('project creation rejection unlocks the form, reports failure, and permits one retry', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let attempts = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('synthetic create failure');
+        return { error: 'test_stop_after_request' };
+      },
+      getProjects: async () => [],
+    },
+  });
+  document.querySelector('#input-project-name').value = 'Retry project';
+
+  await renderer.createProject();
+
+  assert.equal(attempts, 1);
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.equal(elements['btn-cancel-project'].disabled, false);
+  assert.equal(elements['toast-message'].textContent, 'Crate could not start that project. Try again.');
+  assert.equal(elements['toast-message'].getAttribute('role'), 'status');
+  assert.equal(elements['toast-message'].getAttribute('aria-live'), 'polite');
+  assert.equal(elements['project-creation-status'].textContent, 'Crate could not start that project. Try again.');
+
+  await renderer.createProject();
+  assert.equal(attempts, 2);
+});
+
+test('project creation recovers a single persisted project when the create response is lost', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projects = [{ id: 'persisted-project', name: 'Persisted project', status: 'watching', files: [] }];
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => null,
+      getProjects: async () => projects,
+    },
+  });
+  document.querySelector('#input-project-name').value = 'Persisted project';
+
+  await renderer.createProject();
+
+  assert.equal(vm.runInContext('state.projects.length', renderer), 1);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'persisted-project');
+  assert.equal(elements['tab-current-project'].classList.contains('active'), true);
+  assert.equal(elements['btn-create-project'].disabled, false);
+});
+
+test('successful project creation merges its authoritative result when project refresh stays unavailable', async () => {
+  const { document } = createInteractiveRendererDom();
+  const createdProject = { id: 'created-result', name: 'Created result', status: 'watching', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => createdProject,
+      getProjects: async () => { throw new Error('synthetic refresh failure'); },
+    },
+  });
+  vm.runInContext(`state.projects = [{ id: 'older-project', name: 'Older', status: 'watching', files: [] }]`, renderer);
+  document.querySelector('#input-project-name').value = 'Created result';
+
+  await renderer.createProject();
+
+  assert.deepEqual(
+    JSON.parse(vm.runInContext('JSON.stringify(state.projects.map(project => ({ id: project.id, status: project.status })))', renderer)),
+    [
+      { id: 'older-project', status: 'paused' },
+      { id: 'created-result', status: 'watching' },
+    ]
+  );
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'created-result');
+});
+
+test('ambiguous project creation remains locked until reconciliation finds one persisted project', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let refreshCalls = 0;
+  let createCalls = 0;
+  const persistedProject = { id: 'reconciled-project', name: 'Reconciled', status: 'watching', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => {
+        createCalls += 1;
+        throw new Error('synthetic response loss');
+      },
+      getProjects: async () => {
+        refreshCalls += 1;
+        if (refreshCalls <= 3) throw new Error('synthetic refresh failure');
+        return [persistedProject];
+      },
+    },
+  });
+  document.querySelector('#input-project-name').value = 'Reconciled';
+
+  await renderer.createProject();
+
+  assert.equal(refreshCalls, 3);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Confirming\u2026');
+  assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'true');
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'true');
+  assert.equal(elements['btn-cancel-project'].disabled, true);
+  assert.equal(elements['input-project-name'].disabled, true);
+  assert.equal(elements['input-figma-scope'].disabled, true);
+  assert.equal(elements['input-figma-url'].disabled, true);
+  assert.equal(elements['figma-section-toggle'].disabled, true);
+  assert.match(elements['project-creation-status'].textContent, /Do not try again yet/);
+
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+  elements['btn-create-project'].click();
+  await renderer.createProject();
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Escape',
+    preventDefault: () => {},
+  });
+  elements['btn-cancel-project'].click();
+
+  assert.equal(createCalls, 1);
+  assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
+
+  assert.equal(await renderer.reconcileProjectCreationState(), true);
+  assert.equal(refreshCalls, 4);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'reconciled-project');
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.equal(elements['btn-cancel-project'].disabled, false);
+  assert.equal(elements['input-project-name'].disabled, false);
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'false');
+});
+
+test('ambiguous project creation unlocks retry only after reconciliation proves nothing persisted', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let refreshCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => { throw new Error('synthetic response loss'); },
+      getProjects: async () => {
+        refreshCalls += 1;
+        if (refreshCalls <= 3) throw new Error('synthetic refresh failure');
+        return [];
+      },
+    },
+  });
+  document.querySelector('#input-project-name').value = 'Not persisted';
+
+  await renderer.createProject();
+  assert.equal(elements['btn-create-project'].disabled, true);
+
+  assert.equal(await renderer.reconcileProjectCreationState(), true);
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.equal(elements['btn-create-project'].textContent, '\u25B6 Start Watching');
+  assert.equal(
+    elements['project-creation-status'].textContent,
+    'Crate confirmed the project did not start. You can try again.'
+  );
+});
+
+test('failed reconciliation remains locked with consistent unresolved accessibility and controls', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let createCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => {
+        createCalls += 1;
+        throw new Error('synthetic response loss');
+      },
+      getProjects: async () => { throw new Error('synthetic refresh failure'); },
+    },
+  });
+  renderer.setupEventListeners();
+  elements['input-project-name'].value = 'Unresolved project';
+
+  await renderer.createProject();
+  assert.equal(await renderer.reconcileProjectCreationState(), false);
+
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Restart Crate to continue');
+  assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['btn-cancel-project'].disabled, true);
+  assert.equal(elements['input-project-name'].disabled, true);
+  assert.equal(elements['input-figma-scope'].disabled, true);
+  assert.equal(elements['input-figma-url'].disabled, true);
+  assert.equal(elements['figma-section-toggle'].disabled, true);
+  assert.match(elements['project-creation-status'].textContent, /Restart Crate before trying again/);
+
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+  elements['btn-create-project'].click();
+  await renderer.createProject();
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Escape',
+    preventDefault: () => {},
+  });
+  elements['btn-cancel-project'].click();
+
+  assert.equal(createCalls, 1);
+  assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
+});
+
+for (const reconciliationOutcome of ['empty', 'persisted', 'failure']) {
+  test(`concurrent reconciliation callers share one authoritative ${reconciliationOutcome} result`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const authoritativeRead = createDeferred();
+    const persistedProject = {
+      id: 'single-flight-project',
+      name: 'Single flight',
+      status: 'watching',
+      files: [],
+    };
+    let refreshCalls = 0;
+    const renderer = loadRendererHelpers(document, { crate: {
+      createProject: async () => { throw new Error('synthetic response loss'); },
+      getProjects: async () => {
+        refreshCalls += 1;
+        if (refreshCalls <= 3) throw new Error('initial refresh failure');
+        return authoritativeRead.promise;
+      },
+    } });
+    document.querySelector('#input-project-name').value = `Single flight ${reconciliationOutcome}`;
+
+    await renderer.createProject();
+    const generationBeforeSettlement = vm.runInContext('projectCreationGeneration', renderer);
+    const firstCaller = renderer.reconcileProjectCreationState();
+    const secondCaller = renderer.reconcileProjectCreationState();
+    await Promise.resolve();
+    assert.equal(refreshCalls, 4);
+
+    if (reconciliationOutcome === 'failure') {
+      authoritativeRead.reject(new Error('authoritative reconciliation failure'));
+    } else if (reconciliationOutcome === 'persisted') {
+      authoritativeRead.resolve([persistedProject]);
+    } else {
+      authoritativeRead.resolve([]);
+    }
+
+    const results = await Promise.all([firstCaller, secondCaller]);
+    assert.deepEqual(results, reconciliationOutcome === 'failure' ? [false, false] : [true, true]);
+    assert.equal(refreshCalls, 4);
+    assert.equal(
+      vm.runInContext('projectCreationGeneration', renderer),
+      generationBeforeSettlement + 1
+    );
+
+    if (reconciliationOutcome === 'failure') {
+      assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+      assert.equal(elements['btn-create-project'].disabled, true);
+    } else {
+      assert.equal(vm.runInContext('projectCreationPhase', renderer), 'idle');
+      assert.equal(elements['btn-create-project'].disabled, false);
+    }
+    assert.equal(
+      vm.runInContext('state.selectedProjectId', renderer),
+      reconciliationOutcome === 'persisted' ? persistedProject.id : null
+    );
+  });
+}
+
+for (const invocation of ['manual', 'timer']) {
+  for (const rejection of ['synchronous', 'asynchronous']) {
+    test(`${invocation} reconciliation clears single-flight state after ${rejection} rejection`, async () => {
+      const { document, elements } = createInteractiveRendererDom();
+      let refreshCalls = 0;
+      const renderer = loadRendererHelpers(document, { crate: {
+        createProject: async () => { throw new Error('synthetic response loss'); },
+        getProjects: () => {
+          refreshCalls += 1;
+          if (refreshCalls <= 3) return Promise.reject(new Error('initial refresh failure'));
+          if (rejection === 'synchronous') throw new Error('synchronous reconciliation failure');
+          return Promise.reject(new Error('asynchronous reconciliation failure'));
+        },
+      } });
+      document.querySelector('#input-project-name').value = `${invocation} ${rejection}`;
+
+      await renderer.createProject();
+      const generationBeforeSettlement = vm.runInContext('projectCreationGeneration', renderer);
+      if (invocation === 'manual') {
+        assert.equal(await renderer.reconcileProjectCreationState(), false);
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 550));
+      }
+
+      assert.equal(refreshCalls, 4);
+      assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+      assert.equal(
+        vm.runInContext('projectCreationGeneration', renderer),
+        generationBeforeSettlement + 1
+      );
+      assert.equal(vm.runInContext('projectCreationReconciliation', renderer), null);
+      assert.equal(vm.runInContext('projectCreationReconciliationInFlight', renderer), null);
+      assert.equal(vm.runInContext('projectCreationReconciliationTimer', renderer), null);
+      assert.equal(elements['btn-create-project'].disabled, true);
+      assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+    });
+  }
+}
+
+test('watcher reconciliation resolving after terminal unresolved is discarded', async () => {
+  const { document } = createInteractiveRendererDom();
+  const watcherRead = createDeferred();
+  let refreshCalls = 0;
+  let filesUpdatedHandler;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    createProject: async () => { throw new Error('synthetic response loss'); },
+    getProjects: async () => {
+      refreshCalls += 1;
+      if (refreshCalls <= 3) throw new Error('initial refresh failure');
+      if (refreshCalls === 4) return watcherRead.promise;
+      throw new Error('terminal reconciliation failure');
+    },
+    onFilesUpdated: handler => { filesUpdatedHandler = handler; },
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.setupMainProcessListeners();
+  document.querySelector('#input-project-name').value = 'Watcher unresolved';
+
+  await renderer.createProject();
+  filesUpdatedHandler({ projectId: 'watcher-unresolved' });
+  assert.equal(await renderer.reconcileProjectCreationState(), false);
+  assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+
+  watcherRead.resolve([{ id: 'late-watcher-project', name: 'Late', status: 'watching', files: [] }]);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(state.projects)', renderer)), []);
+});
+
+test('scheduled reconciliation settlement ignores an older watcher event read', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const staleEventRead = createDeferred();
+  let refreshCalls = 0;
+  let filesUpdatedHandler;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    createProject: async () => { throw new Error('synthetic response loss'); },
+    getProjects: async () => {
+      refreshCalls += 1;
+      if (refreshCalls <= 3) throw new Error('initial refresh failure');
+      if (refreshCalls === 4) return staleEventRead.promise;
+      return [];
+    },
+    onFilesUpdated: handler => { filesUpdatedHandler = handler; },
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.setupMainProcessListeners();
+  document.querySelector('#input-project-name').value = 'Timer race';
+
+  await renderer.createProject();
+  filesUpdatedHandler({ projectId: 'timer-race' });
+  await new Promise(resolve => setTimeout(resolve, 550));
+
+  assert.equal(refreshCalls, 5);
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+
+  staleEventRead.resolve([{ id: 'stale-event-project', name: 'Stale', status: 'watching', files: [] }]);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+  assert.equal(elements['btn-create-project'].disabled, false);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(state.projects)', renderer)), []);
+});
+
+test('stale event reconciliation cannot settle a later project creation attempt', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const staleEventRead = createDeferred();
+  const projectB = { id: 'attempt-b', name: 'Attempt B', status: 'watching', files: [] };
+  let createCalls = 0;
+  let refreshCalls = 0;
+  let filesUpdatedHandler;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    createProject: async () => {
+      createCalls += 1;
+      throw new Error(`synthetic response loss ${createCalls}`);
+    },
+    getProjects: async () => {
+      refreshCalls += 1;
+      if (refreshCalls <= 3) throw new Error('attempt A refresh failure');
+      if (refreshCalls === 4) return staleEventRead.promise;
+      if (refreshCalls === 5) return [];
+      if (refreshCalls <= 8) throw new Error('attempt B refresh failure');
+      return [projectB];
+    },
+    onFilesUpdated: handler => { filesUpdatedHandler = handler; },
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.setupEventListeners();
+  renderer.setupMainProcessListeners();
+  elements['input-project-name'].value = 'Attempt A';
+
+  await renderer.createProject();
+  filesUpdatedHandler({ projectId: 'attempt-a' });
+  assert.equal(await renderer.reconcileProjectCreationState(), true);
+
+  elements['input-project-name'].value = 'Attempt B';
+  await renderer.createProject();
+  assert.equal(createCalls, 2);
+  assert.equal(elements['btn-create-project'].textContent, 'Confirming\u2026');
+
+  staleEventRead.resolve([{ id: 'attempt-a', name: 'Attempt A', status: 'watching', files: [] }]);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Confirming\u2026');
+  assert.equal(createCalls, 2);
+
+  assert.equal(await renderer.reconcileProjectCreationState(), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectB.id);
+  assert.equal(createCalls, 2);
+});
+
+for (const typedError of ['max_projects_reached', 'invalid_figma_url']) {
+  test(`typed project creation error ${typedError} does not adopt an unrelated stale project`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const existingProject = { id: 'known-project', name: 'Known', status: 'paused', files: [] };
+    const staleProject = { id: 'unseen-project', name: 'Unseen', status: 'watching', files: [] };
+    const renderer = loadRendererHelpers(document, {
+      crate: {
+        createProject: async () => ({ error: typedError }),
+        getProjects: async () => [existingProject, staleProject],
+      },
+    });
+    vm.runInContext(`state.projects = [${JSON.stringify(existingProject)}]`, renderer);
+    document.querySelector('#input-project-name').value = 'Rejected';
+
+    await renderer.createProject();
+
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+    assert.equal(elements['tab-current-project'].classList.contains('active'), false);
+    if (typedError === 'max_projects_reached') {
+      assert.equal(elements['toast-message'].textContent, 'Maximum projects reached. Package or delete a project first.');
+    } else {
+      assert.match(elements['figma-section-error'].textContent, /could not read that Figma URL/);
+    }
+  });
+}
+
+for (const typedError of ['future_typed_error', '']) {
+  for (const unknownTypedRefresh of ['zero', 'one', 'multiple', 'unavailable']) {
+    const typedErrorLabel = typedError || 'empty-string';
+    test(`${typedErrorLabel} typed project creation error fails closed with ${unknownTypedRefresh} refreshed projects`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const visibleProjects = unknownTypedRefresh === 'zero'
+      ? []
+      : [{ id: 'unseen-project', name: 'Unseen', status: 'watching', files: [] }];
+    if (unknownTypedRefresh === 'multiple') {
+      visibleProjects.push({ id: 'second-unseen-project', name: 'Second', status: 'paused', files: [] });
+    }
+    let createCalls = 0;
+    const renderer = loadRendererHelpers(document, {
+      crate: {
+        createProject: async () => {
+          createCalls += 1;
+          return { error: typedError };
+        },
+        getProjects: async () => {
+          if (unknownTypedRefresh === 'unavailable') throw new Error('synthetic refresh failure');
+          return visibleProjects;
+        },
+      },
+    });
+    renderer.setupEventListeners();
+    elements['input-project-name'].value = `Unknown ${unknownTypedRefresh}`;
+
+    await renderer.createProject();
+
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+    assert.equal(vm.runInContext('projectCreationReconciliation', renderer), null);
+    assert.equal(vm.runInContext('projectCreationGeneration', renderer), 2);
+    assert.equal(elements['btn-create-project'].disabled, true);
+    assert.equal(elements['btn-create-project'].textContent, 'Restart Crate to continue');
+    assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+    assert.equal(elements['btn-cancel-project'].disabled, true);
+    assert.match(elements['project-creation-status'].textContent, /could not verify which project started/);
+
+    elements['input-project-name'].dispatchEvent({
+      type: 'keydown',
+      key: 'Enter',
+      preventDefault: () => {},
+    });
+    elements['btn-create-project'].click();
+    elements['btn-cancel-project'].click();
+    elements['input-project-name'].dispatchEvent({
+      type: 'keydown',
+      key: 'Escape',
+      preventDefault: () => {},
+    });
+    await renderer.createProject();
+    assert.equal(createCalls, 1);
+    assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
+    });
+  }
+}
+
+for (const eventRoute of ['files', 'project', 'pending', 'package']) {
+  test(`${eventRoute} event read begun during creation cannot overwrite completed project state`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const createReply = createDeferred();
+    const staleEventRead = createDeferred();
+    const createdProject = {
+      id: `created-${eventRoute}`,
+      name: `Created ${eventRoute}`,
+      status: 'watching',
+      files: [],
+    };
+    const handlers = {};
+    let projectReads = 0;
+    const noOp = () => {};
+    const renderer = loadRendererHelpers(document, { crate: {
+      createProject: async () => createReply.promise,
+      getProjects: async () => {
+        projectReads += 1;
+        if (projectReads === 1) return staleEventRead.promise;
+        return [createdProject];
+      },
+      onFilesUpdated: handler => { handlers.files = handler; },
+      onProjectUpdated: handler => { handlers.project = handler; },
+      onPendingFilesUpdated: handler => { handlers.pending = handler; },
+      onPackageTrigger: handler => { handlers.package = handler; },
+      onFigmaAuthError: noOp,
+      onFigmaScanStarted: noOp,
+      onFigmaScanComplete: noOp,
+      onFigmaScanError: noOp,
+    } });
+    renderer.setupEventListeners();
+    renderer.setupMainProcessListeners();
+    renderer.showNewProjectForm();
+    elements['input-project-name'].value = createdProject.name;
+    const createPromise = renderer.createProject();
+
+    const eventPromise = handlers[eventRoute]({ projectId: createdProject.id });
+    assert.equal(elements['new-project-form'].classList.contains('hidden'), false);
+    assert.equal(elements['btn-create-project'].disabled, true);
+    assert.equal(elements['btn-create-project'].textContent, 'Starting\u2026');
+
+    createReply.resolve(createdProject);
+    await createPromise;
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), createdProject.id);
+
+    staleEventRead.resolve([]);
+    if (eventPromise && typeof eventPromise.then === 'function') await eventPromise;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(
+      JSON.parse(vm.runInContext('JSON.stringify(state.projects.map(project => project.id))', renderer)),
+      [createdProject.id]
+    );
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), createdProject.id);
+    assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  });
+}
+
+for (const eventRoute of ['files', 'project', 'pending', 'package']) {
+  test(`${eventRoute} event read begun during creation cannot settle later reconciliation`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const createReply = createDeferred();
+    const staleEventRead = createDeferred();
+    const persistedProject = {
+      id: `persisted-${eventRoute}`,
+      name: `Persisted ${eventRoute}`,
+      status: 'watching',
+      files: [],
+    };
+    const handlers = {};
+    let projectReads = 0;
+    const noOp = () => {};
+    const renderer = loadRendererHelpers(document, { crate: {
+      createProject: async () => createReply.promise,
+      getProjects: async () => {
+        projectReads += 1;
+        if (projectReads === 1) return staleEventRead.promise;
+        if (projectReads <= 4) throw new Error('post-create refresh failure');
+        return [persistedProject];
+      },
+      onFilesUpdated: handler => { handlers.files = handler; },
+      onProjectUpdated: handler => { handlers.project = handler; },
+      onPendingFilesUpdated: handler => { handlers.pending = handler; },
+      onPackageTrigger: handler => { handlers.package = handler; },
+      onFigmaAuthError: noOp,
+      onFigmaScanStarted: noOp,
+      onFigmaScanComplete: noOp,
+      onFigmaScanError: noOp,
+    } });
+    renderer.setupMainProcessListeners();
+    document.querySelector('#input-project-name').value = persistedProject.name;
+    const createPromise = renderer.createProject();
+    const eventPromise = handlers[eventRoute]({ projectId: persistedProject.id });
+
+    createReply.reject(new Error('synthetic response loss'));
+    await createPromise;
+    assert.equal(vm.runInContext('projectCreationPhase', renderer), 'reconciling');
+    assert.equal(elements['btn-create-project'].disabled, true);
+
+    staleEventRead.resolve([]);
+    if (eventPromise && typeof eventPromise.then === 'function') await eventPromise;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(vm.runInContext('projectCreationPhase', renderer), 'reconciling');
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+    assert.equal(elements['btn-create-project'].disabled, true);
+    assert.match(elements['project-creation-status'].textContent, /Do not try again yet/);
+
+    assert.equal(await renderer.reconcileProjectCreationState(), true);
+    assert.equal(projectReads, 5);
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), persistedProject.id);
+    assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  });
+}
+
+for (const eventRoute of ['files', 'project', 'pending', 'package']) {
+  test(`${eventRoute} event read begun during reconciliation cannot settle creation`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const eventRead = createDeferred();
+    const persistedProject = {
+      id: `reconciled-${eventRoute}`,
+      name: `Reconciled ${eventRoute}`,
+      status: 'watching',
+      files: [],
+    };
+    const handlers = {};
+    let projectReads = 0;
+    const noOp = () => {};
+    const renderer = loadRendererHelpers(document, { crate: {
+      createProject: async () => { throw new Error('synthetic response loss'); },
+      getProjects: async () => {
+        projectReads += 1;
+        if (projectReads <= 3) throw new Error('post-create refresh failure');
+        if (projectReads === 4) return eventRead.promise;
+        return [persistedProject];
+      },
+      onFilesUpdated: handler => { handlers.files = handler; },
+      onProjectUpdated: handler => { handlers.project = handler; },
+      onPendingFilesUpdated: handler => { handlers.pending = handler; },
+      onPackageTrigger: handler => { handlers.package = handler; },
+      onFigmaAuthError: noOp,
+      onFigmaScanStarted: noOp,
+      onFigmaScanComplete: noOp,
+      onFigmaScanError: noOp,
+    } });
+    renderer.setupMainProcessListeners();
+    document.querySelector('#input-project-name').value = persistedProject.name;
+
+    await renderer.createProject();
+    const eventPromise = handlers[eventRoute]({ projectId: persistedProject.id });
+    eventRead.resolve([persistedProject]);
+    if (eventPromise && typeof eventPromise.then === 'function') await eventPromise;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(vm.runInContext('projectCreationPhase', renderer), 'reconciling');
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+    assert.equal(elements['btn-create-project'].disabled, true);
+
+    assert.equal(await renderer.reconcileProjectCreationState(), true);
+    assert.equal(projectReads, 5);
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), persistedProject.id);
+  });
+}
+
+for (const eventRoute of ['files', 'project', 'pending', 'package']) {
+  test(`${eventRoute} event read cannot escape terminal unresolved state`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const lateProject = {
+      id: `late-unresolved-${eventRoute}`,
+      name: `Late unresolved ${eventRoute}`,
+      status: 'watching',
+      files: [],
+    };
+    const handlers = {};
+    let projectReads = 0;
+    const noOp = () => {};
+    const renderer = loadRendererHelpers(document, { crate: {
+      createProject: async () => { throw new Error('synthetic response loss'); },
+      getProjects: async () => {
+        projectReads += 1;
+        if (projectReads <= 4) throw new Error('synthetic refresh failure');
+        return [lateProject];
+      },
+      onFilesUpdated: handler => { handlers.files = handler; },
+      onProjectUpdated: handler => { handlers.project = handler; },
+      onPendingFilesUpdated: handler => { handlers.pending = handler; },
+      onPackageTrigger: handler => { handlers.package = handler; },
+      onFigmaAuthError: noOp,
+      onFigmaScanStarted: noOp,
+      onFigmaScanComplete: noOp,
+      onFigmaScanError: noOp,
+    } });
+    renderer.setupMainProcessListeners();
+    document.querySelector('#input-project-name').value = lateProject.name;
+
+    await renderer.createProject();
+    assert.equal(await renderer.reconcileProjectCreationState(), false);
+    assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+
+    const eventPromise = handlers[eventRoute]({ projectId: lateProject.id });
+    if (eventPromise && typeof eventPromise.then === 'function') await eventPromise;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(projectReads, 5);
+    assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+    assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(state.projects)', renderer)), []);
+    assert.equal(elements['btn-create-project'].disabled, true);
+    assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  });
+}
 
 test('renderer security policy permits only local and bounded data URL file visuals', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');

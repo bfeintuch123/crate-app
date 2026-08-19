@@ -219,6 +219,14 @@ function renderProjects() {
   const list = $('#projects-list');
   const form = $('#new-project-form');
 
+  if (isProjectCreationLocked()) {
+    empty.classList.add('hidden');
+    list.classList.add('hidden');
+    form.classList.remove('hidden');
+    updateAddProjectButton();
+    return;
+  }
+
   if (state.projects.length === 0) {
     empty.classList.remove('hidden');
     list.classList.add('hidden');
@@ -331,7 +339,239 @@ function updateAddProjectButton() {
 }
 
 // ===== New Project Form =====
+let projectCreationPhase = 'idle';
+let projectCreationGeneration = 0;
+let projectCreationReconciliationToken = 0;
+let projectCreationReconciliation = null;
+let projectCreationReconciliationTimer = null;
+let projectCreationReconciliationInFlight = null;
+
+function isProjectCreationLocked() {
+  return projectCreationPhase !== 'idle';
+}
+
+function isProjectCreationBusy() {
+  return projectCreationPhase === 'creating' || projectCreationPhase === 'reconciling';
+}
+
+function getProjectCreationStatus() {
+  let status = $('#project-creation-status');
+  if (!status) {
+    status = document.createElement('div');
+    status.id = 'project-creation-status';
+    status.className = 'form-subtitle';
+    status.style.marginTop = '8px';
+    $('#new-project-form').appendChild(status);
+  }
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.setAttribute('aria-atomic', 'true');
+  return status;
+}
+
+function setProjectCreationStatus(message) {
+  const status = getProjectCreationStatus();
+  status.textContent = message || '';
+}
+
+function setProjectCreationPhase(phase) {
+  projectCreationPhase = phase;
+  const locked = isProjectCreationLocked();
+  const busy = isProjectCreationBusy();
+
+  const createButton = $('#btn-create-project');
+  if (createButton) {
+    const atCap = state.projects.length >= MAX_PROJECTS;
+    createButton.disabled = locked || atCap;
+    createButton.textContent = phase === 'creating'
+      ? 'Starting\u2026'
+      : (phase === 'reconciling'
+        ? 'Confirming\u2026'
+        : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching'));
+    createButton.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
+  const cancelButton = $('#btn-cancel-project');
+  if (cancelButton) cancelButton.disabled = locked;
+
+  for (const selector of [
+    '#input-project-name',
+    '#input-figma-scope',
+    '#input-figma-url',
+    '#figma-section-toggle',
+  ]) {
+    const control = $(selector);
+    if (control) control.disabled = locked;
+  }
+
+  const form = $('#new-project-form');
+  if (form) form.setAttribute('aria-busy', busy ? 'true' : 'false');
+  if (phase === 'creating') setProjectCreationStatus('Starting project. Please wait.');
+}
+
+function clearProjectCreationReconciliation(generation) {
+  if (
+    generation !== undefined
+    && projectCreationReconciliation
+    && projectCreationReconciliation.generation !== generation
+  ) return false;
+  if (projectCreationReconciliationTimer) clearTimeout(projectCreationReconciliationTimer);
+  projectCreationReconciliationTimer = null;
+  projectCreationReconciliation = null;
+  projectCreationReconciliationInFlight = null;
+  return true;
+}
+
+function finishProjectCreationAttempt(generation) {
+  if (generation !== projectCreationGeneration) return false;
+  if (!clearProjectCreationReconciliation(generation)) return false;
+  projectCreationGeneration += 1;
+  setProjectCreationPhase('idle');
+  return true;
+}
+
+function enterProjectCreationUnresolved(generation, message) {
+  if (generation !== projectCreationGeneration) return false;
+  if (!clearProjectCreationReconciliation(generation)) return false;
+  projectCreationGeneration += 1;
+  setProjectCreationPhase('unresolved');
+  setProjectCreationStatus(message);
+  showToast(message);
+  return true;
+}
+
+function getNewProjectsSince(projectIdsBeforeCreate) {
+  return state.projects.filter(project => !projectIdsBeforeCreate.has(project.id));
+}
+
+function mergeCreatedProjectIntoState(project) {
+  if (!project || !project.id || state.projects.some(item => item.id === project.id)) return;
+  state.projects = [
+    ...state.projects.map(item => item.status === 'watching' ? { ...item, status: 'paused' } : item),
+    project,
+  ];
+}
+
+function completeProjectCreation(project, generation) {
+  if (!finishProjectCreationAttempt(generation)) return false;
+  mergeCreatedProjectIntoState(project);
+  state.selectedProjectId = project.id;
+  setProjectCreationStatus('Project started.');
+  showToast('Project started.');
+  hideNewProjectForm();
+  renderProjects();
+  switchTab('current-project');
+  return true;
+}
+
+function applyProjectCreationReconciliation(projects, generation, token) {
+  if (
+    !projectCreationReconciliation
+    || projectCreationReconciliation.generation !== generation
+    || projectCreationReconciliation.token !== token
+    || projectCreationGeneration !== generation
+    || !Array.isArray(projects)
+  ) return false;
+
+  state.projects = projects;
+  const newProjects = getNewProjectsSince(projectCreationReconciliation.projectIdsBeforeCreate);
+  if (newProjects.length === 1) {
+    return completeProjectCreation(newProjects[0], generation);
+  }
+
+  if (!finishProjectCreationAttempt(generation)) return false;
+  if (newProjects.length === 0) {
+    const message = 'Crate confirmed the project did not start. You can try again.';
+    setProjectCreationStatus(message);
+    showToast(message);
+    return true;
+  }
+
+  const message = 'Crate found multiple new projects. Review Projects before trying again.';
+  setProjectCreationStatus(message);
+  showToast(message);
+  hideNewProjectForm();
+  renderProjects();
+  return true;
+}
+
+async function reconcileProjectCreationState(generation = projectCreationReconciliation?.generation) {
+  if (
+    !projectCreationReconciliation
+    || projectCreationReconciliation.generation !== generation
+    || projectCreationGeneration !== generation
+  ) return false;
+  const token = projectCreationReconciliation.token;
+  if (
+    projectCreationReconciliationInFlight
+    && projectCreationReconciliationInFlight.token === token
+  ) return projectCreationReconciliationInFlight.promise;
+
+  if (projectCreationReconciliationTimer) clearTimeout(projectCreationReconciliationTimer);
+  projectCreationReconciliationTimer = null;
+  setProjectCreationPhase('reconciling');
+  const promise = Promise.resolve().then(async () => {
+    try {
+      const projects = await window.crate.getProjects();
+      if (!Array.isArray(projects)) throw new Error('Project list unavailable');
+      return applyProjectCreationReconciliation(projects, generation, token);
+    } catch (error) {
+      if (
+        !projectCreationReconciliation
+        || projectCreationReconciliation.generation !== generation
+        || projectCreationReconciliation.token !== token
+        || projectCreationGeneration !== generation
+      ) return false;
+      logRendererError('Project creation reconciliation failed', error);
+      const message = 'Crate could not confirm whether the project started. Restart Crate before trying again.';
+      enterProjectCreationUnresolved(generation, message);
+      return false;
+    } finally {
+      if (projectCreationReconciliationInFlight?.token === token) {
+        projectCreationReconciliationInFlight = null;
+      }
+    }
+  });
+  projectCreationReconciliationInFlight = { token, promise };
+  return promise;
+}
+
+function beginProjectCreationReconciliation(projectIdsBeforeCreate, generation) {
+  if (generation !== projectCreationGeneration) return false;
+  const token = projectCreationReconciliationToken + 1;
+  projectCreationReconciliationToken = token;
+  projectCreationReconciliation = { projectIdsBeforeCreate, generation, token };
+  projectCreationReconciliationInFlight = null;
+  setProjectCreationPhase('reconciling');
+  const message = 'Crate is confirming whether the project started. Do not try again yet.';
+  setProjectCreationStatus(message);
+  showToast(message);
+  projectCreationReconciliationTimer = setTimeout(() => {
+    projectCreationReconciliationTimer = null;
+    reconcileProjectCreationState(generation);
+  }, 500);
+  return true;
+}
+
+async function refreshProjectsAfterCreation() {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const projects = await window.crate.getProjects();
+      if (!Array.isArray(projects)) throw new Error('Project list unavailable');
+      return { projects, error: null };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return { projects: null, error: lastError };
+}
+
 function showNewProjectForm() {
+  if (isProjectCreationLocked()) {
+    showToast('Restart Crate before starting another project.');
+    return;
+  }
   if (state.projects.length >= MAX_PROJECTS) return;
 
   $('#projects-empty').classList.add('hidden');
@@ -355,6 +595,7 @@ function showNewProjectForm() {
   }
   state.figmaSectionExpanded = false;
   setFigmaSectionExpanded(false);
+  setProjectCreationStatus('');
 
   // Update template display from current settings
   const templateDisplay = $('#naming-template-display');
@@ -366,15 +607,23 @@ function showNewProjectForm() {
 }
 
 function hideNewProjectForm() {
+  if (isProjectCreationLocked()) return;
   $('#new-project-form').classList.add('hidden');
   renderProjects();
 }
 
 async function createProject() {
+  if (isProjectCreationLocked()) return;
+
   const name = $('#input-project-name').value.trim();
-  if (!name) return;
+  if (!name) {
+    showToast('Enter a project name to continue.');
+    $('#input-project-name').focus();
+    return;
+  }
 
   if (state.projects.length >= MAX_PROJECTS) {
+    showToast('Maximum projects reached. Package or delete a project first.');
     return;
   }
 
@@ -403,21 +652,74 @@ async function createProject() {
     figmaError.textContent = '';
   }
 
-  const result = await window.crate.createProject(name, 'automatic', state.figmaScopeMode, figmaUrl);
-  // FIX 6 (M3): Guard against null/error IPC response
-  if (!result || result.error) {
-    if (result && result.error === 'invalid_figma_url' && figmaError) {
+  const projectIdsBeforeCreate = new Set(state.projects.map(project => project.id));
+  const generation = projectCreationGeneration + 1;
+  projectCreationGeneration = generation;
+  setProjectCreationPhase('creating');
+
+  try {
+    let result = null;
+    let createError = null;
+    try {
+      result = await window.crate.createProject(name, 'automatic', state.figmaScopeMode, figmaUrl);
+    } catch (error) {
+      createError = error;
+    }
+
+    const refresh = await refreshProjectsAfterCreation();
+    if (refresh.projects) state.projects = refresh.projects;
+    else if (refresh.error) logRendererError('Project creation state could not refresh', refresh.error);
+
+    if (generation !== projectCreationGeneration) return;
+
+    const hasTypedError = !!result && typeof result.error === 'string';
+    const typedError = hasTypedError ? result.error : null;
+    const knownNonPersistingError = typedError === 'invalid_figma_url' || typedError === 'max_projects_reached';
+    const newProjects = getNewProjectsSince(projectIdsBeforeCreate);
+    let createdProject = null;
+    if (!hasTypedError && result && result.id) {
+      createdProject = state.projects.find(project => project.id === result.id) || result;
+    } else if (!hasTypedError && refresh.projects && newProjects.length === 1) {
+      createdProject = newProjects[0];
+    }
+
+    if (createdProject) {
+      completeProjectCreation(createdProject, generation);
+      return;
+    }
+
+    if (typedError === 'invalid_figma_url' && figmaError) {
       figmaError.textContent = 'Crate could not read that Figma URL. Please double-check and try again.';
       figmaError.classList.remove('hidden');
+      setProjectCreationStatus(figmaError.textContent);
+    } else if (typedError === 'max_projects_reached') {
+      setProjectCreationStatus('Maximum projects reached. Package or delete a project first.');
+      showToast('Maximum projects reached. Package or delete a project first.');
+    } else if (hasTypedError && !knownNonPersistingError) {
+      const message = 'Crate could not verify which project started. Restart Crate before trying again.';
+      enterProjectCreationUnresolved(generation, message);
+      return;
+    } else if (!refresh.projects) {
+      beginProjectCreationReconciliation(projectIdsBeforeCreate, generation);
+      return;
+    } else if (newProjects.length > 1) {
+      showToast('Crate created more than one project. Return to Projects before trying again.');
+      setProjectCreationStatus('Crate created more than one project. Return to Projects before trying again.');
+      finishProjectCreationAttempt(generation);
+      hideNewProjectForm();
+      renderProjects();
+    } else {
+      if (createError) logRendererError('Project creation failed', createError);
+      const message = 'Crate could not start that project. Try again.';
+      setProjectCreationStatus(message);
+      showToast(message);
+      finishProjectCreationAttempt(generation);
     }
-    return;
+  } finally {
+    if (projectCreationGeneration === generation && projectCreationPhase === 'creating') {
+      finishProjectCreationAttempt(generation);
+    }
   }
-
-  state.projects = await window.crate.getProjects();
-  state.selectedProjectId = result.id;
-  hideNewProjectForm();
-  renderProjects();
-  switchTab('current-project');
 }
 
 function setFigmaSectionExpanded(expanded) {
@@ -2631,8 +2933,11 @@ function setupEventListeners() {
 
   // Enter key in project name
   $('#input-project-name').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') createProject();
-    if (e.key === 'Escape') hideNewProjectForm();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!isProjectCreationLocked()) createProject();
+    }
+    if (e.key === 'Escape' && !isProjectCreationLocked()) hideNewProjectForm();
   });
 
   // Project Workspace tab
@@ -3027,10 +3332,25 @@ function setupMainProcessListeners() {
   }
   mainProcessListenersBound = true;
 
+  const captureProjectListRead = () => ({
+    generation: projectCreationGeneration,
+    phase: projectCreationPhase,
+    reconciliationToken: projectCreationReconciliation?.token ?? null,
+  });
+  const projectListReadIsCurrent = context => (
+    context.generation === projectCreationGeneration
+    && context.phase === 'idle'
+    && context.phase === projectCreationPhase
+    && context.reconciliationToken === (projectCreationReconciliation?.token ?? null)
+    && context.reconciliationToken === null
+  );
+
   // File updates from watcher
   window.crate.onFilesUpdated((data) => {
     invalidateFileVisualProject(data.projectId);
+    const projectListRead = captureProjectListRead();
     window.crate.getProjects().then(projects => {
+      if (!projectListReadIsCurrent(projectListRead)) return;
       state.projects = projects;
       if (state.selectedProjectId === data.projectId && isFilesTabActive()) {
         renderFiles();
@@ -3042,7 +3362,10 @@ function setupMainProcessListeners() {
   // Project updated (e.g. from notification action)
   window.crate.onProjectUpdated(async (data) => {
     invalidateFileVisualProject(data.projectId);
-    state.projects = await window.crate.getProjects();
+    const projectListRead = captureProjectListRead();
+    const projects = await window.crate.getProjects();
+    if (!projectListReadIsCurrent(projectListRead)) return;
+    state.projects = projects;
     renderProjects();
     if (state.selectedProjectId === data.projectId && isFilesTabActive()) {
       renderFiles();
@@ -3052,7 +3375,9 @@ function setupMainProcessListeners() {
   // Tier 2 pending files updated from main process
   window.crate.onPendingFilesUpdated((data) => {
     invalidateFileVisualProject(data.projectId);
+    const projectListRead = captureProjectListRead();
     window.crate.getProjects().then(projects => {
+      if (!projectListReadIsCurrent(projectListRead)) return;
       state.projects = projects;
       if (state.selectedProjectId === data.projectId) {
         renderFiles();
@@ -3062,7 +3387,10 @@ function setupMainProcessListeners() {
 
   // Notification-triggered packaging still requires the same authoritative review.
   window.crate.onPackageTrigger(async (data) => {
-    state.projects = await window.crate.getProjects();
+    const projectListRead = captureProjectListRead();
+    const projects = await window.crate.getProjects();
+    if (!projectListReadIsCurrent(projectListRead)) return;
+    state.projects = projects;
     const project = state.projects.find(p => p.id === data.projectId);
     if (project) {
       if (existingAssetsModalProjectId && existingAssetsModalProjectId !== data.projectId) {
@@ -3206,6 +3534,9 @@ function showToast(message) {
     });
     document.body.appendChild(toast);
   }
+  toast.setAttribute('role', 'status');
+  toast.setAttribute('aria-live', 'polite');
+  toast.setAttribute('aria-atomic', 'true');
   toast.textContent = message;
   toast.style.opacity = '1';
   clearTimeout(toast._timer);
