@@ -25,6 +25,8 @@ test('main window uses normal macOS app lifecycle', async () => {
   const timeouts = new Set();
   const errorLogs = [];
   const isolatedHome = path.join(os.tmpdir(), `crate-main-window-test-home-${process.pid}-${Date.now()}`);
+  const isolatedLogs = path.join(isolatedHome, 'logs');
+  fs.mkdirSync(isolatedLogs, { recursive: true });
   let appReady = false;
   let readyCallback = null;
   let appFocusCount = 0;
@@ -182,7 +184,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       isReady: () => appReady,
       show: () => { appShowCount += 1; },
       focus: () => { appFocusCount += 1; },
-      getPath: () => path.join(isolatedHome, 'user-data'),
+      getPath: name => name === 'logs' ? isolatedLogs : path.join(isolatedHome, 'user-data'),
       dock: { setMenu: () => {} },
     },
     BrowserWindow: TestBrowserWindow,
@@ -227,6 +229,32 @@ test('main window uses normal macOS app lifecycle', async () => {
     appReady = true;
     await readyCallback();
 
+    const startupJournalPath = path.join(isolatedLogs, 'startup-phases.jsonl');
+    const startupPhases = () => fs.readFileSync(startupJournalPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).phase);
+    assert.deepEqual(startupPhases(), [
+      'main-module-entered',
+      'dependencies-loaded',
+      'single-instance-lock-start',
+      'single-instance-lock-acquired',
+      'store-preflight-start',
+      'store-preflight-complete',
+      'ready-handler-entered',
+      'figma-credential-storage-configured',
+      'main-window-create-start',
+      'main-window-constructed',
+      'renderer-load-start',
+      'main-window-show-requested',
+      'main-window-visible',
+      'tray-create-start',
+      'tray-created',
+      'watch-recovery-start',
+      'watch-recovery-complete',
+      'ready-handler-complete',
+    ]);
+
     const cleanupDeadline = Date.now() + 1000;
     while (fs.existsSync(isolatedOrphanCache) && Date.now() < cleanupDeadline) {
       await new Promise(resolve => originalSetTimeout(resolve, 10));
@@ -258,6 +286,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(win.options.webPreferences.allowRunningInsecureContent, false);
     assert.ok(win.loadedFile.endsWith(path.join('renderer', 'index.html')));
     assert.equal(typeof win.handlers.get('ready-to-show'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('dom-ready'), 'function');
     assert.equal(typeof win.webContents.handlers.get('did-finish-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('did-fail-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
@@ -392,6 +421,9 @@ test('main window uses normal macOS app lifecycle', async () => {
     );
     assert.ok([...timeouts].every(timeout => timeout.unrefed === true));
 
+    win.webContents.handlers.get('dom-ready')();
+    assert.equal(startupPhases().at(-1), 'renderer-dom-ready');
+
     win.webContents.handlers.get('did-fail-load')({}, -6, 'ERR_FILE_NOT_FOUND');
     assert.equal(win.showCount, 2);
     assert.equal(win.focusCount, 2);
@@ -471,6 +503,15 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(windows.length, 4);
     assert.equal(windows[3].showCount, 1);
     assert.equal(windows[3].focusCount, 1);
+    windows[3].webContents.handlers.get('did-finish-load')();
+    assert.deepEqual(startupPhases().slice(-4), [
+      'main-window-visible',
+      'renderer-load-finished',
+      'main-window-show-requested',
+      'main-window-visible',
+    ]);
+    appHandlers.get('before-quit')();
+    assert.equal(startupPhases().at(-1), 'before-quit');
   } finally {
     Module._resolveFilename = originalResolve;
     Module._load = originalLoad;

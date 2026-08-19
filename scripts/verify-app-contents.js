@@ -24,6 +24,7 @@ const RUNTIME_PARSER_FILES = Object.freeze([
 const REQUIRED_ASAR_ENTRIES = Object.freeze([
   '/package.json',
   '/main.js',
+  '/startup-phase-journal.js',
   '/preload.js',
   '/provenance.js',
   '/diagnostic-summary.js',
@@ -56,6 +57,7 @@ function isAllowedAsarEntry(entry) {
   if (
     entry === '/package.json' ||
     entry === '/main.js' ||
+    entry === '/startup-phase-journal.js' ||
     entry === '/preload.js' ||
     entry === '/provenance.js' ||
     entry === '/diagnostic-summary.js'

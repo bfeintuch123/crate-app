@@ -11,6 +11,14 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { createStartupPhaseJournal, getWatchRecoveryPhase } = require('./startup-phase-journal');
+const startupPhaseJournal = createStartupPhaseJournal({
+  getLogDirectory: () => app.getPath('logs'),
+});
+startupPhaseJournal.mark('main-module-entered');
+process.on('uncaughtExceptionMonitor', () => {
+  startupPhaseJournal.mark('uncaught-exception');
+});
 const Store = require('electron-store');
 const chokidar = require('chokidar');
 const { execSync, exec, execFile, execFileSync } = require('child_process');
@@ -56,6 +64,7 @@ const {
   createByteBudget,
   fetchBufferWithLimits,
 } = require('./parsers/figma-network');
+startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
 const DIAGNOSTICS_FOLDER_NAME = 'Crate Diagnostics';
@@ -4563,14 +4572,20 @@ const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024; // 300MB — guard against OOM on
 const MAX_PROJECTS = 7;
 
 // Single instance lock
+startupPhaseJournal.mark('single-instance-lock-start');
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
+  startupPhaseJournal.mark('single-instance-lock-denied');
+  startupPhaseJournal.close();
   app.quit();
+} else {
+  startupPhaseJournal.mark('single-instance-lock-acquired');
 }
 
 let localStorePaths = null;
 let localStoreStartupError = null;
 let store = null;
+startupPhaseJournal.mark('store-preflight-start');
 try {
   localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
   const candidateStore = new Store({
@@ -4601,9 +4616,11 @@ try {
   validateLocalStoreShape(candidateStore);
   store = candidateStore;
   migrateSettings();
+  startupPhaseJournal.mark('store-preflight-complete');
 } catch (_) {
   store = null;
   localStoreStartupError = new Error('Crate could not secure local settings storage.');
+  startupPhaseJournal.mark('store-preflight-failed');
 }
 
 // One-time migration: update old naming template format to new one
@@ -11323,6 +11340,7 @@ function recreateMainWindow(reason = 'hidden-window') {
 function verifyMainWindowVisible(reason = 'show') {
   if (!trayWindow || trayWindow.isDestroyed()) return false;
   if (typeof trayWindow.isVisible !== 'function' || trayWindow.isVisible()) {
+    startupPhaseJournal.mark('main-window-visible');
     mainWindowHiddenShowAttempts = 0;
     mainWindowVisibleSinceStartup = true;
     clearMainWindowStartupRetries();
@@ -11341,6 +11359,7 @@ function createMainWindow() {
   adoptExistingMainWindow();
   if (trayWindow && !trayWindow.isDestroyed()) return trayWindow;
 
+  startupPhaseJournal.mark('main-window-create-start');
   const nextWindow = new BrowserWindow({
     width: 960,
     height: 760,
@@ -11368,6 +11387,7 @@ function createMainWindow() {
       allowRunningInsecureContent: false,
     }
   });
+  startupPhaseJournal.mark('main-window-constructed');
   mainWindowIdentities.add(nextWindow);
   trayWindow = nextWindow;
 
@@ -11377,11 +11397,20 @@ function createMainWindow() {
   };
 
   if (typeof trayWindow.once === 'function') {
-    trayWindow.once('ready-to-show', revealLoadedMainWindow);
+    trayWindow.once('ready-to-show', () => {
+      startupPhaseJournal.mark('main-window-ready-to-show');
+      revealLoadedMainWindow();
+    });
   }
 
   if (trayWindow.webContents && typeof trayWindow.webContents.once === 'function') {
-    trayWindow.webContents.once('did-finish-load', revealLoadedMainWindow);
+    trayWindow.webContents.once('dom-ready', () => {
+      startupPhaseJournal.mark('renderer-dom-ready');
+    });
+    trayWindow.webContents.once('did-finish-load', () => {
+      startupPhaseJournal.mark('renderer-load-finished');
+      revealLoadedMainWindow();
+    });
   }
 
   if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
@@ -11394,10 +11423,12 @@ function createMainWindow() {
     trayWindow.webContents.on('will-navigate', blockUntrustedNavigation);
     trayWindow.webContents.on('will-redirect', blockUntrustedNavigation);
     trayWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+      startupPhaseJournal.mark('renderer-load-failed');
       console.error('[main-window] renderer failed to load:', redactFigmaLogText(`${errorCode || ''} ${errorDescription || ''}`));
       showMainWindow({ reason: 'renderer-failed-load' });
     });
     trayWindow.webContents.on('render-process-gone', (_event, details = {}) => {
+      startupPhaseJournal.mark('renderer-process-gone');
       console.error('[main-window] renderer process exited:', redactFigmaLogText(details.reason || 'unknown'));
       showMainWindow({ reason: 'renderer-process-gone' });
     });
@@ -11407,9 +11438,11 @@ function createMainWindow() {
     trayWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   }
 
+  startupPhaseJournal.mark('renderer-load-start');
   const loadResult = trayWindow.loadFile(RENDERER_ENTRY_PATH);
   if (loadResult && typeof loadResult.catch === 'function') {
     loadResult.catch((error) => {
+      startupPhaseJournal.mark('renderer-load-failed');
       console.error('[main-window] renderer load failed:', redactFigmaLogText(error && error.message));
       showMainWindow({ reason: 'renderer-load-failed' });
     });
@@ -11450,6 +11483,7 @@ function showMainWindow(options = {}) {
     reason = 'show',
     allowHiddenRecreate = true,
   } = options || {};
+  startupPhaseJournal.mark('main-window-show-requested');
   if (typeof app.isReady === 'function' && !app.isReady()) return;
 
   adoptExistingMainWindow();
@@ -11571,6 +11605,7 @@ function showPackageCompleteNotification(projectName, fileCount, options = {}) {
 }
 
 function createTray() {
+  startupPhaseJournal.mark('tray-create-start');
   const iconPath = path.join(__dirname, 'assets', 'tray-icon.png');
   let trayIcon;
   if (fs.existsSync(iconPath)) {
@@ -11584,6 +11619,7 @@ function createTray() {
   tray = new Tray(trayIcon);
   tray.setToolTip('Crate \u2014 Project File Packager');
   tray.on('click', toggleTrayWindow);
+  startupPhaseJournal.mark('tray-created');
 }
 
 // --- File Watching ---
@@ -16863,7 +16899,9 @@ registerTrustedIpcHandler('inactivity:pause', (event, projectId) => {
 // --- App Lifecycle ---
 
 app.whenReady().then(async () => {
+  startupPhaseJournal.mark('ready-handler-entered');
   if (localStoreStartupError) {
+    startupPhaseJournal.mark('startup-error');
     dialog.showErrorBox(
       'Crate could not open',
       'Crate could not secure its local settings. No project data was opened. Please quit and reopen Crate. If this continues, contact support.'
@@ -16873,7 +16911,11 @@ app.whenReady().then(async () => {
   }
 
   try {
-    configureFigmaCredentialStorage();
+    startupPhaseJournal.mark(
+      configureFigmaCredentialStorage()
+        ? 'figma-credential-storage-configured'
+        : 'figma-credential-storage-failed'
+    );
 
     // Show in Dock so users can right-click → Quit
     // NOTE: Do NOT manually set dock icon — let Electron use the .icns from the packager
@@ -16903,15 +16945,22 @@ app.whenReady().then(async () => {
 
     // Repair legacy state before watcher recovery so only one project can consume
     // the global creative-app observation streams.
+    startupPhaseJournal.mark('watch-recovery-start');
     const activeProject = repairPersistedWatchingProjects();
+    let watchRecoveryPhase = 'watch-recovery-complete';
     if (activeProject) {
       try {
-        await startWatching(activeProject.id, { preserveWatchStartedAt: true });
+        const recoveredProject = await startWatching(activeProject.id, { preserveWatchStartedAt: true });
+        watchRecoveryPhase = getWatchRecoveryPhase(recoveredProject);
       } catch (e) {
+        watchRecoveryPhase = 'watch-recovery-failed';
         console.error('[startup] failed to resume project watch:', redactFigmaLogText(e && e.message));
       }
     }
+    startupPhaseJournal.mark(watchRecoveryPhase);
+    startupPhaseJournal.mark('ready-handler-complete');
   } catch (e) {
+    startupPhaseJournal.mark('startup-error');
     console.error('[startup] app initialization failed:', redactFigmaLogText(e && e.message));
     scheduleMainWindowStartupRetries();
     try {
@@ -16951,6 +17000,8 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', () => {
+  startupPhaseJournal.mark('before-quit');
+  startupPhaseJournal.close();
   isQuitting = true;
   mainWindowVisibleSinceStartup = true;
   // Clean up all watchers
