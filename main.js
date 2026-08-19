@@ -6264,8 +6264,9 @@ function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
   });
 }
 
-// C1: In-flight lock for confirmPackage / projects:package
+// Main-process single-flight guards for mutating package and project creation requests.
 let packageInFlight = false;
+let projectCreationInFlight = null;
 const PACKAGE_REVIEW_TOKEN_TTL_MS = 15 * 60 * 1000;
 const CONSUMED_PACKAGE_REVIEW_TOKEN_CAPACITY = 256;
 const PACKAGE_REVIEW_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -12155,43 +12156,54 @@ registerTrustedIpcHandler('projects:get-all', () => {
 });
 
 registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'automatic', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
-  const projects = getProjects();
+  if (projectCreationInFlight) return { error: 'project_creation_in_flight' };
 
-  // Enforce project cap
-  if (projects.length >= MAX_PROJECTS) {
-    return { error: 'max_projects_reached' };
-  }
+  const creation = (async () => {
+    const projects = getProjects();
 
-  const cleanedName = (name || '').trim() || 'Untitled Project';
-
-  let figmaTrackedFiles = [];
-  if (typeof figmaUrl === 'string' && figmaUrl.trim()) {
-    const locator = createTrackedFigmaLocator(figmaUrl);
-    if (!locator) {
-      return { error: 'invalid_figma_url' };
+    // Enforce project cap
+    if (projects.length >= MAX_PROJECTS) {
+      return { error: 'max_projects_reached' };
     }
-    figmaTrackedFiles = [locator];
-  }
 
-  const newProject = {
-    id: crypto.randomUUID(),
-    name: cleanedName,
-    type: projectType,
-    figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
-    figmaTrackedFiles,
-    status: 'paused',
-    files: [],
-    pendingFiles: [], // Tier 2 candidates awaiting user review
-    assetBaseline: createAssetBaselineState(),
-    excludedAssetKeys: [],
-    createdAt: Date.now(),
-    packagedAt: null,
-    outputPath: null
-  };
-  safelyEnsureProjectProvenance(newProject);
-  projects.push(newProject);
-  store.set('projects', projects);
-  return await startWatching(newProject.id);
+    const cleanedName = (name || '').trim() || 'Untitled Project';
+
+    let figmaTrackedFiles = [];
+    if (typeof figmaUrl === 'string' && figmaUrl.trim()) {
+      const locator = createTrackedFigmaLocator(figmaUrl);
+      if (!locator) {
+        return { error: 'invalid_figma_url' };
+      }
+      figmaTrackedFiles = [locator];
+    }
+
+    const newProject = {
+      id: crypto.randomUUID(),
+      name: cleanedName,
+      type: projectType,
+      figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
+      figmaTrackedFiles,
+      status: 'paused',
+      files: [],
+      pendingFiles: [], // Tier 2 candidates awaiting user review
+      assetBaseline: createAssetBaselineState(),
+      excludedAssetKeys: [],
+      createdAt: Date.now(),
+      packagedAt: null,
+      outputPath: null
+    };
+    safelyEnsureProjectProvenance(newProject);
+    projects.push(newProject);
+    store.set('projects', projects);
+    return await startWatching(newProject.id);
+  })();
+
+  projectCreationInFlight = creation;
+  try {
+    return await creation;
+  } finally {
+    if (projectCreationInFlight === creation) projectCreationInFlight = null;
+  }
 });
 
 // Phase 2: per-project Figma link.

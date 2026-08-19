@@ -13116,6 +13116,54 @@ test('new projects default to automatic app detection across mixed supported app
   assert.equal(lsofRequests.some(args => args.includes(expectedPidList)), true);
 });
 
+test('projects:create persists one project while a concurrent creation request is rejected', async () => {
+  let releaseInitialProcessScan;
+  const initialProcessScan = new Promise(resolve => { releaseInitialProcessScan = resolve; });
+  let processScanStarted = false;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'execFile' && command === '/bin/ps' && args.includes('command=')) {
+      processScanStarted = true;
+      return initialProcessScan;
+    }
+    return { stdout: '' };
+  });
+
+  const firstCreation = callIpcRaw(
+    'projects:create',
+    'Single Flight Project',
+    'automatic',
+    'current-page',
+    null
+  );
+  while (!processScanStarted) await new Promise(resolve => setImmediate(resolve));
+
+  const concurrentCreation = await callIpcRaw(
+    'projects:create',
+    'Single Flight Project',
+    'automatic',
+    'current-page',
+    null
+  );
+  assert.deepEqual(concurrentCreation, { error: 'project_creation_in_flight' });
+
+  releaseInitialProcessScan({ stdout: '', stderr: '' });
+  const createdProject = await firstCreation;
+  assert.ok(createdProject?.id);
+
+  const projects = await callIpcRaw('projects:get-all');
+  assert.equal(projects.filter(project => project.name === 'Single Flight Project').length, 1);
+
+  const nextProject = await callIpcRaw(
+    'projects:create',
+    'Single Flight Follow-up',
+    'automatic',
+    'current-page',
+    null
+  );
+  assert.ok(nextProject?.id);
+  assert.notEqual(nextProject.id, createdProject.id);
+});
+
 test('initial mixed-app detection preserves presentation workspace restrictions per app', async () => {
   const sketchPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.sketch');
   const powerpointPath = path.join(TEST_HOME, 'Projects', 'Mixed', 'outside-workspace.pptx');
@@ -16655,6 +16703,8 @@ test('stale Illustrator activation and old watcher callbacks cannot mutate or em
     fs.writeFileSync(filePath, path.basename(filePath));
   }
 
+  const projectB = await createProject('Stale activation B');
+
   let queryCount = 0;
   let releaseFirstQuery;
   let markFirstQueryStarted;
@@ -16682,7 +16732,7 @@ test('stale Illustrator activation and old watcher callbacks cannot mutate or em
   const createA = createProject('Stale activation A');
   await firstQueryStarted;
   const aId = storeInstance.data.projects[storeInstance.data.projects.length - 1].id;
-  const projectB = await createProject('Stale activation B');
+  await callIpc('projects:start-watching', projectB.id);
   testRendererEvents.length = 0;
   releaseFirstQuery();
   await createA;
