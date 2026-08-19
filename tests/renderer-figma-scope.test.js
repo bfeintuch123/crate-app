@@ -286,7 +286,7 @@ function createPackageDetailsDom() {
   return { document: createDocumentStub(elements), elements };
 }
 
-function loadRendererHelpers(document = createDocumentStub(), windowOverrides = {}) {
+function loadRendererHelpers(document = createDocumentStub(), windowOverrides = {}, contextOverrides = {}) {
   const context = {
     console,
     document,
@@ -294,6 +294,7 @@ function loadRendererHelpers(document = createDocumentStub(), windowOverrides = 
     setTimeout,
     clearTimeout,
     Date,
+    ...contextOverrides,
   };
   vm.createContext(context);
   const appJs = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
@@ -2800,17 +2801,21 @@ test('project creation accepts double Enter as exactly one delayed startup reque
   assert.equal(elements['btn-create-project'].disabled, false);
 });
 
-test('project creation rejection unlocks the form, reports failure, and permits one retry', async () => {
+test('project creation rejection unlocks retry only after delayed reconciliation proves nothing persisted', async () => {
   const { document, elements } = createInteractiveRendererDom();
   let attempts = 0;
+  let projectReads = 0;
   const renderer = loadRendererHelpers(document, {
     crate: {
       createProject: async () => {
         attempts += 1;
         if (attempts === 1) throw new Error('synthetic create failure');
-        return { error: 'test_stop_after_request' };
+        return { error: 'max_projects_reached' };
       },
-      getProjects: async () => [],
+      getProjects: async () => {
+        projectReads += 1;
+        return [];
+      },
     },
   });
   document.querySelector('#input-project-name').value = 'Retry project';
@@ -2818,15 +2823,145 @@ test('project creation rejection unlocks the form, reports failure, and permits 
   await renderer.createProject();
 
   assert.equal(attempts, 1);
+  assert.equal(projectReads, 1);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-cancel-project'].disabled, true);
+  assert.match(elements['project-creation-status'].textContent, /Do not try again yet/);
+
+  assert.equal(await renderer.reconcileProjectCreationState(), true);
+  assert.equal(projectReads, 2);
   assert.equal(elements['btn-create-project'].disabled, false);
   assert.equal(elements['btn-cancel-project'].disabled, false);
-  assert.equal(elements['toast-message'].textContent, 'Crate could not start that project. Try again.');
-  assert.equal(elements['toast-message'].getAttribute('role'), 'status');
-  assert.equal(elements['toast-message'].getAttribute('aria-live'), 'polite');
-  assert.equal(elements['project-creation-status'].textContent, 'Crate could not start that project. Try again.');
+  assert.equal(
+    elements['project-creation-status'].textContent,
+    'Crate confirmed the project did not start. You can try again.'
+  );
 
   await renderer.createProject();
   assert.equal(attempts, 2);
+});
+
+for (const ambiguousOutcome of ['null', 'rejection']) {
+  test(`${ambiguousOutcome} project creation stays locked until delayed persistence is reconciled`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const persistedProject = {
+      id: `late-${ambiguousOutcome}`,
+      name: `Late ${ambiguousOutcome}`,
+      status: 'watching',
+      files: [],
+    };
+    let createCalls = 0;
+    let projectReads = 0;
+    let projectVisible = false;
+    const renderer = loadRendererHelpers(document, {
+      crate: {
+        createProject: async () => {
+          createCalls += 1;
+          if (ambiguousOutcome === 'rejection') throw new Error('synthetic response loss');
+          return null;
+        },
+        getProjects: async () => {
+          projectReads += 1;
+          return projectVisible ? [persistedProject] : [];
+        },
+      },
+    });
+    renderer.setupEventListeners();
+    elements['input-project-name'].value = persistedProject.name;
+
+    await renderer.createProject();
+    assert.equal(projectReads, 1);
+    assert.equal(createCalls, 1);
+    assert.equal(elements['btn-create-project'].disabled, true);
+    assert.equal(elements['btn-create-project'].textContent, 'Confirming\u2026');
+
+    elements['input-project-name'].dispatchEvent({
+      type: 'keydown',
+      key: 'Enter',
+      preventDefault: () => {},
+    });
+    elements['btn-create-project'].click();
+    await renderer.createProject();
+    assert.equal(createCalls, 1);
+
+    projectVisible = true;
+    assert.equal(await renderer.reconcileProjectCreationState(), true);
+    assert.equal(projectReads, 2);
+    assert.equal(createCalls, 1);
+    assert.equal(vm.runInContext('state.selectedProjectId', renderer), persistedProject.id);
+    assert.deepEqual(
+      JSON.parse(vm.runInContext('JSON.stringify(state.projects.map(project => project.id))', renderer)),
+      [persistedProject.id]
+    );
+  });
+}
+
+test('never-settling project creation enters terminal recovery and discards a late response', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const delayedCreate = createDeferred();
+  const timers = [];
+  let nextTimerId = 1;
+  let createCalls = 0;
+  const fakeSetTimeout = (callback, delay) => {
+    const timer = { id: nextTimerId, callback, delay, cleared: false };
+    nextTimerId += 1;
+    timers.push(timer);
+    return timer.id;
+  };
+  const fakeClearTimeout = timerId => {
+    const timer = timers.find(item => item.id === timerId);
+    if (timer) timer.cleared = true;
+  };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      createProject: async () => {
+        createCalls += 1;
+        return delayedCreate.promise;
+      },
+      getProjects: async () => [],
+    },
+  }, {
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+  });
+  renderer.setupEventListeners();
+  elements['input-project-name'].value = 'Never settles';
+
+  const createPromise = renderer.createProject();
+  await Promise.resolve();
+  const watchdog = timers.find(timer => timer.delay === 30000);
+  assert.ok(watchdog);
+  assert.equal(createCalls, 1);
+  assert.equal(elements['btn-create-project'].textContent, 'Starting\u2026');
+  watchdog.callback();
+  await createPromise;
+
+  assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+  assert.equal(vm.runInContext('projectCreationGeneration', renderer), 2);
+  assert.equal(vm.runInContext('projectCreationReconciliation', renderer), null);
+  assert.equal(elements['btn-create-project'].disabled, true);
+  assert.equal(elements['btn-create-project'].textContent, 'Restart Crate to continue');
+  assert.equal(elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['new-project-form'].getAttribute('aria-busy'), 'false');
+  assert.equal(elements['btn-cancel-project'].disabled, true);
+  assert.match(elements['project-creation-status'].textContent, /Restart Crate before trying again/);
+  assert.equal(watchdog.cleared, true);
+
+  elements['input-project-name'].dispatchEvent({
+    type: 'keydown',
+    key: 'Enter',
+    preventDefault: () => {},
+  });
+  elements['btn-create-project'].click();
+  elements['btn-cancel-project'].click();
+  await renderer.createProject();
+  assert.equal(createCalls, 1);
+
+  delayedCreate.resolve({ id: 'late-project', name: 'Late', status: 'watching', files: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext('projectCreationPhase', renderer), 'unresolved');
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), null);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(state.projects)', renderer)), []);
 });
 
 test('project creation recovers a single persisted project when the create response is lost', async () => {

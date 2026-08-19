@@ -1,5 +1,6 @@
 // ===== Constants =====
 const MAX_PROJECTS = 7;
+const PROJECT_CREATION_REQUEST_TIMEOUT_MS = 30000;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
 const PRIMARY_WORKING_FILE_EXTS = new Set([
   '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
@@ -656,15 +657,37 @@ async function createProject() {
   const generation = projectCreationGeneration + 1;
   projectCreationGeneration = generation;
   setProjectCreationPhase('creating');
+  let createRequestTimer = null;
 
   try {
     let result = null;
     let createError = null;
+    const timeoutResult = {};
+    let createRequestResult;
     try {
-      result = await window.crate.createProject(name, 'automatic', state.figmaScopeMode, figmaUrl);
+      createRequestResult = window.crate.createProject(name, 'automatic', state.figmaScopeMode, figmaUrl);
     } catch (error) {
-      createError = error;
+      createRequestResult = Promise.reject(error);
     }
+    const createRequest = Promise.resolve(createRequestResult).then(
+      requestResult => ({ result: requestResult, error: null }),
+      error => ({ result: null, error })
+    );
+    const createOutcome = await Promise.race([
+      createRequest,
+      new Promise(resolve => {
+        createRequestTimer = setTimeout(() => resolve(timeoutResult), PROJECT_CREATION_REQUEST_TIMEOUT_MS);
+      }),
+    ]);
+    if (createOutcome === timeoutResult) {
+      const message = 'Crate could not confirm whether the project started. Restart Crate before trying again.';
+      enterProjectCreationUnresolved(generation, message);
+      return;
+    }
+    result = createOutcome.result;
+    createError = createOutcome.error;
+    clearTimeout(createRequestTimer);
+    createRequestTimer = null;
 
     const refresh = await refreshProjectsAfterCreation();
     if (refresh.projects) state.projects = refresh.projects;
@@ -699,7 +722,7 @@ async function createProject() {
       const message = 'Crate could not verify which project started. Restart Crate before trying again.';
       enterProjectCreationUnresolved(generation, message);
       return;
-    } else if (!refresh.projects) {
+    } else if (!hasTypedError && newProjects.length === 0) {
       beginProjectCreationReconciliation(projectIdsBeforeCreate, generation);
       return;
     } else if (newProjects.length > 1) {
@@ -716,6 +739,7 @@ async function createProject() {
       finishProjectCreationAttempt(generation);
     }
   } finally {
+    if (createRequestTimer) clearTimeout(createRequestTimer);
     if (projectCreationGeneration === generation && projectCreationPhase === 'creating') {
       finishProjectCreationAttempt(generation);
     }
