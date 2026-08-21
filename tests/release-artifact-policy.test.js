@@ -136,6 +136,7 @@ const REVIEWED_HELPER_INFO_KEYS = Object.freeze([
 ].sort());
 const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'main.js',
+  'startup-phase-journal.js',
   'preload.js',
   'provenance.js',
   'diagnostic-summary.js',
@@ -1800,6 +1801,14 @@ test('source binding requires a canonical Git root and regular committed source 
       sourceRoot,
     }).matches, false);
     fs.writeFileSync(externalArtifactPath, `safe bytes for ${externalBinding.source}`);
+
+    const journalDriftFiles = new Map(asarFiles);
+    journalDriftFiles.set('startup-phase-journal.js', 'tampered packaged journal bytes');
+    assert.equal(collectSourceBinding(appPath, cleanRunner, {
+      asar: createFakeAsar(journalDriftFiles),
+      archiveVerifier: () => true,
+      sourceRoot,
+    }).matches, false);
 
     let revisionReads = 0;
     const gitCalls = [];

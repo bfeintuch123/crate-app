@@ -1,5 +1,9 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
+try {
+  if (typeof ipcRenderer.send === 'function') ipcRenderer.send('startup:preload-entered');
+} catch (_) {}
+
 function packageDroppedFile(file) {
   let filePath = '';
   try {
@@ -68,6 +72,26 @@ contextBridge.exposeInMainWorld('crate', {
   getFigmaProjectAssets: (projectId) => ipcRenderer.invoke('figma:project-assets', projectId),
   figmaScanNow: () => ipcRenderer.invoke('figma:scan-now'),
 
+  // Fixed startup diagnostics; each signal accepts no arguments and fails open.
+  reportRendererScriptEntered: () => {
+    try { ipcRenderer.send('startup:renderer-script-entered'); } catch (_) {}
+  },
+  reportRendererInitEntered: () => {
+    try { ipcRenderer.send('startup:renderer-init-entered'); } catch (_) {}
+  },
+  reportRendererStartupDataComplete: () => {
+    try { ipcRenderer.send('startup:renderer-startup-data-complete'); } catch (_) {}
+  },
+  reportRendererStartupDataFailed: () => {
+    try { ipcRenderer.send('startup:renderer-startup-data-failed'); } catch (_) {}
+  },
+  reportRendererFirstRenderComplete: () => {
+    try { ipcRenderer.send('startup:renderer-first-render-complete'); } catch (_) {}
+  },
+  reportRendererFirstFrame: () => {
+    try { ipcRenderer.send('startup:renderer-first-frame'); } catch (_) {}
+  },
+
   // Events from main
   onFilesUpdated: (callback) => {
     ipcRenderer.on('files:updated', (event, data) => callback(data));
@@ -94,3 +118,7 @@ contextBridge.exposeInMainWorld('crate', {
     ipcRenderer.on('figma:scan-error', (event, data) => callback(data));
   },
 });
+
+try {
+  if (typeof ipcRenderer.send === 'function') ipcRenderer.send('startup:preload-bridge-exposed');
+} catch (_) {}

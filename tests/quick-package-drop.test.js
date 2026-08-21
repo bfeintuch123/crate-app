@@ -3,10 +3,11 @@ const assert = require('node:assert/strict');
 const Module = require('module');
 const path = require('path');
 
-function loadPreload({ getPathForFile }) {
+function loadPreload({ getPathForFile, sendError }) {
   const originalLoad = Module._load;
   const exposed = new Map();
   const invocations = [];
+  const signals = [];
   const preloadPath = path.resolve(__dirname, '..', 'preload.js');
 
   Module._load = function patchedLoad(request, parent, isMain) {
@@ -18,6 +19,10 @@ function loadPreload({ getPathForFile }) {
           },
         },
         ipcRenderer: {
+          send(channel, ...args) {
+            if (sendError) throw sendError;
+            signals.push({ channel, args });
+          },
           invoke(channel, ...args) {
             invocations.push({ channel, args });
             return Promise.resolve({ success: true });
@@ -38,8 +43,51 @@ function loadPreload({ getPathForFile }) {
     delete require.cache[preloadPath];
   }
 
-  return { bridge: exposed.get('crate'), invocations };
+  return { bridge: exposed.get('crate'), invocations, signals };
 }
+
+test('preload startup diagnostics are fixed no-argument signals and fail open', () => {
+  const { bridge, signals } = loadPreload({ getPathForFile: () => '' });
+  assert.equal(Object.hasOwn(bridge, 'reportStartupPhase'), false);
+  for (const method of [
+    'reportRendererScriptEntered',
+    'reportRendererInitEntered',
+    'reportRendererStartupDataComplete',
+    'reportRendererStartupDataFailed',
+    'reportRendererFirstRenderComplete',
+    'reportRendererFirstFrame',
+  ]) {
+    assert.equal(typeof bridge[method], 'function');
+    assert.doesNotThrow(() => bridge[method]());
+  }
+  assert.deepEqual(signals, [
+    { channel: 'startup:preload-entered', args: [] },
+    { channel: 'startup:preload-bridge-exposed', args: [] },
+    { channel: 'startup:renderer-script-entered', args: [] },
+    { channel: 'startup:renderer-init-entered', args: [] },
+    { channel: 'startup:renderer-startup-data-complete', args: [] },
+    { channel: 'startup:renderer-startup-data-failed', args: [] },
+    { channel: 'startup:renderer-first-render-complete', args: [] },
+    { channel: 'startup:renderer-first-frame', args: [] },
+  ]);
+
+  const failingLoad = loadPreload({
+    getPathForFile: () => '',
+    sendError: new Error('synthetic ipc failure'),
+  });
+  assert.equal(typeof failingLoad.bridge, 'object');
+  for (const method of [
+    'reportRendererScriptEntered',
+    'reportRendererInitEntered',
+    'reportRendererStartupDataComplete',
+    'reportRendererStartupDataFailed',
+    'reportRendererFirstRenderComplete',
+    'reportRendererFirstFrame',
+  ]) {
+    assert.doesNotThrow(() => failingLoad.bridge[method]());
+  }
+  assert.deepEqual(failingLoad.signals, []);
+});
 
 test('preload packages an operating-system-backed dropped file without a path-resolution bridge', async () => {
   const droppedFile = { name: 'Synthetic Deck.pptx' };

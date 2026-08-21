@@ -91,6 +91,33 @@ const UNSAFE_PACKAGE_FOLDER_CHARS = /[\x00-\x1f\x7f<>:"|?*\\/]/g;
 const RENDERER_ENTRY_PATH = path.join(__dirname, 'renderer', 'index.html');
 const RENDERER_ENTRY_URL = pathToFileURL(RENDERER_ENTRY_PATH).href;
 const mainWindowIdentities = new WeakSet();
+const firstOccurrenceStartupPhases = new Set();
+const RENDERER_STARTUP_DATA_OUTCOME_PHASES = new Set([
+  'renderer-startup-data-complete',
+  'renderer-startup-data-failed',
+]);
+const STARTUP_DIAGNOSTIC_PHASE_BY_CHANNEL = Object.freeze({
+  'startup:renderer-script-entered': 'renderer-script-entered',
+  'startup:renderer-init-entered': 'renderer-init-entered',
+  'startup:renderer-startup-data-complete': 'renderer-startup-data-complete',
+  'startup:renderer-startup-data-failed': 'renderer-startup-data-failed',
+  'startup:renderer-first-render-complete': 'renderer-first-render-complete',
+  'startup:renderer-first-frame': 'renderer-first-frame',
+  'startup:preload-entered': 'preload-entered',
+  'startup:preload-bridge-exposed': 'preload-bridge-exposed',
+});
+
+function markFirstOccurrenceStartupPhase(phase) {
+  if (
+    RENDERER_STARTUP_DATA_OUTCOME_PHASES.has(phase) &&
+    [...RENDERER_STARTUP_DATA_OUTCOME_PHASES].some(candidate => (
+      candidate !== phase && firstOccurrenceStartupPhases.has(candidate)
+    ))
+  ) return false;
+  if (firstOccurrenceStartupPhases.has(phase)) return false;
+  firstOccurrenceStartupPhases.add(phase);
+  return startupPhaseJournal.mark(phase);
+}
 
 function isTrustedRendererUrl(rawUrl) {
   if (typeof rawUrl !== 'string' || !rawUrl) return false;
@@ -136,6 +163,21 @@ function registerTrustedIpcHandler(channel, handler) {
     assertTrustedRendererIpc(event);
     return handler(event, ...args);
   });
+}
+
+function registerStartupDiagnosticIpc() {
+  if (!ipcMain || typeof ipcMain.on !== 'function') return;
+  for (const [channel, phase] of Object.entries(STARTUP_DIAGNOSTIC_PHASE_BY_CHANNEL)) {
+    ipcMain.on(channel, (event, ...args) => {
+      if (args.length !== 0) return;
+      try {
+        assertTrustedRendererIpc(event);
+      } catch (_) {
+        return;
+      }
+      markFirstOccurrenceStartupPhase(phase);
+    });
+  }
 }
 
 function realpathSync(targetPath) {
@@ -4588,6 +4630,7 @@ let store = null;
 startupPhaseJournal.mark('store-preflight-start');
 try {
   localStorePaths = preflightLocalStorePaths(app.getPath('userData'));
+  startupPhaseJournal.mark('store-path-preflight-complete');
   const candidateStore = new Store({
     cwd: localStorePaths.userDataRealPath,
     configFileMode: OWNER_ONLY_FILE_MODE,
@@ -4606,6 +4649,7 @@ try {
       }
     }
   });
+  startupPhaseJournal.mark('store-constructor-complete');
   if (
     typeof candidateStore.path !== 'string' ||
     fs.realpathSync.native(candidateStore.path) !== fs.realpathSync.native(localStorePaths.configPath) ||
@@ -4613,9 +4657,12 @@ try {
   ) {
     throw new Error('Crate could not secure local settings storage.');
   }
+  startupPhaseJournal.mark('store-path-security-complete');
   validateLocalStoreShape(candidateStore);
+  startupPhaseJournal.mark('store-shape-validation-complete');
   store = candidateStore;
   migrateSettings();
+  startupPhaseJournal.mark('store-migrations-complete');
   startupPhaseJournal.mark('store-preflight-complete');
 } catch (_) {
   store = null;
@@ -6294,6 +6341,18 @@ const consumedPackageReviewTokens = new Map();
 let tray = null;
 // Historical name retained for existing renderer send paths; this is now the main app window.
 let trayWindow = null;
+registerStartupDiagnosticIpc();
+app.on('web-contents-created', (_event, webContents) => {
+  markFirstOccurrenceStartupPhase('web-contents-created');
+  if (webContents && typeof webContents.on === 'function') {
+    webContents.on('preload-error', () => {
+      markFirstOccurrenceStartupPhase('preload-error');
+    });
+  }
+});
+app.on('child-process-gone', () => {
+  markFirstOccurrenceStartupPhase('child-process-gone');
+});
 let mainWindowShowFallback = null;
 const mainWindowStartupRetryTimers = new Set();
 const watchers = new Map(); // projectId -> chokidar watcher
@@ -6311,6 +6370,7 @@ const PACKAGE_NOTIFICATION_SHOW_DELAY_MS = 750;
 let mainWindowHiddenShowAttempts = 0;
 let mainWindowVisibleSinceStartup = false;
 let packageForegroundSuppressionUntil = 0;
+let mainWindowInitialDiagnosticsScheduled = false;
 
 function suppressPackageAutoForeground() {
   packageForegroundSuppressionUntil = Math.max(
@@ -11391,6 +11451,15 @@ function createMainWindow() {
   mainWindowIdentities.add(nextWindow);
   trayWindow = nextWindow;
 
+  if (typeof nextWindow.on === 'function') {
+    nextWindow.on('show', () => {
+      markFirstOccurrenceStartupPhase('main-window-show-event');
+    });
+    nextWindow.on('focus', () => {
+      markFirstOccurrenceStartupPhase('main-window-focus-event');
+    });
+  }
+
   const revealLoadedMainWindow = () => {
     clearMainWindowShowFallback();
     showMainWindow({ reason: 'renderer-ready' });
@@ -11414,6 +11483,16 @@ function createMainWindow() {
   }
 
   if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
+    let rendererWasUnresponsive = false;
+    trayWindow.webContents.on('unresponsive', () => {
+      if (rendererWasUnresponsive) return;
+      rendererWasUnresponsive = true;
+      markFirstOccurrenceStartupPhase('main-window-unresponsive');
+    });
+    trayWindow.webContents.on('responsive', () => {
+      if (!rendererWasUnresponsive) return;
+      markFirstOccurrenceStartupPhase('main-window-responsive');
+    });
     const blockUntrustedNavigation = (event, targetUrl) => {
       const requestedUrl = event && typeof event.url === 'string' ? event.url : targetUrl;
       if (!isTrustedRendererUrl(requestedUrl) && event && typeof event.preventDefault === 'function') {
@@ -11440,6 +11519,18 @@ function createMainWindow() {
 
   startupPhaseJournal.mark('renderer-load-start');
   const loadResult = trayWindow.loadFile(RENDERER_ENTRY_PATH);
+  if (!mainWindowInitialDiagnosticsScheduled) {
+    mainWindowInitialDiagnosticsScheduled = true;
+    setImmediate(() => {
+      markFirstOccurrenceStartupPhase('main-event-loop-immediate-after-window');
+    });
+    const eventLoopTimer = setTimeout(() => {
+      markFirstOccurrenceStartupPhase('main-event-loop-timer-after-window');
+    }, 100);
+    if (eventLoopTimer && typeof eventLoopTimer.unref === 'function') {
+      eventLoopTimer.unref();
+    }
+  }
   if (loadResult && typeof loadResult.catch === 'function') {
     loadResult.catch((error) => {
       startupPhaseJournal.mark('renderer-load-failed');
@@ -16947,9 +17038,11 @@ app.whenReady().then(async () => {
     // the global creative-app observation streams.
     startupPhaseJournal.mark('watch-recovery-start');
     const activeProject = repairPersistedWatchingProjects();
+    startupPhaseJournal.mark('watch-state-repair-complete');
     let watchRecoveryPhase = 'watch-recovery-complete';
     if (activeProject) {
       try {
+        startupPhaseJournal.mark('watch-resume-start');
         const recoveredProject = await startWatching(activeProject.id, { preserveWatchStartedAt: true });
         watchRecoveryPhase = getWatchRecoveryPhase(recoveredProject);
       } catch (e) {
@@ -16984,6 +17077,7 @@ app.on('did-become-active', () => {
 });
 
 app.on('second-instance', () => {
+  markFirstOccurrenceStartupPhase('second-instance-received');
   showMainWindow({ reason: 'second-instance' });
 });
 
