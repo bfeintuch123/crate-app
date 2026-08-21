@@ -166,6 +166,7 @@ const EXPECTED_APP_UPDATE_METADATA = Buffer.from(
 );
 const SOURCE_BOUND_ENTRIES = Object.freeze([
   'main.js',
+  'startup-phase-journal.js',
   'preload.js',
   'provenance.js',
   'diagnostic-summary.js',

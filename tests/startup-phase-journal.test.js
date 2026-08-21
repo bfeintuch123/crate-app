@@ -57,6 +57,64 @@ test('startup journal records only bounded privacy-safe phase data', () => {
   }
 });
 
+test('startup journal accepts every added fixed phase with only the phase schema', () => {
+  const addedPhases = [
+    'store-path-preflight-complete',
+    'store-constructor-complete',
+    'store-path-security-complete',
+    'store-shape-validation-complete',
+    'store-migrations-complete',
+    'web-contents-created',
+    'preload-error',
+    'main-window-show-event',
+    'main-window-focus-event',
+    'main-window-unresponsive',
+    'main-window-responsive',
+    'child-process-gone',
+    'second-instance-received',
+    'preload-entered',
+    'preload-bridge-exposed',
+    'renderer-script-entered',
+    'renderer-init-entered',
+    'renderer-startup-data-complete',
+    'renderer-startup-data-failed',
+    'renderer-first-render-complete',
+    'renderer-first-frame',
+    'main-event-loop-immediate-after-window',
+    'main-event-loop-timer-after-window',
+    'watch-state-repair-complete',
+    'watch-resume-start',
+  ];
+  const logDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-startup-journal-fixed-phases-'));
+  const journal = createStartupPhaseJournal({ logDirectory, processId: 43, now: () => 2000 });
+
+  try {
+    for (const phase of addedPhases) assert.equal(journal.mark(phase), true, phase);
+    journal.close();
+    const entries = fs.readFileSync(
+      path.join(logDirectory, STARTUP_PHASE_JOURNAL_FILE),
+      'utf8'
+    ).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(entries.map(entry => entry.phase), addedPhases);
+    for (const [index, entry] of entries.entries()) {
+      assert.deepEqual(Object.keys(entry).sort(), [
+        'elapsedMs',
+        'launchId',
+        'phase',
+        'schemaVersion',
+        'sequence',
+      ]);
+      assert.equal(entry.schemaVersion, 1);
+      assert.equal(entry.launchId, '1jk-17');
+      assert.equal(entry.sequence, index + 1);
+      assert.equal(entry.elapsedMs, 0);
+    }
+  } finally {
+    journal.close();
+    fs.rmSync(logDirectory, { recursive: true, force: true });
+  }
+});
+
 test('startup journal truncates oversized history and rejects unsafe destinations', () => {
   const logDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-startup-journal-cap-'));
   const journalPath = path.join(logDirectory, STARTUP_PHASE_JOURNAL_FILE);

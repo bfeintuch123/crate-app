@@ -1,3 +1,9 @@
+try {
+  if (typeof window !== 'undefined' && typeof window.crate?.reportRendererScriptEntered === 'function') {
+    window.crate.reportRendererScriptEntered();
+  }
+} catch (_) {}
+
 // ===== Constants =====
 const MAX_PROJECTS = 7;
 const PROJECT_CREATION_REQUEST_TIMEOUT_MS = 30000;
@@ -165,6 +171,11 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 // ===== Init =====
 async function init() {
+  try {
+    if (typeof window.crate?.reportRendererInitEntered === 'function') {
+      window.crate.reportRendererInitEntered();
+    }
+  } catch (_) {}
   setupEventListeners();
 
   if (!window.crate) {
@@ -186,13 +197,42 @@ async function init() {
     state.projects = Array.isArray(projects) ? projects : [];
     state.settings = settings && typeof settings === 'object' ? settings : {};
     state.usage = usage && typeof usage === 'object' ? usage : {};
+    try {
+      if (typeof window.crate.reportRendererStartupDataComplete === 'function') {
+        window.crate.reportRendererStartupDataComplete();
+      }
+    } catch (_) {}
   } catch (e) {
     logRendererError('startup data load failed', e);
+    try {
+      if (typeof window.crate.reportRendererStartupDataFailed === 'function') {
+        window.crate.reportRendererStartupDataFailed();
+      }
+    } catch (_) {}
   }
 
   renderProjects();
   renderSettingsControls();
   renderFooter();
+  try {
+    if (typeof window.crate.reportRendererFirstRenderComplete === 'function') {
+      window.crate.reportRendererFirstRenderComplete();
+    }
+  } catch (_) {}
+  try {
+    const requestFrame = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : window.requestAnimationFrame;
+    if (typeof requestFrame === 'function') {
+      requestFrame(() => {
+        try {
+          if (typeof window.crate?.reportRendererFirstFrame === 'function') {
+            window.crate.reportRendererFirstFrame();
+          }
+        } catch (_) {}
+      });
+    }
+  } catch (_) {}
   renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
 }
 

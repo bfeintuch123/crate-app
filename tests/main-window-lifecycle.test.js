@@ -19,6 +19,7 @@ test('main window uses normal macOS app lifecycle', async () => {
   const stubs = new Map();
   const appHandlers = new Map();
   const ipcHandlers = new Map();
+  const ipcEventHandlers = new Map();
   const windows = [];
   const trays = [];
   const intervals = new Set();
@@ -96,6 +97,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       this.focusable = options.focusable !== false;
       this.ignoreMouseEvents = false;
       windows.push(this);
+      appHandlers.get('web-contents-created')?.({}, this.webContents);
     }
 
     static getAllWindows() {
@@ -121,8 +123,8 @@ test('main window uses normal macOS app lifecycle', async () => {
       this.minimized = false;
       this.restoreCount += 1;
     }
-    show() { this.showCount += 1; }
-    focus() { this.focusCount += 1; }
+    show() { this.showCount += 1; this.handlers.get('show')?.(); }
+    focus() { this.focusCount += 1; this.handlers.get('focus')?.(); }
     moveTop() { this.moveTopCount += 1; }
     setFocusable(value) { this.focusable = value; }
     setIgnoreMouseEvents(value) { this.ignoreMouseEvents = value; }
@@ -191,6 +193,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     Tray: TestTray,
     ipcMain: {
       handle(channel, fn) { ipcHandlers.set(channel, fn); },
+      on(channel, fn) { ipcEventHandlers.set(channel, fn); },
     },
     dialog: {
       showOpenDialog: async () => ({ canceled: true }),
@@ -240,17 +243,26 @@ test('main window uses normal macOS app lifecycle', async () => {
       'single-instance-lock-start',
       'single-instance-lock-acquired',
       'store-preflight-start',
+      'store-path-preflight-complete',
+      'store-constructor-complete',
+      'store-path-security-complete',
+      'store-shape-validation-complete',
+      'store-migrations-complete',
       'store-preflight-complete',
       'ready-handler-entered',
       'figma-credential-storage-configured',
       'main-window-create-start',
+      'web-contents-created',
       'main-window-constructed',
       'renderer-load-start',
       'main-window-show-requested',
+      'main-window-show-event',
+      'main-window-focus-event',
       'main-window-visible',
       'tray-create-start',
       'tray-created',
       'watch-recovery-start',
+      'watch-state-repair-complete',
       'watch-recovery-complete',
       'ready-handler-complete',
     ]);
@@ -290,6 +302,9 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(typeof win.webContents.handlers.get('did-finish-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('did-fail-load'), 'function');
     assert.equal(typeof win.webContents.handlers.get('render-process-gone'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('unresponsive'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('responsive'), 'function');
+    assert.equal(typeof win.webContents.handlers.get('preload-error'), 'function');
     assert.equal(typeof win.webContents.handlers.get('will-navigate'), 'function');
     assert.equal(typeof win.webContents.handlers.get('will-redirect'), 'function');
     assert.equal(typeof win.webContents.windowOpenHandler, 'function');
@@ -298,6 +313,58 @@ test('main window uses normal macOS app lifecycle', async () => {
     const mainFrame = { url: rendererUrl };
     win.webContents.mainFrame = mainFrame;
     const trustedEvent = { sender: win.webContents, senderFrame: mainFrame };
+
+    const diagnosticChannels = [
+      'startup:renderer-script-entered',
+      'startup:renderer-init-entered',
+      'startup:renderer-startup-data-complete',
+      'startup:renderer-startup-data-failed',
+      'startup:renderer-first-render-complete',
+      'startup:renderer-first-frame',
+      'startup:preload-entered',
+      'startup:preload-bridge-exposed',
+    ];
+    assert.deepEqual([...ipcEventHandlers.keys()].sort(), [...diagnosticChannels].sort());
+    ipcEventHandlers.get('startup:preload-entered')({
+      sender: win.webContents,
+      senderFrame: { url: '' },
+    });
+    assert.equal(startupPhases().filter(phase => phase === 'preload-entered').length, 0);
+    ipcEventHandlers.get('startup:renderer-script-entered')(trustedEvent, 'unexpected');
+    assert.equal(startupPhases().filter(phase => phase === 'renderer-script-entered').length, 0);
+    ipcEventHandlers.get('startup:renderer-init-entered')({
+      sender: win.webContents,
+      senderFrame: { url: 'https://example.com/' },
+    });
+    assert.equal(startupPhases().filter(phase => phase === 'renderer-init-entered').length, 0);
+    ipcEventHandlers.get('startup:renderer-first-render-complete')({
+      sender: win.webContents,
+      senderFrame: { url: rendererUrl },
+    });
+    assert.equal(startupPhases().filter(phase => phase === 'renderer-first-render-complete').length, 0);
+    for (const channel of diagnosticChannels) {
+      ipcEventHandlers.get(channel)(trustedEvent);
+      ipcEventHandlers.get(channel)(trustedEvent);
+    }
+    for (const channel of diagnosticChannels) {
+      const phase = channel.slice('startup:'.length);
+      const expectedCount = phase === 'renderer-startup-data-failed' ? 0 : 1;
+      assert.equal(startupPhases().filter(recordedPhase => recordedPhase === phase).length, expectedCount);
+    }
+    assert.equal(startupPhases().filter(phase => phase === 'renderer-startup-data-complete').length, 1);
+    assert.equal(startupPhases().filter(phase => phase === 'renderer-startup-data-failed').length, 0);
+
+    win.webContents.handlers.get('unresponsive')();
+    win.webContents.handlers.get('responsive')();
+    win.webContents.handlers.get('responsive')();
+    appHandlers.get('child-process-gone')({}, {});
+    appHandlers.get('child-process-gone')({}, {});
+    win.webContents.handlers.get('preload-error')();
+    assert.equal(startupPhases().filter(phase => phase === 'main-window-unresponsive').length, 1);
+    assert.equal(startupPhases().filter(phase => phase === 'main-window-responsive').length, 1);
+    assert.equal(startupPhases().filter(phase => phase === 'child-process-gone').length, 1);
+    assert.equal(startupPhases().filter(phase => phase === 'preload-error').length, 1);
+
     assert.deepEqual(ipcHandlers.get('projects:get-all')(trustedEvent), []);
     assert.equal(ipcHandlers.has('projects:prepare-package-review'), true);
     assert.equal(ipcHandlers.has('projects:set-existing-assets-decision'), true);
@@ -417,9 +484,12 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(trays.length, 1);
     assert.deepEqual(
       [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
-      [1500]
+      [100, 1500]
     );
     assert.ok([...timeouts].every(timeout => timeout.unrefed === true));
+    const eventLoopTimer = [...timeouts].find(timeout => timeout.delay === 100);
+    timeouts.delete(eventLoopTimer);
+    eventLoopTimer.fn();
 
     win.webContents.handlers.get('dom-ready')();
     assert.equal(startupPhases().at(-1), 'renderer-dom-ready');
@@ -717,8 +787,11 @@ test('startup recovery recreates window if first launch window closes before bec
     assert.equal(windows[0].isVisible(), false);
     assert.deepEqual(
       [...timeouts].map(timeout => timeout.delay).sort((a, b) => a - b),
-      [500, 1500, 1500, 5000, 10000]
+      [100, 500, 1500, 1500, 5000, 10000]
     );
+    const eventLoopTimer = [...timeouts].find(timeout => timeout.delay === 100);
+    timeouts.delete(eventLoopTimer);
+    eventLoopTimer.fn();
 
     windows[0].destroyed = true;
     windows[0].handlers.get('closed')();

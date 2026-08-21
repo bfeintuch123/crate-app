@@ -2761,6 +2761,93 @@ test('DOMContentLoaded clean startup renders the complete Projects surface', asy
   assert.equal(elements['project-rows'].children.length, 3);
 });
 
+test('renderer startup diagnostics record success through the first frame', async () => {
+  const { document } = createInteractiveRendererDom();
+  const signals = [];
+  let frameCallback = null;
+  const noOp = () => {};
+  const bridge = {
+    getProjects: async () => [],
+    getSettings: async () => ({}),
+    getUsage: async () => ({}),
+    getFigmaStatus: async () => ({ connected: false }),
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+    reportRendererScriptEntered: () => signals.push('renderer-script-entered'),
+    reportRendererInitEntered: () => signals.push('renderer-init-entered'),
+    reportRendererStartupDataComplete: () => signals.push('renderer-startup-data-complete'),
+    reportRendererStartupDataFailed: () => signals.push('renderer-startup-data-failed'),
+    reportRendererFirstRenderComplete: () => signals.push('renderer-first-render-complete'),
+    reportRendererFirstFrame: () => signals.push('renderer-first-frame'),
+  };
+
+  loadRendererHelpers(document, { crate: bridge }, {
+    requestAnimationFrame(callback) {
+      frameCallback = callback;
+      return 1;
+    },
+  });
+  await document.listeners.DOMContentLoaded();
+  assert.deepEqual(signals, [
+    'renderer-script-entered',
+    'renderer-init-entered',
+    'renderer-startup-data-complete',
+    'renderer-first-render-complete',
+  ]);
+  assert.equal(typeof frameCallback, 'function');
+  frameCallback();
+  assert.equal(signals.at(-1), 'renderer-first-frame');
+});
+
+test('renderer startup diagnostics record data failure and fail open when signals throw', async () => {
+  const { document } = createInteractiveRendererDom();
+  const signals = [];
+  let frameCallback = null;
+  const noOp = () => {};
+  const bridge = {
+    getProjects: async () => { throw new Error('synthetic startup failure'); },
+    getSettings: async () => ({}),
+    getUsage: async () => ({}),
+    getFigmaStatus: async () => ({ connected: false }),
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+    reportRendererScriptEntered: () => { throw new Error('diagnostic bridge failed'); },
+    reportRendererInitEntered: () => { throw new Error('diagnostic bridge failed'); },
+    reportRendererStartupDataFailed: () => { throw new Error('diagnostic bridge failed'); },
+    reportRendererFirstRenderComplete: () => { throw new Error('diagnostic bridge failed'); },
+    reportRendererFirstFrame: () => { throw new Error('diagnostic bridge failed'); },
+  };
+
+  loadRendererHelpers(document, { crate: bridge }, {
+    requestAnimationFrame(callback) {
+      frameCallback = callback;
+      return 1;
+    },
+  });
+  await assert.doesNotReject(document.listeners.DOMContentLoaded());
+  assert.equal(typeof frameCallback, 'function');
+  assert.doesNotThrow(() => frameCallback());
+});
+
+test('renderer startup remains available when the diagnostic bridge is absent', async () => {
+  const { document } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {});
+  await assert.doesNotReject(document.listeners.DOMContentLoaded());
+  assert.equal(typeof renderer.init, 'function');
+});
+
 test('project creation locks click and Enter submissions until delayed startup refreshes successfully', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const delayedCreate = createDeferred();
