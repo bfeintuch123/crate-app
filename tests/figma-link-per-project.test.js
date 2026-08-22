@@ -1020,6 +1020,7 @@ test('deferred project cache cleanup rechecks current projects immediately befor
   const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-cache-batch-outside-'));
   const outsideFile = path.join(outsideDir, 'keep.txt');
   fs.writeFileSync(outsideFile, 'keep', { mode: 0o644 });
+  const outsideFileInitialMode = process.platform === 'win32' ? null : modeOf(outsideFile);
   if (process.platform !== 'win32') {
     for (let index = 0; index < 50; index++) {
       fs.symlinkSync(outsideFile, path.join(cacheDir, `unsafe-${index}.bin`));
@@ -1074,7 +1075,7 @@ test('deferred project cache cleanup rechecks current projects immediately befor
     if (process.platform !== 'win32') {
       assert.ok(cleanupYieldCount >= 2, 'unsafe cache entries should still yield in bounded batches');
       assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'keep');
-      assert.equal(modeOf(outsideFile), 0o644);
+      assert.equal(modeOf(outsideFile), outsideFileInitialMode);
     }
   } finally {
     releaseRename();
