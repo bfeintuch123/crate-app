@@ -211,14 +211,57 @@ test('reads one bounded regular event file and rejects symlinks', () => {
 test('trusted workflow runs only base-controlled code and leaves source CI unmodified', () => {
   const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/visual-evidence-gate.yml'), 'utf8');
   const sourceGate = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/security-gate.yml'), 'utf8');
+  assert.match(workflow, /^name: Crate PR visual evidence gate\n/u);
+  assert.match(workflow, /name: PR visual evidence\n\s+runs-on: ubuntu-24\.04\n\s+timeout-minutes: 5/u);
   assert.match(workflow, /^\s*pull_request_target:\s*$/m);
   assert.match(workflow, /types: \[opened, synchronize, reopened, ready_for_review, edited\]/);
-  assert.match(workflow, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
-  assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /node \.codex\/tools\/verify_pr_visual_evidence\.js "\$GITHUB_EVENT_PATH"/);
+  assert.match(workflow, /TRUSTED_BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(workflow, /exec node \.codex\/tools\/verify_pr_visual_evidence\.js "\$GITHUB_EVENT_PATH"/);
   assert.doesNotMatch(workflow, /^\s*pull_request:\s*$/m);
   assert.doesNotMatch(workflow, /pull_request\.head\.sha|github\.head_ref|checkout.*head/i);
   assert.doesNotMatch(sourceGate, /verify_pr_visual_evidence|Visual evidence/);
+});
+
+test('trusted-base retrieval is sparse, canonical, exact, credential-free, and fail-closed', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/visual-evidence-gate.yml'), 'utf8');
+  assert.match(workflow, /trusted_origin='https:\/\/github\.com\/bfeintuch123\/crate-app\.git'/u);
+  assert.match(workflow, /fetch --no-tags --depth=1 --no-recurse-submodules "\$trusted_origin" "\$TRUSTED_BASE_SHA"/u);
+  assert.match(workflow, /sparse-checkout set --no-cone/u);
+  for (const trustedPath of [
+    '\.codex\/tools\/verify_pr_visual_evidence\.js',
+    '\.codex\/tools\/visual_evidence_contract\.js',
+    '\.codex\/tools\/publish_visual_evidence\.js',
+  ]) {
+    assert.match(workflow, new RegExp(`\\/${trustedPath}`));
+  }
+  for (const failureCode of [
+    'invalid_trusted_base_sha',
+    'trusted_base_fetch_failed',
+    'trusted_base_path_mismatch',
+    'trusted_base_commit_mismatch',
+    'trusted_base_origin_mismatch',
+    'trusted_base_input_path_mismatch',
+    'trusted_base_input_missing',
+    'trusted_base_input_mismatch',
+    'trusted_base_credentials_persisted',
+  ]) {
+    assert.match(workflow, new RegExp(failureCode));
+  }
+  const validationIndex = workflow.indexOf('invalid_trusted_base_sha');
+  const fetchIndex = workflow.indexOf('fetch --no-tags --depth=1 --no-recurse-submodules');
+  assert.ok(validationIndex >= 0 && validationIndex < fetchIndex, 'base SHA must be validated before fetch interpolation');
+  assert.doesNotMatch(workflow, /actions\/checkout@/u);
+  assert.doesNotMatch(workflow, /git submodule|\.gitmodules/u);
+  assert.doesNotMatch(workflow, /npm\s+(?:ci|install|run|exec)/u);
+  assert.doesNotMatch(workflow, /GITHUB_TOKEN|github\.token|Authorization|Bearer/u);
+});
+
+test('regression guard prevents checkout post-job cleanup from inspecting legacy gitlinks', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/visual-evidence-gate.yml'), 'utf8');
+  assert.doesNotMatch(workflow, /actions\/checkout|submodule foreach|No url found for submodule/u);
+  assert.match(workflow, /--no-recurse-submodules/u);
+  assert.match(workflow, /trusted_base_path_exists/u);
+  assert.match(workflow, /trusted_base_credentials_persisted/u);
 });
 
 test('pull request template contains only parser-compatible visual evidence lines', () => {
