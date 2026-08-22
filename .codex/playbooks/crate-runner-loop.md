@@ -161,17 +161,71 @@ Notes:
 - Long tests such as `tests/provenance-dual-write.test.js` should be allowed to finish before deciding pass/fail.
 - Use focused subsets first when the loop goal is narrow; use the full non-GUI suite when the risk surface is broad.
 
-## Suggested Future Crabbox Jobs
-Do not add `.crabbox.yaml` yet. Inspect Crabbox schema and get Bryant approval before creating or committing any Crabbox config.
+## Configured Crabbox Jobs
+Bryant approved Crabbox repository onboarding on 2026-08-21 after the Beta 2.14
+build completed. The v0.45.0 schema was inspected from the signed release and in
+a disposable generated repository before `.crabbox.yaml` was added on the
+isolated `ops/crabbox-runner-onboarding` branch.
 
-Future jobs may include:
-- `quick-check`: syntax checks plus `git diff --check`
-- `provenance-suite`: provenance and dual-write tests
+Configured jobs are:
+- `quick-check`: syntax checks, visual-evidence helper tests, plus `git diff --check`
+- `provenance-suite`: cross-platform provenance and diagnostic-summary tests
 - `figma-suite`: Figma scope, link, token privacy, and renderer Figma tests
 - `package-parser-suite`: package safety, PSD safety, PowerPoint/Keynote, and Quick Package parser tests
 - `full-nongui-suite`: all safe runner-compatible commands
+- `visual-artifact-collect`: validate and retrieve one already-inspected,
+  public-safe MP4, WebM, or PNG plus its strict JSON manifest; this is
+  collection only, not GUI proof or durable publication
+
+Invoke them through `.codex/tools/run_crabbox_job.sh <job>`. Crabbox v0.45.0
+has a fresh-workspace local-hydration ordering defect in raw one-shot
+`crabbox job run`: it may invalidate the fingerprint before creating the
+workspace. The wrapper warms one lease, performs a sync-only run that creates
+the workspace, explicitly hydrates it, runs the named job with hydration reuse,
+and stops the lease on success or failure.
 
 Release/sign/notarize/deploy jobs stay Mac mini only.
+`tests/provenance-dual-write.test.js` also stays in the macOS lane because its
+coverage intentionally exercises macOS filesystem paths and creative-app
+semantics that do not hold in the Ubuntu Apple VM.
+
+The reviewed default provider is the direct local `apple-vm` backend on the
+Apple Silicon MacBook. It uses no broker or cloud credentials and exposes SSH
+only on loopback. Any alternate provider and associated credentials or spend
+require separate approval. The reviewed config also selects class `standard`,
+spot capacity, and `fallback: none`; do not replace those with the generated
+class `beast` or on-demand fallback without approval.
+
+### Visual Evidence Publication Boundary
+
+The primary path is `.codex/tools/publish_visual_evidence.js`. It binds a
+sanitized media file to the public repository database ID, exact PR number, and
+full head SHA; acquires GitHub auth only in process memory; sends it to curl on
+stdin rather than argv or environment; rejects redirects and schema drift; and
+verifies exact destination bytes and SHA-256 before writing an owner-only
+manifest. It uploads no manifest and does not edit or comment on a PR.
+
+Every GitHub attachment for `bfeintuch123/crate-app` is public. A passing privacy
+inspection is mandatory and repository visibility is never a privacy control.
+The uploader accepts that gate only through an owner-only
+`crate.visual-review.v1` receipt bound to the exact sanitized name, MIME, bytes,
+and SHA-256; command-line PASS assertions are not accepted.
+
+Crabbox v0.45.0 supports credential-free collection on `apple-vm` through
+`artifactGlobs` and `requiredArtifacts`. Under the approved contract, a GitHub
+PR user attachment is the sole durable publication destination. Crabbox
+provides isolated collection, integrity validation, and fail-closed local
+preservation; its trusted-Mac archive is local evidence, not a durable
+off-host URL, and no independent Crabbox publisher is configured or approved.
+If GitHub publication is unavailable or fails, retain the verified bundle and
+fail closed without claiming durable publication. GitHub releases/prereleases
+and release assets are product-release controlled and must never be used as a
+fallback; S3, R2, Cloudflare, brokers, `uploads.sh`, and other backends are
+also outside this lane.
+
+The host validator computes the archive's exact bytes and SHA-256 and derives
+cleanup from a fresh zero-match `crabbox list --json` check for the named lease;
+caller-supplied `cleanup: PASS` is not accepted as evidence.
 
 ## Runner Evidence Format
 Use this format in reports, loop state, PR notes, or handoffs:
@@ -262,7 +316,12 @@ git diff --check
 Use before high-risk non-GUI PRs or release-gate readiness. It is the full safe runner-compatible command list.
 
 ## Crabbox Guidance
-- Do not add `.crabbox.yaml` until schema is inspected and Bryant approves.
+- Use the reviewed `.crabbox.yaml` and `.agents/skills/crabbox/SKILL.md`; do not
+  regenerate them with `crabbox init` or `--force`.
+- Do not override the local `apple-vm` provider, start paid capacity, or
+  register a GitHub self-hosted runner without explicit approval.
+- Never warm speculatively. Reuse one approved lease serially, record its ID,
+  and stop it before handoff.
 - Treat Crabbox as a non-GUI runner unless the schema and environment explicitly prove otherwise.
 - Keep release/sign/notarize/deploy jobs on the Mac mini signed release environment.
 - Do not assume remote runners have private QA folders, Keychain entries, Apple Developer credentials, signing identities, installed creative apps, or GUI automation.
@@ -283,7 +342,8 @@ Stop immediately for:
 - `get-crate.com` or site deploy
 - failed runner commands that cannot be safely resolved inside scope
 - scope expands beyond loop goal
-- missing Crabbox schema when asked to add `.crabbox.yaml`
+- missing or unreviewed Crabbox schema/config drift
+- absent durable Crabbox artifact URL or ambiguous lease cleanup
 
 ## Relationship To Existing Playbooks
 Use this playbook with:
@@ -304,7 +364,7 @@ When another playbook has stricter gates, the stricter gate wins.
 - Evidence is captured in the runner evidence format.
 - Failures are classified as product, test, environment, or scope issues.
 - Stop gates are honored.
-- `.crabbox.yaml` is not added unless schema inspection and Bryant approval are explicit.
+- `.crabbox.yaml` matches the reviewed schema and provider/cost gates.
 - Final report includes files changed, commands run, evidence, risks, and whether Bryant can proceed.
 
 ## Report Format

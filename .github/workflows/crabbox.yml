@@ -1,0 +1,172 @@
+name: Crate Crabbox hydration
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to hydrate
+        required: false
+        type: string
+      crabbox_id:
+        description: Crabbox lease ID
+        required: true
+        type: string
+      crabbox_runner_label:
+        description: Dynamic Crabbox runner label
+        required: true
+        type: string
+      crabbox_job:
+        description: Hydration job identifier expected by Crabbox
+        required: false
+        default: hydrate
+        type: string
+      crabbox_keep_alive_minutes:
+        description: Minutes to keep the hydrated job alive
+        required: false
+        default: '90'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hydrate:
+    # Fixed reviewed labels prevent workflow_dispatch from selecting an arbitrary
+    # self-hosted runner. The dynamic input remains only for v0.45.0 compatibility.
+    runs-on: [self-hosted, crabbox, crabbox-profile-default, crabbox-class-standard]
+    timeout-minutes: 120
+    env:
+      CI: 'true'
+      NODE_OPTIONS: ''
+      NODE_PATH: ''
+      npm_config_fund: 'false'
+      npm_config_ignore_scripts: 'true'
+      npm_config_registry: https://registry.npmjs.org/
+      npm_config_strict_ssl: 'true'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify requested source ref
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          if [ -z "$REQUESTED_REF" ]; then REQUESTED_REF="$GITHUB_SHA"; fi
+          test -n "$REQUESTED_REF"
+          actual="$(git rev-parse HEAD)"
+          expected="$(git rev-parse "${REQUESTED_REF}^{commit}")"
+          test "$actual" = "$expected"
+
+      - name: Reject repository package-manager configuration
+        run: test ! -e .npmrc && test ! -L .npmrc && test ! -e npm-shrinkwrap.json && test ! -L npm-shrinkwrap.json
+
+      - name: Prepare isolated npm configuration
+        run: |
+          /usr/bin/install -m 600 /dev/null "$RUNNER_TEMP/crate-crabbox-user-npmrc"
+          /usr/bin/install -m 600 /dev/null "$RUNNER_TEMP/crate-crabbox-global-npmrc"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.23.1
+
+      - name: Install frozen dependencies without lifecycle scripts
+        env:
+          npm_config_cache: ${{ runner.temp }}/crate-crabbox-npm-cache
+          npm_config_globalconfig: ${{ runner.temp }}/crate-crabbox-global-npmrc
+          npm_config_userconfig: ${{ runner.temp }}/crate-crabbox-user-npmrc
+        run: npm ci --ignore-scripts --registry=https://registry.npmjs.org/
+
+      - name: Verify Linux dependency lifecycle policy
+        run: |
+          node .codex/tools/verify_crabbox_install_policy.js
+          node --check .codex/tools/visual_evidence_contract.js
+          node --check .codex/tools/publish_visual_evidence.js
+          node --check .codex/tools/build_crabbox_visual_bundle.js
+          node --check .codex/tools/validate_crabbox_visual_collection.js
+
+      - name: Mark Crabbox ready
+        shell: bash
+        env:
+          CRABBOX_ID: ${{ inputs.crabbox_id }}
+          CRABBOX_JOB: ${{ inputs.crabbox_job }}
+        run: |
+          case "$CRABBOX_ID" in
+            ""|*[!A-Za-z0-9_-]*)
+              echo "::error::crabbox_id must match [A-Za-z0-9_-]+"
+              exit 2
+              ;;
+          esac
+          case "$CRABBOX_JOB" in
+            *$'\n'*|*$'\r'*)
+              echo "::error::crabbox_job must not contain line breaks"
+              exit 2
+              ;;
+          esac
+          job="$CRABBOX_JOB"
+          if [ -z "$job" ]; then job=hydrate; fi
+          mkdir -p "$HOME/.crabbox/actions"
+          state="$HOME/.crabbox/actions/${CRABBOX_ID}.env"
+          env_file="$HOME/.crabbox/actions/${CRABBOX_ID}.env.sh"
+          services_file="$HOME/.crabbox/actions/${CRABBOX_ID}.services"
+          write_export() {
+            key="$1"
+            value="${!key-}"
+            if [ -n "$value" ]; then
+              printf 'export %s=%q\n' "$key" "$value"
+            fi
+          }
+          {
+            for key in CI GITHUB_ACTIONS GITHUB_WORKSPACE GITHUB_REPOSITORY GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_RUN_ATTEMPT GITHUB_REF GITHUB_REF_NAME GITHUB_SHA GITHUB_EVENT_NAME GITHUB_ACTOR GITHUB_JOB RUNNER_OS RUNNER_ARCH RUNNER_TEMP RUNNER_TOOL_CACHE; do
+              write_export "$key"
+            done
+          } > "${env_file}.tmp"
+          mv "${env_file}.tmp" "$env_file"
+          {
+            echo "# Docker containers visible from the hydrated runner"
+            docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null || true
+          } > "${services_file}.tmp"
+          mv "${services_file}.tmp" "$services_file"
+          tmp="${state}.tmp"
+          commit="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          {
+            echo "WORKSPACE=${GITHUB_WORKSPACE}"
+            echo "COMMIT=${commit}"
+            echo "RUN_ID=${GITHUB_RUN_ID}"
+            echo "JOB=${job}"
+            echo "ENV_FILE=${env_file}"
+            echo "SERVICES_FILE=${services_file}"
+            echo "READY_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$tmp"
+          mv "$tmp" "$state"
+
+      - name: Keep Crabbox job alive
+        shell: bash
+        env:
+          CRABBOX_ID: ${{ inputs.crabbox_id }}
+          CRABBOX_KEEP_ALIVE_MINUTES: ${{ inputs.crabbox_keep_alive_minutes }}
+        run: |
+          case "$CRABBOX_ID" in
+            ""|*[!A-Za-z0-9_-]*)
+              echo "::error::crabbox_id must match [A-Za-z0-9_-]+"
+              exit 2
+              ;;
+          esac
+          minutes="$CRABBOX_KEEP_ALIVE_MINUTES"
+          case "$minutes" in
+            ''|*[!0-9]*) minutes=90 ;;
+          esac
+          stop="$HOME/.crabbox/actions/${CRABBOX_ID}.stop"
+          deadline=$(( $(date +%s) + minutes * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -f "$stop" ]; then
+              exit 0
+            fi
+            sleep 15
+          done
