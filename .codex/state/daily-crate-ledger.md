@@ -32,6 +32,70 @@ Secondary:
 - `/Users/bryantfeintuchclaw/Projects/docs/crate/qa-smokes/`
 - recent `v2.4.x` git log and release tags
 
+## 2026-08-21
+
+### Crabbox Runner Onboarding
+
+- Bryant approved proceeding after the Beta 2.14 build finished; Jenna's Mac
+  testing and all completed release worktrees remained outside scope.
+- Installed and signature-verified official Crabbox v0.45.0 outside the repo.
+- Created isolated branch `ops/crabbox-runner-onboarding` from exact current
+  `origin/v2.4.x` commit `f520d4579d9d3dfa47ecbbba12904750aa253afd`.
+- Added reviewed local Apple VM config, pinned hydration workflow, five named
+  non-GUI jobs, a v0.45.0 hydration workaround, skill guidance, and taskflow.
+- Direct local `apple-vm` uses loopback SSH and a checksum-pinned Ubuntu ARM64
+  image; alternate providers, cloud fallback, paid capacity, credentials, and
+  GitHub runner registration remain disabled or unapproved.
+- End-to-end `quick-check` passed under lease `cbx_fc76b30f732b`, sync run
+  `run_fbad7eb29a03`, and test run `run_2e4c47d58ba3`; the lease was released.
+- A follow-up runner probe classified `provenance-dual-write.test.js` as a
+  macOS-only lane because it exercises macOS paths and creative-app semantics;
+  the Crabbox provenance job now uses cross-platform provenance and diagnostic
+  summary coverage instead.
+- The revised `provenance-suite` passed 8/8 under test run
+  `run_784474199e74`; its Apple VM lease was released.
+- No app source, package manifest, lockfile, dependency, build, release,
+  signing, notarization, deploy, installed app, or Jenna QA state changed.
+- Commit, push, PR, and merge remain separate approval gates.
+
+#### Visual Evidence Publication Boundary
+
+- Live GitHub metadata confirms `bfeintuch123/crate-app` is public; every user
+  attachment is treated as publicly accessible and repository visibility is
+  not a privacy control.
+- Added a strict token-safe GitHub user-attachment helper that binds repository
+  ID and exact PR-head SHA, keeps auth out of argv/environment/files/logs,
+  rejects redirects/schema drift, verifies destination bytes and SHA-256, and
+  writes only an owner-only deterministic manifest. Upload is additionally
+  gated by an owner-only review receipt bound to exact media metadata; a caller
+  cannot assert inspection/privacy PASS. No real upload or PR mutation was
+  performed.
+- Added v0.45.0 `artifactGlobs`/`requiredArtifacts` collection for one already
+  inspected sanitized media file and its manifest. The approved credential-free
+  Apple VM returns only a local archive, not a durable off-host artifact URL.
+- The durable Crabbox fallback therefore remains inactive and fails closed with
+  `durable_crabbox_backend_unapproved`. No release asset, tag, prerelease, S3,
+  R2, Cloudflare, broker, `uploads.sh`, credential, or alternate provider was
+  added.
+
+## 2026-08-22
+
+### Crabbox Contract Gate
+
+- Bryant approved the narrowed workflow contract: GitHub PR user attachments
+  are the sole durable publication destination; Crabbox provides isolated
+  collection, integrity validation, and fail-closed local preservation.
+- If GitHub publication or Crabbox collection/validation is unavailable or
+  fails, the verified local bundle must be retained and the lane must fail
+  closed without claiming durable publication.
+- No independent Crabbox, release-asset, S3, R2, Cloudflare, broker,
+  `uploads.sh`, or other publication backend is approved or configured.
+- The isolated 16-path workflow-only candidate is ready for final checks,
+  explicit-path staging, one commit, branch push, draft PR creation, and
+  independent review. Merge and all product/release gates remain out of scope.
+- Final Apple VM `quick-check` passed 29/29 under lease
+  `cbx_b7319036e263`, run `run_c4bb318ca4ab`; the lease was released.
+
 ## 2026-07-02
 
 ### Crate Ops Loop Hardening

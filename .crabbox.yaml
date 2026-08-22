@@ -1,0 +1,164 @@
+profile: crate-nongui
+provider: apple-vm
+target: linux
+architecture: arm64
+os: ubuntu:26.04
+class: standard
+lease:
+  idleTimeout: 30m
+  ttl: 90m
+capacity:
+  market: spot
+  strategy: most-available
+  fallback: none
+appleVM:
+  user: crabbox
+  workRoot: /work/crabbox
+  cpus: 4
+  memoryMiB: 4096
+  diskGiB: 30
+actions:
+  workflow: .github/workflows/crabbox.yml
+  job: hydrate
+  runnerLabels:
+    - crabbox
+  runnerVersion: latest
+  ephemeral: true
+sync:
+  delete: true
+  checksum: true
+  gitSeed: true
+  fingerprint: true
+  baseRef: v2.4.x
+  timeout: 15m
+  warnFiles: 50000
+  warnBytes: 5368709120
+  failFiles: 150000
+  failBytes: 21474836480
+  allowLarge: false
+  exclude:
+    - .cache
+    - .crabbox
+    - .turbo
+    - coverage
+    - dist
+    - node_modules
+    - playwright-report
+    - private-evidence
+    - test-results
+    - visual-proof-input
+    - visual-proof-output
+    - .github/pr-assets
+env:
+  allow:
+    - CI
+    - NODE_OPTIONS
+cache:
+  npm: true
+  git: true
+  docker: false
+  pnpm: false
+  volumes: []
+jobs:
+  quick-check:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      CI=1 node --check main.js &&
+      node --check provenance.js &&
+      node --check renderer/app.js &&
+      node --test .codex/tools/visual_evidence.test.js &&
+      git diff --check
+    stop: auto
+  provenance-suite:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      CI=1 node --test tests/provenance.test.js &&
+      node --test tests/diagnostic-summary.test.js &&
+      git diff --check
+    stop: auto
+  figma-suite:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      CI=1 node --test tests/figma-link-per-project.test.js &&
+      node --test tests/figma-scope.test.js &&
+      node --test tests/figma-token-privacy.test.js &&
+      node --test tests/renderer-figma-scope.test.js &&
+      git diff --check
+    stop: auto
+  package-parser-suite:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      CI=1 node --check parsers/index.js &&
+      node --check parsers/admission-budgets.js &&
+      node --check parsers/powerpoint.js &&
+      node --check parsers/package-safety.js &&
+      node --test tests/parser-admission-limits.test.js &&
+      node --test tests/psd-embedded-safety.test.js &&
+      node --test tests/quick-package-parser.test.js &&
+      git diff --check
+    stop: auto
+  full-nongui-suite:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      CI=1 node --check main.js &&
+      node --check provenance.js &&
+      node --check renderer/app.js &&
+      node --check parsers/index.js &&
+      node --check parsers/powerpoint.js &&
+      node --check parsers/figma.js &&
+      node --check parsers/package-safety.js &&
+      node --test tests/main-window-lifecycle.test.js &&
+      node --test tests/provenance.test.js &&
+      node --test tests/diagnostic-summary.test.js &&
+      node --test tests/psd-embedded-safety.test.js &&
+      node --test tests/figma-link-per-project.test.js &&
+      node --test tests/figma-scope.test.js &&
+      node --test tests/figma-token-privacy.test.js &&
+      node --test tests/renderer-figma-scope.test.js &&
+      node --test tests/quick-package-parser.test.js &&
+      git diff --check
+    stop: auto
+  visual-artifact-collect:
+    hydrate:
+      actions: true
+      githubRunner: false
+      waitTimeout: 30m
+      keepAliveMinutes: 90
+    shell: true
+    command: >
+      node --check .codex/tools/visual_evidence_contract.js &&
+      node --check .codex/tools/build_crabbox_visual_bundle.js &&
+      node .codex/tools/build_crabbox_visual_bundle.js
+      --input-dir /tmp/crate-visual-evidence
+      --output visual-proof-output
+    artifactGlobs:
+      - visual-proof-output/**
+    requiredArtifacts:
+      - visual-proof-output/visual-evidence.json
+      - visual-proof-output/media/*
+    stop: auto
