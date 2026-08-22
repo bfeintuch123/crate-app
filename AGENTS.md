@@ -186,23 +186,43 @@ workflow when one capture cannot prove all changed states:
 
 - UI impact: stateful | static | none
 - Candidate commit: <full 40-character PR-head SHA>
-- Scenario: <workflow demonstrated>
-- Expected: <expected visible behavior>
-- Observed: <observed visible behavior>
-- Fixture class: synthetic | explicitly-approved-test-safe
-- Capture environment: <source candidate or signed installed candidate>
-- Media inspection: PASS | FAIL
-- Privacy review: PASS | FAIL
-- Media filename: <sanitized filename>
-- Media type: video/mp4 | video/webm | image/png
-- Media bytes: <exact bytes>
-- Media SHA-256: <hash>
-- Upload path: github-user-attachment | crabbox-artifact
-- Crabbox provider/lease/run/archive bytes/archive SHA-256/cleanup: <required only for Crabbox collection>
-- Durable artifact URL: <GitHub user-attachment URL only; never a Crabbox-local path>
+- Rationale: <required when UI impact is none; otherwise not applicable>
+- Scenario: <workflow demonstrated; not applicable only when UI impact is none>
+- Expected: <expected visible behavior; not applicable only when UI impact is none>
+- Observed: <observed visible behavior; not applicable only when UI impact is none>
+- Fixture class: synthetic | explicitly-approved-test-safe | not applicable
+- Capture environment: <source candidate or signed installed candidate; not applicable only when UI impact is none>
+- Media inspection: PASS | not applicable
+- Privacy review: PASS | not applicable
+- Media filename: <sanitized filename; not applicable only when UI impact is none>
+- Media type: video/mp4 | video/webm | image/png | not applicable
+- Media bytes: <exact bytes; not applicable only when UI impact is none>
+- Media SHA-256: <hash; not applicable only when UI impact is none>
+- Collection path: local | crabbox-artifact | not applicable
+- Crabbox collection: not-used | provider=apple-vm; lease=<lease-id>; run=<run-id>; archive=<archive>; archive-bytes=<bytes>; archive-sha256=<hash>; cleanup=PASS | not applicable
+- Durable artifact URL: <GitHub user-attachment URL; not applicable only when UI impact is none>
 
-<bare GitHub video URL or approved artifact URL>
+<bare GitHub user-attachment URL; omit only when UI impact is none>
 ```
+
+The base-controlled `PR visual evidence` check validates this block on every
+non-draft pull request after its workflow and verifier have landed on the base
+branch. It runs from `pull_request_target`, checks out only the exact base SHA,
+never executes PR code, and reads back the public attachment to confirm its
+media signature, byte size, and SHA-256. For `stateful` and `static` impact, all
+media fields and the matching bare GitHub attachment URL are required. For
+`none`, the candidate commit and a substantive rationale are required and every
+media field must be exactly `not applicable`. Autoreview must independently
+confirm that `none` is an honest classification; body text cannot prove that a
+change lacks visible impact. Editing the pull-request body reruns the check;
+pushing a new head commit invalidates the previous candidate binding until the
+evidence is recaptured or reclassified.
+
+The bootstrap PR that first adds this check cannot enforce itself. It requires
+the protected source-security suite and a fresh independent Autoreview. After
+that bootstrap PR merges, registering `PR visual evidence` as a required branch
+check is a separate GitHub-governance gate. Until both steps complete, do not
+claim automated enforcement is active.
 
 Crabbox fallback:
 - The reviewed Crate Crabbox configuration is Tier B non-GUI infrastructure.
@@ -221,6 +241,10 @@ Crabbox fallback:
   manifest hash, durable URL when one is actually available, and verified
   cleanup. Never forward GitHub, Apple, Keychain, tester, or other
   credentials into the lease for proof publication.
+- The public PR block's Crabbox collection fields are supplemental provenance,
+  not a trusted receipt. Autoreview must inspect the owner-only collection and
+  visual-review receipts and bind them to the public attachment; the base
+  workflow intentionally cannot access or publish those private receipts.
 - Do not create or reuse a GitHub release, tag, prerelease, or release asset for
   visual proof. Do not add S3, R2, Cloudflare, a broker, `uploads.sh`, or another
   account/backend in this lane.

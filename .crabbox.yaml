@@ -71,7 +71,9 @@ jobs:
       CI=1 node --check main.js &&
       node --check provenance.js &&
       node --check renderer/app.js &&
+      node --check .codex/tools/verify_pr_visual_evidence.js &&
       node --test .codex/tools/visual_evidence.test.js &&
+      node --test .codex/tools/verify_pr_visual_evidence.test.js &&
       git diff --check
     stop: auto
   provenance-suite:
