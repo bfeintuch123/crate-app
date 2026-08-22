@@ -20,12 +20,58 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out trusted base source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-          submodules: false
+        env:
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          fail() { printf '%s\n' "$1" >&2; exit 1; }
+          if [[ ! "${TRUSTED_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            fail 'invalid_trusted_base_sha'
+          fi
+
+          trusted_origin='https://github.com/bfeintuch123/crate-app.git'
+          trusted_root="${RUNNER_TEMP}/crate-visual-evidence-base"
+          [ ! -e "$trusted_root" ] || fail 'trusted_base_path_exists'
+          mkdir -m 700 "$trusted_root"
+          [ "$(realpath "$trusted_root")" = "$trusted_root" ] || fail 'trusted_base_path_mismatch'
+          git init --quiet "$trusted_root" || fail 'trusted_base_init_failed'
+          [ "$(git -C "$trusted_root" rev-parse --show-toplevel)" = "$trusted_root" ] || fail 'trusted_base_path_mismatch'
+          git -C "$trusted_root" -c credential.helper= remote add origin "$trusted_origin" || fail 'trusted_base_remote_failed'
+          export GIT_TERMINAL_PROMPT=0
+          if ! git -C "$trusted_root" -c credential.helper= -c core.askPass= fetch --no-tags --depth=1 --no-recurse-submodules "$trusted_origin" "$TRUSTED_BASE_SHA"; then
+            fail 'trusted_base_fetch_failed'
+          fi
+          fetched_sha="$(git -C "$trusted_root" rev-parse --verify FETCH_HEAD^{commit})" || fail 'trusted_base_fetch_failed'
+          [ "$fetched_sha" = "$TRUSTED_BASE_SHA" ] || fail 'trusted_base_commit_mismatch'
+          git -C "$trusted_root" sparse-checkout init --no-cone || fail 'trusted_base_sparse_checkout_failed'
+          git -C "$trusted_root" sparse-checkout set --no-cone \
+            /.codex/tools/verify_pr_visual_evidence.js \
+            /.codex/tools/visual_evidence_contract.js \
+            /.codex/tools/publish_visual_evidence.js || fail 'trusted_base_sparse_checkout_failed'
+          git -C "$trusted_root" checkout --quiet --detach "$TRUSTED_BASE_SHA" || fail 'trusted_base_checkout_failed'
+          [ "$(git -C "$trusted_root" rev-parse --verify HEAD^{commit})" = "$TRUSTED_BASE_SHA" ] || fail 'trusted_base_commit_mismatch'
+          [ "$(git -C "$trusted_root" remote get-url origin)" = "$trusted_origin" ] || fail 'trusted_base_origin_mismatch'
+          if git -C "$trusted_root" config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            fail 'trusted_base_credentials_persisted'
+          fi
+          verify_trusted_file() {
+            trusted_path="$1"
+            case "$trusted_path" in
+              .codex/tools/verify_pr_visual_evidence.js|.codex/tools/visual_evidence_contract.js|.codex/tools/publish_visual_evidence.js) ;;
+              *) fail 'trusted_base_input_path_mismatch' ;;
+            esac
+            trusted_file="$trusted_root/$trusted_path"
+            [ -f "$trusted_file" ] && [ ! -L "$trusted_file" ] || fail 'trusted_base_input_missing'
+            [ "$(realpath "$trusted_file")" = "$trusted_file" ] || fail 'trusted_base_input_path_mismatch'
+            trusted_mode="$(git -C "$trusted_root" ls-files --stage -- "$trusted_path" | awk '{print $1}')"
+            [ "$trusted_mode" = '100644' ] || fail 'trusted_base_input_path_mismatch'
+            expected_blob="$(git -C "$trusted_root" rev-parse "$TRUSTED_BASE_SHA:$trusted_path")" || fail 'trusted_base_input_mismatch'
+            actual_blob="$(git -C "$trusted_root" hash-object -- "$trusted_file")" || fail 'trusted_base_input_mismatch'
+            [ "$expected_blob" = "$actual_blob" ] || fail 'trusted_base_input_mismatch'
+          }
+          verify_trusted_file .codex/tools/verify_pr_visual_evidence.js
+          verify_trusted_file .codex/tools/visual_evidence_contract.js
+          verify_trusted_file .codex/tools/publish_visual_evidence.js
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -34,7 +80,36 @@ jobs:
 
       - name: Validate exact-head evidence and public attachment
         if: github.event.pull_request.draft == false
-        run: node .codex/tools/verify_pr_visual_evidence.js "$GITHUB_EVENT_PATH"
+        env:
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_ROOT: ${{ runner.temp }}/crate-visual-evidence-base
+        run: |
+          set -euo pipefail
+          fail() { printf '%s\n' "$1" >&2; exit 1; }
+          if [[ ! "${TRUSTED_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            fail 'invalid_trusted_base_sha'
+          fi
+          [ "$(realpath "$TRUSTED_ROOT")" = "$TRUSTED_ROOT" ] || fail 'trusted_base_path_mismatch'
+          [ "$(git -C "$TRUSTED_ROOT" rev-parse --verify HEAD^{commit})" = "$TRUSTED_BASE_SHA" ] || fail 'trusted_base_commit_mismatch'
+          [ "$(git -C "$TRUSTED_ROOT" remote get-url origin)" = 'https://github.com/bfeintuch123/crate-app.git' ] || fail 'trusted_base_origin_mismatch'
+          if git -C "$TRUSTED_ROOT" config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            fail 'trusted_base_credentials_persisted'
+          fi
+          for trusted_path in \
+            .codex/tools/verify_pr_visual_evidence.js \
+            .codex/tools/visual_evidence_contract.js \
+            .codex/tools/publish_visual_evidence.js; do
+            trusted_file="$TRUSTED_ROOT/$trusted_path"
+            [ -f "$trusted_file" ] && [ ! -L "$trusted_file" ] || fail 'trusted_base_input_missing'
+            [ "$(realpath "$trusted_file")" = "$trusted_file" ] || fail 'trusted_base_input_path_mismatch'
+            trusted_mode="$(git -C "$TRUSTED_ROOT" ls-files --stage -- "$trusted_path" | awk '{print $1}')"
+            [ "$trusted_mode" = '100644' ] || fail 'trusted_base_input_path_mismatch'
+            expected_blob="$(git -C "$TRUSTED_ROOT" rev-parse "$TRUSTED_BASE_SHA:$trusted_path")" || fail 'trusted_base_input_mismatch'
+            actual_blob="$(git -C "$TRUSTED_ROOT" hash-object -- "$trusted_file")" || fail 'trusted_base_input_mismatch'
+            [ "$expected_blob" = "$actual_blob" ] || fail 'trusted_base_input_mismatch'
+          done
+          cd "$TRUSTED_ROOT"
+          exec node .codex/tools/verify_pr_visual_evidence.js "$GITHUB_EVENT_PATH"
 
       - name: Record draft deferral
         if: github.event.pull_request.draft == true
