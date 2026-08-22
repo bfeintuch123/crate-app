@@ -7,6 +7,10 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const contract = require('./visual_evidence_contract');
 
+const REQUIRED_REPOSITORY = 'bfeintuch123/crate-app';
+const REQUIRED_REPOSITORY_ID = '1165820261';
+const REQUIRED_BASE = 'v2.4.x';
+
 function fixedFail(code) { throw new Error(code); }
 
 function parseArgs(argv) {
@@ -62,6 +66,7 @@ function run(program, args, options = {}) {
 }
 
 function verifyGitHubBinding(args, runner = run) {
+  if (args['--repo'] !== REQUIRED_REPOSITORY || args['--repo-id'] !== REQUIRED_REPOSITORY_ID) fixedFail('repository_identity_mismatch');
   let repo;
   let pr;
   try { repo = JSON.parse(runner('gh', ['api', `repos/${args['--repo']}`], { errorCode: 'repository_verification_failed' }).toString('utf8')); }
@@ -70,6 +75,8 @@ function verifyGitHubBinding(args, runner = run) {
   if (repo.private !== false || repo.visibility !== 'public') fixedFail('repository_visibility_mismatch');
   try { pr = JSON.parse(runner('gh', ['api', `repos/${args['--repo']}/pulls/${args['--pr']}`], { errorCode: 'pr_verification_failed' }).toString('utf8')); }
   catch { fixedFail('pr_verification_failed'); }
+  if (!pr.base || pr.base.ref !== REQUIRED_BASE || !pr.base.repo || String(pr.base.repo.id) !== REQUIRED_REPOSITORY_ID ||
+      pr.base.repo.full_name !== REQUIRED_REPOSITORY) fixedFail('pr_base_mismatch');
   if (!pr.head || pr.head.sha !== args['--head-sha']) fixedFail('pr_head_mismatch');
 }
 
@@ -197,11 +204,11 @@ function readback(url, expected, runner = run) {
   contract.safeURL(url);
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-visual-readback-'));
   fs.chmodSync(directory, 0o700);
-  const file = path.join(directory, 'asset');
+  const file = path.join(directory, contract.safeName(expected.name));
   const headers = path.join(directory, 'headers');
   try {
     fs.writeFileSync(headers, '', { mode: 0o600, flag: 'wx' });
-    let output = runner('curl', ['--proto', '=https', '--max-redirs', '0', '--silent', '--show-error', '--dump-header', headers, '--output', file, '--write-out', '%{http_code}', url], { errorCode: 'readback_transport_failure' }).toString('utf8');
+    let output = runner('curl', ['--proto', '=https', '--max-redirs', '0', '--max-filesize', String(contract.MAX_MEDIA_BYTES), '--max-time', '120', '--silent', '--show-error', '--dump-header', headers, '--output', file, '--write-out', '%{http_code}', url], { errorCode: 'readback_transport_failure' }).toString('utf8');
     let status = Number(output);
     if (status === 302) {
       const headerText = fs.readFileSync(headers, 'utf8');
@@ -210,14 +217,14 @@ function readback(url, expected, runner = run) {
       const redirect = locations[0].slice(locations[0].indexOf(':') + 1).trim();
       const redirectConfig = stdinURLConfig(redirect);
       try {
-        output = runner('curl', ['--proto', '=https', '--max-redirs', '0', '--silent', '--show-error', '--output', file, '--write-out', '%{http_code}\n%{redirect_url}', '--config', '-'], { input: redirectConfig, errorCode: 'readback_transport_failure' }).toString('utf8');
+        output = runner('curl', ['--proto', '=https', '--max-redirs', '0', '--max-filesize', String(contract.MAX_MEDIA_BYTES), '--max-time', '120', '--silent', '--show-error', '--output', file, '--write-out', '%{http_code}\n%{redirect_url}', '--config', '-'], { input: redirectConfig, errorCode: 'readback_transport_failure' }).toString('utf8');
       } finally { redirectConfig.fill(0); }
       const values = output.trimEnd().split('\n');
       status = Number(values[0]);
       if ((values[1] || '') !== '') fixedFail('readback_redirect_invalid');
     }
     let inspected;
-    try { inspected = contract.inspectFile(file, 'readback_unavailable'); } catch { fixedFail('readback_unavailable'); }
+    try { inspected = contract.inspectMedia(file, expected.mime); } catch { fixedFail('readback_unavailable'); }
     contract.validateReadback(expected, status, '', inspected.bytes, inspected.sha256);
   } finally {
     try { fs.unlinkSync(file); } catch {}

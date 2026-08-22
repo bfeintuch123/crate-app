@@ -1,0 +1,41 @@
+name: Crate PR visual evidence gate
+
+on:
+  pull_request_target:
+    branches: [v2.4.x]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: crate-pr-visual-evidence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  visual-evidence:
+    name: PR visual evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted base source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.23.1
+
+      - name: Validate exact-head evidence and public attachment
+        if: github.event.pull_request.draft == false
+        run: node .codex/tools/verify_pr_visual_evidence.js "$GITHUB_EVENT_PATH"
+
+      - name: Record draft deferral
+        if: github.event.pull_request.draft == true
+        run: echo "Visual evidence enforcement begins when this pull request is ready for review."

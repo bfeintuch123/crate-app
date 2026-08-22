@@ -135,10 +135,15 @@ test('readback rejects inaccessible, redirected, size, and hash mismatch', () =>
 
 test('GitHub binding rejects wrong identity, non-public repository, and stale head', () => {
   const args = { '--repo': REPO, '--repo-id': REPO_ID, '--pr': '7', '--head-sha': SHA };
+  const base = { ref: 'v2.4.x', repo: { id: Number(REPO_ID), full_name: REPO } };
+  const repository = { id: Number(REPO_ID), full_name: REPO, private: false, visibility: 'public' };
   const runnerFor = (repo, pr) => (_program, command) => Buffer.from(JSON.stringify(command[1].includes('/pulls/') ? pr : repo));
-  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor({ id: 1, full_name: REPO, private: false, visibility: 'public' }, { head: { sha: SHA } })), 'repository_identity_mismatch');
-  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor({ id: Number(REPO_ID), full_name: REPO, private: true, visibility: 'private' }, { head: { sha: SHA } })), 'repository_visibility_mismatch');
-  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor({ id: Number(REPO_ID), full_name: REPO, private: false, visibility: 'public' }, { head: { sha: 'b'.repeat(40) } })), 'pr_head_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding({ ...args, '--repo': 'other/repo' }, () => { throw new Error('must_not_call'); }), 'repository_identity_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding({ ...args, '--repo-id': '1' }, () => { throw new Error('must_not_call'); }), 'repository_identity_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor({ ...repository, private: true, visibility: 'private' }, { base, head: { sha: SHA } })), 'repository_visibility_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor(repository, { base: { ...base, ref: 'main' }, head: { sha: SHA } })), 'pr_base_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor(repository, { base: { ref: 'v2.4.x', repo: { id: 1, full_name: 'other/repo' } }, head: { sha: SHA } })), 'pr_base_mismatch');
+  errorCode(() => publisher.verifyGitHubBinding(args, runnerFor(repository, { base, head: { sha: 'b'.repeat(40) } })), 'pr_head_mismatch');
 });
 
 test('second GitHub binding check rejects a head changed after upload readback', () => {
@@ -147,7 +152,7 @@ test('second GitHub binding check rejects a head changed after upload readback',
   const runner = (_program, command) => {
     if (!command[1].includes('/pulls/')) return Buffer.from(JSON.stringify({ id: Number(REPO_ID), full_name: REPO, private: false, visibility: 'public' }));
     prReads += 1;
-    return Buffer.from(JSON.stringify({ head: { sha: prReads === 1 ? SHA : 'b'.repeat(40) } }));
+    return Buffer.from(JSON.stringify({ base: { ref: 'v2.4.x', repo: { id: Number(REPO_ID), full_name: REPO } }, head: { sha: prReads === 1 ? SHA : 'b'.repeat(40) } }));
   };
   publisher.verifyGitHubBinding(args, runner);
   errorCode(() => publisher.verifyGitHubBinding(args, runner), 'pr_head_mismatch');
@@ -182,6 +187,32 @@ test('readback redirect allows only strict GitHub production asset URLs and keep
   assert.equal(['curl', '--config', '-'].join(' ').includes('X-Amz-Signature'), false);
   config.fill(0);
   assert.equal(config.every(byte => byte === 0), true);
+});
+
+test('destination readback enforces bounded transfer, media signature, size, and hash', () => {
+  const { file, media } = fixture();
+  const mediaBytes = fs.readFileSync(file);
+  const signed = `https://github-production-user-asset-6210.s3.amazonaws.com/1/2-abc.png?X-Amz-Algorithm=A&X-Amz-Credential=B&X-Amz-Date=C&X-Amz-Expires=300&X-Amz-Signature=D&X-Amz-SignedHeaders=host`;
+  const calls = [];
+  const runner = (_program, args) => {
+    calls.push([...args]);
+    const output = args[args.indexOf('--output') + 1];
+    if (args.includes('--dump-header')) {
+      const headers = args[args.indexOf('--dump-header') + 1];
+      fs.writeFileSync(headers, `HTTP/1.1 302 Found\r\nlocation: ${signed}\r\n\r\n`);
+      return Buffer.from('302');
+    }
+    fs.writeFileSync(output, mediaBytes);
+    return Buffer.from('200\n');
+  };
+  publisher.readback('https://github.com/user-attachments/assets/abc-123', media, runner);
+  assert.equal(calls.length, 2);
+  for (const args of calls) {
+    assert.deepEqual(args.slice(args.indexOf('--max-filesize'), args.indexOf('--max-filesize') + 2), ['--max-filesize', String(contract.MAX_MEDIA_BYTES)]);
+    assert.deepEqual(args.slice(args.indexOf('--max-time'), args.indexOf('--max-time') + 2), ['--max-time', '120']);
+  }
+  errorCode(() => publisher.readback('https://github.com/user-attachments/assets/abc-123', { ...media, sha256: 'f'.repeat(64) }, runner), 'readback_hash_mismatch');
+  errorCode(() => publisher.readback('https://github.com/user-attachments/assets/abc-123', { ...media, mime: 'video/mp4', name: 'proof.mp4' }, runner), 'readback_unavailable');
 });
 
 test('token parser rejects control characters and quote injection', () => {
