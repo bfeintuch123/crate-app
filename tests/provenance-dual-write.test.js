@@ -9,6 +9,9 @@ const { EventEmitter } = require('events');
 const { spawn: realSpawn, spawnSync: realSpawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
+const MAIN_UNDER_TEST_ROOT = process.env.CRATE_MAIN_UNDER_TEST
+  ? path.dirname(path.resolve(process.env.CRATE_MAIN_UNDER_TEST))
+  : path.resolve(__dirname, '..');
 const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
 const packageJson = require('../package.json');
 const helperPlistPatch = require('../scripts/patch-helper-info-plists');
@@ -34,6 +37,7 @@ const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-w
 const EXPECTED_LIVE_EVIDENCE_CANDIDATE_CAP = 500;
 const activeIntervals = new Set();
 const activeIntervalCallbacks = new Map();
+const activeIntervalDelays = new Map();
 const activeTimeouts = new Set();
 let cacheCleanupSentinelCounter = 0;
 
@@ -46,12 +50,14 @@ global.setInterval = function trackedSetInterval(fn, delay, ...args) {
   const timer = originalSetInterval(fn, delay, ...args);
   activeIntervals.add(timer);
   activeIntervalCallbacks.set(timer, () => fn(...args));
+  activeIntervalDelays.set(timer, delay);
   return timer;
 };
 
 global.clearInterval = function trackedClearInterval(timer) {
   activeIntervals.delete(timer);
   activeIntervalCallbacks.delete(timer);
+  activeIntervalDelays.delete(timer);
   return originalClearInterval(timer);
 };
 
@@ -109,6 +115,15 @@ async function runTrackedIntervalCallbacks(iterations = 1) {
   }
 }
 
+async function runTrackedIntervalCallbacksForDelay(delay) {
+  const callbacks = [...activeIntervalCallbacks.entries()]
+    .filter(([timer]) => activeIntervalDelays.get(timer) === delay)
+    .map(([, callback]) => callback);
+  for (const callback of callbacks) {
+    await Promise.resolve(callback());
+  }
+}
+
 const STUBS = new Map();
 
 function setStub(name, factory) {
@@ -155,7 +170,7 @@ const testNotifications = [];
 const testMessageBoxes = [];
 const testRendererEvents = [];
 const trustedRendererMainFrame = {
-  url: pathToFileURL(path.resolve(__dirname, '..', 'renderer', 'index.html')).href,
+  url: pathToFileURL(path.join(MAIN_UNDER_TEST_ROOT, 'renderer', 'index.html')).href,
 };
 const trustedRendererWindow = {
   handlers: new Map(),
@@ -699,6 +714,9 @@ class FakeStore {
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     fs.writeFileSync(this.path, '{}', { mode: 0o600 });
     this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
+    this.projectSetCount = 0;
+    this.measureProjectSerialization = false;
+    this.projectSerializedBytes = 0;
     storeInstance = this;
   }
   get(key, fallback) {
@@ -712,6 +730,13 @@ class FakeStore {
     return cur === undefined ? fallback : cur;
   }
   set(key, value) {
+    if (key === 'projects' || (key && typeof key === 'object' && Object.prototype.hasOwnProperty.call(key, 'projects'))) {
+      this.projectSetCount += 1;
+      if (this.measureProjectSerialization) {
+        const projectsValue = typeof key === 'object' ? key.projects : value;
+        this.projectSerializedBytes += Buffer.byteLength(JSON.stringify(projectsValue));
+      }
+    }
     if (typeof key === 'object') {
       Object.assign(this.data, key);
       return;
@@ -946,7 +971,9 @@ setStub('crypto', () => ({
   randomUUID: () => `00000000-0000-4000-8000-${String(++testUuidCounter).padStart(12, '0')}`,
 }));
 
-const mainModulePath = path.resolve(__dirname, '..', 'main.js');
+const mainModulePath = process.env.CRATE_MAIN_UNDER_TEST
+  ? path.resolve(process.env.CRATE_MAIN_UNDER_TEST)
+  : path.join(MAIN_UNDER_TEST_ROOT, 'main.js');
 const originalJavaScriptLoader = Module._extensions['.js'];
 Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filename) {
   if (filename !== mainModulePath) return originalJavaScriptLoader(module, filename);
@@ -991,6 +1018,36 @@ module.exports.__crateMetadataTestHooks = {
   },
   startInactivityChecker() {
     startInactivityChecker();
+  },
+  getActiveWatchingActivationToken(projectId) {
+    return getActiveWatchingActivationToken(projectId);
+  },
+  pollLsofForProject(projectId, activationToken) {
+    return pollLsofForProject(projectId, activationToken);
+  },
+  isLsofPollInProgress(projectId) {
+    return lsofInProgress.has(projectId);
+  },
+  pollPsForProject(projectId, activationToken) {
+    return pollPsForProject(projectId, activationToken);
+  },
+  recordLiveAppStatusBreadcrumb(projectId, appFamily, input) {
+    return recordLiveAppStatusBreadcrumb(projectId, appFamily, input);
+  },
+  mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries) {
+    return mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries);
+  },
+  getWatcherCoordinatorSnapshot(projectId) {
+    return getWatcherCoordinator(projectId).snapshot(projectId);
+  },
+  activateWatcherCoordinator(projectId) {
+    return activateWatcherCoordinator(projectId);
+  },
+  runBackgroundWatcherOperation(projectId, kind, work) {
+    return runBackgroundWatcherOperation(projectId, kind, work);
+  },
+  cancelWatcherCoordinator(projectId) {
+    cancelWatcherCoordinator(projectId);
   },
   createRendererFilePresentation(project, file) {
     return createRendererFilePresentation(project, file);
@@ -2549,6 +2606,8 @@ test.afterEach(async () => {
   if (storeInstance) storeInstance.set('settings.includeDiagnosticReport', false);
   if (storeInstance) storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   if (storeInstance) storeInstance.set('usage.packagesThisMonth', 0);
+  if (storeInstance) storeInstance.measureProjectSerialization = false;
+  if (storeInstance) storeInstance.projectSerializedBytes = 0;
   testNotificationSupported = false;
   testAppActive = true;
   testMainWindowVisible = true;
@@ -6712,7 +6771,7 @@ test('Spotlight route matching is order-independent and ignores ambiguous candid
   );
 });
 
-test('bounded metadata acquires 1668 candidates in seven xattr batches with four workers and zero mdls', async () => {
+test('bounded metadata acquires 1668 candidates while background observers pause and resume', async () => {
   resetTestHomeWorkspace();
   const candidateRoot = path.join(TEST_HOME, 'Desktop', 'bulk-1668');
   fs.mkdirSync(candidateRoot, { recursive: true });
@@ -6777,7 +6836,24 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
       scanPromise.then(() => 'scan-settled')
     ]);
     assert.equal(xattrStartResult, 'xattr-started', 'metadata scan settled before xattr work started');
-    const duringPoll = await waitForProject(
+    await new Promise(resolve => originalSetTimeout(resolve, 750));
+    const duringScan = await getProject(project.id);
+    assert.equal(scanSettled, false);
+    assert.deepEqual(
+      duringScan.liveAppEvidenceStatus,
+      JSON.parse(before).liveAppEvidenceStatus,
+      'background observer state must remain unchanged while package discovery owns the coordinator'
+    );
+    releaseXattrCalls();
+    const scan = await scanPromise;
+    assert.equal(scan.error, undefined);
+    assert.equal(xattrCalls, 7);
+    assert.equal(xattrCandidates, 1668);
+    assert.equal(maxActiveXattrCalls, 4);
+    assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
+    assert.equal(mdlsCalls, 0);
+    await runTrackedIntervalCallbacks(1);
+    const afterResume = await waitForProject(
       project.id,
       item => ['illustrator', 'photoshop', 'indesign'].every(appFamily => (
         getLiveAppStatusEntries(item, appFamily).some(entry => (
@@ -6788,22 +6864,13 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
       )),
       5000
     );
-    assert.equal(scanSettled, false);
-    releaseXattrCalls();
-    const scan = await scanPromise;
-    assert.equal(scan.error, undefined);
-    assert.equal(xattrCalls, 7);
-    assert.equal(xattrCandidates, 1668);
-    assert.equal(maxActiveXattrCalls, 4);
-    assert.equal(spotlightCalls, expectedBulkSpotlightRoots().length);
-    assert.equal(mdlsCalls, 0);
     const after = await getProject(project.id);
     const { liveAppEvidenceStatus: beforeLiveStatus, ...beforeStableState } = JSON.parse(before);
     const { liveAppEvidenceStatus: afterLiveStatus, ...afterStableState } = after;
     assert.deepEqual(afterStableState, beforeStableState);
     assert.notDeepEqual(afterLiveStatus, beforeLiveStatus);
     for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
-      assert.ok(getLiveAppStatusEntries(duringPoll, appFamily).some(entry => (
+      assert.ok(getLiveAppStatusEntries(afterResume, appFamily).some(entry => (
         entry.pollFired === true &&
         entry.appRunning === false &&
         entry.errorCategory === 'app-not-running'
@@ -6814,6 +6881,359 @@ test('bounded metadata acquires 1668 candidates in seven xattr batches with four
     if (scanPromise) await scanPromise.catch(() => {});
     setChildProcessHandler(null);
     fs.rmSync(candidateRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package drain timeout latches incomplete while an lsof child parser remains active', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'coordinated-parser.ai');
+  const outputRoot = makeTempDir();
+  fs.writeFileSync(sourcePath, '%PDF-1.7\nsynthetic fixture\n%%EOF\n');
+  let pollEnabled = false;
+  let releaseSourceRead = () => {};
+  let markSourceReadStarted = () => {};
+  const sourceReadGate = new Promise(resolve => { releaseSourceRead = resolve; });
+  const sourceReadStarted = new Promise(resolve => { markSourceReadStarted = resolve; });
+  const realReadFile = fs.promises.readFile;
+  const trackedSetTimeout = global.setTimeout;
+  let pollPromise = null;
+
+  try {
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+        return { stdout: pollEnabled ? '222 /Applications/Figma.app/Contents/MacOS/Figma\n' : '' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+        return { stdout: `p222\nf20\ntREG\nn${sourcePath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Coordinated Parser Drain');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const initialReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(initialReview.materializable, true);
+
+    fs.promises.readFile = async (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(sourcePath)) {
+        markSourceReadStarted();
+        await sourceReadGate;
+      }
+      return realReadFile.apply(fs.promises, args);
+    };
+    pollEnabled = true;
+    const activationToken = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+    pollPromise = metadataTestHooks.pollLsofForProject(project.id, activationToken);
+    await sourceReadStarted;
+    assert.equal(metadataTestHooks.isLsofPollInProgress(project.id), true);
+
+    global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(
+      fn,
+      delay === 15000 ? 0 : delay,
+      ...args
+    );
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.equal(scan.diagnostics.failurePhase, 'background-watch-drain');
+    assert.deepEqual(
+      Object.keys(scan.diagnostics).sort(),
+      ['candidateCount', 'failurePhase', 'metadataFallbackCount', 'phaseElapsedMs', 'xattrResolvedCount']
+    );
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputRoot, initialReview.token)).error,
+      'package_review_stale'
+    );
+
+    releaseSourceRead();
+    await pollPromise;
+    pollPromise = null;
+    assert.equal(metadataTestHooks.isLsofPollInProgress(project.id), false);
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    fs.promises.readFile = realReadFile;
+    releaseSourceRead();
+    if (pollPromise) await pollPromise;
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('pre-package drain includes an initial lsof snapshot parser before recurring watchers start', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'initial-coordinated-parser.ai');
+  const outputRoot = makeTempDir();
+  fs.writeFileSync(sourcePath, '%PDF-1.7\nsynthetic initial snapshot fixture\n%%EOF\n');
+  let snapshotEnabled = false;
+  let releaseSourceRead = () => {};
+  let markSourceReadStarted = () => {};
+  const sourceReadGate = new Promise(resolve => { releaseSourceRead = resolve; });
+  const sourceReadStarted = new Promise(resolve => { markSourceReadStarted = resolve; });
+  const realReadFile = fs.promises.readFile;
+  const trackedSetTimeout = global.setTimeout;
+  let startPromise = null;
+
+  try {
+    const project = await createProject('Initial Coordinated Parser Drain');
+    await callIpcRaw('projects:pause', project.id);
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    const initialReview = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.equal(initialReview.materializable, true);
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (
+        snapshotEnabled &&
+        kind === 'execFile' &&
+        command === '/bin/ps' &&
+        Array.isArray(args) &&
+        args.join(' ') === 'ax -o pid= -o command='
+      ) {
+        return { stdout: '222 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+      }
+      if (snapshotEnabled && kind === 'execFile' && command === '/usr/sbin/lsof') {
+        return { stdout: `p222\nf20\ntREG\nn${sourcePath}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    fs.promises.readFile = async (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(sourcePath)) {
+        markSourceReadStarted();
+        await sourceReadGate;
+      }
+      return realReadFile.apply(fs.promises, args);
+    };
+    snapshotEnabled = true;
+    startPromise = callIpcRaw('projects:start-watching', project.id);
+    await sourceReadStarted;
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).running, true);
+
+    global.setTimeout = (fn, delay, ...args) => trackedSetTimeout(
+      fn,
+      delay === 15000 ? 0 : delay,
+      ...args
+    );
+    const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+    assert.equal(scan.error, 'package_scan_incomplete');
+    assert.equal(scan.diagnostics.failurePhase, 'background-watch-drain');
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'package_scan_incomplete');
+    assert.equal(
+      (await callIpcRaw('projects:package', project.id, outputRoot, initialReview.token)).error,
+      'package_review_stale'
+    );
+
+    global.setTimeout = trackedSetTimeout;
+    releaseSourceRead();
+    await startPromise;
+    startPromise = null;
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).running, false);
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    fs.promises.readFile = realReadFile;
+    releaseSourceRead();
+    if (startPromise) await startPromise.catch(() => {});
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('initial coordinated lsof parser adopts Illustrator scope and retains a valid linked asset', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'initial-linked-source.ai');
+  const linkedPath = '/Users/CrateQA/initial-linked-asset.png';
+  fs.writeFileSync(sourcePath, `%PDF-1.7\n${linkedPath}\n%%EOF\n`);
+  const realAccess = fs.promises.access;
+
+  try {
+    const project = await createProject('Initial Linked Asset Contract');
+    await callIpcRaw('projects:pause', project.id);
+    await setProjectFiles(project.id, {
+      files: [{
+        path: sourcePath,
+        name: path.basename(sourcePath),
+        ext: '.ai',
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      }],
+      preserveAwaitingAssetBaseline: true,
+    });
+
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
+      if (
+        kind === 'execFile' &&
+        command === '/bin/ps' &&
+        Array.isArray(args) &&
+        args.join(' ') === 'ax -o pid= -o command='
+      ) {
+        return { stdout: '222 /Applications/Adobe Illustrator 2026/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator\n' };
+      }
+      if (kind === 'execFile' && command === '/usr/sbin/lsof') {
+        return { stdout: `p222\nf20\ntREG\nn${sourcePath}\n` };
+      }
+      return { stdout: '' };
+    });
+    fs.promises.access = async (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(linkedPath)) return;
+      return realAccess.apply(fs.promises, args);
+    };
+
+    const { output } = await captureConsoleDuring(() => (
+      callIpcRaw('projects:start-watching', project.id)
+    ));
+    const fresh = await getProject(project.id);
+    assert.equal(
+      [...fresh.files, ...(fresh.pendingFiles || [])].some(file => (
+        file.path === linkedPath && file.source === 'scan-on-open'
+      )),
+      true
+    );
+    assert.equal(fresh.assetBaseline.status, 'decision-required');
+    assert.equal(Object.hasOwn(fresh.assetBaseline, 'failedRequiredSources'), false);
+    assert.doesNotMatch(output, /scan-on-open: controlled failure/);
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    fs.promises.access = realAccess;
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+  }
+});
+
+test('background watcher scheduler executes coalesced non-lsof observer kinds in bounded FIFO order', async () => {
+  const projectId = 'synthetic-fair-watcher-scheduler';
+  metadataTestHooks.activateWatcherCoordinator(projectId);
+  const observed = [];
+  let releaseLiveApp = () => {};
+  const liveAppGate = new Promise(resolve => { releaseLiveApp = resolve; });
+
+  try {
+    const liveAppPromise = metadataTestHooks.runBackgroundWatcherOperation(projectId, 'live-app', async () => {
+      observed.push('live-app');
+      await liveAppGate;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(observed, ['live-app']);
+
+    assert.equal(
+      (await metadataTestHooks.runBackgroundWatcherOperation(projectId, 'figma', async () => {
+        observed.push('figma-stale');
+      })).reason,
+      'coordinator-deferred'
+    );
+    await metadataTestHooks.runBackgroundWatcherOperation(projectId, 'last-used', async () => {
+      observed.push('last-used');
+    });
+    await metadataTestHooks.runBackgroundWatcherOperation(projectId, 'figma', async () => {
+      observed.push('figma');
+    });
+
+    assert.deepEqual(
+      metadataTestHooks.getWatcherCoordinatorSnapshot(projectId).pendingKinds,
+      ['figma', 'last-used']
+    );
+    releaseLiveApp();
+    await liveAppPromise;
+    await waitForCondition(
+      () => observed.length === 3,
+      'coalesced observer kinds did not receive bounded fair service'
+    );
+    assert.deepEqual(observed, ['live-app', 'figma', 'last-used']);
+    assert.deepEqual(metadataTestHooks.getWatcherCoordinatorSnapshot(projectId).pendingKinds, []);
+  } finally {
+    releaseLiveApp();
+    metadataTestHooks.cancelWatcherCoordinator(projectId);
+  }
+});
+
+test('capture-critical lsof sampling is not deferred behind a slow live-app observer', async () => {
+  resetTestHomeWorkspace();
+  const projectDir = path.join(TEST_HOME, 'Desktop', 'lsof-contention-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sourcePath = path.join(projectDir, 'contention-source.fig');
+  const shortLivedAssetPath = path.join(projectDir, 'contention-short-lived.png');
+  fs.writeFileSync(sourcePath, 'synthetic source bytes');
+  let pollEnabled = false;
+  let releaseLiveApp = () => {};
+  const liveAppGate = new Promise(resolve => { releaseLiveApp = resolve; });
+  let liveAppPromise = null;
+
+  try {
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+        return {
+          stdout: pollEnabled
+            ? '222 /Applications/Figma.app/Contents/MacOS/Figma\n'
+            : '',
+        };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+        return {
+          stdout: pollEnabled
+            ? `p222\nf20\ntREG\nn${shortLivedAssetPath}\n`
+            : '',
+        };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Lsof contention capture');
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.fig',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    fs.writeFileSync(shortLivedAssetPath, createSyntheticPngBytes());
+    const observedAfterWatch = new Date(Date.now() + 1000);
+    fs.utimesSync(shortLivedAssetPath, observedAfterWatch, observedAfterWatch);
+    const activationToken = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+    liveAppPromise = metadataTestHooks.runBackgroundWatcherOperation(project.id, 'live-app', async () => {
+      await liveAppGate;
+    });
+    await waitForCondition(
+      () => metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).runningKind === 'live-app',
+      'live-app contention fixture did not occupy the background lane'
+    );
+
+    pollEnabled = true;
+    await metadataTestHooks.pollLsofForProject(project.id, activationToken);
+    const whileLiveAppBlocked = await getProject(project.id);
+    assert.equal(
+      [...whileLiveAppBlocked.files, ...whileLiveAppBlocked.pendingFiles]
+        .some(file => file.path === shortLivedAssetPath),
+      true,
+      'the three-second lsof opportunity must remain available during live-app contention'
+    );
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).runningKind, 'live-app');
+
+    releaseLiveApp();
+    await liveAppPromise;
+    liveAppPromise = null;
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    pollEnabled = false;
+    releaseLiveApp();
+    if (liveAppPromise) await liveAppPromise.catch(() => {});
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(shortLivedAssetPath, { force: true });
   }
 });
 
@@ -13004,6 +13424,55 @@ test('lsof package-output image observations are ignored, not accepted or pendin
   assert.equal(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE).length, 0);
 });
 
+test('lsof excludes a package output selected after the poll starts', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'fresh-output-source.fig');
+  const outputRoot = path.join(TEST_HOME, 'Desktop', 'fresh-output-during-lsof');
+  const outputAsset = path.join(outputRoot, 'candidate.png');
+  fs.mkdirSync(outputRoot, { recursive: true });
+  fs.writeFileSync(sourcePath, 'synthetic fig source');
+  fs.writeFileSync(outputAsset, createSyntheticPngBytes());
+  let projectId = null;
+  let pollEnabled = false;
+
+  try {
+    setChildProcessHandler(({ kind, command }) => {
+      if (kind === 'exec' && command.startsWith('/bin/ps ax')) {
+        return { stdout: pollEnabled ? '222 /Applications/Figma.app/Contents/MacOS/Figma\n' : '' };
+      }
+      if (kind === 'exec' && command.startsWith('/usr/sbin/lsof')) {
+        const storedProject = storeInstance.data.projects.find(project => project.id === projectId);
+        assert.ok(storedProject);
+        storedProject.outputPath = outputRoot;
+        return { stdout: `p222\nf20\ntREG\nn${outputAsset}\n` };
+      }
+      return { stdout: '' };
+    });
+
+    const project = await createProject('Fresh lsof output exclusion');
+    projectId = project.id;
+    await setProjectFiles(project.id, { files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.fig',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    }] });
+    pollEnabled = true;
+    const activationToken = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+    await metadataTestHooks.pollLsofForProject(project.id, activationToken);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.outputPath, outputRoot);
+    assert.equal(fresh.files.some(file => file.path === outputAsset), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === outputAsset), false);
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    setChildProcessHandler(null);
+    fs.rmSync(sourcePath, { force: true });
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
 test('manual add remains allowed for excluded-looking package output paths', async () => {
   const project = await createProject('Manual package output add');
   const filePath = path.join(
@@ -13325,6 +13794,59 @@ test('ongoing lsof poll quarantines broad observations outside session scope', a
   assert.equal(processNodes.length, 0);
   assert.equal(appOpenedObservations.length, 0);
   assert.equal(JSON.stringify(fresh.provenance).includes('SHOULD_NOT_APPEAR_PROCESS_ARG'), false);
+});
+
+test('A/B short-lived lsof-only observation remains detectable within the legacy window', async () => {
+  resetTestHomeWorkspace();
+  const projectDir = path.join(TEST_HOME, 'Desktop', 'ab-short-window-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sourcePath = path.join(projectDir, 'ab-short-window.fig');
+  const assetPath = path.join(projectDir, 'ab-short-window.png');
+  fs.writeFileSync(sourcePath, 'synthetic figma source');
+  setChildProcessHandler(() => ({ stdout: '' }));
+
+  const project = await createProject('A/B short lsof observation');
+  await setProjectFiles(project.id, { files: [{
+    path: sourcePath,
+    name: path.basename(sourcePath),
+    ext: '.fig',
+    addedAt: Date.now(),
+    source: 'manual-browse',
+  }] });
+  fs.writeFileSync(assetPath, 'synthetic short-lived asset');
+  const observedAfterWatch = new Date(Date.now() + 1000);
+  fs.utimesSync(assetPath, observedAfterWatch, observedAfterWatch);
+
+  let assetOpen = true;
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command === '/bin/ps ax -o pid= -o command= 2>/dev/null') {
+      return { stdout: '222 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn -p ')) {
+      return {
+        stdout: assetOpen
+          ? `p222\nf20\ntREG\nn${assetPath}\n`
+          : 'p222\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  // Model a handle that remains open through the legacy t=3s tick but closes
+  // before the proposed t=10s tick. No filesystem or metadata fallback is
+  // provided, so this isolates the existing lsof acquisition contract.
+  await runTrackedIntervalCallbacksForDelay(3000);
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+  assetOpen = false;
+  await runTrackedIntervalCallbacksForDelay(10000);
+  await new Promise(resolve => originalSetTimeout(resolve, 50));
+
+  const fresh = await getProject(project.id);
+  const captured = [...fresh.files, ...fresh.pendingFiles]
+    .some(file => path.resolve(file.path) === path.resolve(assetPath));
+  const expectedCapture = process.env.CRATE_AB_EXPECT_SHORT_LSOF_CAPTURE !== 'false';
+  console.log(`# AB_SHORT_LSOF_CAPTURE=${captured ? 'yes' : 'no'}`);
+  assert.equal(captured, expectedCapture);
 });
 
 test('PowerPoint lsof open-after-watch evidence stays quarantined until confirmed', async () => {
@@ -13661,6 +14183,7 @@ test('Photoshop and InDesign live evidence refresh newly linked assets conservat
   assert.deepEqual(fresh.pendingFiles, []);
 
   includeNewLinks = true;
+  await runTrackedIntervalCallbacks(1);
   fresh = await waitForProject(
     project.id,
     item => item.pendingFiles.some(file => file.path === newPsPath) &&
@@ -14833,7 +15356,113 @@ test('live app breadcrumbs persist zero-file poll and app-not-running status saf
   ], 'zero-file live app status breadcrumbs');
 });
 
-test('live app breadcrumbs are capped per app family across repeated watch starts', async () => {
+test('unchanged large-project live app cycles do not rewrite the project store', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+
+  const project = await createProject('Large no-op live app cycle');
+  await setProjectFiles(project.id, {
+    files: Array.from({ length: 267 }, (_, index) => ({
+      path: path.join(TEST_HOME, 'Desktop', `large-no-op-${String(index).padStart(3, '0')}.png`),
+      name: `large-no-op-${String(index).padStart(3, '0')}.png`,
+      ext: '.png',
+      addedAt: Date.now(),
+      source: 'manual-browse',
+    })),
+  });
+  const activationToken = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+  await metadataTestHooks.pollPsForProject(project.id, activationToken);
+
+  storeInstance.measureProjectSerialization = true;
+  storeInstance.projectSerializedBytes = 0;
+  const beforeWrites = storeInstance.projectSetCount;
+  const beforeProject = structuredClone(await getProject(project.id));
+  const cycleCount = 25;
+  const startedAt = performance.now();
+  for (let index = 0; index < cycleCount; index++) {
+    await metadataTestHooks.pollPsForProject(project.id, activationToken);
+  }
+  const elapsedMs = performance.now() - startedAt;
+  const afterProject = await getProject(project.id);
+
+  const projectWriteDelta = storeInstance.projectSetCount - beforeWrites;
+  const expectedWriteDelta = Number(process.env.CRATE_AB_EXPECT_LIVE_APP_NOOP_WRITES || 0);
+  console.log(`# AB_LIVE_APP_NOOP_PROJECT_WRITES=${projectWriteDelta}`);
+  console.log(`# AB_LIVE_APP_NOOP_SERIALIZED_BYTES=${storeInstance.projectSerializedBytes}`);
+  console.log(`# AB_LIVE_APP_NOOP_ELAPSED_MS=${elapsedMs.toFixed(3)}`);
+  assert.equal(projectWriteDelta, expectedWriteDelta);
+  if (expectedWriteDelta === 0) assert.deepEqual(afterProject, beforeProject);
+  assert.equal(afterProject.files.length, 267);
+});
+
+test('unchanged recurring Figma scope reconciliation does not rewrite the project store', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+
+  const project = await callIpc(
+    'projects:create',
+    'No-op Figma scope reconciliation',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/no-op-scope-key/No-Op?page-id=1%3A1'
+  );
+  await callIpcRaw('projects:pause', project.id);
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  const trackedFile = storedProject.figmaSession.trackedFiles[0];
+  const scopeEntries = [{
+    fileKey: trackedFile.key,
+    lockStatus: trackedFile.lockStatus,
+    lockedPageId: trackedFile.lockedPageId,
+    lockedPageName: trackedFile.lockedPageName,
+    statusReason: trackedFile.statusReason,
+    warning: trackedFile.warning,
+  }];
+  assert.ok(metadataTestHooks.mergeFigmaScopeEntriesIntoSession(project.id, scopeEntries));
+  storeInstance.measureProjectSerialization = true;
+  storeInstance.projectSerializedBytes = 0;
+  const beforeWrites = storeInstance.projectSetCount;
+  const cycleCount = 25;
+  let result = null;
+  const startedAt = performance.now();
+  for (let index = 0; index < cycleCount; index++) {
+    result = metadataTestHooks.mergeFigmaScopeEntriesIntoSession(project.id, scopeEntries);
+  }
+  const elapsedMs = performance.now() - startedAt;
+
+  const projectWriteDelta = storeInstance.projectSetCount - beforeWrites;
+  const expectedWriteDelta = Number(process.env.CRATE_AB_EXPECT_FIGMA_NOOP_WRITES || 0);
+  console.log(`# AB_FIGMA_SCOPE_NOOP_PROJECT_WRITES=${projectWriteDelta}`);
+  console.log(`# AB_FIGMA_SCOPE_NOOP_SERIALIZED_BYTES=${storeInstance.projectSerializedBytes}`);
+  console.log(`# AB_FIGMA_SCOPE_NOOP_ELAPSED_MS=${elapsedMs.toFixed(3)}`);
+  if (expectedWriteDelta === 0) assert.equal(result, null);
+  assert.equal(projectWriteDelta, expectedWriteDelta);
+});
+
+test('repeated watcher intervals dedupe unchanged live app breadcrumbs without project writes', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(() => ({ stdout: '' }));
+
+  const project = await createProject('Deduped watcher lifecycle diagnostics');
+  await waitForProject(
+    project.id,
+    item => getLiveAppStatusEntries(item).some(entry => entry.pollInstalled === true),
+    5000
+  );
+  await runTrackedIntervalCallbacks(1);
+  const afterFirstPoll = await getProject(project.id);
+  const firstEntries = structuredClone(getLiveAppStatusEntries(afterFirstPoll));
+  assert.ok(firstEntries.some(entry => entry.pollFired === true));
+  assert.ok(firstEntries.some(entry => entry.errorCategory === 'app-not-running'));
+
+  const beforeWrites = storeInstance.projectSetCount;
+  await runTrackedIntervalCallbacks(25);
+  const fresh = await getProject(project.id);
+  assert.equal(storeInstance.projectSetCount - beforeWrites, 0);
+  assert.deepEqual(getLiveAppStatusEntries(fresh), firstEntries);
+  assert.equal(fresh.liveAppEvidenceStatus.entryLimit, 20);
+});
+
+test('live app breadcrumbs retain only the latest bounded status transitions per app family', async () => {
   resetTestHomeWorkspace();
   setChildProcessHandler(() => ({ stdout: '' }));
 
@@ -14844,7 +15473,17 @@ test('live app breadcrumbs are capped per app family across repeated watch start
     5000
   );
 
-  await runTrackedIntervalCallbacks(25);
+  for (let index = 0; index < 25; index++) {
+    metadataTestHooks.recordLiveAppStatusBreadcrumb(project.id, 'illustrator', {
+      pollFired: true,
+      projectWatching: true,
+      appRunning: index % 2 === 0,
+      scriptAttempted: false,
+      scriptSuccess: false,
+      stagedCount: 0,
+      errorCategory: index % 2 === 0 ? 'script-not-attempted' : 'app-not-running',
+    });
+  }
 
   const fresh = await getProject(project.id);
   const statusEntries = getLiveAppStatusEntries(fresh);
@@ -15129,6 +15768,7 @@ test('Illustrator live evidence refresh stages a newly placed linked asset with 
   assert.equal(fresh.files.some(file => file.path === existingLinkedPath), true);
 
   includeNewLink = true;
+  await runTrackedIntervalCallbacks(1);
   fresh = await waitForProject(
     project.id,
     item => item.pendingFiles.some(file => file.path === newLinkedPath),

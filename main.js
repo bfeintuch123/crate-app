@@ -1561,12 +1561,37 @@ function buildLiveAppStatusBreadcrumb(appFamily, input = {}) {
   return entry;
 }
 
+function areLiveAppStatusBreadcrumbsEquivalent(previous, next) {
+  if (!previous || !next) return false;
+  const previousSemantic = { ...previous };
+  const nextSemantic = { ...next };
+  delete previousSemantic.observedAt;
+  delete nextSemantic.observedAt;
+  return JSON.stringify(previousSemantic) === JSON.stringify(nextSemantic);
+}
+
 function recordLiveAppStatusBreadcrumb(projectId, appFamily, input = {}) {
   const safeAppFamily = normalizeLiveCaptureReason(appFamily, 'live-app');
   const entry = buildLiveAppStatusBreadcrumb(safeAppFamily, input);
   mutateProject(projectId, (project) => {
     if (!project || typeof project !== 'object') return null;
-    if (!project.liveAppEvidenceStatus || typeof project.liveAppEvidenceStatus !== 'object' || Array.isArray(project.liveAppEvidenceStatus)) {
+    const currentStatus = project.liveAppEvidenceStatus;
+    const currentApps = currentStatus && typeof currentStatus === 'object' && !Array.isArray(currentStatus) &&
+      currentStatus.apps && typeof currentStatus.apps === 'object' && !Array.isArray(currentStatus.apps)
+      ? currentStatus.apps
+      : {};
+    const currentAppStatus = currentApps[safeAppFamily];
+    const currentEntries = currentAppStatus && Array.isArray(currentAppStatus.entries)
+      ? currentAppStatus.entries
+      : [];
+    const currentLatest = currentAppStatus && currentAppStatus.latest
+      ? currentAppStatus.latest
+      : currentEntries[currentEntries.length - 1];
+    if (areLiveAppStatusBreadcrumbsEquivalent(currentLatest, entry)) {
+      return { changed: false };
+    }
+
+    if (!currentStatus || typeof currentStatus !== 'object' || Array.isArray(currentStatus)) {
       project.liveAppEvidenceStatus = {
         schemaVersion: 1,
         entryLimit: MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP,
@@ -1586,8 +1611,8 @@ function recordLiveAppStatusBreadcrumb(projectId, appFamily, input = {}) {
     project.liveAppEvidenceStatus.apps[safeAppFamily] = appStatus;
     project.liveAppEvidenceStatus.schemaVersion = 1;
     project.liveAppEvidenceStatus.entryLimit = MAX_LIVE_APP_STATUS_BREADCRUMBS_PER_APP;
-    return { liveAppEvidenceStatus: project.liveAppEvidenceStatus };
-  });
+    return { changed: true, liveAppEvidenceStatus: project.liveAppEvidenceStatus };
+  }, { persistIfChanged: true, trustResultChanged: true });
   return entry;
 }
 
@@ -1947,18 +1972,32 @@ function getLiveEvidenceLedger(project) {
 }
 
 function recordLiveEvidence(project, fileEntry, classification) {
-  if (!classification || !classification.evidence || !classification.evidenceSummary) return;
+  if (!classification || !classification.evidence || !classification.evidenceSummary) return false;
+  const previousLedger = project && project.liveEvidenceLedger;
+  const previousCandidateLimit = previousLedger && previousLedger.candidateLimit;
   const ledger = getLiveEvidenceLedger(project);
-  if (!ledger) return;
+  if (!ledger) return false;
+  const ledgerShapeChanged = previousCandidateLimit !== ledger.candidateLimit;
   const summary = classification.evidenceSummary;
   const key = summary.evidenceKey || classification.evidence.evidenceKeyHash;
-  if (!key) return;
+  if (!key) return false;
   const existing = ledger.candidates[key] || {
     evidenceKey: key,
     firstObservedAt: summary.observedAt || new Date().toISOString(),
     strongestState: LIVE_CAPTURE_STATES.IGNORED,
     observations: [],
   };
+  // Repeated lsof/live-app observations carry a fresh timestamp but no new
+  // evidence. Avoid rewriting the ledger for that semantic no-op; a changed
+  // capture state, source, or relationship still falls through and persists.
+  if (existing.latest) {
+    const comparable = (value) => {
+      const copy = { ...value };
+      delete copy.observedAt;
+      return JSON.stringify(copy);
+    };
+    if (comparable(existing.latest) === comparable(summary)) return ledgerShapeChanged;
+  }
   const currentRank = getLiveCaptureStateRank(existing.strongestState);
   const nextRank = getLiveCaptureStateRank(summary.captureRecommendation);
   existing.strongestState = nextRank >= currentRank ? summary.captureRecommendation : existing.strongestState;
@@ -1980,6 +2019,7 @@ function recordLiveEvidence(project, fileEntry, classification) {
   ledger.candidates[key] = existing;
   ledger.updatedAt = existing.updatedAt;
   pruneLiveEvidenceLedger(project, key);
+  return true;
 }
 
 function shouldUpdatePendingCandidate(existingFile, classification) {
@@ -2051,7 +2091,10 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   }
 
   const evidence = normalizeLiveEvidence(project, fileEntry, observation, normalizedPath);
-  if (isAutoCaptureExcludedPath(fileEntry.path)) {
+  const excludedByGeneratedOutput = observation.projectCollection
+    ? isAutoCaptureExcludedPath(fileEntry.path, observation.projectCollection)
+    : isAutoCaptureExcludedPath(fileEntry.path);
+  if (excludedByGeneratedOutput) {
     const reason = 'crate-output-path';
     return {
       decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED,
@@ -2163,7 +2206,7 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
   observation = { ...observation, appFamily: getLiveCaptureAppFamily(fileEntry, observation) || 'generic' }; if (!isIllustratorScopedFileAllowed(project, fileEntry, observation)) return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, changed: false, file: fileEntry, reason: 'illustrator-activation-scope', captureReason: 'illustrator-activation-scope', captureState: LIVE_CAPTURE_STATES.IGNORED, normalizedPath: normalizeTrackedFilePath(fileEntry && fileEntry.path) };
   const classification = classifyLiveObservedFile(project, fileEntry, observation);
   const normalizedPath = classification.normalizedPath;
-  recordLiveEvidence(project, fileEntry, classification);
+  const evidenceChanged = recordLiveEvidence(project, fileEntry, classification);
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
     const stagedFile = stripLiveCaptureMetadata(fileEntry);
@@ -2175,7 +2218,7 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
     ));
     project.files.push(stagedFile);
     project.files = deduplicateFiles(project.files);
-    return { ...classification, changed: true, file: stagedFile };
+    return { ...classification, changed: true, evidenceChanged, file: stagedFile };
   }
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.UPDATE_PENDING) {
@@ -2185,7 +2228,7 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
       getTrackedFileDedupKey(file) === candidateKey ||
       normalizeTrackedFilePath(file && file.path) === normalizedPath
     ));
-    if (idx === -1) return { ...classification, changed: false, file: fileEntry };
+    if (idx === -1) return { ...classification, changed: false, evidenceChanged, file: fileEntry };
     const nextFile = decorateLiveObservedFile({
       ...project.pendingFiles[idx],
       source: fileEntry.source || project.pendingFiles[idx].source,
@@ -2193,17 +2236,17 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
       name: fileEntry.name || project.pendingFiles[idx].name,
     }, classification, observation);
     project.pendingFiles[idx] = nextFile;
-    return { ...classification, changed: true, file: nextFile };
+    return { ...classification, changed: true, evidenceChanged, file: nextFile };
   }
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
     const stagedFile = decorateLiveObservedFile(fileEntry, classification, observation);
     if (!Array.isArray(project.pendingFiles)) project.pendingFiles = [];
     project.pendingFiles.push(stagedFile);
-    return { ...classification, changed: true, file: stagedFile };
+    return { ...classification, changed: true, evidenceChanged, file: stagedFile };
   }
 
-  return { ...classification, changed: false, file: fileEntry };
+  return { ...classification, changed: false, evidenceChanged, file: fileEntry };
 }
 
 function pruneExcludedAutoCapturedFiles(project) {
@@ -2751,8 +2794,8 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       changed = true;
     }
 
-    return changed ? { figmaSession: project.figmaSession } : null;
-  });
+    return changed ? { changed: true, figmaSession: project.figmaSession } : null;
+  }, { persistIfChanged: true, trustResultChanged: true });
 }
 
 function shouldIncludeFigmaAssetForPackaging(file, project) {
@@ -6245,15 +6288,36 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 }
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
-function mutateProject(projectId, fn) {
+function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false } = {}) {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
+  // Background observers can legitimately return changed:false after running
+  // their classification/provenance logic. The lsof and live-app observers
+  // opt into the result-based fast path, and explicitly report evidenceChanged
+  // for a real ledger mutation; all other callers retain the historical write
+  // boundary. A generic structural fallback remains available for any future
+  // caller that cannot prove this contract.
+  let before = null;
+  if (persistIfChanged && !trustResultChanged) {
+    try { before = JSON.stringify(project); } catch (_) { before = null; }
+  }
   const result = fn(project, projects);
-  normalizeAutoCaptureProjectState(project);
-  normalizeProjectAssetReviewState(project);
-  safelyEnsureProjectProvenance(project);
-  store.set('projects', projects);
+  const resultChanged = !!(result && result.changed === true);
+  if (!persistIfChanged || !trustResultChanged || resultChanged) {
+    normalizeAutoCaptureProjectState(project);
+    normalizeProjectAssetReviewState(project);
+    safelyEnsureProjectProvenance(project);
+  }
+  let shouldPersist = !persistIfChanged;
+  if (persistIfChanged && trustResultChanged) {
+    shouldPersist = resultChanged;
+  } else if (persistIfChanged) {
+    try { shouldPersist = before === null || JSON.stringify(project) !== before; } catch (_) { shouldPersist = true; }
+  }
+  if (shouldPersist) {
+    store.set('projects', projects);
+  }
   return result;
 }
 
@@ -6267,6 +6331,7 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
   'pre-package-discovery',
   'pre-package-app-scan',
   'pre-package-scan-in-flight',
+  'background-watch-drain',
   'package-input-scan-wait',
   'prepare-package-review',
 ]);
@@ -6356,11 +6421,346 @@ app.on('child-process-gone', () => {
 let mainWindowShowFallback = null;
 const mainWindowStartupRetryTimers = new Set();
 const watchers = new Map(); // projectId -> chokidar watcher
+const watcherCoordinators = new Map(); // projectId -> one non-lsof heavy background observer at a time
+const watcherStartupTimers = new Map(); // projectId:kind -> delayed initial observer timer
+const watcherDeferredOperations = new Map(); // projectId -> one coalesced callback per observer kind
+const watcherDeferredTimers = new Map(); // projectId -> bounded backoff wakeup
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
 const watchingActivationTokens = new Map(); // projectId -> current watch-session token
 const illustratorActivationScopes = new Map(); // projectId -> transient Illustrator activation scope
 let watchingActivationSequence = 0;
+
+const BACKGROUND_WATCHER_BUDGET_MS = 2500;
+const BACKGROUND_WATCHER_DRAIN_TIMEOUT_MS = 15000;
+
+/**
+ * Coordinates the expensive background observers for one watching project.
+ *
+ * The coordinator retains at most one pending request per observer kind. This
+ * prevents interval backlog while ensuring a frequent observer cannot starve
+ * the other background observers indefinitely.
+ */
+function createWatcherCoordinator({
+  now = () => Date.now(),
+  maxBackoffMs = 30000,
+} = {}) {
+  const projects = new Map();
+
+  function stateFor(projectId) {
+    let state = projects.get(projectId);
+    if (!state) {
+      state = {
+        generation: 0,
+        running: false,
+        runningKind: null,
+        packageScanDepth: 0,
+        cancelled: false,
+        backoffUntil: 0,
+        consecutiveOverdue: 0,
+        pendingKinds: [],
+        counters: {
+          started: 0,
+          completed: 0,
+          skippedOverlap: 0,
+          skippedPackageScan: 0,
+          skippedBackoff: 0,
+          deferred: 0,
+          coalesced: 0,
+          overdue: 0,
+        },
+        idleWaiters: [],
+      };
+      projects.set(projectId, state);
+    }
+    return state;
+  }
+
+  function beginPackageScan(projectId) {
+    const state = stateFor(projectId);
+    state.packageScanDepth += 1;
+    state.generation += 1;
+    state.backoffUntil = 0;
+    state.pendingKinds = [];
+    return { projectId, generation: state.generation };
+  }
+
+  function endPackageScan(projectId) {
+    const state = stateFor(projectId);
+    state.packageScanDepth = Math.max(0, state.packageScanDepth - 1);
+    state.generation += 1;
+    state.backoffUntil = 0;
+  }
+
+  function activate(projectId) {
+    const state = stateFor(projectId);
+    state.cancelled = false;
+    state.generation += 1;
+    state.backoffUntil = 0;
+    state.consecutiveOverdue = 0;
+    return state.generation;
+  }
+
+  function cancel(projectId) {
+    const state = stateFor(projectId);
+    state.cancelled = true;
+    state.generation += 1;
+    state.backoffUntil = 0;
+    state.packageScanDepth = 0;
+    state.pendingKinds = [];
+  }
+
+  function defer(projectId, kind) {
+    const state = stateFor(projectId);
+    if (state.cancelled || state.packageScanDepth > 0) return false;
+    if (state.pendingKinds.includes(kind)) {
+      state.counters.coalesced += 1;
+      return true;
+    }
+    state.pendingKinds.push(kind);
+    state.counters.deferred += 1;
+    return true;
+  }
+
+  function takeDeferred(projectId) {
+    const state = stateFor(projectId);
+    if (
+      state.cancelled ||
+      state.packageScanDepth > 0 ||
+      state.running ||
+      state.backoffUntil > now()
+    ) return null;
+    return state.pendingKinds.shift() || null;
+  }
+
+  function clearDeferred(projectId) {
+    stateFor(projectId).pendingKinds = [];
+  }
+
+  function isCurrent(projectId, generation) {
+    const state = stateFor(projectId);
+    return !state.cancelled && state.generation === generation && state.packageScanDepth === 0;
+  }
+
+  function tryStart(projectId, kind) {
+    const state = stateFor(projectId);
+    const timestamp = now();
+    if (state.cancelled || state.packageScanDepth > 0) {
+      state.counters.skippedPackageScan += 1;
+      return null;
+    }
+    if (state.running) {
+      state.counters.skippedOverlap += 1;
+      return null;
+    }
+    if (state.backoffUntil > timestamp) {
+      state.counters.skippedBackoff += 1;
+      return null;
+    }
+    state.running = true;
+    state.runningKind = kind;
+    state.counters.started += 1;
+    return { kind, generation: state.generation, startedAt: timestamp };
+  }
+
+  function finish(projectId, ticket, { overdue = false } = {}) {
+    const state = stateFor(projectId);
+    if (!ticket || !state.running || state.runningKind !== ticket.kind) return;
+    state.running = false;
+    state.runningKind = null;
+    state.counters.completed += 1;
+    if (overdue) {
+      state.counters.overdue += 1;
+      state.consecutiveOverdue += 1;
+      const backoff = Math.min(maxBackoffMs, Math.max(1000, 1000 * (2 ** Math.min(5, state.consecutiveOverdue - 1))));
+      state.backoffUntil = now() + backoff;
+    } else {
+      state.consecutiveOverdue = 0;
+      state.backoffUntil = 0;
+    }
+    const waiters = state.idleWaiters.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+
+  function waitForIdle(projectId) {
+    const state = stateFor(projectId);
+    if (!state.running) return Promise.resolve();
+    return new Promise(resolve => state.idleWaiters.push(resolve));
+  }
+
+  function snapshot(projectId) {
+    const state = stateFor(projectId);
+    return {
+      generation: state.generation,
+      running: state.running,
+      runningKind: state.runningKind,
+      cancelled: state.cancelled,
+      packageScanActive: state.packageScanDepth > 0,
+      backoffUntil: state.backoffUntil,
+      pendingKinds: state.pendingKinds.slice(),
+      counters: { ...state.counters },
+    };
+  }
+
+  return {
+    beginPackageScan,
+    endPackageScan,
+    activate,
+    cancel,
+    defer,
+    takeDeferred,
+    clearDeferred,
+    isCurrent,
+    tryStart,
+    finish,
+    waitForIdle,
+    snapshot,
+  };
+}
+
+function getWatcherCoordinator(projectId) {
+  let coordinator = watcherCoordinators.get(projectId);
+  if (!coordinator) {
+    coordinator = createWatcherCoordinator();
+    watcherCoordinators.set(projectId, coordinator);
+  }
+  return coordinator;
+}
+
+function activateWatcherCoordinator(projectId) {
+  clearDeferredWatcherOperations(projectId);
+  return getWatcherCoordinator(projectId).activate(projectId);
+}
+
+async function pauseWatcherCoordinatorForPackage(projectId) {
+  const coordinator = getWatcherCoordinator(projectId);
+  clearDeferredWatcherOperations(projectId);
+  coordinator.beginPackageScan(projectId);
+  let timeoutId = null;
+  const drained = await Promise.race([
+    Promise.all([
+      coordinator.waitForIdle(projectId),
+      waitForLsofIdle(projectId),
+    ]).then(() => true),
+    new Promise(resolve => {
+      timeoutId = setTimeout(() => resolve(false), BACKGROUND_WATCHER_DRAIN_TIMEOUT_MS);
+    }),
+  ]);
+  if (timeoutId) clearTimeout(timeoutId);
+  return drained;
+}
+
+function resumeWatcherCoordinatorAfterPackage(projectId) {
+  getWatcherCoordinator(projectId).endPackageScan(projectId);
+}
+
+function cancelWatcherCoordinator(projectId) {
+  const coordinator = watcherCoordinators.get(projectId);
+  if (coordinator) coordinator.cancel(projectId);
+  clearDeferredWatcherOperations(projectId);
+  for (const [key, timerId] of watcherStartupTimers) {
+    if (key.startsWith(`${projectId}:`)) {
+      clearTimeout(timerId);
+      watcherStartupTimers.delete(key);
+    }
+  }
+}
+
+function clearDeferredWatcherOperations(projectId) {
+  watcherDeferredOperations.delete(projectId);
+  const timerId = watcherDeferredTimers.get(projectId);
+  if (timerId) clearTimeout(timerId);
+  watcherDeferredTimers.delete(projectId);
+  const coordinator = watcherCoordinators.get(projectId);
+  if (coordinator) coordinator.clearDeferred(projectId);
+}
+
+function deferWatcherOperation(projectId, kind, work) {
+  const coordinator = getWatcherCoordinator(projectId);
+  if (!coordinator.defer(projectId, kind)) return false;
+  let deferred = watcherDeferredOperations.get(projectId);
+  if (!deferred) {
+    deferred = new Map();
+    watcherDeferredOperations.set(projectId, deferred);
+  }
+  deferred.set(kind, work);
+  return true;
+}
+
+function scheduleDeferredWatcherOperation(projectId) {
+  if (watcherDeferredTimers.has(projectId)) return;
+  const coordinator = getWatcherCoordinator(projectId);
+  const snapshot = coordinator.snapshot(projectId);
+  if (snapshot.cancelled || snapshot.packageScanActive || snapshot.running || snapshot.pendingKinds.length === 0) return;
+  const delayMs = Math.max(0, snapshot.backoffUntil - Date.now());
+  const timerId = setTimeout(() => {
+    watcherDeferredTimers.delete(projectId);
+    const kind = coordinator.takeDeferred(projectId);
+    if (!kind) {
+      scheduleDeferredWatcherOperation(projectId);
+      return;
+    }
+    const deferred = watcherDeferredOperations.get(projectId);
+    const work = deferred && deferred.get(kind);
+    if (deferred) {
+      deferred.delete(kind);
+      if (deferred.size === 0) watcherDeferredOperations.delete(projectId);
+    }
+    if (typeof work === 'function') {
+      runBackgroundWatcherOperation(projectId, kind, work, { fromDeferred: true });
+    } else {
+      scheduleDeferredWatcherOperation(projectId);
+    }
+  }, delayMs);
+  if (typeof timerId.unref === 'function') timerId.unref();
+  watcherDeferredTimers.set(projectId, timerId);
+}
+
+function scheduleWatcherStartupTimer(projectId, kind, delayMs, callback) {
+  const key = `${projectId}:${kind}`;
+  const previous = watcherStartupTimers.get(key);
+  if (previous) clearTimeout(previous);
+  const timerId = setTimeout(() => {
+    watcherStartupTimers.delete(key);
+    callback();
+  }, delayMs);
+  watcherStartupTimers.set(key, timerId);
+}
+
+async function runBackgroundWatcherOperation(projectId, kind, work, { fromDeferred = false } = {}) {
+  const coordinator = getWatcherCoordinator(projectId);
+  const initialSnapshot = coordinator.snapshot(projectId);
+  if (!fromDeferred && initialSnapshot.pendingKinds.length > 0) {
+    deferWatcherOperation(projectId, kind, work);
+    scheduleDeferredWatcherOperation(projectId);
+    return { skipped: true, reason: 'coordinator-deferred' };
+  }
+  const ticket = coordinator.tryStart(projectId, kind);
+  if (!ticket) {
+    const snapshot = coordinator.snapshot(projectId);
+    if (!snapshot.cancelled && !snapshot.packageScanActive) {
+      deferWatcherOperation(projectId, kind, work);
+      scheduleDeferredWatcherOperation(projectId);
+      return { skipped: true, reason: 'coordinator-deferred' };
+    }
+    return { skipped: true, reason: 'coordinator-paused' };
+  }
+  let result;
+  try {
+    result = await work(ticket.generation);
+  } catch {
+    console.error(`[crate][watcher] ${kind} operation failed: operation-error`);
+    result = { skipped: true, reason: 'operation-error' };
+  } finally {
+    const elapsedMs = Date.now() - ticket.startedAt;
+    coordinator.finish(projectId, ticket, { overdue: elapsedMs > BACKGROUND_WATCHER_BUDGET_MS });
+    if (elapsedMs > BACKGROUND_WATCHER_BUDGET_MS) {
+      console.warn(`[crate][watcher] ${kind} exceeded its background budget; next cycle deferred`);
+    }
+    scheduleDeferredWatcherOperation(projectId);
+  }
+  return result;
+}
 
 const MAIN_WINDOW_SHOW_FALLBACK_MS = 1500;
 const MAIN_WINDOW_STARTUP_RETRY_DELAYS_MS = [500, 1500, 5000, 10000];
@@ -6485,6 +6885,10 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   const activationToken = ++watchingActivationSequence;
   watchingActivationTokens.clear();
   watchingActivationTokens.set(projectId, activationToken);
+  // Invalidate any prior observer set before the replacement performs its
+  // initial snapshot. Existing interval handles are stopped below by
+  // startWatching, while this gate makes their ticks harmless in the gap.
+  cancelWatcherCoordinator(projectId);
   illustratorActivationScopes.set(projectId, { activationToken, revision: 0, status: 'initializing', baselineDocumentPaths: new Set(), admittedDocumentPaths: new Set(), allowedLinkedPaths: new Set(), excludedLinkedPaths: new Set() });
 
   return {
@@ -6555,7 +6959,28 @@ function getTrackedFileDedupKey(file) {
 
 const lsofPollers = new Map();   // projectId -> setInterval id
 const lsofInProgress = new Set(); // projectIds currently mid-poll (prevent overlap)
-// v2.4.2: per-project, keyed by projectId. Intentional ~3s staleness (lsof poll interval)
+const lsofIdleWaiters = new Map(); // projectId -> package-drain waiters
+
+function waitForLsofIdle(projectId) {
+  if (!lsofInProgress.has(projectId)) return Promise.resolve();
+  return new Promise(resolve => {
+    let waiters = lsofIdleWaiters.get(projectId);
+    if (!waiters) {
+      waiters = [];
+      lsofIdleWaiters.set(projectId, waiters);
+    }
+    waiters.push(resolve);
+  });
+}
+
+function finishLsofPoll(projectId, onComplete) {
+  lsofInProgress.delete(projectId);
+  const waiters = lsofIdleWaiters.get(projectId) || [];
+  lsofIdleWaiters.delete(projectId);
+  for (const resolve of waiters) resolve();
+  onComplete();
+}
+// v2.4.2: per-project, keyed by projectId. Bounded by the lsof poll interval.
 // — acceptable trade-off to avoid calling ps on every file event.
 const designAppRunningCache = new Map();
 
@@ -6591,7 +7016,7 @@ const psPollers = new Map();          // projectId -> setInterval id
 const psPollerStarting = new Set();   // guard: projectIds with initial poll in progress
 const psInProgress = new Set();       // projectIds currently mid-poll
 const liveAppDiagnosticLogTimestamps = new Map();
-const LIVE_APP_REFRESH_INTERVAL_MS = 3000; // 3 seconds
+const LIVE_APP_REFRESH_INTERVAL_MS = 10000; // 10 seconds; avoid sustained main-process polling pressure
 const LIVE_APP_INITIAL_REFRESH_DELAY_MS = 500;
 const LIVE_APP_DIAGNOSTIC_LOG_INTERVAL_MS = 30000;
 const PS_POLL_INTERVAL_MS = LIVE_APP_REFRESH_INTERVAL_MS; // historical alias
@@ -6632,23 +7057,26 @@ function getRunningDesignAppPids(callback) {
 
 // Poll lsof for a single watching project. Runs every LSOF_POLL_MS.
 // Finds files that design apps have open (reads + writes) in watched dirs → Tier 1 auto-capture.
-function pollLsofForProject(projectId, activationToken = null) {
-  if (lsofInProgress.has(projectId)) return; // skip if already running for this project
+function pollLsofForProjectCore(projectId, activationToken = null, onComplete = () => {}, watcherGeneration = null) {
+  if (lsofInProgress.has(projectId)) { onComplete(); return; } // skip if already running for this project
 
-  const currentProjects = getProjects();
-  const project = currentProjects.find(p => p.id === projectId);
-  if (!project || !isActiveWatchingProject(projectId, activationToken)) return;
+  const project = getProjects().find(p => p.id === projectId);
+  if (!project || !isActiveWatchingProject(projectId, activationToken)) { onComplete(); return; }
 
   lsofInProgress.add(projectId);
 
   getRunningDesignAppPids((pids, pidToCmd) => {
     if (!getFreshActiveWatchingProject(projectId, activationToken)) {
-      lsofInProgress.delete(projectId);
+      finishLsofPoll(projectId, onComplete);
+      return;
+    }
+    if (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration)) {
+      finishLsofPoll(projectId, onComplete);
       return;
     }
     designAppRunningCache.set(projectId, pids.length > 0); // v2.4.2: per-project
     if (pids.length === 0) {
-      lsofInProgress.delete(projectId);
+      finishLsofPoll(projectId, onComplete);
       return;
     }
 
@@ -6656,7 +7084,7 @@ function pollLsofForProject(projectId, activationToken = null) {
 
     // Filter to valid numeric PIDs only, then join
     const validPids = pids.filter(p => Number.isInteger(p) && p > 0);
-    if (validPids.length === 0) { lsofInProgress.delete(projectId); return; }
+    if (validPids.length === 0) { finishLsofPoll(projectId, onComplete); return; }
     const pidArg = validPids.join(',');
     // v1.3.20: Use lsof -F (machine-readable) output instead of columnar format.
     // The old columnar parser split lines on whitespace, which broke for any app
@@ -6668,10 +7096,15 @@ function pollLsofForProject(projectId, activationToken = null) {
     // v2.2.2: Include PID in lsof output for scan-on-open re-open detection.
     const cmd = `/usr/sbin/lsof -F ptn -p ${pidArg} 2>/dev/null`;
 
-    exec(cmd, { timeout: 12000 }, (err, stdout) => {
-      lsofInProgress.delete(projectId);
+    exec(cmd, { timeout: 12000 }, async (err, stdout) => {
+      const parserScans = [];
+      try {
       const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
-      if (!stdout || !latestProject) return;
+      if (
+        !stdout ||
+        !latestProject ||
+        (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+      ) return;
 
       const parsedLines = stdout.trim().split('\n');
 
@@ -6736,7 +7169,7 @@ function pollLsofForProject(projectId, activationToken = null) {
         if (!currentPollFiles.has(filePath)) {
           // v2.2.3: Scan-on-close — re-scan file that just closed to catch final-save assets
           if (prevPidSet.size > 0 && isActiveWatchingProject(projectId, activationToken)) {
-            runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
+            parserScans.push(runScanOnOpen(projectId, filePath, activationToken).catch(() => null));
           }
           prevPids.set(filePath, new Set()); // closed
         }
@@ -6745,17 +7178,23 @@ function pollLsofForProject(projectId, activationToken = null) {
         prevPids.set(filePath, pids);
       }
 
-      // Fire-and-forget: run scan-on-open for newly detected design files
+      // Keep child parser work inside this coordinated lsof operation. Package
+      // preparation must not claim a drained watcher while these mutations are
+      // still in flight.
       for (const filePath of filesToScan) {
         if (!isActiveWatchingProject(projectId, activationToken)) break;
-        runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
+        parserScans.push(runScanOnOpen(projectId, filePath, activationToken).catch(() => null));
+      }
+
+      if (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration)) {
+        return;
       }
 
       // Second pass: standard lsof file capture (same as before, minus mtime filter)
       currentPid = null;
       currentType = null;
 
-      const result = mutateProject(projectId, (proj) => {
+      const result = mutateProject(projectId, (proj, projectsAtMutation) => {
         if (!isActiveWatchingProject(projectId, activationToken)) return { changed: false };
 
         const existingPaths = getNormalizedPathSet(proj.files);
@@ -6892,7 +7331,12 @@ function pollLsofForProject(projectId, activationToken = null) {
             captureReason: isPrimarySource ? 'opened-after-watch' : 'app-file-observed',
             captureState: isPrimarySource ? LIVE_CAPTURE_STATES.OBSERVED : LIVE_CAPTURE_STATES.PENDING,
             appFamily: processIdentity ? processIdentity.appFamily : 'generic',
+            // Resolve generated outputs from the same fresh collection being
+            // mutated. An output selected while lsof was running must be
+            // excluded from this poll.
+            projectCollection: projectsAtMutation,
           });
+          if (staged.evidenceChanged) changed = true;
           if (!staged.changed) continue;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
             recordLsofAcceptedFileProvenance(proj, fileEntry, {
@@ -6913,19 +7357,39 @@ function pollLsofForProject(projectId, activationToken = null) {
           proj.files = deduplicateFiles(proj.files);
         }
         return { changed, files: proj.files, pendingFiles: proj.pendingFiles || [] };
-      });
+      }, { persistIfChanged: true, trustResultChanged: true });
 
       if (result && result.changed) sendProjectFileStateToRenderer(projectId, activationToken);
+      } catch {
+        console.error('[crate][watcher] lsof poll failed: operation-error');
+      } finally {
+        if (parserScans.length > 0) await Promise.allSettled(parserScans);
+        finishLsofPoll(projectId, onComplete);
+      }
     });
   });
 }
 
-const LSOF_POLL_MS = 3000; // v1.3.27: reduced from 2s to 3s — still fast enough for capture, less system load
+function pollLsofForProject(projectId, activationToken = null) {
+  const coordinator = getWatcherCoordinator(projectId);
+  const snapshot = coordinator.snapshot(projectId);
+  if (snapshot.cancelled || snapshot.packageScanActive) {
+    return Promise.resolve({ skipped: true, reason: 'coordinator-paused' });
+  }
+  // Lsof is the capture-critical sampling lane. It keeps the established
+  // three-second opportunity even when a slower background observer is busy,
+  // while its own in-progress guard prevents overlap or interval backlog.
+  return new Promise(resolve => {
+    pollLsofForProjectCore(projectId, activationToken, resolve, snapshot.generation);
+  });
+}
+
+const LSOF_POLL_MS = 3000; // Preserve short-lived file detection; lsof's own guard prevents overlap and backlog.
 
 function startLsofPolling(projectId, activationToken = null) {
   stopLsofPolling(projectId); // clear any existing interval first
   // Run once immediately, then on the regular interval
-  setTimeout(() => pollLsofForProject(projectId, activationToken), 500);
+  scheduleWatcherStartupTimer(projectId, 'lsof', 500, () => pollLsofForProject(projectId, activationToken));
   const intervalId = setInterval(() => pollLsofForProject(projectId, activationToken), LSOF_POLL_MS);
   lsofPollers.set(projectId, intervalId);
 }
@@ -6936,7 +7400,6 @@ function stopLsofPolling(projectId) {
     clearInterval(intervalId);
     lsofPollers.delete(projectId);
   }
-  lsofInProgress.delete(projectId);
 }
 
 // --- Figma Auto-Tracking Functions ---
@@ -8032,7 +8495,7 @@ async function ingestFigmaAssetsIntoProject(
  * Poll Figma API for recent files and extract assets.
  * Runs on watch session start and every 60 seconds.
  */
-async function pollFigmaForProject(projectId, isInitialScan = false, activationToken = null) {
+async function pollFigmaForProjectCore(projectId, isInitialScan = false, activationToken = null, watcherGeneration = null) {
   if (figmaInProgress.has(projectId)) return { skipped: true, reason: 'in-progress' }; // Prevent overlapping polls
 
   const currentProjects = getProjects();
@@ -8124,6 +8587,9 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       return { skipped: true, reason: 'watch-session-superseded' };
     }
 
+    if (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration)) {
+      return { skipped: true, reason: 'watch-session-superseded' };
+    }
     const scopeStateResult = mergeFigmaScopeEntriesIntoSession(projectId, scanResult.scopeEntries || []);
     const activeProject = getProjects().find(p => p.id === projectId) || latestProject;
     let activeWarnings = (((activeProject || {}).figmaSession || {}).warnings) || [];
@@ -8236,7 +8702,10 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
       'poll',
       activationToken
     );
-    if (!isActiveWatchingProject(projectId, activationToken)) {
+    if (
+      !isActiveWatchingProject(projectId, activationToken) ||
+      (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+    ) {
       return { skipped: true, reason: 'watch-session-superseded' };
     }
 
@@ -8305,6 +8774,12 @@ async function pollFigmaForProject(projectId, isInitialScan = false, activationT
   }
 }
 
+async function pollFigmaForProject(projectId, isInitialScan = false, activationToken = null) {
+  return runBackgroundWatcherOperation(projectId, 'figma', (watcherGeneration) => (
+    pollFigmaForProjectCore(projectId, isInitialScan, activationToken, watcherGeneration)
+  ));
+}
+
 /**
  * Start Figma polling for a project.
  */
@@ -8321,8 +8796,9 @@ async function startFigmaPolling(projectId, activationToken = null) {
 
   let initialResult;
   try {
-    // Run initial scan immediately
-    initialResult = await pollFigmaForProject(projectId, true, activationToken);
+    // Preserve the one-time startup scan. Only recurring background ticks are
+    // coalesced by the watcher coordinator.
+    initialResult = await pollFigmaForProjectCore(projectId, true, activationToken, null);
   } finally {
     if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) {
       figmaPollerStarting.delete(projectId);
@@ -9079,7 +9555,7 @@ function admitIllustratorSourcesForProject(projectId, filePaths) {
   const revised = reviseIllustratorActivationScope(projectId, scope, next => {
     if (next.status === 'failed-closed') next.status = 'recovering-explicit'; for (const documentPath of (filePaths || []).map(normalizeTrackedFilePath).filter(Boolean)) { next.admittedDocumentPaths.add(documentPath); next.baselineDocumentPaths.delete(documentPath); }
   });
-  if (revised && revised.status === 'ready') pollPsForProject(projectId, activationToken);
+  if (revised && revised.status === 'ready') pollPsForProjectCore(projectId, activationToken, null);
   return revised;
 }
 function admitIllustratorRelationshipPathsForProject(projectId, sourcePath, linkedPaths) {
@@ -9180,6 +9656,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
   const result = mutateProject(projectId, (proj) => {
     if (proj.status !== 'watching' || !isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
     let changed = false;
+    let evidenceChanged = false;
     let stagedCount = 0;
     const stagedStates = new Map();
     const stagedByApp = new Map();
@@ -9201,6 +9678,10 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
         relationshipSourcePath: evidence.relationshipSourcePath,
         liveEvidence: evidence,
       });
+      if (staged.evidenceChanged) {
+        evidenceChanged = true;
+        changed = true;
+      }
       if (!staged.changed) continue;
       stagedCount++;
       changed = true;
@@ -9224,22 +9705,25 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
 
     return {
       changed,
+      evidenceChanged,
       stagedCount,
       stagedStates: Array.from(stagedStates.entries()),
       stagedByApp: Array.from(stagedByApp.entries()),
       files: proj.files,
       pendingFiles: proj.pendingFiles || [],
     };
-  });
+  }, { persistIfChanged: true, trustResultChanged: true });
 
-  if (!result || result.stagedCount === 0) {
+  if (!result || (result.stagedCount === 0 && result.evidenceChanged !== true)) {
     return { changed: false, stagedCount: 0, skipped };
   }
 
-  lastFileActivity.set(projectId, Date.now());
-  inactivityNotified.delete(projectId);
+  if (result.stagedCount > 0) {
+    lastFileActivity.set(projectId, Date.now());
+    inactivityNotified.delete(projectId);
+  }
 
-  sendProjectFileStateToRenderer(projectId, activationToken);
+  if (result.stagedCount > 0) sendProjectFileStateToRenderer(projectId, activationToken);
 
   return result;
 }
@@ -9596,9 +10080,9 @@ function createInDesignLiveEvidenceRecords(projectId, activeState, project = nul
 
 /**
  * Poll Photoshop and InDesign for open smart objects / linked assets (embedded + linked).
- * Fires every 3 seconds; skips silently if neither app is running.
+ * Fires every 10 seconds; skips silently if no supported local app is running.
  */
-async function pollPsForProject(projectId, activationToken = null) {
+async function pollPsForProjectCore(projectId, activationToken = null, watcherGeneration = null) {
   if (psInProgress.has(projectId)) return;
 
   const currentProjects = getProjects();
@@ -9861,7 +10345,11 @@ async function pollPsForProject(projectId, activationToken = null) {
       console.log(`[crate][live-app] Polled active app evidence for project ${projectId}: ${polledApps.join(', ')} (${liveEvidenceRecords.length} records)`);
     }
 
-    if (liveEvidenceRecords.length === 0 || !isActiveWatchingProject(projectId, activationToken)) return;
+    if (
+      liveEvidenceRecords.length === 0 ||
+      !isActiveWatchingProject(projectId, activationToken) ||
+      (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+    ) return;
 
     const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken);
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
@@ -9888,6 +10376,12 @@ async function pollPsForProject(projectId, activationToken = null) {
   }
 }
 
+async function pollPsForProject(projectId, activationToken = null) {
+  return runBackgroundWatcherOperation(projectId, 'live-app', (watcherGeneration) => (
+    pollPsForProjectCore(projectId, activationToken, watcherGeneration)
+  ));
+}
+
 /**
  * Start live app evidence refresh for a project.
  */
@@ -9909,11 +10403,11 @@ function startPsPolling(projectId, activationToken = null) {
   }, PS_POLL_INTERVAL_MS);
   psPollers.set(projectId, intervalId);
 
-  setTimeout(() => {
+  scheduleWatcherStartupTimer(projectId, 'live-app', LIVE_APP_INITIAL_REFRESH_DELAY_MS, () => {
     pollPsForProject(projectId, activationToken).finally(() => {
       psPollerStarting.delete(projectId);
     });
-  }, LIVE_APP_INITIAL_REFRESH_DELAY_MS);
+  });
 }
 
 /**
@@ -9937,7 +10431,7 @@ function stopPsPolling(projectId) {
 // kMDItemLastUsedDate on that file but lsof misses it (<1 sec open).
 // This poller runs every 10s during active watch sessions to catch those files.
 
-async function pollLastUsedForProject(projectId, activationToken = null) {
+async function pollLastUsedForProjectCore(projectId, activationToken = null, watcherGeneration = null) {
   try {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
@@ -10002,7 +10496,11 @@ async function pollLastUsedForProject(projectId, activationToken = null) {
     // mdfind failed — skip this poll cycle
   }
 
-  if (newFiles.length === 0 || !isActiveWatchingProject(projectId, activationToken)) return;
+  if (
+    newFiles.length === 0 ||
+    !isActiveWatchingProject(projectId, activationToken) ||
+    (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+  ) return;
 
   const result = mutateProject(projectId, (proj) => {
     if (!isActiveWatchingProject(projectId, activationToken)) return null;
@@ -10034,8 +10532,8 @@ async function pollLastUsedForProject(projectId, activationToken = null) {
         },
       });
     }
-    return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
-  });
+    return { changed: true, files: proj.files, pendingFiles: proj.pendingFiles || [] };
+  }, { persistIfChanged: true, trustResultChanged: true });
 
   if (result) sendProjectFileStateToRenderer(projectId, activationToken);
   } catch (e) {
@@ -10043,9 +10541,15 @@ async function pollLastUsedForProject(projectId, activationToken = null) {
   }
 }
 
+async function pollLastUsedForProject(projectId, activationToken = null) {
+  return runBackgroundWatcherOperation(projectId, 'last-used', (watcherGeneration) => (
+    pollLastUsedForProjectCore(projectId, activationToken, watcherGeneration)
+  ));
+}
+
 function startLastUsedPolling(projectId, activationToken = null) {
   if (lastUsedPollers.has(projectId)) return;
-  setTimeout(() => pollLastUsedForProject(projectId, activationToken), 10000); // v2.4.8: 10s delay — ensures watchStartedAt is written before first poll
+  scheduleWatcherStartupTimer(projectId, 'last-used', 10000, () => pollLastUsedForProject(projectId, activationToken)); // v2.4.8: 10s delay — ensures watchStartedAt is written before first poll
   const intervalId = setInterval(() => pollLastUsedForProject(projectId, activationToken), LAST_USED_POLL_MS);
   lastUsedPollers.set(projectId, intervalId);
 }
@@ -11749,6 +12253,28 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   await initializeIllustratorActivationScope(projectId, activationToken);
   if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
 
+  // Replace any prior watcher before the initial lsof snapshot, then account
+  // for that snapshot and its parser children in the same drainable lane as
+  // recurring background observations.
+  stopWatching(projectId, { invalidateActivation: false });
+  if (!isActiveWatchingProject(projectId, activationToken)) return null;
+  activateWatcherCoordinator(projectId);
+
+  await runBackgroundWatcherOperation(projectId, 'lsof', async (watcherGeneration) => {
+  const initialSnapshotParserScans = [];
+  const capturedInitialOperation = captureProjectOperation(projectId);
+  if (!capturedInitialOperation) return null;
+  const coordinatorCurrent = () => (
+    getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration)
+  );
+  const initialWatcherOperation = {
+    current: () => capturedInitialOperation.current() && coordinatorCurrent(),
+    adoptScope(scope) {
+      if (!coordinatorCurrent()) return false;
+      return capturedInitialOperation.adoptScope(scope) && coordinatorCurrent();
+    },
+  };
+
   // FIX 4 (H1): Converted from execSync to async — no longer blocks main process
   // v1.3.38: One-time lsof snapshot to capture files already open in design apps
   // BEFORE the polling loop begins.
@@ -11756,7 +12282,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
     const { stdout: psOut } = await execFileAsync('/bin/ps', ['ax', '-o', 'pid=', '-o', 'command='], {
       timeout: 5000, encoding: 'utf8'
     });
-    if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
+    if (!getFreshActiveWatchingProject(projectId, activationToken) || !initialWatcherOperation.current()) return null;
     const pids = [];
     const pidToCmd = new Map();
     for (const line of psOut.trim().split('\n')) {
@@ -11777,15 +12303,15 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         const { stdout: lsofOut } = await execFileAsync('/usr/sbin/lsof', ['-F', 'ptn', '-p', validPids.join(',')], {
           timeout: 12000, encoding: 'utf8'
         });
-        if (!getFreshActiveWatchingProject(projectId, activationToken)) return null;
+        if (!getFreshActiveWatchingProject(projectId, activationToken) || !initialWatcherOperation.current()) return null;
 
         // FIX 1: Use mutateProject to atomically apply snapshot results
         // v2.2.2: Collect design files for scan-on-open
         const snapshotDesignFiles = [];
 
-        if (!isActiveWatchingProject(projectId, activationToken)) return null;
+        if (!isActiveWatchingProject(projectId, activationToken) || !initialWatcherOperation.current()) return null;
         const snapshotResult = mutateProject(projectId, (project) => {
-          if (!isActiveWatchingProject(projectId, activationToken)) return null;
+          if (!isActiveWatchingProject(projectId, activationToken) || !initialWatcherOperation.current()) return null;
           const existingPaths = getNormalizedPathSet(project.files);
           const pendingPaths = getNormalizedPathSet(project.pendingFiles);
           let snapshotChanged = false;
@@ -11950,26 +12476,35 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         });
         if (snapshotResult) sendProjectFileStateToRenderer(projectId, activationToken);
 
-        // v2.2.2: Fire-and-forget scan-on-open for design files found in initial snapshot.
+        // Keep initial scan-on-open work inside the coordinated snapshot so
+        // package preparation cannot observe an idle watcher prematurely.
         // Initialize scannedDesignFiles for this project and mark these as scanned.
-        if (snapshotDesignFiles.length > 0 && isActiveWatchingProject(projectId, activationToken)) {
+        if (
+          snapshotDesignFiles.length > 0 &&
+          isActiveWatchingProject(projectId, activationToken) &&
+          initialWatcherOperation.current()
+        ) {
           if (!scannedDesignFiles.has(projectId)) scannedDesignFiles.set(projectId, new Set());
           const scanned = scannedDesignFiles.get(projectId);
           for (const fp of snapshotDesignFiles) {
             scanned.add(fp);
-            runScanOnOpen(projectId, fp, activationToken).catch(() => {});
+            initialSnapshotParserScans.push(
+              runScanOnOpen(projectId, fp, activationToken, initialWatcherOperation).catch(() => null)
+            );
           }
         }
       }
     }
   } catch (e) {
     console.error('[crate] initial lsof snapshot error:', e.message);
+  } finally {
+    if (initialSnapshotParserScans.length > 0) {
+      await Promise.allSettled(initialSnapshotParserScans);
+    }
+    capturedInitialOperation.close();
   }
+  });
 
-  if (!isActiveWatchingProject(projectId, activationToken)) return null;
-
-  // Stop existing watcher if any
-  stopWatching(projectId, { invalidateActivation: false });
   if (!isActiveWatchingProject(projectId, activationToken)) return null;
 
   const homedir = os.homedir();
@@ -12159,6 +12694,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
   if (invalidateActivation) watchingActivationTokens.delete(projectId);
+  cancelWatcherCoordinator(projectId);
   const watcher = watchers.get(projectId);
   if (watcher) {
     watcher.close();
@@ -12687,6 +13223,21 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   packageScanDiagnosticState.delete(projectId);
   const previousFigmaPackageBlock = figmaPackageTransferBlocks.get(projectId);
   try {
+  const watcherDrainStartedAt = Date.now();
+  const watcherDrained = await pauseWatcherCoordinatorForPackage(projectId);
+  if (!watcherDrained) {
+    const drainDiagnostic = {
+      failurePhase: 'background-watch-drain',
+      phaseElapsedMs: Math.max(0, Date.now() - watcherDrainStartedAt),
+      candidateCount: 0,
+      xattrResolvedCount: 0,
+      metadataFallbackCount: 0,
+    };
+    incompletePackageScans.add(projectId);
+    packageScanDiagnosticState.set(projectId, drainDiagnostic);
+    invalidatePackageReviewForProject(projectId);
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete', drainDiagnostic);
+  }
   const projects = getProjects();
   let project = projects.find(p => p.id === projectId);
   if (!project || !operationCurrent()) return null;
@@ -13395,6 +13946,7 @@ end tell`;
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
+    resumeWatcherCoordinatorAfterPackage(projectId);
     if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();
     const settlement = packageScanSettlements.get(projectId);
@@ -16633,6 +17185,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   consumedPackageReviewTokens.clear();
   incompletePackageScans.clear();
   packageScanDiagnosticState.clear();
+  for (const projectId of watcherCoordinators.keys()) cancelWatcherCoordinator(projectId);
   const projectCacheIds = safeStoredProjectCacheIds();
   // Stop all active watchers and lsof pollers
   for (const [id, watcher] of watchers) {
@@ -16847,7 +17400,7 @@ registerTrustedIpcHandler('figma:scan-project', async (event, projectId) => {
   }
 
   try {
-    const result = await pollFigmaForProject(projectId, true, activationToken);
+    const result = await pollFigmaForProjectCore(projectId, true, activationToken, null);
     if (result && result.rateLimited === true) {
       return {
         success: false,
@@ -16918,7 +17471,7 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
   const scanResults = await Promise.all(
     scannableProjects.map(async ({ project, activationToken }) => {
       try {
-        return await pollFigmaForProject(project.id, false, activationToken);
+        return await pollFigmaForProjectCore(project.id, false, activationToken, null);
       } finally {
         if (watchingActivationTokens.get(project.id) === activationToken) {
           figmaManualScanInFlight.delete(project.id);
@@ -17098,6 +17651,7 @@ app.on('before-quit', () => {
   startupPhaseJournal.close();
   isQuitting = true;
   mainWindowVisibleSinceStartup = true;
+  for (const projectId of watcherCoordinators.keys()) cancelWatcherCoordinator(projectId);
   // Clean up all watchers
   for (const [id, watcher] of watchers) {
     watcher.close();
