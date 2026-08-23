@@ -7,8 +7,5 @@ dist/
 installer/
 .env
 .codex/research/
-/.crabbox/
-/visual-proof-input/
-/visual-proof-output/
 /private-evidence/
 /.github/pr-assets/

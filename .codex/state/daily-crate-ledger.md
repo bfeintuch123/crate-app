@@ -36,6 +36,9 @@ Secondary:
 
 ### Crabbox Runner Onboarding
 
+- Status: superseded and relocated to Crate Ops PR #15. The reusable runner,
+  collection, and visual-evidence implementation described below remains
+  historical record only; Crate App no longer owns those operational assets.
 - Bryant approved proceeding after the Beta 2.14 build finished; Jenna's Mac
   testing and all completed release worktrees remained outside scope.
 - Installed and signature-verified official Crabbox v0.45.0 outside the repo.
@@ -82,6 +85,9 @@ Secondary:
 
 ### Crabbox Contract Gate
 
+- Status: superseded and relocated to Crate Ops PR #15. Retain the contract
+  facts below as historical provenance; operational collection and validation
+  now belong to the separately reviewed Crate Ops workflow.
 - Bryant approved the narrowed workflow contract: GitHub PR user attachments
   are the sole durable publication destination; Crabbox provides isolated
   collection, integrity validation, and fail-closed local preservation.
