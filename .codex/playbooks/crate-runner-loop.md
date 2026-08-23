@@ -29,7 +29,7 @@ If the doctor reports warnings, classify them before continuing. If it reports f
 - Bryant asks for Crabbox-style, runner-backed, or self-verifying Crate loops.
 - Codex needs a repeatable non-GUI command suite before making or approving changes.
 - A fresh agent needs to know which checks can run locally, remotely, on the signing Mac, or only through installed-app QA.
-- A future `.crabbox.yaml` is being considered but must not be added until schema and approval gates are satisfied.
+- Operational runner configuration and collection are owned by the separately reviewed Crate Ops workflow; no runner configuration belongs in Crate App.
 
 ## Start Prompt
 Use a prompt like:
@@ -39,7 +39,7 @@ Use .codex/playbooks/crate-runner-loop.md and .codex/playbooks/crate-codex-loops
 Execution tier: <A|B|C|D>.
 Allowed runner commands: <command list or suite>.
 Evidence required: command, environment, branch/commit, run id if available, logs/evidence location, pass/fail, duration, failures, next action.
-Do not add .crabbox.yaml, mutate dependencies, build, release, deploy, tag, notarize, or touch crate-web unless explicitly approved.
+Do not add runner configuration, mutate dependencies, build, release, deploy, tag, notarize, or touch crate-web unless explicitly approved.
 ```
 
 ## Definitions
@@ -60,7 +60,7 @@ Every runner-backed step should capture:
 - branch/commit
 - standing order
 - taskflow path
-- run id if Crabbox
+- run id if a remote runner is used
 - logs/evidence location
 - pass/fail
 - duration
@@ -161,71 +161,21 @@ Notes:
 - Long tests such as `tests/provenance-dual-write.test.js` should be allowed to finish before deciding pass/fail.
 - Use focused subsets first when the loop goal is narrow; use the full non-GUI suite when the risk surface is broad.
 
-## Configured Crabbox Jobs
-Bryant approved Crabbox repository onboarding on 2026-08-21 after the Beta 2.14
-build completed. The v0.45.0 schema was inspected from the signed release and in
-a disposable generated repository before `.crabbox.yaml` was added on the
-isolated `ops/crabbox-runner-onboarding` branch.
+## Crate Ops Runner Ownership
 
-Configured jobs are:
-- `quick-check`: syntax checks, visual-evidence helper tests, plus `git diff --check`
-- `provenance-suite`: cross-platform provenance and diagnostic-summary tests
-- `figma-suite`: Figma scope, link, token privacy, and renderer Figma tests
-- `package-parser-suite`: package safety, PSD safety, PowerPoint/Keynote, and Quick Package parser tests
-- `full-nongui-suite`: all safe runner-compatible commands
-- `visual-artifact-collect`: validate and retrieve one already-inspected,
-  public-safe MP4, WebM, or PNG plus its strict JSON manifest; this is
-  collection only, not GUI proof or durable publication
+Operational Crabbox collection and validation are owned by the separately
+reviewed Crate Ops crate-crabbox workflow (PR #15). Crate App retains the
+generic runner evidence format, safe command sets, product-specific validation
+guidance, and the QA/release/signing/notarization/deploy boundaries above; no
+runner implementation or operational configuration belongs in this repository.
 
-Invoke them through `.codex/tools/run_crabbox_job.sh <job>`. Crabbox v0.45.0
-has a fresh-workspace local-hydration ordering defect in raw one-shot
-`crabbox job run`: it may invalidate the fingerprint before creating the
-workspace. The wrapper warms one lease, performs a sync-only run that creates
-the workspace, explicitly hydrates it, runs the named job with hydration reuse,
-and stops the lease on success or failure.
-
-Release/sign/notarize/deploy jobs stay Mac mini only.
-`tests/provenance-dual-write.test.js` also stays in the macOS lane because its
-coverage intentionally exercises macOS filesystem paths and creative-app
-semantics that do not hold in the Ubuntu Apple VM.
-
-The reviewed default provider is the direct local `apple-vm` backend on the
-Apple Silicon MacBook. It uses no broker or cloud credentials and exposes SSH
-only on loopback. Any alternate provider and associated credentials or spend
-require separate approval. The reviewed config also selects class `standard`,
-spot capacity, and `fallback: none`; do not replace those with the generated
-class `beast` or on-demand fallback without approval.
-
-### Visual Evidence Publication Boundary
-
-The primary path is `.codex/tools/publish_visual_evidence.js`. It binds a
-sanitized media file to the public repository database ID, exact PR number, and
-full head SHA; acquires GitHub auth only in process memory; sends it to curl on
-stdin rather than argv or environment; rejects redirects and schema drift; and
-verifies exact destination bytes and SHA-256 before writing an owner-only
-manifest. It uploads no manifest and does not edit or comment on a PR.
-
-Every GitHub attachment for `bfeintuch123/crate-app` is public. A passing privacy
-inspection is mandatory and repository visibility is never a privacy control.
-The uploader accepts that gate only through an owner-only
-`crate.visual-review.v1` receipt bound to the exact sanitized name, MIME, bytes,
-and SHA-256; command-line PASS assertions are not accepted.
-
-Crabbox v0.45.0 supports credential-free collection on `apple-vm` through
-`artifactGlobs` and `requiredArtifacts`. Under the approved contract, a GitHub
-PR user attachment is the sole durable publication destination. Crabbox
-provides isolated collection, integrity validation, and fail-closed local
-preservation; its trusted-Mac archive is local evidence, not a durable
-off-host URL, and no independent Crabbox publisher is configured or approved.
-If GitHub publication is unavailable or fails, retain the verified bundle and
-fail closed without claiming durable publication. GitHub releases/prereleases
-and release assets are product-release controlled and must never be used as a
-fallback; S3, R2, Cloudflare, brokers, `uploads.sh`, and other backends are
-also outside this lane.
-
-The host validator computes the archive's exact bytes and SHA-256 and derives
-cleanup from a fresh zero-match `crabbox list --json` check for the named lease;
-caller-supplied `cleanup: PASS` is not accepted as evidence.
+Real Mac capture remains the authority for Crate UI evidence. The Crate Ops
+workflow may validate already-captured, already-inspected sanitized media, but
+it cannot capture or simulate the macOS app. A GitHub PR user attachment is the
+sole durable publication destination and is public disclosure; never use a
+release asset or alternate backend for visual proof. If collection or
+publication is unavailable, retain the verified local bundle, report the exact
+blocker, and fail closed.
 
 ## Runner Evidence Format
 Use this format in reports, loop state, PR notes, or handoffs:
@@ -315,18 +265,18 @@ git diff --check
 ### full-nongui-suite
 Use before high-risk non-GUI PRs or release-gate readiness. It is the full safe runner-compatible command list.
 
-## Crabbox Guidance
-- Use the reviewed `.crabbox.yaml` and `.agents/skills/crabbox/SKILL.md`; do not
-  regenerate them with `crabbox init` or `--force`.
-- Do not override the local `apple-vm` provider, start paid capacity, or
-  register a GitHub self-hosted runner without explicit approval.
-- Never warm speculatively. Reuse one approved lease serially, record its ID,
-  and stop it before handoff.
-- Treat Crabbox as a non-GUI runner unless the schema and environment explicitly prove otherwise.
-- Keep release/sign/notarize/deploy jobs on the Mac mini signed release environment.
-- Do not assume remote runners have private QA folders, Keychain entries, Apple Developer credentials, signing identities, installed creative apps, or GUI automation.
-- Store Crabbox run ids and logs/evidence locations in runner evidence and `/handoff state`.
-- If a remote runner fails because dependencies or fixtures are unavailable, classify it as an environment limitation before changing product code.
+## Crate Ops Guidance
+- Route operational collection and validation to the separately reviewed Crate
+  Ops crate-crabbox workflow.
+- Treat any remote runner as non-GUI unless its separately reviewed ownership
+  and environment prove otherwise.
+- Keep release/sign/notarize/deploy jobs on the Mac mini signed release
+  environment and installed-app GUI QA in the Jenna lane.
+- Do not assume a remote runner has private QA folders, Keychain entries, Apple
+  Developer credentials, signing identities, installed creative apps, or GUI
+  automation.
+- If a remote runner fails because dependencies or fixtures are unavailable,
+  classify it as an environment limitation before changing product code.
 
 ## Stop Gates
 Stop immediately for:
@@ -343,7 +293,7 @@ Stop immediately for:
 - failed runner commands that cannot be safely resolved inside scope
 - scope expands beyond loop goal
 - missing or unreviewed Crabbox schema/config drift
-- absent durable Crabbox artifact URL or ambiguous lease cleanup
+- absent durable visual-proof publication or ambiguous remote-runner ownership
 
 ## Relationship To Existing Playbooks
 Use this playbook with:
@@ -364,7 +314,7 @@ When another playbook has stricter gates, the stricter gate wins.
 - Evidence is captured in the runner evidence format.
 - Failures are classified as product, test, environment, or scope issues.
 - Stop gates are honored.
-- `.crabbox.yaml` matches the reviewed schema and provider/cost gates.
+- Any operational collection path remains owned and reviewed outside Crate App.
 - Final report includes files changed, commands run, evidence, risks, and whether Bryant can proceed.
 
 ## Report Format

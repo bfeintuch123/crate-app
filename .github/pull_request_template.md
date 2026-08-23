@@ -6,13 +6,21 @@
 
 <!-- List the exact commands, suites, or manual checks that passed. -->
 
-<!-- For stateful or static impact, replace every placeholder below and put the exact Durable artifact URL alone after the final field so GitHub renders it. -->
+<!--
+For UI changes, complete every field below and add the reviewed, sanitized
+GitHub user-attachment URL on its own line after the final field. Evidence must
+be current for the exact candidate commit. Collection and artifact preparation
+may be performed through the separately reviewed Crate Ops workflow; publication
+and privacy review remain explicit, human-reviewed steps.
+For UI impact none, provide a specific rationale and use "not applicable" for
+the remaining evidence fields.
+-->
 
 ## Visual Evidence
 
 - UI impact: stateful | static | none
 - Candidate commit: <full 40-character PR-head SHA>
-- Rationale: <required when UI impact is none; otherwise not applicable>
+- Rationale: <specific reason when UI impact is none; otherwise not applicable>
 - Scenario: <workflow demonstrated; not applicable only when UI impact is none>
 - Expected: <expected visible behavior; not applicable only when UI impact is none>
 - Observed: <observed visible behavior; not applicable only when UI impact is none>
@@ -24,10 +32,15 @@
 - Media type: video/mp4 | video/webm | image/png | not applicable
 - Media bytes: <exact bytes; not applicable only when UI impact is none>
 - Media SHA-256: <hash; not applicable only when UI impact is none>
-- Collection path: local | crabbox-artifact | not applicable
-- Crabbox collection: not-used | provider=apple-vm; lease=<lease-id>; run=<run-id>; archive=<archive>; archive-bytes=<bytes>; archive-sha256=<hash>; cleanup=PASS | not applicable
 - Durable artifact URL: <GitHub user-attachment URL; not applicable only when UI impact is none>
+
+<!--
+For stateful or static impact, the attachment must be inspected, sanitized,
+privacy-reviewed, and tied to the exact candidate commit. Do not commit proof
+media or use an alternate public host.
+-->
 
 ## Risks
 
-<!-- Summarize residual risk and explicitly note watcher, package, parser, Figma, release, or dependency impact when relevant. -->
+<!-- Summarize residual risk and note watcher, package, parser, Figma, release,
+or dependency impact when relevant. -->

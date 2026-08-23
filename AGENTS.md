@@ -173,10 +173,10 @@ Attachment and storage requirements:
 - Bind the sanitized filename in the upload request and verify byte size and
   SHA-256 from destination readback before calling the attachment complete;
   GitHub's returned asset URL does not expose the original filename.
-- `.codex/tools/publish_visual_evidence.js` uploads the media and writes the
-  owner-only JSON evidence record. It does not comment on or otherwise mutate a
-  pull request; adding the verified bare URL to a PR is a separate authorized
-  action.
+- A GitHub PR user attachment is the sole durable publication destination for
+  visual proof. Treat the public attachment and returned CDN URL as public
+  disclosure, and add the verified bare URL only through the separately
+  authorized PR workflow.
 
 Every affected PR must include this evidence block, once per materially changed
 workflow when one capture cannot prove all changed states:
@@ -198,60 +198,22 @@ workflow when one capture cannot prove all changed states:
 - Media type: video/mp4 | video/webm | image/png | not applicable
 - Media bytes: <exact bytes; not applicable only when UI impact is none>
 - Media SHA-256: <hash; not applicable only when UI impact is none>
-- Collection path: local | crabbox-artifact | not applicable
-- Crabbox collection: not-used | provider=apple-vm; lease=<lease-id>; run=<run-id>; archive=<archive>; archive-bytes=<bytes>; archive-sha256=<hash>; cleanup=PASS | not applicable
 - Durable artifact URL: <GitHub user-attachment URL; not applicable only when UI impact is none>
 
 <bare GitHub user-attachment URL; omit only when UI impact is none>
 ```
 
-The base-controlled `PR visual evidence` check validates this block on every
-non-draft pull request after its workflow and verifier have landed on the base
-branch. It runs from `pull_request_target`, checks out only the exact base SHA,
-never executes PR code, and reads back the public attachment to confirm its
-media signature, byte size, and SHA-256. For `stateful` and `static` impact, all
-media fields and the matching bare GitHub attachment URL are required. For
-`none`, the candidate commit and a substantive rationale are required and every
-media field must be exactly `not applicable`. Autoreview must independently
-confirm that `none` is an honest classification; body text cannot prove that a
-change lacks visible impact. Editing the pull-request body reruns the check;
-pushing a new head commit invalidates the previous candidate binding until the
-evidence is recaptured or reclassified.
+Operational collection and validation are owned by the separately reviewed
+Crate Ops crate-crabbox workflow. Real Mac capture remains the authority for
+Crate UI proof; no runner implementation, configuration, publisher, or
+automated visual-enforcement workflow belongs in Crate App. If collection is
+unavailable or fails, retain the verified local bundle, report the exact
+blocker, and fail closed.
 
-The bootstrap PR that first adds this check cannot enforce itself. It requires
-the protected source-security suite and a fresh independent Autoreview. After
-that bootstrap PR merges, registering `PR visual evidence` as a required branch
-check is a separate GitHub-governance gate. Until both steps complete, do not
-claim automated enforcement is active.
-
-Crabbox fallback:
-- The reviewed Crate Crabbox configuration is Tier B non-GUI infrastructure.
-  Its `visual-artifact-collect` job may validate and retrieve an
-  already-captured, already-inspected, sanitized video and manifest using
-  v0.45.0 `artifactGlobs` and `requiredArtifacts`.
-- The approved contract makes a GitHub PR user attachment the sole durable
-  publication destination. The credential-free local `apple-vm` backend
-  provides isolated Crabbox collection, integrity validation, and fail-closed
-  local preservation; it does not produce a durable off-host URL. A local
-  archive path is never a durable URL, and no independent Crabbox publisher is
-  configured or approved in this lane.
-- Crabbox must not capture, simulate, or claim visual verification of the
-  macOS app; the real Mac surface remains the authority for UI proof.
-- Record the Crabbox provider, lease ID, run ID, local collection archive,
-  manifest hash, durable URL when one is actually available, and verified
-  cleanup. Never forward GitHub, Apple, Keychain, tester, or other
-  credentials into the lease for proof publication.
-- The public PR block's Crabbox collection fields are supplemental provenance,
-  not a trusted receipt. Autoreview must inspect the owner-only collection and
-  visual-review receipts and bind them to the public attachment; the base
-  workflow intentionally cannot access or publish those private receipts.
-- Do not create or reuse a GitHub release, tag, prerelease, or release asset for
-  visual proof. Do not add S3, R2, Cloudflare, a broker, `uploads.sh`, or another
-  account/backend in this lane.
-- If GitHub attachment publication is unavailable or fails, or Crabbox
-  collection/validation fails, retain the verified local bundle, report the
-  exact blocker, and fail closed. Never claim durable publication and never
-  fall back to an unapproved host or backend.
+Do not create or reuse a GitHub release, tag, prerelease, release asset, S3,
+R2, Cloudflare, broker, or other alternate host for visual proof. The Crate Ops
+workflow may validate already-captured, already-inspected sanitized media, but
+it cannot capture or simulate the macOS app or replace real Mac QA.
 
 Autoreview and merge readiness must inspect the actual media, confirm it covers
 the material changed flow, check the privacy boundary, and reject missing,
