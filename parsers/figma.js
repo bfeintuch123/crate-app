@@ -567,7 +567,7 @@ class FigmaParser extends BaseParser {
    * Make an authenticated request to the Figma API.
    * @private
    */
-  async _fetchAPI(endpoint, token, apiBudget = null) {
+  async _fetchAPI(endpoint, token, apiBudget = null, options = {}) {
     assertFigmaScanNotRateLimited(apiBudget, endpoint);
     const url = `${FIGMA_API_BASE}${endpoint}`;
     try {
@@ -575,6 +575,7 @@ class FigmaParser extends BaseParser {
         fetchImpl: fetch,
         url,
         headers: { 'X-Figma-Token': token },
+        signal: options && options.signal,
         timeoutMs: FIGMA_NETWORK_LIMITS.requestTimeoutMs,
         maxBytes: FIGMA_NETWORK_LIMITS.apiResponseBytes,
         budget: apiBudget || createByteBudget(
@@ -1227,7 +1228,7 @@ class FigmaParser extends BaseParser {
    * @param {{scopeMode?: string, requestedPageId?: string|null, requestedNodeId?: string|null}} scopeEntry
    * @returns {Promise<{valid: boolean, reason?: string, retryAfterMs?: number|null, scope?: Object}>}
    */
-  async validateTrackedFileScope(fileKey, scopeEntry = null) {
+  async validateTrackedFileScope(fileKey, scopeEntry = null, options = {}) {
     try {
       const token = await this.getStoredToken();
       if (!token) return { valid: false, reason: 'not-connected' };
@@ -1243,7 +1244,12 @@ class FigmaParser extends BaseParser {
       const scopeQuery = requestedScopeId
         ? `?ids=${encodeURIComponent(requestedScopeId)}&depth=1`
         : '?depth=1';
-      const fileData = await this._fetchAPI(`/files/${fileKey}${scopeQuery}`, token, apiBudget);
+      const fileData = await this._fetchAPI(
+        `/files/${fileKey}${scopeQuery}`,
+        token,
+        apiBudget,
+        { signal: options && options.signal }
+      );
       const scope = this._resolveScopeRoot(fileData && fileData.document, scopeEntry);
       const safeScope = {
         scopeMode: scope.scopeMode,

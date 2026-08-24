@@ -166,6 +166,7 @@ async function fetchBufferWithLimits({
   fetchImpl,
   url,
   headers = undefined,
+  signal = undefined,
   timeoutMs = FIGMA_NETWORK_LIMITS.requestTimeoutMs,
   maxBytes,
   budget = null,
@@ -182,6 +183,23 @@ async function fetchBufferWithLimits({
   const controller = new AbortController();
   let activeResponse = null;
   let timeoutId;
+  const abortFromCaller = () => {
+    controller.abort();
+    destroyResponseBody(activeResponse);
+  };
+
+  if (signal != null) {
+    if (
+      typeof signal !== 'object' ||
+      typeof signal.addEventListener !== 'function' ||
+      typeof signal.removeEventListener !== 'function' ||
+      typeof signal.aborted !== 'boolean'
+    ) {
+      throw new TypeError('Figma abort signal is invalid.');
+    }
+    if (signal.aborted) abortFromCaller();
+    else signal.addEventListener('abort', abortFromCaller, { once: true });
+  }
 
   const operation = (async () => {
     let currentUrl = assertHttpsUrl(url);
@@ -241,6 +259,7 @@ async function fetchBufferWithLimits({
     throw new FigmaNetworkError('request-failed');
   } finally {
     clearTimeout(timeoutId);
+    if (signal != null) signal.removeEventListener('abort', abortFromCaller);
   }
 }
 

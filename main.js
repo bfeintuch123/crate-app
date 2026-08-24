@@ -2267,6 +2267,7 @@ const FIGMA_LINK_PREFLIGHT_TIMEOUT_MS = 12_000;
 const FIGMA_CONNECTION_STATUS_REASON = 'figma-connection-invalid';
 const FIGMA_CONNECTION_WARNING = 'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.';
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
+const figmaLinkValidationInFlight = new Map();
 
 function getProjectFigmaScopeMode(project) {
   const projectMode = project && project.figmaScopeMode;
@@ -2426,14 +2427,34 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
   for (const candidate of figmaTrackedFileKeyDetails(locator)) {
     const remainingMs = deadlineAt - Date.now();
     if (remainingMs <= 0) return { success: false, error: 'figma_verification_failed' };
+    const validationKey = JSON.stringify([
+      candidate.key,
+      effectiveScopeMode,
+      locator.requestedPageId || null,
+      locator.requestedNodeId || null,
+    ]);
+    if (figmaLinkValidationInFlight.has(validationKey)) {
+      return { success: false, error: 'figma_verification_failed' };
+    }
+    const controller = new AbortController();
     let timeoutId = null;
     const timeoutResult = { valid: false, reason: 'timeout' };
-    const validationPromise = parser.validateTrackedFileScope(candidate.key, {
-      key: candidate.key,
-      scopeMode: effectiveScopeMode,
-      requestedPageId: locator.requestedPageId || null,
-      requestedNodeId: locator.requestedNodeId || null,
+    let validationPromise = Promise.resolve(parser.validateTrackedFileScope(
+      candidate.key,
+      {
+        key: candidate.key,
+        scopeMode: effectiveScopeMode,
+        requestedPageId: locator.requestedPageId || null,
+        requestedNodeId: locator.requestedNodeId || null,
+      },
+      { signal: controller.signal }
+    )).catch(() => ({ valid: false, reason: 'request-failed' }));
+    validationPromise = validationPromise.finally(() => {
+      if (figmaLinkValidationInFlight.get(validationKey) === validationPromise) {
+        figmaLinkValidationInFlight.delete(validationKey);
+      }
     });
+    figmaLinkValidationInFlight.set(validationKey, validationPromise);
     let validation = null;
     try {
       validation = await Promise.race([
@@ -2448,6 +2469,7 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
       if (timeoutId) clearTimeout(timeoutId);
     }
     if (Date.now() >= deadlineAt || validation === timeoutResult) {
+      controller.abort();
       return { success: false, error: 'figma_verification_failed' };
     }
     if (validation && validation.valid) {
@@ -2467,6 +2489,18 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
   }
 
   return { success: false, error: finalError };
+}
+
+async function preflightProjectFigmaConnection(project) {
+  const trackedFiles = normalizeTrackedFigmaFiles((project && project.figmaTrackedFiles) || []);
+  const scopeMode = getProjectFigmaScopeMode(project);
+  const preflights = [];
+  for (const trackedFile of trackedFiles) {
+    const preflight = await preflightTrackedFigmaLocator(trackedFile, scopeMode);
+    if (!preflight.success) return { success: false, error: preflight.error };
+    preflights.push(preflight);
+  }
+  return { success: true, preflights };
 }
 
 function figmaLocatorMatches(left, right) {
@@ -2691,7 +2725,7 @@ function markProjectFigmaConnectionUnavailable(projectId) {
   }, { persistIfChanged: true, trustResultChanged: true });
 }
 
-function clearProjectFigmaConnectionUnavailable(projectId) {
+function clearProjectFigmaConnectionUnavailable(projectId, verifiedPreflights = []) {
   return mutateProject(projectId, (project) => {
     const session = project.figmaSession;
     if (!session || !Array.isArray(session.trackedFiles)) return null;
@@ -2708,9 +2742,19 @@ function clearProjectFigmaConnectionUnavailable(projectId) {
         trackedFile.statusReason !== FIGMA_CONNECTION_STATUS_REASON &&
         trackedFile.warning !== FIGMA_CONNECTION_WARNING
       ) continue;
-      const replacement = rebuilt.trackedFiles[index];
-      if (!replacement) continue;
-      for (const field of ['lockStatus', 'lockedPageId', 'lockedPageName', 'statusReason', 'warning']) {
+      const rebuiltReplacement = rebuilt.trackedFiles[index];
+      const verified = verifiedPreflights[index] || null;
+      if (!rebuiltReplacement || !verified || !verified.scope) continue;
+      const replacement = {
+        ...rebuiltReplacement,
+        ...(verified.resolvedKey ? { resolvedKey: verified.resolvedKey } : {}),
+        lockStatus: verified.scope.lockStatus,
+        lockedPageId: verified.scope.lockedPageId,
+        lockedPageName: verified.scope.lockedPageName,
+        statusReason: verified.scope.statusReason,
+        warning: null,
+      };
+      for (const field of ['resolvedKey', 'lockStatus', 'lockedPageId', 'lockedPageName', 'statusReason', 'warning']) {
         if (trackedFile[field] === replacement[field]) continue;
         trackedFile[field] = replacement[field];
         changed = true;
@@ -17539,7 +17583,15 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
   // Start Figma polling for any currently watching projects
   const projects = getProjects();
   for (const project of projects) {
-    const warningCleared = clearProjectFigmaConnectionUnavailable(project.id);
+    if (!projectHasFigmaTrackedFiles(project)) continue;
+    const preflight = await preflightProjectFigmaConnection(project);
+    if (!preflight.success) {
+      const warningUpdate = markProjectFigmaConnectionUnavailable(project.id);
+      if (warningUpdate) sendToRenderer('project:updated', { projectId: project.id });
+      stopFigmaPolling(project.id);
+      continue;
+    }
+    const warningCleared = clearProjectFigmaConnectionUnavailable(project.id, preflight.preflights);
     if (warningCleared) sendToRenderer('project:updated', { projectId: project.id });
     if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
       const activationToken = getActiveWatchingActivationToken(project.id);
