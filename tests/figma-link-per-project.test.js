@@ -387,6 +387,8 @@ setStub('node-fetch', () => (...args) => fetchHandler(...args));
 const { FigmaParser: RealFigmaParser } = require('../parsers/figma');
 let storedFigmaToken = null;
 let nextFigmaTokenVerification = { valid: true };
+let nextFigmaLinkValidation = null;
+let figmaLinkValidationCalls = [];
 let nextFigmaStoreResult = true;
 let nextFigmaScanResult = null;
 let nextFigmaScanError = null;
@@ -408,6 +410,29 @@ class TestFigmaParser extends RealFigmaParser {
 
   async verifyTokenCandidate() {
     return { ...nextFigmaTokenVerification };
+  }
+
+  async validateTrackedFileScope(fileKey, scopeEntry) {
+    figmaLinkValidationCalls.push({ fileKey, scopeEntry: JSON.parse(JSON.stringify(scopeEntry || null)) });
+    if (typeof nextFigmaLinkValidation === 'function') {
+      return await nextFigmaLinkValidation(fileKey, scopeEntry);
+    }
+    if (Array.isArray(nextFigmaLinkValidation)) {
+      const next = nextFigmaLinkValidation.shift();
+      if (next) return JSON.parse(JSON.stringify(next));
+    } else if (nextFigmaLinkValidation) {
+      return JSON.parse(JSON.stringify(nextFigmaLinkValidation));
+    }
+    return {
+      valid: true,
+      scope: {
+        scopeMode: scopeEntry && scopeEntry.scopeMode === 'entire-file' ? 'entire-file' : 'current-page',
+        lockStatus: scopeEntry && scopeEntry.scopeMode === 'entire-file' ? 'entire-file' : 'locked',
+        lockedPageId: (scopeEntry && (scopeEntry.requestedPageId || scopeEntry.requestedNodeId)) || null,
+        lockedPageName: 'Verified Page',
+        statusReason: null,
+      },
+    };
   }
 
   async deleteToken() {
@@ -557,6 +582,8 @@ async function cleanupProjectsAndTimers() {
   remainingProjectsReadFailures = 0;
   storedFigmaToken = null;
   nextFigmaTokenVerification = { valid: true };
+  nextFigmaLinkValidation = null;
+  figmaLinkValidationCalls = [];
   nextFigmaStoreResult = true;
   nextFigmaScanResult = null;
   nextFigmaScanError = null;
@@ -1497,6 +1524,160 @@ test('projects:create rejects an invalid Figma URL', async () => {
   assert.ok(!projects.some(p => p.name === 'Phase2-create-invalid-url'));
 });
 
+for (const [reason, expectedError] of [
+  ['not-connected', 'figma_not_connected'],
+  ['invalid-token', 'figma_invalid_token'],
+  ['access-denied', 'figma_file_unavailable'],
+  ['file-not-found', 'figma_file_unavailable'],
+  ['rate-limited', 'figma_rate_limited'],
+  ['timeout', 'figma_verification_failed'],
+]) {
+  test(`projects:create rejects Figma preflight ${reason} without persisting a project`, async () => {
+    nextFigmaLinkValidation = { valid: false, reason };
+    const before = await callIpc('projects:get-all');
+    const result = await callIpc(
+      'projects:create',
+      `Figma preflight ${reason}`,
+      'branding',
+      'current-page',
+      'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+    );
+
+    assert.deepEqual(result, { error: expectedError });
+    assert.deepEqual(await callIpc('projects:get-all'), before);
+  });
+}
+
+test('projects:create bounds a slow Figma preflight and never persists after a late success', async () => {
+  let releaseValidation;
+  nextFigmaLinkValidation = () => new Promise(resolve => { releaseValidation = resolve; });
+  const before = await callIpc('projects:get-all');
+  const previousSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, delay, ...args) => originalSetTimeout(
+    callback,
+    delay === 12_000 ? 5 : delay,
+    ...args
+  );
+  try {
+    const result = await callIpc(
+      'projects:create',
+      'Figma stalled preflight',
+      'branding',
+      'current-page',
+      'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+    );
+    assert.deepEqual(result, { error: 'figma_verification_failed' });
+    assert.deepEqual(await callIpc('projects:get-all'), before);
+    releaseValidation({
+      valid: true,
+      scope: {
+        scopeMode: 'current-page',
+        lockStatus: 'locked',
+        lockedPageId: '1:1',
+        lockedPageName: 'Late Page',
+        statusReason: null,
+      },
+    });
+    await new Promise(resolve => originalSetTimeout(resolve, 20));
+    assert.deepEqual(await callIpc('projects:get-all'), before);
+  } finally {
+    global.setTimeout = previousSetTimeout;
+  }
+});
+
+test('projects:create can retry cleanly after a transient Figma preflight failure', async () => {
+  nextFigmaLinkValidation = { valid: false, reason: 'timeout' };
+  const failed = await callIpc(
+    'projects:create',
+    'Figma transient retry',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  assert.deepEqual(failed, { error: 'figma_verification_failed' });
+  assert.equal((await callIpc('projects:get-all')).length, 0);
+
+  nextFigmaLinkValidation = { valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Verified Page',
+    statusReason: null,
+  } };
+  const created = await callIpc(
+    'projects:create',
+    'Figma transient retry',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  assert.ok(created && created.id);
+  assert.equal((await callIpc('projects:get-all')).length, 1);
+});
+
+test('projects:create contains an unexpected Figma preflight rejection without persisting', async () => {
+  nextFigmaLinkValidation = async () => {
+    throw new Error('SHOULD_NOT_APPEAR_PRIVATE_PREFLIGHT_DETAIL');
+  };
+  const before = await callIpc('projects:get-all');
+  const result = await callIpc(
+    'projects:create',
+    'Figma rejected preflight',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+
+  assert.deepEqual(result, { error: 'figma_verification_failed' });
+  assert.deepEqual(await callIpc('projects:get-all'), before);
+  assert.equal(JSON.stringify(result).includes('SHOULD_NOT_APPEAR_PRIVATE_PREFLIGHT_DETAIL'), false);
+});
+
+test('projects:create accepts a verified fallback key without widening Current Page scope', async () => {
+  nextFigmaLinkValidation = [
+    { valid: false, reason: 'file-not-found' },
+    {
+      valid: true,
+      scope: {
+        scopeMode: 'current-page',
+        lockStatus: 'locked',
+        lockedPageId: '2:1',
+        lockedPageName: 'Verified Page',
+        statusReason: null,
+      },
+    },
+  ];
+  const project = await callIpc(
+    'projects:create',
+    'Figma verified fallback',
+    'branding',
+    'current-page',
+    'https://www.figma.com/proto/PrototypeKey/Preview?node-id=2-1&file-key=CanonicalKey'
+  );
+
+  assert.ok(project && project.id);
+  assert.deepEqual(figmaLinkValidationCalls.map(call => call.fileKey), ['CanonicalKey', 'PrototypeKey']);
+  assert.deepEqual(figmaLinkValidationCalls.map(call => call.scopeEntry.scopeMode), ['current-page', 'current-page']);
+});
+
+test('projects:create stops candidate validation on the first Figma rate limit', async () => {
+  nextFigmaLinkValidation = [
+    { valid: false, reason: 'rate-limited', retryAfterMs: 30_000 },
+    { valid: true, scope: { scopeMode: 'current-page', lockStatus: 'locked', lockedPageId: '2:1' } },
+  ];
+  const result = await callIpc(
+    'projects:create',
+    'Figma rate-limited candidates',
+    'branding',
+    'current-page',
+    'https://www.figma.com/proto/PrototypeKey/Preview?node-id=2-1&file-key=CanonicalKey'
+  );
+
+  assert.deepEqual(result, { error: 'figma_rate_limited' });
+  assert.deepEqual(figmaLinkValidationCalls.map(call => call.fileKey), ['CanonicalKey']);
+  assert.equal((await callIpc('projects:get-all')).length, 0);
+});
+
 test('starting or resuming a project atomically pauses the previous watcher and preserves both projects', async () => {
   const first = await callIpc(
     'projects:create',
@@ -1541,7 +1722,7 @@ test('projects:set-figma-link preserves the link when replacement URL is empty',
     'Phase2-clear-link',
     'branding',
     'current-page',
-    'https://www.figma.com/file/CLEARME/My-File'
+    'https://www.figma.com/file/CLEARME/My-File?page-id=1%3A1'
   );
   assert.equal(project.figmaTrackedFiles.length, 1);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
@@ -1561,6 +1742,23 @@ test('projects:set-figma-link preserves the link when replacement URL is empty',
   assert.equal(fresh.figmaSession.trackedFiles.length, 1);
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'entire-file');
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+});
+
+test('projects:set-figma-link rejects a failed preflight without replacing project state', async () => {
+  const project = await callIpc('projects:create', 'Figma edit preflight');
+  const before = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  nextFigmaLinkValidation = { valid: false, reason: 'invalid-token' };
+
+  const result = await callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1',
+    scopeMode: 'current-page',
+  });
+
+  assert.deepEqual(result, { success: false, error: 'figma_invalid_token' });
+  const after = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(after.figmaTrackedFiles, before.figmaTrackedFiles);
+  assert.deepEqual(after.figmaSession, before.figmaSession);
 });
 
 test('projects:set-figma-link removes the link only through an explicit action', async () => {
@@ -1597,6 +1795,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   assert.equal(project.figmaTrackedFiles.length, 0);
   assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
 
+  storedFigmaToken = 'test-token';
   const newUrl = 'https://www.figma.com/file/REBUILD9/Rebuilt-File?page-id=2%3A2';
   const result = await callIpc('projects:set-figma-link', project.id, {
     action: 'replace',
@@ -1618,7 +1817,7 @@ test('projects:set-figma-link rebuilds figmaSession from the new url', async () 
   // Phase 1 page-lock behavior must still be applied to the per-project URL.
   assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'locked');
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '2:2');
-  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+  await waitForActiveFigmaPollerCount(activePollersBefore + 1);
 });
 
 test('legacy persisted Figma URLs migrate without reconnecting or losing page scope', async () => {
@@ -2044,6 +2243,75 @@ test('figma:connect keeps the working token when secure storage is unavailable',
   assert.equal(storedFigmaToken, 'WORKING_TOKEN_VALUE');
 });
 
+test('a valid-at-creation Figma link records a persistent warning if the connection later becomes invalid', async () => {
+  const activePollersBefore = await getActiveFigmaPollerCount();
+  storedFigmaToken = 'initially-valid-token';
+  nextFigmaScanResult = {
+    files: [],
+    assets: [],
+    errors: [{ type: 'auth', message: 'Figma token invalid or not set' }],
+    warnings: [],
+    scopeEntries: [],
+    candidateDiagnostics: {
+      metadataFailureReasonCounts: { 'invalid-token': 1 },
+      fileFetchFailureReasonCounts: {},
+    },
+  };
+
+  const project = await callIpc(
+    'projects:create',
+    'Figma expires after creation',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  assert.ok(project && project.id);
+
+  await waitForCondition(() => {
+    const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
+    return !!(stored && stored.figmaSession && stored.figmaSession.sessionWarnings.includes(
+      'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.'
+    ));
+  }, 'expired connection should become a persistent project warning');
+
+  const warned = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(warned.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
+  assert.equal(warned.figmaSession.trackedFiles[0].statusReason, 'figma-connection-invalid');
+  assert.equal(warned.files.length, 0);
+  assert.equal(await getActiveFigmaPollerCount(), activePollersBefore);
+  assert.equal(rendererMessages.some(message => message.channel === 'figma:auth-error'), true);
+
+  await callIpc('projects:pause', project.id);
+  nextFigmaScanResult = figmaScanResult([], []);
+  const reconnected = await callIpc('figma:connect', 'replacement-valid-token');
+  assert.equal(reconnected.success, true);
+  const recovered = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(recovered.figmaSession.sessionWarnings.includes(
+    'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.'
+  ), false);
+  assert.equal(recovered.figmaSession.trackedFiles[0].lockStatus, 'locked');
+  assert.equal(recovered.figmaSession.trackedFiles[0].statusReason, null);
+});
+
+test('disconnecting Figma preserves linked project state and marks it blocked until reconnect', async () => {
+  storedFigmaToken = 'connected-token';
+  const project = await callIpc(
+    'projects:create',
+    'Figma deliberate disconnect',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1'
+  );
+  await callIpc('projects:pause', project.id);
+
+  const disconnected = await callIpc('figma:disconnect');
+  assert.equal(disconnected.success, true);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG22');
+  assert.equal(fresh.figmaSession.trackedFiles[0].statusReason, 'figma-connection-invalid');
+  assert.match(fresh.figmaSession.warnings[0], /Reconnect in Settings/);
+});
+
 test('figma:status counts linked watching projects separately from active pollers', async () => {
   const project = await callIpc(
     'projects:create',
@@ -2355,41 +2623,19 @@ test('legacy Figma project with invalid figmaScopeMode defaults its session to C
   assert.equal(fresh.figmaSession.trackedFiles[0].lockedPageId, '1:1');
 });
 
-test('Current Page Only without a page-linked URL fails closed at package time', async () => {
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-no-page-'));
-  try {
-    const project = await callIpc(
-      'projects:create',
-      'Figma No Page Lock',
-      'branding',
-      'current-page',
-      'https://www.figma.com/file/FIG22/Brand-Cloud'
-    );
-    const assetPath = path.join(tmpRoot, 'out-of-scope.png');
-    fs.writeFileSync(assetPath, 'out of scope asset');
-    await addFigmaAutoFileToProject(project.id, assetPath, {
-      figmaPageId: '2:2',
-      figmaPageName: 'Other Page',
-    });
+test('Current Page Only without a page-linked URL is rejected before project persistence', async () => {
+  const before = await callIpc('projects:get-all');
+  const result = await callIpc(
+    'projects:create',
+    'Figma No Page Lock',
+    'branding',
+    'current-page',
+    'https://www.figma.com/file/FIG22/Brand-Cloud'
+  );
 
-    const fresh = (await callIpc('projects:get-all')).find(p => p.id === project.id);
-    assert.equal(fresh.figmaSession.scopeMode, 'current-page');
-    assert.equal(fresh.figmaSession.trackedFiles[0].lockStatus, 'unresolved');
-    assert.equal(fresh.figmaSession.trackedFiles[0].statusReason, 'figma-current-page-no-page-or-node-param');
-    assert.match(fresh.figmaSession.trackedFiles[0].warning, /could not find a page or node/i);
-    assert.match(fresh.figmaSession.warnings[0], /No Figma assets will be captured/i);
-
-    const outputDir = path.join(tmpRoot, 'out');
-    const result = await callIpc('projects:package', project.id, outputDir);
-    assert.equal(result.success, true);
-    assert.equal(result.copiedCount, 0);
-    assert.equal(result.embeddedCount, 0);
-    assert.equal(result.totalFiles, 0);
-    assert.deepEqual(result.errors, []);
-    assert.equal(fs.existsSync(path.join(packageFolder(outputDir, 'Figma No Page Lock'), 'out-of-scope.png')), false);
-  } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
-  }
+  assert.deepEqual(result, { error: 'figma_scope_unresolved' });
+  assert.equal(figmaLinkValidationCalls.length, 0, 'missing page context should fail before any Figma request');
+  assert.deepEqual(await callIpc('projects:get-all'), before);
 });
 
 test('explicit Entire File still packages Figma assets from any page', async () => {
@@ -2430,6 +2676,7 @@ test('explicit Entire File still packages Figma assets from any page', async () 
 test('explicit Current Page Only packages only locked-page Figma assets', async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-current-'));
   try {
+    storedFigmaToken = 'test-token';
     const project = await callIpc(
       'projects:create',
       'Figma Explicit Current',

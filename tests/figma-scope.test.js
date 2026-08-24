@@ -139,7 +139,8 @@ class StubFigmaParser extends FigmaParser {
   }
 
   async _fetchAPI(endpoint) {
-    if (endpoint === `/files/${FILE_KEY}`) {
+    this.requestedEndpoints = [...(this.requestedEndpoints || []), endpoint];
+    if (endpoint === `/files/${FILE_KEY}` || endpoint.startsWith(`/files/${FILE_KEY}?`)) {
       return { document: DOCUMENT_FIXTURE };
     }
     if (endpoint === `/files/${FILE_KEY}/images`) {
@@ -266,6 +267,84 @@ test('Retry-After parsing accepts bounded integer seconds only', () => {
   assert.equal(parseFigmaRetryAfterMs('Wed, 21 Oct 2030 07:28:00 GMT'), null);
   assert.equal(parseFigmaRetryAfterMs('999999999999999999999999'), null);
   assert.equal(parseFigmaRetryAfterMs(String(60 * 60 * 24 * 365)), 31 * 24 * 60 * 60 * 1000);
+});
+
+test('tracked-link preflight verifies file access and locks Current Page without asset discovery', async () => {
+  const parser = new StubFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: '1:1',
+    requestedNodeId: null,
+  });
+
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.scope, {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    statusReason: null,
+  });
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=1%3A1&depth=1`]);
+});
+
+test('tracked-link preflight resolves a selected node to its enclosing page', async () => {
+  const parser = new StubFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: null,
+    requestedNodeId: '2:1',
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.scope.lockedPageId, '1:1');
+  assert.equal(result.scope.lockedPageName, 'Page One');
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=2%3A1&depth=1`]);
+});
+
+test('tracked-link preflight reports an unresolved requested page without fetching assets', async () => {
+  const parser = new StubFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: '9:9',
+    requestedNodeId: null,
+  });
+
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, 'figma-current-page-requested-page-not-found');
+  assert.equal(result.scope.lockStatus, 'unresolved');
+});
+
+test('tracked-link preflight distinguishes a missing connection from a rejected credential', async () => {
+  const disconnected = new class extends StubFigmaParser {
+    async getStoredToken() { return null; }
+  }();
+  assert.deepEqual(
+    await disconnected.validateTrackedFileScope(FILE_KEY, { scopeMode: 'entire-file' }),
+    { valid: false, reason: 'not-connected' }
+  );
+
+  const rejected = new class extends StubFigmaParser {
+    async _fetchAPI() {
+      const error = new Error('safe rejection');
+      error._crateFigmaApiStatus = 401;
+      throw error;
+    }
+  }();
+  assert.deepEqual(
+    await rejected.validateTrackedFileScope(FILE_KEY, { scopeMode: 'entire-file' }),
+    { valid: false, reason: 'invalid-token', retryAfterMs: null }
+  );
+
+  const unavailableCredentialStore = new class extends StubFigmaParser {
+    async getStoredToken() {
+      throw new Error('SHOULD_NOT_APPEAR_PRIVATE_CREDENTIAL_DETAIL');
+    }
+  }();
+  assert.deepEqual(
+    await unavailableCredentialStore.validateTrackedFileScope(FILE_KEY, { scopeMode: 'entire-file' }),
+    { valid: false, reason: 'request-failed', retryAfterMs: null }
+  );
 });
 
 test('metadata rate limiting skips the depth fallback request', async () => {

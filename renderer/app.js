@@ -90,6 +90,27 @@ function isValidFigmaUrl(url) {
   ));
 }
 
+function getFigmaLinkErrorMessage(error) {
+  switch (error) {
+    case 'invalid_figma_url':
+      return 'Crate could not read that Figma URL. Please double-check and try again.';
+    case 'figma_not_connected':
+      return 'Connect Figma in Settings before linking a Figma file.';
+    case 'figma_invalid_token':
+      return 'Your Figma connection is no longer valid. Reconnect in Settings, then try again.';
+    case 'figma_rate_limited':
+      return 'Figma is temporarily limiting requests. Wait for the cooldown, then try again.';
+    case 'figma_file_unavailable':
+      return 'Crate could not access that Figma file. Check the link and file permissions, then try again.';
+    case 'figma_scope_unresolved':
+      return 'Current Page Only needs a link to the exact Figma page or selected layer. Open it in Figma, copy that URL, and try again.';
+    case 'figma_verification_failed':
+      return 'Crate could not verify that Figma link. Check your connection and try again.';
+    default:
+      return '';
+  }
+}
+
 function sanitizeRendererLogText(value) {
   let text = '';
   if (value instanceof Error) {
@@ -593,7 +614,8 @@ async function createProject() {
 
     const hasTypedError = !!result && typeof result.error === 'string';
     const typedError = hasTypedError ? result.error : null;
-    const knownNonPersistingError = typedError === 'invalid_figma_url' || typedError === 'max_projects_reached';
+    const figmaLinkErrorMessage = getFigmaLinkErrorMessage(typedError);
+    const knownNonPersistingError = typedError === 'max_projects_reached' || !!figmaLinkErrorMessage;
     if (!hasTypedError && result && result.id) {
       try {
         const projects = await window.crate.getProjects();
@@ -605,8 +627,8 @@ async function createProject() {
       return;
     }
 
-    if (typedError === 'invalid_figma_url' && figmaError) {
-      figmaError.textContent = 'Crate could not read that Figma URL. Please double-check and try again.';
+    if (figmaLinkErrorMessage && figmaError) {
+      figmaError.textContent = figmaLinkErrorMessage;
       figmaError.classList.remove('hidden');
       setProjectCreationStatus(figmaError.textContent);
     } else if (typedError === 'max_projects_reached') {
@@ -765,10 +787,13 @@ function renderFigmaWarningCard(container, warning, retryAt = null) {
   const safeMessage = sanitizeRendererLogText(message);
   const lowerMessage = message.toLowerCase();
   const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
-  const title = isRateLimited ? 'Figma rate limiting' : 'File cannot be read';
+  const isConnectionUnavailable = lowerMessage.includes('not connected') || lowerMessage.includes('reconnect in settings');
+  const title = isRateLimited
+    ? 'Figma rate limiting'
+    : (isConnectionUnavailable ? 'Figma connection required' : 'File cannot be read');
   const action = isRateLimited
     ? (formatFigmaRetryTime(retryAt) || 'Crate will retry after Figma allows the request.')
-    : 'Reconnect Figma or check file access.';
+    : (isConnectionUnavailable ? 'Reconnect Figma in Settings.' : 'Reconnect Figma or check file access.');
 
   container.classList.remove('hidden');
 
@@ -3168,9 +3193,7 @@ async function persistFigmaLinkEdit(payload, successMessage) {
 
   if (!result || !result.success) {
     if (errorEl) {
-      errorEl.textContent = result && result.error === 'invalid_figma_url'
-        ? 'Crate could not read that Figma URL. Please double-check and try again.'
-        : 'Failed to save Figma link.';
+      errorEl.textContent = getFigmaLinkErrorMessage(result && result.error) || 'Failed to save Figma link.';
       errorEl.style.display = 'block';
     }
     return false;

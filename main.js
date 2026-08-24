@@ -2263,6 +2263,9 @@ function pruneExcludedAutoCapturedFiles(project) {
 const FIGMA_SCOPE_CURRENT_PAGE = 'current-page';
 const FIGMA_SCOPE_ENTIRE_FILE = 'entire-file';
 const FIGMA_MAX_RATE_LIMIT_BACKOFF_MS = 31 * 24 * 60 * 60 * 1000;
+const FIGMA_LINK_PREFLIGHT_TIMEOUT_MS = 12_000;
+const FIGMA_CONNECTION_STATUS_REASON = 'figma-connection-invalid';
+const FIGMA_CONNECTION_WARNING = 'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.';
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
 
 function getProjectFigmaScopeMode(project) {
@@ -2385,6 +2388,85 @@ function createTrackedFigmaLocator(rawUrl) {
   const fileKey = FigmaParser.extractFileKey(trimmedUrl);
   if (!fileKey) return null;
   return normalizeTrackedFigmaFiles([{ key: fileKey, url: trimmedUrl }])[0] || null;
+}
+
+function figmaLinkPreflightErrorForReason(reason) {
+  if (reason === 'not-connected') return 'figma_not_connected';
+  if (reason === 'invalid-token') return 'figma_invalid_token';
+  if (reason === 'rate-limited') return 'figma_rate_limited';
+  if (reason === 'access-denied' || reason === 'file-not-found') return 'figma_file_unavailable';
+  if (
+    reason === 'figma-current-page-no-page-or-node-param' ||
+    reason === 'figma-current-page-requested-page-not-found' ||
+    reason === 'figma-current-page-requested-node-not-found'
+  ) {
+    return 'figma_scope_unresolved';
+  }
+  return 'figma_verification_failed';
+}
+
+async function preflightTrackedFigmaLocator(locator, scopeMode) {
+  if (!locator) return { success: false, error: 'invalid_figma_url' };
+  const effectiveScopeMode = VALID_FIGMA_SCOPE_MODES.has(scopeMode)
+    ? scopeMode
+    : FIGMA_SCOPE_CURRENT_PAGE;
+  if (
+    effectiveScopeMode === FIGMA_SCOPE_CURRENT_PAGE &&
+    !locator.requestedPageId &&
+    !locator.requestedNodeId
+  ) {
+    return { success: false, error: 'figma_scope_unresolved' };
+  }
+
+  const { FigmaParser } = require('./parsers/figma');
+  const parser = new FigmaParser();
+  let finalError = 'figma_verification_failed';
+  const deadlineAt = Date.now() + FIGMA_LINK_PREFLIGHT_TIMEOUT_MS;
+
+  for (const candidate of figmaTrackedFileKeyDetails(locator)) {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) return { success: false, error: 'figma_verification_failed' };
+    let timeoutId = null;
+    const timeoutResult = { valid: false, reason: 'timeout' };
+    const validationPromise = parser.validateTrackedFileScope(candidate.key, {
+      key: candidate.key,
+      scopeMode: effectiveScopeMode,
+      requestedPageId: locator.requestedPageId || null,
+      requestedNodeId: locator.requestedNodeId || null,
+    });
+    let validation = null;
+    try {
+      validation = await Promise.race([
+        validationPromise,
+        new Promise(resolve => {
+          timeoutId = setTimeout(() => resolve(timeoutResult), remainingMs);
+        }),
+      ]);
+    } catch (_) {
+      validation = { valid: false, reason: 'request-failed' };
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+    if (Date.now() >= deadlineAt || validation === timeoutResult) {
+      return { success: false, error: 'figma_verification_failed' };
+    }
+    if (validation && validation.valid) {
+      return {
+        success: true,
+        resolvedKey: candidate.key,
+        scope: validation.scope || null,
+      };
+    }
+
+    const error = figmaLinkPreflightErrorForReason(validation && validation.reason);
+    if (error === 'figma_not_connected' || error === 'figma_invalid_token' || error === 'figma_rate_limited') {
+      return { success: false, error };
+    }
+    if (error === 'figma_scope_unresolved') finalError = error;
+    else if (error === 'figma_file_unavailable' && finalError === 'figma_verification_failed') finalError = error;
+  }
+
+  return { success: false, error: finalError };
 }
 
 function figmaLocatorMatches(left, right) {
@@ -2571,6 +2653,76 @@ function rebuildFigmaSessionWarnings(session) {
   }
 
   return warnings;
+}
+
+function markProjectFigmaConnectionUnavailable(projectId) {
+  ensureProjectFigmaSession(projectId);
+  return mutateProject(projectId, (project) => {
+    const session = project.figmaSession;
+    if (!session || !Array.isArray(session.trackedFiles)) return null;
+    let changed = false;
+    if (!Array.isArray(session.sessionWarnings)) session.sessionWarnings = [];
+    if (!session.sessionWarnings.includes(FIGMA_CONNECTION_WARNING)) {
+      session.sessionWarnings.push(FIGMA_CONNECTION_WARNING);
+      changed = true;
+    }
+    for (const trackedFile of session.trackedFiles) {
+      if (trackedFile.scopeMode === FIGMA_SCOPE_CURRENT_PAGE && trackedFile.lockStatus !== 'unresolved') {
+        trackedFile.lockStatus = 'unresolved';
+        trackedFile.lockedPageId = null;
+        trackedFile.lockedPageName = null;
+        changed = true;
+      }
+      if (trackedFile.statusReason !== FIGMA_CONNECTION_STATUS_REASON) {
+        trackedFile.statusReason = FIGMA_CONNECTION_STATUS_REASON;
+        changed = true;
+      }
+      if (trackedFile.warning !== FIGMA_CONNECTION_WARNING) {
+        trackedFile.warning = FIGMA_CONNECTION_WARNING;
+        changed = true;
+      }
+    }
+    const warnings = rebuildFigmaSessionWarnings(session);
+    if (JSON.stringify(session.warnings || []) !== JSON.stringify(warnings)) {
+      session.warnings = warnings;
+      changed = true;
+    }
+    return changed ? { changed: true, figmaSession: session } : null;
+  }, { persistIfChanged: true, trustResultChanged: true });
+}
+
+function clearProjectFigmaConnectionUnavailable(projectId) {
+  return mutateProject(projectId, (project) => {
+    const session = project.figmaSession;
+    if (!session || !Array.isArray(session.trackedFiles)) return null;
+    const rebuilt = buildFigmaSessionSnapshot(project);
+    let changed = false;
+    const nextSessionWarnings = (session.sessionWarnings || []).filter(warning => warning !== FIGMA_CONNECTION_WARNING);
+    if (JSON.stringify(session.sessionWarnings || []) !== JSON.stringify(nextSessionWarnings)) {
+      session.sessionWarnings = nextSessionWarnings;
+      changed = true;
+    }
+    for (let index = 0; index < session.trackedFiles.length; index++) {
+      const trackedFile = session.trackedFiles[index];
+      if (
+        trackedFile.statusReason !== FIGMA_CONNECTION_STATUS_REASON &&
+        trackedFile.warning !== FIGMA_CONNECTION_WARNING
+      ) continue;
+      const replacement = rebuilt.trackedFiles[index];
+      if (!replacement) continue;
+      for (const field of ['lockStatus', 'lockedPageId', 'lockedPageName', 'statusReason', 'warning']) {
+        if (trackedFile[field] === replacement[field]) continue;
+        trackedFile[field] = replacement[field];
+        changed = true;
+      }
+    }
+    const warnings = rebuildFigmaSessionWarnings(session);
+    if (JSON.stringify(session.warnings || []) !== JSON.stringify(warnings)) {
+      session.warnings = warnings;
+      changed = true;
+    }
+    return changed ? { changed: true, figmaSession: session } : null;
+  }, { persistIfChanged: true, trustResultChanged: true });
 }
 
 function buildFigmaSessionSnapshot(project, _settings = {}) {
@@ -4238,6 +4390,17 @@ function summarizeFigmaErrorsForLog(errors) {
     .map(error => redactFigmaLogText(error));
 }
 
+function hasFigmaAuthError(errors) {
+  return (Array.isArray(errors) ? errors : [errors]).some(error => {
+    const type = error && typeof error === 'object' ? error.type : '';
+    const message = typeof error === 'string' ? error : ((error && error.message) || '');
+    const lower = String(message).toLowerCase();
+    return type === 'auth' || lower.includes('401') || lower.includes('unauthorized') ||
+      lower.includes('token invalid') || lower.includes('invalid figma api token') ||
+      lower.includes('personal access token');
+  });
+}
+
 function summarizeFigmaCandidateDiagnosticsForLog(diagnostics) {
   if (!diagnostics || typeof diagnostics !== 'object') return null;
   const safeCounts = (value) => {
@@ -4284,6 +4447,14 @@ function hasFigmaRateLimitDiagnostic(diagnostics) {
   const fileFetchReasons = diagnostics.fileFetchFailureReasonCounts || {};
   return Number(metadataReasons['rate-limited'] || 0) > 0 ||
     Number(fileFetchReasons['rate-limited'] || 0) > 0;
+}
+
+function hasFigmaInvalidTokenDiagnostic(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return false;
+  const metadataReasons = diagnostics.metadataFailureReasonCounts || {};
+  const fileFetchReasons = diagnostics.fileFetchFailureReasonCounts || {};
+  return Number(metadataReasons['invalid-token'] || 0) > 0 ||
+    Number(fileFetchReasons['invalid-token'] || 0) > 0;
 }
 
 function figmaRateLimitWarning() {
@@ -8538,6 +8709,9 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
   }
   if (!token) {
     stopFigmaPolling(projectId);
+    const warningUpdate = markProjectFigmaConnectionUnavailable(projectId);
+    if (warningUpdate) sendToRenderer('project:updated', { projectId });
+    sendToRenderer('figma:auth-error', { projectId, error: 'Figma is not connected — reconnect in Settings' });
     return { skipped: true, reason: 'not-connected' }; // Figma not connected
   }
 
@@ -8619,29 +8793,20 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
     if (scanResult.errors.length > 0) {
       console.warn('[crate][figma] Scan errors:', summarizeFigmaErrorsForLog(scanResult.errors));
       // Detect token expiry / auth failures — stop polling instead of retrying every 60s
-      const hasInvalidTokenDiagnostic = !!(
-        candidateDiagnostics &&
-        (
-          Number(candidateDiagnostics.metadataFailureReasonCounts && candidateDiagnostics.metadataFailureReasonCounts['invalid-token']) > 0 ||
-          Number(candidateDiagnostics.fileFetchFailureReasonCounts && candidateDiagnostics.fileFetchFailureReasonCounts['invalid-token']) > 0
-        )
-      );
-      const authError = scanResult.errors.find(e => {
-        const msg = typeof e === 'string' ? e : (e && e.message) || '';
-        const type = (e && e.type) || '';
-        const lower = msg.toLowerCase();
-        return type === 'auth' || msg.includes('401') ||
-               lower.includes('unauthorized') ||
-               lower.includes('token invalid') ||
-               lower.includes('invalid figma api token') ||
-               lower.includes('personal access token');
-      });
-      if (authError || hasInvalidTokenDiagnostic) {
+      const hasInvalidTokenDiagnostic = hasFigmaInvalidTokenDiagnostic(candidateDiagnostics);
+      if (hasFigmaAuthError(scanResult.errors) || hasInvalidTokenDiagnostic) {
         console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
         stopFigmaPolling(projectId);
+        const warningUpdate = markProjectFigmaConnectionUnavailable(projectId);
+        if (warningUpdate) sendToRenderer('project:updated', { projectId });
         // Notify renderer about auth failure
         sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
-        return { projectId, error: 'Figma token expired or invalid — reconnect in Settings' };
+        return {
+          skipped: true,
+          reason: 'auth-failed',
+          projectId,
+          error: 'Figma token expired or invalid — reconnect in Settings'
+        };
       }
     }
 
@@ -8763,7 +8928,10 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
     if (msg.includes('401') || msg.includes('unauthorized') || msg.includes('token invalid') || msg.includes('invalid figma api token') || msg.includes('personal access token')) {
       console.error('[crate][figma] Token appears expired or revoked — stopping Figma polling for project', projectId);
       stopFigmaPolling(projectId);
+      const warningUpdate = markProjectFigmaConnectionUnavailable(projectId);
+      if (warningUpdate) sendToRenderer('project:updated', { projectId });
       sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
+      return { skipped: true, reason: 'auth-failed', projectId, error: safeError };
     }
     return { projectId, error: safeError };
   } finally {
@@ -8805,7 +8973,7 @@ async function startFigmaPolling(projectId, activationToken = null) {
     }
   }
 
-  if (initialResult && initialResult.reason === 'not-connected') {
+  if (initialResult && (initialResult.reason === 'not-connected' || initialResult.reason === 'auth-failed')) {
     return;
   }
 
@@ -12831,12 +12999,17 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
 
     const cleanedName = (name || '').trim() || 'Untitled Project';
 
+    const scopeMode = VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode)
+      ? figmaScopeMode
+      : FIGMA_SCOPE_CURRENT_PAGE;
     let figmaTrackedFiles = [];
     if (typeof figmaUrl === 'string' && figmaUrl.trim()) {
       const locator = createTrackedFigmaLocator(figmaUrl);
       if (!locator) {
         return { error: 'invalid_figma_url' };
       }
+      const preflight = await preflightTrackedFigmaLocator(locator, scopeMode);
+      if (!preflight.success) return { error: preflight.error };
       figmaTrackedFiles = [locator];
     }
 
@@ -12844,7 +13017,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
       id: crypto.randomUUID(),
       name: cleanedName,
       type: projectType,
-      figmaScopeMode: VALID_FIGMA_SCOPE_MODES.has(figmaScopeMode) ? figmaScopeMode : FIGMA_SCOPE_CURRENT_PAGE,
+      figmaScopeMode: scopeMode,
       figmaTrackedFiles,
       status: 'paused',
       files: [],
@@ -12893,6 +13066,11 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
       return { success: false, error: 'invalid_figma_url' };
     }
     figmaTrackedFiles = [locator];
+  }
+
+  if (action !== 'remove' && figmaTrackedFiles.length > 0) {
+    const preflight = await preflightTrackedFigmaLocator(figmaTrackedFiles[0], scopeMode);
+    if (!preflight.success) return { success: false, error: preflight.error };
   }
 
   const settings = store.get('settings') || {};
@@ -13893,6 +14071,15 @@ end tell`;
 
         if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
           console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
+        }
+
+        if (
+          hasFigmaAuthError(figmaScanResult.errors) ||
+          hasFigmaInvalidTokenDiagnostic(candidateDiagnostics)
+        ) {
+          const warningUpdate = markProjectFigmaConnectionUnavailable(projectId);
+          if (warningUpdate) sendToRenderer('project:updated', { projectId });
+          sendToRenderer('figma:auth-error', { projectId, error: 'Figma token expired or invalid — reconnect in Settings' });
         }
 
         if (isRateLimited) {
@@ -17352,6 +17539,8 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
   // Start Figma polling for any currently watching projects
   const projects = getProjects();
   for (const project of projects) {
+    const warningCleared = clearProjectFigmaConnectionUnavailable(project.id);
+    if (warningCleared) sendToRenderer('project:updated', { projectId: project.id });
     if (project.status === 'watching' && projectHasFigmaTrackedFiles(project) && !figmaPollers.has(project.id)) {
       const activationToken = getActiveWatchingActivationToken(project.id);
       if (activationToken !== null) startFigmaPolling(project.id, activationToken);
@@ -17376,6 +17565,12 @@ registerTrustedIpcHandler('figma:disconnect', async () => {
   figmaManualScanInFlight.clear();
   figmaScanTimestamps.clear();
   figmaRateLimitBackoffs.clear();
+
+  for (const project of getProjects()) {
+    if (!projectHasFigmaTrackedFiles(project)) continue;
+    const warningUpdate = markProjectFigmaConnectionUnavailable(project.id);
+    if (warningUpdate) sendToRenderer('project:updated', { projectId: project.id });
+  }
 
   return { success: deleted };
 });
