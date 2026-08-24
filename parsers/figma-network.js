@@ -23,6 +23,36 @@ const SAFE_MESSAGES = Object.freeze({
   timeout: 'Figma transfer timed out.',
 });
 
+const trackedOperationBySignal = new WeakMap();
+
+function trackFigmaNetworkOperation(signal) {
+  if (!signal || typeof signal !== 'object') return Promise.resolve();
+  let resolveSettlement;
+  const settlement = new Promise(resolve => { resolveSettlement = resolve; });
+  trackedOperationBySignal.set(signal, {
+    started: false,
+    resolveSettlement,
+  });
+  return settlement;
+}
+
+function finalizeFigmaNetworkOperationTracking(signal) {
+  const tracker = signal && typeof signal === 'object'
+    ? trackedOperationBySignal.get(signal)
+    : null;
+  if (!tracker || tracker.started) return;
+  tracker.resolveSettlement();
+  trackedOperationBySignal.delete(signal);
+}
+
+function settleTrackedFigmaNetworkOperation(signal, tracker) {
+  if (!tracker) return;
+  tracker.resolveSettlement();
+  if (trackedOperationBySignal.get(signal) === tracker) {
+    trackedOperationBySignal.delete(signal);
+  }
+}
+
 class FigmaNetworkError extends Error {
   constructor(reason) {
     super(SAFE_MESSAGES[reason] || 'Figma transfer failed.');
@@ -183,9 +213,19 @@ async function fetchBufferWithLimits({
   const controller = new AbortController();
   let activeResponse = null;
   let timeoutId;
+  let callerAbortReject = null;
+  const callerAbort = signal == null
+    ? null
+    : new Promise((_, reject) => {
+      callerAbortReject = () => reject(new FigmaNetworkError('timeout'));
+    });
   const abortFromCaller = () => {
     controller.abort();
     destroyResponseBody(activeResponse);
+    if (callerAbortReject) {
+      callerAbortReject();
+      callerAbortReject = null;
+    }
   };
 
   if (signal != null) {
@@ -200,6 +240,9 @@ async function fetchBufferWithLimits({
     if (signal.aborted) abortFromCaller();
     else signal.addEventListener('abort', abortFromCaller, { once: true });
   }
+
+  const operationTracker = signal == null ? null : trackedOperationBySignal.get(signal);
+  if (operationTracker) operationTracker.started = true;
 
   const operation = (async () => {
     let currentUrl = assertHttpsUrl(url);
@@ -242,6 +285,12 @@ async function fetchBufferWithLimits({
       return { response, buffer };
     }
   })();
+  if (operationTracker) {
+    operation.then(
+      () => settleTrackedFigmaNetworkOperation(signal, operationTracker),
+      () => settleTrackedFigmaNetworkOperation(signal, operationTracker)
+    );
+  }
 
   const timeout = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
@@ -252,13 +301,16 @@ async function fetchBufferWithLimits({
   });
 
   try {
-    return await Promise.race([operation, timeout]);
+    const races = [operation, timeout];
+    if (callerAbort) races.push(callerAbort);
+    return await Promise.race(races);
   } catch (error) {
     if (error && error._crateFigmaNetworkSafe) throw error;
     if (error && error.name === 'AbortError') throw new FigmaNetworkError('timeout');
     throw new FigmaNetworkError('request-failed');
   } finally {
     clearTimeout(timeoutId);
+    callerAbortReject = null;
     if (signal != null) signal.removeEventListener('abort', abortFromCaller);
   }
 }
@@ -267,5 +319,7 @@ module.exports = {
   FIGMA_NETWORK_LIMITS,
   FigmaNetworkError,
   createByteBudget,
+  finalizeFigmaNetworkOperationTracking,
   fetchBufferWithLimits,
+  trackFigmaNetworkOperation,
 };

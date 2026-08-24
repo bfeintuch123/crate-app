@@ -2268,6 +2268,7 @@ const FIGMA_CONNECTION_STATUS_REASON = 'figma-connection-invalid';
 const FIGMA_CONNECTION_WARNING = 'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.';
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
 const figmaLinkValidationInFlight = new Map();
+const figmaLinkValidationOccupancy = new Map();
 
 function getProjectFigmaScopeMode(project) {
   const projectMode = project && project.figmaScopeMode;
@@ -2420,6 +2421,10 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
   }
 
   const { FigmaParser } = require('./parsers/figma');
+  const {
+    finalizeFigmaNetworkOperationTracking,
+    trackFigmaNetworkOperation,
+  } = require('./parsers/figma-network');
   const parser = new FigmaParser();
   let finalError = 'figma_verification_failed';
   const deadlineAt = Date.now() + FIGMA_LINK_PREFLIGHT_TIMEOUT_MS;
@@ -2433,13 +2438,34 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
       locator.requestedPageId || null,
       locator.requestedNodeId || null,
     ]);
-    if (figmaLinkValidationInFlight.has(validationKey)) {
+    if (
+      figmaLinkValidationInFlight.has(validationKey) ||
+      figmaLinkValidationOccupancy.has(validationKey)
+    ) {
       return { success: false, error: 'figma_verification_failed' };
     }
     const controller = new AbortController();
+    const underlyingSettlement = trackFigmaNetworkOperation(controller.signal);
+    const occupancy = {
+      underlyingSettled: false,
+      validationSettled: false,
+    };
+    const clearOccupancyIfSettled = () => {
+      if (
+        occupancy.underlyingSettled &&
+        occupancy.validationSettled &&
+        figmaLinkValidationOccupancy.get(validationKey) === occupancy
+      ) {
+        figmaLinkValidationOccupancy.delete(validationKey);
+      }
+    };
+    underlyingSettlement.then(() => {
+      occupancy.underlyingSettled = true;
+      clearOccupancyIfSettled();
+    });
     let timeoutId = null;
     const timeoutResult = { valid: false, reason: 'timeout' };
-    let validationPromise = Promise.resolve(parser.validateTrackedFileScope(
+    let validationPromise = Promise.resolve().then(() => parser.validateTrackedFileScope(
       candidate.key,
       {
         key: candidate.key,
@@ -2450,10 +2476,14 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
       { signal: controller.signal }
     )).catch(() => ({ valid: false, reason: 'request-failed' }));
     validationPromise = validationPromise.finally(() => {
+      finalizeFigmaNetworkOperationTracking(controller.signal);
+      occupancy.validationSettled = true;
+      clearOccupancyIfSettled();
       if (figmaLinkValidationInFlight.get(validationKey) === validationPromise) {
         figmaLinkValidationInFlight.delete(validationKey);
       }
     });
+    figmaLinkValidationOccupancy.set(validationKey, occupancy);
     figmaLinkValidationInFlight.set(validationKey, validationPromise);
     let validation = null;
     try {
@@ -2470,6 +2500,9 @@ async function preflightTrackedFigmaLocator(locator, scopeMode) {
     }
     if (Date.now() >= deadlineAt || validation === timeoutResult) {
       controller.abort();
+      if (figmaLinkValidationInFlight.get(validationKey) === validationPromise) {
+        figmaLinkValidationInFlight.delete(validationKey);
+      }
       return { success: false, error: 'figma_verification_failed' };
     }
     if (validation && validation.valid) {
@@ -6561,6 +6594,23 @@ function safePackageReviewDiagnosticInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function isValidFigmaCurrentPagePackageScope(trackedFile, scopeEntry) {
+  if (!trackedFile || !scopeEntry) return false;
+  if (scopeEntry.scopeMode !== FIGMA_SCOPE_CURRENT_PAGE) return false;
+  if (scopeEntry.fileFetchStatus !== 'success' || scopeEntry.assetFetchStatus === 'failed') return false;
+  if (scopeEntry.lockStatus !== 'locked') return false;
+
+  const resolvedPageId = normalizeStoredFigmaScopeId(scopeEntry.lockedPageId);
+  if (!resolvedPageId) return false;
+
+  // Node-scoped links resolve to their enclosing page; the persisted
+  // lockedPageId is the validated identity that package-time scope can compare.
+  const explicitPageIds = [trackedFile.requestedPageId, trackedFile.lockedPageId]
+    .map(normalizeStoredFigmaScopeId)
+    .filter(Boolean);
+  return explicitPageIds.every(pageId => pageId === resolvedPageId);
+}
+
 function createPackageReviewDiagnosticEvidence(details = {}) {
   const diagnostics = {};
   if (PACKAGE_REVIEW_DIAGNOSTIC_PHASES.has(details.failurePhase)) {
@@ -6602,8 +6652,14 @@ function didFigmaPrePackageScanSucceed(scanResult, rawTrackedFiles) {
     return scopeEntries.some((entry) => {
       if (!entry || entry.fileFetchStatus !== 'success' || entry.assetFetchStatus === 'failed') return false;
       const entryPrimaryKey = typeof entry.primaryKey === 'string' ? entry.primaryKey.trim() : '';
-      if (entryPrimaryKey && primaryKey) return entryPrimaryKey === primaryKey;
-      return typeof entry.fileKey === 'string' && candidateKeys.has(entry.fileKey.trim());
+      const matchesTrackedFile = entryPrimaryKey && primaryKey
+        ? entryPrimaryKey === primaryKey
+        : typeof entry.fileKey === 'string' && candidateKeys.has(entry.fileKey.trim());
+      if (!matchesTrackedFile) return false;
+      if (trackedFile.scopeMode === FIGMA_SCOPE_CURRENT_PAGE) {
+        return isValidFigmaCurrentPagePackageScope(trackedFile, entry);
+      }
+      return true;
     });
   });
 }

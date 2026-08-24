@@ -396,6 +396,7 @@ let lastFigmaScanOptions = null;
 let figmaScanInvocationCount = 0;
 let figmaScanDelayMs = 0;
 let useRealFigmaAutoTrackScan = false;
+let useRealFigmaLinkValidation = false;
 class TestFigmaParser extends RealFigmaParser {
   async getStoredToken() {
     return storedFigmaToken;
@@ -414,6 +415,7 @@ class TestFigmaParser extends RealFigmaParser {
 
   async validateTrackedFileScope(fileKey, scopeEntry, options = {}) {
     figmaLinkValidationCalls.push({ fileKey, scopeEntry: JSON.parse(JSON.stringify(scopeEntry || null)) });
+    if (useRealFigmaLinkValidation) return super.validateTrackedFileScope(fileKey, scopeEntry, options);
     if (typeof nextFigmaLinkValidation === 'function') {
       return await nextFigmaLinkValidation(fileKey, scopeEntry, options);
     }
@@ -591,6 +593,7 @@ async function cleanupProjectsAndTimers() {
   figmaScanInvocationCount = 0;
   figmaScanDelayMs = 0;
   useRealFigmaAutoTrackScan = false;
+  useRealFigmaLinkValidation = false;
   rendererMessages.length = 0;
   fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
   await callIpc('settings:update', 'includeDiagnosticReport', false);
@@ -1637,6 +1640,72 @@ test('projects:create can retry cleanly after a transient Figma preflight failur
   );
   assert.ok(created && created.id);
   assert.equal((await callIpc('projects:get-all')).length, 1);
+});
+
+test('Figma preflight settles on caller abort when fetch ignores AbortSignal and retries without overlap', async () => {
+  const project = await callIpc('projects:create', 'Figma ignored abort preflight');
+  storedFigmaToken = 'test-token';
+  useRealFigmaLinkValidation = true;
+
+  let fetchCalls = 0;
+  let activeFetches = 0;
+  let maxActiveFetches = 0;
+  let startedResolve;
+  let releaseFirstFetch;
+  const firstFetchStarted = new Promise(resolve => { startedResolve = resolve; });
+  const firstFetchReleased = new Promise(resolve => { releaseFirstFetch = resolve; });
+  fetchHandler = async () => {
+    fetchCalls += 1;
+    activeFetches += 1;
+    maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+    if (fetchCalls === 1) {
+      startedResolve();
+      await firstFetchReleased;
+    }
+    activeFetches -= 1;
+    return figmaApiResponse(200, {
+      document: {
+        id: '0:0',
+        type: 'DOCUMENT',
+        children: [{ id: '1:1', type: 'CANVAS', name: 'Verified Page', children: [] }],
+      },
+    });
+  };
+
+  const previousSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, delay, ...args) => originalSetTimeout(
+    callback,
+    delay === 12_000 ? 5 : delay,
+    ...args
+  );
+  const linkRequest = {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1',
+    scopeMode: 'current-page',
+  };
+
+  try {
+    const firstValidation = callIpc('projects:set-figma-link', project.id, linkRequest);
+    await firstFetchStarted;
+
+    assert.deepEqual(await firstValidation, { success: false, error: 'figma_verification_failed' });
+    const immediateRetry = await callIpc('projects:set-figma-link', project.id, linkRequest);
+    assert.deepEqual(immediateRetry, { success: false, error: 'figma_verification_failed' });
+    assert.equal(fetchCalls, 1, 'identical retry must wait for the ignored-abort fetch to settle');
+    assert.equal(activeFetches, 1, 'the first ignored-abort fetch must still be outstanding');
+    assert.equal(maxActiveFetches, 1, 'identical validations must never overlap');
+
+    releaseFirstFetch();
+    await new Promise(resolve => originalSetTimeout(resolve, 0));
+    assert.equal(activeFetches, 0, 'ignored-abort fetch must be released before the clean retry');
+
+    const retry = await callIpc('projects:set-figma-link', project.id, linkRequest);
+    assert.equal(retry.success, true);
+    assert.equal(fetchCalls, 2);
+    assert.equal(maxActiveFetches, 1, 'identical validations must never overlap');
+  } finally {
+    global.setTimeout = previousSetTimeout;
+  }
 });
 
 test('projects:create contains an unexpected Figma preflight rejection without persisting', async () => {
@@ -2754,6 +2823,72 @@ test('legacy persisted unresolved Current Page session remains excluded at packa
   assert.match(packaged.error, /could not securely retrieve all Figma assets/i);
   assert.equal(fs.existsSync(outputDir), false);
   assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBefore);
+});
+
+test('package-time Current Page scope blocks when the Figma file fetch succeeds but page resolution is unresolved', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-package-unresolved-scope-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Unresolved Package Scope');
+    nextFigmaScanResult = figmaScanResult([], [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      scopeMode: 'current-page',
+      lockStatus: 'unresolved',
+      lockedPageId: null,
+      lockedPageName: null,
+      statusReason: 'figma-current-page-requested-page-not-found',
+      fileFetchStatus: 'success',
+      fileFetchFailureReason: null,
+      assetFetchStatus: 'not-attempted',
+    }]);
+
+    const usageBefore = fakeStoreInstance.get('usage.packagesThisMonth');
+    const scan = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const packaged = await callIpc('projects:package', project.id, outputDir);
+    assert.match(packaged.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(fs.existsSync(outputDir), false);
+    assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBefore);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('package-time Current Page scope rejects a validated page that mismatches persisted page identity', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-package-mismatched-scope-'));
+  try {
+    const project = await createLinkedFigmaProject('Figma Mismatched Package Scope');
+    const storedProjects = fakeStoreInstance.get('projects');
+    const storedProject = storedProjects.find(item => item.id === project.id);
+    storedProject.figmaSession.trackedFiles[0].lockedPageId = '1:1';
+    fakeStoreInstance.set('projects', storedProjects);
+    nextFigmaScanResult = figmaScanResult([], [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '2:2',
+      lockedPageName: 'Unexpected Page',
+      statusReason: null,
+      fileFetchStatus: 'success',
+      fileFetchFailureReason: null,
+      assetFetchStatus: 'success',
+    }]);
+
+    const usageBefore = fakeStoreInstance.get('usage.packagesThisMonth');
+    const scan = await callIpc('projects:pre-package-scan', project.id);
+    assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+
+    const outputDir = path.join(tmpRoot, 'out');
+    const packaged = await callIpc('projects:package', project.id, outputDir);
+    assert.match(packaged.error, /could not securely retrieve all Figma assets/i);
+    assert.equal(fs.existsSync(outputDir), false);
+    assert.equal(fakeStoreInstance.get('usage.packagesThisMonth'), usageBefore);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('Current Page Only without a page-linked URL is rejected before project persistence', async () => {
