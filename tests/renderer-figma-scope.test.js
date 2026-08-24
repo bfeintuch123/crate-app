@@ -454,6 +454,19 @@ test('renderer accepts modern Figma URL shapes that the main process parses', ()
   assert.equal(renderer.isValidFigmaUrl('https://example.com/design/Petra_logo-File_123/Petra-Logo?node-id=2-1'), false);
 });
 
+test('Figma link preflight deadline stays below the renderer project-creation boundary', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const rendererSource = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
+  const mainMatch = mainSource.match(/const FIGMA_LINK_PREFLIGHT_TIMEOUT_MS = ([\d_]+);/);
+  const rendererMatch = rendererSource.match(/const PROJECT_CREATION_REQUEST_TIMEOUT_MS = ([\d_]+);/);
+  assert.ok(mainMatch);
+  assert.ok(rendererMatch);
+  const preflightMs = Number(mainMatch[1].replace(/_/g, ''));
+  const creationMs = Number(rendererMatch[1].replace(/_/g, ''));
+  assert.ok(preflightMs > 0);
+  assert.ok(preflightMs < creationMs);
+});
+
 test('Edit Figma Link keeps the saved URL out of the renderer and preserves it when blank', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const calls = [];
@@ -1769,6 +1782,24 @@ test('Figma rate-limit warning card shows the server retry time when available',
   assert.equal(text.includes('Crate will retry after Figma allows the request.'), false);
 });
 
+test('Figma connection warning card distinguishes authentication from file access', () => {
+  const document = createDocumentStub();
+  const renderer = loadRendererHelpers(document);
+  const container = createElementStub();
+  container.ownerDocument = document;
+  container.append = (...children) => children.forEach(child => container.appendChild(child));
+
+  renderer.renderFigmaWarningCard(
+    container,
+    'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.'
+  );
+
+  const text = getElementTreeText(container);
+  assert.equal(text.includes('Figma connection required'), true);
+  assert.equal(text.includes('Reconnect Figma in Settings.'), true);
+  assert.equal(text.includes('File cannot be read'), false);
+});
+
 test('Figma retry copy falls back safely for expired or invalid timestamps', () => {
   const renderer = loadRendererHelpers();
   const warning = 'Figma is temporarily rate limiting this scan.';
@@ -3069,7 +3100,16 @@ test('successful project creation uses the authoritative result when refresh is 
   assert.equal(vm.runInContext('projectCreationPhase', renderer), 'idle');
 });
 
-for (const typedError of ['max_projects_reached', 'invalid_figma_url']) {
+for (const [typedError, figmaMessagePattern] of [
+  ['max_projects_reached', null],
+  ['invalid_figma_url', /could not read that Figma URL/],
+  ['figma_not_connected', /Connect Figma in Settings/],
+  ['figma_invalid_token', /connection is no longer valid/],
+  ['figma_rate_limited', /temporarily limiting requests/],
+  ['figma_file_unavailable', /could not access that Figma file/],
+  ['figma_scope_unresolved', /link to the exact Figma page or selected layer/],
+  ['figma_verification_failed', /could not verify that Figma link/],
+]) {
   test(`known project creation error ${typedError} unlocks the form without selecting a project`, async () => {
     const { document, elements } = createInteractiveRendererDom();
     const renderer = loadRendererHelpers(document, {
@@ -3089,7 +3129,7 @@ for (const typedError of ['max_projects_reached', 'invalid_figma_url']) {
     if (typedError === 'max_projects_reached') {
       assert.equal(elements['toast-message'].textContent, 'Maximum projects reached. Package or delete a project first.');
     } else {
-      assert.match(elements['figma-section-error'].textContent, /could not read that Figma URL/);
+      assert.match(elements['figma-section-error'].textContent, figmaMessagePattern);
     }
   });
 }

@@ -229,6 +229,77 @@ test('bounded Figma fetch times out with a privacy-safe error', async () => {
   );
 });
 
+test('bounded Figma fetch propagates a caller abort without exposing request details', async () => {
+  const controller = new AbortController();
+  let requestSignal = null;
+  let abortObserved = false;
+  const pending = fetchBufferWithLimits({
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      requestSignal = options.signal;
+      options.signal.addEventListener('abort', () => {
+        abortObserved = true;
+        const error = new Error('aborted private Figma request');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }),
+    url: 'https://cdn.figma.test/private.png?token=SHOULD_NOT_LEAK',
+    signal: controller.signal,
+    maxBytes: 16,
+  });
+
+  controller.abort();
+  await assert.rejects(pending, error => {
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.message.includes('SHOULD_NOT_LEAK'), false);
+    assert.equal(error.message.includes('cdn.figma.test'), false);
+    return true;
+  });
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(abortObserved, true);
+});
+
+test('bounded Figma fetch rejects on caller abort even when fetch ignores AbortSignal', async () => {
+  const controller = new AbortController();
+  let requestStarted = false;
+  let requestSignal = null;
+  let stubPromiseSettled = false;
+  const pending = fetchBufferWithLimits({
+    fetchImpl: (_url, options) => {
+      requestStarted = true;
+      requestSignal = options.signal;
+      const stubPromise = new Promise(() => {});
+      stubPromise.then(
+        () => { stubPromiseSettled = true; },
+        () => { stubPromiseSettled = true; }
+      );
+      return stubPromise;
+    },
+    url: 'https://cdn.figma.test/ignored-abort.png',
+    signal: controller.signal,
+    maxBytes: 16,
+    timeoutMs: 1_000,
+  });
+
+  const startedAt = Date.now();
+  while (!requestStarted && Date.now() - startedAt < 100) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(requestStarted, true);
+  assert.ok(requestSignal);
+  assert.notEqual(requestSignal, controller.signal);
+  controller.abort();
+
+  await assert.rejects(pending, error => {
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.message, 'Figma transfer timed out.');
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 500, 'caller abort must settle independently of fetch implementation');
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(stubPromiseSettled, false);
+});
+
 test('bounded Figma fetch destroys an active response body on timeout', async () => {
   const body = new Readable({ read() {} });
   await assert.rejects(

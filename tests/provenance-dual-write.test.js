@@ -1074,6 +1074,52 @@ async function createProject(name = 'Provenance Dual Write') {
   return callIpc('projects:create', name, 'branding', 'current-page', null);
 }
 
+async function createVerifiedFigmaProject(name, scopeMode, url) {
+  const previousFigmaStub = STUBS.get('./parsers/figma');
+  const { FigmaParser } = require('../parsers/figma');
+  class VerifiedFigmaLinkParser extends FigmaParser {
+    async validateTrackedFileScope(fileKey, scopeEntry = {}) {
+      const lockedPageId = scopeEntry.requestedPageId || scopeEntry.requestedNodeId || null;
+      return {
+        valid: true,
+        scope: {
+          scopeMode: scopeEntry.scopeMode,
+          lockStatus: scopeEntry.scopeMode === 'entire-file' ? 'entire-file' : 'locked',
+          lockedPageId,
+          lockedPageName: lockedPageId ? 'Verified test page' : null,
+          statusReason: null,
+        },
+      };
+    }
+
+    async autoTrackScan(project = {}) {
+      return {
+        files: [],
+        assets: [],
+        errors: [],
+        warnings: [],
+        scopeEntries: (project.figmaTrackedFiles || []).map(file => ({
+          fileKey: file.key,
+          primaryKey: file.key,
+          fileFetchStatus: 'success',
+          assetFetchStatus: 'success',
+          lockStatus: project.figmaScopeMode === 'entire-file' ? 'entire-file' : 'locked',
+          lockedPageId: file.requestedPageId || file.requestedNodeId || null,
+          lockedPageName: (file.requestedPageId || file.requestedNodeId) ? 'Verified test page' : null,
+          statusReason: null,
+        })),
+      };
+    }
+  }
+  setStub('./parsers/figma', () => ({ FigmaParser: VerifiedFigmaLinkParser }));
+  try {
+    return await callIpc('projects:create', name, 'branding', scopeMode, url);
+  } finally {
+    if (previousFigmaStub) STUBS.set('./parsers/figma', previousFigmaStub);
+    else STUBS.delete('./parsers/figma');
+  }
+}
+
 async function getProject(projectId) {
   const projects = await callIpc('projects:get-all');
   return projects.find(project => project.id === projectId);
@@ -5205,10 +5251,8 @@ test('staged presentation materializer rejects output bytes that do not equal th
 test('Figma cached source mutation invalidates its reviewed source plan before output', async () => {
   const tmpRoot = makeTempDir();
   try {
-    const project = await callIpc(
-      'projects:create',
+    const project = await createVerifiedFigmaProject(
       'Figma Cached Source Plan',
-      'branding',
       'entire-file',
       'https://www.figma.com/file/SAFEFILEKEY/Cached-Source'
     );
@@ -15399,10 +15443,8 @@ test('unchanged recurring Figma scope reconciliation does not rewrite the projec
   resetTestHomeWorkspace();
   setChildProcessHandler(() => ({ stdout: '' }));
 
-  const project = await callIpc(
-    'projects:create',
+  const project = await createVerifiedFigmaProject(
     'No-op Figma scope reconciliation',
-    'branding',
     'current-page',
     'https://www.figma.com/file/no-op-scope-key/No-Op?page-id=1%3A1'
   );
@@ -17161,10 +17203,8 @@ test('paused linked Figma project preserves pre-package locked-page asset ingest
   resetTestHomeWorkspace();
   setChildProcessHandler(() => ({ stdout: '' }));
   const fileKey = 'paused-prepackage-figma';
-  const project = await callIpc(
-    'projects:create',
+  const project = await createVerifiedFigmaProject(
     'Paused Figma pre-package',
-    'branding',
     'current-page',
     `https://www.figma.com/file/${fileKey}/Paused-File?page-id=1%3A1`
   );

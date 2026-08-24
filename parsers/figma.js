@@ -567,7 +567,7 @@ class FigmaParser extends BaseParser {
    * Make an authenticated request to the Figma API.
    * @private
    */
-  async _fetchAPI(endpoint, token, apiBudget = null) {
+  async _fetchAPI(endpoint, token, apiBudget = null, options = {}) {
     assertFigmaScanNotRateLimited(apiBudget, endpoint);
     const url = `${FIGMA_API_BASE}${endpoint}`;
     try {
@@ -575,6 +575,7 @@ class FigmaParser extends BaseParser {
         fetchImpl: fetch,
         url,
         headers: { 'X-Figma-Token': token },
+        signal: options && options.signal,
         timeoutMs: FIGMA_NETWORK_LIMITS.requestTimeoutMs,
         maxBytes: FIGMA_NETWORK_LIMITS.apiResponseBytes,
         budget: apiBudget || createByteBudget(
@@ -1215,6 +1216,64 @@ class FigmaParser extends BaseParser {
         ? figmaApiFailureReasonFromStatus(error._crateFigmaApiStatus)
         : classifyFigmaParserFailure(error);
       return { valid: false, reason };
+    }
+  }
+
+  /**
+   * Verify that the stored connection can read one explicitly linked Figma
+   * file and, for Current Page Only, resolve the requested page or node.
+   * This deliberately stops before image discovery or asset downloads.
+   *
+   * @param {string} fileKey
+   * @param {{scopeMode?: string, requestedPageId?: string|null, requestedNodeId?: string|null}} scopeEntry
+   * @returns {Promise<{valid: boolean, reason?: string, retryAfterMs?: number|null, scope?: Object}>}
+   */
+  async validateTrackedFileScope(fileKey, scopeEntry = null, options = {}) {
+    try {
+      const token = await this.getStoredToken();
+      if (!token) return { valid: false, reason: 'not-connected' };
+      if (!fetch) return { valid: false, reason: 'request-failed' };
+
+      const apiBudget = createByteBudget(
+        FIGMA_NETWORK_LIMITS.apiOperationBytes,
+        FIGMA_NETWORK_LIMITS.apiOperationTimeoutMs
+      );
+      const requestedPageId = FigmaParser.normalizeNodeId(scopeEntry && scopeEntry.requestedPageId);
+      const requestedNodeId = FigmaParser.normalizeNodeId(scopeEntry && scopeEntry.requestedNodeId);
+      const requestedScopeId = requestedPageId || requestedNodeId;
+      const scopeQuery = requestedScopeId
+        ? `?ids=${encodeURIComponent(requestedScopeId)}&depth=1`
+        : '?depth=1';
+      const fileData = await this._fetchAPI(
+        `/files/${fileKey}${scopeQuery}`,
+        token,
+        apiBudget,
+        { signal: options && options.signal }
+      );
+      const scope = this._resolveScopeRoot(fileData && fileData.document, scopeEntry);
+      const safeScope = {
+        scopeMode: scope.scopeMode,
+        lockStatus: scope.lockStatus,
+        lockedPageId: scope.lockedPageId,
+        lockedPageName: scope.lockedPageName,
+        statusReason: scope.statusReason,
+      };
+
+      if (scope.scopeMode === 'current-page' && scope.lockStatus !== 'locked') {
+        return {
+          valid: false,
+          reason: scope.statusReason || FIGMA_SCOPE_REASONS.FILE_FETCH_FAILED,
+          scope: safeScope,
+        };
+      }
+
+      return { valid: true, scope: safeScope };
+    } catch (error) {
+      return {
+        valid: false,
+        reason: classifyFigmaParserFailure(error),
+        retryAfterMs: getFigmaParserRetryAfterMs(error),
+      };
     }
   }
 
