@@ -1,10 +1,9 @@
 /*
  * Crate UI stability layer
  *
- * Imported by styles.css after styles-base.css so responsive containment can
- * be reviewed and evolved independently from the established visual system.
- * This file changes presentation only; it does not alter project, watcher,
- * Figma, or package behavior.
+ * Loaded after styles.css so responsive containment can evolve independently
+ * from the established visual system. This file changes presentation only; it
+ * does not alter project, watcher, Figma, or package behavior.
  */
 
 :root {
@@ -226,10 +225,12 @@
   overflow-wrap: anywhere;
 }
 
-/* Dialogs remain inside the available window. */
+/* Dialogs remain inside the available window and keep their content reachable. */
 .modal {
   max-width: calc(100vw - 32px);
   max-height: calc(100vh - 32px);
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .modal-body,
@@ -387,7 +388,8 @@
   }
 }
 
-/* Neutralize fixed-width rules inherited at the legacy narrow breakpoint. */
+/* Neutralize fixed-width rules inherited at the legacy narrow breakpoint and
+   keep its top navigation usable while the current 720px minimum remains. */
 @media (max-width: 760px) {
   #tab-current-project.active,
   #tab-settings.active,
@@ -396,9 +398,45 @@
     min-width: 0;
   }
 
-  .tab-content,
+  .app-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "brand"
+      "primary"
+      "support";
+  }
+
+  .app-tabs,
+  .app-tabs-secondary {
+    flex-wrap: wrap;
+  }
+
+  .app-tab {
+    flex: 1 1 120px;
+    min-width: 0;
+    justify-content: center;
+  }
+
+  .app-main {
+    min-height: 0;
+    padding: 12px;
+  }
+
+  .tab-content {
+    max-width: 100%;
+    padding: 18px 14px;
+  }
+
   #files-view {
     max-width: 100%;
+  }
+
+  #projects-list,
+  #files-view,
+  #new-project-form,
+  .settings-section,
+  .v2-quick-package {
+    padding: 16px;
   }
 
   .package-review-ready {
