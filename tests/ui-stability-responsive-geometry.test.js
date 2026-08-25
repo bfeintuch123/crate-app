@@ -9,6 +9,7 @@ const { spawnSync } = require('child_process');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const stylesHref = new URL(`file://${path.join(rendererDir, 'styles.css')}`).href;
+const stabilityStylesHref = new URL(`file://${path.join(rendererDir, 'ui-stability.css')}`).href;
 const viewports = [
   [1440, 900],
   [1200, 800],
@@ -49,6 +50,7 @@ function fixtureHtml() {
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="${stylesHref}">
+  <link rel="stylesheet" href="${stabilityStylesHref}">
 </head>
 <body>
   <div id="app">
