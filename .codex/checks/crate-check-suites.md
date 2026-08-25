@@ -143,6 +143,49 @@ node --test tests/psd-embedded-safety.test.js
 git diff --check
 ```
 
+## ui-stability-responsive-geometry
+
+Use when changes affect Crate window resizing, responsive layout, Review Assets containment, control wrapping, asset-card density, modal sizing, UI state preservation during resize, or the supported minimum-window contract.
+
+Source and focused checks:
+
+```sh
+node --check tests/ui-stability-fixture.js
+node --check tests/ui-stability-preload.js
+node --check tests/ui-stability-electron-harness.js
+node --check tests/ui-stability-responsive-geometry.test.js
+node --test tests/ui-stability-fixture.test.js
+node --test tests/ui-stability-harness-contract.test.js
+node --test tests/ui-stability-responsive.test.js
+node --test tests/ui-stability-responsive-geometry.test.js
+node --test tests/renderer-figma-scope.test.js
+node --test tests/main-window-lifecycle.test.js
+git diff --check
+```
+
+The dependency-free browser geometry test may report an intentional environment skip when Chrome or Chromium is unavailable. That skip does not satisfy the Mac proof gate.
+
+Exact-head macOS evidence gate, using a dependency-complete approved worktree and an owner-only private evidence directory:
+
+```sh
+CRATE_UI_SHOW=1 \
+CRATE_UI_EVIDENCE_DIR=<approved-private-evidence-directory> \
+./node_modules/.bin/electron tests/ui-stability-electron-harness.js \
+  > <approved-private-evidence-directory>/geometry-report.json
+```
+
+The exact-head Mac gate must use synthetic data and confirm:
+
+- root, app shell, Current Project, files view, and Review Assets have no horizontal overflow;
+- sidebar/content, heading/search, summary/actions, cards, and footer do not intersect;
+- the responsive card-density modes remain readable;
+- search and active-filter state survive resizing;
+- resize alone triggers no project, workspace, or preview requests;
+- screenshots and the complete resize video are inspected and pass privacy review;
+- the minimum BrowserWindow decision follows measured usability rather than concealing broken geometry.
+
+Any UI-affecting commit after evidence capture makes that evidence stale.
+
 ## release-gate-readonly
 
 Use before any internal QA release mutation.
