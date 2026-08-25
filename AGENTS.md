@@ -127,99 +127,29 @@ Before merge:
 
 ## Visual PR Evidence
 
-Every pull request that changes user-visible Crate UI state or interaction must
-include a short sanitized video demonstrating the affected behavior from a real
-running Crate candidate at the exact PR head. This includes navigation, forms,
-dialogs, settings, loading/error/empty states, Package Review, package progress
-or completion, window behavior, relaunch behavior, and `main.js` or `preload.js`
-changes that alter a visible user flow. Purely static layout, styling,
-typography, or spacing changes may use inspected before/after screenshots when
-a video would add no meaningful evidence. A PR with no visible UI effect must
-say why in its evidence section.
+UI-changing Crate PRs require sanitized, inspected visual evidence from a real
+running Crate candidate at the exact PR head. Use a short video for stateful
+flows; purely static layout, styling, typography, or spacing changes may use
+inspected before/after screenshots when video adds no meaningful value. A PR
+with no visible UI effect must say why.
 
-Capture and review requirements:
-- Use only synthetic or explicitly approved test-safe fixtures.
-- Show the action, state transition, and resulting state; do not use a still
-  frame or a launch-only clip as proof of an interactive flow.
-- Capture only Crate and the minimum approved Finder surface. Exclude customer
-  work, tester projects, private filenames or paths, Figma links, credentials,
-  notifications, unrelated apps, and desktop content.
-- Disable or remove audio unless audio is the behavior under test.
-- The acting agent must open and inspect the complete capture before treating
-  it as proof. Uninspected media is not verification.
-- Bind the evidence to the full PR-head commit, scenario, expected result,
-  observed result, sanitized filename, byte size, SHA-256, media type, capture
-  environment, and privacy-review result. Any later UI-affecting commit makes
-  earlier evidence stale and requires recapture.
-- PR-level visual proof does not replace signed, notarized, installed-app QA at
-  the release gate.
+Use only synthetic or explicitly approved test-safe fixtures. Capture only
+Crate and the minimum approved Finder surface; exclude customer or tester work,
+private filenames or paths, Figma links, credentials, notifications, unrelated
+apps, and desktop content. Disable audio unless it is the behavior under test.
+Any later UI-affecting commit makes earlier evidence stale and requires
+recapture.
 
-Attachment and storage requirements:
-- `bfeintuch123/crate-app` is public. Treat every GitHub user attachment and
-  returned CDN URL as public disclosure; repository visibility is not a privacy
-  control. Upload only inspected proof that is safe for anyone to access. Put a
-  returned video URL on its own line so GitHub renders the player.
-- Use MP4/H.264 with a broadly compatible pixel format when the approved local
-  recorder/transcoder can produce it; WebM is acceptable when it plays back in
-  GitHub and the evidence record names the format.
-- Never commit proof media or a `.github/pr-assets` directory to a product
-  branch. Keep temporary captures in an approved private evidence directory.
-- Never print, log, persist, or place `gh auth token` in command arguments. Use
-  only a reviewed token-safe uploader; if none is available, stop for the
-  approved attachment path instead of improvising credential handling.
-- The uploader requires an owner-only `crate.visual-review.v1` receipt binding
-  inspection and privacy PASS to the exact sanitized name, MIME type, byte
-  count, and SHA-256. Caller-supplied PASS flags are not review evidence.
-- Bind the sanitized filename in the upload request and verify byte size and
-  SHA-256 from destination readback before calling the attachment complete;
-  GitHub's returned asset URL does not expose the original filename.
-- A GitHub PR user attachment is the sole durable publication destination for
-  visual proof. Treat the public attachment and returned CDN URL as public
-  disclosure, and add the verified bare URL only through the separately
-  authorized PR workflow.
+Use the approved Crate Ops visual-evidence workflow for capture, validation,
+receipt handling, and publication. Prefer a verified GitHub
+attachment. If publication fails, retain the Crate Ops/Crabbox validation
+receipt and exact sanitized media metadata/hash, document the infrastructure
+blocker, and obtain Bryant's explicit exception; a durable public URL is
+preferred but is not mandatory under that exception. Never commit proof media
+or `.github/pr-assets` to a product branch.
 
-Every affected PR must include this evidence block, once per materially changed
-workflow when one capture cannot prove all changed states:
-
-```markdown
-## Visual Evidence
-
-- UI impact: stateful | static | none
-- Candidate commit: <full 40-character PR-head SHA>
-- Rationale: <required when UI impact is none; otherwise not applicable>
-- Scenario: <workflow demonstrated; not applicable only when UI impact is none>
-- Expected: <expected visible behavior; not applicable only when UI impact is none>
-- Observed: <observed visible behavior; not applicable only when UI impact is none>
-- Fixture class: synthetic | explicitly-approved-test-safe | not applicable
-- Capture environment: <source candidate or signed installed candidate; not applicable only when UI impact is none>
-- Media inspection: PASS | not applicable
-- Privacy review: PASS | not applicable
-- Media filename: <sanitized filename; not applicable only when UI impact is none>
-- Media type: video/mp4 | video/webm | image/png | not applicable
-- Media bytes: <exact bytes; not applicable only when UI impact is none>
-- Media SHA-256: <hash; not applicable only when UI impact is none>
-- Durable artifact URL: <GitHub user-attachment URL; not applicable only when UI impact is none>
-
-<bare GitHub user-attachment URL; omit only when UI impact is none>
-```
-
-Operational collection and validation are owned by the separately reviewed
-Crate Ops crate-crabbox workflow. Real Mac capture remains the authority for
-Crate UI proof; no runner implementation, configuration, publisher, or
-automated visual-enforcement workflow belongs in Crate App. If collection is
-unavailable or fails, retain the verified local bundle, report the exact
-blocker, and fail closed.
-
-Do not create or reuse a GitHub release, tag, prerelease, release asset, S3,
-R2, Cloudflare, broker, or other alternate host for visual proof. The Crate Ops
-workflow may validate already-captured, already-inspected sanitized media, but
-it cannot capture or simulate the macOS app or replace real Mac QA.
-
-Autoreview and merge readiness must inspect the actual media, confirm it covers
-the material changed flow, check the privacy boundary, and reject missing,
-stale, misleading, or inaccessible proof. A stateful UI PR without current
-video proof is not merge-ready. If proof is genuinely infeasible, record the
-exact blocker in the PR and obtain Bryant's explicit exception before merge.
+PR visual evidence does not replace signed, notarized, installed-app QA at the
+release gate.
 
 ## Release Workflow
 Follow `.codex/playbooks/release-crate.md` and `.codex/playbooks/crate-release-gate.md` as the executable release authority:
