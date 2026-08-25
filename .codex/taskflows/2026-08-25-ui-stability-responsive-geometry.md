@@ -23,7 +23,7 @@ Make the existing Crate macOS UI adapt cleanly from its normal desktop size down
 Allowed:
 
 - inspect the exact canonical UI and window behavior inherited from PRs #226 and #227
-- update responsive layout and containment in renderer CSS
+- update responsive layout and containment inside an existing allowed renderer source file
 - make the smallest semantic markup changes required in `renderer/index.html`
 - update `main.js` only after an evidence-based minimum-window decision
 - replace focused responsive test authority that encoded broken width constraints
@@ -46,8 +46,9 @@ Forbidden:
 ## Implemented Responsive Contract
 
 - retained the established `renderer/styles.css` unchanged
-- loaded one focused `renderer/ui-stability.css` layer immediately after the established stylesheet
-- kept the stylesheet inside the existing `renderer/**/*` packaged-content boundary without changing build, release, or verifier configuration
+- placed the focused responsive contract in a named `<style id="crate-ui-stability">` block in the already permitted `renderer/index.html`, after the established stylesheet link
+- preserved the hardened packaged-content allowlist, which permits only `renderer/app.js`, `renderer/index.html`, and `renderer/styles.css` in the shipped ASAR
+- did not modify build, release, verifier, dependency, or ASAR policy configuration
 - neutralized inherited `640px`, `680px`, and `800px` layout pressure through later flexible rules
 - made Current Project and Review Assets respond to their actual content-pane width through container queries
 - moved Review Assets search and actions onto separate rows before collision
@@ -64,14 +65,14 @@ Forbidden:
 - `tests/ui-stability-preload.js` exposes a test-only `window.crate` bridge without touching production preload code or real data
 - `tests/ui-stability-electron-harness.js` loads the real renderer, opens the real Project Workspace and Review Assets flow, resizes through the supported matrix, records geometry, and optionally captures screenshots
 - `tests/ui-stability-responsive-geometry.test.js` runs an independent real-Chromium geometry probe when Chrome or Chromium is available
-- focused source tests verify that `renderer/index.html` loads `styles.css` before `ui-stability.css`
+- focused source tests extract and verify the named responsive block from `renderer/index.html`
 - focused source and fixture tests remain dependency-free and run through the existing Node test system
 
 ## State
 
 - current phase: exact-head source CI followed by macOS visual and geometry verification
-- last completed checkpoint: dedicated responsive stylesheet, focused tests, synthetic fixture, browser geometry probe, Electron harness, UI standard, and named check suite pushed
-- last runtime/test head before this taskflow-only correction: `b2672910aa6685249ac325adfcbf295fa324df8c`
+- last completed checkpoint: packaged-content-safe inline responsive contract, focused tests, synthetic fixture, browser geometry probe, Electron harness, UI standard, and named check suite pushed
+- last runtime/test head before this taskflow-only correction: `64827c0dbf294194782e0473b949988cb184f62e`
 - authoritative PR: `#231`
 - next action: obtain a passing exact-head GitHub source gate, then run synthetic large-project Mac QA without editing the implementation branch
 - blocker: authentic macOS Electron geometry and video evidence require the separate Mac QA lane
@@ -89,7 +90,7 @@ Forbidden:
 - [x] independent Chromium geometry probe
 - [x] focused source-contract tests
 - [x] named UI-stability check suite
-- [x] packaged-content boundary preserved without config mutation
+- [x] hardened packaged-content allowlist preserved without config mutation
 - [ ] exact-head complete source regression gate
 - [ ] live Mac visual proof at exact PR head
 - [ ] evidence-based minimum-window decision
@@ -103,13 +104,13 @@ Forbidden:
 | --- | --- | --- | --- |
 | 2026-08-25 | Verified canonical and feature branch | `origin/v2.4.x` and the feature branch began at `fa4d3d22378f11e4bcd80c55402194bda77da398` | PASS |
 | 2026-08-25 | Confirmed Chief handoff | PR #227 merge `436c718e8d7c625673ed6bc255a9f718c58dd9b1`; PR #226 merge `fa4d3d22378f11e4bcd80c55402194bda77da398`; no active source writer reported | PASS |
-| 2026-08-25 | Added responsive presentation layer | established stylesheet unchanged; `renderer/ui-stability.css` loaded after it from `renderer/index.html` | IMPLEMENTED |
-| 2026-08-25 | Preserved packaged-content policy | responsive stylesheet remains under the existing `renderer/**/*` build boundary; no build or verifier config changed | PASS |
+| 2026-08-25 | Added responsive presentation contract | named inline responsive block follows `renderer/styles.css` inside permitted `renderer/index.html` | IMPLEMENTED |
+| 2026-08-25 | Preserved packaged-content policy | `scripts/verify-app-contents.js` renderer allowlist remains unchanged and no new shipped renderer file exists | PASS |
 | 2026-08-25 | Added synthetic geometry coverage | 263-asset fixture, test-only preload, real-renderer Electron harness, optional real-Chromium probe | IMPLEMENTED |
 | 2026-08-25 | Replaced stale responsive test authority | focused tests assert the shrink/reflow contract and no longer require the inherited defect | IMPLEMENTED |
 | 2026-08-25 | Added durable UI process | UI-stability standard and `ui-stability-responsive-geometry` named check suite | IMPLEMENTED |
 | 2026-08-25 | Earlier source gate | workflow run `32893793347`, job `97951593801` passed at an earlier responsive source head | PASS, SUPERSEDED BY NEWER HEAD |
-| 2026-08-25 | Dedicated stylesheet restored | commit `b2672910aa6685249ac325adfcbf295fa324df8c` | PUSHED |
+| 2026-08-25 | Packaged-content-safe consolidation | commit `64827c0dbf294194782e0473b949988cb184f62e` | PUSHED |
 | 2026-08-25 | Current source gate | PR #231 exact-head rerun after this taskflow correction | PENDING |
 
 ## Exact-Head Mac QA Requirements
@@ -131,7 +132,7 @@ Use only the committed synthetic fixture. At the exact final candidate head:
 ## Risks
 
 - Source and optional Chromium checks do not substitute for authentic macOS Electron visual judgment.
-- The separate presentation layer intentionally leaves the established visual system untouched; future visual refactors must continue loading it in the documented order.
+- The focused responsive contract is intentionally inside `renderer/index.html` to preserve the hardened ASAR inventory; future refactors must preserve its cascade position or deliberately update packaged-content policy with separate security proof.
 - The existing Electron minimum may still permit an undesirable shell transition around the legacy `760px` breakpoint; the final minimum must follow real Mac evidence.
 - Large-list DOM reconciliation, preview scheduling, scroll-anchor preservation during live updates, and renderer event coalescing are intentionally deferred to the separate smoothness phase.
 
