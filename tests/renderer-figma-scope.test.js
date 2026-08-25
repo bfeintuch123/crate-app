@@ -1800,6 +1800,123 @@ test('Figma connection warning card distinguishes authentication from file acces
   assert.equal(text.includes('File cannot be read'), false);
 });
 
+test('Figma warning cards use source-backed recovery actions and keep zero-image results informational', () => {
+  const document = createDocumentStub();
+  const renderer = loadRendererHelpers(document);
+  const cases = [
+    ['file-access', 'Figma file access required', 'Check access or replace the Figma link, then try again.', 'Blocked'],
+    ['scope', 'Figma page or layer link required', 'Use the exact Figma page or layer link, or replace the Figma link, then try again.', 'Blocked'],
+    ['unknown', 'Figma scan needs attention', 'Check your Figma connection and try again.', 'Blocked'],
+    ['informational', 'No exportable Figma assets', 'This page has no exportable image assets.', 'Info'],
+  ];
+
+  for (const [category, title, action, status] of cases) {
+    const container = createElementStub();
+    container.ownerDocument = document;
+    container.append = (...children) => children.forEach(child => container.appendChild(child));
+    renderer.renderFigmaWarningCard(container, 'A safe Figma warning.', null, category);
+    const text = getElementTreeText(container);
+    assert.equal(text.includes(title), true);
+    assert.equal(text.includes(action), true);
+    assert.equal(text.includes(status), true);
+  }
+});
+
+test('Package Review recovery uses the persisted Figma failure category without changing the package gate', () => {
+  const renderer = loadRendererHelpers();
+  const error = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
+  const project = category => ({
+    figmaSession: { trackedFiles: [{ failureCategory: category }] },
+  });
+
+  assert.equal(
+    renderer.getPackageReviewRecoveryMessage(error, null, project('connection')),
+    'Reconnect Figma in Settings, then try packaging again.'
+  );
+  assert.equal(
+    renderer.getPackageReviewRecoveryMessage(error, null, project('rate-limited')),
+    'Wait for the Figma cooldown, then try packaging again.'
+  );
+  assert.equal(
+    renderer.getPackageReviewRecoveryMessage(error, null, project('file-access')),
+    'Check access or replace the Figma link, then try packaging again.'
+  );
+  assert.equal(
+    renderer.getPackageReviewRecoveryMessage(error, null, project('scope')),
+    'Use the exact Figma page or layer link, or replace the Figma link, then try packaging again.'
+  );
+  assert.equal(
+    renderer.getPackageReviewRecoveryMessage(error, null, project('unknown')),
+    'Check your Figma connection and try again.'
+  );
+});
+
+test('first Package Now failure uses the refreshed Figma category recovery copy', async () => {
+  const transferError = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
+  const cases = [
+    ['file-access', 'Check access or replace the Figma link, then try packaging again.'],
+    ['scope', 'Use the exact Figma page or layer link, or replace the Figma link, then try packaging again.'],
+    ['rate-limited', 'Wait for the Figma cooldown, then try packaging again.'],
+    ['unknown', 'Check your Figma connection and try again.'],
+  ];
+
+  for (const [caseIndex, [category, expectedMessage]] of cases.entries()) {
+    const { document, elements } = createInteractiveRendererDom();
+    const project = {
+      id: `first-package-failure-${category}`,
+      name: `First Package Failure ${category}`,
+      type: 'branding',
+      status: 'watching',
+      files: [],
+      pendingFiles: [],
+      excludedAssetKeys: [],
+      figmaScopeMode: 'current-page',
+      figmaTrackedFiles: [{ key: `safe-${category}` }],
+      figmaSession: { trackedFiles: [], warnings: [] },
+    };
+    const refreshedProject = {
+      ...project,
+      figmaSession: {
+        trackedFiles: [{ failureCategory: category }],
+        warnings: ['Figma scan needs attention.'],
+      },
+    };
+    const review = {
+      token: `00000000-0000-4000-8000-0000000004${String(caseIndex + 1).padStart(2, '0')}`,
+      projectId: project.id,
+      files: [],
+      totalFiles: 0,
+      materializable: true,
+    };
+    let projectSnapshot = project;
+    let packageCalls = 0;
+    const renderer = loadRendererHelpers(document, { crate: {
+      getProjects: async () => [projectSnapshot],
+      preScanSession: async () => ({ success: true }),
+      preparePackageReview: async () => review,
+      packageProject: async projectId => {
+        packageCalls++;
+        assert.equal(projectId, project.id);
+        return { error: transferError };
+      },
+    } });
+    renderer.testProject = project;
+    vm.runInContext(`
+      state.projects = [testProject];
+      state.selectedProjectId = testProject.id;
+      state.settings = { namingTemplate: '{Project}_{Date}' };
+      state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+    `, renderer);
+
+    assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+    projectSnapshot = refreshedProject;
+    await renderer.confirmPackage();
+
+    assert.equal(packageCalls, 1);
+    assert.equal(elements['modal-package-review-message'].textContent, expectedMessage);
+  }
+});
+
 test('Figma retry copy falls back safely for expired or invalid timestamps', () => {
   const renderer = loadRendererHelpers();
   const warning = 'Figma is temporarily rate limiting this scan.';
@@ -3103,11 +3220,11 @@ test('successful project creation uses the authoritative result when refresh is 
 for (const [typedError, figmaMessagePattern] of [
   ['max_projects_reached', null],
   ['invalid_figma_url', /could not read that Figma URL/],
-  ['figma_not_connected', /Connect Figma in Settings/],
-  ['figma_invalid_token', /connection is no longer valid/],
+  ['figma_not_connected', /Reconnect Figma in Settings/],
+  ['figma_invalid_token', /Reconnect Figma in Settings/],
   ['figma_rate_limited', /temporarily limiting requests/],
-  ['figma_file_unavailable', /could not access that Figma file/],
-  ['figma_scope_unresolved', /link to the exact Figma page or selected layer/],
+  ['figma_file_unavailable', /Check access or replace the Figma link/],
+  ['figma_scope_unresolved', /exact Figma page or selected layer link/],
   ['figma_verification_failed', /could not verify that Figma link/],
 ]) {
   test(`known project creation error ${typedError} unlocks the form without selecting a project`, async () => {

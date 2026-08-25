@@ -2284,6 +2284,20 @@ const FIGMA_MAX_RATE_LIMIT_BACKOFF_MS = 31 * 24 * 60 * 60 * 1000;
 const FIGMA_LINK_PREFLIGHT_TIMEOUT_MS = 12_000;
 const FIGMA_CONNECTION_STATUS_REASON = 'figma-connection-invalid';
 const FIGMA_CONNECTION_WARNING = 'Figma is not connected. Reconnect in Settings. No Figma assets will be captured until the connection is restored.';
+const FIGMA_FAILURE_CATEGORIES = new Set([
+  'connection',
+  'rate-limited',
+  'file-access',
+  'scope',
+  'unknown',
+  'informational',
+]);
+const FIGMA_SCOPE_FAILURE_STATUS_REASONS = new Set([
+  'figma-current-page-no-page-or-node-param',
+  'figma-current-page-requested-page-not-found',
+  'figma-current-page-requested-node-not-found',
+  'figma-current-page-prototype-link-file-fetch-failed',
+]);
 const VALID_FIGMA_SCOPE_MODES = new Set([FIGMA_SCOPE_CURRENT_PAGE, FIGMA_SCOPE_ENTIRE_FILE]);
 const figmaLinkValidationInFlight = new Map();
 const figmaLinkValidationOccupancy = new Map();
@@ -2300,6 +2314,36 @@ function normalizeStoredFigmaScopeId(value) {
   const normalized = FigmaParser.normalizeNodeId(value);
   if (!normalized || normalized.length > 120) return null;
   return /^\d+:\d+(?::\d+)*$/.test(normalized) ? normalized : null;
+}
+
+function normalizeFigmaFailureCategory(value) {
+  return FIGMA_FAILURE_CATEGORIES.has(value) ? value : null;
+}
+
+function getFigmaFailureCategory(scope = {}) {
+  if (!scope || typeof scope !== 'object') return null;
+  const statusReason = typeof scope.statusReason === 'string' ? scope.statusReason : '';
+  const fileFetchFailureReason = typeof scope.fileFetchFailureReason === 'string'
+    ? scope.fileFetchFailureReason
+    : '';
+
+  if (
+    statusReason === FIGMA_CONNECTION_STATUS_REASON ||
+    fileFetchFailureReason === 'not-connected' ||
+    fileFetchFailureReason === 'invalid-token'
+  ) return 'connection';
+  if (
+    statusReason === 'figma-current-page-rate-limited' ||
+    fileFetchFailureReason === 'rate-limited'
+  ) return 'rate-limited';
+  if (statusReason === 'figma-current-page-zero-image-refs') return 'informational';
+  if (FIGMA_SCOPE_FAILURE_STATUS_REASONS.has(statusReason)) return 'scope';
+  if (
+    fileFetchFailureReason === 'access-denied' ||
+    fileFetchFailureReason === 'file-not-found'
+  ) return 'file-access';
+  if (statusReason === 'figma-current-page-file-fetch-failed' || fileFetchFailureReason) return 'unknown';
+  return null;
 }
 
 function sanitizeStoredFigmaSessionText(value, maxLength) {
@@ -2689,6 +2733,13 @@ function migrateProjectFigmaLinkPrivacy(project) {
           : null,
         statusReason: sanitizeStoredFigmaSessionText(rawSessionEntry.statusReason, 160)
           || rebuiltEntry.statusReason,
+        failureCategory: normalizeFigmaFailureCategory(rawSessionEntry.failureCategory)
+          || getFigmaFailureCategory({
+            statusReason: rawSessionEntry.statusReason || rebuiltEntry.statusReason,
+            fileFetchFailureReason: rawSessionEntry.fileFetchFailureReason,
+          })
+          || rebuiltEntry.failureCategory
+          || null,
         warning: sanitizeStoredFigmaSessionText(rawSessionEntry.warning, 500)
           || rebuiltEntry.warning,
         scopeMode: FIGMA_SCOPE_CURRENT_PAGE,
@@ -2762,6 +2813,10 @@ function markProjectFigmaConnectionUnavailable(projectId) {
         trackedFile.statusReason = FIGMA_CONNECTION_STATUS_REASON;
         changed = true;
       }
+      if (trackedFile.failureCategory !== 'connection') {
+        trackedFile.failureCategory = 'connection';
+        changed = true;
+      }
       if (trackedFile.warning !== FIGMA_CONNECTION_WARNING) {
         trackedFile.warning = FIGMA_CONNECTION_WARNING;
         changed = true;
@@ -2803,9 +2858,10 @@ function clearProjectFigmaConnectionUnavailable(projectId, verifiedPreflights = 
         lockedPageId: verified.scope.lockedPageId,
         lockedPageName: verified.scope.lockedPageName,
         statusReason: verified.scope.statusReason,
+        failureCategory: getFigmaFailureCategory(verified.scope),
         warning: null,
       };
-      for (const field of ['resolvedKey', 'lockStatus', 'lockedPageId', 'lockedPageName', 'statusReason', 'warning']) {
+      for (const field of ['resolvedKey', 'lockStatus', 'lockedPageId', 'lockedPageName', 'statusReason', 'failureCategory', 'warning']) {
         if (trackedFile[field] === replacement[field]) continue;
         trackedFile[field] = replacement[field];
         changed = true;
@@ -2840,11 +2896,13 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
       let warning = null;
       let lockedPageId = null;
       let statusReason = null;
+      let failureCategory = null;
 
       if (scopeMode === FIGMA_SCOPE_CURRENT_PAGE) {
         if (!requestedPageId && !requestedNodeId) {
           lockStatus = 'unresolved';
           statusReason = 'figma-current-page-no-page-or-node-param';
+          failureCategory = 'scope';
           warning = 'Current Page Only could not find a page or node in the linked Figma location. No Figma assets will be captured for this file in this session.';
         } else if (requestedPageId) {
           lockStatus = 'locked';
@@ -2865,6 +2923,7 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
         lockedPageName: null,
         scopeMode,
         statusReason,
+        failureCategory,
         warning,
       };
     }),
@@ -2877,6 +2936,7 @@ function buildFigmaSessionSnapshot(project, _settings = {}) {
     for (const trackedFile of snapshot.trackedFiles) {
       trackedFile.lockStatus = 'unresolved';
       trackedFile.statusReason = 'figma-current-page-rate-limited';
+      trackedFile.failureCategory = 'rate-limited';
       trackedFile.warning = warning;
     }
   }
@@ -3002,7 +3062,12 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       const nextLockStatus = typeof nextScope.lockStatus === 'string' ? nextScope.lockStatus : trackedFile.lockStatus;
       const nextLockedPageId = nextScope.lockedPageId != null ? nextScope.lockedPageId : trackedFile.lockedPageId;
       const nextLockedPageName = nextScope.lockedPageName != null ? nextScope.lockedPageName : trackedFile.lockedPageName;
-      const nextStatusReason = nextScope.statusReason != null ? nextScope.statusReason : trackedFile.statusReason;
+      const nextStatusReason = Object.prototype.hasOwnProperty.call(nextScope, 'statusReason')
+        ? nextScope.statusReason
+        : trackedFile.statusReason;
+      const nextFailureCategory = normalizeFigmaFailureCategory(nextScope.failureCategory)
+        || getFigmaFailureCategory(nextScope)
+        || null;
       const nextWarning = nextScope.warning != null ? nextScope.warning : trackedFile.warning;
       const nextResolvedKey = typeof nextScope.fileKey === 'string' && nextScope.fileKey.trim()
         ? nextScope.fileKey.trim()
@@ -3022,6 +3087,10 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       }
       if (trackedFile.statusReason !== nextStatusReason) {
         trackedFile.statusReason = nextStatusReason;
+        changed = true;
+      }
+      if (trackedFile.failureCategory !== nextFailureCategory) {
+        trackedFile.failureCategory = nextFailureCategory;
         changed = true;
       }
       if (trackedFile.warning !== nextWarning) {
@@ -4636,6 +4705,10 @@ function updateFigmaSessionRateLimitWarning(projectId, retryAt) {
         trackedFile.statusReason = 'figma-current-page-rate-limited';
         changed = true;
       }
+      if (trackedFile.failureCategory !== 'rate-limited') {
+        trackedFile.failureCategory = 'rate-limited';
+        changed = true;
+      }
       if (trackedFile.warning !== warning) {
         trackedFile.warning = warning;
         changed = true;
@@ -4665,6 +4738,10 @@ function clearFigmaRateLimitState(projectId) {
       }
       if (trackedFile.warning === warning) {
         trackedFile.warning = null;
+        changed = true;
+      }
+      if (normalizeFigmaFailureCategory(trackedFile.failureCategory) === 'rate-limited') {
+        trackedFile.failureCategory = null;
         changed = true;
       }
     }

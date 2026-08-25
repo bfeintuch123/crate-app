@@ -73,6 +73,21 @@ function redactRendererCredentialText(value) {
 const FIGMA_URL_PATTERN = /(?:(?:https?:\/\/)?(?:www\.|embed\.)?figma\.com\/(?:file|design|proto)\/|figma:\/\/(?:file|design|proto)\/)([a-zA-Z0-9_-]+)/i;
 const FIGMA_OPEN_URL_PATTERN = /figma:\/\/open\?/i;
 const FIGMA_FILE_KEY_PARAM_PATTERN = /[?&#](?:file-key|fileKey|file_key|file-id|fileId|file_id)=([a-zA-Z0-9_-]+)/i;
+const FIGMA_PACKAGE_TRANSFER_ERROR_MESSAGE = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
+const FIGMA_FAILURE_CATEGORIES = new Set([
+  'connection',
+  'rate-limited',
+  'file-access',
+  'scope',
+  'unknown',
+  'informational',
+]);
+const FIGMA_SCOPE_FAILURE_STATUS_REASONS = new Set([
+  'figma-current-page-no-page-or-node-param',
+  'figma-current-page-requested-page-not-found',
+  'figma-current-page-requested-node-not-found',
+  'figma-current-page-prototype-link-file-fetch-failed',
+]);
 function isValidFigmaUrl(url) {
   if (typeof url !== 'string') return false;
   const trimmed = url.trim();
@@ -95,15 +110,15 @@ function getFigmaLinkErrorMessage(error) {
     case 'invalid_figma_url':
       return 'Crate could not read that Figma URL. Please double-check and try again.';
     case 'figma_not_connected':
-      return 'Connect Figma in Settings before linking a Figma file.';
+      return 'Reconnect Figma in Settings before linking a Figma file.';
     case 'figma_invalid_token':
-      return 'Your Figma connection is no longer valid. Reconnect in Settings, then try again.';
+      return 'Reconnect Figma in Settings, then try again.';
     case 'figma_rate_limited':
       return 'Figma is temporarily limiting requests. Wait for the cooldown, then try again.';
     case 'figma_file_unavailable':
-      return 'Crate could not access that Figma file. Check the link and file permissions, then try again.';
+      return 'Check access or replace the Figma link, then try again.';
     case 'figma_scope_unresolved':
-      return 'Current Page Only needs a link to the exact Figma page or selected layer. Open it in Figma, copy that URL, and try again.';
+      return 'Use the exact Figma page or selected layer link, or replace the Figma link, then try again.';
     case 'figma_verification_failed':
       return 'Crate could not verify that Figma link. Check your connection and try again.';
     default:
@@ -742,6 +757,51 @@ function getProjectFigmaWarning(project) {
   return warnings[0] || '';
 }
 
+function normalizeFigmaFailureCategory(value) {
+  return FIGMA_FAILURE_CATEGORIES.has(value) ? value : null;
+}
+
+function getFigmaFailureCategoryFromScope(scope = {}) {
+  if (!scope || typeof scope !== 'object') return null;
+  const statusReason = typeof scope.statusReason === 'string' ? scope.statusReason : '';
+  if (statusReason === 'figma-connection-invalid') return 'connection';
+  if (statusReason === 'figma-current-page-rate-limited') return 'rate-limited';
+  if (statusReason === 'figma-current-page-zero-image-refs') return 'informational';
+  if (FIGMA_SCOPE_FAILURE_STATUS_REASONS.has(statusReason)) return 'scope';
+  if (statusReason === 'figma-current-page-file-fetch-failed') return 'unknown';
+  return null;
+}
+
+function getFigmaFailureCategoryFromWarning(warning) {
+  const lowerWarning = typeof warning === 'string' ? warning.toLowerCase() : '';
+  if (!lowerWarning) return null;
+  if (lowerWarning.includes('rate') || lowerWarning.includes('429') || lowerWarning.includes('cooldown')) {
+    return 'rate-limited';
+  }
+  if (lowerWarning.includes('not connected') || lowerWarning.includes('reconnect in settings')) {
+    return 'connection';
+  }
+  if (
+    lowerWarning.includes('could not find the requested page') ||
+    lowerWarning.includes('could not find the requested node') ||
+    lowerWarning.includes('could not find a page or node') ||
+    lowerWarning.includes('prototype link')
+  ) return 'scope';
+  if (lowerWarning.includes('no exportable image assets')) return 'informational';
+  return null;
+}
+
+function getProjectFigmaFailureCategory(project) {
+  const trackedFiles = (project && project.figmaSession && project.figmaSession.trackedFiles) || [];
+  const categories = trackedFiles
+    .map(file => normalizeFigmaFailureCategory(file && file.failureCategory) || getFigmaFailureCategoryFromScope(file))
+    .filter(Boolean);
+  for (const category of ['connection', 'rate-limited', 'file-access', 'scope', 'unknown', 'informational']) {
+    if (categories.includes(category)) return category;
+  }
+  return getFigmaFailureCategoryFromWarning(getProjectFigmaWarning(project));
+}
+
 function getProjectFigmaRateLimitRetryAt(project) {
   const retryAt = project && project.figmaSession && project.figmaSession.rateLimitRetryAt;
   return Number.isSafeInteger(retryAt) && retryAt > Date.now() && retryAt <= Date.now() + (31 * 24 * 60 * 60 * 1000)
@@ -767,16 +827,47 @@ function formatFigmaRetryTime(retryAt) {
   return `Try again after ${formatted}.`;
 }
 
-function getFigmaWarningDisplayText(warning, retryAt = null) {
+function getFigmaWarningDisplayText(warning, retryAt = null, failureCategory = null) {
   const message = typeof warning === 'string' ? warning.trim() : '';
   if (!message) return '';
   const lowerMessage = message.toLowerCase();
-  const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
+  const category = normalizeFigmaFailureCategory(failureCategory) || getFigmaFailureCategoryFromWarning(message);
+  const isRateLimited = category === 'rate-limited' || lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
   const retryText = isRateLimited ? formatFigmaRetryTime(retryAt) : '';
   return retryText ? `${message} ${retryText}` : message;
 }
 
-function renderFigmaWarningCard(container, warning, retryAt = null) {
+function getFigmaFailureAction(category, retryAt = null) {
+  switch (category) {
+    case 'connection':
+      return 'Reconnect Figma in Settings.';
+    case 'rate-limited':
+      return formatFigmaRetryTime(retryAt) || 'Wait for the Figma cooldown, then try again.';
+    case 'file-access':
+      return 'Check access or replace the Figma link, then try again.';
+    case 'scope':
+      return 'Use the exact Figma page or layer link, or replace the Figma link, then try again.';
+    case 'informational':
+      return 'This page has no exportable image assets.';
+    case 'unknown':
+    default:
+      return 'Check your Figma connection and try again.';
+  }
+}
+
+function getFigmaFailureTitle(category) {
+  switch (category) {
+    case 'connection': return 'Figma connection required';
+    case 'rate-limited': return 'Figma rate limiting';
+    case 'file-access': return 'Figma file access required';
+    case 'scope': return 'Figma page or layer link required';
+    case 'informational': return 'No exportable Figma assets';
+    case 'unknown':
+    default: return 'Figma scan needs attention';
+  }
+}
+
+function renderFigmaWarningCard(container, warning, retryAt = null, failureCategory = null) {
   if (!container) return;
   const message = typeof warning === 'string' ? warning.trim() : '';
   container.innerHTML = '';
@@ -785,15 +876,12 @@ function renderFigmaWarningCard(container, warning, retryAt = null) {
   if (!message) return;
 
   const safeMessage = sanitizeRendererLogText(message);
-  const lowerMessage = message.toLowerCase();
-  const isRateLimited = lowerMessage.includes('rate') || lowerMessage.includes('429') || lowerMessage.includes('cooldown');
-  const isConnectionUnavailable = lowerMessage.includes('not connected') || lowerMessage.includes('reconnect in settings');
-  const title = isRateLimited
-    ? 'Figma rate limiting'
-    : (isConnectionUnavailable ? 'Figma connection required' : 'File cannot be read');
-  const action = isRateLimited
-    ? (formatFigmaRetryTime(retryAt) || 'Crate will retry after Figma allows the request.')
-    : (isConnectionUnavailable ? 'Reconnect Figma in Settings.' : 'Reconnect Figma or check file access.');
+  const category = normalizeFigmaFailureCategory(failureCategory)
+    || getFigmaFailureCategoryFromWarning(message)
+    || 'unknown';
+  const isInformational = category === 'informational';
+  const title = getFigmaFailureTitle(category);
+  const action = getFigmaFailureAction(category, retryAt);
 
   container.classList.remove('hidden');
 
@@ -807,11 +895,11 @@ function renderFigmaWarningCard(container, warning, retryAt = null) {
 
   const statusEl = document.createElement('div');
   statusEl.className = 'figma-warning-status';
-  statusEl.textContent = 'Blocked';
+  statusEl.textContent = isInformational ? 'Info' : 'Blocked';
 
   const noteTitle = document.createElement('div');
   noteTitle.className = 'figma-warning-title';
-  noteTitle.textContent = 'Do not package yet';
+  noteTitle.textContent = isInformational ? 'Figma scan note' : 'Do not package yet';
 
   const noteCopy = document.createElement('div');
   noteCopy.className = 'figma-warning-copy';
@@ -918,7 +1006,12 @@ async function renderFiles() {
   }
   if (figmaWarningText) {
     const warning = getProjectFigmaWarning(project);
-    renderFigmaWarningCard(figmaWarningText, warning, getProjectFigmaRateLimitRetryAt(project));
+    renderFigmaWarningCard(
+      figmaWarningText,
+      warning,
+      getProjectFigmaRateLimitRetryAt(project),
+      getProjectFigmaFailureCategory(project)
+    );
   }
 
   const excludedAssetKeys = new Set(project.excludedAssetKeys || []);
@@ -2395,7 +2488,13 @@ function renderPackageReview(project, review, message = '') {
   const modalWarning = $('#modal-figma-warning');
   if (modalWarning) {
     const warning = hasFigmaContext ? getProjectFigmaWarning(project) : '';
-    modalWarning.textContent = getFigmaWarningDisplayText(warning, getProjectFigmaRateLimitRetryAt(project));
+    const retryAt = getProjectFigmaRateLimitRetryAt(project);
+    const failureCategory = getProjectFigmaFailureCategory(project);
+    const displayWarning = getFigmaWarningDisplayText(warning, retryAt, failureCategory);
+    const recoveryAction = warning ? getFigmaFailureAction(failureCategory || 'unknown', retryAt) : '';
+    modalWarning.textContent = [displayWarning, recoveryAction]
+      .filter(Boolean)
+      .join(' ');
     modalWarning.style.display = warning ? 'block' : 'none';
   }
   const presentationReminder = $('#modal-presentation-reminder');
@@ -2597,11 +2696,29 @@ function formatPackageReviewDiagnosticSummary(error, diagnostics) {
   return `Diagnostic: ${parts.join(' · ')}.`;
 }
 
-function getPackageReviewRecoveryMessage(error, diagnostics = null) {
+function getFigmaPackageRecoveryMessage(project) {
+  switch (getProjectFigmaFailureCategory(project)) {
+    case 'connection':
+      return 'Reconnect Figma in Settings, then try packaging again.';
+    case 'rate-limited':
+      return 'Wait for the Figma cooldown, then try packaging again.';
+    case 'file-access':
+      return 'Check access or replace the Figma link, then try packaging again.';
+    case 'scope':
+      return 'Use the exact Figma page or layer link, or replace the Figma link, then try packaging again.';
+    case 'unknown':
+      return 'Check your Figma connection and try again.';
+    default:
+      return PACKAGE_REVIEW_RECOVERY_MESSAGE;
+  }
+}
+
+function getPackageReviewRecoveryMessage(error, diagnostics = null, project = null) {
   let message = PACKAGE_REVIEW_RECOVERY_MESSAGE;
   if (error === 'package_review_changed') message = PACKAGE_REVIEW_CHANGED_MESSAGE;
   else if (error === 'package_review_unavailable') message = PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
   else if (error === 'package_scan_incomplete') message = PACKAGE_SCAN_INCOMPLETE_MESSAGE;
+  else if (error === FIGMA_PACKAGE_TRANSFER_ERROR_MESSAGE) message = getFigmaPackageRecoveryMessage(project);
   const diagnosticSummary = formatPackageReviewDiagnosticSummary(error, diagnostics);
   return diagnosticSummary ? `${message} ${diagnosticSummary}` : message;
 }
@@ -2644,9 +2761,16 @@ async function showPackageModal({
           return false;
         }
       }
+      try {
+        state.projects = await window.crate.getProjects();
+        project = state.projects.find(item => item.id === projectId) || project;
+      } catch (_) {
+        // Keep the last safe project snapshot when refresh is unavailable.
+      }
       const failureMessage = message || getPackageReviewRecoveryMessage(
         review?.error || 'package_review_unavailable',
-        review?.diagnostics
+        review?.diagnostics,
+        project
       );
       renderPackageReview(project, await createUnavailableRendererReview(project, failureMessage), failureMessage);
       return false;
@@ -2723,7 +2847,7 @@ function renderPackageDetails(result) {
 }
 
 async function confirmPackage() {
-  const project = state.projects.find(p => p.id === state.selectedProjectId);
+  let project = state.projects.find(p => p.id === state.selectedProjectId);
   const confirmButton = $('#btn-confirm-package');
   if (!project || !state.packageReviewToken || confirmButton?.disabled) return;
 
@@ -2749,7 +2873,10 @@ async function confirmPackage() {
       window.crate.preScanSession(project.id),
       new Promise(resolve => setTimeout(() => resolve(null), 12000))
     ]);
-    if (scanResult) state.projects = await window.crate.getProjects();
+    if (scanResult) {
+      state.projects = await window.crate.getProjects();
+      project = state.projects.find(p => p.id === project.id) || project;
+    }
 
     state.packageReviewToken = null;
     const result = await window.crate.packageProject(project.id, outputPath, reviewToken);
@@ -2768,7 +2895,7 @@ async function confirmPackage() {
       );
       const recoveryMessage = suppliedReview?.materializable === false
         ? suppliedReview.message || PACKAGE_REVIEW_UNAVAILABLE_MESSAGE
-        : getPackageReviewRecoveryMessage(typedError, result?.diagnostics);
+        : getPackageReviewRecoveryMessage(typedError, result?.diagnostics, project);
       hidePackageProgressModal();
       await showPackageModal({
         message: recoveryMessage,
