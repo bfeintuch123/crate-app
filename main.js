@@ -3062,10 +3062,11 @@ function mergeFigmaScopeEntriesIntoSession(projectId, scopeEntries = []) {
       const nextLockStatus = typeof nextScope.lockStatus === 'string' ? nextScope.lockStatus : trackedFile.lockStatus;
       const nextLockedPageId = nextScope.lockedPageId != null ? nextScope.lockedPageId : trackedFile.lockedPageId;
       const nextLockedPageName = nextScope.lockedPageName != null ? nextScope.lockedPageName : trackedFile.lockedPageName;
-      const nextStatusReason = nextScope.statusReason != null ? nextScope.statusReason : trackedFile.statusReason;
+      const nextStatusReason = Object.prototype.hasOwnProperty.call(nextScope, 'statusReason')
+        ? nextScope.statusReason
+        : trackedFile.statusReason;
       const nextFailureCategory = normalizeFigmaFailureCategory(nextScope.failureCategory)
         || getFigmaFailureCategory(nextScope)
-        || trackedFile.failureCategory
         || null;
       const nextWarning = nextScope.warning != null ? nextScope.warning : trackedFile.warning;
       const nextResolvedKey = typeof nextScope.fileKey === 'string' && nextScope.fileKey.trim()
@@ -4704,6 +4705,10 @@ function updateFigmaSessionRateLimitWarning(projectId, retryAt) {
         trackedFile.statusReason = 'figma-current-page-rate-limited';
         changed = true;
       }
+      if (trackedFile.failureCategory !== 'rate-limited') {
+        trackedFile.failureCategory = 'rate-limited';
+        changed = true;
+      }
       if (trackedFile.warning !== warning) {
         trackedFile.warning = warning;
         changed = true;
@@ -4733,6 +4738,10 @@ function clearFigmaRateLimitState(projectId) {
       }
       if (trackedFile.warning === warning) {
         trackedFile.warning = null;
+        changed = true;
+      }
+      if (normalizeFigmaFailureCategory(trackedFile.failureCategory) === 'rate-limited') {
+        trackedFile.failureCategory = null;
         changed = true;
       }
     }

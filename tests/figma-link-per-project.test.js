@@ -2528,6 +2528,7 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   const tracked = rateLimitedProject.figmaSession.trackedFiles[0];
   assert.equal(tracked.lockStatus, 'unresolved');
   assert.equal(tracked.statusReason, 'figma-current-page-rate-limited');
+  assert.equal(tracked.failureCategory, 'rate-limited');
   assert.match(tracked.warning, /rate limiting/i);
   assert.equal(tracked.warning.includes('figma.com'), false);
   assert.equal(tracked.warning.includes('token'), false);
@@ -2570,6 +2571,125 @@ test('Figma rate-limit diagnostics enter cooldown and surface a safe project war
   assert.equal(scanNow.success, false);
   assert.equal(scanNow.rateLimitedCount, 1);
   assert.equal(figmaScanInvocationCount, 1, 'scan-now must honor the active cooldown without another API scan');
+});
+
+test('authoritative Figma scope recovery clears stale file-access and scope categories', async () => {
+  const project = await createLinkedFigmaProject('Figma Failure Category Recovery');
+  const failureScopes = [
+    {
+      fileFetchFailureReason: 'file-not-found',
+      statusReason: 'figma-current-page-file-fetch-failed',
+      fileFetchStatus: 'failed',
+      assetFetchStatus: 'not-attempted',
+      warning: 'Current Page Only could not read the tracked Figma file. No Figma assets will be captured for this file in this session.',
+      expectedCategory: 'file-access',
+    },
+    {
+      fileFetchFailureReason: null,
+      statusReason: 'figma-current-page-requested-page-not-found',
+      fileFetchStatus: 'success',
+      assetFetchStatus: 'not-attempted',
+      warning: 'Current Page Only could not resolve the requested Figma page. No Figma assets will be captured for this file in this session.',
+      expectedCategory: 'scope',
+    },
+  ];
+
+  for (const failureScope of failureScopes) {
+    nextFigmaScanResult = figmaScanResult([], [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'unresolved',
+      lockedPageId: null,
+      lockedPageName: null,
+      statusReason: failureScope.statusReason,
+      warning: failureScope.warning,
+      fileFetchStatus: failureScope.fileFetchStatus,
+      fileFetchFailureReason: failureScope.fileFetchFailureReason,
+      assetFetchStatus: failureScope.assetFetchStatus,
+    }]);
+    const failedScan = await callIpc('figma:scan-project', project.id);
+    assert.equal(failedScan.success, true);
+
+    let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(fresh.figmaSession.trackedFiles[0].failureCategory, failureScope.expectedCategory);
+
+    nextFigmaScanResult = figmaScanResult([], [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      statusReason: null,
+      failureCategory: null,
+      warning: null,
+      fileFetchStatus: 'success',
+      fileFetchFailureReason: null,
+      assetFetchStatus: 'success',
+    }]);
+    const recoveredScan = await callIpc('figma:scan-project', project.id);
+    assert.equal(recoveredScan.success, true);
+
+    fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(fresh.figmaSession.trackedFiles[0].failureCategory, null);
+  }
+});
+
+test('Figma rate-limit entry explicitly records the rate-limited failure category', async () => {
+  const project = await createLinkedFigmaProject('Figma Explicit Rate Limit Category');
+  nextFigmaScanResult = {
+    files: [{ key: 'FIG22', name: 'Brand Cloud', isTracked: true }],
+    assets: [],
+    rateLimited: true,
+    errors: [],
+    warnings: [],
+    scopeEntries: [{
+      fileKey: 'FIG22',
+      primaryKey: 'FIG22',
+      fileName: 'Brand Cloud',
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: '1:1',
+      lockedPageName: 'Page One',
+      statusReason: null,
+      warning: null,
+      fileFetchStatus: 'success',
+      fileFetchFailureReason: null,
+      assetFetchStatus: 'success',
+    }],
+  };
+
+  const scan = await callIpc('figma:scan-project', project.id);
+  assert.equal(scan.success, false);
+  assert.equal(scan.rateLimited, true);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaSession.trackedFiles[0].failureCategory, 'rate-limited');
+});
+
+test('Figma rate-limit cleanup preserves an unrelated current failure category', async () => {
+  const project = await createLinkedFigmaProject('Figma Preserve Non Rate Limit Category');
+  const rateLimitWarning = 'Figma is temporarily rate limiting this scan. Crate will retry after a cooldown; no Figma assets will be captured for this file in this session until Figma allows the request.';
+  const projects = fakeStoreInstance.get('projects');
+  const storedProject = projects.find(item => item.id === project.id);
+  const trackedFile = storedProject.figmaSession.trackedFiles[0];
+  trackedFile.failureCategory = 'file-access';
+  trackedFile.statusReason = 'figma-current-page-rate-limited';
+  trackedFile.warning = rateLimitWarning;
+  storedProject.figmaSession.warnings = [rateLimitWarning];
+  delete storedProject.figmaSession.rateLimitRetryAt;
+  fakeStoreInstance.set('projects', projects);
+
+  nextFigmaScanResult = figmaScanResult([], []);
+  const scan = await callIpc('figma:scan-project', project.id);
+  assert.equal(scan.success, true);
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaSession.trackedFiles[0].failureCategory, 'file-access');
+  assert.equal(fresh.figmaSession.trackedFiles[0].statusReason, null);
+  assert.equal(fresh.figmaSession.trackedFiles[0].warning, null);
 });
 
 test('live scan stops real Figma API requests after an image-map rate limit', async () => {
@@ -2638,6 +2758,7 @@ test('Figma cooldown survives pause and restart until package-time recovery succ
   const retryAt = rateLimitedProject.figmaSession.rateLimitRetryAt;
   const usageBeforeRecovery = fakeStoreInstance.get('usage.packagesThisMonth');
   assert.ok(retryAt > Date.now());
+  assert.equal(rateLimitedProject.figmaSession.trackedFiles[0].failureCategory, 'rate-limited');
 
   await callIpc('projects:pause', project.id);
   await callIpc('projects:start-watching', project.id);
@@ -2679,6 +2800,7 @@ test('Figma cooldown survives pause and restart until package-time recovery succ
 
   const recoveredProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   assert.equal(recoveredProject.figmaSession.rateLimitRetryAt, undefined);
+  assert.equal(recoveredProject.figmaSession.trackedFiles[0].failureCategory, null);
   assert.equal(recoveredProject.figmaSession.warnings.some(warning => /rate limiting/i.test(warning)), false);
 });
 
