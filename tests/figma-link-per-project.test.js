@@ -2816,6 +2816,8 @@ test('legacy persisted unresolved Current Page session remains excluded at packa
   const usageBefore = fakeStoreInstance.get('usage.packagesThisMonth');
   const scan = await callIpc('projects:pre-package-scan', project.id);
   assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+  const categorized = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(categorized.figmaSession.trackedFiles[0].failureCategory, 'file-access');
 
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-legacy-unresolved-'));
   fs.rmSync(outputDir, { recursive: true, force: true });
@@ -2845,6 +2847,8 @@ test('package-time Current Page scope blocks when the Figma file fetch succeeds 
     const usageBefore = fakeStoreInstance.get('usage.packagesThisMonth');
     const scan = await callIpc('projects:pre-package-scan', project.id);
     assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+    const categorized = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(categorized.figmaSession.trackedFiles[0].failureCategory, 'scope');
 
     const outputDir = path.join(tmpRoot, 'out');
     const packaged = await callIpc('projects:package', project.id, outputDir);
