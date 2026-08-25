@@ -1,0 +1,111 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+
+const rendererDir = path.join(__dirname, '..', 'renderer');
+const entry = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
+const base = fs.readFileSync(path.join(rendererDir, 'styles-base.css'), 'utf8');
+const stability = fs.readFileSync(path.join(rendererDir, 'ui-stability.css'), 'utf8');
+
+function requireInOrder(source, first, second, label) {
+  const firstIndex = source.indexOf(first);
+  const secondIndex = source.indexOf(second);
+  assert.notEqual(firstIndex, -1, `${label} must contain ${first}`);
+  assert.notEqual(secondIndex, -1, `${label} must contain ${second}`);
+  assert.ok(firstIndex < secondIndex, `${label} must load ${first} before ${second}`);
+}
+
+test('renderer loads the established styles before the responsive stability layer', () => {
+  requireInOrder(
+    entry,
+    '@import url("./styles-base.css");',
+    '@import url("./ui-stability.css");',
+    'renderer/styles.css',
+  );
+});
+
+test('responsive layer explicitly neutralizes legacy fixed-width surfaces', () => {
+  assert.match(
+    base,
+    /\.project-dashboard,\s*\.asset-review-workspace\s*\{\s*min-width:\s*640px;/,
+    'the test must continue documenting the inherited fixed-width defect',
+  );
+  assert.match(
+    base,
+    /#tab-current-project\.active\s*\{\s*min-width:\s*680px;/,
+    'the test must continue documenting the inherited narrow-window defect',
+  );
+
+  assert.match(
+    stability,
+    /\.app-content,[\s\S]*?\.asset-review-workspace,[\s\S]*?#tab-settings\.active\s*\{\s*min-width:\s*0;\s*max-width:\s*100%;/,
+  );
+  assert.match(
+    stability,
+    /@media \(max-width:\s*760px\)[\s\S]*?#tab-current-project\.active,[\s\S]*?\.asset-review-workspace\s*\{\s*min-width:\s*0;/,
+  );
+  assert.match(
+    stability,
+    /#tab-settings\.active\s*\{\s*width:\s*100%;\s*grid-template-columns:\s*repeat\(auto-fit,/,
+  );
+});
+
+test('Review Assets responds to its own pane width instead of the outer window alone', () => {
+  assert.match(
+    stability,
+    /\.asset-review-workspace\s*\{[\s\S]*?container-name:\s*asset-review;[\s\S]*?container-type:\s*inline-size;/,
+  );
+  assert.match(
+    stability,
+    /@container asset-review \(max-width:\s*720px\)[\s\S]*?\.asset-review-header\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\);/,
+  );
+  assert.match(
+    stability,
+    /@container asset-review \(max-width:\s*640px\)[\s\S]*?\.asset-review-toolbar\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\);/,
+  );
+});
+
+test('asset presentation steps down from cards to a compact readable row', () => {
+  assert.match(stability, /\.asset-card-grid\s*\{\s*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\);/);
+  assert.match(
+    stability,
+    /@container asset-review \(max-width:\s*900px\)[\s\S]*?grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/,
+  );
+  assert.match(
+    stability,
+    /@container asset-review \(max-width:\s*560px\)[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,
+  );
+  assert.match(
+    stability,
+    /@container asset-review \(max-width:\s*420px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?grid-template-columns:\s*64px minmax\(0, 1fr\) auto;/,
+  );
+});
+
+test('Review Assets footer stays within the workspace instead of using negative offsets', () => {
+  const footerStart = stability.indexOf('.asset-review-footer {');
+  const footerEnd = stability.indexOf('\n}', footerStart);
+  assert.notEqual(footerStart, -1);
+  assert.notEqual(footerEnd, -1);
+  const footerRule = stability.slice(footerStart, footerEnd + 2);
+
+  assert.match(footerRule, /position:\s*sticky;/);
+  assert.match(footerRule, /right:\s*auto;/);
+  assert.match(footerRule, /left:\s*auto;/);
+  assert.match(footerRule, /width:\s*100%;/);
+  assert.doesNotMatch(footerRule, /-24px/);
+});
+
+test('stability layer avoids broad transitions and respects reduced motion', () => {
+  assert.doesNotMatch(stability, /transition:\s*all\b/);
+  assert.match(
+    stability,
+    /\.v2-drop-zone\s*\{\s*transition:[\s\S]*?border-color[\s\S]*?background-color/,
+  );
+  assert.match(
+    stability,
+    /@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?animation-duration:\s*0\.01ms !important;[\s\S]*?transition-duration:\s*0\.01ms !important;/,
+  );
+});
