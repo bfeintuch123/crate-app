@@ -9,10 +9,7 @@ const { spawnSync } = require('child_process');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const stylesHref = new URL(`file://${path.join(rendererDir, 'styles.css')}`).href;
-const rendererIndex = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
-const stabilityMatch = rendererIndex.match(/<style id="crate-ui-stability">([\s\S]*?)<\/style>/u);
-assert.ok(stabilityMatch, 'renderer/index.html must contain the source-bound UI-stability style block');
-const stabilityStyles = stabilityMatch[1];
+const stabilityStylesHref = new URL(`file://${path.join(rendererDir, 'ui-stability.css')}`).href;
 const viewports = [
   [1440, 900],
   [1200, 800],
@@ -25,6 +22,7 @@ const viewports = [
 function findBrowser() {
   const candidates = [
     process.env.CRATE_UI_TEST_BROWSER,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium',
@@ -53,7 +51,7 @@ function fixtureHtml() {
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="${stylesHref}">
-  <style>${stabilityStyles}</style>
+  <link rel="stylesheet" href="${stabilityStylesHref}">
 </head>
 <body>
   <div id="app">

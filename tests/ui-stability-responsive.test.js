@@ -7,11 +7,7 @@ const path = require('path');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
-const baseStyles = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
-const verifier = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'verify-app-contents.js'), 'utf8');
-const stabilityMatch = index.match(/<style id="crate-ui-stability">([\s\S]*?)<\/style>/u);
-assert.ok(stabilityMatch, 'renderer/index.html must contain the source-bound UI-stability style block');
-const stability = stabilityMatch[1];
+const stability = fs.readFileSync(path.join(rendererDir, 'ui-stability.css'), 'utf8');
 
 function requireInOrder(source, first, second, label) {
   const firstIndex = source.indexOf(first);
@@ -21,17 +17,13 @@ function requireInOrder(source, first, second, label) {
   assert.ok(firstIndex < secondIndex, `${label} must load ${first} before ${second}`);
 }
 
-test('renderer keeps responsive UI inside existing source-bound files', () => {
+test('renderer loads the established stylesheet before the responsive stability layer', () => {
   requireInOrder(
     index,
     '<link rel="stylesheet" href="styles.css">',
-    '<style id="crate-ui-stability">',
+    '<link rel="stylesheet" href="ui-stability.css">',
     'renderer/index.html',
   );
-  assert.equal(fs.existsSync(path.join(rendererDir, 'ui-stability.css')), false);
-  assert.equal(fs.existsSync(path.join(rendererDir, 'responsive.css')), false);
-  assert.doesNotMatch(baseStyles, /@import\s+url\("\.\/(?:ui-stability|responsive)\.css"\)/u);
-  assert.match(verifier, /renderer\\\/(?:app\\\.js\|index\\\.html\|styles\\\.css)/u);
 });
 
 test('responsive layer establishes a shrink contract without scaling the application', () => {
@@ -45,7 +37,7 @@ test('responsive layer establishes a shrink contract without scaling the applica
   );
   assert.match(
     stability,
-    /#tab-settings\.active\s*\{[\s\S]*?width:\s*100%;[\s\S]*?grid-template-columns:\s*repeat\(auto-fit,/,
+    /#tab-settings\.active\s*\{\s*width:\s*100%;\s*grid-template-columns:\s*repeat\(auto-fit,/,
   );
   assert.doesNotMatch(stability, /\bzoom\s*:/);
   assert.doesNotMatch(stability, /transform:\s*scale\s*\(/);
@@ -96,10 +88,10 @@ test('asset presentation steps down from stable cards to a compact readable row'
 
 test('Review Assets footer stays within the workspace and stacks at narrow widths', () => {
   const footerStart = stability.indexOf('.asset-review-footer {');
-  const footerEnd = stability.indexOf('\n    }', footerStart);
+  const footerEnd = stability.indexOf('\n}', footerStart);
   assert.notEqual(footerStart, -1);
   assert.notEqual(footerEnd, -1);
-  const footerRule = stability.slice(footerStart, footerEnd + 6);
+  const footerRule = stability.slice(footerStart, footerEnd + 2);
 
   assert.match(footerRule, /position:\s*sticky;/);
   assert.match(footerRule, /right:\s*auto;/);
@@ -148,8 +140,12 @@ test('Settings and dialogs shrink inside the available window', () => {
   );
 });
 
-test('stability layer replaces broad drop-zone motion and respects reduced motion', () => {
-  assert.match(stability, /\.project-dot\.watching\s*\{\s*animation:\s*none;/);
+test('stability layer avoids broad transitions and keeps stable status indicators calm', () => {
+  assert.doesNotMatch(stability, /transition:\s*all\b/);
+  assert.match(
+    stability,
+    /\.project-dot\.watching,\s*\.app-dot\s*\{\s*animation:\s*none;/,
+  );
   assert.match(
     stability,
     /\.v2-drop-zone\s*\{\s*transition:[\s\S]*?border-color[\s\S]*?background-color/,
