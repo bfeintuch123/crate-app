@@ -150,6 +150,7 @@ async function collectGeometry(window) {
         sidebar: rect('.app-sidebar'),
         main: rect('.app-main'),
         content: rect('.app-content'),
+        assetReview: rect('#asset-review-workspace'),
         back: rect('#btn-review-assets-back'),
         heading: rect('.asset-review-header > div'),
         search: rect('.asset-review-search'),
