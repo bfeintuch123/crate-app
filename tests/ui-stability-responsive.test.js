@@ -4,11 +4,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const { isAllowedAsarEntry } = require('../scripts/verify-app-contents');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
 const baseStyles = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
-const verifier = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'verify-app-contents.js'), 'utf8');
 const stabilityMatch = index.match(/<style id="crate-ui-stability">([\s\S]*?)<\/style>/u);
 assert.ok(stabilityMatch, 'renderer/index.html must contain the source-bound UI-stability style block');
 const stability = stabilityMatch[1];
@@ -31,7 +31,21 @@ test('renderer keeps responsive UI inside existing source-bound files', () => {
   assert.equal(fs.existsSync(path.join(rendererDir, 'ui-stability.css')), false);
   assert.equal(fs.existsSync(path.join(rendererDir, 'responsive.css')), false);
   assert.doesNotMatch(baseStyles, /@import\s+url\("\.\/(?:ui-stability|responsive)\.css"\)/u);
-  assert.match(verifier, /renderer\\\/(?:app\\\.js\|index\\\.html\|styles\\\.css)/u);
+
+  for (const entry of [
+    '/renderer/app.js',
+    '/renderer/index.html',
+    '/renderer/styles.css',
+  ]) {
+    assert.equal(isAllowedAsarEntry(entry), true, `${entry} must remain allowed`);
+  }
+
+  for (const entry of [
+    '/renderer/ui-stability.css',
+    '/renderer/responsive.css',
+  ]) {
+    assert.equal(isAllowedAsarEntry(entry), false, `${entry} must remain disallowed`);
+  }
 });
 
 test('responsive layer establishes a shrink contract without scaling the application', () => {
