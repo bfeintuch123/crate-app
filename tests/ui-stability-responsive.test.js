@@ -128,6 +128,13 @@ test('Review Assets footer stays within the workspace and stacks at narrow width
   );
 });
 
+test('short-height windows keep the Review Assets footer in normal flow', () => {
+  assert.match(
+    stability,
+    /@media \(max-height:\s*600px\)[\s\S]*?\.asset-review-footer\s*\{[\s\S]*?position:\s*static;[\s\S]*?bottom:\s*auto;/,
+  );
+});
+
 test('legacy narrow window wraps navigation and keeps content inside the shell', () => {
   assert.match(
     stability,
