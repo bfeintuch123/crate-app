@@ -154,6 +154,45 @@ test('coordinator permits one heavy operation and fairly coalesces overlap by ki
   assert.equal(coordinator.snapshot(projectId).running, false);
 });
 
+test('bounded per-project admission preserves distinct paths and fails closed on overflow', () => {
+  const coordinator = createWatcherCoordinator({ maxDeferredOperationsPerProject: 2 });
+  const projectId = 'bounded-project';
+  const otherProjectId = 'isolated-project';
+  coordinator.activate(projectId);
+  coordinator.activate(otherProjectId);
+
+  assert.equal(coordinator.defer(projectId, 'chokidar-add', '/tmp/first.ai'), true);
+  assert.equal(coordinator.defer(projectId, 'chokidar-add', '/tmp/second.ai'), true);
+  const beforeOverflow = coordinator.snapshot(projectId);
+  assert.equal(
+    JSON.stringify(Array.from(beforeOverflow.pendingOperations, operation => `${operation.kind}:${operation.key}`)),
+    JSON.stringify(['chokidar-add:/tmp/first.ai', 'chokidar-add:/tmp/second.ai'])
+  );
+  assert.equal(coordinator.defer(projectId, 'chokidar-add', '/tmp/third.ai'), false);
+  assert.equal(coordinator.defer(projectId, 'chokidar-add', '/tmp/fourth.ai'), false);
+  const afterOverflow = coordinator.snapshot(projectId);
+  assert.equal(
+    JSON.stringify(Array.from(afterOverflow.pendingOperations, operation => `${operation.kind}:${operation.key}`)),
+    JSON.stringify(Array.from(beforeOverflow.pendingOperations, operation => `${operation.kind}:${operation.key}`))
+  );
+  assert.equal(afterOverflow.counters.queueFull, 2);
+
+  assert.equal(coordinator.defer(projectId, 'chokidar-add', '/tmp/first.ai'), true);
+  const afterDuplicate = coordinator.snapshot(projectId);
+  assert.equal(
+    JSON.stringify(Array.from(afterDuplicate.pendingOperations, operation => `${operation.kind}:${operation.key}`)),
+    JSON.stringify(Array.from(beforeOverflow.pendingOperations, operation => `${operation.kind}:${operation.key}`))
+  );
+  assert.equal(afterDuplicate.counters.coalesced, 1);
+
+  assert.equal(coordinator.defer(otherProjectId, 'chokidar-add', '/tmp/other-first.ai'), true);
+  assert.equal(coordinator.defer(otherProjectId, 'chokidar-add', '/tmp/other-second.ai'), true);
+  assert.equal(coordinator.defer(otherProjectId, 'chokidar-add', '/tmp/other-third.ai'), false);
+  assert.equal(coordinator.snapshot(otherProjectId).counters.queueFull, 1);
+  assert.equal(coordinator.takeDeferred(projectId), 'chokidar-add');
+  assert.equal(coordinator.snapshot(otherProjectId).pendingOperations.length, 2);
+});
+
 test('overdue work applies bounded backoff instead of queue growth', () => {
   let now = 1000;
   const coordinator = createWatcherCoordinator({ now: () => now, maxBackoffMs: 8000 });
