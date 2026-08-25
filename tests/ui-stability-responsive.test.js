@@ -140,9 +140,12 @@ test('Settings and dialogs shrink inside the available window', () => {
   );
 });
 
-test('stability layer avoids broad transitions and respects reduced motion', () => {
+test('stability layer avoids broad transitions and keeps stable status indicators calm', () => {
   assert.doesNotMatch(stability, /transition:\s*all\b/);
-  assert.match(stability, /\.project-dot\.watching\s*\{\s*animation:\s*none;/);
+  assert.match(
+    stability,
+    /\.project-dot\.watching,\s*\.app-dot\s*\{\s*animation:\s*none;/,
+  );
   assert.match(
     stability,
     /\.v2-drop-zone\s*\{\s*transition:[\s\S]*?border-color[\s\S]*?background-color/,
