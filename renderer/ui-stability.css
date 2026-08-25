@@ -451,8 +451,9 @@
   }
 }
 
-/* Motion communicates active work without making stable states pulse forever. */
-.project-dot.watching {
+/* Stable status indicators should not pulse continuously. */
+.project-dot.watching,
+.app-dot {
   animation: none;
 }
 
