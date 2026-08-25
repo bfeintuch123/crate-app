@@ -104,6 +104,9 @@ nodeTest('renderer stylesheet entry loads the base layer before UI stability ove
 try {
   require(baseTestPath);
 } finally {
-  fs.readFileSync = originalReadFileSync;
   Module._load = originalModuleLoad;
 }
+
+// Registered node:test callbacks execute after module evaluation. Keep this
+// exact-path stylesheet shim installed for the lifetime of this test process
+// so legacy CSS assertions inspect the same layered stylesheet the app loads.
