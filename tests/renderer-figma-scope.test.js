@@ -37,8 +37,8 @@ fs.readFileSync = function patchedReadFileSync(filePath, options) {
   return Buffer.from(effectiveStyles, 'utf8').toString(encoding);
 };
 
-try {
-  require('./renderer-figma-scope-base.js');
-} finally {
-  fs.readFileSync = originalReadFileSync;
-}
+require('./renderer-figma-scope-base.js');
+
+// Registered node:test callbacks execute after module evaluation. Keep this
+// exact-path stylesheet shim installed for the lifetime of this test process
+// so legacy CSS assertions inspect the same layered stylesheet the app loads.
