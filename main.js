@@ -1009,8 +1009,11 @@ function isSavedOrConfirmedProjectFile(file) {
 
 function isCurrentSessionSavedSource(project, file) {
   if (!project || !file || typeof file.path !== 'string') return false;
-  if (getFileCaptureSource(file)) return false;
   const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+  if (getFileCaptureSource(file) === 'chokidar-add' && PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
+    return hasTrustedCurrentSessionFilesystemEvidence(project, file.path);
+  }
+  if (getFileCaptureSource(file)) return false;
   if (!PRIMARY_DESIGN_EXTENSIONS.has(ext)) return false;
   const watchStart = project.watchStartedAt || project.createdAt || 0;
   const addedAt = typeof file.addedAt === 'number' ? file.addedAt : 0;
@@ -1209,9 +1212,24 @@ function cleanupBroadObserverProjectState(project) {
   return changed;
 }
 
-function normalizeAutoCaptureProjectState(project) {
+function clearPersistedCurrentSessionFilesystemEvidence(project) {
   if (!project || typeof project !== 'object') return false;
   let changed = false;
+  for (const collection of [project.files, project.pendingFiles]) {
+    if (!Array.isArray(collection)) continue;
+    for (const file of collection) {
+      if (file && Object.prototype.hasOwnProperty.call(file, 'currentSessionFilesystemEvidence')) {
+        delete file.currentSessionFilesystemEvidence;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function normalizeAutoCaptureProjectState(project) {
+  if (!project || typeof project !== 'object') return false;
+  let changed = clearPersistedCurrentSessionFilesystemEvidence(project);
 
   if (!Array.isArray(project.files)) {
     project.files = [];
@@ -5125,6 +5143,7 @@ function getProjects() {
   let changed = false;
   for (const project of val) {
     if (migrateProjectFigmaLinkPrivacy(project)) changed = true;
+    if (clearPersistedCurrentSessionFilesystemEvidence(project)) changed = true;
     if (normalizeProjectAssetReviewState(project)) changed = true;
   }
   if (changed) store.set('projects', val);
@@ -5421,12 +5440,18 @@ function recordPendingFileDecision(project, fileEntry, decision) {
     }
 
     if (decision !== 'rejected') return;
+    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
+    if (!normalizedPath) return;
+
+    const exclusionKey = getAssetReviewExclusionKey(fileEntry);
+    if (exclusionKey) {
+      const excludedKeys = new Set(project.excludedAssetKeys || []);
+      excludedKeys.add(exclusionKey);
+      project.excludedAssetKeys = [...excludedKeys];
+    }
 
     const provenance = ensureProjectProvenance(project);
     if (!provenance) return;
-
-    const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
-    if (!normalizedPath) return;
 
     const sessionId = getProjectProvenanceSessionId(project, provenance);
     const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
@@ -6694,7 +6719,7 @@ const mainWindowStartupRetryTimers = new Set();
 const watchers = new Map(); // projectId -> chokidar watcher
 const watcherCoordinators = new Map(); // projectId -> one non-lsof heavy background observer at a time
 const watcherStartupTimers = new Map(); // projectId:kind -> delayed initial observer timer
-const watcherDeferredOperations = new Map(); // projectId -> one coalesced callback per observer kind
+const watcherDeferredOperations = new Map(); // projectId -> bounded deferred operation entries
 const watcherDeferredTimers = new Map(); // projectId -> bounded backoff wakeup
 const lastFileActivity = new Map(); // projectId -> timestamp
 const inactivityNotified = new Set(); // projectIds already notified
@@ -6704,19 +6729,60 @@ let watchingActivationSequence = 0;
 
 const BACKGROUND_WATCHER_BUDGET_MS = 2500;
 const BACKGROUND_WATCHER_DRAIN_TIMEOUT_MS = 15000;
+const CHOKIDAR_ADD_STAT_TIMEOUT_MS = 1000;
+const MAX_DEFERRED_WATCHER_OPERATIONS_PER_PROJECT = 64;
+const MAX_CURRENT_SESSION_FILESYSTEM_EVIDENCE_PER_PROJECT = 512;
+const currentSessionFilesystemEvidenceByProject = new Map();
+
+function currentSessionFilesystemEvidenceKey(projectId, filePath) {
+  const normalizedPath = normalizeTrackedFilePath(filePath);
+  if (!projectId || !normalizedPath) return null;
+  return `${projectId}:${normalizedPath}`;
+}
+
+function markCurrentSessionFilesystemEvidence(projectId, filePath, activationToken) {
+  const key = currentSessionFilesystemEvidenceKey(projectId, filePath);
+  if (!key || activationToken === null || activationToken === undefined) return;
+  let entries = currentSessionFilesystemEvidenceByProject.get(projectId);
+  if (!entries) {
+    entries = new Map();
+    currentSessionFilesystemEvidenceByProject.set(projectId, entries);
+  }
+  entries.delete(key);
+  entries.set(key, activationToken);
+  while (entries.size > MAX_CURRENT_SESSION_FILESYSTEM_EVIDENCE_PER_PROJECT) {
+    entries.delete(entries.keys().next().value);
+  }
+}
+
+function clearCurrentSessionFilesystemEvidence(projectId) {
+  currentSessionFilesystemEvidenceByProject.delete(projectId);
+}
+
+function hasTrustedCurrentSessionFilesystemEvidence(project, filePath) {
+  const projectId = project && project.id;
+  const key = currentSessionFilesystemEvidenceKey(projectId, filePath);
+  if (!key || !project || project.status !== 'watching') return false;
+  const entries = currentSessionFilesystemEvidenceByProject.get(projectId);
+  return !!entries && entries.get(key) === watchingActivationTokens.get(projectId);
+}
 
 /**
  * Coordinates the expensive background observers for one watching project.
  *
- * The coordinator retains at most one pending request per observer kind. This
- * prevents interval backlog while ensuring a frequent observer cannot starve
- * the other background observers indefinitely.
+ * The coordinator retains a bounded FIFO of pending operations. Periodic
+ * observers still coalesce by kind, while chokidar admissions use normalized
+ * file identity so different files cannot overwrite each other.
  */
 function createWatcherCoordinator({
   now = () => Date.now(),
   maxBackoffMs = 30000,
+  maxDeferredOperationsPerProject = 64,
 } = {}) {
   const projects = new Map();
+  const queueLimit = Number.isInteger(maxDeferredOperationsPerProject) && maxDeferredOperationsPerProject >= 0
+    ? maxDeferredOperationsPerProject
+    : 64;
 
   function stateFor(projectId) {
     let state = projects.get(projectId);
@@ -6729,7 +6795,8 @@ function createWatcherCoordinator({
         cancelled: false,
         backoffUntil: 0,
         consecutiveOverdue: 0,
-        pendingKinds: [],
+        pendingOperations: [],
+        lastDeferredKind: null,
         counters: {
           started: 0,
           completed: 0,
@@ -6738,6 +6805,8 @@ function createWatcherCoordinator({
           skippedBackoff: 0,
           deferred: 0,
           coalesced: 0,
+          invalidated: 0,
+          queueFull: 0,
           overdue: 0,
         },
         idleWaiters: [],
@@ -6752,7 +6821,8 @@ function createWatcherCoordinator({
     state.packageScanDepth += 1;
     state.generation += 1;
     state.backoffUntil = 0;
-    state.pendingKinds = [];
+    state.counters.invalidated += state.pendingOperations.length;
+    state.pendingOperations = [];
     return { projectId, generation: state.generation };
   }
 
@@ -6778,22 +6848,36 @@ function createWatcherCoordinator({
     state.generation += 1;
     state.backoffUntil = 0;
     state.packageScanDepth = 0;
-    state.pendingKinds = [];
+    state.counters.invalidated += state.pendingOperations.length;
+    state.pendingOperations = [];
   }
 
-  function defer(projectId, kind) {
+  function deferOperation(projectId, kind, operationKey = kind) {
     const state = stateFor(projectId);
-    if (state.cancelled || state.packageScanDepth > 0) return false;
-    if (state.pendingKinds.includes(kind)) {
+    if (state.cancelled || state.packageScanDepth > 0) return { accepted: false, reason: 'paused' };
+    const key = typeof operationKey === 'string' && operationKey ? operationKey : kind;
+    if (
+      (state.running && state.runningKind === kind && state.runningKey === key) ||
+      state.pendingOperations.some(operation => operation.kind === kind && operation.key === key)
+    ) {
       state.counters.coalesced += 1;
-      return true;
+      return { accepted: true, coalesced: true };
     }
-    state.pendingKinds.push(kind);
+    if (state.pendingOperations.length >= queueLimit) {
+      state.counters.queueFull += 1;
+      state.counters.invalidated += 1;
+      return { accepted: false, reason: 'queue-full', invalidated: true };
+    }
+    state.pendingOperations.push({ kind, key });
     state.counters.deferred += 1;
-    return true;
+    return { accepted: true, queued: true };
   }
 
-  function takeDeferred(projectId) {
+  function defer(projectId, kind, operationKey = kind) {
+    return deferOperation(projectId, kind, operationKey).accepted;
+  }
+
+  function takeDeferredOperation(projectId) {
     const state = stateFor(projectId);
     if (
       state.cancelled ||
@@ -6801,11 +6885,28 @@ function createWatcherCoordinator({
       state.running ||
       state.backoffUntil > now()
     ) return null;
-    return state.pendingKinds.shift() || null;
+    if (state.pendingOperations.length === 0) return null;
+    let index = 0;
+    if (state.lastDeferredKind !== null) {
+      const fairIndex = state.pendingOperations.findIndex(operation => operation.kind !== state.lastDeferredKind);
+      if (fairIndex >= 0) index = fairIndex;
+    }
+    const [operation] = state.pendingOperations.splice(index, 1);
+    state.lastDeferredKind = operation.kind;
+    return operation;
   }
 
-  function clearDeferred(projectId) {
-    stateFor(projectId).pendingKinds = [];
+  function takeDeferred(projectId) {
+    const operation = takeDeferredOperation(projectId);
+    return operation ? operation.kind : null;
+  }
+
+  function invalidateDeferred(projectId) {
+    const state = stateFor(projectId);
+    const count = state.pendingOperations.length;
+    state.pendingOperations = [];
+    state.counters.invalidated += count;
+    return count;
   }
 
   function isCurrent(projectId, generation) {
@@ -6813,7 +6914,7 @@ function createWatcherCoordinator({
     return !state.cancelled && state.generation === generation && state.packageScanDepth === 0;
   }
 
-  function tryStart(projectId, kind) {
+  function tryStart(projectId, kind, operationKey = kind) {
     const state = stateFor(projectId);
     const timestamp = now();
     if (state.cancelled || state.packageScanDepth > 0) {
@@ -6830,6 +6931,7 @@ function createWatcherCoordinator({
     }
     state.running = true;
     state.runningKind = kind;
+    state.runningKey = typeof operationKey === 'string' && operationKey ? operationKey : kind;
     state.counters.started += 1;
     return { kind, generation: state.generation, startedAt: timestamp };
   }
@@ -6839,6 +6941,7 @@ function createWatcherCoordinator({
     if (!ticket || !state.running || state.runningKind !== ticket.kind) return;
     state.running = false;
     state.runningKind = null;
+    state.runningKey = null;
     state.counters.completed += 1;
     if (overdue) {
       state.counters.overdue += 1;
@@ -6865,10 +6968,12 @@ function createWatcherCoordinator({
       generation: state.generation,
       running: state.running,
       runningKind: state.runningKind,
+      runningKey: state.runningKey,
       cancelled: state.cancelled,
       packageScanActive: state.packageScanDepth > 0,
       backoffUntil: state.backoffUntil,
-      pendingKinds: state.pendingKinds.slice(),
+      pendingKinds: state.pendingOperations.map(operation => operation.kind),
+      pendingOperations: state.pendingOperations.map(operation => ({ ...operation })),
       counters: { ...state.counters },
     };
   }
@@ -6880,7 +6985,7 @@ function createWatcherCoordinator({
     cancel,
     defer,
     takeDeferred,
-    clearDeferred,
+    invalidateDeferred,
     isCurrent,
     tryStart,
     finish,
@@ -6892,20 +6997,23 @@ function createWatcherCoordinator({
 function getWatcherCoordinator(projectId) {
   let coordinator = watcherCoordinators.get(projectId);
   if (!coordinator) {
-    coordinator = createWatcherCoordinator();
+    coordinator = createWatcherCoordinator({
+      maxDeferredOperationsPerProject: MAX_DEFERRED_WATCHER_OPERATIONS_PER_PROJECT,
+    });
     watcherCoordinators.set(projectId, coordinator);
   }
   return coordinator;
 }
 
 function activateWatcherCoordinator(projectId) {
-  clearDeferredWatcherOperations(projectId);
+  clearDeferredWatcherOperations(projectId, 'activation');
+  clearCurrentSessionFilesystemEvidence(projectId);
   return getWatcherCoordinator(projectId).activate(projectId);
 }
 
 async function pauseWatcherCoordinatorForPackage(projectId) {
   const coordinator = getWatcherCoordinator(projectId);
-  clearDeferredWatcherOperations(projectId);
+  clearDeferredWatcherOperations(projectId, 'package-scan');
   coordinator.beginPackageScan(projectId);
   let timeoutId = null;
   const drained = await Promise.race([
@@ -6928,7 +7036,8 @@ function resumeWatcherCoordinatorAfterPackage(projectId) {
 function cancelWatcherCoordinator(projectId) {
   const coordinator = watcherCoordinators.get(projectId);
   if (coordinator) coordinator.cancel(projectId);
-  clearDeferredWatcherOperations(projectId);
+  clearDeferredWatcherOperations(projectId, 'cancel');
+  clearCurrentSessionFilesystemEvidence(projectId);
   for (const [key, timerId] of watcherStartupTimers) {
     if (key.startsWith(`${projectId}:`)) {
       clearTimeout(timerId);
@@ -6937,48 +7046,97 @@ function cancelWatcherCoordinator(projectId) {
   }
 }
 
-function clearDeferredWatcherOperations(projectId) {
+function clearDeferredWatcherOperations(projectId, reason = 'lifecycle') {
+  const deferred = watcherDeferredOperations.get(projectId);
   watcherDeferredOperations.delete(projectId);
   const timerId = watcherDeferredTimers.get(projectId);
   if (timerId) clearTimeout(timerId);
   watcherDeferredTimers.delete(projectId);
+  const invalidation = { skipped: true, reason: 'coordinator-invalidated', invalidationReason: reason };
+  for (const operation of deferred || []) {
+    for (const settle of operation.waiters || []) settle(invalidation);
+  }
   const coordinator = watcherCoordinators.get(projectId);
-  if (coordinator) coordinator.clearDeferred(projectId);
+  if (coordinator) coordinator.invalidateDeferred(projectId, reason);
 }
 
-function deferWatcherOperation(projectId, kind, work) {
+function deferWatcherOperation(projectId, kind, work, operationKey = kind, settle = null) {
   const coordinator = getWatcherCoordinator(projectId);
-  if (!coordinator.defer(projectId, kind)) return false;
+  const before = coordinator.snapshot(projectId);
+  const accepted = coordinator.defer(projectId, kind, operationKey);
+  const after = coordinator.snapshot(projectId);
+  const deferredResult = {
+    accepted,
+    coalesced: accepted && after.counters.coalesced > before.counters.coalesced,
+    queued: accepted && after.counters.deferred > before.counters.deferred,
+    reason: accepted ? undefined : (
+      after.counters.queueFull > before.counters.queueFull ? 'queue-full' : 'paused'
+    ),
+    invalidated: !accepted && after.counters.queueFull > before.counters.queueFull,
+  };
+  if (!deferredResult.accepted) return deferredResult;
   let deferred = watcherDeferredOperations.get(projectId);
+  if (deferredResult.coalesced) {
+    const existing = deferred && deferred.find(item => (
+      item.kind === kind && item.operationKey === operationKey
+    ));
+    if (existing && kind !== 'chokidar-add') existing.work = work;
+    if (existing && typeof settle === 'function') existing.waiters.push(settle);
+    else if (typeof settle === 'function') settle({ skipped: true, reason: 'coordinator-coalesced' });
+    return deferredResult;
+  }
   if (!deferred) {
-    deferred = new Map();
+    deferred = [];
     watcherDeferredOperations.set(projectId, deferred);
   }
-  deferred.set(kind, work);
-  return true;
+  deferred.push({ kind, operationKey, work, waiters: typeof settle === 'function' ? [settle] : [] });
+  return deferredResult;
 }
 
 function scheduleDeferredWatcherOperation(projectId) {
   if (watcherDeferredTimers.has(projectId)) return;
   const coordinator = getWatcherCoordinator(projectId);
   const snapshot = coordinator.snapshot(projectId);
-  if (snapshot.cancelled || snapshot.packageScanActive || snapshot.running || snapshot.pendingKinds.length === 0) return;
+  if (snapshot.cancelled || snapshot.packageScanActive || snapshot.running || snapshot.pendingOperations.length === 0) return;
   const delayMs = Math.max(0, snapshot.backoffUntil - Date.now());
   const timerId = setTimeout(() => {
     watcherDeferredTimers.delete(projectId);
-    const kind = coordinator.takeDeferred(projectId);
-    if (!kind) {
+    const pendingBefore = coordinator.snapshot(projectId).pendingOperations;
+    const operationKind = coordinator.takeDeferred(projectId);
+    if (!operationKind) {
+      scheduleDeferredWatcherOperation(projectId);
+      return;
+    }
+    const pendingAfter = coordinator.snapshot(projectId).pendingOperations;
+    const operation = pendingBefore.find(candidate => (
+      candidate.kind === operationKind &&
+      !pendingAfter.some(remaining => remaining.kind === candidate.kind && remaining.key === candidate.key)
+    ));
+    if (!operation) {
       scheduleDeferredWatcherOperation(projectId);
       return;
     }
     const deferred = watcherDeferredOperations.get(projectId);
-    const work = deferred && deferred.get(kind);
+    const workIndex = deferred
+      ? deferred.findIndex(item => item.kind === operation.kind && item.operationKey === operation.key)
+      : -1;
+    const operationEntry = workIndex >= 0 ? deferred[workIndex] : null;
+    const work = operationEntry && operationEntry.work;
     if (deferred) {
-      deferred.delete(kind);
-      if (deferred.size === 0) watcherDeferredOperations.delete(projectId);
+      if (workIndex >= 0) deferred.splice(workIndex, 1);
+      if (deferred.length === 0) watcherDeferredOperations.delete(projectId);
     }
     if (typeof work === 'function') {
-      runBackgroundWatcherOperation(projectId, kind, work, { fromDeferred: true });
+      Promise.resolve(runBackgroundWatcherOperation(projectId, operation.kind, work, {
+        fromDeferred: true,
+        operationKey: operation.key,
+      })).then(result => {
+        for (const settle of operationEntry.waiters || []) settle(result);
+      }, () => {
+        for (const settle of operationEntry.waiters || []) settle({ skipped: true, reason: 'operation-error' });
+      });
+    } else if (operationEntry) {
+      for (const settle of operationEntry.waiters || []) settle({ skipped: true, reason: 'coordinator-invalidated' });
     } else {
       scheduleDeferredWatcherOperation(projectId);
     }
@@ -6998,21 +7156,41 @@ function scheduleWatcherStartupTimer(projectId, kind, delayMs, callback) {
   watcherStartupTimers.set(key, timerId);
 }
 
-async function runBackgroundWatcherOperation(projectId, kind, work, { fromDeferred = false } = {}) {
+async function runBackgroundWatcherOperation(projectId, kind, work, {
+  fromDeferred = false,
+  operationKey = kind,
+  awaitDeferred = false,
+} = {}) {
   const coordinator = getWatcherCoordinator(projectId);
   const initialSnapshot = coordinator.snapshot(projectId);
-  if (!fromDeferred && initialSnapshot.pendingKinds.length > 0) {
-    deferWatcherOperation(projectId, kind, work);
-    scheduleDeferredWatcherOperation(projectId);
-    return { skipped: true, reason: 'coordinator-deferred' };
+  if (!fromDeferred && initialSnapshot.pendingOperations.length > 0) {
+    let settle;
+    const completion = new Promise(resolve => { settle = resolve; });
+    const deferredResult = deferWatcherOperation(projectId, kind, work, operationKey, settle);
+    if (deferredResult.accepted && deferredResult.queued) scheduleDeferredWatcherOperation(projectId);
+    if (deferredResult.accepted && awaitDeferred) return completion;
+    return {
+      skipped: true,
+      reason: deferredResult.coalesced ? 'coordinator-coalesced' : (
+        deferredResult.reason === 'queue-full' ? 'coordinator-queue-full' : 'coordinator-deferred'
+      ),
+    };
   }
-  const ticket = coordinator.tryStart(projectId, kind);
+  const ticket = coordinator.tryStart(projectId, kind, operationKey);
   if (!ticket) {
     const snapshot = coordinator.snapshot(projectId);
     if (!snapshot.cancelled && !snapshot.packageScanActive) {
-      deferWatcherOperation(projectId, kind, work);
-      scheduleDeferredWatcherOperation(projectId);
-      return { skipped: true, reason: 'coordinator-deferred' };
+      let settle;
+      const completion = new Promise(resolve => { settle = resolve; });
+      const deferredResult = deferWatcherOperation(projectId, kind, work, operationKey, settle);
+      if (deferredResult.accepted && deferredResult.queued) scheduleDeferredWatcherOperation(projectId);
+      if (deferredResult.accepted && awaitDeferred) return completion;
+      return {
+        skipped: true,
+        reason: deferredResult.coalesced ? 'coordinator-coalesced' : (
+          deferredResult.reason === 'queue-full' ? 'coordinator-queue-full' : 'coordinator-deferred'
+        ),
+      };
     }
     return { skipped: true, reason: 'coordinator-paused' };
   }
@@ -12495,7 +12673,7 @@ async function isUnacceptedGenericChangeInCurrentWatchSession(project, filePath,
     try {
       stats = await fs.promises.stat(filePath);
     } catch (_error) {
-      return false;
+      return null;
     }
   }
 
@@ -12507,10 +12685,32 @@ async function isUnacceptedGenericChangeInCurrentWatchSession(project, filePath,
     !Number.isFinite(stats.mtimeMs) ||
     !Number.isFinite(stats.birthtimeMs)
   ) {
-    return false;
+    return null;
   }
 
   return stats.mtimeMs >= watchStartedAt || stats.birthtimeMs >= watchStartedAt;
+}
+
+async function getBoundedChokidarAddStats(filePath, isCurrent) {
+  if (typeof isCurrent !== 'function' || !isCurrent()) return null;
+  let timeoutId = null;
+  const statPromise = Promise.resolve()
+    .then(() => fs.promises.stat(filePath))
+    .catch(() => null);
+  let stats = null;
+  try {
+    stats = await Promise.race([
+      statPromise,
+      new Promise(resolve => {
+        timeoutId = setTimeout(() => resolve(null), CHOKIDAR_ADD_STAT_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+  if (typeof isCurrent !== 'function' || !isCurrent()) return null;
+  if (!stats || !Number.isFinite(stats.mtimeMs) || !Number.isFinite(stats.birthtimeMs)) return null;
+  return stats;
 }
 
 async function startWatching(projectId, { preserveWatchStartedAt = false } = {}) {
@@ -12825,46 +13025,108 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
     // v2.2.5: Skip temp/backup files from all design apps (Illustrator ~, Photoshop .tmp, etc.)
     if (name.includes('~') || name.endsWith('.tmp')) return;
 
-    // Small delay to let macOS write file metadata
-    await new Promise(resolve => setTimeout(resolve, 500));
-    if (!isActiveWatchingProject(projectId, activationToken)) return;
-
     // v2.2.6: Only capture PRIMARY design source files via chokidar 'add'.
     // Image/media/font/pdf files are NOT captured here — they produce false positives
     // because Finder and design app browsers briefly open images for thumbnails.
     // lsof polling is the reliable mechanism for capturing those files.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
-      const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
-      const result = mutateProject(projectId, (proj) => {
-        if (!isActiveWatchingProject(projectId, activationToken)) return null;
-        const staged = stageLiveObservedFile(proj, fileEntry, {
-          allowDirect: true,
-          appFamily: 'generic',
-          reason: 'chokidar-add',
-        });
-        if (!staged.changed) return null;
-        if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
-          recordSessionObservedFile(proj, fileEntry, {
-            kind: OBSERVER_KINDS.CHOKIDAR,
-            method: 'add',
+      await runBackgroundWatcherOperation(projectId, 'chokidar-add', async (watcherGeneration) => {
+        const coordinatorCurrent = () => (
+          getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration)
+        );
+        const capturedOperation = captureProjectOperation(projectId);
+        if (!capturedOperation) return null;
+        const operationCurrent = () => (
+          capturedOperation.current() &&
+          coordinatorCurrent() &&
+          isActiveWatchingProject(projectId, activationToken)
+        );
+        const operation = {
+          current: operationCurrent,
+          adoptScope(scope) {
+            if (!coordinatorCurrent()) return false;
+            return capturedOperation.adoptScope(scope) && coordinatorCurrent();
+          },
+        };
+        if (!operationCurrent()) return null;
+
+        // Small delay to let macOS write file metadata. Keep this inside the
+        // coordinator ticket so package drain cannot pass while admission is
+        // still unresolved.
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (!operationCurrent()) return null;
+
+        const currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+        if (!currentProject || !operationCurrent()) return null;
+        const stats = await getBoundedChokidarAddStats(filePath, operationCurrent);
+        if (!stats || !operationCurrent()) return null;
+        const addBelongsToCurrentSession = await isUnacceptedGenericChangeInCurrentWatchSession(
+          currentProject,
+          filePath,
+          stats
+        );
+        // Fail closed when bounded filesystem evidence is unavailable. Accepted
+        // files still return true from the helper so reopen/rescan behavior is
+        // preserved without treating the add event as new authority.
+        if (addBelongsToCurrentSession === null || !operationCurrent()) return null;
+
+        const fileEntry = {
+          path: filePath,
+          name,
+          ext,
+          addedAt: Date.now(),
+          source: 'chokidar-add',
+        };
+        if (!operationCurrent()) return null;
+        const result = mutateProject(projectId, (proj) => {
+          if (!operationCurrent()) return null;
+          const staged = stageLiveObservedFile(proj, fileEntry, {
+            allowDirect: addBelongsToCurrentSession === true,
+            forcePending: addBelongsToCurrentSession !== true,
+            appFamily: 'generic',
+            reason: 'chokidar-add',
+            captureReason: 'chokidar-add',
+            observerMethod: 'chokidar-add',
+            liveEvidence: {
+              source: 'chokidar-add',
+              observerMethod: 'chokidar-add',
+            },
           });
+          if (!staged.changed) return null;
+          if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
+            markCurrentSessionFilesystemEvidence(projectId, filePath, activationToken);
+            recordSessionObservedFile(proj, fileEntry, {
+              kind: OBSERVER_KINDS.CHOKIDAR,
+              method: 'add',
+            });
+          }
+          return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
+        });
+
+        if (result) {
+          lastFileActivity.set(projectId, Date.now());
+          inactivityNotified.delete(projectId);
+          if (!operationCurrent()) return null;
+          sendProjectFileStateToRenderer(projectId, activationToken);
         }
-        return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
+
+        if (!operationCurrent()) return null;
+        const updatedProject = getFreshActiveWatchingProject(projectId, activationToken);
+        if (
+          !updatedProject ||
+          !operationCurrent() ||
+          !isAcceptedProjectFilePath(updatedProject, filePath) ||
+          !SCAN_ON_OPEN_EXTENSIONS.has(ext)
+        ) return result;
+
+        if (!operationCurrent()) return null;
+        await runScanOnOpen(projectId, filePath, activationToken, operation);
+        if (!operationCurrent()) return null;
+        return result;
+      }, {
+        operationKey: normalizeTrackedFilePath(filePath),
+        awaitDeferred: true,
       });
-
-      if (result) {
-        lastFileActivity.set(projectId, Date.now());
-        inactivityNotified.delete(projectId);
-        sendProjectFileStateToRenderer(projectId, activationToken);
-      }
-
-      const updatedProject = getProjects().find(project => project.id === projectId);
-      if (
-        isAcceptedProjectFilePath(updatedProject, filePath) &&
-        SCAN_ON_OPEN_EXTENSIONS.has(ext)
-      ) {
-        await runScanOnOpen(projectId, filePath, activationToken);
-      }
     }
 
     // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed.

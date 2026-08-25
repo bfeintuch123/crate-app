@@ -1040,6 +1040,12 @@ module.exports.__crateMetadataTestHooks = {
   getWatcherCoordinatorSnapshot(projectId) {
     return getWatcherCoordinator(projectId).snapshot(projectId);
   },
+  pauseWatcherCoordinatorForPackage(projectId) {
+    return pauseWatcherCoordinatorForPackage(projectId);
+  },
+  resumeWatcherCoordinatorAfterPackage(projectId) {
+    resumeWatcherCoordinatorAfterPackage(projectId);
+  },
   activateWatcherCoordinator(projectId) {
     return activateWatcherCoordinator(projectId);
   },
@@ -1167,6 +1173,19 @@ async function emitWatcher(eventName, filePath, ...args) {
   const handler = latestWatcherHandlers()[eventName];
   assert.equal(typeof handler, 'function', `expected ${eventName} watcher handler`);
   await handler(filePath, ...args);
+}
+
+async function emitWatcherWithStats(eventName, filePath, stats) {
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function statForTest(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) return stats;
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    await emitWatcher(eventName, filePath);
+  } finally {
+    fs.promises.stat = originalStat;
+  }
 }
 
 function manualDialogFor(filePaths) {
@@ -12917,23 +12936,671 @@ test('provenance recording failure does not block manual file capture', async ()
 test('chokidar add records session observation only after primary design file add succeeds', async () => {
   const filePath = path.join(os.tmpdir(), 'layout.psd');
   fs.writeFileSync(filePath, 'older design file');
-  const oldTimestamp = new Date(Date.now() - 60000);
-  fs.utimesSync(filePath, oldTimestamp, oldTimestamp);
   const project = await createProject('Chokidar add provenance');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
 
-  await emitWatcher('add', filePath);
-  await emitWatcher('add', filePath);
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt + 1,
+    birthtimeMs: stored.watchStartedAt + 1,
+  });
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt + 1,
+    birthtimeMs: stored.watchStartedAt + 1,
+  });
 
   const fresh = await getProject(project.id);
   assert.equal(fresh.files.length, 1);
   assert.equal(fresh.files[0].path, filePath);
   assert.equal(fresh.files[0].ext, '.psd');
+  assert.equal(fresh.files[0].source, 'chokidar-add');
   assertSessionObservedFile(
     fresh,
     OBSERVER_KINDS.CHOKIDAR,
     'add',
     CONFIDENCE_BANDS.CANDIDATE
   );
+});
+
+test('chokidar add stages a pre-existing primary design file for review', async () => {
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Review_Project.ai');
+  writeSyntheticAiFile(filePath, 'pre-existing primary source');
+  const project = await createProject('Pre-existing chokidar add');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+
+  let sourceReadCount = 0;
+  const originalReadFile = fs.promises.readFile;
+  const originalReadFileSync = fs.readFileSync;
+  fs.promises.readFile = async function countSourceReads(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, candidatePath, ...args);
+  };
+  fs.readFileSync = function countSourceReadsSync(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) sourceReadCount++;
+    return originalReadFileSync.call(fs, candidatePath, ...args);
+  };
+  try {
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: stored.watchStartedAt - 10_000,
+      birthtimeMs: stored.watchStartedAt - 20_000,
+    });
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === filePath), false);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  const pending = fresh.pendingFiles.find(file => file.path === filePath);
+  assert.equal(pending.captureState, 'pending');
+  assert.equal(pending.captureReason, 'chokidar-add');
+  assert.equal(pending.source, 'chokidar-add');
+  assert.equal(pending.captureEvidence.source, 'chokidar-add');
+  assert.equal(pending.captureEvidence.observerMethod, 'chokidar-add');
+  assert.equal(pending.captureEvidence.evidenceStrength, 'broad-app-signal');
+  assert.equal(sourceReadCount, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP).length, 0);
+  assert.equal(getProvenanceNodes(fresh, NODE_TYPES.APP_PROCESS).length, 0);
+  assert.equal(getSessionObservedByMethod(fresh, 'add').length, 0);
+});
+
+test('package drain waits for an unresolved chokidar add admission and blocks its late mutation', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Drain_Race_Project.ai');
+  writeSyntheticAiFile(filePath, 'package drain race');
+  const project = await createProject('Chokidar package drain race');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  let markStatStarted;
+  let releaseStat;
+  const statStarted = new Promise(resolve => { markStatStarted = resolve; });
+  const statGate = new Promise(resolve => { releaseStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdCandidateStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) {
+      markStatStarted();
+      return statGate;
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  let drainPromise;
+  try {
+    const addPromise = emitWatcher('add', filePath);
+    await statStarted;
+    let drainSettled = false;
+    drainPromise = metadataTestHooks.pauseWatcherCoordinatorForPackage(project.id).then(result => {
+      drainSettled = true;
+      return result;
+    });
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+    assert.equal(drainSettled, false);
+    releaseStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    assert.equal(await drainPromise, true);
+    await addPromise;
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === filePath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+  } finally {
+    releaseStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    if (drainPromise) await drainPromise.catch(() => {});
+    fs.promises.stat = originalStat;
+    metadataTestHooks.resumeWatcherCoordinatorAfterPackage(project.id);
+  }
+});
+
+test('different chokidar adds queued behind coordinator contention are both admitted', async () => {
+  const firstPath = path.join(TEST_HOME, 'Desktop', 'Queued_First_Project.ai');
+  const secondPath = path.join(TEST_HOME, 'Desktop', 'Queued_Second_Project.indd');
+  writeSyntheticAiFile(firstPath, 'first queued source');
+  fs.writeFileSync(secondPath, 'second queued source');
+  const project = await createProject('Queued distinct chokidar adds');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  let releaseFirstStat;
+  let markFirstStatStarted;
+  const firstStatStarted = new Promise(resolve => { markFirstStatStarted = resolve; });
+  const firstStatGate = new Promise(resolve => { releaseFirstStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdFirstCandidateStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(firstPath)) {
+      markFirstStatStarted();
+      return firstStatGate;
+    }
+    if ([firstPath, secondPath].some(filePath => path.resolve(filePath) === path.resolve(candidatePath))) {
+      return {
+        mtimeMs: stored.watchStartedAt + 1,
+        birthtimeMs: stored.watchStartedAt + 1,
+      };
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    const firstAdd = emitWatcher('add', firstPath);
+    await firstStatStarted;
+    const secondAdd = emitWatcher('add', secondPath);
+    releaseFirstStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    await Promise.all([firstAdd, secondAdd]);
+  } finally {
+    releaseFirstStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    fs.promises.stat = originalStat;
+  }
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.filter(file => file.path === firstPath).length, 1);
+  assert.equal(fresh.files.filter(file => file.path === secondPath).length, 1);
+  assert.equal(fresh.pendingFiles.some(file => [firstPath, secondPath].includes(file.path)), false);
+  assert.equal(getSessionObservedByMethod(fresh, 'add').length, 2);
+});
+
+test('same-file duplicate chokidar adds coalesce without duplicate state or observations', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Queued_Duplicate_Project.ai');
+  writeSyntheticAiFile(filePath, 'same-file duplicate source');
+  const project = await createProject('Queued duplicate chokidar add');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  let releaseStat;
+  let markStatStarted;
+  const statStarted = new Promise(resolve => { markStatStarted = resolve; });
+  const statGate = new Promise(resolve => { releaseStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdDuplicateStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) {
+      markStatStarted();
+      return statGate;
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    const firstAdd = emitWatcher('add', filePath);
+    await statStarted;
+    const duplicateAdd = emitWatcher('add', filePath);
+    releaseStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    await Promise.all([firstAdd, duplicateAdd]);
+  } finally {
+    releaseStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    fs.promises.stat = originalStat;
+  }
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 0);
+  assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
+  assert.equal(Object.values(fresh.liveEvidenceLedger.candidates || {})
+    .filter(entry => entry.latest?.candidateName === path.basename(filePath)).length, 1);
+});
+
+test('package pause explicitly invalidates every deferred chokidar add and resume re-observes each path', async () => {
+  const blockerPath = path.join(TEST_HOME, 'Desktop', 'Package_Blocker_Project.ai');
+  const firstPath = path.join(TEST_HOME, 'Desktop', 'Package_Deferred_First_Project.ai');
+  const secondPath = path.join(TEST_HOME, 'Desktop', 'Package_Deferred_Second_Project.ai');
+  for (const filePath of [blockerPath, firstPath, secondPath]) writeSyntheticAiFile(filePath, 'package pause queue source');
+  const project = await createProject('Package deferred chokidar adds');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  let releaseBlockerStat;
+  let markBlockerStatStarted;
+  const blockerStatStarted = new Promise(resolve => { markBlockerStatStarted = resolve; });
+  const blockerStatGate = new Promise(resolve => { releaseBlockerStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdPackageBlockerStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(blockerPath)) {
+      markBlockerStatStarted();
+      return blockerStatGate;
+    }
+    if ([blockerPath, firstPath, secondPath].some(filePath => path.resolve(filePath) === path.resolve(candidatePath))) {
+      return {
+        mtimeMs: stored.watchStartedAt + 1,
+        birthtimeMs: stored.watchStartedAt + 1,
+      };
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  let drainPromise;
+  try {
+    const blockerAdd = emitWatcher('add', blockerPath);
+    await blockerStatStarted;
+    const firstAdd = emitWatcher('add', firstPath);
+    const secondAdd = emitWatcher('add', secondPath);
+    drainPromise = metadataTestHooks.pauseWatcherCoordinatorForPackage(project.id);
+    releaseBlockerStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    assert.equal(await drainPromise, true);
+    await Promise.all([blockerAdd, firstAdd, secondAdd]);
+
+    let fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => [blockerPath, firstPath, secondPath].includes(file.path)), false);
+    assert.equal(fresh.pendingFiles.some(file => [blockerPath, firstPath, secondPath].includes(file.path)), false);
+    const pausedSnapshot = metadataTestHooks.getWatcherCoordinatorSnapshot(project.id);
+    assert.ok(pausedSnapshot.counters.invalidated >= 2);
+    assert.deepEqual(pausedSnapshot.pendingKinds, []);
+
+    metadataTestHooks.resumeWatcherCoordinatorAfterPackage(project.id);
+    await Promise.all([
+      emitWatcher('add', firstPath),
+      emitWatcher('add', secondPath),
+    ]);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.path === firstPath).length, 1);
+    assert.equal(fresh.files.filter(file => file.path === secondPath).length, 1);
+  } finally {
+    releaseBlockerStat({
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    if (drainPromise) await drainPromise.catch(() => {});
+    fs.promises.stat = originalStat;
+    metadataTestHooks.resumeWatcherCoordinatorAfterPackage(project.id);
+  }
+});
+
+test('chokidar add stat timeout fails closed and cannot mutate after a late resolution', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Timed_Out_Project.ai');
+  writeSyntheticAiFile(filePath, 'bounded stat timeout');
+  const project = await createProject('Chokidar stat timeout');
+  let markStatStarted;
+  let releaseStat;
+  const statStarted = new Promise(resolve => { markStatStarted = resolve; });
+  const statGate = new Promise(resolve => { releaseStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdTimedOutStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) {
+      markStatStarted();
+      return statGate;
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  testRendererEvents.length = 0;
+  try {
+    const addPromise = emitWatcher('add', filePath);
+    await statStarted;
+    const settled = await Promise.race([
+      addPromise.then(() => true),
+      new Promise(resolve => originalSetTimeout(() => resolve(false), 1500)),
+    ]);
+    assert.equal(settled, true);
+    let fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === filePath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+    releaseStat({
+      mtimeMs: project.watchStartedAt + 1,
+      birthtimeMs: project.watchStartedAt + 1,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === filePath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+    assert.equal(testRendererEvents.some(event => event.data?.projectId === project.id), false);
+  } finally {
+    releaseStat({
+      mtimeMs: project.watchStartedAt + 1,
+      birthtimeMs: project.watchStartedAt + 1,
+    });
+    fs.promises.stat = originalStat;
+  }
+});
+
+test('a stale chokidar add cannot mutate or scan after watcher generation changes during delay or stat', async () => {
+  const delayPath = path.join(TEST_HOME, 'Desktop', 'Stale_Delay_Project.ai');
+  writeSyntheticAiFile(delayPath, 'stale during add delay');
+  const project = await createProject('Chokidar generation during delay');
+  testRendererEvents.length = 0;
+  const delayedAdd = emitWatcher('add', delayPath);
+  await new Promise(resolve => originalSetTimeout(resolve, 25));
+  metadataTestHooks.activateWatcherCoordinator(project.id);
+  await delayedAdd;
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === delayPath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === delayPath), false);
+
+  const statPath = path.join(TEST_HOME, 'Desktop', 'Stale_Stat_Project.ai');
+  writeSyntheticAiFile(statPath, 'stale during add stat');
+  let markStatStarted;
+  let releaseStat;
+  const statStarted = new Promise(resolve => { markStatStarted = resolve; });
+  const statGate = new Promise(resolve => { releaseStat = resolve; });
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function holdStaleStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(statPath)) {
+      markStatStarted();
+      return statGate;
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    const statAdd = emitWatcher('add', statPath);
+    await statStarted;
+    metadataTestHooks.activateWatcherCoordinator(project.id);
+    releaseStat({
+      mtimeMs: project.watchStartedAt + 1,
+      birthtimeMs: project.watchStartedAt + 1,
+    });
+    await statAdd;
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === statPath), false);
+    assert.equal(fresh.pendingFiles.some(file => file.path === statPath), false);
+    assert.equal(testRendererEvents.some(event => event.data?.projectId === project.id), false);
+  } finally {
+    releaseStat({
+      mtimeMs: project.watchStartedAt + 1,
+      birthtimeMs: project.watchStartedAt + 1,
+    });
+    fs.promises.stat = originalStat;
+  }
+});
+
+test('validated current-session chokidar add anchors later relevant broad link evidence', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'AnchorProject', 'Anchor_Project.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'AnchorProject', 'Anchor_Link.ai');
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  writeSyntheticAiFile(sourcePath, 'validated current-session anchor');
+  fs.writeFileSync(linkedPath, 'related broad link');
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Chokidar current-session anchor');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  await emitWatcherWithStats('add', sourcePath, {
+    mtimeMs: stored.watchStartedAt + 1,
+    birthtimeMs: stored.watchStartedAt + 1,
+  });
+  let fresh = await getProject(project.id);
+  const anchor = fresh.files.find(file => file.path === sourcePath);
+  assert.equal(anchor.source, 'chokidar-add');
+  assert.equal(Object.prototype.hasOwnProperty.call(anchor, 'currentSessionFilesystemEvidence'), false);
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid= -o command=')) {
+      return { stdout: '321 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn -p 321')) {
+      return { stdout: `p321\nf12\ntREG\nn${linkedPath}\n` };
+    }
+    return { stdout: '' };
+  });
+  await new Promise(resolve => originalSetTimeout(resolve, 75));
+  await metadataTestHooks.pollLsofForProject(
+    project.id,
+    metadataTestHooks.getActiveWatchingActivationToken(project.id)
+  );
+
+  fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath), true);
+  assert.equal(Object.values(fresh.liveEvidenceLedger.candidates || {})
+    .some(entry => entry.latest?.reason === 'broad-observer-outside-session'), false);
+});
+
+test('persisted current-session chokidar markers are cleared before they can anchor broad evidence', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'ForgedMarkerProject', 'Forged_Marker_Project.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'ForgedMarkerProject', 'Forged_Marker_Link.ai');
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.writeFileSync(sourcePath, 'forged persisted marker source');
+  fs.writeFileSync(linkedPath, 'must remain unanchored');
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Forged persisted chokidar marker');
+  await setProjectFiles(project.id, {
+    files: [{
+      path: sourcePath,
+      name: path.basename(sourcePath),
+      ext: '.ai',
+      addedAt: Date.now() - 60_000,
+      source: 'chokidar-add',
+      currentSessionFilesystemEvidence: true,
+    }],
+  });
+
+  const normalized = await getProject(project.id);
+  const persisted = normalized.files.find(file => file.path === sourcePath);
+  assert.ok(persisted);
+  assert.equal(Object.prototype.hasOwnProperty.call(persisted, 'currentSessionFilesystemEvidence'), false);
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid= -o command=')) {
+      return { stdout: '654 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn -p 654')) {
+      return { stdout: `p654\nf13\ntREG\nn${linkedPath}\n` };
+    }
+    return { stdout: '' };
+  });
+  await metadataTestHooks.pollLsofForProject(
+    project.id,
+    metadataTestHooks.getActiveWatchingActivationToken(project.id)
+  );
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath), false);
+  assert.ok(Object.values(fresh.liveEvidenceLedger.candidates || {})
+    .some(entry => entry.latest?.reason === 'broad-observer-outside-session'));
+});
+
+test('a stale pending chokidar add candidate does not anchor later broad link evidence', async () => {
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'StalePendingProject', 'Stale_Pending_Project.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'StalePendingProject', 'Stale_Pending_Link.ai');
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  writeSyntheticAiFile(sourcePath, 'stale pending candidate');
+  fs.writeFileSync(linkedPath, 'must remain unanchored');
+  setChildProcessHandler(() => ({ stdout: '' }));
+  const project = await createProject('Chokidar stale pending anchor');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  await emitWatcherWithStats('add', sourcePath, {
+    mtimeMs: stored.watchStartedAt - 10_000,
+    birthtimeMs: stored.watchStartedAt - 20_000,
+  });
+  let fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === sourcePath), true);
+  assert.equal(fresh.pendingFiles.some(file => file.currentSessionFilesystemEvidence === true), false);
+
+  setChildProcessHandler(({ kind, command }) => {
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid= -o command=')) {
+      return { stdout: '654 /Applications/Figma.app/Contents/MacOS/Figma\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn -p 654')) {
+      return { stdout: `p654\nf13\ntREG\nn${linkedPath}\n` };
+    }
+    return { stdout: '' };
+  });
+  await new Promise(resolve => originalSetTimeout(resolve, 75));
+  await metadataTestHooks.pollLsofForProject(
+    project.id,
+    metadataTestHooks.getActiveWatchingActivationToken(project.id)
+  );
+
+  fresh = await getProject(project.id);
+  assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath), false);
+  assert.ok(Object.values(fresh.liveEvidenceLedger.candidates || {})
+    .some(entry => entry.latest?.reason === 'broad-observer-outside-session'));
+});
+
+test('chokidar add keeps a moved or synchronized primary file pending when timestamps are preserved', async () => {
+  const filePath = path.join(TEST_HOME, 'Documents', 'Synced', 'Review_Project.indd');
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, 'synchronized old primary source');
+  const project = await createProject('Preserved timestamp chokidar add');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt - 1,
+    birthtimeMs: stored.watchStartedAt - 1,
+  });
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === filePath), false);
+  assert.deepEqual(fresh.pendingFiles.map(file => file.path), [filePath]);
+  assert.equal(fresh.pendingFiles[0].source, 'chokidar-add');
+});
+
+test('chokidar add stat failure leaves an unaccepted primary source untouched', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Unavailable_Project.ai');
+  writeSyntheticAiFile(filePath, 'stat evidence unavailable');
+  const project = await createProject('Chokidar add stat failure');
+  const before = await getProject(project.id);
+  const originalStat = fs.promises.stat;
+  fs.promises.stat = async function failCandidateStat(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) {
+      throw new Error('forced candidate stat failure');
+    }
+    return originalStat.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    await emitWatcher('add', filePath);
+  } finally {
+    fs.promises.stat = originalStat;
+  }
+
+  const after = await getProject(project.id);
+  assert.deepEqual(after.files, before.files);
+  assert.deepEqual(after.pendingFiles, before.pendingFiles);
+  assert.deepEqual(after.liveEvidenceLedger, before.liveEvidenceLedger);
+});
+
+test('chokidar add automatically captures a current-session primary source and scans it', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'New_Project.ai');
+  writeSyntheticAiFile(filePath, 'current-session primary source');
+  const project = await createProject('Current-session chokidar add');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const captured = await captureConsoleDuring(() => emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt + 1,
+    birthtimeMs: stored.watchStartedAt + 1,
+  }));
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.equal(fresh.files[0].source, 'chokidar-add');
+  assert.match(captured.output, /scan-on-open: scanning New_Project\.ai/);
+});
+
+test('chokidar add reopens an accepted primary source and permits a rescan', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Accepted_Reopen.ai');
+  writeSyntheticAiFile(filePath, 'accepted source reopened during session');
+  const project = await createProject('Accepted chokidar reopen');
+  await setProjectFiles(project.id, {
+    files: [{
+      path: filePath,
+      name: path.basename(filePath),
+      ext: '.ai',
+      addedAt: Date.now() - 60_000,
+      source: 'manual-browse',
+    }],
+  });
+  let sourceReadCount = 0;
+  const originalReadFile = fs.promises.readFile;
+  const originalReadFileSync = fs.readFileSync;
+  fs.promises.readFile = async function countSourceReads(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, candidatePath, ...args);
+  };
+  fs.readFileSync = function countSourceReadsSync(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) sourceReadCount++;
+    return originalReadFileSync.call(fs, candidatePath, ...args);
+  };
+  try {
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: project.watchStartedAt - 20_000,
+      birthtimeMs: project.watchStartedAt - 30_000,
+    });
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.filter(file => file.path === filePath).length, 1);
+  assert.deepEqual(fresh.pendingFiles, []);
+  assert.ok(sourceReadCount > 0, 'accepted reopen should retain scan-on-open');
+});
+
+test('accepting a pre-existing chokidar candidate moves it to files and enables parser work', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Accepted_Old_Project.ai');
+  writeSyntheticAiFile(filePath, 'old source accepted by the user');
+  const project = await createProject('Accept old chokidar candidate');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt - 10_000,
+    birthtimeMs: stored.watchStartedAt - 20_000,
+  });
+  assert.equal((await getProject(project.id)).pendingFiles.length, 1);
+
+  let sourceReadCount = 0;
+  const originalReadFile = fs.promises.readFile;
+  fs.promises.readFile = async function countSourceReads(candidatePath, ...args) {
+    if (path.resolve(candidatePath) === path.resolve(filePath)) sourceReadCount++;
+    return originalReadFile.call(fs.promises, candidatePath, ...args);
+  };
+  try {
+    const result = await callIpc('projects:accept-pending', project.id, filePath);
+    assert.equal(result.files.some(file => file.path === filePath && file.acceptedPending === true), true);
+    assert.deepEqual(result.pendingFiles, []);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+  }
+
+  const fresh = await getProject(project.id);
+  assert.ok(sourceReadCount > 0, 'accepted primary source should enable scan-on-open');
+  assert.equal(getSessionObservedByMethod(fresh, 'projects:accept-pending').length, 1);
+});
+
+test('rejecting a pre-existing chokidar candidate prevents reappearance and review inclusion', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Rejected_Old_Project.ai');
+  writeSyntheticAiFile(filePath, 'old source rejected by the user');
+  const project = await createProject('Reject old chokidar candidate');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt - 10_000,
+    birthtimeMs: stored.watchStartedAt - 20_000,
+  });
+  await callIpc('projects:reject-pending', project.id, filePath);
+  const afterReject = await getProject(project.id);
+  assert.ok(afterReject.excludedAssetKeys.includes(filePath));
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: stored.watchStartedAt - 10_000,
+    birthtimeMs: stored.watchStartedAt - 20_000,
+  });
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === filePath), false);
+  assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+  const review = await callIpcRaw('projects:prepare-package-review', project.id);
+  assert.equal(review.files.some(file => file.path === filePath || file.name === path.basename(filePath)), false);
+});
+
+test('pre-existing chokidar candidates remain pending across pause and resume without duplicate observers', async () => {
+  const filePath = path.join(TEST_HOME, 'Desktop', 'Paused_Old_Project.ai');
+  writeSyntheticAiFile(filePath, 'old source across pause and resume');
+  const project = await createProject('Pause resume old chokidar candidate');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const staleStats = {
+    mtimeMs: stored.watchStartedAt - 10_000,
+    birthtimeMs: stored.watchStartedAt - 20_000,
+  };
+  await emitWatcherWithStats('add', filePath, staleStats);
+  await callIpc('projects:pause', project.id);
+  await callIpc('projects:start-watching', project.id);
+  await emitWatcherWithStats('add', filePath, staleStats);
+
+  const fresh = await getProject(project.id);
+  assert.equal(fresh.files.some(file => file.path === filePath), false);
+  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
+  const ledgerEntry = Object.values(fresh.liveEvidenceLedger.candidates)
+    .find(entry => entry.latest && entry.latest.candidateName === path.basename(filePath));
+  assert.ok(ledgerEntry);
+  assert.equal(ledgerEntry.observations.length, 1);
+  assert.equal(ledgerEntry.latest.source, 'chokidar-add');
+  assert.equal(ledgerEntry.latest.observerMethod, 'chokidar-add');
 });
 
 test('chokidar change records observation only for a previously unseen primary design file', async () => {
@@ -13973,7 +14640,10 @@ test('failed Illustrator process snapshot does not claim generic chokidar source
 
   const project = await createProject('Illustrator process query failure');
   testRendererEvents.length = 0;
-  await emitWatcher('add', filePath);
+  await emitWatcherWithStats('add', filePath, {
+    mtimeMs: project.watchStartedAt + 1,
+    birthtimeMs: project.watchStartedAt + 1,
+  });
   const fresh = await getProject(project.id);
 
   assert.equal(fresh.files.some(file => file.path === filePath), true);
@@ -16045,7 +16715,13 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
     const project = await createProject(`Unrelated ${scopeState} scope`);
     manualDialogFor([trustedAiAnchor]);
     await callIpc('projects:add-files', project.id);
-    for (const filePath of appPaths) await emitWatcher('add', filePath);
+    const currentSessionStats = {
+      mtimeMs: project.watchStartedAt + 1,
+      birthtimeMs: project.watchStartedAt + 1,
+    };
+    for (const filePath of appPaths) {
+      await emitWatcherWithStats('add', filePath, currentSessionStats);
+    }
     await runTrackedIntervalCallbacks();
     await new Promise(resolve => originalSetTimeout(resolve, 100));
 
