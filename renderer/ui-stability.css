@@ -37,8 +37,7 @@
 }
 
 #files-view,
-.project-dashboard,
-.asset-review-workspace {
+.project-dashboard {
   width: 100%;
 }
 
@@ -52,6 +51,7 @@
   container-name: asset-review;
   container-type: inline-size;
   isolation: isolate;
+  width: 100%;
   min-height: 0;
   padding-bottom: 0;
 }
