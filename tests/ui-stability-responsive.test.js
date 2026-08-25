@@ -6,8 +6,8 @@ const fs = require('fs');
 const path = require('path');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
-const entry = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
-const base = fs.readFileSync(path.join(rendererDir, 'styles-base.css'), 'utf8');
+const html = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
+const base = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
 const stability = fs.readFileSync(path.join(rendererDir, 'ui-stability.css'), 'utf8');
 
 function requireInOrder(source, first, second, label) {
@@ -20,10 +20,10 @@ function requireInOrder(source, first, second, label) {
 
 test('renderer loads the established styles before the responsive stability layer', () => {
   requireInOrder(
-    entry,
-    '@import url("./styles-base.css");',
-    '@import url("./ui-stability.css");',
-    'renderer/styles.css',
+    html,
+    '<link rel="stylesheet" href="styles.css">',
+    '<link rel="stylesheet" href="ui-stability.css">',
+    'renderer/index.html',
   );
 });
 
