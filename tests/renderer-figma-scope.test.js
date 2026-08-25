@@ -37,8 +37,7 @@ fs.readFileSync = function patchedReadFileSync(filePath, options) {
   return Buffer.from(effectiveStyles, 'utf8').toString(encoding);
 };
 
-try {
-  require('./renderer-figma-scope-base.js');
-} finally {
-  fs.readFileSync = originalReadFileSync;
-}
+// Registered node:test callbacks execute after module evaluation. Keep the
+// exact-path stylesheet shim installed for this test worker's lifetime so
+// legacy renderer assertions see the same effective CSS that Electron loads.
+require('./renderer-figma-scope-base.js');
