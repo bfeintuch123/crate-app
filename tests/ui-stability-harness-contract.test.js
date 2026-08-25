@@ -68,6 +68,22 @@ test('UI stability harness navigates through the real project and Review Assets 
   );
 });
 
+test('UI stability harness rejects footer overlap with preceding Review Assets controls', () => {
+  for (const label of [
+    'Review Assets back control',
+    'Review Assets heading',
+    'Review Assets search',
+    'asset filters',
+    'asset summary',
+    'bulk actions',
+  ]) {
+    assert.ok(
+      harness.includes(`Review Assets footer overlaps ${label}`),
+      `harness must reject footer overlap with ${label}`,
+    );
+  }
+});
+
 test('UI stability harness rejects resize-triggered data and preview reloads', () => {
   assert.match(harness, /resizeMetrics\.getProjects !== 0/);
   assert.match(harness, /resizeMetrics\.getAssetWorkspace !== 0/);

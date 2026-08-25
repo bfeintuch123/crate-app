@@ -206,6 +206,21 @@ function evaluateGeometry(geometry, sizeLabel) {
   if (rectanglesOverlap(geometry.rects.summary, geometry.rects.actions)) {
     failures.push(`${sizeLabel}: asset summary overlaps bulk actions`);
   }
+
+  const footerOverlapTargets = [
+    ['Review Assets back control', geometry.rects.back],
+    ['Review Assets heading', geometry.rects.heading],
+    ['Review Assets search', geometry.rects.search],
+    ['asset filters', geometry.rects.filters],
+    ['asset summary', geometry.rects.summary],
+    ['bulk actions', geometry.rects.actions],
+  ];
+  for (const [label, target] of footerOverlapTargets) {
+    if (rectanglesOverlap(geometry.rects.footer, target)) {
+      failures.push(`${sizeLabel}: Review Assets footer overlaps ${label}`);
+    }
+  }
+
   if (geometry.outsideCards > 0) {
     failures.push(`${sizeLabel}: ${geometry.outsideCards} sampled cards cross the workspace boundary`);
   }
