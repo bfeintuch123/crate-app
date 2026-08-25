@@ -23,7 +23,7 @@ Make the existing Crate macOS UI adapt cleanly from its normal desktop size down
 Allowed:
 
 - inspect the exact canonical UI and window behavior inherited from PRs #226 and #227
-- update responsive layout and containment in renderer CSS
+- update responsive layout and containment inside existing source-bound renderer files
 - make the smallest semantic markup changes required in `renderer/index.html`
 - update `main.js` only after an evidence-based minimum-window decision
 - replace focused responsive test authority that encoded broken width constraints
@@ -46,16 +46,17 @@ Forbidden:
 ## Implemented Responsive Contract
 
 - retained the established `renderer/styles.css` unchanged
-- loaded one focused `renderer/ui-stability.css` layer immediately after the established stylesheet
+- placed the focused responsive contract inside the already source-bound `renderer/index.html`, after the established stylesheet link
+- removed the temporary extra renderer stylesheet so packaged-content and source-binding allowlists remain unchanged
 - neutralized inherited `640px`, `680px`, and `800px` layout pressure through later flexible rules
 - made Current Project and Review Assets respond to their actual content-pane width through container queries
 - moved Review Assets search and actions onto separate rows before collision
 - changed asset density from four columns to three, two, and a compact readable row
 - replaced the negatively offset absolute Review Assets footer with a contained sticky footer
 - made the Project Workspace dashboard, Settings, and major dialog surfaces respect the available width
-- kept the current 720px Electron minimum usable by allowing the legacy narrow navigation to wrap
+- kept the current 720px Electron minimum testable by allowing the legacy narrow navigation to wrap
 - removed the permanent project-list Watching pulse and added reduced-motion handling
-- preserved all package, watcher, Figma, quota, provenance, privacy, version, and dependency behavior
+- preserved all package, watcher, Figma, quota, provenance, privacy, version, dependency, and packaged-content policy behavior
 
 ## Test Architecture
 
@@ -63,13 +64,14 @@ Forbidden:
 - `tests/ui-stability-preload.js` exposes a test-only `window.crate` bridge without touching production preload code or real data
 - `tests/ui-stability-electron-harness.js` loads the real renderer, opens the real Project Workspace and Review Assets flow, resizes through the supported matrix, records geometry, and optionally captures screenshots
 - `tests/ui-stability-responsive-geometry.test.js` runs an independent real-Chromium geometry probe when Chrome or Chromium is available
+- focused source tests read the source-bound responsive block from `renderer/index.html`
 - focused source and fixture tests remain dependency-free and run through the existing Node test system
 
 ## State
 
 - current phase: exact-head source CI followed by macOS visual and geometry verification
-- last completed checkpoint: responsive implementation and focused test corrections pushed to the remote branch
-- last code/test head before this taskflow-only update: `aa99f11e69c857356ee3423e87ea27801ebf8fbb`
+- last completed checkpoint: source-bound responsive consolidation pushed without expanding Crate's packaged renderer inventory
+- last code/test head: `6023274b8687fe845d40be19db42320220ccad1e`
 - authoritative PR: `#231`
 - next action: obtain a passing exact-head GitHub source gate, then run synthetic large-project Mac QA without editing the implementation branch
 - blocker: authentic macOS Electron geometry and video evidence require the separate Mac QA lane
@@ -86,6 +88,7 @@ Forbidden:
 - [x] synthetic fixture and real-renderer Electron harness
 - [x] independent Chromium geometry probe
 - [x] focused source-contract tests
+- [x] packaged-content/source-binding boundary preserved
 - [ ] exact-head complete source regression gate
 - [ ] live Mac visual proof at exact PR head
 - [ ] evidence-based minimum-window decision
@@ -99,11 +102,13 @@ Forbidden:
 | --- | --- | --- | --- |
 | 2026-08-25 | Verified canonical and feature branch | `origin/v2.4.x` and the feature branch began at `fa4d3d22378f11e4bcd80c55402194bda77da398` | PASS |
 | 2026-08-25 | Confirmed Chief handoff | PR #227 merge `436c718e8d7c625673ed6bc255a9f718c58dd9b1`; PR #226 merge `fa4d3d22378f11e4bcd80c55402194bda77da398`; no active source writer reported | PASS |
-| 2026-08-25 | Added responsive presentation layer | established stylesheet unchanged; focused layer loaded from `renderer/index.html` | IMPLEMENTED |
+| 2026-08-25 | Added responsive presentation contract | focused responsive block follows `renderer/styles.css` inside source-bound `renderer/index.html` | IMPLEMENTED |
+| 2026-08-25 | Preserved packaged-content policy | no additional runtime renderer file and no release-verifier or allowlist change | PASS |
 | 2026-08-25 | Added synthetic geometry coverage | 263-asset fixture, test-only preload, real-renderer Electron harness, optional real-Chromium probe | IMPLEMENTED |
 | 2026-08-25 | Replaced stale responsive test authority | focused tests assert the shrink/reflow contract and no longer require the inherited defect | IMPLEMENTED |
 | 2026-08-25 | Earlier source gate | workflow run `32893793347`, job `97951593801` passed at an earlier responsive source head | PASS, SUPERSEDED BY NEWER HEAD |
-| 2026-08-25 | Current source gate | PR #231 exact-head rerun after focused test corrections | PENDING |
+| 2026-08-25 | Source-bound cleanup | commit `6023274b8687fe845d40be19db42320220ccad1e` | PUSHED |
+| 2026-08-25 | Current source gate | PR #231 exact-head rerun after source-bound cleanup and taskflow refresh | PENDING |
 
 ## Exact-Head Mac QA Requirements
 
@@ -124,7 +129,7 @@ Use only the committed synthetic fixture. At the exact final candidate head:
 ## Risks
 
 - Source and optional Chromium checks do not substitute for authentic macOS Electron visual judgment.
-- The separate presentation layer intentionally leaves the established visual system untouched; future visual refactors must continue loading it in the documented order.
+- The focused responsive contract is intentionally contained in an existing source-bound renderer file; future visual refactors must preserve its cascade order or deliberately migrate it with equivalent packaged-content proof.
 - The existing Electron minimum may still permit an undesirable shell transition around the legacy `760px` breakpoint; the final minimum must follow real Mac evidence.
 - Large-list DOM reconciliation, preview scheduling, scroll-anchor preservation during live updates, and renderer event coalescing are intentionally deferred to the separate smoothness phase.
 
