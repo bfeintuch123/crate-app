@@ -173,10 +173,19 @@ Attachment and storage requirements:
 - Bind the sanitized filename in the upload request and verify byte size and
   SHA-256 from destination readback before calling the attachment complete;
   GitHub's returned asset URL does not expose the original filename.
-- A GitHub PR user attachment is the sole durable publication destination for
-  visual proof. Treat the public attachment and returned CDN URL as public
-  disclosure, and add the verified bare URL only through the separately
+- Prefer the official stable GitHub CLI `--attach` path for PR video
+  publication when the installed CLI provides it.
+- Until then, allow one reviewed token-safe raw GitHub upload attempt. Accept
+  a public attachment only after exact destination byte-count and SHA-256
+  verification; treat the attachment and returned CDN URL as public
+  disclosure, and add a verified bare URL only through the separately
   authorized PR workflow.
+- If GitHub returns non-media bytes or attachment publication fails, a
+  Crabbox-validated local recording may satisfy review evidence only when
+  Bryant grants an explicit exception and the evidence includes the
+  inspection receipt, exact filename/MIME/bytes/SHA-256, exact-head binding and
+  tests, and an explicit infrastructure-blocker statement. A durable public
+  attachment URL is preferred but is not mandatory under that exception.
 
 Every affected PR must include this evidence block, once per materially changed
 workflow when one capture cannot prove all changed states:
@@ -198,28 +207,36 @@ workflow when one capture cannot prove all changed states:
 - Media type: video/mp4 | video/webm | image/png | not applicable
 - Media bytes: <exact bytes; not applicable only when UI impact is none>
 - Media SHA-256: <hash; not applicable only when UI impact is none>
-- Durable artifact URL: <GitHub user-attachment URL; not applicable only when UI impact is none>
+- Crabbox validation: PASS | not applicable
+- Inspection receipt: <owner-only receipt reference; not applicable unless the explicit exception applies>
+- Evidence exception: <Bryant's explicit exception and exact infrastructure blocker; not applicable otherwise>
+- Durable artifact URL: <verified GitHub user-attachment URL; not applicable under the explicit exception>
 
-<bare GitHub user-attachment URL; omit only when UI impact is none>
+<bare verified GitHub user-attachment URL; omit when UI impact is none or the explicit exception applies>
 ```
 
 Operational collection and validation are owned by the separately reviewed
 Crate Ops crate-crabbox workflow. Real Mac capture remains the authority for
 Crate UI proof; no runner implementation, configuration, publisher, or
 automated visual-enforcement workflow belongs in Crate App. If collection is
-unavailable or fails, retain the verified local bundle, report the exact
-blocker, and fail closed.
+unavailable or fails, retain any verified local bundle and report the exact
+blocker; it is not sufficient for the exception unless the media has the
+required Crabbox validation receipt.
 
-Do not create or reuse a GitHub release, tag, prerelease, release asset, S3,
-R2, Cloudflare, broker, or other alternate host for visual proof. The Crate Ops
-workflow may validate already-captured, already-inspected sanitized media, but
-it cannot capture or simulate the macOS app or replace real Mac QA.
+Do not create or reuse a GitHub release, tag, prerelease, or release asset for
+visual proof in Crate App. The Crate Ops workflow may validate
+already-captured, already-inspected sanitized media, but it cannot capture or
+simulate the macOS app or replace real Mac QA. Optional public Crabbox/R2
+artifact hosting remains future Crate Ops work and cannot block a Crate
+product PR.
 
 Autoreview and merge readiness must inspect the actual media, confirm it covers
 the material changed flow, check the privacy boundary, and reject missing,
 stale, misleading, or inaccessible proof. A stateful UI PR without current
-video proof is not merge-ready. If proof is genuinely infeasible, record the
-exact blocker in the PR and obtain Bryant's explicit exception before merge.
+video proof is not merge-ready unless the explicit exception above has been
+granted and every required exception field is present. If proof or publication
+is genuinely infeasible, record the exact blocker in the PR and obtain
+Bryant's explicit exception before merge.
 
 ## Release Workflow
 Follow `.codex/playbooks/release-crate.md` and `.codex/playbooks/crate-release-gate.md` as the executable release authority:
