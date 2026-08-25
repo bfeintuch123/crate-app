@@ -69,6 +69,11 @@ test('UI stability harness navigates through the real project and Review Assets 
 });
 
 test('UI stability harness rejects footer overlap with preceding Review Assets controls', () => {
+  assert.ok(
+    harness.includes('Review Assets footer overlaps ${label}'),
+    'harness must report the intersecting footer target',
+  );
+
   for (const label of [
     'Review Assets back control',
     'Review Assets heading',
@@ -78,8 +83,8 @@ test('UI stability harness rejects footer overlap with preceding Review Assets c
     'bulk actions',
   ]) {
     assert.ok(
-      harness.includes(`Review Assets footer overlaps ${label}`),
-      `harness must reject footer overlap with ${label}`,
+      harness.includes(`'${label}'`) || harness.includes(`"${label}"`),
+      `harness must measure footer overlap with ${label}`,
     );
   }
 });
