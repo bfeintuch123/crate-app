@@ -61,7 +61,11 @@ test('UI stability harness navigates through the real project and Review Assets 
   assert.match(harness, /#added-assets-list > \.asset-file-row/);
   assert.match(harness, /length === 256/);
   assert.match(harness, /#asset-review-search/);
-  assert.match(harness, /data-asset-filter=\\"added\\"/);
+  assert.ok(
+    harness.includes('data-asset-filter="added"')
+      || harness.includes('data-asset-filter=\\"added\\"'),
+    'harness must select the Added filter',
+  );
 });
 
 test('UI stability harness rejects resize-triggered data and preview reloads', () => {
