@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
-const html = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
+const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
 const base = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
 const stability = fs.readFileSync(path.join(rendererDir, 'ui-stability.css'), 'utf8');
 
@@ -18,9 +18,9 @@ function requireInOrder(source, first, second, label) {
   assert.ok(firstIndex < secondIndex, `${label} must load ${first} before ${second}`);
 }
 
-test('renderer loads the established styles before the responsive stability layer', () => {
+test('renderer loads the established stylesheet before the responsive stability layer', () => {
   requireInOrder(
-    html,
+    index,
     '<link rel="stylesheet" href="styles.css">',
     '<link rel="stylesheet" href="ui-stability.css">',
     'renderer/index.html',
@@ -125,7 +125,7 @@ test('Settings and dialogs shrink inside the available window', () => {
   );
   assert.match(
     stability,
-    /\.modal\s*\{[\s\S]*?max-width:\s*calc\(100vw - 32px\);[\s\S]*?max-height:\s*calc\(100vh - 32px\);/,
+    /\.modal\s*\{[\s\S]*?max-width:\s*calc\(100vw - 32px\);[\s\S]*?max-height:\s*calc\(100vh - 32px\);[\s\S]*?overflow-y:\s*auto;/,
   );
   assert.match(
     stability,
