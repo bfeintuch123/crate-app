@@ -25,6 +25,7 @@ const viewports = [
 function findBrowser() {
   const candidates = [
     process.env.CRATE_UI_TEST_BROWSER,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium',
