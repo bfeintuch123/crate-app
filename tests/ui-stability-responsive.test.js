@@ -7,7 +7,6 @@ const path = require('path');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const index = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
-const base = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
 const stability = fs.readFileSync(path.join(rendererDir, 'ui-stability.css'), 'utf8');
 
 function requireInOrder(source, first, second, label) {
@@ -27,18 +26,7 @@ test('renderer loads the established stylesheet before the responsive stability 
   );
 });
 
-test('responsive layer explicitly neutralizes legacy fixed-width surfaces', () => {
-  assert.match(
-    base,
-    /\.project-dashboard,\s*\.asset-review-workspace\s*\{\s*min-width:\s*640px;/,
-    'the test must continue documenting the inherited fixed-width defect',
-  );
-  assert.match(
-    base,
-    /#tab-current-project\.active\s*\{\s*min-width:\s*680px;/,
-    'the test must continue documenting the inherited narrow-window defect',
-  );
-
+test('responsive layer establishes a shrink contract without scaling the application', () => {
   assert.match(
     stability,
     /\.app-content,[\s\S]*?\.asset-review-workspace,[\s\S]*?#tab-settings\.active\s*\{\s*min-width:\s*0;\s*max-width:\s*100%;/,
@@ -115,6 +103,21 @@ test('Review Assets footer stays within the workspace and stacks at narrow width
   assert.match(
     stability,
     /@container asset-review \(max-width:\s*640px\)[\s\S]*?\.asset-review-footer\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/,
+  );
+});
+
+test('legacy narrow window wraps navigation and keeps content inside the shell', () => {
+  assert.match(
+    stability,
+    /@media \(max-width:\s*760px\)[\s\S]*?\.app-sidebar\s*\{[\s\S]*?grid-template-areas:\s*"brand"\s*"primary"\s*"support";/,
+  );
+  assert.match(
+    stability,
+    /@media \(max-width:\s*760px\)[\s\S]*?\.app-tabs,\s*\.app-tabs-secondary\s*\{\s*flex-wrap:\s*wrap;/,
+  );
+  assert.match(
+    stability,
+    /@media \(max-width:\s*760px\)[\s\S]*?\.app-tab\s*\{[\s\S]*?flex:\s*1 1 120px;[\s\S]*?min-width:\s*0;[\s\S]*?justify-content:\s*center;/,
   );
 });
 
