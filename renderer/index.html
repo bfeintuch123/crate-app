@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-44vIYhv4jL6XROuiIVEZG08KBMBNdhXS2aryWhYf6BQ='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
   <title>Crate</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1015,7 +1015,7 @@
     </div>
 
     <!-- Delete Confirmation Modal -->
-    <div class="modal-overlay hidden" id="modal-delete-confirm">
+    <div class="modal-overlay hidden" id="modal-delete-confirm" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title" aria-describedby="delete-confirm-desc" tabindex="-1">
       <div class="modal modal-centered">
         <div class="confirm-title" id="delete-confirm-title">Remove project?</div>
         <div class="confirm-desc" id="delete-confirm-desc">The files on your computer are not affected.</div>
@@ -1027,11 +1027,11 @@
     </div>
 
     <!-- Edit Figma Link Modal (per-project, Phase 2) -->
-    <div class="modal-overlay hidden" id="modal-edit-figma-link">
+    <div class="modal-overlay hidden" id="modal-edit-figma-link" role="dialog" aria-modal="true" aria-labelledby="edit-figma-title" aria-describedby="edit-figma-subtitle" tabindex="-1">
       <div class="modal">
         <div class="modal-header-area">
-          <div class="modal-title">Edit Figma Link</div>
-          <div class="modal-subtitle">Adjust the scope, or paste a new Figma URL to replace the current link.</div>
+          <div class="modal-title" id="edit-figma-title">Edit Figma Link</div>
+          <div class="modal-subtitle" id="edit-figma-subtitle">Adjust the scope, or paste a new Figma URL to replace the current link.</div>
         </div>
         <div class="modal-body">
           <div class="form-field">
@@ -1057,10 +1057,10 @@
     </div>
 
     <!-- Clear All Confirmation Modal -->
-    <div class="modal-overlay hidden" id="modal-clear-all">
+    <div class="modal-overlay hidden" id="modal-clear-all" role="dialog" aria-modal="true" aria-labelledby="clear-all-title" aria-describedby="clear-all-desc" tabindex="-1">
       <div class="modal modal-centered">
-        <div class="confirm-title">Remove all projects from Crate?</div>
-        <div class="confirm-desc">This does not delete any files from your computer. Your work stays safe.</div>
+        <div class="confirm-title" id="clear-all-title">Remove all projects from Crate?</div>
+        <div class="confirm-desc" id="clear-all-desc">This does not delete any files from your computer. Your work stays safe.</div>
         <div class="modal-actions">
           <button class="modal-btn-secondary" id="btn-clear-all-cancel">Cancel</button>
           <button class="modal-btn-danger" id="btn-clear-all-confirm">Remove All</button>
@@ -1070,7 +1070,7 @@
   </div>
 
     <!-- V2 Results Modal -->
-    <div class="modal-overlay hidden" id="modal-v2-results">
+    <div class="modal-overlay hidden" id="modal-v2-results" role="dialog" aria-modal="true" aria-labelledby="v2-result-title" aria-describedby="v2-result-subtitle" tabindex="-1">
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title" id="v2-result-title">Package Complete</div>
@@ -1088,5 +1088,142 @@
     </div>
 
   <script src="app.js"></script>
+  <script>(() => {
+  const modalConfigs = [
+    {
+      id: 'modal-delete-confirm',
+      closeId: 'btn-delete-cancel',
+      initialFocusId: 'btn-delete-cancel',
+      fallback: () => document.querySelector('.app-tab[data-tab="projects"]')
+    },
+    {
+      id: 'modal-clear-all',
+      closeId: 'btn-clear-all-cancel',
+      initialFocusId: 'btn-clear-all-cancel',
+      fallback: () => document.querySelector('#btn-clear-all')
+    },
+    {
+      id: 'modal-edit-figma-link',
+      closeId: 'btn-edit-figma-cancel',
+      initialFocusId: 'edit-figma-url',
+      fallback: () => document.querySelector('#files-figma-scope')
+        || document.querySelector('.app-tab[data-tab="current-project"]')
+    },
+    {
+      id: 'modal-v2-results',
+      closeId: 'btn-v2-done',
+      initialFocusId: 'btn-v2-done',
+      fallback: () => document.querySelector('#btn-v2-browse')
+        || document.querySelector('.app-tab[data-tab="quick-package"]')
+    }
+  ];
+  const modalState = new Map();
+  const focusableSelector = [
+    'button:not([disabled])',
+    '[href]',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    'summary',
+    '[tabindex]:not([tabindex="-1"])'
+  ].join(', ');
+
+  function setBackgroundBlocked(blocked) {
+    for (const id of ['app-sidebar', 'app-main']) {
+      const element = document.getElementById(id);
+      if (!element) continue;
+      element.inert = blocked;
+      if (blocked) element.setAttribute('aria-hidden', 'true');
+      else element.removeAttribute('aria-hidden');
+    }
+  }
+
+  function getFocusable(modal) {
+    return [...modal.querySelectorAll(focusableSelector)]
+      .filter(element => !element.disabled && element.getAttribute('aria-hidden') !== 'true');
+  }
+
+  function anyModalOpen(except = null) {
+    return [...document.querySelectorAll('.modal-overlay')]
+      .some(modal => modal !== except && !modal.classList.contains('hidden'));
+  }
+
+  function restoreFocus(config, opener) {
+    const target = opener && opener.isConnected ? opener : config.fallback?.();
+    target?.focus?.({ preventScroll: true });
+  }
+
+  function handleKeydown(event, config, modal) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      document.getElementById(config.closeId)?.click();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = getFocusable(modal);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      modal.focus();
+      return;
+    }
+    const activeIndex = focusable.indexOf(document.activeElement);
+    const movingBeforeFirst = event.shiftKey && activeIndex <= 0;
+    const movingPastLast = !event.shiftKey
+      && (activeIndex === -1 || activeIndex === focusable.length - 1);
+    if (!movingBeforeFirst && !movingPastLast) return;
+    event.preventDefault();
+    focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+  }
+
+  function openModal(config, modal) {
+    const state = modalState.get(config.id) || {};
+    if (state.open) return;
+    state.open = true;
+    state.opener = document.activeElement && !modal.contains(document.activeElement)
+      ? document.activeElement
+      : state.opener;
+    state.keydown = event => handleKeydown(event, config, modal);
+    modalState.set(config.id, state);
+    setBackgroundBlocked(true);
+    modal.addEventListener('keydown', state.keydown);
+    const target = document.getElementById(config.initialFocusId)
+      || getFocusable(modal)[0]
+      || modal;
+    target.focus?.({ preventScroll: true });
+  }
+
+  function closeModal(config, modal) {
+    const state = modalState.get(config.id);
+    if (!state?.open) return;
+    state.open = false;
+    if (state.keydown) modal.removeEventListener('keydown', state.keydown);
+    if (!anyModalOpen(modal)) setBackgroundBlocked(false);
+    restoreFocus(config, state.opener);
+    state.opener = null;
+    state.keydown = null;
+  }
+
+  function initialize() {
+    for (const config of modalConfigs) {
+      const modal = document.getElementById(config.id);
+      if (!modal) continue;
+      const sync = () => {
+        if (modal.classList.contains('hidden')) closeModal(config, modal);
+        else openModal(config, modal);
+      };
+      new MutationObserver(sync).observe(modal, {
+        attributes: true,
+        attributeFilter: ['class']
+      });
+      sync();
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initialize, { once: true });
+  } else {
+    initialize();
+  }
+})();</script>
 </body>
 </html>
