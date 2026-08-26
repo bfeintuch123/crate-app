@@ -5,52 +5,66 @@
 - created: 2026-08-26
 - updated: 2026-08-26
 - owner: ChatGPT GitHub implementation lane
-- standing order: SO-008 read-only design/product audit, followed by SO-002 scoped fix-and-PR work only for confirmed findings
+- standing order: SO-008 read-only design/product audit followed by SO-002 scoped fix-and-PR implementation
 - repo: `bfeintuch123/crate-app`
 - branch: `codex/ui-consistency-accessibility-polish`
 - base: `v2.4.x@de935e307c61674af5a684ceab4895aa650a467b`
+- draft PR: `#233 — Polish app-wide UX consistency and accessibility`
 - Phase A authority: merged PR #231
 - Phase B authority: merged PR #232
-- mode: audit-first; draft PR; no merge authority
-- status: active
+- mode: audit-first; one focused draft PR; no merge authority
+- status: production implementation complete; exact-head validation and MacBook QA pending
 
 ## Goal
 
 Apply one coherent, accessible interaction language across Crate now that Phase A stabilized desktop geometry and Phase B stabilized renderer updates, previews, and core action feedback. Phase C is a focused consistency and accessibility pass, not a redesign.
 
-## Scope
+## Implemented scope
 
-Allowed:
+Phase C now provides:
 
-- inspect Projects, Project Workspace, Quick Package, Settings, Help, Existing Assets, Package Review, package progress/completion, Figma states, and quota/upgrade states;
-- audit focus placement and restoration, keyboard order, visible focus, dialog semantics, live-status semantics, busy/disabled states, empty/loading/error/success presentation, stable dimensions, reduced motion, and residual layout shifts;
-- add focused synthetic tests and documentation;
-- change `renderer/app.js`, `renderer/index.html`, and `renderer/styles.css` only for confirmed residual Phase C findings;
-- use small atomic commits and push each completed commit immediately;
-- open and maintain one draft PR against `v2.4.x`.
+- complete accessible naming and modal semantics for Remove Project, Clear All Projects, Edit Figma Link, and Quick Package results;
+- focus entry, Tab/Shift+Tab containment, Escape close through existing safe controls, background inertness, and opener restoration for those four secondary dialogs;
+- `aria-current="page"` synchronization for the active Crate destination;
+- keyboard operation for project selection, Start/Pause Watching, and the Project Workspace Figma-link entry;
+- visible focus indicators for native and custom button-role controls;
+- keyboard reveal of the project remove control through `:focus-within`;
+- explicit accessible names and descriptions for project creation, Figma, Settings, and Edit Figma controls;
+- consistent alert/status semantics for Figma validation, warnings, linking status, and scan descriptions;
+- exact CSP hash binding for the source-bound Phase C script inside the existing packaged `renderer/index.html`;
+- focused source-contract and runtime tests;
+- a read-only exact-head MacBook QA procedure.
 
-Forbidden:
+## Protected boundaries
 
-- deferred navigation order change (`Projects → Project Workspace → Quick Package`);
-- route or selected-project behavior changes;
-- design-system or layout redesign;
-- weakening Phase A's `1100 × 760` desktop minimum or responsive containment;
-- weakening Phase B's keyed reconciliation, preview scheduling, event coalescing, or action feedback;
-- package, quota, watcher, parser, provenance, Figma semantic, persistence, privacy, credential, dependency, lockfile, version, build, signing, notarization, release, website, or deployment changes;
-- Beta 2.15 work;
-- merge without Bryant's explicit approval.
+The implementation does not change:
+
+- deferred navigation order (`Projects → Project Workspace → Quick Package` remains separate);
+- route names, selected-project behavior, active-state behavior, or Quick Package behavior;
+- Phase A's `1100 × 760` desktop minimum, responsive geometry, or containment;
+- Phase B's keyed reconciliation, preview scheduling, event coalescing, action feedback, or state preservation;
+- package selection, output, counts, quota, or transaction behavior;
+- watcher admission, file classification, or coordination;
+- parsers or provenance;
+- Figma scope, network, package-time, retry, or error-message semantics;
+- project persistence;
+- privacy, credentials, or path redaction;
+- dependencies or lockfile;
+- version, build, signing, notarization, release, Beta 2.15, website, or deployment state.
+
+No extra packaged renderer file was added. Runtime changes remain inside the existing source-bound `renderer/index.html`.
 
 ## State
 
-- current phase: C0 read-only app-wide audit
-- last completed checkpoint: canonical Phase B merge verified at `de935e307c61674af5a684ceab4895aa650a467b`; fresh Phase C branch created
-- next action: inspect current renderer and focused tests, record confirmed residual consistency/accessibility findings, and define the smallest implementation sequence
-- blocker: none
-- approval state: Bryant authorized branch, draft PR, audit, and later scoped Phase C implementation; merge not authorized
-- preferences applied: small atomic commits, immediate pushes, remote verification after every commit, one builder, no navigation reorder
-- routing decision: `crate-router` principles with SO-008 audit and SO-002 narrow implementation; Crate Fix Review Stack before merge readiness
-- workflow eval suite/result: pending
-- outcome receipt: pending
+- current phase: C3 exact-head validation and read-only QA handoff
+- last completed checkpoint: C0 audit, C1 dialog/focus consistency, C2 keyboard/naming/status/focus-visible consistency, focused test contracts, and QA procedure committed and pushed
+- next action: require successful exact-head source CI, run security/regression/Autoreview, and hand the frozen exact head to the current MacBook Chief for the committed QA procedure
+- blocker: none in the implementation lane
+- approval state: Bryant authorized Phase C implementation; merge is not authorized
+- preferences applied: one builder, small atomic commits, immediate pushes, remote verification, no navigation reorder
+- routing decision: SO-008 audit followed by SO-002 narrow fixes; Crate Fix Review Stack before merge readiness
+- workflow eval suite/result: exact-head source gate pending on the final documentation checkpoint
+- outcome receipt: pending exact-head validation and Bryant approval
 
 ## Checkpoints
 
@@ -58,14 +72,18 @@ Forbidden:
 - [x] no overlapping open UI implementation PR found
 - [x] fresh Phase C branch created
 - [x] taskflow created and pushed
-- [ ] draft PR opened
-- [ ] C0 read-only app-wide audit complete
-- [ ] confirmed findings and non-goals documented
-- [ ] C1 focus, keyboard, and dialog consistency implemented
-- [ ] C2 status, feedback, state-presentation, and motion consistency implemented
-- [ ] focused tests and Phase A/B regressions pass
-- [ ] complete source CI, security review, and Autoreview pass
-- [ ] exact-head visual proof for visible changes complete or documented exception approved
+- [x] draft PR opened
+- [x] C0 read-only app-wide audit complete
+- [x] confirmed findings and non-goals documented
+- [x] C1 dialog and focus consistency implemented
+- [x] C1 focused runtime and source contracts added
+- [x] C2 keyboard, naming, status, and focus-visible consistency implemented
+- [x] C2 focused runtime and source contracts added
+- [x] MacBook exact-head QA procedure documented
+- [ ] final focused tests and Phase A/B regressions pass on exact head
+- [ ] complete source CI passes on exact head
+- [ ] security review, regression review, and Autoreview pass
+- [ ] exact-head visual and keyboard proof complete or documented exception approved
 - [ ] Bryant approval
 - [ ] merge and Vault handoff
 - [ ] separate navigation-order PR begins only after Phase C closes
@@ -75,33 +93,47 @@ Forbidden:
 | Time | Action | Evidence | Result |
 | --- | --- | --- | --- |
 | 2026-08-26 | Resolve canonical Phase B merge | `v2.4.x@de935e307c61674af5a684ceab4895aa650a467b` | PASS |
-| 2026-08-26 | Inspect open PR ownership | Only historical documentation PR #156 open; no overlapping UI builder | PASS |
+| 2026-08-26 | Inspect open PR ownership | No overlapping open UI implementation PR | PASS |
 | 2026-08-26 | Create Phase C branch | `codex/ui-consistency-accessibility-polish` from exact canonical SHA | PASS |
+| 2026-08-26 | Open draft PR | PR #233 against `v2.4.x` | PASS |
+| 2026-08-26 | Complete read-only audit | `docs/crate/design/phase-c-ux-consistency-audit.md` | 7 confirmed findings; no redesign |
+| 2026-08-26 | Implement secondary dialog focus lifecycle | source-bound `renderer/index.html` contract | PUSHED |
+| 2026-08-26 | Implement app-wide keyboard/naming/status consistency | source-bound `renderer/index.html` contract | PUSHED |
+| 2026-08-26 | Add focused contracts | `tests/ui-consistency-*.test.js` | PUSHED |
+| 2026-08-26 | Document exact-head QA | `docs/crate/qa-smokes/ui-consistency-accessibility.md` | PUSHED |
 
-## Audit Questions
+## Confirmed audit findings closed by source implementation
 
-1. Does every modal establish an accessible dialog name, move focus inside on open, trap focus while open, and restore focus to the correct opener on close?
-2. Do meaningful async actions expose consistent immediate acknowledgement, `aria-busy`, disabled state, stable dimensions, error recovery, and duplicate-action suppression?
-3. Are status, error, success, empty, progress, and blocked states announced through appropriate `role`, `aria-live`, or `aria-atomic` semantics without duplicate announcements?
-4. Are keyboard navigation order, focus indicators, and reachable controls consistent across every supported desktop surface?
-5. Do empty/loading/error messages reserve stable space only where useful, without trapping focus on empty content or causing avoidable layout shifts?
-6. Does reduced-motion behavior cover remaining nonessential animations and transitions without suppressing essential feedback?
-7. Are there any remaining Phase B state-preservation or focus-restoration edges when keyed rows legitimately change or disappear?
+1. Secondary dialogs lacked complete dialog semantics and focus lifecycle.
+2. Project selection and watching controls were not fully keyboard-operable.
+3. Edit Figma Link entry was pointer-only.
+4. Several form and toggle controls lacked explicit accessible names.
+5. Dynamic Figma error and status surfaces lacked a uniform announcement contract.
+6. Active navigation state was visual but did not expose `aria-current`.
+7. Focus visibility and keyboard discovery of the remove action were inconsistent.
 
-## Risks
+## Risks and required review
 
-- subjective scope expansion into redesign;
-- duplicate or noisy announcements;
-- focus traps or opener restoration regressions;
-- changing established error or package semantics;
-- unnecessary animation added in the name of polish;
-- invalidating Phase A geometry or Phase B deterministic behavior;
-- accidentally implementing the deferred navigation order in this PR.
+Review must specifically guard against:
+
+- focus traps or restoration regressions;
+- duplicate or noisy status announcements;
+- project row keyboard activation interfering with nested watching/removal controls;
+- a Figma-link entry becoming focusable before its existing action is available;
+- CSP hash drift after any inline-script change;
+- focus outlines being clipped at the Phase A desktop minimum;
+- any accidental navigation reorder;
+- Phase A geometry or Phase B smoothness regressions;
+- subjective expansion into redesign.
+
+Any later runtime-affecting commit invalidates exact-head Phase C evidence.
 
 ## Handoff
 
-Next exact action:
+After exact-head CI passes, the current MacBook Chief should follow:
 
 ```text
-Complete the read-only source and test audit on the exact Phase C branch head. Record only confirmed residual consistency/accessibility findings, open the draft PR early, and do not change production renderer files until the audit defines a narrow implementation sequence.
+docs/crate/qa-smokes/ui-consistency-accessibility.md
 ```
+
+The Chief must remain read-only, use synthetic content, verify keyboard/focus/status behavior and Phase A/B regressions, and return `PASS`, `NEEDS_FIX`, or `BLOCKED` without merging or beginning the navigation-order PR.
