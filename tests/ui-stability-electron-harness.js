@@ -4,32 +4,30 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { app, BrowserWindow } = require('electron');
+const {
+  DESKTOP_WINDOW_MINIMUM,
+  applyDesktopWindowMinimum,
+} = require('../startup-phase-journal');
 
 const ROOT = path.join(__dirname, '..');
 const RENDERER_PATH = path.join(ROOT, 'renderer', 'index.html');
 const PRELOAD_PATH = path.join(__dirname, 'ui-stability-preload.js');
-const MAIN_SOURCE_PATH = path.join(ROOT, 'main.js');
 const SHOW_WINDOW = process.env.CRATE_UI_SHOW === '1';
 const EVIDENCE_DIR = process.env.CRATE_UI_EVIDENCE_DIR
   ? path.resolve(process.env.CRATE_UI_EVIDENCE_DIR)
   : null;
 const TOLERANCE_PX = 1;
 const TEST_TIMEOUT_MS = 30_000;
+const BELOW_MINIMUM_REQUEST = Object.freeze({ width: 720, height: 560 });
 const temporaryUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-ui-stability-'));
 
 app.setPath('userData', temporaryUserData);
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
 function readConfiguredMinimumWindow() {
-  const source = fs.readFileSync(MAIN_SOURCE_PATH, 'utf8');
-  const minWidthMatch = source.match(/minWidth:\s*(\d+)/);
-  const minHeightMatch = source.match(/minHeight:\s*(\d+)/);
-  if (!minWidthMatch || !minHeightMatch) {
-    throw new Error('Could not resolve Crate minimum BrowserWindow dimensions.');
-  }
   return {
-    width: Number(minWidthMatch[1]),
-    height: Number(minHeightMatch[1]),
+    width: DESKTOP_WINDOW_MINIMUM.width,
+    height: DESKTOP_WINDOW_MINIMUM.height,
   };
 }
 
@@ -95,6 +93,21 @@ async function waitForPreviewMetricsToSettle(window) {
   throw new Error('Preview request metrics did not settle.');
 }
 
+function readWindowContract(window) {
+  const [width, height] = window.getSize();
+  const [minimumWidth, minimumHeight] = window.getMinimumSize();
+  return {
+    outerSize: { width, height },
+    minimumSize: { width: minimumWidth, height: minimumHeight },
+  };
+}
+
+async function setOuterSize(window, size) {
+  window.setSize(size.width, size.height, false);
+  await settleLayout(window);
+  return readWindowContract(window);
+}
+
 async function collectGeometry(window) {
   return window.webContents.executeJavaScript(`(() => {
     const rect = selector => {
@@ -135,6 +148,12 @@ async function collectGeometry(window) {
     const activeFilter = document.querySelector('.asset-filter.active')?.dataset.assetFilter || null;
     const root = document.documentElement;
     const body = document.body;
+    const navigationButtons = [...document.querySelectorAll('.app-tab')];
+    const navigationLabelsVisible = navigationButtons.length > 0 && navigationButtons.every(button => {
+      const value = button.getBoundingClientRect();
+      return value.width > 1 && value.height > 1 && button.textContent.trim().length > 0;
+    });
+    const sidebarRect = document.querySelector('.app-sidebar')?.getBoundingClientRect() || null;
     return {
       viewport: { width: window.innerWidth, height: window.innerHeight },
       root: { clientWidth: root.clientWidth, scrollWidth: root.scrollWidth },
@@ -146,6 +165,15 @@ async function collectGeometry(window) {
       currentProject: dimensions('#tab-current-project'),
       filesView: dimensions('#files-view'),
       assetReview: dimensions('#asset-review-workspace'),
+      desktopNavigation: {
+        compactNavigationActive: window.matchMedia('(max-width: 760px)').matches,
+        labelsVisible: navigationLabelsVisible,
+        sidebarVisible: Boolean(
+          sidebarRect
+          && sidebarRect.width >= 180
+          && sidebarRect.height >= window.innerHeight - 2
+        ),
+      },
       rects: {
         sidebar: rect('.app-sidebar'),
         main: rect('.app-main'),
@@ -173,7 +201,7 @@ async function collectGeometry(window) {
   })()`, true);
 }
 
-function evaluateGeometry(geometry, sizeLabel) {
+function evaluateGeometry(geometry, sizeLabel, requestedSize, windowContract, configuredMinimum) {
   const failures = [];
   const assertFits = (label, dimensions) => {
     if (!dimensions) failures.push(`${sizeLabel}: missing ${label}`);
@@ -183,6 +211,25 @@ function evaluateGeometry(geometry, sizeLabel) {
       );
     }
   };
+
+  if (
+    windowContract.minimumSize.width !== configuredMinimum.width
+    || windowContract.minimumSize.height !== configuredMinimum.height
+  ) {
+    failures.push(
+      `${sizeLabel}: BrowserWindow minimum ${windowContract.minimumSize.width}x${windowContract.minimumSize.height} `
+      + `does not match ${configuredMinimum.width}x${configuredMinimum.height}`,
+    );
+  }
+  if (
+    windowContract.outerSize.width !== requestedSize.width
+    || windowContract.outerSize.height !== requestedSize.height
+  ) {
+    failures.push(
+      `${sizeLabel}: requested outer size ${requestedSize.width}x${requestedSize.height}, observed `
+      + `${windowContract.outerSize.width}x${windowContract.outerSize.height}`,
+    );
+  }
 
   if (geometry.root.scrollWidth > geometry.root.clientWidth + TOLERANCE_PX) {
     failures.push(`${sizeLabel}: document has horizontal overflow`);
@@ -197,6 +244,15 @@ function evaluateGeometry(geometry, sizeLabel) {
   assertFits('files view', geometry.filesView);
   assertFits('Review Assets', geometry.assetReview);
 
+  if (geometry.desktopNavigation.compactNavigationActive) {
+    failures.push(`${sizeLabel}: compact navigation is active at a supported desktop size`);
+  }
+  if (!geometry.desktopNavigation.labelsVisible) {
+    failures.push(`${sizeLabel}: desktop navigation labels are not all visible`);
+  }
+  if (!geometry.desktopNavigation.sidebarVisible) {
+    failures.push(`${sizeLabel}: persistent desktop sidebar is not visible`);
+  }
   if (rectanglesOverlap(geometry.rects.sidebar, geometry.rects.main)) {
     failures.push(`${sizeLabel}: sidebar overlaps main content`);
   }
@@ -249,10 +305,10 @@ function evaluateGeometry(geometry, sizeLabel) {
   return failures;
 }
 
-async function captureScreenshot(window, size) {
+async function captureScreenshot(window, label) {
   if (!EVIDENCE_DIR) return null;
   fs.mkdirSync(EVIDENCE_DIR, { recursive: true });
-  const name = `crate-ui-stability-${size.width}x${size.height}.png`;
+  const name = `crate-ui-stability-${label}.png`;
   const destination = path.join(EVIDENCE_DIR, name);
   const image = await window.webContents.capturePage();
   fs.writeFileSync(destination, image.toPNG(), { mode: 0o600 });
@@ -261,24 +317,21 @@ async function captureScreenshot(window, size) {
 
 async function run() {
   const configuredMinimum = readConfiguredMinimumWindow();
-  const sizes = uniqueSizes([
-    { width: 1440, height: 900 },
-    { width: 1280, height: 800 },
-    { width: 1200, height: 800 },
-    { width: 1100, height: 760 },
-    { width: 1040, height: 760 },
-    { width: 960, height: 760 },
-    { width: 900, height: 700 },
+  const supportedSizes = uniqueSizes([
     configuredMinimum,
+    { width: 1200, height: 800 },
+    { width: 1280, height: 800 },
+    { width: 1440, height: 900 },
   ]);
   const pageErrors = [];
   const consoleErrors = [];
   const results = [];
   const failures = [];
 
+  const initialSize = supportedSizes[supportedSizes.length - 1];
   const window = new BrowserWindow({
-    width: sizes[0].width,
-    height: sizes[0].height,
+    width: initialSize.width,
+    height: initialSize.height,
     show: SHOW_WINDOW,
     backgroundColor: '#ffffff',
     webPreferences: {
@@ -289,6 +342,7 @@ async function run() {
       webSecurity: true,
     },
   });
+  applyDesktopWindowMinimum(window);
 
   window.webContents.on('console-message', (_event, level, message) => {
     if (level >= 3) consoleErrors.push(String(message));
@@ -331,21 +385,61 @@ async function run() {
     const initialPreviewMetrics = await waitForPreviewMetricsToSettle(window);
     await window.webContents.executeJavaScript('window.crateUiHarness.resetMetrics()', true);
 
-    for (const size of sizes) {
-      window.setContentSize(size.width, size.height, false);
-      await settleLayout(window);
+    const requestedBelowMinimum = BELOW_MINIMUM_REQUEST;
+    const clampedWindowContract = await setOuterSize(window, requestedBelowMinimum);
+    const clampedGeometry = await collectGeometry(window);
+    const clampFailures = [];
+    if (
+      clampedWindowContract.outerSize.width !== configuredMinimum.width
+      || clampedWindowContract.outerSize.height !== configuredMinimum.height
+    ) {
+      clampFailures.push(
+        `below-minimum request ${requestedBelowMinimum.width}x${requestedBelowMinimum.height} produced `
+        + `${clampedWindowContract.outerSize.width}x${clampedWindowContract.outerSize.height} instead of `
+        + `${configuredMinimum.width}x${configuredMinimum.height}`,
+      );
+    }
+    if (clampedGeometry.desktopNavigation.compactNavigationActive) {
+      clampFailures.push('below-minimum request activated compact navigation after native clamping');
+    }
+    if (!clampedGeometry.desktopNavigation.sidebarVisible) {
+      clampFailures.push('below-minimum request did not preserve the desktop sidebar after native clamping');
+    }
+    failures.push(...clampFailures);
+    const minimumClamp = {
+      requested: requestedBelowMinimum,
+      actualWindow: clampedWindowContract,
+      actualViewport: clampedGeometry.viewport,
+      desktopNavigation: clampedGeometry.desktopNavigation,
+      failures: clampFailures,
+      screenshot: await captureScreenshot(
+        window,
+        `requested-${requestedBelowMinimum.width}x${requestedBelowMinimum.height}-clamped-to-${clampedWindowContract.outerSize.width}x${clampedWindowContract.outerSize.height}`,
+      ),
+    };
+
+    for (const size of supportedSizes) {
+      const windowContract = await setOuterSize(window, size);
       const geometry = await collectGeometry(window);
       const sizeLabel = `${size.width}x${size.height}`;
-      const sizeFailures = evaluateGeometry(geometry, sizeLabel);
+      const sizeFailures = evaluateGeometry(
+        geometry,
+        sizeLabel,
+        size,
+        windowContract,
+        configuredMinimum,
+      );
       failures.push(...sizeFailures);
       results.push({
-        size,
+        requestedSize: size,
+        windowContract,
         geometry,
         failures: sizeFailures,
-        screenshot: await captureScreenshot(window, size),
+        screenshot: await captureScreenshot(window, sizeLabel),
       });
     }
 
+    await setOuterSize(window, configuredMinimum);
     await window.webContents.executeJavaScript(`(() => {
       const search = document.querySelector('#asset-review-search');
       search.value = 'Synthetic_Figma_Asset_00';
@@ -354,17 +448,18 @@ async function run() {
     })()`, true);
     await settleLayout(window);
     const beforeStateResize = await collectGeometry(window);
-    window.setContentSize(1200, 800, false);
-    await settleLayout(window);
-    window.setContentSize(configuredMinimum.width, configuredMinimum.height, false);
-    await settleLayout(window);
+    await setOuterSize(window, { width: 1440, height: 900 });
+    await setOuterSize(window, configuredMinimum);
     const afterStateResize = await collectGeometry(window);
 
     if (afterStateResize.searchValue !== beforeStateResize.searchValue) {
-      failures.push('search query changed during resize sequence');
+      failures.push('search query changed during minimum-to-wide-to-minimum resize sequence');
     }
     if (afterStateResize.activeFilter !== beforeStateResize.activeFilter) {
-      failures.push('active asset filter changed during resize sequence');
+      failures.push('active asset filter changed during minimum-to-wide-to-minimum resize sequence');
+    }
+    if (afterStateResize.desktopNavigation.compactNavigationActive) {
+      failures.push('compact navigation activated during supported resize sequence');
     }
 
     const resizeMetrics = await window.webContents.executeJavaScript(
@@ -382,8 +477,10 @@ async function run() {
     }
 
     const report = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       configuredMinimum,
+      supportedSizes,
+      minimumClamp,
       fixture: await window.webContents.executeJavaScript('window.crateUiHarness.getExpected()', true),
       initialPreviewMetrics,
       resizeMetrics,
@@ -391,6 +488,7 @@ async function run() {
       consoleErrors,
       results,
       statePreservation: {
+        sequence: 'minimum-to-wide-to-minimum',
         before: {
           searchValue: beforeStateResize.searchValue,
           activeFilter: beforeStateResize.activeFilter,

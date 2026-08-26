@@ -29,20 +29,18 @@ test('UI stability Electron harness and test-only preload parse without producti
   assert.match(preload, /contextBridge\.exposeInMainWorld\('crateUiHarness'/);
 });
 
-test('UI stability harness measures the supported resize matrix and actual overflow geometry', () => {
+test('UI stability harness measures only the supported desktop resize matrix', () => {
   for (const size of [
-    '1440, height: 900',
-    '1280, height: 800',
     '1200, height: 800',
-    '1100, height: 760',
-    '1040, height: 760',
-    '960, height: 760',
-    '900, height: 700',
+    '1280, height: 800',
+    '1440, height: 900',
   ]) {
-    assert.ok(harness.includes(size), `missing resize matrix entry ${size}`);
+    assert.ok(harness.includes(size), `missing supported resize matrix entry ${size}`);
   }
 
-  assert.match(harness, /readConfiguredMinimumWindow\(\)/);
+  assert.match(harness, /DESKTOP_WINDOW_MINIMUM/);
+  assert.match(harness, /supportedSizes/);
+  assert.doesNotMatch(harness, /\{ width: 900, height: 700 \}/);
   assert.match(harness, /document\.documentElement/);
   assert.match(harness, /scrollWidth/);
   assert.match(harness, /clientWidth/);
@@ -52,6 +50,26 @@ test('UI stability harness measures the supported resize matrix and actual overf
   assert.match(harness, /minimumMeasuredCardWidth/);
   assert.match(harness, /capturePage\(\)/);
   assert.match(harness, /CRATE_UI_EVIDENCE_DIR/);
+});
+
+test('UI stability harness proves native below-minimum requests are clamped', () => {
+  assert.match(harness, /BELOW_MINIMUM_REQUEST\s*=\s*Object\.freeze\(\{ width: 720, height: 560 \}\)/);
+  assert.match(harness, /window\.setSize\(size\.width, size\.height, false\)/);
+  assert.match(harness, /window\.getSize\(\)/);
+  assert.match(harness, /window\.getMinimumSize\(\)/);
+  assert.match(harness, /minimumClamp/);
+  assert.match(harness, /below-minimum request/);
+  assert.match(harness, /actualWindow/);
+  assert.match(harness, /actualViewport/);
+});
+
+test('UI stability harness requires the persistent desktop navigation at supported sizes', () => {
+  assert.match(harness, /compactNavigationActive/);
+  assert.match(harness, /labelsVisible/);
+  assert.match(harness, /sidebarVisible/);
+  assert.match(harness, /compact navigation is active at a supported desktop size/);
+  assert.match(harness, /persistent desktop sidebar is not visible/);
+  assert.match(harness, /compact navigation activated during supported resize sequence/);
 });
 
 test('UI stability harness navigates through the real project and Review Assets controls', () => {
@@ -90,11 +108,12 @@ test('UI stability harness rejects footer overlap with preceding Review Assets c
 });
 
 test('UI stability harness rejects resize-triggered data and preview reloads', () => {
+  assert.match(harness, /minimum-to-wide-to-minimum/);
   assert.match(harness, /resizeMetrics\.getProjects !== 0/);
   assert.match(harness, /resizeMetrics\.getAssetWorkspace !== 0/);
   assert.match(harness, /resizeMetrics\.getFileVisual !== 0/);
-  assert.match(harness, /search query changed during resize sequence/);
-  assert.match(harness, /active asset filter changed during resize sequence/);
+  assert.match(harness, /search query changed during minimum-to-wide-to-minimum resize sequence/);
+  assert.match(harness, /active asset filter changed during minimum-to-wide-to-minimum resize sequence/);
 });
 
 test('UI stability harness uses the existing Electron dependency and remains outside packaged app files', () => {

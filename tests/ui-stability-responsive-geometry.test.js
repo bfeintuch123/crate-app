@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { DESKTOP_WINDOW_MINIMUM } = require('../startup-phase-journal');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
 const stylesHref = new URL(`file://${path.join(rendererDir, 'styles.css')}`).href;
@@ -15,11 +16,9 @@ assert.ok(stabilityMatch, 'renderer/index.html must contain the source-bound UI-
 const stabilityStyles = stabilityMatch[1];
 const viewports = [
   [1440, 900],
+  [1280, 800],
   [1200, 800],
-  [960, 760],
-  [900, 700],
-  [760, 680],
-  [720, 640],
+  [DESKTOP_WINDOW_MINIMUM.width, DESKTOP_WINDOW_MINIMUM.height],
 ];
 
 function findBrowser() {
@@ -115,11 +114,17 @@ function fixtureHtml() {
     const reviewRect = rect('#asset-review-workspace');
     const headerRect = rect('#review-copy');
     const searchRect = rect('.asset-review-search');
+    const filtersRect = rect('.asset-review-filters');
     const summaryRect = rect('#asset-review-summary');
     const actionsRect = rect('.asset-review-toolbar .asset-panel-actions');
     const footerRect = rect('.asset-review-footer');
+    const sidebarRect = rect('.app-sidebar');
     const cardRects = cards.slice(0, 12).map(card => card.getBoundingClientRect());
     const columns = getComputedStyle(grid).gridTemplateColumns.split(/\\s+/).filter(Boolean).length;
+    const navigationLabelsVisible = Array.from(document.querySelectorAll('.app-tab')).every(button => {
+      const value = button.getBoundingClientRect();
+      return value.width > 1 && value.height > 1 && button.textContent.trim().length > 0;
+    });
     const metrics = {
       innerWidth,
       root: { clientWidth: root.clientWidth, scrollWidth: root.scrollWidth },
@@ -128,8 +133,14 @@ function fixtureHtml() {
       review: { clientWidth: review.clientWidth, scrollWidth: review.scrollWidth },
       columns,
       minimumCardWidth: Math.min(...cardRects.map(card => card.width)),
+      compactNavigationActive: matchMedia('(max-width: 760px)').matches,
+      navigationLabelsVisible,
+      desktopSidebarVisible: sidebarRect.width >= 180 && sidebarRect.height >= innerHeight - 2,
       headerSearchOverlap: overlaps(headerRect, searchRect),
       summaryActionsOverlap: overlaps(summaryRect, actionsRect),
+      footerFiltersOverlap: overlaps(footerRect, filtersRect),
+      footerSummaryOverlap: overlaps(footerRect, summaryRect),
+      footerActionsOverlap: overlaps(footerRect, actionsRect),
       footerContained: within(footerRect, reviewRect) && footerRect.right <= reviewRect.right + 1,
       cardsContained: cardRects.every(card => within(card, reviewRect) && card.right <= reviewRect.right + 1),
       query: document.querySelector('.asset-review-search input').value,
@@ -171,7 +182,7 @@ function runGeometryProbe(browser, width, height) {
 
 const browser = findBrowser();
 
-test('real browser geometry keeps Review Assets inside the Crate shell', {
+test('real browser geometry keeps supported desktop Review Assets inside the Crate shell', {
   skip: browser ? false : 'Chrome or Chromium is not available in this environment',
   timeout: 120_000,
 }, () => {
@@ -183,11 +194,17 @@ test('real browser geometry keeps Review Assets inside the Crate shell', {
     assert.ok(metrics.app.scrollWidth <= metrics.app.clientWidth + 1, `${label}: app must not overflow horizontally`);
     assert.ok(metrics.content.scrollWidth <= metrics.content.clientWidth + 1, `${label}: content must not overflow horizontally`);
     assert.ok(metrics.review.scrollWidth <= metrics.review.clientWidth + 1, `${label}: Review Assets must not overflow horizontally`);
+    assert.equal(metrics.compactNavigationActive, false, `${label}: compact navigation is not a supported desktop layout`);
+    assert.equal(metrics.navigationLabelsVisible, true, `${label}: desktop navigation labels must remain visible`);
+    assert.equal(metrics.desktopSidebarVisible, true, `${label}: desktop sidebar must remain visible`);
     assert.equal(metrics.headerSearchOverlap, false, `${label}: heading and search must not overlap`);
     assert.equal(metrics.summaryActionsOverlap, false, `${label}: summary and bulk actions must not overlap`);
+    assert.equal(metrics.footerFiltersOverlap, false, `${label}: footer must not overlap filters`);
+    assert.equal(metrics.footerSummaryOverlap, false, `${label}: footer must not overlap summary`);
+    assert.equal(metrics.footerActionsOverlap, false, `${label}: footer must not overlap bulk actions`);
     assert.equal(metrics.footerContained, true, `${label}: footer must stay inside Review Assets`);
     assert.equal(metrics.cardsContained, true, `${label}: cards must stay inside Review Assets`);
-    assert.ok(metrics.minimumCardWidth >= 120, `${label}: asset presentation must remain readable`);
+    assert.ok(metrics.minimumCardWidth >= 150, `${label}: asset presentation must remain readable`);
     assert.equal(metrics.query, 'synthetic query', `${label}: search state must survive layout`);
   }
 });
