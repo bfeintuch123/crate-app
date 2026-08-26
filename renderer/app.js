@@ -1830,12 +1830,13 @@ function setAssetPanelCount(element, includedCount, totalCount = includedCount) 
 function renderAssetPanelList(list, project, files, options = {}) {
   if (!list) return;
   if (!Array.isArray(files) || files.length === 0) {
-    reconcileKeyedList(list, [{ empty: true }], () => {
+    const emptyMessage = options.emptyMessage || 'No assets in this group.';
+    reconcileKeyedList(list, [{ empty: true, message: emptyMessage }], item => {
       const empty = document.createElement('div');
       empty.className = 'asset-panel-empty';
-      empty.textContent = options.emptyMessage || 'No assets in this group.';
+      empty.textContent = item.message;
       return empty;
-    }, () => 'empty');
+    }, item => `empty:${item.message}`);
     return;
   }
   reconcileKeyedList(list, files, file => createAssetFileRow(project, file, {

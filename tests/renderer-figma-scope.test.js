@@ -1582,6 +1582,159 @@ test('file visual queue stays bounded and cancels stale queued work on project s
   assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 0);
 });
 
+test('file visual demand stays bounded while every required visible preview eventually loads', async () => {
+  const pngData = `data:image/png;base64,${Buffer.from('visible').toString('base64')}`;
+  const pending = [];
+  const calls = [];
+  let active = 0;
+  let maxActive = 0;
+  let maxQueue = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: (projectId, identity) => {
+      calls.push([projectId, identity]);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      return new Promise(resolve => pending.push({ identity, resolve }));
+    },
+  } });
+  renderer.setActiveFileVisualProject('stress-project');
+
+  const requests = [];
+  for (let index = 0; index < 500; index += 1) {
+    requests.push(renderer.requestFileVisual(
+      'stress-project',
+      `asset-${index}`,
+      `revision-${index}`,
+      10
+    ));
+  }
+  const observeBounds = () => {
+    maxQueue = Math.max(maxQueue, vm.runInContext('fileVisualQueue.length', renderer));
+    assert.ok(vm.runInContext('fileVisualQueue.length', renderer) <= 128);
+    assert.ok(vm.runInContext('fileVisualActiveRequests', renderer) <= 4);
+    assert.ok(vm.runInContext('fileVisualInFlight.size', renderer) <= 501);
+  };
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.equal(calls.length, 4);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 368);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 500);
+
+  const duplicateRequests = [
+    renderer.requestFileVisual('stress-project', 'asset-499', 'revision-499', 10),
+    renderer.requestFileVisual('stress-project', 'asset-499', 'revision-499', 0),
+  ];
+  const visibleRequest = renderer.requestFileVisual(
+    'stress-project',
+    'visible-required',
+    'visible-required-revision',
+    0
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 369);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 501);
+  assert.equal(duplicateRequests[0], duplicateRequests[1]);
+
+  const first = pending.shift();
+  active -= 1;
+  first.resolve({ kind: 'fallback' });
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.deepEqual(calls[4], ['stress-project', 'visible-required']);
+
+  while (calls.length < 501 || pending.length > 0) {
+    const batch = pending.splice(0);
+    batch.forEach(({ identity, resolve }) => {
+      active -= 1;
+      resolve(identity === 'visible-required' ? { kind: 'thumbnail', dataUrl: pngData } : { kind: 'fallback' });
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    observeBounds();
+  }
+
+  const results = await Promise.all([...requests, ...duplicateRequests, visibleRequest]);
+  assert.equal(results.at(-1).kind, 'thumbnail');
+  assert.equal(calls.length, 501);
+  assert.equal(maxActive, 4);
+  assert.ok(maxQueue <= 128);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 0);
+});
+
+test('stale file visual results are rejected after project invalidation', async () => {
+  const pngData = `data:image/png;base64,${Buffer.from('stale').toString('base64')}`;
+  const stale = createDeferred();
+  let calls = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: () => {
+      calls += 1;
+      return calls === 1 ? stale.promise : { kind: 'thumbnail', dataUrl: pngData };
+    },
+  } });
+  const file = {
+    name: 'Stale.png',
+    ext: '.png',
+    visualIdentity: 'stale-identity',
+    visualRevision: 'stale-revision',
+  };
+  const staleContainer = renderer.createFileVisual('stale-project', file);
+  await new Promise(resolve => setImmediate(resolve));
+  renderer.invalidateFileVisualProject('stale-project');
+  stale.resolve({ kind: 'thumbnail', dataUrl: pngData });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(staleContainer.classList.contains('is-thumbnail'), false);
+  assert.equal(staleContainer.children.length, 1);
+
+  const freshContainer = renderer.createFileVisual('stale-project', {
+    ...file,
+    visualRevision: 'fresh-revision',
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(freshContainer.classList.contains('is-thumbnail'), true);
+  assert.equal(calls, 2);
+});
+
+test('Added Assets empty-state copy updates in both directions without replacing unrelated rows', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const existing = {
+    name: 'Existing.png',
+    ext: '.png',
+    assetOrigin: 'existing',
+    projectRole: 'asset',
+    visualIdentity: 'existing-stable',
+    visualRevision: 'existing-revision',
+  };
+  const project = {
+    id: 'empty-state-variants',
+    name: 'Empty State Variants',
+    files: [existing],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
+  const firstEmpty = elements['added-assets-list'].children[0];
+  const existingRow = elements['existing-assets-list'].children[0];
+  assert.equal(getElementTreeText(firstEmpty), 'New package-ready assets will appear here as you work.');
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: true }, project.files);
+  const activeEmpty = elements['added-assets-list'].children[0];
+  assert.notEqual(activeEmpty, firstEmpty);
+  assert.equal(getElementTreeText(activeEmpty), 'No package-ready assets yet. Review the files Crate observed.');
+  assert.equal(elements['existing-assets-list'].children[0], existingRow);
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
+  const restoredEmpty = elements['added-assets-list'].children[0];
+  assert.notEqual(restoredEmpty, activeEmpty);
+  assert.equal(getElementTreeText(restoredEmpty), 'New package-ready assets will appear here as you work.');
+  assert.equal(elements['existing-assets-list'].children[0], existingRow);
+});
+
 test('file visual scheduler releases slots after synchronous bridge failures', async () => {
   let calls = 0;
   const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
