@@ -3015,12 +3015,12 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Review Assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change Folder<\/button>/);
-  assert.match(html, /id="modal-package-review-message"[^>]*role="status"[^>]*aria-live="polite"[^>]*tabindex="-1"/);
+  assert.match(html, /<div(?=[^>]*id="modal-package-review-message")(?=[^>]*role="status")(?=[^>]*aria-live="polite")(?=[^>]*tabindex="-1")[^>]*>/);
   assert.match(html, /id="modal-file-list"[^>]*role="region"[^>]*tabindex="-1"/);
   assert.match(html, /id="asset-review-heading"[^>]*tabindex="-1"/);
   assert.match(html, /data-asset-filter="all"[^>]*aria-pressed="true"/);
   assert.match(html, /data-asset-filter="existing"[^>]*aria-pressed="false"/);
-  assert.match(html, /id="toggle-package-folders"[^>]*aria-label="Organize packages by file type"/);
+  assert.match(html, /<input(?=[^>]*id="toggle-package-folders")(?=[^>]*aria-labelledby="setting-package-folders-label")(?=[^>]*aria-describedby="setting-package-folders-desc")[^>]*>/);
   assert.match(html, /id="toggle-package-review-folders"[^>]*aria-labelledby="package-review-organization-label"[^>]*aria-describedby="package-review-organization-status"/);
   assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
   assert.match(css, /\.modal-review-message\.is-empty\s*\{[\s\S]*visibility:\s*hidden;/);
@@ -3037,9 +3037,10 @@ test('navigation uses Projects, Quick Package, and Project Workspace consistentl
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const visibleHtml = html.replace(/<!--[\s\S]*?-->/g, '');
 
-  assert.match(visibleHtml, /data-tab="projects">Projects<\/button>/);
-  assert.match(visibleHtml, /data-tab="quick-package">Quick Package<\/button>/);
-  assert.match(visibleHtml, /data-tab="current-project">Project Workspace<\/button>/);
+  assert.match(
+    visibleHtml,
+    /<button(?=[^>]*data-tab="projects")[^>]*>\s*Projects\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="quick-package")[^>]*>\s*Quick Package\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="current-project")[^>]*>\s*Project Workspace\s*<\/button>/
+  );
   assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
   assert.equal(visibleHtml.includes('Current Project'), false);
 });
