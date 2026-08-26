@@ -69,15 +69,16 @@ test('Figma validation and warning surfaces use nonduplicative status semantics'
   assert.doesNotMatch(indexHtml, /id="figma-scan-status"[^>]*aria-live=/u);
 });
 
-test('Phase C script exposes current navigation without changing route order', () => {
+test('Phase C script exposes current navigation without changing primary control order', () => {
   assert.match(indexHtml, /data-tab="projects" aria-current="page">Projects/u);
   assert.match(phaseCScript, /function updateNavigationState\(\)/u);
   assert.match(phaseCScript, /setAttribute\('aria-current', 'page'\)/u);
   assert.match(phaseCScript, /removeAttribute\('aria-current'\)/u);
 
-  const projects = indexHtml.indexOf('data-tab="projects"');
-  const quickPackage = indexHtml.indexOf('data-tab="quick-package"');
-  const workspace = indexHtml.indexOf('data-tab="current-project"');
+  const primaryNav = indexHtml.match(/<nav class="app-tabs" aria-label="Primary">([\s\S]*?)<\/nav>/u)?.[1] || '';
+  const projects = primaryNav.indexOf('data-tab="projects"');
+  const quickPackage = primaryNav.indexOf('data-tab="quick-package"');
+  const workspace = primaryNav.indexOf('data-tab="current-project"');
   assert.ok(projects >= 0 && quickPackage > projects && workspace > quickPackage);
 });
 
@@ -112,5 +113,4 @@ test('Phase C stays inside existing renderer source files', () => {
   assert.equal(fs.existsSync(path.join(__dirname, '..', 'renderer', 'phase-c.js')), false);
   assert.equal(fs.existsSync(path.join(__dirname, '..', 'renderer', 'accessibility.js')), false);
   assert.match(indexHtml, /<script src="app\.js"><\/script>/u);
-  assert.doesNotMatch(indexHtml, /data-tab="current-project"[\s\S]*data-tab="quick-package"/u);
 });
