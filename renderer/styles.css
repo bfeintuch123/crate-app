@@ -2011,6 +2011,10 @@ body {
   color: #78350f;
 }
 
+.modal-review-message.is-empty {
+  visibility: hidden;
+}
+
 .modal-review-message:focus-visible,
 .modal-file-list:focus-visible {
   outline: 2px solid var(--black);
@@ -3000,6 +3004,25 @@ body {
 .app-btn {
   max-width: 240px;
 }
+
+#btn-package,
+#btn-add-files,
+#btn-figma-scan-now,
+#btn-figma-connect,
+#btn-create-project,
+#btn-confirm-package,
+#btn-cancel-package {
+  min-height: 40px;
+  white-space: nowrap;
+}
+
+#btn-package { min-width: 144px; }
+#btn-add-files { min-width: 112px; }
+#btn-figma-scan-now { min-width: 96px; }
+#btn-figma-connect { min-width: 128px; }
+#btn-create-project { min-width: 150px; }
+#btn-confirm-package { min-width: 150px; }
+#btn-cancel-package { min-width: 142px; }
 
 #btn-add-project {
   background: var(--black);

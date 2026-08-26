@@ -33,7 +33,48 @@ function createElementStub(tagName = 'div') {
       },
       contains: (name) => classes.has(name),
     },
-    appendChild: child => element.children.push(child),
+    appendChild: child => {
+      if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
+        child.parentNode.removeChild(child);
+      }
+      const currentIndex = element.children.indexOf(child);
+      if (currentIndex >= 0) element.children.splice(currentIndex, 1);
+      element.children.push(child);
+      if (child) child.parentNode = element;
+      return child;
+    },
+    insertBefore: (child, reference) => {
+      if (!reference) return element.appendChild(child);
+      if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
+        child.parentNode.removeChild(child);
+      }
+      const currentIndex = element.children.indexOf(child);
+      if (currentIndex >= 0) element.children.splice(currentIndex, 1);
+      const referenceIndex = element.children.indexOf(reference);
+      element.children.splice(referenceIndex < 0 ? element.children.length : referenceIndex, 0, child);
+      if (child) child.parentNode = element;
+      return child;
+    },
+    removeChild: child => {
+      const index = element.children.indexOf(child);
+      if (index >= 0) element.children.splice(index, 1);
+      if (child?.parentNode === element) child.parentNode = null;
+      return child;
+    },
+    replaceChild: (next, previous) => {
+      const index = element.children.indexOf(previous);
+      if (index >= 0) element.children[index] = next;
+      if (previous?.parentNode === element) previous.parentNode = null;
+      if (next) next.parentNode = element;
+      return previous;
+    },
+    replaceChildren: (...children) => {
+      for (const child of element.children) {
+        if (child?.parentNode === element) child.parentNode = null;
+      }
+      element.children = [];
+      children.filter(Boolean).forEach(child => element.appendChild(child));
+    },
     addEventListener: (type, fn) => {
       if (!listeners[type]) listeners[type] = [];
       listeners[type].push(fn);
@@ -56,6 +97,18 @@ function createElementStub(tagName = 'div') {
     getAttribute: name => attributes[name],
     removeAttribute: name => { delete attributes[name]; },
     querySelector: selector => {
+      if (selector.startsWith('[data-render-key="')) {
+        const key = selector.slice(18, -2);
+        return element.children.find(child => child.dataset?.renderKey === key) || null;
+      }
+      if (selector === '.project-pill' && html.includes('project-pill')) {
+        if (!element.projectPill) {
+          element.projectPill = createElementStub('span');
+          element.projectPill.ownerDocument = element.ownerDocument;
+          element.appendChild(element.projectPill);
+        }
+        return element.projectPill;
+      }
       if (
         selector === '.btn-accept-pending'
         || selector === '.btn-reject-pending'
@@ -67,7 +120,11 @@ function createElementStub(tagName = 'div') {
       }
       return null;
     },
-    querySelectorAll: selector => selector.includes('button') ? element.focusableElements : [],
+    querySelectorAll: selector => {
+      if (selector.includes('button')) return element.focusableElements;
+      if (selector === '[data-render-key]') return createNodeList(element.children);
+      return [];
+    },
     closest: () => null,
   };
 
@@ -146,6 +203,7 @@ function createDocumentStub(elements = {}, options = {}) {
     addEventListener: (type, fn) => { listeners[type] = fn; },
     querySelector: selector => {
       if (selector.startsWith('#')) return getElementById(selector.slice(1));
+      if (selector === '.app-content') return getElementById('app-content');
       if (selector === '.package-review-modal') return attach(options.packageReviewDialog || null);
       if (selector === '.app-tab[data-tab="projects"]') {
         return attach((options.tabs || []).find(tab => tab.dataset.tab === 'projects') || null);
@@ -175,9 +233,11 @@ function createInteractiveRendererDom() {
   const elements = {
     'app-sidebar': createElementStub('aside'),
     'app-main': createElementStub('main'),
+    'app-content': createElementStub('main'),
     'tab-projects': createElementStub('section'),
     'tab-current-project': createElementStub('section'),
     'tab-settings': createElementStub('section'),
+    'asset-review-search': createElementStub('input'),
     'btn-package': createElementStub('button'),
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
@@ -1503,7 +1563,8 @@ test('file visual queue stays bounded and cancels stale queued work on project s
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 4);
   assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
-  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 132);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 8);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 140);
 
   renderer.setActiveFileVisualProject('new-project');
   const selectedRequest = renderer.requestFileVisual('new-project', 'selected', 'selected-revision');
@@ -1519,6 +1580,159 @@ test('file visual queue stays bounded and cancels stale queued work on project s
   assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 0);
   assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 0);
   assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 0);
+});
+
+test('file visual demand stays bounded while every required visible preview eventually loads', async () => {
+  const pngData = `data:image/png;base64,${Buffer.from('visible').toString('base64')}`;
+  const pending = [];
+  const calls = [];
+  let active = 0;
+  let maxActive = 0;
+  let maxQueue = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: (projectId, identity) => {
+      calls.push([projectId, identity]);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      return new Promise(resolve => pending.push({ identity, resolve }));
+    },
+  } });
+  renderer.setActiveFileVisualProject('stress-project');
+
+  const requests = [];
+  for (let index = 0; index < 500; index += 1) {
+    requests.push(renderer.requestFileVisual(
+      'stress-project',
+      `asset-${index}`,
+      `revision-${index}`,
+      10
+    ));
+  }
+  const observeBounds = () => {
+    maxQueue = Math.max(maxQueue, vm.runInContext('fileVisualQueue.length', renderer));
+    assert.ok(vm.runInContext('fileVisualQueue.length', renderer) <= 128);
+    assert.ok(vm.runInContext('fileVisualActiveRequests', renderer) <= 4);
+    assert.ok(vm.runInContext('fileVisualInFlight.size', renderer) <= 501);
+  };
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.equal(calls.length, 4);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 368);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 500);
+
+  const duplicateRequests = [
+    renderer.requestFileVisual('stress-project', 'asset-499', 'revision-499', 10),
+    renderer.requestFileVisual('stress-project', 'asset-499', 'revision-499', 0),
+  ];
+  const visibleRequest = renderer.requestFileVisual(
+    'stress-project',
+    'visible-required',
+    'visible-required-revision',
+    0
+  );
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 369);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 501);
+  assert.equal(duplicateRequests[0], duplicateRequests[1]);
+
+  const first = pending.shift();
+  active -= 1;
+  first.resolve({ kind: 'fallback' });
+  await new Promise(resolve => setImmediate(resolve));
+  observeBounds();
+  assert.deepEqual(calls[4], ['stress-project', 'visible-required']);
+
+  while (calls.length < 501 || pending.length > 0) {
+    const batch = pending.splice(0);
+    batch.forEach(({ identity, resolve }) => {
+      active -= 1;
+      resolve(identity === 'visible-required' ? { kind: 'thumbnail', dataUrl: pngData } : { kind: 'fallback' });
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    observeBounds();
+  }
+
+  const results = await Promise.all([...requests, ...duplicateRequests, visibleRequest]);
+  assert.equal(results.at(-1).kind, 'thumbnail');
+  assert.equal(calls.length, 501);
+  assert.equal(maxActive, 4);
+  assert.ok(maxQueue <= 128);
+  assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 0);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 0);
+});
+
+test('stale file visual results are rejected after project invalidation', async () => {
+  const pngData = `data:image/png;base64,${Buffer.from('stale').toString('base64')}`;
+  const stale = createDeferred();
+  let calls = 0;
+  const renderer = loadRendererHelpers(createDocumentStub(), { crate: {
+    getFileVisual: () => {
+      calls += 1;
+      return calls === 1 ? stale.promise : { kind: 'thumbnail', dataUrl: pngData };
+    },
+  } });
+  const file = {
+    name: 'Stale.png',
+    ext: '.png',
+    visualIdentity: 'stale-identity',
+    visualRevision: 'stale-revision',
+  };
+  const staleContainer = renderer.createFileVisual('stale-project', file);
+  await new Promise(resolve => setImmediate(resolve));
+  renderer.invalidateFileVisualProject('stale-project');
+  stale.resolve({ kind: 'thumbnail', dataUrl: pngData });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(staleContainer.classList.contains('is-thumbnail'), false);
+  assert.equal(staleContainer.children.length, 1);
+
+  const freshContainer = renderer.createFileVisual('stale-project', {
+    ...file,
+    visualRevision: 'fresh-revision',
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(freshContainer.classList.contains('is-thumbnail'), true);
+  assert.equal(calls, 2);
+});
+
+test('Added Assets empty-state copy updates in both directions without replacing unrelated rows', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const existing = {
+    name: 'Existing.png',
+    ext: '.png',
+    assetOrigin: 'existing',
+    projectRole: 'asset',
+    visualIdentity: 'existing-stable',
+    visualRevision: 'existing-revision',
+  };
+  const project = {
+    id: 'empty-state-variants',
+    name: 'Empty State Variants',
+    files: [existing],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
+  const firstEmpty = elements['added-assets-list'].children[0];
+  const existingRow = elements['existing-assets-list'].children[0];
+  assert.equal(getElementTreeText(firstEmpty), 'New package-ready assets will appear here as you work.');
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: true }, project.files);
+  const activeEmpty = elements['added-assets-list'].children[0];
+  assert.notEqual(activeEmpty, firstEmpty);
+  assert.equal(getElementTreeText(activeEmpty), 'No package-ready assets yet. Review the files Crate observed.');
+  assert.equal(elements['existing-assets-list'].children[0], existingRow);
+
+  renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
+  const restoredEmpty = elements['added-assets-list'].children[0];
+  assert.notEqual(restoredEmpty, activeEmpty);
+  assert.equal(getElementTreeText(restoredEmpty), 'New package-ready assets will appear here as you work.');
+  assert.equal(elements['existing-assets-list'].children[0], existingRow);
 });
 
 test('file visual scheduler releases slots after synchronous bridge failures', async () => {
@@ -2809,6 +3023,9 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /id="toggle-package-folders"[^>]*aria-label="Organize packages by file type"/);
   assert.match(html, /id="toggle-package-review-folders"[^>]*aria-labelledby="package-review-organization-label"[^>]*aria-describedby="package-review-organization-status"/);
   assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
+  assert.match(css, /\.modal-review-message\.is-empty\s*\{[\s\S]*visibility:\s*hidden;/);
+  assert.match(css, /#btn-package,[\s\S]*#btn-cancel-package\s*\{[\s\S]*min-height:\s*40px;[\s\S]*white-space:\s*nowrap;/);
+  assert.match(css, /#btn-package\s*\{\s*min-width:\s*144px;\s*\}/);
   assert.match(css, /\.package-review-modal\s*\{(?=[^}]*position:\s*relative;)(?=[^}]*overflow-x:\s*hidden;)(?=[^}]*overflow-y:\s*auto;)[^}]*\}/);
   assert.match(css, /\.toggle input:focus-visible \+ \.toggle-slider\s*\{(?=[^}]*outline:\s*2px solid var\(--black\);)(?=[^}]*outline-offset:\s*3px;)[^}]*\}/);
   assert.match(html, /id="modal-upgrade"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-describedby="upgrade-subtitle"/);
@@ -4002,4 +4219,269 @@ test('Quick Package clears progress and permits retry after rejected drop or Bro
   assert.equal(browseAttempts, 2);
   assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
   assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+});
+
+test('renderer coalesces a synchronous file-event burst into one visible refresh', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  const handlers = {};
+  const project = { id: 'burst-project', name: 'Burst', status: 'watching', files: [] };
+  let projectReads = 0;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: () => {
+      projectReads += 1;
+      return deferred.promise;
+    },
+    onFilesUpdated: handler => { handlers.files = handler; },
+    onProjectUpdated: handler => { handlers.project = handler; },
+    onPendingFilesUpdated: handler => { handlers.pending = handler; },
+    onPackageTrigger: handler => { handlers.package = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  vm.runInContext('state.projects = [];', renderer);
+  renderer.setupMainProcessListeners();
+
+  for (let index = 0; index < 10; index += 1) handlers.files({ projectId: project.id });
+  assert.equal(projectReads, 1);
+
+  deferred.resolve([project]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(projectReads, 1);
+  assert.equal(elements['project-rows'].children.length, 1);
+});
+
+test('renderer reconciles unchanged asset rows and restores Review Assets view state', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  elements['asset-review-search'].id = 'asset-review-search';
+  const assets = index => ({
+    name: `Synthetic_${index}.png`,
+    ext: '.png',
+    appFamily: 'figma',
+    assetOrigin: 'added',
+    projectRole: 'asset',
+    visualIdentity: `visual-${index}`,
+    visualRevision: `revision-${index}`,
+  });
+  const project = {
+    id: 'identity-project',
+    name: 'Identity Project',
+    status: 'watching',
+    files: [assets(1), assets(2), assets(3)],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  let workspace = { projectId: project.id, files: project.files, pendingFiles: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getAssetWorkspace: async () => workspace,
+    },
+  });
+  vm.runInContext(`state.projects = [${JSON.stringify(project)}]; state.selectedProjectId = '${project.id}'; state.assetReviewOpen = true; state.assetReviewFilter = 'added'; state.assetReviewQuery = 'Synthetic';`, renderer);
+  document.querySelector('#tab-projects').classList.remove('active');
+  document.querySelector('#tab-current-project').classList.add('active');
+  await renderer.renderFiles();
+
+  const firstRow = elements['added-assets-list'].children[0];
+  const firstVisual = firstRow.children[0];
+  elements['app-content'].scrollTop = 317;
+  elements['asset-review-search'].value = 'Synthetic';
+  elements['asset-review-search'].focus();
+
+  const updatedProject = JSON.parse(JSON.stringify(project));
+  updatedProject.files[1].name = 'Synthetic_2_Updated.png';
+  updatedProject.files[1].visualRevision = 'revision-2-updated';
+  updatedProject.files.push(assets(4));
+  workspace = { projectId: project.id, files: updatedProject.files, pendingFiles: [] };
+  vm.runInContext(`state.projects = [${JSON.stringify(updatedProject)}]`, renderer);
+  await renderer.renderFiles();
+
+  assert.equal(elements['added-assets-list'].children.length, 4);
+  assert.equal(elements['added-assets-list'].children[0], firstRow);
+  assert.equal(elements['added-assets-list'].children[0].children[0], firstVisual);
+  assert.notEqual(elements['added-assets-list'].children[1], firstRow);
+  assert.equal(elements['app-content'].scrollTop, 317);
+  assert.equal(document.activeElement, elements['asset-review-search']);
+  assert.equal(vm.runInContext('state.assetReviewOpen', renderer), true);
+  assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'added');
+  assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'Synthetic');
+});
+
+test('renderer acknowledges Add Files immediately and suppresses duplicate in-flight actions', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  let addCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: () => {
+        addCalls += 1;
+        return deferred.promise;
+      },
+    },
+  });
+  vm.runInContext("state.selectedProjectId = 'action-project'; state.projects = [{ id: 'action-project', name: 'Action Project', status: 'watching', files: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  const event = { type: 'click', currentTarget: elements['btn-add-files'] };
+  elements['btn-add-files'].dispatchEvent(event);
+  elements['btn-add-files'].dispatchEvent(event);
+
+  assert.equal(addCalls, 1);
+  assert.equal(elements['btn-add-files'].disabled, true);
+  assert.equal(elements['btn-add-files'].textContent, 'Adding…');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'true');
+
+  deferred.resolve(null);
+  await deferred.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].textContent, '+ Add Files');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+});
+
+test('renderer acknowledges Start Watching immediately and suppresses duplicate toggles', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  let startCalls = 0;
+  const project = { id: 'watch-action-project', name: 'Watch Action Project', status: 'paused', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      startWatching: () => {
+        startCalls += 1;
+        return deferred.promise;
+      },
+      getProjects: async () => [project],
+    },
+  });
+  vm.runInContext(`state.projects = [${JSON.stringify(project)}]`, renderer);
+  renderer.renderProjects();
+  const pill = elements['project-rows'].children[0].querySelector('.project-pill');
+
+  pill.click();
+  pill.click();
+
+  assert.equal(startCalls, 1);
+  assert.equal(pill.disabled, true);
+  assert.equal(pill.textContent, 'Starting…');
+  assert.equal(pill.getAttribute('aria-busy'), 'true');
+
+  deferred.resolve();
+  await deferred.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pill.disabled, false);
+  assert.equal(pill.textContent, 'Start Watching');
+  assert.equal(pill.getAttribute('aria-busy'), 'false');
+});
+
+test('renderer acknowledges Figma Scan Now immediately and suppresses duplicate scans', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  let scanCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      figmaScanNow: () => {
+        scanCalls += 1;
+        return deferred.promise;
+      },
+    },
+  });
+  renderer.setupEventListeners();
+
+  elements['btn-figma-scan-now'].click();
+  elements['btn-figma-scan-now'].click();
+
+  assert.equal(scanCalls, 1);
+  assert.equal(elements['btn-figma-scan-now'].disabled, true);
+  assert.equal(elements['btn-figma-scan-now'].textContent, 'Scanning...');
+  assert.equal(elements['btn-figma-scan-now'].getAttribute('aria-busy'), 'true');
+
+  deferred.resolve({ triggered: 1 });
+  await deferred.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['btn-figma-scan-now'].disabled, false);
+  assert.equal(elements['btn-figma-scan-now'].textContent, 'Scan Now');
+  assert.equal(elements['btn-figma-scan-now'].getAttribute('aria-busy'), 'false');
+});
+
+test('renderer acknowledges Package Review immediately and keeps its empty status box dimension-stable', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  let prepareCalls = 0;
+  const project = {
+    id: 'package-action-project',
+    name: 'Package Action Project',
+    status: 'watching',
+    files: [{ name: 'Synthetic.png', ext: '.png', assetOrigin: 'added', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const review = {
+    token: '00000000-0000-4000-8000-000000000201',
+    projectId: project.id,
+    files: project.files,
+    totalFiles: 1,
+    folderName: 'Package Action Project',
+  };
+  const scheduleTimeout = setTimeout;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      preScanSession: async () => null,
+      preparePackageReview: () => {
+        prepareCalls += 1;
+        return deferred.promise;
+      },
+      getProjects: async () => [project],
+    },
+  }, {
+    setTimeout: (...args) => {
+      const timer = scheduleTimeout(...args);
+      timer.unref?.();
+      return timer;
+    },
+  });
+  vm.runInContext(`state.selectedProjectId = '${project.id}'; state.projects = [${JSON.stringify(project)}];`, renderer);
+  renderer.setupEventListeners();
+
+  const event = { type: 'click', currentTarget: elements['btn-package'] };
+  elements['btn-package'].dispatchEvent(event);
+  elements['btn-package'].dispatchEvent(event);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(prepareCalls, 1);
+  assert.equal(elements['btn-package'].disabled, true);
+  assert.equal(elements['btn-package'].textContent, 'Preparing…');
+  assert.equal(elements['btn-package'].getAttribute('aria-busy'), 'true');
+
+  deferred.resolve(review);
+  await deferred.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['btn-package'].disabled, false);
+  assert.equal(elements['btn-package'].textContent, 'Package Project');
+  assert.equal(elements['btn-package'].getAttribute('aria-busy'), 'false');
+
+  const message = elements['modal-package-review-message'];
+  assert.equal(message.classList.contains('hidden'), false);
+  assert.equal(message.classList.contains('is-empty'), true);
+});
+
+test('renderer schedules visible preview work before lower-priority offscreen work', async () => {
+  const calls = [];
+  const renderer = loadRendererHelpers(createInteractiveRendererDom().document, {
+    crate: {
+      getFileVisual: async (...args) => {
+        calls.push(args);
+        return { kind: 'fallback' };
+      },
+    },
+  });
+
+  const offscreen = renderer.requestFileVisual('preview-project', 'offscreen', 'rev-offscreen', 10);
+  const visible = renderer.requestFileVisual('preview-project', 'visible', 'rev-visible', 0);
+  const nearby = renderer.requestFileVisual('preview-project', 'nearby', 'rev-nearby', 5);
+  await Promise.all([offscreen, visible, nearby]);
+
+  assert.deepEqual(calls.map(call => call[1]), ['visible', 'nearby', 'offscreen']);
 });
