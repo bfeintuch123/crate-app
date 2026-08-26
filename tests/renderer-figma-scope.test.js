@@ -33,7 +33,48 @@ function createElementStub(tagName = 'div') {
       },
       contains: (name) => classes.has(name),
     },
-    appendChild: child => element.children.push(child),
+    appendChild: child => {
+      if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
+        child.parentNode.removeChild(child);
+      }
+      const currentIndex = element.children.indexOf(child);
+      if (currentIndex >= 0) element.children.splice(currentIndex, 1);
+      element.children.push(child);
+      if (child) child.parentNode = element;
+      return child;
+    },
+    insertBefore: (child, reference) => {
+      if (!reference) return element.appendChild(child);
+      if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
+        child.parentNode.removeChild(child);
+      }
+      const currentIndex = element.children.indexOf(child);
+      if (currentIndex >= 0) element.children.splice(currentIndex, 1);
+      const referenceIndex = element.children.indexOf(reference);
+      element.children.splice(referenceIndex < 0 ? element.children.length : referenceIndex, 0, child);
+      if (child) child.parentNode = element;
+      return child;
+    },
+    removeChild: child => {
+      const index = element.children.indexOf(child);
+      if (index >= 0) element.children.splice(index, 1);
+      if (child?.parentNode === element) child.parentNode = null;
+      return child;
+    },
+    replaceChild: (next, previous) => {
+      const index = element.children.indexOf(previous);
+      if (index >= 0) element.children[index] = next;
+      if (previous?.parentNode === element) previous.parentNode = null;
+      if (next) next.parentNode = element;
+      return previous;
+    },
+    replaceChildren: (...children) => {
+      for (const child of element.children) {
+        if (child?.parentNode === element) child.parentNode = null;
+      }
+      element.children = [];
+      children.filter(Boolean).forEach(child => element.appendChild(child));
+    },
     addEventListener: (type, fn) => {
       if (!listeners[type]) listeners[type] = [];
       listeners[type].push(fn);
@@ -56,6 +97,10 @@ function createElementStub(tagName = 'div') {
     getAttribute: name => attributes[name],
     removeAttribute: name => { delete attributes[name]; },
     querySelector: selector => {
+      if (selector.startsWith('[data-render-key="')) {
+        const key = selector.slice(18, -2);
+        return element.children.find(child => child.dataset?.renderKey === key) || null;
+      }
       if (
         selector === '.btn-accept-pending'
         || selector === '.btn-reject-pending'
@@ -67,7 +112,11 @@ function createElementStub(tagName = 'div') {
       }
       return null;
     },
-    querySelectorAll: selector => selector.includes('button') ? element.focusableElements : [],
+    querySelectorAll: selector => {
+      if (selector.includes('button')) return element.focusableElements;
+      if (selector === '[data-render-key]') return createNodeList(element.children);
+      return [];
+    },
     closest: () => null,
   };
 
@@ -146,6 +195,7 @@ function createDocumentStub(elements = {}, options = {}) {
     addEventListener: (type, fn) => { listeners[type] = fn; },
     querySelector: selector => {
       if (selector.startsWith('#')) return getElementById(selector.slice(1));
+      if (selector === '.app-content') return getElementById('app-content');
       if (selector === '.package-review-modal') return attach(options.packageReviewDialog || null);
       if (selector === '.app-tab[data-tab="projects"]') {
         return attach((options.tabs || []).find(tab => tab.dataset.tab === 'projects') || null);
@@ -175,9 +225,11 @@ function createInteractiveRendererDom() {
   const elements = {
     'app-sidebar': createElementStub('aside'),
     'app-main': createElementStub('main'),
+    'app-content': createElementStub('main'),
     'tab-projects': createElementStub('section'),
     'tab-current-project': createElementStub('section'),
     'tab-settings': createElementStub('section'),
+    'asset-review-search': createElementStub('input'),
     'btn-package': createElementStub('button'),
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
@@ -4002,4 +4054,93 @@ test('Quick Package clears progress and permits retry after rejected drop or Bro
   assert.equal(browseAttempts, 2);
   assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
   assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
+});
+
+test('renderer coalesces a synchronous file-event burst into one visible refresh', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const deferred = createDeferred();
+  const handlers = {};
+  const project = { id: 'burst-project', name: 'Burst', status: 'watching', files: [] };
+  let projectReads = 0;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: () => {
+      projectReads += 1;
+      return deferred.promise;
+    },
+    onFilesUpdated: handler => { handlers.files = handler; },
+    onProjectUpdated: handler => { handlers.project = handler; },
+    onPendingFilesUpdated: handler => { handlers.pending = handler; },
+    onPackageTrigger: handler => { handlers.package = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  vm.runInContext('state.projects = [];', renderer);
+  renderer.setupMainProcessListeners();
+
+  for (let index = 0; index < 10; index += 1) handlers.files({ projectId: project.id });
+  assert.equal(projectReads, 1);
+
+  deferred.resolve([project]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(projectReads, 1);
+  assert.equal(elements['project-rows'].children.length, 1);
+});
+
+test('renderer reconciles unchanged asset rows and restores Review Assets view state', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  elements['asset-review-search'].id = 'asset-review-search';
+  const assets = index => ({
+    name: `Synthetic_${index}.png`,
+    ext: '.png',
+    appFamily: 'figma',
+    assetOrigin: 'added',
+    projectRole: 'asset',
+    visualIdentity: `visual-${index}`,
+    visualRevision: `revision-${index}`,
+  });
+  const project = {
+    id: 'identity-project',
+    name: 'Identity Project',
+    status: 'watching',
+    files: [assets(1), assets(2), assets(3)],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  let workspace = { projectId: project.id, files: project.files, pendingFiles: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getAssetWorkspace: async () => workspace,
+    },
+  });
+  vm.runInContext(`state.projects = [${JSON.stringify(project)}]; state.selectedProjectId = '${project.id}'; state.assetReviewOpen = true; state.assetReviewFilter = 'added'; state.assetReviewQuery = 'Synthetic';`, renderer);
+  document.querySelector('#tab-projects').classList.remove('active');
+  document.querySelector('#tab-current-project').classList.add('active');
+  await renderer.renderFiles();
+
+  const firstRow = elements['added-assets-list'].children[0];
+  const firstVisual = firstRow.children[0];
+  elements['app-content'].scrollTop = 317;
+  elements['asset-review-search'].value = 'Synthetic';
+  elements['asset-review-search'].focus();
+
+  const updatedProject = JSON.parse(JSON.stringify(project));
+  updatedProject.files[1].name = 'Synthetic_2_Updated.png';
+  updatedProject.files[1].visualRevision = 'revision-2-updated';
+  updatedProject.files.push(assets(4));
+  workspace = { projectId: project.id, files: updatedProject.files, pendingFiles: [] };
+  vm.runInContext(`state.projects = [${JSON.stringify(updatedProject)}]`, renderer);
+  await renderer.renderFiles();
+
+  assert.equal(elements['added-assets-list'].children.length, 4);
+  assert.equal(elements['added-assets-list'].children[0], firstRow);
+  assert.equal(elements['added-assets-list'].children[0].children[0], firstVisual);
+  assert.notEqual(elements['added-assets-list'].children[1], firstRow);
+  assert.equal(elements['app-content'].scrollTop, 317);
+  assert.equal(document.activeElement, elements['asset-review-search']);
+  assert.equal(vm.runInContext('state.assetReviewOpen', renderer), true);
+  assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'added');
+  assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'Synthetic');
 });
