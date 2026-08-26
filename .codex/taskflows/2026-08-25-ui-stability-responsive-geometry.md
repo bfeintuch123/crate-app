@@ -8,138 +8,136 @@
 - standing order: SO-002 Autonomous Crate Failure Loop
 - repo: `bfeintuch123/crate-app`
 - branch: `codex/ui-stability-responsive-geometry`
-- base: `fa4d3d22378f11e4bcd80c55402194bda77da398`
+- canonical base: `fa4d3d22378f11e4bcd80c55402194bda77da398`
 - authoritative draft PR: `#231`
 - superseded drafts: `#228`, `#229`, `#230`
 - mode: scoped implementation, draft PR only
-- status: active; Phase A source implementation complete, exact-head CI and Mac visual gate pending
+- status: active; desktop-minimum correction pushed, exact-head CI and fresh MacBook visual QA pending
 
 ## Goal
 
-Make the existing Crate macOS UI adapt cleanly from its normal desktop size down to the currently configured minimum window size, beginning with Project Workspace and Review Assets. Eliminate application-level horizontal overflow, clipped or overlapping controls, and translucent surface bleed without redesigning the product or changing package, watcher, Figma, provenance, quota, privacy, release, or dependency behavior.
+Preserve Crate's recognizable desktop application presentation while eliminating overflow, clipping, control collisions, and visual bleed. Crate should adapt cleanly between its supported minimum, normal, and wide desktop sizes, but it should not operate in an ultra-compact or mobile-style mode.
+
+## Product-direction correction
+
+Bryant reviewed the earlier `720 × 560` presentation and rejected it as too cramped. The responsive transitions remain useful defensive behavior, but they are no longer part of the supported user-visible window range.
+
+The selected desktop minimum is:
+
+```text
+1100 × 760 outer window pixels
+```
+
+Rationale:
+
+- `1100 × 760` already passed the earlier geometry and human screenshot matrix;
+- it preserves the persistent left sidebar and readable desktop navigation;
+- it avoids the compact two-row navigation state;
+- it leaves Review Assets, Settings, and dialogs at a comfortable desktop density;
+- it is a product decision based on Crate's background-utility role, not a copy of another application's dimensions.
+
+A smaller `1100 × 720` contract was not selected because it lacked equivalent exact-head evidence across Settings, dialogs, keyboard navigation, and the full Review Assets workflow.
 
 ## Scope
 
 Allowed:
 
-- inspect the exact canonical UI and window behavior inherited from PRs #226 and #227
-- update responsive layout and containment inside an existing allowed renderer source file
-- make the smallest semantic markup changes required in `renderer/index.html`
-- update `main.js` only after an evidence-based minimum-window decision
-- replace focused responsive test authority that encoded broken width constraints
-- add dependency-free synthetic UI geometry checks and documentation
-- use small atomic commits and push every completed commit immediately
-- maintain draft PR #231 against `v2.4.x`
+- enforce the real Electron `BrowserWindow` minimum natively;
+- clamp the initial window and later resize requests to `1100 × 760`;
+- keep the existing responsive and footer-containment fixes;
+- preserve defensive below-minimum CSS for unexpected embedding or test conditions;
+- update the real-Electron and real-Chromium geometry matrices;
+- add focused minimum-window and clamp regression tests;
+- update this taskflow, the UI-stability standard, and PR #231;
+- use small atomic commits and push every completed unit immediately.
 
 Forbidden:
 
-- package selection or output changes
-- watcher admission or observer changes
-- parser or provenance changes
-- Figma scope or network changes
-- quota, billing, release, signing, notarization, deploy, or version changes
-- dependency or lockfile mutation
-- renderer framework migration
-- global CSS scaling, `zoom`, or hiding inaccessible overflow as the primary fix
-- merge without Bryant's explicit approval
+- navigation redesign;
+- Phase B list-performance or renderer-reconciliation work;
+- package, watcher, parser, Figma, provenance, quota, privacy, dependency, release, signing, notarization, deploy, or version changes;
+- force-push or history rewrite;
+- merge without Bryant's explicit approval.
 
-## Implemented Responsive Contract
+## Implemented desktop contract
 
-- retained the established `renderer/styles.css` unchanged
-- placed the focused responsive contract in a named `<style id="crate-ui-stability">` block in the already permitted `renderer/index.html`, after the established stylesheet link
-- preserved the hardened packaged-content allowlist, which permits only `renderer/app.js`, `renderer/index.html`, and `renderer/styles.css` in the shipped ASAR
-- did not modify build, release, verifier, dependency, or ASAR policy configuration
-- neutralized inherited `640px`, `680px`, and `800px` layout pressure through later flexible rules
-- made Current Project and Review Assets respond to their actual content-pane width through container queries
-- moved Review Assets search and actions onto separate rows before collision
-- changed asset density from four columns to three, two, and a compact readable row
-- replaced the negatively offset absolute Review Assets footer with a contained sticky footer
-- made the Project Workspace dashboard, Settings, and major dialog surfaces respect the available width
-- kept the current 720px Electron minimum testable by allowing the legacy narrow navigation to wrap
-- removed permanent Watching/status pulses and added reduced-motion handling
-- preserved all package, watcher, Figma, quota, provenance, privacy, version, dependency, and release behavior
+- `startup-phase-journal.js`, which is loaded by `main.js` before the real `BrowserWindow` is constructed, installs a `browser-window-created` handler;
+- the handler calls native `setMinimumSize(1100, 760)` on the real window;
+- an initial or later size below the contract is raised to at least `1100 × 760` with native `setSize`;
+- the existing `720 × 560` constructor baseline is no longer the authoritative supported contract;
+- the Electron harness reads the exported desktop minimum rather than parsing obsolete constructor literals;
+- a requested `720 × 560` size is tested only as a clamp request and is reported separately from supported layouts;
+- the supported geometry matrix begins at `1100 × 760` and continues through `1200 × 800`, `1280 × 800`, and `1440 × 900`;
+- compact navigation must remain inactive and the persistent sidebar visible throughout the supported matrix;
+- the short-height footer correction and all other useful responsive containment rules remain present.
 
-## Test Architecture
+## Test architecture
 
-- `tests/ui-stability-fixture.js` creates a synthetic project with three physical working files, one renderer-derived Figma source, seven existing assets, and 256 added assets
-- `tests/ui-stability-preload.js` exposes a test-only `window.crate` bridge without touching production preload code or real data
-- `tests/ui-stability-electron-harness.js` loads the real renderer, opens the real Project Workspace and Review Assets flow, resizes through the supported matrix, records geometry, and optionally captures screenshots
-- `tests/ui-stability-responsive-geometry.test.js` runs an independent real-Chromium geometry probe when Chrome or Chromium is available
-- focused source tests extract and verify the named responsive block from `renderer/index.html`
-- focused source and fixture tests remain dependency-free and run through the existing Node test system
-
-## State
-
-- current phase: exact-head source CI followed by macOS visual and geometry verification
-- last completed checkpoint: packaged-content-safe inline responsive contract, focused tests, synthetic fixture, browser geometry probe, Electron harness, UI standard, and named check suite pushed
-- last runtime/test head before this taskflow-only correction: `64827c0dbf294194782e0473b949988cb184f62e`
-- authoritative PR: `#231`
-- next action: obtain a passing exact-head GitHub source gate, then run synthetic large-project Mac QA without editing the implementation branch
-- blocker: authentic macOS Electron geometry and video evidence require the separate Mac QA lane
-- approval state: Bryant authorized implementation; merge remains unapproved
-- preferences applied: fresh canonical branch, small atomic commits, immediate push after every completed commit, one builder
-- routing decision: Phase A responsive geometry only; large-asset renderer smoothness remains a separate follow-up branch after Bryant approves the visible direction
-- outcome receipt: pending exact-head CI, visual evidence, and final review
+- `tests/desktop-window-minimum.test.js` proves the contract loads before window construction, applies native minimum bounds, clamps smaller dimensions, and installs idempotently;
+- the pre-existing comprehensive `tests/main-window-lifecycle.test.js` remains intact;
+- `tests/ui-stability-electron-harness.js` records requested outer size, actual outer size, native minimum, renderer viewport, navigation mode, geometry, state preservation, and no-refetch metrics;
+- the harness requests `720 × 560` and must observe a native clamp to `1100 × 760`;
+- `tests/ui-stability-harness-contract.test.js` protects the supported matrix, clamp evidence, desktop navigation, footer-overlap checks, and no-refetch behavior;
+- `tests/ui-stability-responsive-geometry.test.js` treats only `1100 × 760` and larger viewports as supported desktop layouts;
+- the synthetic fixture remains privacy-safe with four represented working-file sources, seven existing assets, and 256 added assets.
 
 ## Checkpoints
 
-- [x] preflight / canonical handoff confirmed
-- [x] context loaded
-- [x] responsive geometry implementation
-- [x] synthetic fixture and real-renderer Electron harness
-- [x] independent Chromium geometry probe
-- [x] focused source-contract tests
-- [x] named UI-stability check suite
-- [x] hardened packaged-content allowlist preserved without config mutation
+- [x] canonical handoff and one-builder ownership confirmed
+- [x] responsive geometry and visual containment implemented
+- [x] synthetic fixture and real-renderer Electron harness implemented
+- [x] footer-overlap regression detected and corrected
+- [x] Bryant rejected the ultra-compact supported mode
+- [x] selected `1100 × 760` desktop minimum documented
+- [x] native desktop minimum implementation pushed
+- [x] below-minimum clamp and desktop-navigation tests pushed
+- [x] pre-existing lifecycle coverage preserved
+- [x] UI-stability standard updated
 - [ ] exact-head complete source regression gate
-- [ ] live Mac visual proof at exact PR head
-- [ ] evidence-based minimum-window decision
-- [ ] proof bundle
-- [ ] ledger/state and vault-ready final report
-- [ ] Bryant and independent final-head review
+- [ ] fresh MacBook proof of native resize refusal and desktop containment
+- [ ] Settings, Existing Assets, Package Review, dialogs, and keyboard checks at the minimum
+- [ ] privacy-safe screenshots and continuous resize video
+- [ ] Bryant visible Phase A approval
+- [ ] proof bundle and vault-ready handoff
+- [ ] separate authorization for Phase B
 
-## Evidence
+## Evidence log
 
-| Time | Action | Evidence | Result |
-| --- | --- | --- | --- |
-| 2026-08-25 | Verified canonical and feature branch | `origin/v2.4.x` and the feature branch began at `fa4d3d22378f11e4bcd80c55402194bda77da398` | PASS |
-| 2026-08-25 | Confirmed Chief handoff | PR #227 merge `436c718e8d7c625673ed6bc255a9f718c58dd9b1`; PR #226 merge `fa4d3d22378f11e4bcd80c55402194bda77da398`; no active source writer reported | PASS |
-| 2026-08-25 | Added responsive presentation contract | named inline responsive block follows `renderer/styles.css` inside permitted `renderer/index.html` | IMPLEMENTED |
-| 2026-08-25 | Preserved packaged-content policy | `scripts/verify-app-contents.js` renderer allowlist remains unchanged and no new shipped renderer file exists | PASS |
-| 2026-08-25 | Added synthetic geometry coverage | 263-asset fixture, test-only preload, real-renderer Electron harness, optional real-Chromium probe | IMPLEMENTED |
-| 2026-08-25 | Replaced stale responsive test authority | focused tests assert the shrink/reflow contract and no longer require the inherited defect | IMPLEMENTED |
-| 2026-08-25 | Added durable UI process | UI-stability standard and `ui-stability-responsive-geometry` named check suite | IMPLEMENTED |
-| 2026-08-25 | Earlier source gate | workflow run `32893793347`, job `97951593801` passed at an earlier responsive source head | PASS, SUPERSEDED BY NEWER HEAD |
-| 2026-08-25 | Packaged-content-safe consolidation | commit `64827c0dbf294194782e0473b949988cb184f62e` | PUSHED |
-| 2026-08-25 | Current source gate | PR #231 exact-head rerun after this taskflow correction | PENDING |
+| Date | Action | Result |
+| --- | --- | --- |
+| 2026-08-25 | Canonical base and merged PR #226/#227 handoff confirmed | PASS |
+| 2026-08-25 | Responsive geometry, synthetic fixture, and containment tests added | IMPLEMENTED |
+| 2026-08-25 | Source-contract correction at `1293ce7753df78b6a393b61be4d11000cc64afb9` | PASS |
+| 2026-08-25 | MacBook inspection found footer overlap at `720 × 560` | NEEDS FIX |
+| 2026-08-25 | Footer overlap correction reached `f326ea8a12fe3eed3932a9e77facc879b81d8ab8` | PASS, SUPERSEDED BY PRODUCT DIRECTION CHANGE |
+| 2026-08-25 | Bryant selected a comfortable desktop minimum | `1100 × 760` |
+| 2026-08-25 | Native minimum and focused contract tests pushed | IMPLEMENTED |
+| 2026-08-25 | Supported geometry matrix updated; below-minimum request separated | IMPLEMENTED |
+| 2026-08-25 | Exact-head CI for final desktop-minimum documentation head | PENDING |
 
-## Exact-Head Mac QA Requirements
+## Fresh MacBook QA requirements
 
-Use only the committed synthetic fixture. At the exact final candidate head:
+At the exact final candidate head:
 
-1. Run `tests/ui-stability-electron-harness.js` through the repository's Electron binary with an owner-only evidence directory.
-2. Open the real synthetic Project Workspace and Review Assets flow containing four represented working files, seven existing assets, and 256 added assets.
-3. Capture geometry at `1440x900`, `1280x800`, `1200x800`, `1100x760`, `1040x760`, `960x760`, `900x700`, and the configured minimum.
-4. Confirm root, app-content, Current Project, files-view, and Review Assets `scrollWidth <= clientWidth + 1`.
-5. Confirm the sidebar does not overlap content; heading/search, summary/actions, asset cards, and footer do not intersect.
-6. Slowly resize across the full supported range and inspect four-, three-, two-column, and compact-row states where reachable.
-7. Confirm search text and active filters survive resizing.
-8. Inspect pink preview surfaces, green/pink app gradients, white panels, rounded edges, modal containment, and the sticky footer for visual bleed.
-9. Confirm resize alone causes no preview requests, project refetches, console errors, or unhandled rejections.
-10. Capture privacy-safe screenshots and a complete resize video; inspect the media before treating it as evidence.
-11. Recommend whether `main.js` should retain `720x560` or adopt a larger minimum based on measured usability rather than convenience.
+1. Confirm the native minimum reports `1100 × 760`.
+2. Attempt to resize below the minimum and demonstrate macOS refusing further reduction.
+3. Record requested outer size, actual outer size, and actual renderer viewport.
+4. Test `1100 × 760`, `1200 × 800`, `1280 × 800`, and `1440 × 900`.
+5. Confirm the persistent left sidebar and readable labels remain present.
+6. Confirm compact navigation is inactive throughout the supported matrix.
+7. Inspect Review Assets, Project Workspace, Settings, Existing Assets, Package Review, and representative dialogs at the minimum.
+8. Confirm no horizontal overflow, clipping, footer overlap, surface bleed, or inaccessible control.
+9. Verify keyboard navigation and visible focus indicators.
+10. Confirm search and filter state survive minimum-to-wide-to-minimum resizing.
+11. Confirm resize causes no project, workspace, or preview refetches.
+12. Capture privacy-safe screenshots and a continuous resize video from the exact head.
 
-## Risks
+## Risks and deferred work
 
-- Source and optional Chromium checks do not substitute for authentic macOS Electron visual judgment.
-- The focused responsive contract is intentionally inside `renderer/index.html` to preserve the hardened ASAR inventory; future refactors must preserve its cascade position or deliberately update packaged-content policy with separate security proof.
-- The existing Electron minimum may still permit an undesirable shell transition around the legacy `760px` breakpoint; the final minimum must follow real Mac evidence.
-- Large-list DOM reconciliation, preview scheduling, scroll-anchor preservation during live updates, and renderer event coalescing are intentionally deferred to the separate smoothness phase.
+- Defensive below-minimum CSS remains intentionally present but is not a supported product mode.
+- The native contract is installed through the startup bootstrap already imported before main-window construction; exact MacBook QA must confirm there is no visible launch flicker and that native resize refusal behaves as intended.
+- Large-list DOM reconciliation, preview scheduling, scroll anchoring during live updates, focus preservation during updates, and renderer event coalescing remain Phase B.
 
 ## Handoff
 
-Next exact action after the current CI passes:
-
-```text
-Check out draft PR #231 at its exact final head on the approved Mac QA worktree. Run the committed synthetic Electron harness and complete the Review Assets resize/visual matrix. Return the geometry JSON, inspected screenshots/video, privacy result, and an evidence-based minimum-window recommendation. Do not edit the implementation branch during QA.
-```
+After exact-head CI passes, the current Chief on the MacBook independently verifies PR #231, demonstrates the enforced minimum, captures fresh evidence, and returns a Phase A verdict to Bryant. The Chief must not edit the branch, merge the PR, or begin Phase B.
