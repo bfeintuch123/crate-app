@@ -1453,6 +1453,7 @@ const FILE_VISUAL_MAX_QUEUE = 128;
 const fileVisualCache = new Map();
 const fileVisualInFlight = new Map();
 const fileVisualQueue = [];
+const fileVisualDeferred = new Map();
 const fileVisualProjectEpochs = new Map();
 let fileVisualActiveRequests = 0;
 let fileVisualActiveProjectId = null;
@@ -1535,6 +1536,11 @@ function cancelQueuedFileVisualTasks(predicate) {
     fileVisualQueue.splice(index, 1);
     settleQueuedFileVisualTask(task);
   }
+  for (const [cacheKey, task] of fileVisualDeferred) {
+    if (!predicate(task)) continue;
+    fileVisualDeferred.delete(cacheKey);
+    settleQueuedFileVisualTask(task);
+  }
 }
 
 function invalidateFileVisualProject(projectId) {
@@ -1580,19 +1586,58 @@ function takeNextFileVisualTask() {
   return fileVisualQueue.splice(prioritizedIndex >= 0 ? prioritizedIndex : 0, 1)[0] || null;
 }
 
-function boundFileVisualQueue() {
-  while (fileVisualQueue.length >= FILE_VISUAL_MAX_QUEUE) {
-    let dropIndex = fileVisualQueue.findIndex(task => task.projectId !== fileVisualActiveProjectId);
-    if (dropIndex < 0) dropIndex = 0;
-    const [dropped] = fileVisualQueue.splice(dropIndex, 1);
-    settleQueuedFileVisualTask(dropped);
+function getHighestPriorityFileVisualTask(tasks) {
+  let selectedIndex = -1;
+  for (let index = 0; index < tasks.length; index += 1) {
+    if (
+      selectedIndex < 0 ||
+      tasks[index].priority < tasks[selectedIndex].priority
+    ) selectedIndex = index;
+  }
+  return selectedIndex;
+}
+
+function promoteDeferredFileVisualTasks() {
+  while (fileVisualQueue.length < FILE_VISUAL_MAX_QUEUE && fileVisualDeferred.size > 0) {
+    const candidates = [...fileVisualDeferred.values()].filter(task => (
+      !fileVisualActiveProjectId || task.projectId === fileVisualActiveProjectId
+    ));
+    const selectedIndex = getHighestPriorityFileVisualTask(candidates);
+    if (selectedIndex < 0) return;
+    const task = candidates[selectedIndex];
+    fileVisualDeferred.delete(task.cacheKey);
+    fileVisualQueue.push(task);
   }
 }
 
+function enqueueFileVisualTask(task) {
+  if (fileVisualQueue.length < FILE_VISUAL_MAX_QUEUE) {
+    fileVisualQueue.push(task);
+    return;
+  }
+
+  const demotableIndex = fileVisualQueue.reduce((selectedIndex, queuedTask, index) => {
+    if (
+      selectedIndex < 0 ||
+      queuedTask.priority > fileVisualQueue[selectedIndex].priority
+    ) return index;
+    return selectedIndex;
+  }, -1);
+  if (demotableIndex >= 0 && task.priority < fileVisualQueue[demotableIndex].priority) {
+    const [demoted] = fileVisualQueue.splice(demotableIndex, 1);
+    fileVisualDeferred.set(demoted.cacheKey, demoted);
+    fileVisualQueue.push(task);
+    return;
+  }
+  fileVisualDeferred.set(task.cacheKey, task);
+}
+
 function pumpFileVisualQueue() {
+  promoteDeferredFileVisualTasks();
   while (fileVisualActiveRequests < FILE_VISUAL_MAX_CONCURRENCY && fileVisualQueue.length > 0) {
     const task = takeNextFileVisualTask();
     if (!task) return;
+    promoteDeferredFileVisualTasks();
     fileVisualActiveRequests += 1;
     Promise.resolve()
       .then(() => window.crate.getFileVisual(task.projectId, task.identity, task.revision))
@@ -1611,6 +1656,7 @@ function pumpFileVisualQueue() {
         if (fileVisualInFlight.get(task.cacheKey) === task.request) {
           fileVisualInFlight.delete(task.cacheKey);
         }
+        promoteDeferredFileVisualTasks();
         pumpFileVisualQueue();
       });
   }
@@ -1643,8 +1689,7 @@ function requestFileVisual(projectId, identity, revision, priority = null) {
     settled: false,
   };
   fileVisualInFlight.set(cacheKey, request);
-  boundFileVisualQueue();
-  fileVisualQueue.push(task);
+  enqueueFileVisualTask(task);
   if (priority === null) pumpFileVisualQueue();
   else scheduleFileVisualQueuePump();
   return request;

@@ -1563,7 +1563,8 @@ test('file visual queue stays bounded and cancels stale queued work on project s
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(vm.runInContext('fileVisualActiveRequests', renderer), 4);
   assert.equal(vm.runInContext('fileVisualQueue.length', renderer), 128);
-  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 132);
+  assert.equal(vm.runInContext('fileVisualDeferred.size', renderer), 8);
+  assert.equal(vm.runInContext('fileVisualInFlight.size', renderer), 140);
 
   renderer.setActiveFileVisualProject('new-project');
   const selectedRequest = renderer.requestFileVisual('new-project', 'selected', 'selected-revision');
