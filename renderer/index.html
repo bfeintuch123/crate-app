@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-meSHNlfCpu6p03AwJHwQ4F8o6xL/iAX6aq88aWumNjM='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-Kt2Zp+fZv2Y9wbp/swv1kyF2JHHT5d2zYkNh9CN9wGA='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
   <title>Crate</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1298,8 +1298,10 @@
   function decorateFigmaLink() {
     const link = document.getElementById('files-figma-scope');
     if (!link) return;
+    const enabled = typeof link.onclick === 'function';
     link.setAttribute('role', 'button');
-    link.setAttribute('tabindex', '0');
+    link.setAttribute('tabindex', enabled ? '0' : '-1');
+    link.setAttribute('aria-disabled', enabled ? 'false' : 'true');
     const label = link.textContent?.trim() || 'Edit Figma link';
     link.setAttribute('aria-label', label);
   }
