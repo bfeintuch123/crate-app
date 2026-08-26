@@ -11,7 +11,7 @@
 - canonical base SHA: `d2a7be01b89d3ff8bebfe3daf927aa34e6a16629`
 - branch: `codex/ui-stability-app-smoothness`
 - Phase A authority: merged PR #231
-- Phase B status: active diagnosis; no runtime changes yet
+- Phase B status: B1/B2 implementation complete; deterministic validation complete; MacBook Electron baseline remains blocked by QA infrastructure
 
 ## Product objective
 
@@ -48,6 +48,11 @@ Do not reopen or weaken Phase A unless a focused Phase B test proves a direct re
 ## Phase B workstreams
 
 ### B0 — Read-only app-wide baseline audit
+
+Disposition: `BLOCKED_BY_QA_INFRASTRUCTURE`. The direct MacBook Electron launch did not
+produce a renderer window or baseline report because the disposable Electron runtime
+terminated before startup. This is not a Crate product failure; deterministic renderer
+tests and later normal local-development-build MacBook QA remain authoritative.
 
 Measure current behavior before production edits at synthetic sizes:
 
@@ -143,12 +148,12 @@ Avoid `main.js`, watcher modules, package modules, parsers, Figma transport, dep
 - [x] one-builder ownership confirmed from GitHub-visible app work
 - [x] fresh Phase B branch created
 - [x] taskflow created and pushed
-- [ ] draft PR opened
-- [ ] app-wide baseline audit complete
-- [ ] baseline reviewed against small, normal, and stress fixtures
-- [ ] B1 implementation complete
+- [x] draft PR opened
+- [x] app-wide baseline audit complete (deterministic synthetic audit; MacBook Electron run blocked by QA infrastructure)
+- [x] baseline reviewed against small, normal, and stress fixtures
+- [x] B1 implementation complete
 - [ ] B1 exact-head tests and MacBook QA complete
-- [ ] B2 confirmed interaction issues implemented
+- [x] B2 confirmed interaction issues implemented
 - [ ] B2 exact-head app-wide QA complete
 - [ ] Bryant approval
 - [ ] merge and Vault handoff
