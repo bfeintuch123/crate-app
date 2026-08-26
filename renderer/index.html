@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-44vIYhv4jL6XROuiIVEZG08KBMBNdhXS2aryWhYf6BQ='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-meSHNlfCpu6p03AwJHwQ4F8o6xL/iAX6aq88aWumNjM='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
   <title>Crate</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -456,6 +456,24 @@
         background-color var(--crate-motion-fast) var(--crate-ease-out);
     }
 
+    :is(button, [href], input, select, textarea, summary, [role="button"][tabindex]):focus-visible {
+      outline: 2px solid var(--black);
+      outline-offset: 3px;
+    }
+
+    .app-sidebar :is(button, [href], [role="button"][tabindex]):focus-visible {
+      outline-color: var(--white);
+    }
+
+    .project-info[role="button"] {
+      border-radius: 6px;
+    }
+
+    .project-row:focus-within .project-delete {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *,
       *::before,
@@ -476,7 +494,7 @@
       </div>
 
       <nav class="app-tabs" aria-label="Primary">
-        <button class="app-tab active" data-tab="projects">Projects</button>
+        <button class="app-tab active" data-tab="projects" aria-current="page">Projects</button>
         <button class="app-tab" data-tab="quick-package">Quick Package</button>
         <button class="app-tab" data-tab="current-project">Project Workspace</button>
       </nav>
@@ -521,7 +539,7 @@
           <div class="app-label">New Project</div>
           <div class="form-subtitle">Name your project &mdash; Crate will watch project dependencies while you work.</div>
           <div class="form-field">
-            <div class="app-label">Project Name</div>
+            <label class="app-label" for="input-project-name">Project Name</label>
             <div class="form-input-wrap">
               <input type="text" id="input-project-name" class="form-input" placeholder="e.g. Nike &mdash; Brand Refresh">
             </div>
@@ -534,14 +552,15 @@
                 <span class="figma-section-label">Link a Figma file (optional)</span>
               </button>
               <div class="figma-section-body hidden" id="figma-section-body">
-                <input type="text" id="input-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
-                <div class="form-subtitle" style="margin-top:6px;">Scope</div>
-                <select id="input-figma-scope" class="settings-input" style="width:100%;">
+                <label class="sr-only" for="input-figma-url">Figma file URL</label>
+                <input type="text" id="input-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="figma-section-help" style="width:100%;box-sizing:border-box;">
+                <label class="form-subtitle" for="input-figma-scope" style="display:block;margin-top:6px;">Scope</label>
+                <select id="input-figma-scope" class="settings-input" aria-describedby="figma-section-help" style="width:100%;">
                   <option value="current-page" selected>Current Page Only</option>
                   <option value="entire-file">Entire File</option>
                 </select>
-                <div class="figma-section-help">Open your Figma page first, then copy the URL from your browser bar &mdash; that lets Crate scope to the page you are working on.</div>
-                <div class="figma-section-error hidden" id="figma-section-error"></div>
+                <div class="figma-section-help" id="figma-section-help">Open your Figma page first, then copy the URL from your browser bar &mdash; that lets Crate scope to the page you are working on.</div>
+                <div class="figma-section-error hidden" id="figma-section-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
               </div>
             </div>
           </div>
@@ -592,12 +611,12 @@
                   <span class="app-status-text" id="files-status-text">Watching</span>
                 </div>
               </div>
-              <div class="project-dashboard-alert hidden" id="project-linking-alert" role="status"></div>
+              <div class="project-dashboard-alert hidden" id="project-linking-alert" role="status" aria-live="polite" aria-atomic="true"></div>
             </header>
 
             <div class="project-dashboard-controls">
-              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link"></div>
-              <div id="files-figma-warning" class="figma-warning-card hidden"></div>
+              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link" aria-label="Edit Figma link"></div>
+              <div id="files-figma-warning" class="figma-warning-card hidden" role="status" aria-live="polite" aria-atomic="true"></div>
             </div>
 
             <div class="asset-metric-grid" aria-label="Asset summary">
@@ -706,7 +725,7 @@
         <div class="settings-section">
           <div class="settings-section-title">Naming Template</div>
           <div class="settings-row">
-            <div class="settings-label">Template</div>
+            <label class="settings-label" for="input-naming-template">Template</label>
           </div>
           <input class="settings-input" id="input-naming-template" value="{Project}_{Date}">
           <div class="settings-preview-text">Preview: <span id="settings-naming-preview">Nike_BrandRefresh_2026-02-20</span></div>
@@ -716,42 +735,42 @@
           <div class="settings-section-title">Preferences</div>
           <div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label">Package alerts</div>
-              <div class="settings-desc">Get alerts when Crate notices a watched project has been idle.</div>
+              <div class="settings-label" id="setting-notifications-label">Package alerts</div>
+              <div class="settings-desc" id="setting-notifications-desc">Get alerts when Crate notices a watched project has been idle.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-notifications">
+              <input type="checkbox" id="toggle-notifications" aria-labelledby="setting-notifications-label" aria-describedby="setting-notifications-desc">
               <span class="toggle-slider"></span>
             </label>
           </div>
           <div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label">Include diagnostic report in packages</div>
-              <div class="settings-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
+              <div class="settings-label" id="setting-diagnostics-label">Include diagnostic report in packages</div>
+              <div class="settings-desc" id="setting-diagnostics-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-diagnostic-report">
+              <input type="checkbox" id="toggle-diagnostic-report" aria-labelledby="setting-diagnostics-label" aria-describedby="setting-diagnostics-desc setting-diagnostics-hint">
               <span class="toggle-slider"></span>
             </label>
           </div>
-          <div class="diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div>
+          <div class="diagnostics-hint" id="setting-diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div>
           <div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label">Show Package Details after packaging</div>
-              <div class="settings-desc">Shows a simple package summary after Crate gathers your files.</div>
+              <div class="settings-label" id="setting-package-details-label">Show Package Details after packaging</div>
+              <div class="settings-desc" id="setting-package-details-desc">Shows a simple package summary after Crate gathers your files.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-package-details">
+              <input type="checkbox" id="toggle-package-details" aria-labelledby="setting-package-details-label" aria-describedby="setting-package-details-desc">
               <span class="toggle-slider"></span>
             </label>
           </div>
           <div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label">Organize packages by file type</div>
-              <div class="settings-desc">Creates folders such as AI, PNG, and PDF. Turn this off to keep all files together.</div>
+              <div class="settings-label" id="setting-package-folders-label">Organize packages by file type</div>
+              <div class="settings-desc" id="setting-package-folders-desc">Creates folders such as AI, PNG, and PDF. Turn this off to keep all files together.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-package-folders" aria-label="Organize packages by file type">
+              <input type="checkbox" id="toggle-package-folders" aria-labelledby="setting-package-folders-label" aria-describedby="setting-package-folders-desc">
               <span class="toggle-slider"></span>
             </label>
           </div>
@@ -781,7 +800,7 @@
                 <div class="figma-auto-desc">Crate scans Figma links that you add to projects and captures approved assets.</div>
               </div>
               <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
-              <button class="app-btn outline" id="btn-figma-scan-now" style="width:100%;margin-top:8px;">Scan Now</button>
+              <button class="app-btn outline" id="btn-figma-scan-now" aria-describedby="figma-scan-status" style="width:100%;margin-top:8px;">Scan Now</button>
               <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Project Workspace to add or change project Figma assets.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
@@ -795,6 +814,7 @@
                 <div class="figma-step">2. Generate a Personal Access Token</div>
                 <div class="figma-step">3. Paste it below &mdash; that's it!</div>
               </div>
+              <label class="sr-only" for="input-figma-token">Figma personal access token</label>
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
               <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Reconnect Figma</button>
               <div class="figma-benefit-hint">
@@ -895,7 +915,7 @@
             <div class="modal-row-label">Project</div>
             <div class="modal-row-value" id="modal-project-name"></div>
           </div>
-          <div id="modal-figma-warning" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
+          <div id="modal-figma-warning" role="status" aria-live="polite" aria-atomic="true" style="font-size:12px;color:#f59e0b;margin-bottom:8px;"></div>
           <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
           <div class="modal-reminder hidden" id="modal-presentation-reminder">
             <div class="modal-reminder-title">Save before packaging</div>
@@ -1035,18 +1055,18 @@
         </div>
         <div class="modal-body">
           <div class="form-field">
-            <div class="app-label">Replace Figma URL (optional)</div>
-            <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
-            <div class="form-subtitle" style="margin-top:6px;">Leave blank to keep the current link.</div>
+            <label class="app-label" for="edit-figma-url">Replace Figma URL (optional)</label>
+            <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="edit-figma-url-help" style="width:100%;box-sizing:border-box;">
+            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link.</div>
           </div>
           <div class="form-field">
-            <div class="app-label">Scope</div>
+            <label class="app-label" for="edit-figma-scope">Scope</label>
             <select id="edit-figma-scope" class="settings-input" style="width:100%;">
               <option value="current-page">Current Page Only</option>
               <option value="entire-file">Entire File</option>
             </select>
           </div>
-          <div id="edit-figma-error" style="font-size:12px;color:#f87171;margin-bottom:8px;display:none;"></div>
+          <div id="edit-figma-error" role="alert" aria-live="assertive" aria-atomic="true" style="font-size:12px;color:#f87171;margin-bottom:8px;display:none;"></div>
           <div class="modal-actions">
             <button class="modal-btn-danger" id="btn-edit-figma-remove">Remove Link</button>
             <button class="modal-btn-secondary" id="btn-edit-figma-cancel">Cancel</button>
@@ -1203,7 +1223,7 @@
     state.keydown = null;
   }
 
-  function initialize() {
+  function initializeModals() {
     for (const config of modalConfigs) {
       const modal = document.getElementById(config.id);
       if (!modal) continue;
@@ -1217,6 +1237,99 @@
       });
       sync();
     }
+  }
+
+  function updateNavigationState() {
+    for (const tab of document.querySelectorAll('.app-tab')) {
+      if (tab.classList.contains('active')) tab.setAttribute('aria-current', 'page');
+      else tab.removeAttribute('aria-current');
+    }
+  }
+
+  function activateKeyboardControl(event, element) {
+    if (!['Enter', ' '].includes(event.key)) return;
+    if (element.getAttribute('aria-disabled') === 'true') return;
+    event.preventDefault();
+    element.click();
+  }
+
+  function decorateProjectRows() {
+    const container = document.getElementById('project-rows');
+    if (!container) return;
+    for (const row of container.querySelectorAll('.project-row')) {
+      const info = row.querySelector('.project-info');
+      const name = row.querySelector('.project-name')?.textContent?.trim() || 'project';
+      const status = row.querySelector('.project-status')?.textContent?.trim() || '';
+      if (info) {
+        info.setAttribute('role', 'button');
+        info.setAttribute('tabindex', '0');
+        info.setAttribute('aria-label', `Open ${name}${status ? `. ${status}` : ''}`);
+      }
+      const pill = row.querySelector('.project-pill');
+      if (pill) {
+        pill.setAttribute('role', 'button');
+        pill.setAttribute('tabindex', '0');
+        pill.setAttribute('aria-disabled', pill.getAttribute('aria-busy') === 'true' ? 'true' : 'false');
+      }
+    }
+  }
+
+  function initializeProjectKeyboard() {
+    const container = document.getElementById('project-rows');
+    if (!container) return;
+    decorateProjectRows();
+    new MutationObserver(decorateProjectRows).observe(container, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['aria-busy', 'class']
+    });
+    container.addEventListener('keydown', event => {
+      const pill = event.target.closest?.('.project-pill');
+      if (pill) {
+        activateKeyboardControl(event, pill);
+        return;
+      }
+      const info = event.target.closest?.('.project-info[role="button"]');
+      if (info) activateKeyboardControl(event, info);
+    });
+  }
+
+  function decorateFigmaLink() {
+    const link = document.getElementById('files-figma-scope');
+    if (!link) return;
+    link.setAttribute('role', 'button');
+    link.setAttribute('tabindex', '0');
+    const label = link.textContent?.trim() || 'Edit Figma link';
+    link.setAttribute('aria-label', label);
+  }
+
+  function initializeFigmaLinkKeyboard() {
+    const link = document.getElementById('files-figma-scope');
+    if (!link) return;
+    decorateFigmaLink();
+    new MutationObserver(decorateFigmaLink).observe(link, {
+      childList: true,
+      subtree: true
+    });
+    link.addEventListener('keydown', event => activateKeyboardControl(event, link));
+  }
+
+  function initializeNavigationState() {
+    updateNavigationState();
+    for (const tab of document.querySelectorAll('.app-tab')) {
+      new MutationObserver(updateNavigationState).observe(tab, {
+        attributes: true,
+        attributeFilter: ['class']
+      });
+    }
+  }
+
+  function initialize() {
+    initializeModals();
+    initializeNavigationState();
+    initializeProjectKeyboard();
+    initializeFigmaLinkKeyboard();
   }
 
   if (document.readyState === 'loading') {
