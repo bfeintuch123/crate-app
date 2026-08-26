@@ -11,6 +11,7 @@ const {
 
 const LEGACY_HARNESS_PATH = path.join(__dirname, 'ui-stability-electron-harness-legacy.js');
 const SHOW_WINDOW = process.env.CRATE_UI_SHOW === '1';
+const FORCE_FAILURE = process.env.CRATE_UI_FORCE_FAILURE === '1';
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
 const HARNESS_TIMEOUT_MS = 180_000;
 
@@ -155,6 +156,7 @@ async function run() {
   const runnerFailures = [];
   if (legacy.signal) runnerFailures.push(`legacy harness terminated by ${legacy.signal}`);
   if (legacy.exitCode !== 0) runnerFailures.push(`legacy harness exited with status ${legacy.exitCode}`);
+  if (FORCE_FAILURE) runnerFailures.push('forced harness failure for exit-code verification');
   report.failures = [...(Array.isArray(report.failures) ? report.failures : []), ...runnerFailures];
 
   const exitCode = getHarnessExitCode({
@@ -167,6 +169,7 @@ async function run() {
     legacyExitCode: legacy.exitCode,
     legacySignal: legacy.signal,
     visibleMacEvidence: process.platform === 'darwin' && SHOW_WINDOW,
+    forcedFailure: FORCE_FAILURE,
     connectedWorkAreas: workAreas,
     removedWorkAreaFailures,
   };
