@@ -5,6 +5,74 @@ const STARTUP_PHASE_JOURNAL_FILE = 'startup-phases.jsonl';
 const STARTUP_PHASE_JOURNAL_MODE = 0o600;
 const STARTUP_PHASE_JOURNAL_MAX_BYTES = 128 * 1024;
 const STARTUP_PHASE_JOURNAL_MAX_ENTRIES = 128;
+const DESKTOP_WINDOW_MINIMUM = Object.freeze({
+  width: 1100,
+  height: 760,
+});
+const desktopWindowMinimumApps = new WeakSet();
+
+function applyDesktopWindowMinimum(browserWindow) {
+  if (
+    !browserWindow ||
+    (typeof browserWindow.isDestroyed === 'function' && browserWindow.isDestroyed()) ||
+    typeof browserWindow.setMinimumSize !== 'function'
+  ) return false;
+
+  try {
+    browserWindow.setMinimumSize(
+      DESKTOP_WINDOW_MINIMUM.width,
+      DESKTOP_WINDOW_MINIMUM.height
+    );
+
+    if (
+      typeof browserWindow.getSize === 'function' &&
+      typeof browserWindow.setSize === 'function'
+    ) {
+      const [currentWidth, currentHeight] = browserWindow.getSize();
+      const nextWidth = Math.max(
+        Number(currentWidth) || 0,
+        DESKTOP_WINDOW_MINIMUM.width
+      );
+      const nextHeight = Math.max(
+        Number(currentHeight) || 0,
+        DESKTOP_WINDOW_MINIMUM.height
+      );
+      if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
+        browserWindow.setSize(nextWidth, nextHeight, false);
+      }
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function installDesktopWindowMinimum(appModule) {
+  if (
+    !appModule ||
+    (typeof appModule !== 'object' && typeof appModule !== 'function') ||
+    typeof appModule.on !== 'function'
+  ) return false;
+  if (desktopWindowMinimumApps.has(appModule)) return true;
+
+  desktopWindowMinimumApps.add(appModule);
+  appModule.on('browser-window-created', (_event, browserWindow) => {
+    applyDesktopWindowMinimum(browserWindow);
+  });
+  return true;
+}
+
+function installDesktopWindowMinimumFromElectron() {
+  try {
+    const electron = require('electron');
+    return installDesktopWindowMinimum(electron && electron.app);
+  } catch (_) {
+    return false;
+  }
+}
+
+const desktopWindowMinimumInstalled = installDesktopWindowMinimumFromElectron();
+
 const STARTUP_PHASES = new Set([
   'main-module-entered',
   'dependencies-loaded',
@@ -179,10 +247,14 @@ function createStartupPhaseJournal(options = {}) {
 }
 
 module.exports = {
+  DESKTOP_WINDOW_MINIMUM,
   STARTUP_PHASE_JOURNAL_FILE,
   STARTUP_PHASE_JOURNAL_MAX_BYTES,
   STARTUP_PHASE_JOURNAL_MODE,
   STARTUP_PHASES,
+  applyDesktopWindowMinimum,
   createStartupPhaseJournal,
+  desktopWindowMinimumInstalled,
   getWatchRecoveryPhase,
+  installDesktopWindowMinimum,
 };
