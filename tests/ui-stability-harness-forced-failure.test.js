@@ -29,3 +29,9 @@ test('UI stability harness exposes an explicit fail-closed verification mode', (
   assert.match(policy, /processModule\.exitCode = finalExitCode/);
   assert.match(policy, /appModule\.exit\(finalExitCode\)/);
 });
+
+test('UI stability harness flushes its structured report before exiting Electron', () => {
+  assert.match(harness, /async function writeReport\(report\)/);
+  assert.match(harness, /process\.stdout\.write\(output, error =>/);
+  assert.match(harness, /await writeReport\(report\)/);
+});

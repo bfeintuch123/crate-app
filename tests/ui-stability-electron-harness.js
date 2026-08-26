@@ -146,6 +146,16 @@ function reconcileWorkAreaCaps(report, workAreas) {
   return removedFailures;
 }
 
+async function writeReport(report) {
+  const output = `${JSON.stringify(report, null, 2)}\n`;
+  await new Promise((resolve, reject) => {
+    process.stdout.write(output, error => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
 async function run() {
   const legacy = await runLegacyHarness();
   if (legacy.stderr) process.stderr.write(legacy.stderr);
@@ -175,7 +185,7 @@ async function run() {
   };
   report.exitCode = exitCode;
 
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  await writeReport(report);
   return exitCode;
 }
 
