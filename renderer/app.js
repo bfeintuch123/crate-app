@@ -54,6 +54,7 @@ let fileWorkspaceRenderRequestId = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
+const rendererActionsInFlight = new Set();
 
 function redactRendererPrivatePaths(value) {
   // Delimiters and line breaks may appear in filenames, so redact the value tail.
@@ -330,6 +331,36 @@ function reconcileKeyedList(list, items, build, keyForItem = getRendererItemKey)
   }
 }
 
+function setRendererActionBusy(element, busy, busyLabel, idleLabel = null) {
+  if (!element) return;
+  if (busy) {
+    if (element.dataset) element.dataset.actionIdleLabel = idleLabel ?? element.textContent;
+    element.setAttribute('aria-busy', 'true');
+    element.classList.add('is-action-busy');
+    if ('disabled' in element) element.disabled = true;
+    if (busyLabel) element.textContent = busyLabel;
+    return;
+  }
+  element.setAttribute('aria-busy', 'false');
+  element.classList.remove('is-action-busy');
+  if ('disabled' in element) element.disabled = false;
+  const storedLabel = element.dataset?.actionIdleLabel;
+  if (storedLabel !== undefined) element.textContent = storedLabel;
+  if (element.dataset) delete element.dataset.actionIdleLabel;
+}
+
+async function runRendererAction(key, element, busyLabel, action, idleLabel = null) {
+  if (rendererActionsInFlight.has(key)) return undefined;
+  rendererActionsInFlight.add(key);
+  setRendererActionBusy(element, true, busyLabel, idleLabel);
+  try {
+    return await action();
+  } finally {
+    rendererActionsInFlight.delete(key);
+    setRendererActionBusy(element, false, busyLabel, idleLabel);
+  }
+}
+
 // ===== Init =====
 async function init() {
   try {
@@ -476,13 +507,19 @@ function renderProjectRows() {
     const pill = row.querySelector('.project-pill');
     pill.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (project.status === 'watching') {
-        await window.crate.pauseProject(project.id);
-      } else {
-        await window.crate.startWatching(project.id);
+      const action = project.status === 'watching' ? 'pauseProject' : 'startWatching';
+      const busyLabel = project.status === 'watching' ? 'Pausing…' : 'Starting…';
+      try {
+        await runRendererAction(`watch:${project.id}`, pill, busyLabel, async () => {
+          await window.crate[action](project.id);
+          state.projects = await window.crate.getProjects();
+          if (isTabActive('projects')) renderProjects();
+          if (state.selectedProjectId === project.id && isTabActive('current-project')) await renderFiles();
+        }, pillText);
+      } catch (error) {
+        logRendererError(`${action} failed`, error);
+        showToast('Crate could not update watching. Try again.');
       }
-      state.projects = await window.crate.getProjects();
-      renderProjects();
     });
 
     // Click delete -> show confirmation
@@ -1419,6 +1456,7 @@ const fileVisualQueue = [];
 const fileVisualProjectEpochs = new Map();
 let fileVisualActiveRequests = 0;
 let fileVisualActiveProjectId = null;
+let fileVisualPumpScheduled = false;
 
 function getFileVisualIdentity(file) {
   if (!file || typeof file !== 'object') return null;
@@ -1515,14 +1553,30 @@ function setActiveFileVisualProject(projectId) {
   fileVisualActiveProjectId = nextProjectId;
   if (previousProjectId) invalidateFileVisualProject(previousProjectId);
   cancelQueuedFileVisualTasks(task => task.projectId !== nextProjectId);
-  pumpFileVisualQueue();
+  scheduleFileVisualQueuePump();
+}
+
+function scheduleFileVisualQueuePump() {
+  if (fileVisualPumpScheduled) return;
+  fileVisualPumpScheduled = true;
+  Promise.resolve().then(() => {
+    fileVisualPumpScheduled = false;
+    pumpFileVisualQueue();
+  });
 }
 
 function takeNextFileVisualTask() {
   if (fileVisualQueue.length === 0) return null;
-  const prioritizedIndex = fileVisualActiveProjectId
-    ? fileVisualQueue.findIndex(task => task.projectId === fileVisualActiveProjectId)
-    : -1;
+  let prioritizedIndex = -1;
+  for (let index = 0; index < fileVisualQueue.length; index += 1) {
+    const task = fileVisualQueue[index];
+    if (fileVisualActiveProjectId && task.projectId !== fileVisualActiveProjectId) continue;
+    if (
+      prioritizedIndex < 0 ||
+      task.priority < fileVisualQueue[prioritizedIndex].priority
+    ) prioritizedIndex = index;
+  }
+  if (prioritizedIndex < 0) prioritizedIndex = 0;
   return fileVisualQueue.splice(prioritizedIndex >= 0 ? prioritizedIndex : 0, 1)[0] || null;
 }
 
@@ -1562,7 +1616,7 @@ function pumpFileVisualQueue() {
   }
 }
 
-function requestFileVisual(projectId, identity, revision) {
+function requestFileVisual(projectId, identity, revision, priority = null) {
   if (!projectId || !identity || !revision || typeof window.crate?.getFileVisual !== 'function') {
     return Promise.resolve({ kind: 'fallback' });
   }
@@ -1581,6 +1635,7 @@ function requestFileVisual(projectId, identity, revision) {
     projectId,
     identity,
     revision,
+    priority: Number.isFinite(priority) ? priority : 0,
     cacheKey,
     epoch: getFileVisualProjectEpoch(projectId),
     request,
@@ -1590,11 +1645,12 @@ function requestFileVisual(projectId, identity, revision) {
   fileVisualInFlight.set(cacheKey, request);
   boundFileVisualQueue();
   fileVisualQueue.push(task);
-  pumpFileVisualQueue();
+  if (priority === null) pumpFileVisualQueue();
+  else scheduleFileVisualQueuePump();
   return request;
 }
 
-function createFileVisual(projectId, file) {
+function createFileVisual(projectId, file, { priority = 0 } = {}) {
   const container = document.createElement('span');
   container.className = 'file-visual file-visual-fallback';
   container.setAttribute('aria-hidden', 'true');
@@ -1607,7 +1663,7 @@ function createFileVisual(projectId, file) {
   container.appendChild(badge);
 
   if (!projectId || !identity || !revision) return container;
-  requestFileVisual(projectId, identity, revision).then(result => applyResolvedFileVisual(container, result));
+  requestFileVisual(projectId, identity, revision, priority).then(result => applyResolvedFileVisual(container, result));
   return container;
 }
 
@@ -1679,7 +1735,7 @@ function appendAssetFileRestorationAction(row, project, file) {
 function createAssetFileRow(
   project,
   file,
-  { excluded = false, protectedSource = false, sourceRecoveryAllowed = false } = {}
+  { excluded = false, protectedSource = false, sourceRecoveryAllowed = false, previewPriority = 0 } = {}
 ) {
   const row = document.createElement('div');
   row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
@@ -1688,7 +1744,7 @@ function createAssetFileRow(
     ? 'excluded'
     : (file?.assetOrigin === 'existing' ? 'existing' : 'added');
   row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
-  row.appendChild(createFileVisual(project && project.id, file));
+  row.appendChild(createFileVisual(project && project.id, file, { priority: previewPriority }));
 
   const copy = document.createElement('div');
   copy.className = 'asset-file-copy';
@@ -1741,14 +1797,15 @@ function renderAssetPanelList(list, project, files, options = {}) {
     excluded: file.excluded === true,
     protectedSource: file.protectedSource === true || options.protectedSource === true,
     sourceRecoveryAllowed: file.sourceRecoveryAllowed === true,
+    previewPriority: options.previewPriority || 0,
   }));
 }
 
-function createRecentAssetCard(project, file) {
+function createRecentAssetCard(project, file, { previewPriority = 0 } = {}) {
   const card = document.createElement('div');
   card.className = 'recent-asset-card';
   card.setAttribute('role', 'listitem');
-  card.appendChild(createFileVisual(project.id, file));
+  card.appendChild(createFileVisual(project.id, file, { priority: previewPriority }));
   const name = document.createElement('span');
   name.textContent = file?.name || 'Untitled asset';
   name.title = name.textContent;
@@ -1837,7 +1894,9 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   const recentList = $('#recent-assets-list');
   if (recentList) {
     const recent = [...includedExisting, ...includedAdded].slice(-5).reverse();
-    reconcileKeyedList(recentList, recent, file => createRecentAssetCard(project, file));
+    reconcileKeyedList(recentList, recent, file => createRecentAssetCard(project, file, {
+      previewPriority: state.assetReviewOpen ? 10 : 0,
+    }));
     const remaining = Math.max(0, includedExisting.length + includedAdded.length - recent.length);
     const moreKey = 'recent-more';
     const existingMore = Array.from(recentList.children || []).find(child => child.dataset?.renderKey === moreKey);
@@ -1932,14 +1991,17 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   renderAssetPanelList($('#project-file-list'), project, sourceFiles, {
     protectedSource: true,
     emptyMessage: 'Add a project file to begin.',
+    previewPriority: state.assetReviewOpen ? 10 : 0,
   });
   renderAssetPanelList($('#existing-assets-list'), project, existingAssets, {
     emptyMessage: 'No existing assets found.',
+    previewPriority: state.assetReviewOpen ? 0 : 10,
   });
   renderAssetPanelList($('#added-assets-list'), project, addedAssets, {
     emptyMessage: options.hasActiveCandidates
       ? 'No package-ready assets yet. Review the files Crate observed.'
       : 'New package-ready assets will appear here as you work.',
+    previewPriority: state.assetReviewOpen ? 0 : 10,
   });
 
   setAssetPanelCount($('#project-file-count'), sourceFiles.length);
@@ -2142,7 +2204,9 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
       ? 'Needs save'
       : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs review');
 
-    row.appendChild(createFileVisual(project.id, file));
+    row.appendChild(createFileVisual(project.id, file, {
+      priority: state.assetReviewOpen ? 0 : 10,
+    }));
     const copy = document.createElement('span');
     copy.className = 'pending-file-copy';
     const name = document.createElement('span');
@@ -2180,15 +2244,41 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     row.appendChild(actions);
 
     acceptButton.addEventListener('click', async () => {
-      await window.crate.acceptPending(project.id, getFileVisualIdentity(file) || rawFile.path);
-      state.projects = await window.crate.getProjects();
-      renderFiles();
+      try {
+        await runRendererAction(
+          `pending-accept:${project.id}:${getRendererItemKey(file, index)}`,
+          acceptButton,
+          'Adding…',
+          async () => {
+            await window.crate.acceptPending(project.id, getFileVisualIdentity(file) || rawFile.path);
+            state.projects = await window.crate.getProjects();
+            await renderFiles();
+          },
+          '+ Add',
+        );
+      } catch (error) {
+        logRendererError('pending asset add failed', error);
+        showToast('Crate could not add that asset. Try again.');
+      }
     });
 
     rejectButton.addEventListener('click', async () => {
-      await window.crate.rejectPending(project.id, getFileVisualIdentity(file) || rawFile.path);
-      state.projects = await window.crate.getProjects();
-      renderFiles();
+      try {
+        await runRendererAction(
+          `pending-reject:${project.id}:${getRendererItemKey(file, index)}`,
+          rejectButton,
+          'Skipping…',
+          async () => {
+            await window.crate.rejectPending(project.id, getFileVisualIdentity(file) || rawFile.path);
+            state.projects = await window.crate.getProjects();
+            await renderFiles();
+          },
+          'Skip',
+        );
+      } catch (error) {
+        logRendererError('pending asset skip failed', error);
+        showToast('Crate could not skip that asset. Try again.');
+      }
     });
 
     return row;
@@ -2403,7 +2493,7 @@ function focusPackageReviewDialog() {
   const reviewDialog = document.querySelector('.package-review-modal');
   if (reviewDialog) reviewDialog.scrollTop = 0;
   const reviewMessage = $('#modal-package-review-message');
-  if (reviewMessage && !reviewMessage.classList.contains('hidden')) {
+  if (reviewMessage && !reviewMessage.classList.contains('hidden') && !reviewMessage.classList.contains('is-empty')) {
     reviewMessage.focus({ preventScroll: true });
     return;
   }
@@ -2635,7 +2725,8 @@ function renderPackageReview(project, review, message = '') {
   if (reviewMessage) {
     const visibleMessage = message || review.message || '';
     reviewMessage.textContent = visibleMessage;
-    reviewMessage.classList.toggle('hidden', !visibleMessage);
+    reviewMessage.classList.remove('hidden');
+    reviewMessage.classList.toggle('is-empty', !visibleMessage);
   }
   const confirmButton = $('#btn-confirm-package');
   if (confirmButton) confirmButton.disabled = !canPackage;
@@ -3129,19 +3220,28 @@ function setupEventListeners() {
   });
 
   // Project Workspace tab
-  $('#btn-add-files').addEventListener('click', async () => {
+  $('#btn-add-files').addEventListener('click', async (event) => {
     if (!state.selectedProjectId) {
       showToast('Select a project first');
       return;
     }
-    const files = await window.crate.addFiles(state.selectedProjectId);
-    if (files) {
-      state.projects = await window.crate.getProjects();
-      renderFiles();
+    const button = event.currentTarget || $('#btn-add-files');
+    try {
+      await runRendererAction(`add-files:${state.selectedProjectId}`, button, 'Adding…', async () => {
+        const files = await window.crate.addFiles(state.selectedProjectId);
+        if (files) {
+          state.projects = await window.crate.getProjects();
+          await renderFiles();
+        }
+      }, '+ Add Files');
+    } catch (error) {
+      logRendererError('Add Files failed', error);
+      showToast('Crate could not add files. Try again.');
     }
   });
 
-  $('#btn-package').addEventListener('click', async () => {
+  $('#btn-package').addEventListener('click', async (event) => {
+    const button = event.currentTarget || $('#btn-package');
     const projectId = state.selectedProjectId;
     if (!projectId) return;
 
@@ -3159,7 +3259,12 @@ function setupEventListeners() {
       const ok = confirm('This project was already packaged. Package again?');
       if (!ok) return;
     }
-    await showPackageModal();
+    try {
+      await runRendererAction(`package-review:${projectId}`, button, 'Preparing…', () => showPackageModal(), 'Package Project');
+    } catch (error) {
+      logRendererError('Package Review preparation failed', error);
+      showToast('Package Review could not open. Try again.');
+    }
   });
 
   // Package modal
@@ -3324,9 +3429,8 @@ function setupEventListeners() {
       return;
     }
 
-    connectButton.disabled = true;
     const previousLabel = connectButton.textContent;
-    connectButton.textContent = 'Connecting...';
+    setRendererActionBusy(connectButton, true, 'Connecting...', previousLabel);
     try {
       const result = await window.crate.connectFigma(token);
       if (result.success) {
@@ -3346,8 +3450,7 @@ function setupEventListeners() {
       logRendererError('Figma connection failed', error);
       showToast('Crate could not reach Figma. Nothing was saved.');
     } finally {
-      connectButton.disabled = false;
-      connectButton.textContent = previousLabel;
+      setRendererActionBusy(connectButton, false, 'Connecting...', previousLabel);
     }
   });
 
@@ -3506,6 +3609,7 @@ function setFigmaScanButtonLoading(isLoading) {
   if (!button) return;
   state.figmaScanInFlight = isLoading;
   button.disabled = isLoading;
+  button.setAttribute('aria-busy', isLoading ? 'true' : 'false');
   button.textContent = isLoading ? 'Scanning...' : 'Scan Now';
 }
 
