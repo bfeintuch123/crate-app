@@ -1,20 +1,23 @@
-# Crate Phase C — UX Consistency and Accessibility QA
+# Crate Consolidated Packaged-App QA — UX Consistency, Navigation, and Regression
 
-Use this procedure on a fresh exact-head MacBook checkout of draft PR #233 after the source gate is green.
+Use this procedure for the one consolidated packaged Crate candidate after Phase A, Phase B, Phase C, and the separate navigation-order change have merged into the canonical `v2.4.x` branch.
 
-This is a read-only QA and evidence gate. Do not edit source or tests, create commits, push, modify the navigation-order PR, merge, build a packaged app, sign, notarize, release, deploy, begin Beta 2.15, or update the Vault.
+This is a read-only QA and evidence gate for a candidate that has already been built through the repository-approved process. Do not edit source or tests, create commits, push, merge, rebuild, sign, notarize, release, deploy, begin Beta 2.15, or update the Vault during QA.
 
 ## Authority
 
 - repository: `bfeintuch123/crate-app`
-- draft PR: `#233 — Polish app-wide UX consistency and accessibility`
-- branch: `codex/ui-consistency-accessibility-polish`
-- base: live `v2.4.x` containing Phase B merge `de935e307c61674af5a684ceab4895aa650a467b`
-- Phase A authority: merged PR #231
-- Phase B authority: merged PR #232
-- navigation order for this gate is: `Projects → Project Workspace → Quick Package`
+- candidate: one packaged Crate artifact built from the resolved canonical `v2.4.x` head
+- canonical head: resolve and record the full SHA immediately before QA
+- Phase A authority: merged desktop minimum and responsive-containment work
+- Phase B authority: merged state/rendering stability, preview scheduling, and interaction feedback work
+- Phase C authority: merged UX consistency, accessibility, focus, status, and reduced-motion work
+- navigation authority: the separately merged navigation-order change
+- required primary navigation order: `Projects → Project Workspace → Quick Package`
 
-Resolve the live PR and remote branch head immediately before execution. Require them to match and require successful exact-head source CI.
+The candidate must include the canonical Crate fixes carried by Phases A, B, and C and the navigation-order change. It must not reintroduce any removed Crate Ops or Crabbox implementation, workflow, runner, artifact-publishing, or operations files into the Crate App repository. Crate Ops guidance and the instruction-based `AGENTS.md` policy remain operational documentation; they are not product runtime code or packaged-app behavior.
+
+Resolve the canonical `v2.4.x` head and packaged-candidate provenance immediately before execution. Require the recorded source SHA, artifact provenance, and protected source CI to match.
 
 ## Privacy-safe fixture
 
@@ -36,7 +39,7 @@ node --test --test-concurrency=1 \
   tests/ui-stability-responsive-geometry.test.js \
   tests/main-window-lifecycle.test.js
 
-git diff --check de935e307c61674af5a684ceab4895aa650a467b...HEAD
+git diff --check
 ```
 
 Run the complete serial source suite in the approved lockfile-identical environment:
@@ -47,11 +50,11 @@ node --test --test-concurrency=1 tests/*.test.js
 
 Record exact commands, Node and Electron versions, exit codes, pass/fail/skip counts, and durations. Do not change `package.json` or `package-lock.json`.
 
-## Normal local candidate
+## Candidate identity and provenance
 
-Use the existing approved normal local-development candidate path. Phase C does not require another custom disposable Electron runner because it does not change native lifecycle or packaging.
+Record the canonical source SHA, packaged artifact name and hash, build provenance, and the exact source and test checks used to produce the candidate. Confirm the packaged artifact contains the merged Crate source and does not contain removed Crate Ops or Crabbox implementation. Preserve the existing Phase A `1100 × 760` desktop minimum and the Phase B/Phase C source contracts.
 
-The candidate must be bound to the exact PR head and use the existing Phase A `1100 × 760` desktop minimum.
+Use the repository-approved packaged-app launch path. Do not substitute a browser mock, static HTML, a stale PR checkout, or an unverified development shell for the packaged candidate.
 
 ## Required keyboard and focus scenarios
 
@@ -65,10 +68,8 @@ Using the keyboard only:
 4. Confirm exactly one active destination exposes `aria-current="page"` through the accessibility inspector or a trusted DOM probe.
 5. Confirm the visible and keyboard order is:
    - Projects;
-   - Project Workspace.
+   - Project Workspace;
    - Quick Package.
-
-Do not implement or simulate the separately deferred reorder.
 
 ### 2. Projects list
 
@@ -122,7 +123,7 @@ Using only a repository-approved synthetic Quick Package result state:
 
 ### 6. Established dialogs regressions
 
-Confirm Phase C did not regress the existing specialized behavior for:
+Confirm the consolidated candidate did not regress the existing specialized behavior for:
 
 - Existing Assets decision;
 - Package Review;
@@ -163,6 +164,21 @@ At `1100 × 760`, normal, and wide sizes confirm:
 - reduced-motion preference suppresses nonessential motion;
 - Phase A and Phase B deterministic tests remain green.
 
+## Olivia/Jenna regression coverage
+
+Exercise the canonical scenarios that previously exposed Crate failures:
+
+- large watched projects remain responsive and do not cause sustained main-process runaway work;
+- watcher polling remains bounded, single-flight, cancellable, and free of no-op project-store rewrites;
+- pre-existing files are not admitted as newly captured work merely because a supported design application is open;
+- genuinely new current-session files, parser-confirmed assets, provenance, package selection, output-folder exclusions, quota behavior, and persisted project state remain unchanged;
+- Figma link scope, token failure handling, package-time blocking, and recovery guidance remain fail-closed and privacy-safe;
+- Review Assets counts, filters, search, thumbnails, scroll, focus, card identity, and footer containment remain correct;
+- Package Review does not create output, include an unrelated Illustrator asset, or bypass user review;
+- start/pause/resume, relaunch, package recovery, and error states remain usable.
+
+Record any difference from the accepted Olivia/Jenna behavior as a defect. Do not dismiss it as a UI-only change without tracing it to the candidate and its canonical source.
+
 ## Evidence
 
 Capture only the minimum privacy-safe evidence required to show:
@@ -182,16 +198,21 @@ Do not commit or publish evidence before Bryant reviews it.
 ## Return
 
 ```ini
-PHASE_C_PR233_QA=PASS|NEEDS_FIX|BLOCKED
-authoritative_pr=233
-exact_head=
-remote_branch_head=
+CONSOLIDATED_CRATE_PACKAGED_QA=PASS|NEEDS_FIX|BLOCKED
+canonical_branch=v2.4.x
+canonical_head=
+packaged_candidate=
+packaged_candidate_sha256=
 source_ci=
+phase_a_regressions=
+phase_b_regressions=
+phase_c_regressions=
+olivia_jenna_regressions=
 worktree_clean=
 focused_tests=
 full_source_suite=
 git_diff_check=
-primary_navigation_order=Projects,Quick_Package,Project_Workspace
+primary_navigation_order=Projects,Project_Workspace,Quick_Package
 aria_current=PASS|FAIL
 project_keyboard=PASS|FAIL
 watch_control_keyboard=PASS|FAIL
@@ -213,10 +234,10 @@ complete_media_review=
 privacy_review=
 repository_mutated=no
 pr_mutated=no
-navigation_reorder_started=no
+navigation_reorder_verified=PASS|FAIL
 build_started=no
 beta_2_15_started=no
 exact_blockers=
 ```
 
-Stop after returning the report. Do not merge PR #233 and do not begin the navigation-order PR.
+Stop after returning the report. Do not merge, rebuild, release, or begin Beta 2.15 from this QA procedure. Advance toward Beta 2.15 and Olivia testing only after this consolidated candidate passes.
