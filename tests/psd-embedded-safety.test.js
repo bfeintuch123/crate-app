@@ -266,6 +266,11 @@ setStub('crypto', () => ({
 
 require(path.resolve(__dirname, '..', 'main.js'));
 
+test.beforeEach(() => {
+  // These fixtures assert the legacy flat output contract explicitly.
+  storeInstance.set('settings.packageOutputLayoutMode', 'flat');
+});
+
 function callIpcRaw(channel, ...args) {
   const handler = ipcHandlers.get(channel);
   if (!handler) throw new Error(`No IPC handler registered for ${channel}`);

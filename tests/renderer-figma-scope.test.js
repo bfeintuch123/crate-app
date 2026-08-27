@@ -387,6 +387,20 @@ function loadRendererHelpers(document = createDocumentStub(), windowOverrides = 
   return context;
 }
 
+test('renderer defaults a missing package organization preference to folders', () => {
+  const renderer = loadRendererHelpers();
+
+  assert.equal(renderer.getPackageOutputLayoutMode({}), 'by-extension-v1');
+  assert.equal(
+    renderer.getPackageOutputLayoutMode({ packageOutputLayoutMode: 'flat' }),
+    'flat'
+  );
+  assert.equal(
+    renderer.getPackageOutputLayoutMode({ packageOutputLayoutMode: 'corrupt-layout-value' }),
+    'flat'
+  );
+});
+
 test('renderer log sanitizer removes complete quoted private paths containing spaces', () => {
   const renderer = loadRendererHelpers();
   const privatePath = '/private/tmp/neutral client/file.fig';

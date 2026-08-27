@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('module');
 const crypto = require('crypto');
+const { EventEmitter } = require('events');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -201,6 +202,116 @@ class BrowserWindowStub {
   webContents = { send: () => {} };
 }
 
+class PackageTransactionUtilityProcessStub extends EventEmitter {
+  constructor(modulePath, args, options) {
+    super();
+    this.modulePath = modulePath;
+    this.args = args;
+    this.options = options;
+    this.outputFd = null;
+    this.outputIdentity = null;
+    this.outputLeafName = null;
+    this.expectedLength = 0n;
+    this.bytesWritten = 0n;
+    this.killed = false;
+    queueMicrotask(() => {
+      if (!this.killed) this.emit('spawn');
+    });
+  }
+
+  emitMessage(message) {
+    queueMicrotask(() => {
+      if (!this.killed) this.emit('message', message);
+    });
+  }
+
+  postMessage(message) {
+    if (this.killed) return;
+    try {
+      if (message.type === 'init-session') {
+        this.emitMessage({ type: 'session-ready' });
+        return;
+      }
+      if (message.type === 'write-start') {
+        this.expectedLength = BigInt(message.expectedLength);
+        this.outputLeafName = message.leafName;
+        this.bytesWritten = 0n;
+        this.outputFd = fs.openSync(
+          path.join(this.options.cwd, message.leafName),
+          fs.constants.O_WRONLY |
+            fs.constants.O_CREAT |
+            fs.constants.O_EXCL |
+            fs.constants.O_NOFOLLOW,
+          0o600
+        );
+        const opened = fs.fstatSync(this.outputFd, { bigint: true });
+        this.outputIdentity = { dev: opened.dev, ino: opened.ino };
+        this.emitMessage({
+          type: 'opened',
+          outputIdentity: {
+            dev: `${opened.dev}`,
+            ino: `${opened.ino}`,
+          },
+        });
+        return;
+      }
+      if (message.type === 'ownership-ack') {
+        this.emitMessage({ type: 'ready' });
+        return;
+      }
+      if (message.type === 'chunk') {
+        const chunk = Buffer.from(message.data);
+        fs.writeSync(this.outputFd, chunk, 0, chunk.length, null);
+        this.bytesWritten += BigInt(chunk.length);
+        this.emitMessage({ type: 'ack', sequence: message.sequence });
+        return;
+      }
+      if (message.type === 'end') {
+        fs.fsyncSync(this.outputFd);
+        fs.closeSync(this.outputFd);
+        this.outputFd = null;
+        this.emitMessage({
+          type: 'complete',
+          bytesWritten: `${this.bytesWritten}`,
+          outputIdentity: {
+            dev: `${this.outputIdentity.dev}`,
+            ino: `${this.outputIdentity.ino}`,
+          },
+        });
+        return;
+      }
+      if (message.type === 'cleanup') {
+        if (this.outputFd !== null) {
+          fs.closeSync(this.outputFd);
+          this.outputFd = null;
+        }
+        for (const childName of fs.readdirSync(this.options.cwd)) {
+          fs.unlinkSync(path.join(this.options.cwd, childName));
+        }
+        this.emitMessage({ type: 'complete', bytesWritten: '0' });
+        return;
+      }
+      if (message.type === 'release') {
+        this.emitMessage({ type: 'released' });
+        queueMicrotask(() => this.kill());
+      }
+    } catch (error) {
+      this.emit('error', error);
+      this.kill();
+    }
+  }
+
+  kill() {
+    if (this.killed) return;
+    this.killed = true;
+    if (this.outputFd !== null) {
+      try { fs.closeSync(this.outputFd); } catch (_) {}
+      this.outputFd = null;
+    }
+    queueMicrotask(() => this.emit('exit', 0, null));
+  }
+}
+
 const electronStub = {
   app: {
     requestSingleInstanceLock: () => true,
@@ -214,6 +325,9 @@ const electronStub = {
     dock: { setMenu: () => {} },
   },
   BrowserWindow: BrowserWindowStub,
+  utilityProcess: {
+    fork: (modulePath, args, options) => new PackageTransactionUtilityProcessStub(modulePath, args, options),
+  },
   Tray: class { constructor() {} on() {} setToolTip() {} isDestroyed() { return true; } destroy() {} },
   ipcMain: {
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
@@ -2286,7 +2400,7 @@ test('Figma link candidate fallback can lock and stage assets without widening s
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assert.equal(packageResult.success, true);
     assert.equal(packageResult.copiedCount, 1);
-    assert.equal(fs.existsSync(path.join(packageFolder(outputDir, 'Phase2-link-candidate-fallback'), fresh.files[0].name)), true);
+    assert.equal(fs.existsSync(path.join(packageFolder(outputDir, 'Phase2-link-candidate-fallback'), 'PNG', fresh.files[0].name)), true);
   } finally {
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
@@ -3061,7 +3175,7 @@ test('explicit Entire File still packages Figma assets from any page', async () 
     assert.equal(result.embeddedCount, 0);
     assert.equal(result.totalFiles, 1);
     assert.deepEqual(result.errors, []);
-    assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Explicit Entire'), 'entire-file-asset.png'), 'utf8'), 'entire file asset');
+    assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Explicit Entire'), 'PNG', 'entire-file-asset.png'), 'utf8'), 'entire file asset');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -3100,7 +3214,7 @@ test('explicit Current Page Only packages only locked-page Figma assets', async 
     assert.deepEqual(result.errors, []);
 
     const packagedFolder = packageFolder(outputDir, 'Figma Explicit Current');
-    assert.equal(fs.readFileSync(path.join(packagedFolder, 'in-scope.png'), 'utf8'), 'in scope asset');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'PNG', 'in-scope.png'), 'utf8'), 'in scope asset');
     assert.equal(fs.existsSync(path.join(packagedFolder, 'out-of-scope.png')), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -3145,7 +3259,7 @@ test('parser-shaped Figma assets retain fileKey for Current Page Only packaging'
     assert.deepEqual(result.errors, []);
 
     const packagedFolder = packageFolder(outputDir, 'Figma Parser FileKey Package');
-    assert.equal(fs.readFileSync(path.join(packagedFolder, 'Brand_Cloud_Parser_Key_Asset.png'), 'utf8'), 'parser file key asset');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'PNG', 'Brand_Cloud_Parser_Key_Asset.png'), 'utf8'), 'parser file key asset');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -3189,7 +3303,7 @@ test('package waits for in-flight Figma scan downloads before selecting package 
     const scan = await scanPromise;
     assert.equal(scan.success, true);
     const packagedFolder = packageFolder(outputDir, 'Figma Package Waits For Scan');
-    assert.equal(fs.readFileSync(path.join(packagedFolder, 'Brand_Cloud_Delayed_Asset.png'), 'utf8'), 'delayed figma asset');
+    assert.equal(fs.readFileSync(path.join(packagedFolder, 'PNG', 'Brand_Cloud_Delayed_Asset.png'), 'utf8'), 'delayed figma asset');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -3398,7 +3512,7 @@ test('pre-package Figma download failure blocks output until a clean retry succe
     assert.equal(packaged.success, true);
     assert.equal(packaged.copiedCount, 1);
     assert.equal(
-      fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Download Block'), 'Brand_Cloud_Oversized.png'), 'utf8'),
+      fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Download Block'), 'PNG', 'Brand_Cloud_Oversized.png'), 'utf8'),
       'recovered asset'
     );
   } finally {
