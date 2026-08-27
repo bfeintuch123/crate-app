@@ -2,7 +2,7 @@
 
 Use this procedure on a fresh exact-head MacBook checkout of draft PR #233 after the source gate is green.
 
-This is a read-only QA and evidence gate. Do not edit source or tests, create commits, push, modify PR #233, merge, build a packaged app, sign, notarize, release, deploy, begin Beta 2.15, update the Vault, or implement the deferred navigation reorder.
+This is a read-only QA and evidence gate. Do not edit source or tests, create commits, push, modify the navigation-order PR, merge, build a packaged app, sign, notarize, release, deploy, begin Beta 2.15, or update the Vault.
 
 ## Authority
 
@@ -12,7 +12,7 @@ This is a read-only QA and evidence gate. Do not edit source or tests, create co
 - base: live `v2.4.x` containing Phase B merge `de935e307c61674af5a684ceab4895aa650a467b`
 - Phase A authority: merged PR #231
 - Phase B authority: merged PR #232
-- navigation order remains unchanged in this PR: `Projects → Quick Package → Project Workspace`
+- navigation order for this gate is: `Projects → Project Workspace → Quick Package`
 
 Resolve the live PR and remote branch head immediately before execution. Require them to match and require successful exact-head source CI.
 
@@ -59,14 +59,14 @@ The candidate must be bound to the exact PR head and use the existing Phase A `1
 
 Using the keyboard only:
 
-1. Tab through Projects, Quick Package, Project Workspace, Settings, and Help.
+1. Tab through Projects, Project Workspace, Quick Package, Settings, and Help.
 2. Confirm every destination has a visible focus indicator.
 3. Activate each destination with the native button behavior.
 4. Confirm exactly one active destination exposes `aria-current="page"` through the accessibility inspector or a trusted DOM probe.
-5. Confirm the visible and keyboard order is still:
+5. Confirm the visible and keyboard order is:
    - Projects;
-   - Quick Package;
    - Project Workspace.
+   - Quick Package.
 
 Do not implement or simulate the separately deferred reorder.
 
@@ -172,7 +172,7 @@ Capture only the minimum privacy-safe evidence required to show:
 - one secondary dialog focus loop and Escape close;
 - Figma-link keyboard activation and Edit Figma dialog focus;
 - Settings toggle naming/focus;
-- no navigation reorder;
+- the requested navigation order;
 - no geometry regression at the desktop minimum.
 
 Use a tightly framed, silent, window-only recording when video is useful. Inspect the complete recording and every screenshot. Record filenames, media type, exact byte count, SHA-256, exact PR head, capture environment, complete-inspection result, and privacy result.

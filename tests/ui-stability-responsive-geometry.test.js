@@ -59,7 +59,7 @@ function fixtureHtml() {
   <div id="app">
     <aside class="app-sidebar" id="app-sidebar">
       <div class="sidebar-brand"><span class="app-logo">CRATE</span></div>
-      <nav class="app-tabs"><button class="app-tab active">Projects</button><button class="app-tab">Quick Package</button><button class="app-tab">Project Workspace</button></nav>
+      <nav class="app-tabs"><button class="app-tab active">Projects</button><button class="app-tab">Project Workspace</button><button class="app-tab">Quick Package</button></nav>
       <div class="sidebar-spacer"></div>
       <nav class="app-tabs app-tabs-secondary"><button class="app-tab">Settings</button><button class="app-tab">Help</button></nav>
     </aside>

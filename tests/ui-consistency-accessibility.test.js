@@ -291,9 +291,22 @@ test('secondary dialogs use a visible fallback when a drag/drop or rerender open
   assert.equal(document.activeElement, browse);
 });
 
-test('Phase C leaves the separately deferred primary navigation order unchanged', () => {
-  const projects = indexHtml.indexOf('data-tab="projects"');
-  const quickPackage = indexHtml.indexOf('data-tab="quick-package"');
-  const workspace = indexHtml.indexOf('data-tab="current-project"');
-  assert.ok(projects >= 0 && quickPackage > projects && workspace > quickPackage);
+test('Phase C preserves primary navigation labels, route tokens, and requested order', () => {
+  const primaryNav = indexHtml.match(/<nav class="app-tabs" aria-label="Primary">([\s\S]*?)<\/nav>/u)?.[1] || '';
+  const buttons = [...primaryNav.matchAll(/<button\b([^>]*)>([^<]+)<\/button>/gu)].map(([, attributes, label]) => ({
+    attributes,
+    route: attributes.match(/data-tab="([^"]+)"/u)?.[1],
+    label: label.trim(),
+  }));
+
+  assert.deepEqual(
+    buttons.map(({ route, label }) => ({ route, label })),
+    [
+      { route: 'projects', label: 'Projects' },
+      { route: 'current-project', label: 'Project Workspace' },
+      { route: 'quick-package', label: 'Quick Package' },
+    ],
+  );
+  assert.match(buttons[0].attributes, /aria-current="page"/u);
+  assert.ok(buttons.every(({ attributes }) => !/\btabindex\s*=/u.test(attributes)));
 });
