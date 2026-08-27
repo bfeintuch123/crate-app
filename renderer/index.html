@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-Kt2Zp+fZv2Y9wbp/swv1kyF2JHHT5d2zYkNh9CN9wGA='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-wA34cJMmqjSkij3NPLIPeBtajqZRFznQdEKZjY2dPuw='; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;">
   <title>Crate</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -799,7 +799,7 @@
                 <div class="figma-auto-title">&#x2705; Project links enabled</div>
                 <div class="figma-auto-desc">Crate scans Figma links that you add to projects and captures approved assets.</div>
               </div>
-              <div id="figma-scan-status" class="figma-scan-status" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
+              <div id="figma-scan-status" class="figma-scan-status" role="status" aria-live="polite" aria-atomic="true" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
               <button class="app-btn outline" id="btn-figma-scan-now" aria-describedby="figma-scan-status" style="width:100%;margin-top:8px;">Scan Now</button>
               <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Project Workspace to add or change project Figma assets.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
@@ -1126,15 +1126,19 @@
       id: 'modal-edit-figma-link',
       closeId: 'btn-edit-figma-cancel',
       initialFocusId: 'edit-figma-url',
-      fallback: () => document.querySelector('#files-figma-scope')
-        || document.querySelector('.app-tab[data-tab="current-project"]')
+      fallback: () => [
+        document.querySelector('#files-figma-scope'),
+        document.querySelector('.app-tab[data-tab="current-project"]')
+      ].find(isActuallyFocusable) || null
     },
     {
       id: 'modal-v2-results',
       closeId: 'btn-v2-done',
       initialFocusId: 'btn-v2-done',
-      fallback: () => document.querySelector('#btn-v2-browse')
-        || document.querySelector('.app-tab[data-tab="quick-package"]')
+      fallback: () => [
+        document.querySelector('#btn-v2-browse'),
+        document.querySelector('.app-tab[data-tab="quick-package"]')
+      ].find(isActuallyFocusable) || null
     }
   ];
   const modalState = new Map();
@@ -1158,9 +1162,37 @@
     }
   }
 
+  function isHidden(element) {
+    for (let current = element; current; current = current.parentElement || current.parentNode) {
+      if (
+        current.hidden === true
+        || current.getAttribute?.('hidden') != null
+        || current.getAttribute?.('aria-hidden') === 'true'
+        || current.classList?.contains('hidden')
+        || current.style?.display === 'none'
+        || current.style?.visibility === 'hidden'
+      ) return true;
+      if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+        const computed = window.getComputedStyle(current);
+        if (computed.display === 'none' || computed.visibility === 'hidden') return true;
+      }
+    }
+    return false;
+  }
+
+  function isActuallyFocusable(element) {
+    if (!element || element.isConnected === false || typeof element.focus !== 'function') return false;
+    if (element.disabled || element.getAttribute?.('aria-disabled') === 'true' || isHidden(element)) return false;
+    if (element.getAttribute?.('tabindex') === '-1') return false;
+    const tagName = String(element.tagName || '').toLowerCase();
+    return element.getAttribute?.('tabindex') != null
+      || (Number.isFinite(element.tabIndex) && element.tabIndex >= 0)
+      || ['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tagName);
+  }
+
   function getFocusable(modal) {
     return [...modal.querySelectorAll(focusableSelector)]
-      .filter(element => !element.disabled && element.getAttribute('aria-hidden') !== 'true');
+      .filter(isActuallyFocusable);
   }
 
   function anyModalOpen(except = null) {
@@ -1169,7 +1201,7 @@
   }
 
   function restoreFocus(config, opener) {
-    const target = opener && opener.isConnected ? opener : config.fallback?.();
+    const target = [opener, config.fallback?.()].find(isActuallyFocusable);
     target?.focus?.({ preventScroll: true });
   }
 
@@ -1199,9 +1231,12 @@
     const state = modalState.get(config.id) || {};
     if (state.open) return;
     state.open = true;
-    state.opener = document.activeElement && !modal.contains(document.activeElement)
-      ? document.activeElement
+    const explicitOpener = modal._crateOpener;
+    const activeElement = explicitOpener || document.activeElement;
+    state.opener = activeElement && !modal.contains(activeElement) && isActuallyFocusable(activeElement)
+      ? activeElement
       : state.opener;
+    delete modal._crateOpener;
     state.keydown = event => handleKeydown(event, config, modal);
     modalState.set(config.id, state);
     setBackgroundBlocked(true);

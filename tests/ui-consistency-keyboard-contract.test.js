@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+const rendererApp = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
 const phaseCScriptMatch = indexHtml.match(
   /<script src="app\.js"><\/script>\s*<script>([\s\S]*?)<\/script>\s*<\/body>/u,
 );
@@ -66,7 +67,10 @@ test('Figma validation and warning surfaces use nonduplicative status semantics'
     /id="modal-figma-warning"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u,
   );
   assert.match(indexHtml, /id="btn-figma-scan-now"[^>]*aria-describedby="figma-scan-status"/u);
-  assert.doesNotMatch(indexHtml, /id="figma-scan-status"[^>]*aria-live=/u);
+  assert.match(
+    indexHtml,
+    /id="figma-scan-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u,
+  );
 });
 
 test('Phase C script exposes current navigation without changing primary control order', () => {
@@ -107,6 +111,7 @@ test('visible focus and keyboard-revealed project actions are source-bound', () 
     stabilityCss,
     /\.project-row:focus-within \.project-delete\s*\{[\s\S]*?opacity:\s*1;[\s\S]*?pointer-events:\s*auto;/u,
   );
+  assert.match(rendererApp, /class="project-delete"[^>]*aria-label="Remove project"/u);
 });
 
 test('Phase C stays inside existing renderer source files', () => {

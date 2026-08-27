@@ -552,9 +552,12 @@ test('Edit Figma Link keeps the saved URL out of the renderer and preserves it w
   renderer.testProject = project;
   vm.runInContext('state.projects = [testProject]', renderer);
 
+  const opener = document.querySelector('#files-figma-scope');
+  opener.focus();
   renderer.openEditFigmaLinkModal(project.id);
   assert.equal(elements['edit-figma-url'].value, '');
   assert.equal(elements['edit-figma-url'].focused, true);
+  assert.equal(elements['modal-edit-figma-link']._crateOpener, opener);
 
   elements['edit-figma-scope'].value = 'entire-file';
   await renderer.saveEditFigmaLinkModal();
@@ -651,6 +654,49 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
   assert.equal(text.includes('token'), false);
   assert.equal(text.includes('Bearer'), false);
   assert.equal(text.includes('1:1'), false);
+});
+
+test('Figma scan lifecycle uses the single status announcement without duplicate toasts', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const handlers = {};
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: handler => { handlers.started = handler; },
+    onFigmaScanComplete: handler => { handlers.complete = handler; },
+    onFigmaScanError: handler => { handlers.error = handler; },
+  } });
+
+  renderer.setupMainProcessListeners();
+  handlers.started({ timestamp: Date.UTC(2026, 5, 17, 12, 0, 0) });
+  assert.match(elements['figma-scan-status'].textContent, /Scan started/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.complete({
+    filesFound: 2,
+    assetsFound: 1,
+    addedCount: 1,
+    timestamp: Date.UTC(2026, 5, 17, 12, 1, 0),
+  });
+  assert.match(elements['figma-scan-status'].textContent, /Scan completed/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.complete({
+    filesFound: 2,
+    assetsFound: 0,
+    warning: 'Current Page Only could not be locked.',
+    timestamp: Date.UTC(2026, 5, 17, 12, 2, 0),
+  });
+  assert.match(elements['figma-scan-status'].textContent, /could not be locked/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.error({ error: 'Figma is unavailable' });
+  assert.match(elements['figma-scan-status'].textContent, /Figma is unavailable/);
+  assert.equal(elements['toast-message'], undefined);
 });
 
 test('Package Details shows the no-issue state without issue messages', () => {
@@ -3465,6 +3511,7 @@ for (const [typedError, figmaMessagePattern] of [
       assert.equal(elements['toast-message'].textContent, 'Maximum projects reached. Package or delete a project first.');
     } else {
       assert.match(elements['figma-section-error'].textContent, figmaMessagePattern);
+      assert.equal(elements['project-creation-status'].textContent, '');
     }
   });
 }

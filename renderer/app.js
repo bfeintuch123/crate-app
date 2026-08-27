@@ -34,6 +34,7 @@ let state = {
   figmaScopeMode: 'current-page',
   figmaSectionExpanded: false,
   figmaScanInFlight: false,
+  figmaScanStartedAt: null,
   lastFigmaWarning: null,
   editFigmaProjectId: null,
   assetWorkspace: null,
@@ -493,7 +494,7 @@ function renderProjectRows() {
         <div class="project-status">${statusLabel}</div>
       </div>
       <span class="project-pill ${project.status}" data-id="${project.id}">${pillText}</span>
-      <button class="project-delete" data-id="${project.id}" title="Remove project">&times;</button>
+      <button class="project-delete" data-id="${project.id}" title="Remove project" aria-label="Remove project">&times;</button>
     `;
 
     // Click row -> go to Project Workspace
@@ -809,7 +810,7 @@ async function createProject() {
     if (figmaLinkErrorMessage && figmaError) {
       figmaError.textContent = figmaLinkErrorMessage;
       figmaError.classList.remove('hidden');
-      setProjectCreationStatus(figmaError.textContent);
+      setProjectCreationStatus('');
     } else if (typedError === 'max_projects_reached') {
       setProjectCreationStatus('Maximum projects reached. Package or delete a project first.');
       showToast('Maximum projects reached. Package or delete a project first.');
@@ -3548,9 +3549,13 @@ function setupEventListeners() {
         }
       }
     } catch (e) {
-      showToast('Figma scan could not finish. Try again.');
+      updateFigmaScanStatus({
+        errors: ['Figma scan could not finish. Try again.'],
+        timestamp: Date.now(),
+      });
     } finally {
       setFigmaScanButtonLoading(false);
+      state.figmaScanStartedAt = null;
     }
   });
 
@@ -3581,7 +3586,13 @@ function openEditFigmaLinkModal(projectId) {
     errorEl.textContent = '';
   }
 
-  $('#modal-edit-figma-link').classList.remove('hidden');
+  const modal = $('#modal-edit-figma-link');
+  if (modal) {
+    // Capture the triggering control before focusing the URL input. The
+    // source-bound dialog controller consumes this marker when it observes opening.
+    modal._crateOpener = document.activeElement;
+    modal.classList.remove('hidden');
+  }
   if (urlInput) urlInput.focus();
 }
 
@@ -3752,20 +3763,20 @@ function setupMainProcessListeners() {
   });
 
   window.crate.onFigmaScanStarted((data) => {
+    // Manual scans announce immediately; the matching bridge event should not
+    // cause a second polite announcement for the same start.
+    if (state.figmaScanInFlight && state.figmaScanStartedAt) return;
     updateFigmaScanStatus({ ...data, phase: 'started' });
   });
 
   // Figma scan complete notification
   window.crate.onFigmaScanComplete((data) => {
+    state.figmaScanStartedAt = null;
     const displayWarning = getFigmaWarningDisplayText(data.warning, data.retryAt);
     if (displayWarning) {
-      if (state.lastFigmaWarning !== displayWarning) {
-        showToast(displayWarning);
-        state.lastFigmaWarning = displayWarning;
-      }
-    } else if (data.addedCount > 0) {
+      state.lastFigmaWarning = displayWarning;
+    } else {
       state.lastFigmaWarning = null;
-      showToast(`Figma scan: ${data.addedCount} new asset${data.addedCount !== 1 ? 's' : ''} added`);
     }
     // Update scan status line
     updateFigmaScanStatus(data);
@@ -3773,8 +3784,11 @@ function setupMainProcessListeners() {
 
   // Figma scan error notification
   window.crate.onFigmaScanError((data) => {
-    showToast(`Figma scan error: ${data.error || 'Unknown error'}`);
-    updateFigmaScanStatus({ errors: [data.error || 'Unknown error'], timestamp: Date.now() });
+    state.figmaScanStartedAt = null;
+    updateFigmaScanStatus({
+      errors: [data.error || 'Unknown error'],
+      timestamp: Date.now(),
+    });
   });
 }
 
@@ -3785,6 +3799,7 @@ function updateFigmaScanStatus(data) {
 
   const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : 'just now';
   if (data.phase === 'started') {
+    state.figmaScanStartedAt = data.timestamp || Date.now();
     el.style.color = '#60a5fa';
     el.textContent = `Scan started (${time})...`;
     return;

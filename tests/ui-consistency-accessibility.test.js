@@ -132,6 +132,10 @@ function createPhaseCDom() {
     const first = add(firstId, { focusable: true });
     const second = add(secondId, { focusable: true });
     modal._focusable = [first, second];
+    if (modalId === 'modal-edit-figma-link') {
+      const removeLink = add('btn-edit-figma-remove', { classes: ['hidden'], focusable: true });
+      modal._focusable.push(removeLink);
+    }
   }
 
   for (const [modalId, closeId] of [
@@ -234,6 +238,57 @@ test('secondary dialog controller traps focus, closes on Escape, and restores it
   assert.equal(elements.get('app-sidebar').inert, false);
   assert.equal(elements.get('app-main').getAttribute('aria-hidden'), null);
   assert.equal(document.activeElement, opener);
+});
+
+test('Edit Figma no-link modal excludes its hidden Remove Link control from the focus trap', () => {
+  const script = getPhaseCScript();
+  const { document, elements } = createPhaseCDom();
+  const context = { document, MutationObserver: MutationObserverStub, Map };
+  vm.createContext(context);
+  vm.runInContext(script, context, { filename: 'renderer/index.html#phase-c-dialogs-hidden-remove' });
+
+  const opener = elements.get('tab-current-project');
+  const modal = elements.get('modal-edit-figma-link');
+  const url = elements.get('edit-figma-url');
+  const cancel = elements.get('btn-edit-figma-cancel');
+  const removeLink = elements.get('btn-edit-figma-remove');
+
+  opener.focus();
+  modal.classList.remove('hidden');
+  assert.equal(document.activeElement, url);
+
+  url.focus();
+  let tabPrevented = false;
+  modal.dispatchEvent({
+    type: 'keydown',
+    key: 'Tab',
+    shiftKey: true,
+    preventDefault: () => { tabPrevented = true; },
+  });
+  assert.equal(tabPrevented, true);
+  assert.equal(document.activeElement, cancel);
+  assert.notEqual(document.activeElement, removeLink);
+});
+
+test('secondary dialogs use a visible fallback when a drag/drop or rerender opener is stale', () => {
+  const script = getPhaseCScript();
+  const { document, elements } = createPhaseCDom();
+  const context = { document, MutationObserver: MutationObserverStub, Map };
+  vm.createContext(context);
+  vm.runInContext(script, context, { filename: 'renderer/index.html#phase-c-dialogs-fallback' });
+
+  const opener = elements.get('tab-quick-package');
+  const modal = elements.get('modal-v2-results');
+  const done = elements.get('btn-v2-done');
+  const browse = elements.get('btn-v2-browse');
+
+  opener.focus();
+  modal.classList.remove('hidden');
+  opener.isConnected = false;
+  done.click();
+
+  assert.equal(modal.classList.contains('hidden'), true);
+  assert.equal(document.activeElement, browse);
 });
 
 test('Phase C leaves the separately deferred primary navigation order unchanged', () => {
