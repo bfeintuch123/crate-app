@@ -699,6 +699,25 @@ test('Figma scan lifecycle uses the single status announcement without duplicate
   assert.equal(elements['toast-message'], undefined);
 });
 
+for (const [label, result, expectedMessage] of [
+  ['already in progress', { triggered: 0, inFlight: true }, 'Figma scan already in progress'],
+  ['no active projects', { triggered: 0, skipped: 0, inFlight: false }, 'No active projects to scan'],
+]) {
+  test(`Scan Now routes the ${label} result through the sole status announcement`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const renderer = loadRendererHelpers(document, { crate: {
+      figmaScanNow: async () => result,
+    } });
+
+    renderer.setupEventListeners();
+    const scanHandler = elements['btn-figma-scan-now'].listeners.click[0];
+    await scanHandler();
+
+    assert.equal(elements['figma-scan-status'].textContent, expectedMessage);
+    assert.equal(elements['toast-message'], undefined);
+  });
+}
+
 test('Package Details shows the no-issue state without issue messages', () => {
   const { document, elements } = createPackageDetailsDom();
   const renderer = loadRendererHelpers(document);

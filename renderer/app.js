@@ -3543,9 +3543,15 @@ function setupEventListeners() {
       const result = await window.crate.figmaScanNow();
       if (result.triggered === 0) {
         if (result.inFlight || result.skipped > 0) {
-          showToast('Figma scan already in progress');
+          updateFigmaScanStatus({
+            phase: 'manual-noop',
+            message: 'Figma scan already in progress',
+          });
         } else {
-          showToast('No active projects to scan');
+          updateFigmaScanStatus({
+            phase: 'manual-noop',
+            message: 'No active projects to scan',
+          });
         }
       }
     } catch (e) {
@@ -3798,6 +3804,11 @@ function updateFigmaScanStatus(data) {
   if (!el) return;
 
   const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : 'just now';
+  if (data.phase === 'manual-noop') {
+    el.style.color = '#9ca3af';
+    el.textContent = data.message || '';
+    return;
+  }
   if (data.phase === 'started') {
     state.figmaScanStartedAt = data.timestamp || Date.now();
     el.style.color = '#60a5fa';
