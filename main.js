@@ -11,7 +11,11 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { createStartupPhaseJournal, getWatchRecoveryPhase } = require('./startup-phase-journal');
+const {
+  DESKTOP_WINDOW_MINIMUM,
+  createStartupPhaseJournal,
+  getWatchRecoveryPhase,
+} = require('./startup-phase-journal');
 const startupPhaseJournal = createStartupPhaseJournal({
   getLogDirectory: () => app.getPath('logs'),
 });
@@ -5027,7 +5031,7 @@ try {
         notifications: true,
         includeDiagnosticReport: false,
         showPackageDetails: true,
-        packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.FLAT
+        packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
       },
       usage: {
         packagesThisMonth: 0,
@@ -5091,10 +5095,7 @@ function migrateSettings() {
   if (settings.showPackageDetails === undefined) {
     store.set('settings.showPackageDetails', true);
   }
-  const packageOutputLayoutMode = normalizePackageOutputLayoutMode(settings.packageOutputLayoutMode);
-  if (packageOutputLayoutMode !== settings.packageOutputLayoutMode) {
-    store.set('settings.packageOutputLayoutMode', packageOutputLayoutMode);
-  }
+  migratePackageOutputLayoutMode(settings);
 
   // v2.7.0 (Phase 2): Figma link moved per-project. Drop deprecated global
   // settings.figmaTrackedFiles and settings.figmaTeamIds — users re-link
@@ -5105,6 +5106,31 @@ function migrateSettings() {
   if (settings.figmaTeamIds !== undefined) {
     store.delete('settings.figmaTeamIds');
   }
+}
+
+function getPackageOutputLayoutModeFromSettings(settings) {
+  if (
+    settings &&
+    Object.prototype.hasOwnProperty.call(settings, 'packageOutputLayoutMode')
+  ) {
+    return normalizePackageOutputLayoutMode(settings.packageOutputLayoutMode);
+  }
+  return PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
+}
+
+function migratePackageOutputLayoutMode(settings = store.get('settings') || {}) {
+  const hasStoredPreference = Object.prototype.hasOwnProperty.call(
+    settings,
+    'packageOutputLayoutMode'
+  );
+  const packageOutputLayoutMode = getPackageOutputLayoutModeFromSettings(settings);
+  if (
+    !hasStoredPreference ||
+    packageOutputLayoutMode !== settings.packageOutputLayoutMode
+  ) {
+    store.set('settings.packageOutputLayoutMode', packageOutputLayoutMode);
+  }
+  return packageOutputLayoutMode;
 }
 
 function configureFigmaCredentialStorage() {
@@ -12448,10 +12474,13 @@ function createMainWindow() {
 
   startupPhaseJournal.mark('main-window-create-start');
   const nextWindow = new BrowserWindow({
-    width: 960,
-    height: 760,
-    minWidth: 720,
-    minHeight: 560,
+    // Keep the native constructor authoritative. The startup helper remains a
+    // safety net for every created window, but it must not be the only guard
+    // against compact navigation becoming reachable in the packaged app.
+    width: DESKTOP_WINDOW_MINIMUM.width,
+    height: DESKTOP_WINDOW_MINIMUM.height,
+    minWidth: DESKTOP_WINDOW_MINIMUM.width,
+    minHeight: DESKTOP_WINDOW_MINIMUM.height,
     show: true,
     focusable: true,
     title: 'Crate',
@@ -15568,7 +15597,7 @@ function getRelevantPackageReviewSettings() {
   return {
     includeDiagnosticReport: settings.includeDiagnosticReport === true,
     namingTemplate: sanitizeNamingTemplate(settings.namingTemplate),
-    outputLayoutMode: normalizePackageOutputLayoutMode(settings.packageOutputLayoutMode),
+    outputLayoutMode: getPackageOutputLayoutModeFromSettings(settings),
   };
 }
 
@@ -18148,7 +18177,7 @@ registerTrustedIpcHandler('settings:update', (event, key, value) => {
     return store.get('settings');
   }
   if (key === 'packageOutputLayoutMode') {
-    const previousMode = normalizePackageOutputLayoutMode(store.get(`settings.${key}`));
+    const previousMode = getPackageOutputLayoutModeFromSettings(store.get('settings') || {});
     const nextMode = normalizePackageOutputLayoutMode(value);
     store.set(`settings.${key}`, nextMode);
     if (previousMode !== nextMode) invalidateAllPackageReviews();

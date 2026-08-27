@@ -18,7 +18,7 @@ const EVIDENCE_DIR = process.env.CRATE_UI_EVIDENCE_DIR
   : null;
 const TOLERANCE_PX = 1;
 const TEST_TIMEOUT_MS = 30_000;
-const BELOW_MINIMUM_REQUEST = Object.freeze({ width: 720, height: 560 });
+const BELOW_MINIMUM_REQUEST = Object.freeze({ width: 960, height: 700 });
 const temporaryUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-ui-stability-'));
 
 app.setPath('userData', temporaryUserData);

@@ -2685,9 +2685,15 @@ function getPackageDestinationLabel(outputPath) {
 }
 
 function getPackageOutputLayoutMode(settings = state.settings) {
-  return settings?.packageOutputLayoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
-    ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
-    : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
+  if (
+    settings &&
+    Object.prototype.hasOwnProperty.call(settings, 'packageOutputLayoutMode')
+  ) {
+    return settings.packageOutputLayoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+      ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+      : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
+  }
+  return PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
 }
 
 function syncPackageOutputLayoutControls(layoutMode = getPackageOutputLayoutMode()) {
