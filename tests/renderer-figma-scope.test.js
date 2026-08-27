@@ -552,9 +552,12 @@ test('Edit Figma Link keeps the saved URL out of the renderer and preserves it w
   renderer.testProject = project;
   vm.runInContext('state.projects = [testProject]', renderer);
 
+  const opener = document.querySelector('#files-figma-scope');
+  opener.focus();
   renderer.openEditFigmaLinkModal(project.id);
   assert.equal(elements['edit-figma-url'].value, '');
   assert.equal(elements['edit-figma-url'].focused, true);
+  assert.equal(elements['modal-edit-figma-link']._crateOpener, opener);
 
   elements['edit-figma-scope'].value = 'entire-file';
   await renderer.saveEditFigmaLinkModal();
@@ -652,6 +655,68 @@ test('renderer Figma scan status shows privacy-safe candidate diagnostics', () =
   assert.equal(text.includes('Bearer'), false);
   assert.equal(text.includes('1:1'), false);
 });
+
+test('Figma scan lifecycle uses the single status announcement without duplicate toasts', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const handlers = {};
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: noOp,
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: handler => { handlers.started = handler; },
+    onFigmaScanComplete: handler => { handlers.complete = handler; },
+    onFigmaScanError: handler => { handlers.error = handler; },
+  } });
+
+  renderer.setupMainProcessListeners();
+  handlers.started({ timestamp: Date.UTC(2026, 5, 17, 12, 0, 0) });
+  assert.match(elements['figma-scan-status'].textContent, /Scan started/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.complete({
+    filesFound: 2,
+    assetsFound: 1,
+    addedCount: 1,
+    timestamp: Date.UTC(2026, 5, 17, 12, 1, 0),
+  });
+  assert.match(elements['figma-scan-status'].textContent, /Scan completed/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.complete({
+    filesFound: 2,
+    assetsFound: 0,
+    warning: 'Current Page Only could not be locked.',
+    timestamp: Date.UTC(2026, 5, 17, 12, 2, 0),
+  });
+  assert.match(elements['figma-scan-status'].textContent, /could not be locked/);
+  assert.equal(elements['toast-message'], undefined);
+
+  handlers.error({ error: 'Figma is unavailable' });
+  assert.match(elements['figma-scan-status'].textContent, /Figma is unavailable/);
+  assert.equal(elements['toast-message'], undefined);
+});
+
+for (const [label, result, expectedMessage] of [
+  ['already in progress', { triggered: 0, inFlight: true }, 'Figma scan already in progress'],
+  ['no active projects', { triggered: 0, skipped: 0, inFlight: false }, 'No active projects to scan'],
+]) {
+  test(`Scan Now routes the ${label} result through the sole status announcement`, async () => {
+    const { document, elements } = createInteractiveRendererDom();
+    const renderer = loadRendererHelpers(document, { crate: {
+      figmaScanNow: async () => result,
+    } });
+
+    renderer.setupEventListeners();
+    const scanHandler = elements['btn-figma-scan-now'].listeners.click[0];
+    await scanHandler();
+
+    assert.equal(elements['figma-scan-status'].textContent, expectedMessage);
+    assert.equal(elements['toast-message'], undefined);
+  });
+}
 
 test('Package Details shows the no-issue state without issue messages', () => {
   const { document, elements } = createPackageDetailsDom();
@@ -3015,12 +3080,12 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Review Assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change Folder<\/button>/);
-  assert.match(html, /id="modal-package-review-message"[^>]*role="status"[^>]*aria-live="polite"[^>]*tabindex="-1"/);
+  assert.match(html, /<div(?=[^>]*id="modal-package-review-message")(?=[^>]*role="status")(?=[^>]*aria-live="polite")(?=[^>]*tabindex="-1")[^>]*>/);
   assert.match(html, /id="modal-file-list"[^>]*role="region"[^>]*tabindex="-1"/);
   assert.match(html, /id="asset-review-heading"[^>]*tabindex="-1"/);
   assert.match(html, /data-asset-filter="all"[^>]*aria-pressed="true"/);
   assert.match(html, /data-asset-filter="existing"[^>]*aria-pressed="false"/);
-  assert.match(html, /id="toggle-package-folders"[^>]*aria-label="Organize packages by file type"/);
+  assert.match(html, /<input(?=[^>]*id="toggle-package-folders")(?=[^>]*aria-labelledby="setting-package-folders-label")(?=[^>]*aria-describedby="setting-package-folders-desc")[^>]*>/);
   assert.match(html, /id="toggle-package-review-folders"[^>]*aria-labelledby="package-review-organization-label"[^>]*aria-describedby="package-review-organization-status"/);
   assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
   assert.match(css, /\.modal-review-message\.is-empty\s*\{[\s\S]*visibility:\s*hidden;/);
@@ -3037,9 +3102,10 @@ test('navigation uses Projects, Quick Package, and Project Workspace consistentl
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const visibleHtml = html.replace(/<!--[\s\S]*?-->/g, '');
 
-  assert.match(visibleHtml, /data-tab="projects">Projects<\/button>/);
-  assert.match(visibleHtml, /data-tab="quick-package">Quick Package<\/button>/);
-  assert.match(visibleHtml, /data-tab="current-project">Project Workspace<\/button>/);
+  assert.match(
+    visibleHtml,
+    /<button(?=[^>]*data-tab="projects")[^>]*>\s*Projects\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="quick-package")[^>]*>\s*Quick Package\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="current-project")[^>]*>\s*Project Workspace\s*<\/button>/
+  );
   assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
   assert.equal(visibleHtml.includes('Current Project'), false);
 });
@@ -3464,6 +3530,7 @@ for (const [typedError, figmaMessagePattern] of [
       assert.equal(elements['toast-message'].textContent, 'Maximum projects reached. Package or delete a project first.');
     } else {
       assert.match(elements['figma-section-error'].textContent, figmaMessagePattern);
+      assert.equal(elements['project-creation-status'].textContent, '');
     }
   });
 }
