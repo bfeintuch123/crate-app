@@ -73,17 +73,34 @@ test('Figma validation and warning surfaces use nonduplicative status semantics'
   );
 });
 
-test('Phase C script exposes current navigation without changing primary control order', () => {
+test('Phase C exposes the requested primary DOM and keyboard order with current-page semantics', () => {
   assert.match(indexHtml, /data-tab="projects" aria-current="page">Projects/u);
   assert.match(phaseCScript, /function updateNavigationState\(\)/u);
   assert.match(phaseCScript, /setAttribute\('aria-current', 'page'\)/u);
   assert.match(phaseCScript, /removeAttribute\('aria-current'\)/u);
 
   const primaryNav = indexHtml.match(/<nav class="app-tabs" aria-label="Primary">([\s\S]*?)<\/nav>/u)?.[1] || '';
-  const projects = primaryNav.indexOf('data-tab="projects"');
-  const quickPackage = primaryNav.indexOf('data-tab="quick-package"');
-  const workspace = primaryNav.indexOf('data-tab="current-project"');
-  assert.ok(projects >= 0 && quickPackage > projects && workspace > quickPackage);
+  const buttons = [...primaryNav.matchAll(/<button\b([^>]*)>([^<]+)<\/button>/gu)].map(([, attributes, label]) => ({
+    attributes,
+    route: attributes.match(/data-tab="([^"]+)"/u)?.[1],
+    label: label.trim(),
+  }));
+  assert.deepEqual(
+    buttons.map(({ route, label }) => ({ route, label })),
+    [
+      { route: 'projects', label: 'Projects' },
+      { route: 'current-project', label: 'Project Workspace' },
+      { route: 'quick-package', label: 'Quick Package' },
+    ],
+  );
+  assert.match(buttons[0].attributes, /aria-current="page"/u);
+  assert.ok(buttons.every(({ attributes }) => !/\btabindex\s*=/u.test(attributes)));
+
+  assert.match(rendererApp, /const normalizedTab = tabName === 'files' \? 'current-project' : tabName;/u);
+  assert.match(rendererApp, /t\.dataset\.tab === normalizedTab/u);
+  assert.match(rendererApp, /tc\.id === `tab-\$\{normalizedTab\}`/u);
+  assert.match(rendererApp, /state\.selectedProjectId = project\.id;\s*switchTab\('current-project'\);/u);
+  assert.match(rendererApp, /tab\.addEventListener\('click', \(\) => switchTab\(tab\.dataset\.tab\)\);/u);
 });
 
 test('project selection, watch controls, and Figma-link editing have keyboard contracts', () => {

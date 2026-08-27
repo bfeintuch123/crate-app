@@ -3104,7 +3104,7 @@ test('navigation uses Projects, Quick Package, and Project Workspace consistentl
 
   assert.match(
     visibleHtml,
-    /<button(?=[^>]*data-tab="projects")[^>]*>\s*Projects\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="quick-package")[^>]*>\s*Quick Package\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="current-project")[^>]*>\s*Project Workspace\s*<\/button>/
+    /<button(?=[^>]*data-tab="projects")[^>]*>\s*Projects\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="current-project")[^>]*>\s*Project Workspace\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="quick-package")[^>]*>\s*Quick Package\s*<\/button>/
   );
   assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
   assert.equal(visibleHtml.includes('Current Project'), false);
