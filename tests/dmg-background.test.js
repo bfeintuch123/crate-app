@@ -81,7 +81,7 @@ function darkRuns(row, threshold = 80) {
   return runs;
 }
 
-test('DMG background keeps its dimensions and original Crate-specific graphic direction', () => {
+test('DMG background keeps its dimensions and a clear two-stem right-facing graphic', () => {
   const { height, rows, width } = decodeRgbPng(path.join(__dirname, '..', 'build', 'dmg-background.png'));
   const backgroundColor = [245, 245, 247];
   const graphicPixels = [];
@@ -101,14 +101,14 @@ test('DMG background keeps its dimensions and original Crate-specific graphic di
       right: Math.max(bounds.right, x),
       top: Math.min(bounds.top, y),
     }), { bottom: -1, left: width, right: -1, top: height }),
-    { bottom: 202, left: 185, right: 431, top: 129 }
+    { bottom: 204, left: 185, right: 431, top: 129 }
   );
   assert.equal(graphicPixels.every(([, , current]) => current[0] === current[1] && current[1] === current[2] || current.join(',') === backgroundColor.join(',')), true);
 
-  // The arrow tip is at the right edge, with upper and lower strokes trailing back to the left.
-  assert.ok(darkRuns(rows[174]).some(([start, end]) => start === 329 && end === 335));
+  // The arrow tip is at the right edge, with two distinct upper and lower stems trailing back to the left.
+  assert.ok(darkRuns(rows[173]).some(([start, end]) => start === 328 && end === 335));
   assert.ok(darkRuns(rows[188]).some(([start, end]) => start === 347 && end === 351));
-  assert.ok(darkRuns(rows[201]).some(([start, end]) => start === 334 && end === 337));
+  assert.ok(darkRuns(rows[203]).some(([start, end]) => start === 329 && end === 332));
   assert.ok(Math.max(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) >= 430);
   assert.ok(Math.min(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) <= 188);
 });
