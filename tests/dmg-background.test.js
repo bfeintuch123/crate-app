@@ -101,14 +101,15 @@ test('DMG background keeps its dimensions and a clear two-stem right-facing grap
       right: Math.max(bounds.right, x),
       top: Math.min(bounds.top, y),
     }), { bottom: -1, left: width, right: -1, top: height }),
-    { bottom: 204, left: 185, right: 431, top: 129 }
+    { bottom: 207, left: 185, right: 431, top: 129 }
   );
   assert.equal(graphicPixels.every(([, , current]) => current[0] === current[1] && current[1] === current[2] || current.join(',') === backgroundColor.join(',')), true);
 
-  // The arrow tip is at the right edge, with two distinct upper and lower stems trailing back to the left.
-  assert.ok(darkRuns(rows[173]).some(([start, end]) => start === 328 && end === 335));
-  assert.ok(darkRuns(rows[188]).some(([start, end]) => start === 347 && end === 351));
-  assert.ok(darkRuns(rows[203]).some(([start, end]) => start === 329 && end === 332));
+  // The three incoming strokes remain distinct near the shared right-facing tip.
+  assert.ok(darkRuns(rows[180]).some(([start, end]) => start === 339 && end === 343)); // upper head stem
+  assert.ok(darkRuns(rows[184]).some(([start, end]) => start === 315 && end === 335)); // center shaft
+  assert.ok(darkRuns(rows[198]).some(([start, end]) => start === 336 && end === 340)); // lower head stem
+  assert.ok(darkRuns(rows[188]).some(([start, end]) => start === 334 && end === 351)); // shared tip
   assert.ok(Math.max(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) >= 430);
   assert.ok(Math.min(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) <= 188);
 });
