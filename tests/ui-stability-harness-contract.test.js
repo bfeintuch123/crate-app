@@ -61,7 +61,7 @@ test('UI stability harness measures only the supported desktop resize matrix', (
 });
 
 test('UI stability harness proves native below-minimum requests are clamped', () => {
-  assert.match(legacyHarness, /BELOW_MINIMUM_REQUEST\s*=\s*Object\.freeze\(\{ width: 720, height: 560 \}\)/);
+  assert.match(legacyHarness, /BELOW_MINIMUM_REQUEST\s*=\s*Object\.freeze\(\{ width: 960, height: 700 \}\)/);
   assert.match(legacyHarness, /window\.setSize\(size\.width, size\.height, false\)/);
   assert.match(legacyHarness, /window\.getSize\(\)/);
   assert.match(legacyHarness, /window\.getMinimumSize\(\)/);

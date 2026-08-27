@@ -25,6 +25,16 @@ test('desktop minimum bootstrap loads before the real BrowserWindow is construct
   assert.deepEqual(DESKTOP_WINDOW_MINIMUM, { width: 1100, height: 760 });
 });
 
+test('real BrowserWindow construction carries the authoritative desktop minimum', () => {
+  const browserWindowConstruction = mainSource.indexOf('new BrowserWindow({');
+  const browserWindowSource = mainSource.slice(browserWindowConstruction, browserWindowConstruction + 1400);
+
+  assert.match(browserWindowSource, /width:\s*DESKTOP_WINDOW_MINIMUM\.width/);
+  assert.match(browserWindowSource, /height:\s*DESKTOP_WINDOW_MINIMUM\.height/);
+  assert.match(browserWindowSource, /minWidth:\s*DESKTOP_WINDOW_MINIMUM\.width/);
+  assert.match(browserWindowSource, /minHeight:\s*DESKTOP_WINDOW_MINIMUM\.height/);
+});
+
 test('desktop minimum applies native BrowserWindow limits and clamps smaller bounds', () => {
   const calls = [];
   let size = [960, 700];

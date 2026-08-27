@@ -1055,6 +1055,12 @@ module.exports.__crateMetadataTestHooks = {
   cancelWatcherCoordinator(projectId) {
     cancelWatcherCoordinator(projectId);
   },
+  getPackageOutputLayoutModeFromSettings(settings) {
+    return getPackageOutputLayoutModeFromSettings(settings);
+  },
+  migratePackageOutputLayoutMode(settings) {
+    return migratePackageOutputLayoutMode(settings);
+  },
   createRendererFilePresentation(project, file) {
     return createRendererFilePresentation(project, file);
   },
@@ -1357,6 +1363,33 @@ function presentationCachePaths(projectId) {
 function resetPresentationCacheRoot() {
   fs.rmSync(path.join(TEST_HOME, '.crate'), { recursive: true, force: true });
 }
+
+test('package layout defaults to folders and migration preserves explicit choices', () => {
+  assert.equal(
+    storeInstance.get('settings.packageOutputLayoutMode'),
+    PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+  );
+
+  storeInstance.delete('settings.packageOutputLayoutMode');
+  assert.equal(
+    metadataTestHooks.migratePackageOutputLayoutMode(),
+    PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+  );
+  assert.equal(
+    storeInstance.get('settings.packageOutputLayoutMode'),
+    PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
+  );
+
+  for (const [value, expected] of [
+    [PACKAGE_OUTPUT_LAYOUT_MODES.FLAT, PACKAGE_OUTPUT_LAYOUT_MODES.FLAT],
+    [PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION, PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION],
+    ['corrupt-layout-value', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT],
+  ]) {
+    storeInstance.set('settings.packageOutputLayoutMode', value);
+    assert.equal(metadataTestHooks.migratePackageOutputLayoutMode(), expected);
+    assert.equal(storeInstance.get('settings.packageOutputLayoutMode'), expected);
+  }
+});
 
 test('completed presentation cleanup records cannot remove a later file at the same cache path', () => {
   const cacheDir = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-cleanup-record-test-'));
@@ -4715,7 +4748,7 @@ test('organized writer rejects an ancestor moved before immutable ancestry valid
   }
 });
 
-test('absent and invalid layout settings preserve exact legacy flat Project Workspace output', async () => {
+test('absent layout defaults to organized output while invalid layout remains flat', async () => {
   const tmpRoot = makeTempDir();
   try {
     const cases = [
@@ -4743,11 +4776,69 @@ test('absent and invalid layout settings preserve exact legacy flat Project Work
       const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
 
       assert.equal(result.success, true, scenario.label);
-      assert.deepEqual(fs.readdirSync(result.folderPath), [sourceName], scenario.label);
-      assert.equal(fs.readFileSync(path.join(result.folderPath, sourceName), 'utf8'), `${scenario.label} bytes`);
-      assert.equal(fs.existsSync(path.join(result.folderPath, 'AI')), false, scenario.label);
+      if (scenario.value === undefined) {
+        assert.deepEqual(fs.readdirSync(result.folderPath), ['AI'], scenario.label);
+        assert.deepEqual(fs.readdirSync(path.join(result.folderPath, 'AI')), [sourceName], scenario.label);
+      } else {
+        assert.deepEqual(fs.readdirSync(result.folderPath), [sourceName], scenario.label);
+        assert.equal(fs.existsSync(path.join(result.folderPath, 'AI')), false, scenario.label);
+      }
+      const outputPath = scenario.value === undefined
+        ? path.join(result.folderPath, 'AI', sourceName)
+        : path.join(result.folderPath, sourceName);
+      assert.equal(fs.readFileSync(outputPath, 'utf8'), `${scenario.label} bytes`);
     }
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 2);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('organized package routes representative design, image, and document files without flat duplicates', async () => {
+  const tmpRoot = makeTempDir();
+  try {
+    const project = await createProject('Representative Organized Package');
+    const outputDir = path.join(tmpRoot, 'out');
+    fs.mkdirSync(outputDir);
+    const files = [
+      ['synthetic-illustration.ai', 'AI'],
+      ['synthetic-preview.png', 'PNG'],
+      ['synthetic-document.pdf', 'PDF'],
+    ];
+    const trackedFiles = files.map(([name]) => {
+      const filePath = path.join(tmpRoot, name);
+      fs.writeFileSync(filePath, `${name} bytes`);
+      return {
+        path: filePath,
+        name,
+        ext: path.extname(name),
+        addedAt: Date.now(),
+        source: 'manual-browse',
+      };
+    });
+    await setProjectFiles(project.id, { files: trackedFiles });
+    storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION);
+
+    const review = await callIpcRaw('projects:prepare-package-review', project.id);
+    assert.deepEqual(
+      review.files.map(file => [file.name, file.packageFolder]),
+      [
+        ['synthetic-illustration.ai', 'AI'],
+        ['synthetic-preview.png', 'PNG'],
+        ['synthetic-document.pdf', 'PDF'],
+      ]
+    );
+    const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
+
+    assert.equal(result.success, true);
+    assert.equal(result.copiedCount, 3);
+    assert.deepEqual(fs.readdirSync(result.folderPath).sort(), ['AI', 'PDF', 'PNG']);
+    for (const [name, folder] of files) {
+      assert.deepEqual(fs.readdirSync(path.join(result.folderPath, folder)), [name]);
+      assert.equal(fs.readFileSync(path.join(result.folderPath, folder, name), 'utf8'), `${name} bytes`);
+      assert.equal(fs.existsSync(path.join(result.folderPath, name)), false);
+    }
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), 1);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

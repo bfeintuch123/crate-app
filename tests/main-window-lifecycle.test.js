@@ -275,10 +275,10 @@ test('main window uses normal macOS app lifecycle', async () => {
 
     assert.equal(windows.length, 1);
     const win = windows[0];
-    assert.equal(win.options.width, 960);
+    assert.equal(win.options.width, 1100);
     assert.equal(win.options.height, 760);
-    assert.equal(win.options.minWidth, 720);
-    assert.equal(win.options.minHeight, 560);
+    assert.equal(win.options.minWidth, 1100);
+    assert.equal(win.options.minHeight, 760);
     assert.equal(win.options.show, true);
     assert.equal(win.options.focusable, true);
     assert.equal(win.options.frame, true);
