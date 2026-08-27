@@ -81,6 +81,28 @@ function darkRuns(row, threshold = 80) {
   return runs;
 }
 
+function hasDarkPixelInBox(rows, left, top, right, bottom) {
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      if (Math.max(...pixel(rows[y], x)) < 80) return true;
+    }
+  }
+  return false;
+}
+
+function hasDarkPixelFarEnoughFromRect(rows, left, top, right, bottom, rectangle, gap) {
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      if (Math.max(...pixel(rows[y], x)) < 80) {
+        const outsideHorizontally = x >= rectangle.right + gap || x <= rectangle.left - gap;
+        const outsideVertically = y >= rectangle.bottom + gap || y <= rectangle.top - gap;
+        if (!outsideHorizontally && !outsideVertically) return false;
+      }
+    }
+  }
+  return true;
+}
+
 test('DMG background keeps its dimensions and a clear two-stem right-facing graphic', () => {
   const { height, rows, width } = decodeRgbPng(path.join(__dirname, '..', 'build', 'dmg-background.png'));
   const backgroundColor = [245, 245, 247];
@@ -101,17 +123,48 @@ test('DMG background keeps its dimensions and a clear two-stem right-facing grap
       right: Math.max(bounds.right, x),
       top: Math.min(bounds.top, y),
     }), { bottom: -1, left: width, right: -1, top: height }),
-    { bottom: 207, left: 185, right: 431, top: 129 }
+    { bottom: 203, left: 224, right: 484, top: 131 }
   );
   assert.equal(graphicPixels.every(([, , current]) => current[0] === current[1] && current[1] === current[2] || current.join(',') === backgroundColor.join(',')), true);
 
   // The three incoming strokes remain distinct near the shared right-facing tip.
-  assert.ok(darkRuns(rows[180]).some(([start, end]) => start === 339 && end === 343)); // upper head stem
-  assert.ok(darkRuns(rows[184]).some(([start, end]) => start === 315 && end === 335)); // center shaft
-  assert.ok(darkRuns(rows[198]).some(([start, end]) => start === 336 && end === 340)); // lower head stem
-  assert.ok(darkRuns(rows[188]).some(([start, end]) => start === 334 && end === 351)); // shared tip
-  assert.ok(Math.max(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) >= 430);
-  assert.ok(Math.min(...graphicPixels.filter(([, , current]) => Math.max(...current) < 80).map(([x]) => x)) <= 188);
+  assert.ok(darkRuns(rows[174]).some(([start, end]) => start === 294 && end === 298)); // upper head stem
+  assert.ok(darkRuns(rows[184]).some(([start, end]) => start === 239 && end === 288)); // center shaft
+  assert.ok(darkRuns(rows[202]).some(([start, end]) => start === 294 && end === 297)); // lower head stem
+  assert.ok(darkRuns(rows[188]).some(([start, end]) => start === 287 && end === 313)); // shared tip
+
+  const applications = dmgSpec.contents.find(({ path: itemPath }) => itemPath === '/Applications');
+  const iconHalfSize = dmgSpec['icon-size'] / 2;
+  const crate = dmgSpec.contents.find(({ path: itemPath }) => itemPath === '../dist/mac-arm64/Crate.app');
+  const crateRectangle = {
+    bottom: crate.y + iconHalfSize,
+    left: crate.x - iconHalfSize,
+    right: crate.x + iconHalfSize,
+    top: crate.y - iconHalfSize,
+  };
+  const applicationsRectangle = {
+    bottom: applications.y + iconHalfSize,
+    left: applications.x - iconHalfSize,
+    right: applications.x + iconHalfSize,
+    top: applications.y - iconHalfSize,
+  };
+  const darkPixels = graphicPixels.filter(([, , current]) => Math.max(...current) < 80);
+  const arrowPixels = darkPixels.filter(([x]) => x < 400);
+  assert.equal(Math.min(...arrowPixels.map(([x]) => x)), 225);
+  assert.equal(Math.max(...arrowPixels.map(([x]) => x)), 313);
+  assert.equal(arrowPixels.every(([x]) => x >= crateRectangle.right + 25 && x <= applicationsRectangle.left - 30), true);
+  assert.equal(hasDarkPixelInBox(rows, crateRectangle.left, crateRectangle.top, crateRectangle.right, crateRectangle.bottom), false);
+  assert.equal(hasDarkPixelInBox(rows, applicationsRectangle.left, applicationsRectangle.top, applicationsRectangle.right, applicationsRectangle.bottom), false);
+  const applicationsTopRight = {
+    x: applicationsRectangle.right,
+    y: applicationsRectangle.top,
+  };
+  assert.deepEqual(applicationsTopRight, { x: 465, y: 150 });
+  assert.equal(hasDarkPixelInBox(rows, applicationsTopRight.x - 12, applicationsTopRight.y - 20, applicationsTopRight.x - 6, applicationsTopRight.y - 6), true);
+  assert.equal(hasDarkPixelInBox(rows, applicationsTopRight.x + 1, applicationsTopRight.y - 20, applicationsTopRight.x + 13, applicationsTopRight.y - 6), true);
+  assert.equal(hasDarkPixelInBox(rows, applicationsTopRight.x + 4, applicationsTopRight.y, applicationsTopRight.x + 20, applicationsTopRight.y + 10), true);
+  assert.equal(hasDarkPixelFarEnoughFromRect(rows, applicationsRectangle.left, applicationsRectangle.top - 20, applicationsRectangle.right + 20, applicationsRectangle.bottom, applicationsRectangle, 5), true);
+  assert.equal(hasDarkPixelInBox(rows, 375, 130, 435, 175), false);
 });
 
 test('DMG layout keeps the Crate and Applications positions beside the graphic', () => {
