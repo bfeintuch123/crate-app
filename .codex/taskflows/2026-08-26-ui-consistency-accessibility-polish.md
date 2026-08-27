@@ -13,7 +13,7 @@
 - Phase A authority: merged PR #231
 - Phase B authority: merged PR #232
 - mode: audit-first; one focused draft PR; no merge authority
-- status: production implementation and two corrective commits complete; protected code-head CI is green; final documentation-head CI and independent read-only review remain pending
+- status: production implementation and two corrective commits complete; prior documentation-head protected CI is green at `05b4c42aba7e01332c07c4663dbdb62367022495`; both independent product/source/accessibility reviews passed; the resulting documentation-only head still requires exact-head CI and final readback
 
 ## Goal
 
@@ -69,15 +69,15 @@ No extra packaged renderer file was added. The actual production boundary is the
 
 ## State
 
-- current phase: C4 documentation closeout after the protected code-head correction gate
-- last completed checkpoint: original Phase C implementation, six-finding correction commit `8adbf33e737e91c7792c03fbd5053cbe1577399d`, zero-trigger follow-up `dd4b2988b9b86b83e0e91578d5a0cd8e32c52a6e`, and protected code-head CI
-- next action: resolve the live PR head after this documentation-only commit, require protected CI for that exact head, then route the frozen result to independent read-only review
+- current phase: C4 documentation closeout after the protected code-head correction gate and prior documentation-head CI
+- last completed checkpoint: original Phase C implementation, six-finding correction commit `8adbf33e737e91c7792c03fbd5053cbe1577399d`, zero-trigger follow-up `dd4b2988b9b86b83e0e91578d5a0cd8e32c52a6e`, documentation commit `05b4c42aba7e01332c07c4663dbdb62367022495`, its protected exact-head CI, and both independent product/source/accessibility reviews
+- next action: resolve the live PR head after this documentation-only commit, require protected CI for that resulting exact head, perform final live readback, and keep the PR draft for the remaining approval gate
 - blocker: none in the implementation lane
 - approval state: Bryant authorized Phase C implementation; merge is not authorized
 - preferences applied: one builder, small atomic commits, immediate pushes, remote verification, no navigation reorder
 - routing decision: SO-008 audit followed by SO-002 narrow fixes; Crate Fix Review Stack before merge readiness
-- workflow eval suite/result: protected code-head source gate green; final documentation-head exact CI is required downstream
-- outcome receipt: code-head validation recorded; final documentation-head CI, independent review, and Bryant approval remain pending
+- workflow eval suite/result: protected code-head and prior documentation-head source gates green; the resulting documentation-only exact-head CI and final live readback are required downstream
+- outcome receipt: prior documentation-head validation and both independent product/source/accessibility PASS reviews are recorded; only the resulting documentation-only head's protected CI/readback and Bryant approval remain pending
 
 ## Checkpoints
 
@@ -97,8 +97,9 @@ No extra packaged renderer file was added. The actual production boundary is the
 - [x] follow-up correction closed both manual zero-trigger outcomes through the single Figma status path
 - [x] protected code-head CI passed at `dd4b2988b9b86b83e0e91578d5a0cd8e32c52a6e` (`33029071750/98377113934`)
 - [x] final focused tests and Phase A/B regressions pass on protected code head (`219/219` focused; complete source CI green)
-- [ ] final documentation-head protected source CI passes
-- [ ] security review, regression review, and Autoreview pass
+- [x] prior documentation-head protected source CI passed at exact head `05b4c42aba7e01332c07c4663dbdb62367022495` (`33029512444/98378513554`)
+- [x] both independent Luna/high product/source/accessibility reviews passed; each found only the stale taskflow P2, now corrected
+- [ ] resulting documentation-only head protected source CI and final live readback pass (future exact SHA and CI must be resolved after this commit)
 - [ ] exact-head visual and keyboard proof complete or documented exception approved
 - [ ] Bryant approval
 - [ ] merge and Vault handoff
@@ -120,6 +121,10 @@ No extra packaged renderer file was added. The actual production boundary is the
 | 2026-08-26 | First six-finding correction | `8adbf33e737e91c7792c03fbd5053cbe1577399d`; closed the first six findings except the discovered manual zero-trigger announcement gap; production boundary `renderer/index.html` plus `renderer/app.js`; focused correction tests `143/143` | PUSHED |
 | 2026-08-27 | Manual Scan Now zero-trigger correction | `dd4b2988b9b86b83e0e91578d5a0cd8e32c52a6e`; both outcomes use `figma-scan-status`; follow-up focused suite `219/219` | PUSHED |
 | 2026-08-27 | Protected code-head CI | exact head `dd4b2988b9b86b83e0e91578d5a0cd8e32c52a6e`; run `33029071750`; job `98377113934`; complete source suite `1,013 total, 1,012 passed, 0 failed, 1 skipped`; dependency audit `0 vulnerabilities` | PASS |
+| 2026-08-27 | Protected prior documentation-head CI | exact head `05b4c42aba7e01332c07c4663dbdb62367022495`; run `33029512444`; job `98378513554`; complete source suite `1,013 total, 1,012 passed, 0 failed, 1 skipped` | PASS |
+| 2026-08-27 | Independent product/source/accessibility reviews | Two independent Luna/high read-only reviews; both passed the product/source corrections and all seven accessibility findings, with only the stale taskflow P2 remaining | PASS |
+
+The prior documentation-head CI receipt above is PASS and is not pending. This documentation-only follow-up creates a new head whose exact SHA must be resolved after commit and push; protected CI for that resulting exact head and final live PR readback remain required. No future documentation commit SHA or CI result is pre-recorded here.
 
 ## Confirmed audit findings closed by source implementation
 
@@ -149,7 +154,7 @@ Any later runtime-affecting commit invalidates exact-head Phase C evidence.
 
 ## Handoff
 
-After final documentation-head exact CI passes and independent review authorizes the next gate, the current MacBook Chief should follow:
+After the resulting documentation-only head's exact CI and final live readback pass, the current MacBook Chief should follow:
 
 ```text
 docs/crate/qa-smokes/ui-consistency-accessibility.md
