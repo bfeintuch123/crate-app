@@ -3550,6 +3550,7 @@ const FILE_VISUAL_TYPE_ICON_CACHE_CAPACITY = 64;
 const FILE_VISUAL_SAFE_RASTER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp']);
 const fileVisualIdentitySecret = crypto.randomBytes(32);
 const fileVisualTypeIconCache = new Map();
+const fileVisualTypeIconPending = new Map();
 const fileVisualProjectCache = new Map();
 const fileVisualProjectCacheEpochs = new Map();
 let fileVisualProjectCacheGeneration = 0;
@@ -4058,18 +4059,25 @@ async function getBoundedFileTypeIcon(ext) {
     rememberFileVisualTypeIcon(ext, cached);
     return cached;
   }
-  try {
-    const hint = getFileVisualTypeIconHint(ext);
-    if (!hint || !verifyFileVisualTypeIconHint(hint)) return null;
-    const icon = await app.getFileIcon(hint.hintPath, { size: 'normal' });
-    if (!verifyFileVisualTypeIconHint(hint)) return null;
-    const dataUrl = encodeBoundedFileVisual(icon);
-    if (!dataUrl) return null;
-    rememberFileVisualTypeIcon(ext, dataUrl);
-    return dataUrl;
-  } catch (_) {
-    return null;
-  }
+  if (fileVisualTypeIconPending.has(ext)) return fileVisualTypeIconPending.get(ext);
+  const pending = (async () => {
+    try {
+      const hint = getFileVisualTypeIconHint(ext);
+      if (!hint || !verifyFileVisualTypeIconHint(hint)) return null;
+      const icon = await app.getFileIcon(hint.hintPath, { size: 'normal' });
+      if (!verifyFileVisualTypeIconHint(hint)) return null;
+      const dataUrl = encodeBoundedFileVisual(icon);
+      if (!dataUrl) return null;
+      rememberFileVisualTypeIcon(ext, dataUrl);
+      return dataUrl;
+    } catch (_) {
+      return null;
+    } finally {
+      fileVisualTypeIconPending.delete(ext);
+    }
+  })();
+  fileVisualTypeIconPending.set(ext, pending);
+  return pending;
 }
 
 function runSerializedFileVisualRasterWork(task) {

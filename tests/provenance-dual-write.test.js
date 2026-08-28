@@ -998,6 +998,7 @@ module.exports.__crateMetadataTestHooks = {
   },
   clearFileVisualTypeIconCache() {
     fileVisualTypeIconCache.clear();
+    fileVisualTypeIconPending.clear();
   },
   clearFileVisualProjectCache() {
     clearFileVisualProjectCache();
@@ -11059,6 +11060,12 @@ test('Review Assets preview requests stay bounded for large projects and preserv
     lstat: rasterQueue * 16,
     realpath: rasterQueue * 6,
   };
+  const correctedFileTypeIconFilesystemResolutionBounds = {
+    // Coalesced icon work performs one fixed hint validation sequence for
+    // the concurrent fallback cohort, regardless of its request count.
+    lstatSync: 5,
+    realpathSync: 3,
+  };
   const measurements = [];
   try {
     testNativeFileVisualImage = createTestNativeImage(64);
@@ -11156,14 +11163,9 @@ test('Review Assets preview requests stay bounded for large projects and preserv
         )), true);
       }
       assert.ok(correctedPath.elapsedMs < 30000, `${assetCount} corrected requests exceeded the 30-second safety ceiling`);
-      const iconFallbackRequests = Math.max(0, assetCount - rasterQueue);
       const correctedFilesystemResolutionBounds = {
         ...correctedRasterFilesystemResolutionBounds,
-        // A concurrent icon-cache miss performs five sync lstat calls and
-        // three sync realpath calls. Bound these only to requests that the
-        // bounded raster queue intentionally declined.
-        lstatSync: iconFallbackRequests * 5,
-        realpathSync: iconFallbackRequests * 3,
+        ...correctedFileTypeIconFilesystemResolutionBounds,
       };
       for (const [api, bound] of Object.entries(correctedFilesystemResolutionBounds)) {
         assert.ok(
