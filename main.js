@@ -3550,8 +3550,29 @@ const FILE_VISUAL_TYPE_ICON_CACHE_CAPACITY = 64;
 const FILE_VISUAL_SAFE_RASTER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp']);
 const fileVisualIdentitySecret = crypto.randomBytes(32);
 const fileVisualTypeIconCache = new Map();
+const fileVisualProjectCache = new Map();
 let fileVisualRasterWorkTail = Promise.resolve();
 let fileVisualRasterWorkPending = 0;
+
+function clearFileVisualProjectCache(projectId = null) {
+  if (typeof projectId === 'string' && projectId) {
+    fileVisualProjectCache.delete(projectId);
+    return;
+  }
+  fileVisualProjectCache.clear();
+}
+
+function getCurrentFileVisualProjectCache(projectId, project) {
+  const cache = fileVisualProjectCache.get(projectId);
+  if (
+    !cache ||
+    cache.project !== project ||
+    cache.files !== project?.files ||
+    cache.pendingFiles !== project?.pendingFiles ||
+    cache.illustratorScope !== getIllustratorActivationScope(projectId)
+  ) return null;
+  return cache;
+}
 
 function createProjectFileVisualIdentity(projectId, file) {
   const authoritativeKey = getAssetReviewExclusionKey(file);
@@ -3652,10 +3673,46 @@ async function getProjectAssetWorkspace(projectId) {
   const project = getProjects().find(item => item && item.id === projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
   if (!project || !scopedProject) return null;
+  const projectFiles = project.files;
+  const projectPendingFiles = project.pendingFiles;
+  const illustratorScope = getIllustratorActivationScope(projectId);
+  const files = await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file)));
+  const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file)));
+  const visualRecords = new Map();
+  for (const [index, file] of (scopedProject.files || []).entries()) {
+    const presentation = files[index];
+    if (presentation?.visualIdentity) visualRecords.set(presentation.visualIdentity, {
+      file,
+      visualRevision: presentation.visualRevision,
+    });
+  }
+  for (const [index, file] of (scopedProject.pendingFiles || []).entries()) {
+    const presentation = pendingFiles[index];
+    if (presentation?.visualIdentity) visualRecords.set(presentation.visualIdentity, {
+      file,
+      visualRevision: presentation.visualRevision,
+    });
+  }
+  // Mutations clear the cache. This post-await identity check also prevents
+  // an in-flight workspace build from publishing stale records after a
+  // concurrent project update.
+  if (
+    project.files === projectFiles &&
+    project.pendingFiles === projectPendingFiles &&
+    getIllustratorActivationScope(projectId) === illustratorScope
+  ) {
+    fileVisualProjectCache.set(projectId, {
+      project,
+      files: projectFiles,
+      pendingFiles: projectPendingFiles,
+      illustratorScope,
+      visualRecords,
+    });
+  }
   return {
     projectId,
-    files: await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file))),
-    pendingFiles: await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file))),
+    files,
+    pendingFiles,
   };
 }
 
@@ -3683,12 +3740,14 @@ function encodeBoundedFileVisual(image) {
   }
 }
 
-function resolveProjectOwnedFileVisualRecord(projectId, visualIdentity) {
+function resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, projectOverride = null) {
   if (
     typeof projectId !== 'string' || projectId.length === 0 || projectId.length > 128 ||
     typeof visualIdentity !== 'string' || !FILE_VISUAL_ID_PATTERN.test(visualIdentity)
   ) return null;
-  const project = getProjects().find(item => item && item.id === projectId);
+  const project = projectOverride || getProjects().find(item => item && item.id === projectId);
+  const cached = getCurrentFileVisualProjectCache(projectId, project);
+  if (cached) return cached.visualRecords.get(visualIdentity)?.file || null;
   const scopedProject = project && getIllustratorScopedProjectView(project);
   if (!scopedProject) return null;
   return [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])].find(file => (
@@ -4037,11 +4096,16 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
 }
 
 async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevision) {
-  const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity);
+  const project = typeof projectId === 'string' ? getProjects().find(item => item && item.id === projectId) : null;
+  const cached = getCurrentFileVisualProjectCache(projectId, project);
+  const cachedRecord = cached?.visualRecords.get(visualIdentity) || null;
+  const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
   if (!file) return { error: 'not_found' };
   if (
     typeof visualRevision !== 'string' || !FILE_VISUAL_REVISION_PATTERN.test(visualRevision) ||
-    await createProjectFileVisualRevision(projectId, file) !== visualRevision
+    (cachedRecord
+      ? cachedRecord.visualRevision !== visualRevision
+      : await createProjectFileVisualRevision(projectId, file) !== visualRevision)
   ) return { error: 'stale_visual' };
   const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
   if (
@@ -5249,7 +5313,10 @@ function getProjects() {
     if (clearPersistedCurrentSessionFilesystemEvidence(project)) changed = true;
     if (normalizeProjectAssetReviewState(project)) changed = true;
   }
-  if (changed) store.set('projects', val);
+  if (changed) {
+    clearFileVisualProjectCache();
+    store.set('projects', val);
+  }
   return val;
 }
 
@@ -6668,6 +6735,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
+  if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
   // Background observers can legitimately return changed:false after running
   // their classification/provenance logic. The lsof and live-app observers
   // opt into the result-based fast path, and explicitly report evidenceChanged
@@ -7379,6 +7447,7 @@ function repairPersistedWatchingProjects() {
   for (const project of watchingProjects) {
     if (project.id !== retainedProject.id) project.status = 'paused';
   }
+  clearFileVisualProjectCache();
   store.set('projects', projects);
   console.warn(
     `[startup] repaired ${watchingProjects.length} Watching projects; retained the most recent project`
@@ -7428,6 +7497,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   project.figmaSession = buildFigmaSessionSnapshot(project, settings);
   normalizeAutoCaptureProjectState(project);
   safelyEnsureProjectProvenance(project);
+  clearFileVisualProjectCache();
   store.set('projects', projects);
 
   for (const pausedProjectId of pausedProjectIds) {
@@ -13450,7 +13520,10 @@ registerTrustedIpcHandler('projects:get-all', () => {
   for (const project of projects) {
     if (normalizeAutoCaptureProjectState(project)) changed = true;
   }
-  if (changed) store.set('projects', projects);
+  if (changed) {
+    clearFileVisualProjectCache();
+    store.set('projects', projects);
+  }
   return projects.map(getIllustratorScopedProjectView);
 });
 
@@ -13498,6 +13571,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
     };
     safelyEnsureProjectProvenance(newProject);
     projects.push(newProject);
+    clearFileVisualProjectCache();
     store.set('projects', projects);
     return await startWatching(newProject.id);
   })();
@@ -17885,6 +17959,7 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   designFilePids.clear();
   assetBaselineScans.clear();
 
+  clearFileVisualProjectCache();
   store.set('projects', []);
   if (projectCacheIds !== null) {
     scheduleProjectCacheCleanup({

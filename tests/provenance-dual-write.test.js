@@ -999,6 +999,9 @@ module.exports.__crateMetadataTestHooks = {
   clearFileVisualTypeIconCache() {
     fileVisualTypeIconCache.clear();
   },
+  clearFileVisualProjectCache() {
+    clearFileVisualProjectCache();
+  },
   getFileVisualRasterLimits() {
     return {
       sourceBytes: FILE_VISUAL_MAX_RASTER_SOURCE_BYTES,
@@ -1238,6 +1241,34 @@ async function setProjectFiles(projectId, {
     project.liveEvidenceLedger = liveEvidenceLedger;
   }
   return project;
+}
+
+async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 10000) {
+  const counts = { lstat: 0, realpath: 0 };
+  const originalLstat = fs.promises.lstat;
+  const originalRealpath = fs.promises.realpath;
+  let timeoutId = null;
+  fs.promises.lstat = async function measuredFileVisualLstat(...args) {
+    counts.lstat++;
+    return originalLstat.call(fs.promises, ...args);
+  };
+  fs.promises.realpath = async function measuredFileVisualRealpath(...args) {
+    counts.realpath++;
+    return originalRealpath.call(fs.promises, ...args);
+  };
+  const startedAt = Date.now();
+  try {
+    const requestResult = Promise.resolve().then(requestFactory);
+    const timeoutResult = new Promise((resolve, reject) => {
+      timeoutId = originalSetTimeout(() => reject(new Error(`file visual requests exceeded ${timeoutMs}ms`)), timeoutMs);
+    });
+    const responses = await Promise.race([requestResult, timeoutResult]);
+    return { ...counts, elapsedMs: Date.now() - startedAt, responses };
+  } finally {
+    if (timeoutId) originalClearTimeout(timeoutId);
+    fs.promises.lstat = originalLstat;
+    fs.promises.realpath = originalRealpath;
+  }
 }
 
 async function settleAssetBaselineForUnrelatedPackageTest(projectId) {
@@ -2729,6 +2760,7 @@ test.afterEach(async () => {
   testLastFileIconPath = null;
   testLastFileIconOptions = null;
   metadataTestHooks.clearFileVisualTypeIconCache();
+  metadataTestHooks.clearFileVisualProjectCache();
   clearTrackedTimers();
 });
 
@@ -10989,6 +11021,128 @@ test('raster thumbnail work uses a defensible byte and pixel bound with one boun
   assert.equal(maximumActive, 1);
   assert.equal(active, 0);
   assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 0);
+});
+
+test('Review Assets preview requests stay bounded for large projects and preserve project-owned safety', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stress-'));
+  const assetCounts = [30, 263, 500];
+  const measurements = [];
+  try {
+    testNativeFileVisualImage = createTestNativeImage(64);
+    testNativeFileIconImage = createTestNativeImage(64);
+    const project = await createProject('Review Assets visual stress');
+    const otherProject = await createProject('Review Assets other project');
+    const otherAssetPath = path.join(fixtureRoot, 'other-project.png');
+    fs.writeFileSync(otherAssetPath, createSyntheticPngBytes(24, 24, 0x71));
+    await setProjectFiles(otherProject.id, {
+      files: [{
+        ...makePendingFile(otherAssetPath, 'manual-browse'),
+        assetOrigin: 'added',
+        projectRole: 'asset',
+      }],
+    });
+    const otherWorkspace = await callIpcRaw('projects:get-asset-workspace', otherProject.id);
+    const otherPresentation = otherWorkspace.files[0];
+
+    for (const assetCount of assetCounts) {
+      const assetDir = path.join(fixtureRoot, String(assetCount));
+      fs.mkdirSync(assetDir, { recursive: true });
+      const files = [];
+      for (let index = 0; index < assetCount; index++) {
+        const assetPath = path.join(assetDir, `asset-${String(index).padStart(3, '0')}.png`);
+        fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, index & 0xff));
+        files.push({
+          ...makePendingFile(assetPath, 'manual-browse'),
+          assetOrigin: 'added',
+          projectRole: 'asset',
+        });
+      }
+      const pendingPaths = [
+        path.join(assetDir, 'pre-existing-illustrator-1.ai'),
+        path.join(assetDir, 'pre-existing-illustrator-2.ai'),
+      ];
+      for (const pendingPath of pendingPaths) writeSyntheticAiFile(pendingPath);
+      await setProjectFiles(project.id, {
+        files,
+        pendingFiles: pendingPaths.map(filePath => ({
+          ...makePendingFile(filePath, 'illustrator-active-session'),
+          assetOrigin: 'existing',
+          projectRole: 'source',
+        })),
+      });
+      metadataTestHooks.clearFileVisualProjectCache();
+
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      assert.equal(workspace.files.length, assetCount);
+      assert.deepEqual(workspace.pendingFiles.map(file => file.name), [
+        'pre-existing-illustrator-1.ai',
+        'pre-existing-illustrator-2.ai',
+      ]);
+      assert.equal(new Set(workspace.files.map(file => file.visualIdentity)).size, assetCount);
+      assert.equal(workspace.files.every(file => !Object.hasOwn(file, 'path')), true);
+      const requests = workspace.files.map(file => (
+        ['projects:get-file-visual', project.id, file.visualIdentity, file.visualRevision]
+      ));
+
+      metadataTestHooks.clearFileVisualProjectCache();
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      const legacyPath = await measureProjectFileVisualRequests(
+        () => Promise.all(requests.map(request => callIpcRaw(...request)))
+      );
+
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      await callIpcRaw('projects:get-asset-workspace', project.id);
+      const correctedPath = await measureProjectFileVisualRequests(
+        () => Promise.all(requests.map(request => callIpcRaw(...request)))
+      );
+      measurements.push({
+        assetCount,
+        legacyPath: {
+          elapsedMs: legacyPath.elapsedMs,
+          lstat: legacyPath.lstat,
+          realpath: legacyPath.realpath,
+        },
+        correctedPath: {
+          elapsedMs: correctedPath.elapsedMs,
+          lstat: correctedPath.lstat,
+          realpath: correctedPath.realpath,
+        },
+      });
+
+      for (const result of [legacyPath, correctedPath]) {
+        assert.equal(result.responses.length, assetCount);
+        assert.equal(result.responses.every(response => (
+          response && ['thumbnail', 'icon'].includes(response.kind)
+        )), true);
+        assert.ok(result.elapsedMs < 10000);
+      }
+      assert.ok(
+        correctedPath.lstat <= legacyPath.lstat - assetCount,
+        `${assetCount} assets should not repeat project visual revision lstat work per preview request`
+      );
+      assert.ok(correctedPath.realpath <= legacyPath.realpath);
+
+      assert.deepEqual(
+        await callIpcRaw('projects:get-file-visual', otherProject.id, workspace.files[0].visualIdentity, workspace.files[0].visualRevision),
+        { error: 'not_found' }
+      );
+      assert.deepEqual(
+        await callIpcRaw('projects:get-file-visual', project.id, otherPresentation.visualIdentity, otherPresentation.visualRevision),
+        { error: 'not_found' }
+      );
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      assert.deepEqual(stored.pendingFiles.map(file => file.path), pendingPaths);
+      assert.equal(stored.files.length, assetCount);
+    }
+
+    if (process.env.CRATE_FILE_VISUAL_STRESS_REPORT === '1') {
+      process.stdout.write(`# file-visual-stress ${JSON.stringify(measurements)}\n`);
+    }
+  } finally {
+    testNativeFileVisualImage = null;
+    testNativeFileIconImage = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('Package Review gives duplicate same-name files distinct opaque visuals bound to exact manifest sources', async () => {
