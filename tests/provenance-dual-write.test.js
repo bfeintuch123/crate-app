@@ -1244,10 +1244,23 @@ async function setProjectFiles(projectId, {
 }
 
 async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 30000) {
-  const counts = { lstat: 0, realpath: 0 };
+  const counts = {
+    open: 0,
+    lstat: 0,
+    realpath: 0,
+    lstatSync: 0,
+    realpathSync: 0,
+  };
+  const originalOpen = fs.promises.open;
   const originalLstat = fs.promises.lstat;
   const originalRealpath = fs.promises.realpath;
+  const originalLstatSync = fs.lstatSync;
+  const originalRealpathSyncNative = fs.realpathSync.native;
   let timeoutId = null;
+  fs.promises.open = async function measuredFileVisualOpen(...args) {
+    counts.open++;
+    return originalOpen.call(fs.promises, ...args);
+  };
   fs.promises.lstat = async function measuredFileVisualLstat(...args) {
     counts.lstat++;
     return originalLstat.call(fs.promises, ...args);
@@ -1255,6 +1268,14 @@ async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 3000
   fs.promises.realpath = async function measuredFileVisualRealpath(...args) {
     counts.realpath++;
     return originalRealpath.call(fs.promises, ...args);
+  };
+  fs.lstatSync = function measuredFileVisualLstatSync(...args) {
+    counts.lstatSync++;
+    return originalLstatSync.call(fs, ...args);
+  };
+  fs.realpathSync.native = function measuredFileVisualRealpathSyncNative(...args) {
+    counts.realpathSync++;
+    return originalRealpathSyncNative.call(fs.realpathSync, ...args);
   };
   const startedAt = Date.now();
   try {
@@ -1266,8 +1287,11 @@ async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 3000
     return { ...counts, elapsedMs: Date.now() - startedAt, responses };
   } finally {
     if (timeoutId) originalClearTimeout(timeoutId);
+    fs.promises.open = originalOpen;
     fs.promises.lstat = originalLstat;
     fs.promises.realpath = originalRealpath;
+    fs.lstatSync = originalLstatSync;
+    fs.realpathSync.native = originalRealpathSyncNative;
   }
 }
 
@@ -11026,6 +11050,15 @@ test('raster thumbnail work uses a defensible byte and pixel bound with one boun
 test('Review Assets preview requests stay bounded for large projects and preserve project-owned safety', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stress-'));
   const assetCounts = [30, 263, 500];
+  const rasterQueue = metadataTestHooks.getFileVisualRasterLimits().queue;
+  const correctedRasterFilesystemResolutionBounds = {
+    // One accepted raster lane performs two opens, sixteen async lstat calls,
+    // and six async realpath calls. These are fixed bounds, independent of
+    // the number of requested assets.
+    open: rasterQueue * 2,
+    lstat: rasterQueue * 16,
+    realpath: rasterQueue * 6,
+  };
   const measurements = [];
   try {
     testNativeFileVisualImage = createTestNativeImage(64);
@@ -11099,13 +11132,19 @@ test('Review Assets preview requests stay bounded for large projects and preserv
         assetCount,
         legacyPath: {
           elapsedMs: legacyPath.elapsedMs,
+          open: legacyPath.open,
           lstat: legacyPath.lstat,
           realpath: legacyPath.realpath,
+          lstatSync: legacyPath.lstatSync,
+          realpathSync: legacyPath.realpathSync,
         },
         correctedPath: {
           elapsedMs: correctedPath.elapsedMs,
+          open: correctedPath.open,
           lstat: correctedPath.lstat,
           realpath: correctedPath.realpath,
+          lstatSync: correctedPath.lstatSync,
+          realpathSync: correctedPath.realpathSync,
         },
       });
 
@@ -11114,13 +11153,23 @@ test('Review Assets preview requests stay bounded for large projects and preserv
         assert.equal(result.responses.every(response => (
           response && ['thumbnail', 'icon'].includes(response.kind)
         )), true);
-        assert.ok(result.elapsedMs < 30000);
+        assert.ok(result.elapsedMs < 30000, `${assetCount} assets exceeded the 30-second safety ceiling`);
       }
-      assert.ok(
-        correctedPath.lstat <= legacyPath.lstat - assetCount,
-        `${assetCount} assets should not repeat project visual revision lstat work per preview request`
-      );
-      assert.ok(correctedPath.realpath <= legacyPath.realpath);
+      const iconFallbackRequests = Math.max(0, assetCount - rasterQueue);
+      const correctedFilesystemResolutionBounds = {
+        ...correctedRasterFilesystemResolutionBounds,
+        // A concurrent icon-cache miss performs five sync lstat calls and
+        // three sync realpath calls. Bound these only to requests that the
+        // bounded raster queue intentionally declined.
+        lstatSync: iconFallbackRequests * 5,
+        realpathSync: iconFallbackRequests * 3,
+      };
+      for (const [api, bound] of Object.entries(correctedFilesystemResolutionBounds)) {
+        assert.ok(
+          correctedPath[api] <= bound,
+          `${assetCount} assets exceeded corrected ${api} bound: ${correctedPath[api]} > ${bound}`
+        );
+      }
 
       assert.deepEqual(
         await callIpcRaw('projects:get-file-visual', otherProject.id, workspace.files[0].visualIdentity, workspace.files[0].visualRevision),
