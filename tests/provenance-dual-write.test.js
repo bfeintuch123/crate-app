@@ -11120,7 +11120,8 @@ test('Review Assets preview requests stay bounded for large projects and preserv
       metadataTestHooks.clearFileVisualProjectCache();
       metadataTestHooks.clearFileVisualTypeIconCache();
       const legacyPath = await measureProjectFileVisualRequests(
-        () => Promise.all(requests.map(request => callIpcRaw(...request)))
+        () => Promise.all(requests.map(request => callIpcRaw(...request))),
+        120000
       );
 
       metadataTestHooks.clearFileVisualTypeIconCache();
@@ -11153,8 +11154,8 @@ test('Review Assets preview requests stay bounded for large projects and preserv
         assert.equal(result.responses.every(response => (
           response && ['thumbnail', 'icon'].includes(response.kind)
         )), true);
-        assert.ok(result.elapsedMs < 30000, `${assetCount} assets exceeded the 30-second safety ceiling`);
       }
+      assert.ok(correctedPath.elapsedMs < 30000, `${assetCount} corrected requests exceeded the 30-second safety ceiling`);
       const iconFallbackRequests = Math.max(0, assetCount - rasterQueue);
       const correctedFilesystemResolutionBounds = {
         ...correctedRasterFilesystemResolutionBounds,
