@@ -11148,7 +11148,7 @@ test('Review Assets preview requests stay bounded for large projects and preserv
 test('Review Assets does not publish an in-flight workspace built before a project mutation', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-race-'));
   const assetPath = path.join(fixtureRoot, 'asset.png');
-  const pendingPath = path.join(fixtureRoot, 'pending.pdf');
+  const pendingPath = path.join(fixtureRoot, 'pending.png');
   let releaseLstat = null;
   let lstatStartedResolve = null;
   const lstatStarted = new Promise(resolve => { lstatStartedResolve = resolve; });
@@ -11156,13 +11156,13 @@ test('Review Assets does not publish an in-flight workspace built before a proje
   let gated = false;
   try {
     fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x42));
-    writeSyntheticPdfFile(pendingPath);
+    fs.writeFileSync(pendingPath, createSyntheticPngBytes(28, 20, 0x44));
     const project = await createProject('Review Assets visual race');
     await setProjectFiles(project.id, {
       files: [{ ...makePendingFile(assetPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
       pendingFiles: [{
-        ...makePendingFile(pendingPath, 'illustrator-active-session'),
-        assetOrigin: 'existing',
+        ...makePendingFile(pendingPath, 'manual-browse'),
+        assetOrigin: 'added',
         projectRole: 'asset',
       }],
     });
@@ -11174,7 +11174,7 @@ test('Review Assets does not publish an in-flight workspace built before a proje
     metadataTestHooks.clearFileVisualProjectCache();
     const gate = new Promise(resolve => { releaseLstat = resolve; });
     fs.promises.lstat = async function gatedFileVisualLstat(candidatePath, ...args) {
-      if (!gated && path.resolve(candidatePath) === path.resolve(assetPath)) {
+      if (!gated && path.resolve(candidatePath) === path.resolve(pendingPath)) {
         gated = true;
         lstatStartedResolve();
         await gate;

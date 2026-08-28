@@ -3674,7 +3674,7 @@ async function createRendererFilePresentation(project, file) {
   };
 }
 
-async function getProjectAssetWorkspace(projectId) {
+async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (typeof projectId !== 'string' || !projectId || projectId.length > 128) return null;
   const project = getProjects().find(item => item && item.id === projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
@@ -3700,15 +3700,20 @@ async function getProjectAssetWorkspace(projectId) {
       visualRevision: presentation.visualRevision,
     });
   }
-  // Mutations clear the cache. This post-await identity check also prevents
-  // an in-flight workspace build from publishing stale records after a
-  // concurrent project update.
-  if (
+  // Mutations clear the cache. This post-await freshness check prevents an
+  // in-flight workspace build from publishing or returning stale records
+  // after a concurrent project update. Retry once so the renderer receives a
+  // current snapshot; repeated churn fails closed instead of returning stale data.
+  const workspaceIsFresh = (
     fileVisualProjectCacheEpoch === cacheEpoch &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
     getIllustratorActivationScope(projectId) === illustratorScope
-  ) {
+  );
+  if (!workspaceIsFresh) {
+    return retryCount < 2 ? getProjectAssetWorkspace(projectId, retryCount + 1) : null;
+  }
+  if (workspaceIsFresh) {
     fileVisualProjectCache.set(projectId, {
       epoch: cacheEpoch,
       project,
