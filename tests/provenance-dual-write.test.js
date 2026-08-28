@@ -17552,7 +17552,7 @@ test('Illustrator baseline document stays excluded until Add files admits its so
   assert.equal(fresh.pendingFiles.some(file => file.path === linkedPath && file.source === 'ai-linked'), true);
 });
 
-test('current-session watcher save admits a baseline Illustrator source and its parser-confirmed linked asset', async () => {
+test('strong project-session saved evidence may auto-include while broad app-open observation stays out', async () => {
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Review_Project.ai');
   const linkedPath = '/Users/CrateQA/Review_Initial.png';
@@ -17596,6 +17596,7 @@ test('current-session watcher save admits a baseline Illustrator source and its 
     const project = await createProject('Illustrator baseline watcher save');
     assert.equal(illustratorQueryCount >= 1, true);
     let fresh = await getProject(project.id);
+    // Broad app-open observation alone must not auto-include either the source or its link.
     assert.deepEqual(fresh.files, []);
     assert.deepEqual(fresh.pendingFiles, []);
 
@@ -17619,6 +17620,7 @@ test('current-session watcher save admits a baseline Illustrator source and its 
     assert.deepEqual(fresh.files.map(file => file.path).sort(), [linkedPath, sourcePath].sort());
     assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
     assert.equal(fresh.files.filter(file => file.path === linkedPath).length, 1);
+    // A saved, current-session source with parser-confirmed linkage may auto-include its link.
     assert.equal(getSessionObservedByMethod(fresh, 'projects:add-files').length, 0);
     assert.equal(getSessionObservedByMethod(fresh, 'scan-on-open').length, 1);
     const linkedLedgerEntries = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})

@@ -622,7 +622,7 @@
             <div class="asset-metric-grid" aria-label="Asset summary">
               <div class="asset-metric existing"><strong id="metric-existing-count">0</strong><span>Existing</span></div>
               <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added while working</span></div>
-              <div class="asset-metric missing"><strong id="metric-missing-count">0</strong><span>Needs linking</span></div>
+              <div class="asset-metric missing"><strong id="metric-missing-count">0</strong><span>Needs Review</span></div>
               <div class="asset-metric excluded"><strong id="metric-excluded-count">0</strong><span>Excluded</span></div>
             </div>
 
@@ -660,7 +660,7 @@
             <div class="asset-review-header">
               <div>
                 <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
-                <p>Everything is included automatically. Use &times; only when something does not belong.</p>
+                <p>Crate automatically includes files it can confidently connect to this project. Review anything it could not verify.</p>
               </div>
               <label class="asset-review-search">
                 <span class="sr-only">Search assets</span>
@@ -672,15 +672,15 @@
               <button type="button" class="asset-filter active" data-asset-filter="all" aria-pressed="true">All <span id="filter-count-all">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="existing" aria-pressed="false">Existing <span id="filter-count-existing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="added" aria-pressed="false">Added <span id="filter-count-added">0</span></button>
-              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Linking <span id="filter-count-missing">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Review <span id="filter-count-missing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="excluded" aria-pressed="false">Excluded <span id="filter-count-excluded">0</span></button>
             </div>
 
             <div class="asset-review-toolbar">
               <div id="asset-review-summary">0 assets</div>
-              <div class="asset-panel-actions" aria-label="Needs Linking or Review controls">
-                <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all eligible assets that need linking or review">Add All Eligible</button>
-                <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all eligible assets that need linking or review">Skip All Eligible</button>
+              <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
+                <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review">Add All</button>
+                <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review">Skip All</button>
               </div>
             </div>
 
@@ -703,7 +703,7 @@
 
               <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
                 <div class="asset-panel-header">
-                  <h2 class="asset-panel-title" id="pending-header">Needs Linking or Review</h2>
+                  <h2 class="asset-panel-title" id="pending-header">Review Before Packaging</h2>
                 </div>
                 <div id="pending-file-list" class="missing-asset-grid"></div>
               </section>

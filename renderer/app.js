@@ -1298,19 +1298,19 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   const eligiblePendingCount = pendingCandidates.filter(candidate => candidate.target).length;
   const controls = $('.asset-panel-actions');
   if (controls) {
-    controls.setAttribute('aria-label', hasPendingReview ? 'Needs Linking or Review controls' : 'Existing Assets controls');
+    controls.setAttribute('aria-label', hasPendingReview ? 'Review Before Packaging controls' : 'Existing Assets controls');
   }
 
   if (includeAll) {
-    includeAll.textContent = hasPendingReview ? 'Add All Eligible' : 'Include All Existing';
-    includeAll.setAttribute('aria-label', hasPendingReview ? 'Add all eligible assets that need linking or review' : 'Include all existing assets');
+    includeAll.textContent = hasPendingReview ? 'Add All' : 'Include All Existing';
+    includeAll.setAttribute('aria-label', hasPendingReview ? 'Add all assets needing review' : 'Include all existing assets');
     includeAll.disabled = hasPendingReview
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === existingAssets.length;
   }
   if (skipAll) {
-    skipAll.textContent = hasPendingReview ? 'Skip All Eligible' : 'Skip All Existing';
-    skipAll.setAttribute('aria-label', hasPendingReview ? 'Skip all eligible assets that need linking or review' : 'Skip all existing assets');
+    skipAll.textContent = hasPendingReview ? 'Skip All' : 'Skip All Existing';
+    skipAll.setAttribute('aria-label', hasPendingReview ? 'Skip all assets needing review' : 'Skip all existing assets');
     skipAll.disabled = hasPendingReview
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === 0;
@@ -2074,7 +2074,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   const alert = $('#project-linking-alert');
   if (alert) {
     alert.textContent = pendingFiles.length
-      ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} linking or review`
+      ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
       : '';
     alert.classList.toggle('hidden', pendingFiles.length === 0);
   }
@@ -2113,7 +2113,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     for (const [label, count] of [...originCounts.entries()].sort((a, b) => b[1] - a[1])) {
       appendDefinitionRow(originList, label, count);
     }
-    if (pendingFiles.length) appendDefinitionRow(originList, 'Needs linking or review', pendingFiles.length, 'warning');
+    if (pendingFiles.length) appendDefinitionRow(originList, 'Needs Review', pendingFiles.length, 'warning');
   }
 
   const totalIncludedAssets = includedExisting.length + includedAdded.length;
@@ -2386,7 +2386,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
-      ? 'Needs save'
+      ? 'Needs Save'
       : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs review');
 
     row.appendChild(createFileVisual(project.id, file, {
@@ -2994,7 +2994,7 @@ function renderPackageReview(project, review, message = '') {
     appendDefinitionRow(summaryList, 'Working files', workingCount);
     appendDefinitionRow(summaryList, 'Existing assets', existingCount);
     appendDefinitionRow(summaryList, 'Added while working', addedCount);
-    appendDefinitionRow(summaryList, 'Needs linking', needsLinkingCount, needsLinkingCount ? 'warning' : '');
+    appendDefinitionRow(summaryList, 'Needs Review', needsLinkingCount, needsLinkingCount ? 'warning' : '');
     if (!canPackage && needsLinkingCount === 0) {
       appendDefinitionRow(summaryList, 'Package status', 'Review required', 'warning');
     }

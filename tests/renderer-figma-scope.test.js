@@ -1305,7 +1305,7 @@ test('generic presentation assets preserve Keynote and PowerPoint source applica
   assert.equal(appText.includes('PowerPoint'), true);
 });
 
-test('Current Project linking alert uses correct singular and plural copy', () => {
+test('Current Project review alert uses correct singular and plural copy', () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = { id: 'linking-copy', files: [], pendingFiles: [], excludedAssetKeys: [] };
   const renderer = loadRendererHelpers(document, { crate: {} });
@@ -1317,11 +1317,11 @@ test('Current Project linking alert uses correct singular and plural copy', () =
   renderer.testWorkspace = { projectId: project.id, files: [], pendingFiles: [pending(1)] };
   vm.runInContext('state.assetWorkspace = testWorkspace;', renderer);
   renderer.renderAssetWorkspace(project, {}, []);
-  assert.equal(elements['project-linking-alert'].textContent, '1 file needs linking or review');
+  assert.equal(elements['project-linking-alert'].textContent, '1 file needs review');
 
   renderer.testWorkspace.pendingFiles.push(pending(2));
   renderer.renderAssetWorkspace(project, {}, []);
-  assert.equal(elements['project-linking-alert'].textContent, '2 files need linking or review');
+  assert.equal(elements['project-linking-alert'].textContent, '2 files need review');
 });
 
 test('Figma Working File and asset labels reflect Entire File scope without fabricating a local source file', () => {
@@ -1402,7 +1402,7 @@ test('Review Assets switches from the dashboard without changing inclusion state
   assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
 });
 
-test('Review Assets search filters Needs Linking rows and hides an empty pending section', () => {
+test('Review Assets search filters Needs Review rows and hides an empty pending section', () => {
   const { document, elements } = createInteractiveRendererDom();
   const renderer = loadRendererHelpers(document, { crate: {} });
   const pendingList = document.querySelector('#pending-file-list');
@@ -1465,9 +1465,9 @@ test('Existing Assets batch controls use the persisted cohort decision IPC and p
   assert.equal(elements['btn-skip-all-existing'].disabled, true);
 });
 
-test('Needs Linking items all use the individual Add contract through one bulk action', async () => {
+test('Needs Review items all use the individual Add contract through one bulk action', async () => {
   const fixture = await loadPendingBatchFixture({ id: 'pending-batch-add' });
-  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All Eligible');
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All');
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, false);
   assert.equal(fixture.elements['pending-file-list'].children.length, 4);
 
@@ -1486,9 +1486,9 @@ test('Needs Linking items all use the individual Add contract through one bulk a
   assert.equal(fixture.document.querySelector('#btn-review-assets-continue').disabled, false);
 });
 
-test('Needs Linking items all use the individual Skip contract through one bulk action', async () => {
+test('Needs Review items all use the individual Skip contract through one bulk action', async () => {
   const fixture = await loadPendingBatchFixture({ id: 'pending-batch-skip' });
-  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All Eligible');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
   assert.equal(fixture.elements['btn-skip-all-existing'].disabled, false);
 
   assert.equal(await fixture.renderer.submitAssetReviewBatchDecision('skip'), true);
@@ -1505,7 +1505,7 @@ test('Needs Linking items all use the individual Skip contract through one bulk 
   assert.equal(fixture.elements['pending-section'].classList.contains('hidden'), true);
 });
 
-test('Needs Linking bulk Add leaves ineligible candidates unchanged and reports a partial result', async () => {
+test('Needs Review bulk Add leaves ineligible candidates unchanged and reports a partial result', async () => {
   const project = createPendingBatchProject('pending-batch-mixed');
   const allowedPaths = project.pendingFiles.slice(0, 3).map(file => file.path);
   const fixture = await loadPendingBatchFixture({ project, allowedPaths });
@@ -1521,7 +1521,7 @@ test('Needs Linking bulk Add leaves ineligible candidates unchanged and reports 
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, false);
 });
 
-test('Needs Linking bulk actions suppress rapid repeated activation and preserve current review state', async () => {
+test('Needs Review bulk actions suppress rapid repeated activation and preserve current review state', async () => {
   const gate = createDeferred();
   let first = true;
   const fixture = await loadPendingBatchFixture({
@@ -1552,7 +1552,7 @@ test('Needs Linking bulk actions suppress rapid repeated activation and preserve
   assert.equal(fixture.elements['asset-review-workspace'].classList.contains('hidden'), false);
 });
 
-test('Needs Linking bulk controls remain disabled when no pending item has an individual target', async () => {
+test('Needs Review bulk controls remain disabled when no pending item has an individual target', async () => {
   const project = createPendingBatchProject('pending-batch-empty-eligible');
   project.pendingFiles = [{ name: 'No identity.png', ext: '.png' }];
   const fixture = await loadPendingBatchFixture({ project });
@@ -1590,18 +1590,27 @@ test('individual pending Add and Skip actions keep their existing targets and la
   });
 });
 
-test('Needs Linking bulk controls retain keyboard and accessibility semantics', async () => {
+test('Review Before Packaging uses the approved terminology and retains keyboard and accessibility semantics', async () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
-  assert.match(html, /<button type="button"[^>]*id="btn-include-all-existing"[^>]*>Add All Eligible<\/button>/);
-  assert.match(html, /<button type="button"[^>]*id="btn-skip-all-existing"[^>]*>Skip All Eligible<\/button>/);
-  assert.match(html, /id="btn-include-all-existing"[^>]*aria-label="Add all eligible assets that need linking or review"/);
-  assert.match(html, /id="btn-skip-all-existing"[^>]*aria-label="Skip all eligible assets that need linking or review"/);
+  assert.match(html, /<span>Needs Review<\/span>/);
+  assert.match(html, /data-asset-filter="missing"[^>]*aria-pressed="false">Needs Review/);
+  assert.match(html, /<p>Crate automatically includes files it can confidently connect to this project\. Review anything it could not verify\.<\/p>/);
+  assert.match(html, /<h2 class="asset-panel-title" id="pending-header">Review Before Packaging<\/h2>/);
+  assert.match(html, /<button type="button"[^>]*id="btn-include-all-existing"[^>]*>Add All<\/button>/);
+  assert.match(html, /<button type="button"[^>]*id="btn-skip-all-existing"[^>]*>Skip All<\/button>/);
+  assert.match(html, /id="btn-include-all-existing"[^>]*aria-label="Add all assets needing review"/);
+  assert.match(html, /id="btn-skip-all-existing"[^>]*aria-label="Skip all assets needing review"/);
 
   const fixture = await loadPendingBatchFixture({ id: 'pending-accessibility' });
-  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Add all eligible assets that need linking or review');
-  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Skip all eligible assets that need linking or review');
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Add all assets needing review');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Skip all assets needing review');
   assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), undefined);
   assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), undefined);
+  const pendingRow = fixture.elements['pending-file-list'].children[0];
+  const pendingStateBadge = pendingRow.children.find(child => child.className === 'pending-state-badge');
+  const pendingCopy = pendingRow.children.find(child => child.className === 'pending-file-copy');
+  assert.equal(pendingStateBadge.textContent, 'Needs Save');
+  assert.match(pendingCopy.children[1].textContent, /Save to make package-ready\./);
 });
 
 test('per-file Existing Asset exclusion keeps the row available for Include All restoration', async () => {
@@ -2152,7 +2161,7 @@ test('Package Review uses the same project-owned visual identity without renderi
   assert.equal(summary.includes('Working files 1'), true);
   assert.equal(summary.includes('Existing assets 0'), true);
   assert.equal(summary.includes('Added while working 0'), true);
-  assert.equal(summary.includes('Needs linking 0'), true);
+  assert.equal(summary.includes('Needs Review 0'), true);
 });
 
 test('Package Review shows privacy-safe source context for visual assets', () => {
@@ -2492,7 +2501,7 @@ test('Package Review reports authoritative unavailable counts and resets blocked
   assert.equal(summary.includes('Working files 1'), true);
   assert.equal(summary.includes('Existing assets 1'), true);
   assert.equal(summary.includes('Added while working 1'), true);
-  assert.equal(summary.includes('Needs linking 2'), true);
+  assert.equal(summary.includes('Needs Review 2'), true);
   assert.equal(packageReviewDialog.scrollTop, 0);
   assert.equal(elements['modal-package-review-message'].focused, true);
 });
