@@ -3693,8 +3693,14 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
   const cacheGeneration = fileVisualProjectCacheGeneration;
-  const files = await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file)));
-  const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file)));
+  const files = await Promise.all((scopedProject.files || []).map(async (file, sourceIndex) => ({
+    ...(await createRendererFilePresentation(project, file)),
+    sourceIndex,
+  })));
+  const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
+    ...(await createRendererFilePresentation(project, file)),
+    sourceIndex,
+  })));
   const visualRecords = new Map();
   for (const [index, file] of (scopedProject.files || []).entries()) {
     const presentation = files[index];

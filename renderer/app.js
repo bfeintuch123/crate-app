@@ -1278,22 +1278,41 @@ function getPendingDecisionStableKey(file) {
   );
 }
 
-function getPendingAssetsForBatchDecision(project) {
+function getVisiblePendingAssetEntries(project) {
   if (!project || typeof project !== 'object') return [];
   const excluded = new Set(project.excludedAssetKeys || []);
-  const pending = (project.pendingFiles || []).filter(file => (
-    file &&
-    getPendingCaptureState(file) === 'pending' &&
-    !excluded.has(getAssetReviewExclusionKey(file))
+  return (project.pendingFiles || [])
+    .map((rawFile, sourceIndex) => ({ rawFile, sourceIndex }))
+    .filter(({ rawFile }) => (
+      rawFile && !excluded.has(getAssetReviewExclusionKey(rawFile))
+    ));
+}
+
+function getPendingWorkspacePresentation(rawFile, sourceIndex, presentations) {
+  if (!Array.isArray(presentations)) return null;
+  const stableKey = getPendingDecisionStableKey(rawFile);
+  if (stableKey) {
+    const identityMatches = presentations.filter(file => (
+      getPendingDecisionStableKey(file) === stableKey
+    ));
+    if (identityMatches.length === 1) return identityMatches[0];
+  }
+  return presentations.find(file => file && file.sourceIndex === sourceIndex) || null;
+}
+
+function getPendingAssetsForBatchDecision(project) {
+  if (!project || typeof project !== 'object') return [];
+  const pending = getVisiblePendingAssetEntries(project).filter(({ rawFile }) => (
+    getPendingCaptureState(rawFile) === 'pending'
   ));
   const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
   const presentations = Array.isArray(workspace?.pendingFiles)
     ? workspace.pendingFiles.filter(file => file.excluded !== true)
     : [];
 
-  return pending.map((rawFile, index) => {
-    const presentation = presentations[index];
-    const file = presentation && presentation.name === rawFile.name
+  return pending.map(({ rawFile, sourceIndex }) => {
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
       ? { ...rawFile, ...presentation }
       : rawFile;
     return {
@@ -2400,9 +2419,11 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   }
 
   section.classList.remove('hidden');
+  const visiblePendingEntries = getVisiblePendingAssetEntries(project);
   reconcileKeyedList(list, pending, (rawFile, index) => {
-    const presentation = presentations[index];
-    const file = presentation && presentation.name === rawFile.name
+    const sourceIndex = visiblePendingEntries[index]?.sourceIndex;
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
       ? { ...rawFile, ...presentation }
       : { ...rawFile, protectedSource: true, visualIdentity: null };
     const row = document.createElement('div');
