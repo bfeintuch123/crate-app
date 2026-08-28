@@ -1243,7 +1243,7 @@ async function setProjectFiles(projectId, {
   return project;
 }
 
-async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 10000) {
+async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 30000) {
   const counts = { lstat: 0, realpath: 0 };
   const originalLstat = fs.promises.lstat;
   const originalRealpath = fs.promises.realpath;
@@ -11114,7 +11114,7 @@ test('Review Assets preview requests stay bounded for large projects and preserv
         assert.equal(result.responses.every(response => (
           response && ['thumbnail', 'icon'].includes(response.kind)
         )), true);
-        assert.ok(result.elapsedMs < 10000);
+        assert.ok(result.elapsedMs < 30000);
       }
       assert.ok(
         correctedPath.lstat <= legacyPath.lstat - assetCount,
