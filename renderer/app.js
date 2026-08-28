@@ -1262,11 +1262,20 @@ function getExistingAssetsForDecision(project) {
   ));
 }
 
+function getPendingDecisionTarget(file) {
+  if (!file || typeof file !== 'object') return null;
+  return getFileVisualIdentity(file) || (
+    typeof file.path === 'string' && file.path ? file.path : null
+  );
+}
+
 function getPendingAssetsForBatchDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const excluded = new Set(project.excludedAssetKeys || []);
   const pending = (project.pendingFiles || []).filter(file => (
-    file && !excluded.has(getAssetReviewExclusionKey(file))
+    file &&
+    getPendingCaptureState(file) === 'pending' &&
+    !excluded.has(getAssetReviewExclusionKey(file))
   ));
   const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
   const presentations = Array.isArray(workspace?.pendingFiles)
@@ -1281,9 +1290,7 @@ function getPendingAssetsForBatchDecision(project) {
     return {
       rawFile,
       file,
-      target: getFileVisualIdentity(file) || (
-        typeof rawFile.path === 'string' && rawFile.path ? rawFile.path : null
-      ),
+      target: getPendingDecisionTarget(file) || getPendingDecisionTarget(rawFile),
     };
   });
 }
@@ -1293,25 +1300,29 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   const skipAll = $('#btn-skip-all-existing');
   if (!includeAll && !skipAll) return;
 
+  const excluded = new Set(project?.excludedAssetKeys || []);
+  const visiblePending = (project?.pendingFiles || []).filter(file => (
+    file && !excluded.has(getAssetReviewExclusionKey(file))
+  ));
   const pendingCandidates = getPendingAssetsForBatchDecision(project);
-  const hasPendingReview = pendingCandidates.length > 0;
+  const hasPendingReviewSurface = visiblePending.length > 0;
   const eligiblePendingCount = pendingCandidates.filter(candidate => candidate.target).length;
   const controls = $('.asset-panel-actions');
   if (controls) {
-    controls.setAttribute('aria-label', hasPendingReview ? 'Review Before Packaging controls' : 'Existing Assets controls');
+    controls.setAttribute('aria-label', hasPendingReviewSurface ? 'Review Before Packaging controls' : 'Existing Assets controls');
   }
 
   if (includeAll) {
-    includeAll.textContent = hasPendingReview ? 'Add All' : 'Include All Existing';
-    includeAll.setAttribute('aria-label', hasPendingReview ? 'Add all assets needing review' : 'Include all existing assets');
-    includeAll.disabled = hasPendingReview
+    includeAll.textContent = hasPendingReviewSurface ? 'Add All' : 'Include All Existing';
+    includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : 'Include all existing assets');
+    includeAll.disabled = hasPendingReviewSurface
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === existingAssets.length;
   }
   if (skipAll) {
-    skipAll.textContent = hasPendingReview ? 'Skip All' : 'Skip All Existing';
-    skipAll.setAttribute('aria-label', hasPendingReview ? 'Skip all assets needing review' : 'Skip all existing assets');
-    skipAll.disabled = hasPendingReview
+    skipAll.textContent = hasPendingReviewSurface ? 'Skip All' : 'Skip All Existing';
+    skipAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Skip all assets needing review' : 'Skip all existing assets');
+    skipAll.disabled = hasPendingReviewSurface
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === 0;
   }
@@ -1531,7 +1542,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
     let renderedUpdatedState = false;
     try {
       for (const candidate of pendingCandidates) {
-        if (!candidate.target || typeof candidate.rawFile?.path !== 'string' || !candidate.rawFile.path) {
+        if (!candidate.target) {
           failedCount += 1;
           continue;
         }
@@ -1542,7 +1553,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
             : await window.crate.rejectPending(project.id, candidate.target);
           const remainingPendingFiles = getPendingFilesFromDecisionResult(result, decision);
           const applied = Array.isArray(remainingPendingFiles) && !remainingPendingFiles.some(file => (
-            file && file.path === candidate.rawFile.path
+            getPendingDecisionTarget(file) === candidate.target
           ));
           if (applied) appliedCount += 1;
           else failedCount += 1;
@@ -1579,8 +1590,12 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
 async function submitAssetReviewBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
+  const excluded = new Set(project.excludedAssetKeys || []);
+  const visiblePending = (project.pendingFiles || []).filter(file => (
+    file && !excluded.has(getAssetReviewExclusionKey(file))
+  ));
   const pendingCandidates = getPendingAssetsForBatchDecision(project);
-  if (pendingCandidates.length > 0) {
+  if (visiblePending.length > 0) {
     return submitPendingAssetsBatchDecision(decision, project, pendingCandidates.filter(candidate => candidate.target));
   }
   return submitExistingAssetsBatchDecision(decision);
@@ -2387,7 +2402,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
       ? 'Needs Save'
-      : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs review');
+      : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs Review');
 
     row.appendChild(createFileVisual(project.id, file, {
       priority: state.assetReviewOpen ? 0 : 10,
