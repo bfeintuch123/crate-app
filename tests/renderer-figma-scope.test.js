@@ -426,6 +426,7 @@ function createPendingBatchBridge(project, { allowedPaths = null, beforeAccept =
   let persisted = cloneTestValue(project);
   const calls = [];
   const allowed = allowedPaths ? new Set(allowedPaths) : null;
+  const targetFor = file => file.path || file.visualIdentity || file.fileId || null;
   const present = file => ({
     name: file.name,
     ext: file.ext,
@@ -449,7 +450,7 @@ function createPendingBatchBridge(project, { allowedPaths = null, beforeAccept =
       calls.push({ action: 'acceptPending', projectId, target });
       if (beforeAccept) await beforeAccept();
       const file = findPending(target);
-      if (!file || (allowed && !allowed.has(file.path))) return null;
+      if (!file || (allowed && !allowed.has(targetFor(file)))) return null;
       persisted.pendingFiles = persisted.pendingFiles.filter(candidate => candidate !== file);
       persisted.files.push({ ...file, captureState: 'ready', acceptedPending: true });
       return {
@@ -460,7 +461,7 @@ function createPendingBatchBridge(project, { allowedPaths = null, beforeAccept =
     rejectPending: async (projectId, target) => {
       calls.push({ action: 'rejectPending', projectId, target });
       const file = findPending(target);
-      if (!file || (allowed && !allowed.has(file.path))) return cloneTestValue(persisted.pendingFiles);
+      if (!file || (allowed && !allowed.has(targetFor(file)))) return cloneTestValue(persisted.pendingFiles);
       persisted.pendingFiles = persisted.pendingFiles.filter(candidate => candidate !== file);
       persisted.excludedAssetKeys.push(file.path || file.visualIdentity || file.fileId);
       return cloneTestValue(persisted.pendingFiles);
@@ -1578,17 +1579,24 @@ test('Needs Review bulk actions accept identity-only targets for Add and Skip', 
     ext: '.png',
     fileId: 'identity-only-add',
     captureState: 'pending',
+  }, {
+    name: 'Identity Add Unchanged.png',
+    ext: '.png',
+    fileId: 'identity-only-add-unchanged',
+    captureState: 'pending',
   }];
-  const addFixture = await loadPendingBatchFixture({ project: addProject });
+  const addFixture = await loadPendingBatchFixture({
+    project: addProject,
+    allowedPaths: ['identity-only-add'],
+  });
 
   assert.equal(addFixture.elements['btn-include-all-existing'].disabled, false);
   assert.equal(await addFixture.renderer.submitAssetReviewBatchDecision('include'), true);
-  assert.deepEqual(addFixture.calls, [{
-    action: 'acceptPending',
-    projectId: addProject.id,
-    target: 'identity-only-add',
-  }]);
-  assert.equal(addFixture.getPersisted().pendingFiles.length, 0);
+  assert.deepEqual(addFixture.calls.map(call => call.target), [
+    'identity-only-add',
+    'identity-only-add-unchanged',
+  ]);
+  assert.deepEqual(addFixture.getPersisted().pendingFiles.map(file => file.fileId), ['identity-only-add-unchanged']);
 
   const skipProject = createPendingBatchProject('pending-batch-identity-skip');
   skipProject.pendingFiles = [{
@@ -1596,17 +1604,24 @@ test('Needs Review bulk actions accept identity-only targets for Add and Skip', 
     ext: '.png',
     fileId: 'identity-only-skip',
     captureState: 'pending',
+  }, {
+    name: 'Identity Skip Unchanged.png',
+    ext: '.png',
+    fileId: 'identity-only-skip-unchanged',
+    captureState: 'pending',
   }];
-  const skipFixture = await loadPendingBatchFixture({ project: skipProject });
+  const skipFixture = await loadPendingBatchFixture({
+    project: skipProject,
+    allowedPaths: ['identity-only-skip'],
+  });
 
   assert.equal(skipFixture.elements['btn-skip-all-existing'].disabled, false);
   assert.equal(await skipFixture.renderer.submitAssetReviewBatchDecision('skip'), true);
-  assert.deepEqual(skipFixture.calls, [{
-    action: 'rejectPending',
-    projectId: skipProject.id,
-    target: 'identity-only-skip',
-  }]);
-  assert.equal(skipFixture.getPersisted().pendingFiles.length, 0);
+  assert.deepEqual(skipFixture.calls.map(call => call.target), [
+    'identity-only-skip',
+    'identity-only-skip-unchanged',
+  ]);
+  assert.deepEqual(skipFixture.getPersisted().pendingFiles.map(file => file.fileId), ['identity-only-skip-unchanged']);
   assert.deepEqual(skipFixture.getPersisted().excludedAssetKeys, ['identity-only-skip']);
 });
 

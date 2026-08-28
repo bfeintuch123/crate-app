@@ -1269,6 +1269,15 @@ function getPendingDecisionTarget(file) {
   );
 }
 
+function getPendingDecisionStableKey(file) {
+  if (!file || typeof file !== 'object') return null;
+  return getFileVisualIdentity(file) || (
+    typeof file.fileId === 'string' && file.fileId ? file.fileId : null
+  ) || (
+    typeof file.path === 'string' && file.path ? file.path : null
+  );
+}
+
 function getPendingAssetsForBatchDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const excluded = new Set(project.excludedAssetKeys || []);
@@ -1291,6 +1300,7 @@ function getPendingAssetsForBatchDecision(project) {
       rawFile,
       file,
       target: getPendingDecisionTarget(file) || getPendingDecisionTarget(rawFile),
+      stableTarget: getPendingDecisionStableKey(rawFile),
     };
   });
 }
@@ -1552,8 +1562,9 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
             ? await window.crate.acceptPending(project.id, candidate.target)
             : await window.crate.rejectPending(project.id, candidate.target);
           const remainingPendingFiles = getPendingFilesFromDecisionResult(result, decision);
+          const candidateTargets = new Set([candidate.target, candidate.stableTarget].filter(Boolean));
           const applied = Array.isArray(remainingPendingFiles) && !remainingPendingFiles.some(file => (
-            getPendingDecisionTarget(file) === candidate.target
+            candidateTargets.has(getPendingDecisionStableKey(file))
           ));
           if (applied) appliedCount += 1;
           else failedCount += 1;
