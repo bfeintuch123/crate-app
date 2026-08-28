@@ -9089,6 +9089,7 @@ async function ingestFigmaAssetsIntoProject(
       if (!projectHasLocalPath && !projectHasFigmaKey) {
         project.files.push({ ...result.fileRecord });
         project.files = deduplicateFiles(project.files);
+        clearFileVisualProjectCache(projectId);
       }
       mutateProject(projectId, (proj) => {
         if (!isCurrent()) return null;
@@ -13936,7 +13937,13 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     }, false);
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
-  const operationCurrent = operation.current, stagePrePackageFile = (project, file, observation) => operationCurrent() ? stageLiveObservedFile(project, file, observation) : null;
+  const operationCurrent = operation.current;
+  const stagePrePackageFile = (project, file, observation) => {
+    if (!operationCurrent()) return null;
+    const staged = stageLiveObservedFile(project, file, observation);
+    if (staged?.changed) clearFileVisualProjectCache(projectId);
+    return staged;
+  };
   // FIX 2 (C2): Track scan in-flight so package handler can wait
   scanInFlight.add(projectId);
   incompletePackageScans.delete(projectId);
@@ -14458,6 +14465,7 @@ end tell`;
 
   if (newCount > 0) {
     project.files = deduplicateFiles(project.files);
+    clearFileVisualProjectCache(projectId);
   }
 
   // v2.2.3: Pre-package double-check — re-extract linked assets from all scannable
@@ -14502,6 +14510,7 @@ end tell`;
     }
     if (doubleCheckCount > 0) {
       project.files = deduplicateFiles(project.files);
+      clearFileVisualProjectCache(projectId);
       newCount += doubleCheckCount;
     }
   } catch (e) {
@@ -14556,7 +14565,10 @@ end tell`;
       return { files: proj.files };
     });
     if (!operationCurrent()) return null;
-    if (merged) project.files = merged.files;
+    if (merged) {
+      project.files = merged.files;
+      clearFileVisualProjectCache(projectId);
+    }
   }
 
   // Figma authoritative recovery pass for package-time scan.
@@ -14663,6 +14675,7 @@ end tell`;
 
   if (!operationCurrent()) return null;
   project.files = deduplicateFiles(project.files);
+  clearFileVisualProjectCache(projectId);
   const finalProject = getProjects().find(item => item.id === projectId);
   incompletePackageScans.delete(projectId);
   packageScanDiagnosticState.set(projectId, {
