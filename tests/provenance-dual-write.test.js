@@ -998,6 +998,10 @@ module.exports.__crateMetadataTestHooks = {
   },
   clearFileVisualTypeIconCache() {
     fileVisualTypeIconCache.clear();
+    fileVisualTypeIconPending.clear();
+  },
+  clearFileVisualProjectCache() {
+    clearFileVisualProjectCache();
   },
   getFileVisualRasterLimits() {
     return {
@@ -1238,6 +1242,58 @@ async function setProjectFiles(projectId, {
     project.liveEvidenceLedger = liveEvidenceLedger;
   }
   return project;
+}
+
+async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 30000) {
+  const counts = {
+    open: 0,
+    lstat: 0,
+    realpath: 0,
+    lstatSync: 0,
+    realpathSync: 0,
+  };
+  const originalOpen = fs.promises.open;
+  const originalLstat = fs.promises.lstat;
+  const originalRealpath = fs.promises.realpath;
+  const originalLstatSync = fs.lstatSync;
+  const originalRealpathSyncNative = fs.realpathSync.native;
+  let timeoutId = null;
+  fs.promises.open = async function measuredFileVisualOpen(...args) {
+    counts.open++;
+    return originalOpen.call(fs.promises, ...args);
+  };
+  fs.promises.lstat = async function measuredFileVisualLstat(...args) {
+    counts.lstat++;
+    return originalLstat.call(fs.promises, ...args);
+  };
+  fs.promises.realpath = async function measuredFileVisualRealpath(...args) {
+    counts.realpath++;
+    return originalRealpath.call(fs.promises, ...args);
+  };
+  fs.lstatSync = function measuredFileVisualLstatSync(...args) {
+    counts.lstatSync++;
+    return originalLstatSync.call(fs, ...args);
+  };
+  fs.realpathSync.native = function measuredFileVisualRealpathSyncNative(...args) {
+    counts.realpathSync++;
+    return originalRealpathSyncNative.call(fs.realpathSync, ...args);
+  };
+  const startedAt = Date.now();
+  try {
+    const requestResult = Promise.resolve().then(requestFactory);
+    const timeoutResult = new Promise((resolve, reject) => {
+      timeoutId = originalSetTimeout(() => reject(new Error(`file visual requests exceeded ${timeoutMs}ms`)), timeoutMs);
+    });
+    const responses = await Promise.race([requestResult, timeoutResult]);
+    return { ...counts, elapsedMs: Date.now() - startedAt, responses };
+  } finally {
+    if (timeoutId) originalClearTimeout(timeoutId);
+    fs.promises.open = originalOpen;
+    fs.promises.lstat = originalLstat;
+    fs.promises.realpath = originalRealpath;
+    fs.lstatSync = originalLstatSync;
+    fs.realpathSync.native = originalRealpathSyncNative;
+  }
 }
 
 async function settleAssetBaselineForUnrelatedPackageTest(projectId) {
@@ -2729,6 +2785,7 @@ test.afterEach(async () => {
   testLastFileIconPath = null;
   testLastFileIconOptions = null;
   metadataTestHooks.clearFileVisualTypeIconCache();
+  metadataTestHooks.clearFileVisualProjectCache();
   clearTrackedTimers();
 });
 
@@ -10989,6 +11046,347 @@ test('raster thumbnail work uses a defensible byte and pixel bound with one boun
   assert.equal(maximumActive, 1);
   assert.equal(active, 0);
   assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 0);
+});
+
+test('Review Assets preview requests stay bounded for large projects and preserve project-owned safety', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stress-'));
+  const assetCounts = [30, 263, 500];
+  const rasterQueue = metadataTestHooks.getFileVisualRasterLimits().queue;
+  const correctedRasterFilesystemResolutionBounds = {
+    // One accepted raster lane performs two opens, sixteen async lstat calls,
+    // and six async realpath calls. These are fixed bounds, independent of
+    // the number of requested assets.
+    open: rasterQueue * 2,
+    lstat: rasterQueue * 16,
+    realpath: rasterQueue * 6,
+  };
+  const correctedFileTypeIconFilesystemResolutionBounds = {
+    // Coalesced icon work performs one fixed hint validation sequence for
+    // the concurrent fallback cohort, regardless of its request count.
+    lstatSync: 5,
+    realpathSync: 3,
+  };
+  const measurements = [];
+  try {
+    testNativeFileVisualImage = createTestNativeImage(64);
+    testNativeFileIconImage = createTestNativeImage(64);
+    const project = await createProject('Review Assets visual stress');
+    const otherProject = await createProject('Review Assets other project');
+    const otherAssetPath = path.join(fixtureRoot, 'other-project.png');
+    fs.writeFileSync(otherAssetPath, createSyntheticPngBytes(24, 24, 0x71));
+    await setProjectFiles(otherProject.id, {
+      files: [{
+        ...makePendingFile(otherAssetPath, 'manual-browse'),
+        assetOrigin: 'added',
+        projectRole: 'asset',
+      }],
+    });
+    const otherWorkspace = await callIpcRaw('projects:get-asset-workspace', otherProject.id);
+    const otherPresentation = otherWorkspace.files[0];
+
+    for (const assetCount of assetCounts) {
+      const assetDir = path.join(fixtureRoot, String(assetCount));
+      fs.mkdirSync(assetDir, { recursive: true });
+      const files = [];
+      for (let index = 0; index < assetCount; index++) {
+        const assetPath = path.join(assetDir, `asset-${String(index).padStart(3, '0')}.png`);
+        fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, index & 0xff));
+        files.push({
+          ...makePendingFile(assetPath, 'manual-browse'),
+          assetOrigin: 'added',
+          projectRole: 'asset',
+        });
+      }
+      const pendingPaths = [
+        path.join(assetDir, 'pre-existing-illustrator-1.ai'),
+        path.join(assetDir, 'pre-existing-illustrator-2.ai'),
+      ];
+      for (const pendingPath of pendingPaths) writeSyntheticAiFile(pendingPath);
+      await setProjectFiles(project.id, {
+        files,
+        pendingFiles: pendingPaths.map(filePath => ({
+          ...makePendingFile(filePath, 'illustrator-active-session'),
+          assetOrigin: 'existing',
+          projectRole: 'source',
+        })),
+      });
+      metadataTestHooks.clearFileVisualProjectCache();
+
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      assert.equal(workspace.files.length, assetCount);
+      assert.deepEqual(workspace.pendingFiles.map(file => file.name), [
+        'pre-existing-illustrator-1.ai',
+        'pre-existing-illustrator-2.ai',
+      ]);
+      assert.equal(new Set(workspace.files.map(file => file.visualIdentity)).size, assetCount);
+      assert.equal(workspace.files.every(file => !Object.hasOwn(file, 'path')), true);
+      const requests = workspace.files.map(file => (
+        ['projects:get-file-visual', project.id, file.visualIdentity, file.visualRevision]
+      ));
+
+      metadataTestHooks.clearFileVisualProjectCache();
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      const legacyPath = await measureProjectFileVisualRequests(
+        () => Promise.all(requests.map(request => callIpcRaw(...request))),
+        120000
+      );
+
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      await callIpcRaw('projects:get-asset-workspace', project.id);
+      const correctedPath = await measureProjectFileVisualRequests(
+        () => Promise.all(requests.map(request => callIpcRaw(...request)))
+      );
+      measurements.push({
+        assetCount,
+        legacyPath: {
+          elapsedMs: legacyPath.elapsedMs,
+          open: legacyPath.open,
+          lstat: legacyPath.lstat,
+          realpath: legacyPath.realpath,
+          lstatSync: legacyPath.lstatSync,
+          realpathSync: legacyPath.realpathSync,
+        },
+        correctedPath: {
+          elapsedMs: correctedPath.elapsedMs,
+          open: correctedPath.open,
+          lstat: correctedPath.lstat,
+          realpath: correctedPath.realpath,
+          lstatSync: correctedPath.lstatSync,
+          realpathSync: correctedPath.realpathSync,
+        },
+      });
+
+      for (const result of [legacyPath, correctedPath]) {
+        assert.equal(result.responses.length, assetCount);
+        assert.equal(result.responses.every(response => (
+          response && ['thumbnail', 'icon'].includes(response.kind)
+        )), true);
+      }
+      assert.ok(correctedPath.elapsedMs < 30000, `${assetCount} corrected requests exceeded the 30-second safety ceiling`);
+      const correctedFilesystemResolutionBounds = {
+        ...correctedRasterFilesystemResolutionBounds,
+        ...correctedFileTypeIconFilesystemResolutionBounds,
+      };
+      for (const [api, bound] of Object.entries(correctedFilesystemResolutionBounds)) {
+        assert.ok(
+          correctedPath[api] <= bound,
+          `${assetCount} assets exceeded corrected ${api} bound: ${correctedPath[api]} > ${bound}`
+        );
+      }
+
+      assert.deepEqual(
+        await callIpcRaw('projects:get-file-visual', otherProject.id, workspace.files[0].visualIdentity, workspace.files[0].visualRevision),
+        { error: 'not_found' }
+      );
+      assert.deepEqual(
+        await callIpcRaw('projects:get-file-visual', project.id, otherPresentation.visualIdentity, otherPresentation.visualRevision),
+        { error: 'not_found' }
+      );
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      assert.deepEqual(stored.pendingFiles.map(file => file.path), pendingPaths);
+      assert.equal(stored.files.length, assetCount);
+    }
+
+    if (process.env.CRATE_FILE_VISUAL_STRESS_REPORT === '1') {
+      process.stdout.write(`# file-visual-stress ${JSON.stringify(measurements)}\n`);
+    }
+  } finally {
+    testNativeFileVisualImage = null;
+    testNativeFileIconImage = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Review Assets does not publish an in-flight workspace built before a project mutation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-race-'));
+  const assetPath = path.join(fixtureRoot, 'asset.png');
+  const pendingPath = path.join(fixtureRoot, 'pending.png');
+  let releaseLstat = null;
+  let lstatStartedResolve = null;
+  const lstatStarted = new Promise(resolve => { lstatStartedResolve = resolve; });
+  const originalLstat = fs.promises.lstat;
+  let gated = false;
+  try {
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x42));
+    fs.writeFileSync(pendingPath, createSyntheticPngBytes(28, 20, 0x44));
+    const project = await createProject('Review Assets visual race');
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(assetPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+      pendingFiles: [{
+        ...makePendingFile(pendingPath, 'manual-browse'),
+        assetOrigin: 'added',
+        projectRole: 'asset',
+      }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const initialWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const pendingPresentation = initialWorkspace.pendingFiles[0];
+    assert.ok(pendingPresentation?.visualIdentity);
+
+    metadataTestHooks.clearFileVisualProjectCache();
+    const gate = new Promise(resolve => { releaseLstat = resolve; });
+    fs.promises.lstat = async function gatedFileVisualLstat(candidatePath, ...args) {
+      if (!gated && path.resolve(candidatePath) === path.resolve(pendingPath)) {
+        gated = true;
+        lstatStartedResolve();
+        await gate;
+      }
+      return originalLstat.call(fs.promises, candidatePath, ...args);
+    };
+
+    const buildingWorkspace = callIpcRaw('projects:get-asset-workspace', project.id);
+    await Promise.race([
+      lstatStarted,
+      new Promise((_, reject) => originalSetTimeout(() => reject(new Error('workspace build did not reach lstat')), 3000)),
+    ]);
+
+    const accepted = await callIpcRaw('projects:accept-pending', project.id, pendingPath);
+    assert.equal(accepted.pendingFiles.length, 0);
+    assert.equal(accepted.files.length, 2);
+    releaseLstat();
+    const staleWorkspace = await buildingWorkspace;
+    assert.equal(staleWorkspace.pendingFiles.length, 0);
+
+    const currentWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(currentWorkspace.pendingFiles.length, 0);
+    assert.equal(currentWorkspace.files.length, 2);
+    const acceptedVisual = await callIpcRaw(
+      'projects:get-file-visual',
+      project.id,
+      pendingPresentation.visualIdentity,
+      pendingPresentation.visualRevision
+    );
+    assert.ok(acceptedVisual && ['icon', 'fallback'].includes(acceptedVisual.kind));
+  } finally {
+    if (releaseLstat) releaseLstat();
+    fs.promises.lstat = originalLstat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Review Assets never publishes a visual after its project record changes in flight', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-response-race-'));
+  const rasterPath = path.join(fixtureRoot, 'raster.png');
+  const iconPath = path.join(fixtureRoot, 'document.pdf');
+  const project = await createProject('Review Assets visual response race');
+  const runCase = async ({ filePath, visualKind, mutate, expected }) => {
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(filePath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const presentation = workspace.files[0];
+    let releaseVisual;
+    let visualStartedResolve;
+    const visualStarted = new Promise(resolve => { visualStartedResolve = resolve; });
+    const visualGate = new Promise(resolve => { releaseVisual = resolve; });
+    const hook = async () => {
+      visualStartedResolve();
+      await mutate();
+      await visualGate;
+    };
+    if (visualKind === 'thumbnail') testBeforeNativeThumbnailResolve = hook;
+    else testBeforeFileIconResolve = hook;
+    try {
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      const request = callIpcRaw(
+        'projects:get-file-visual', project.id, presentation.visualIdentity, presentation.visualRevision
+      );
+      await Promise.race([
+        visualStarted,
+        new Promise((_, reject) => originalSetTimeout(() => reject(new Error(`${visualKind} work did not start`)), 3000)),
+      ]);
+      releaseVisual();
+      assert.deepEqual(await request, expected);
+    } finally {
+      testBeforeNativeThumbnailResolve = null;
+      testBeforeFileIconResolve = null;
+    }
+  };
+
+  try {
+    fs.writeFileSync(rasterPath, createSyntheticPngBytes(32, 24, 0x61));
+    testNativeFileVisualImage = createTestNativeImage(64);
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        const currentProject = storeInstance.data.projects.find(item => item.id === project.id);
+        currentProject.files[0] = { ...currentProject.files[0], name: 'Mutated raster.png' };
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        await setProjectFiles(project.id, {
+          files: [{ ...makePendingFile(rasterPath, 'replacement'), assetOrigin: 'added', projectRole: 'asset' }],
+        });
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        await setProjectFiles(project.id, { files: [] });
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'not_found' },
+    });
+
+    writeSyntheticPdfFile(iconPath);
+    testNativeFileIconImage = createTestNativeImage(64);
+    await runCase({
+      filePath: iconPath,
+      visualKind: 'icon',
+      mutate: async () => {
+        const currentProject = storeInstance.data.projects.find(item => item.id === project.id);
+        currentProject.files[0] = { ...currentProject.files[0], name: 'Mutated document.pdf' };
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+  } finally {
+    testNativeFileVisualImage = null;
+    testNativeFileIconImage = null;
+    testBeforeNativeThumbnailResolve = null;
+    testBeforeFileIconResolve = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Review Assets returns stale_visual when a raster source changes without a project refresh', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stale-'));
+  const assetPath = path.join(fixtureRoot, 'asset.png');
+  try {
+    testNativeFileVisualImage = createTestNativeImage(64);
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x43));
+    const project = await createProject('Review Assets stale visual');
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(assetPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const presentation = workspace.files[0];
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x99));
+
+    assert.deepEqual(
+      await callIpcRaw(
+        'projects:get-file-visual',
+        project.id,
+        presentation.visualIdentity,
+        presentation.visualRevision
+      ),
+      { error: 'stale_visual' }
+    );
+  } finally {
+    testNativeFileVisualImage = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('Package Review gives duplicate same-name files distinct opaque visuals bound to exact manifest sources', async () => {
