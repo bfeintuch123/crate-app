@@ -3551,10 +3551,15 @@ const FILE_VISUAL_SAFE_RASTER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.g
 const fileVisualIdentitySecret = crypto.randomBytes(32);
 const fileVisualTypeIconCache = new Map();
 const fileVisualProjectCache = new Map();
+let fileVisualProjectCacheEpoch = 0;
 let fileVisualRasterWorkTail = Promise.resolve();
 let fileVisualRasterWorkPending = 0;
 
 function clearFileVisualProjectCache(projectId = null) {
+  // The epoch also invalidates workspace builders that are between their
+  // asynchronous filesystem reads and cache publication. Array/object
+  // identity checks alone cannot detect an in-place project mutation.
+  fileVisualProjectCacheEpoch += 1;
   if (typeof projectId === 'string' && projectId) {
     fileVisualProjectCache.delete(projectId);
     return;
@@ -3566,6 +3571,7 @@ function getCurrentFileVisualProjectCache(projectId, project) {
   const cache = fileVisualProjectCache.get(projectId);
   if (
     !cache ||
+    cache.epoch !== fileVisualProjectCacheEpoch ||
     cache.project !== project ||
     cache.files !== project?.files ||
     cache.pendingFiles !== project?.pendingFiles ||
@@ -3676,6 +3682,7 @@ async function getProjectAssetWorkspace(projectId) {
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
   const illustratorScope = getIllustratorActivationScope(projectId);
+  const cacheEpoch = fileVisualProjectCacheEpoch;
   const files = await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file)));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file)));
   const visualRecords = new Map();
@@ -3697,11 +3704,13 @@ async function getProjectAssetWorkspace(projectId) {
   // an in-flight workspace build from publishing stale records after a
   // concurrent project update.
   if (
+    fileVisualProjectCacheEpoch === cacheEpoch &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
     getIllustratorActivationScope(projectId) === illustratorScope
   ) {
     fileVisualProjectCache.set(projectId, {
+      epoch: cacheEpoch,
       project,
       files: projectFiles,
       pendingFiles: projectPendingFiles,
@@ -4066,7 +4075,7 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
     let snapshot = null;
     try {
       if (createProjectFileVisualRevisionFromStat(projectId, file, source.sourceStat) !== visualRevision) {
-        return null;
+        return { stale: true };
       }
       const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
       snapshot = await createPrivateFileVisualSnapshot(source, ext);
@@ -4114,6 +4123,7 @@ async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevisi
     typeof nativeImage.createThumbnailFromPath === 'function'
   ) {
     const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision);
+    if (dataUrl?.stale) return { error: 'stale_visual' };
     if (dataUrl) return { kind: 'thumbnail', dataUrl };
   }
   const iconDataUrl = await getBoundedFileTypeIcon(ext);

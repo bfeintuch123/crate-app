@@ -11145,6 +11145,103 @@ test('Review Assets preview requests stay bounded for large projects and preserv
   }
 });
 
+test('Review Assets does not publish an in-flight workspace built before a project mutation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-race-'));
+  const assetPath = path.join(fixtureRoot, 'asset.png');
+  const pendingPath = path.join(fixtureRoot, 'pending.pdf');
+  let releaseLstat = null;
+  let lstatStartedResolve = null;
+  const lstatStarted = new Promise(resolve => { lstatStartedResolve = resolve; });
+  const originalLstat = fs.promises.lstat;
+  let gated = false;
+  try {
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x42));
+    writeSyntheticPdfFile(pendingPath);
+    const project = await createProject('Review Assets visual race');
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(assetPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+      pendingFiles: [{
+        ...makePendingFile(pendingPath, 'illustrator-active-session'),
+        assetOrigin: 'existing',
+        projectRole: 'asset',
+      }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const initialWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const pendingPresentation = initialWorkspace.pendingFiles[0];
+    assert.ok(pendingPresentation?.visualIdentity);
+
+    metadataTestHooks.clearFileVisualProjectCache();
+    const gate = new Promise(resolve => { releaseLstat = resolve; });
+    fs.promises.lstat = async function gatedFileVisualLstat(candidatePath, ...args) {
+      if (!gated && path.resolve(candidatePath) === path.resolve(assetPath)) {
+        gated = true;
+        lstatStartedResolve();
+        await gate;
+      }
+      return originalLstat.call(fs.promises, candidatePath, ...args);
+    };
+
+    const buildingWorkspace = callIpcRaw('projects:get-asset-workspace', project.id);
+    await Promise.race([
+      lstatStarted,
+      new Promise((_, reject) => originalSetTimeout(() => reject(new Error('workspace build did not reach lstat')), 3000)),
+    ]);
+
+    const accepted = await callIpcRaw('projects:accept-pending', project.id, pendingPath);
+    assert.equal(accepted.pendingFiles.length, 0);
+    assert.equal(accepted.files.length, 2);
+    releaseLstat();
+    const staleWorkspace = await buildingWorkspace;
+    assert.equal(staleWorkspace.pendingFiles.length, 0);
+
+    const currentWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(currentWorkspace.pendingFiles.length, 0);
+    assert.equal(currentWorkspace.files.length, 2);
+    const acceptedVisual = await callIpcRaw(
+      'projects:get-file-visual',
+      project.id,
+      pendingPresentation.visualIdentity,
+      pendingPresentation.visualRevision
+    );
+    assert.ok(acceptedVisual && ['icon', 'fallback'].includes(acceptedVisual.kind));
+  } finally {
+    if (releaseLstat) releaseLstat();
+    fs.promises.lstat = originalLstat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Review Assets returns stale_visual when a raster source changes without a project refresh', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stale-'));
+  const assetPath = path.join(fixtureRoot, 'asset.png');
+  try {
+    testNativeFileVisualImage = createTestNativeImage(64);
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x43));
+    const project = await createProject('Review Assets stale visual');
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(assetPath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const presentation = workspace.files[0];
+    fs.writeFileSync(assetPath, createSyntheticPngBytes(32, 24, 0x99));
+
+    assert.deepEqual(
+      await callIpcRaw(
+        'projects:get-file-visual',
+        project.id,
+        presentation.visualIdentity,
+        presentation.visualRevision
+      ),
+      { error: 'stale_visual' }
+    );
+  } finally {
+    testNativeFileVisualImage = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('Package Review gives duplicate same-name files distinct opaque visuals bound to exact manifest sources', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-duplicate-review-visual-test-'));
   try {
