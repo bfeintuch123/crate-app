@@ -11212,6 +11212,101 @@ test('Review Assets does not publish an in-flight workspace built before a proje
   }
 });
 
+test('Review Assets never publishes a visual after its project record changes in flight', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-response-race-'));
+  const rasterPath = path.join(fixtureRoot, 'raster.png');
+  const iconPath = path.join(fixtureRoot, 'document.pdf');
+  const project = await createProject('Review Assets visual response race');
+  const runCase = async ({ filePath, visualKind, mutate, expected }) => {
+    await setProjectFiles(project.id, {
+      files: [{ ...makePendingFile(filePath, 'manual-browse'), assetOrigin: 'added', projectRole: 'asset' }],
+    });
+    metadataTestHooks.clearFileVisualProjectCache();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const presentation = workspace.files[0];
+    let releaseVisual;
+    let visualStartedResolve;
+    const visualStarted = new Promise(resolve => { visualStartedResolve = resolve; });
+    const visualGate = new Promise(resolve => { releaseVisual = resolve; });
+    const hook = async () => {
+      visualStartedResolve();
+      await mutate();
+      await visualGate;
+    };
+    if (visualKind === 'thumbnail') testBeforeNativeThumbnailResolve = hook;
+    else testBeforeFileIconResolve = hook;
+    try {
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      const request = callIpcRaw(
+        'projects:get-file-visual', project.id, presentation.visualIdentity, presentation.visualRevision
+      );
+      await Promise.race([
+        visualStarted,
+        new Promise((_, reject) => originalSetTimeout(() => reject(new Error(`${visualKind} work did not start`)), 3000)),
+      ]);
+      releaseVisual();
+      assert.deepEqual(await request, expected);
+    } finally {
+      testBeforeNativeThumbnailResolve = null;
+      testBeforeFileIconResolve = null;
+    }
+  };
+
+  try {
+    fs.writeFileSync(rasterPath, createSyntheticPngBytes(32, 24, 0x61));
+    testNativeFileVisualImage = createTestNativeImage(64);
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        const currentProject = storeInstance.data.projects.find(item => item.id === project.id);
+        currentProject.files[0] = { ...currentProject.files[0], name: 'Mutated raster.png' };
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        await setProjectFiles(project.id, {
+          files: [{ ...makePendingFile(rasterPath, 'replacement'), assetOrigin: 'added', projectRole: 'asset' }],
+        });
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+    await runCase({
+      filePath: rasterPath,
+      visualKind: 'thumbnail',
+      mutate: async () => {
+        await setProjectFiles(project.id, { files: [] });
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'not_found' },
+    });
+
+    writeSyntheticPdfFile(iconPath);
+    testNativeFileIconImage = createTestNativeImage(64);
+    await runCase({
+      filePath: iconPath,
+      visualKind: 'icon',
+      mutate: async () => {
+        const currentProject = storeInstance.data.projects.find(item => item.id === project.id);
+        currentProject.files[0] = { ...currentProject.files[0], name: 'Mutated document.pdf' };
+        metadataTestHooks.clearFileVisualProjectCache(project.id);
+      },
+      expected: { error: 'stale_visual' },
+    });
+  } finally {
+    testNativeFileVisualImage = null;
+    testNativeFileIconImage = null;
+    testBeforeNativeThumbnailResolve = null;
+    testBeforeFileIconResolve = null;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('Review Assets returns stale_visual when a raster source changes without a project refresh', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stale-'));
   const assetPath = path.join(fixtureRoot, 'asset.png');

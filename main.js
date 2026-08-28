@@ -3551,19 +3551,26 @@ const FILE_VISUAL_SAFE_RASTER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.g
 const fileVisualIdentitySecret = crypto.randomBytes(32);
 const fileVisualTypeIconCache = new Map();
 const fileVisualProjectCache = new Map();
-let fileVisualProjectCacheEpoch = 0;
+const fileVisualProjectCacheEpochs = new Map();
+let fileVisualProjectCacheGeneration = 0;
 let fileVisualRasterWorkTail = Promise.resolve();
 let fileVisualRasterWorkPending = 0;
+
+function getFileVisualProjectCacheEpoch(projectId) {
+  if (typeof projectId !== 'string' || !projectId) return 0;
+  return fileVisualProjectCacheEpochs.get(projectId) || 0;
+}
 
 function clearFileVisualProjectCache(projectId = null) {
   // The epoch also invalidates workspace builders that are between their
   // asynchronous filesystem reads and cache publication. Array/object
   // identity checks alone cannot detect an in-place project mutation.
-  fileVisualProjectCacheEpoch += 1;
   if (typeof projectId === 'string' && projectId) {
+    fileVisualProjectCacheEpochs.set(projectId, getFileVisualProjectCacheEpoch(projectId) + 1);
     fileVisualProjectCache.delete(projectId);
     return;
   }
+  fileVisualProjectCacheGeneration += 1;
   fileVisualProjectCache.clear();
 }
 
@@ -3571,7 +3578,8 @@ function getCurrentFileVisualProjectCache(projectId, project) {
   const cache = fileVisualProjectCache.get(projectId);
   if (
     !cache ||
-    cache.epoch !== fileVisualProjectCacheEpoch ||
+    cache.epoch !== getFileVisualProjectCacheEpoch(projectId) ||
+    cache.generation !== fileVisualProjectCacheGeneration ||
     cache.project !== project ||
     cache.files !== project?.files ||
     cache.pendingFiles !== project?.pendingFiles ||
@@ -3682,7 +3690,8 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
   const illustratorScope = getIllustratorActivationScope(projectId);
-  const cacheEpoch = fileVisualProjectCacheEpoch;
+  const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
+  const cacheGeneration = fileVisualProjectCacheGeneration;
   const files = await Promise.all((scopedProject.files || []).map(file => createRendererFilePresentation(project, file)));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(file => createRendererFilePresentation(project, file)));
   const visualRecords = new Map();
@@ -3705,7 +3714,8 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   // after a concurrent project update. Retry once so the renderer receives a
   // current snapshot; repeated churn fails closed instead of returning stale data.
   const workspaceIsFresh = (
-    fileVisualProjectCacheEpoch === cacheEpoch &&
+    getFileVisualProjectCacheEpoch(projectId) === cacheEpoch &&
+    fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
     getIllustratorActivationScope(projectId) === illustratorScope
@@ -3716,6 +3726,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (workspaceIsFresh) {
     fileVisualProjectCache.set(projectId, {
       epoch: cacheEpoch,
+      generation: cacheGeneration,
       project,
       files: projectFiles,
       pendingFiles: projectPendingFiles,
@@ -4109,18 +4120,60 @@ function getBoundedRasterThumbnail(projectId, file, visualRevision) {
   });
 }
 
+function getProjectOwnedFileVisualRequestError({
+  projectId,
+  visualIdentity,
+  visualRevision,
+  requestEpoch,
+  requestProject,
+  requestFile,
+}) {
+  const storedProjects = typeof projectId === 'string' ? store.get('projects', []) : [];
+  const currentProject = Array.isArray(storedProjects)
+    ? storedProjects.find(item => item && item.id === projectId)
+    : null;
+  if (!currentProject) return { error: 'not_found' };
+  const currentFile = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, currentProject);
+  if (!currentFile) return { error: 'not_found' };
+  if (
+    getFileVisualProjectCacheEpoch(projectId) !== requestEpoch ||
+    currentProject !== requestProject ||
+    currentFile !== requestFile ||
+    createProjectFileVisualIdentity(projectId, currentFile) !== visualIdentity
+  ) return { error: 'stale_visual' };
+
+  const currentCache = getCurrentFileVisualProjectCache(projectId, currentProject);
+  const currentRecord = currentCache?.visualRecords.get(visualIdentity);
+  if (currentRecord && (
+    currentRecord.file !== currentFile ||
+    currentRecord.visualRevision !== visualRevision
+  )) return { error: 'stale_visual' };
+  return null;
+}
+
 async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevision) {
   const project = typeof projectId === 'string' ? getProjects().find(item => item && item.id === projectId) : null;
   const cached = getCurrentFileVisualProjectCache(projectId, project);
   const cachedRecord = cached?.visualRecords.get(visualIdentity) || null;
   const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
   if (!file) return { error: 'not_found' };
+  const requestEpoch = getFileVisualProjectCacheEpoch(projectId);
   if (
     typeof visualRevision !== 'string' || !FILE_VISUAL_REVISION_PATTERN.test(visualRevision) ||
     (cachedRecord
       ? cachedRecord.visualRevision !== visualRevision
       : await createProjectFileVisualRevision(projectId, file) !== visualRevision)
   ) return { error: 'stale_visual' };
+  const request = {
+    projectId,
+    visualIdentity,
+    visualRevision,
+    requestEpoch,
+    requestProject: project,
+    requestFile: file,
+  };
+  const initialRequestError = getProjectOwnedFileVisualRequestError(request);
+  if (initialRequestError) return initialRequestError;
   const ext = (file.ext || path.extname(file.path || '')).toLowerCase();
   if (
     FILE_VISUAL_SAFE_RASTER_EXTENSIONS.has(ext) &&
@@ -4128,10 +4181,14 @@ async function getProjectOwnedFileVisual(projectId, visualIdentity, visualRevisi
     typeof nativeImage.createThumbnailFromPath === 'function'
   ) {
     const dataUrl = await getBoundedRasterThumbnail(projectId, file, visualRevision);
+    const rasterRequestError = getProjectOwnedFileVisualRequestError(request);
+    if (rasterRequestError) return rasterRequestError;
     if (dataUrl?.stale) return { error: 'stale_visual' };
     if (dataUrl) return { kind: 'thumbnail', dataUrl };
   }
   const iconDataUrl = await getBoundedFileTypeIcon(ext);
+  const iconRequestError = getProjectOwnedFileVisualRequestError(request);
+  if (iconRequestError) return iconRequestError;
   if (iconDataUrl) return { kind: 'icon', dataUrl: iconDataUrl };
   return { kind: 'fallback' };
 }
