@@ -13341,15 +13341,10 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           const scanned = scannedDesignFiles.get(projectId);
           for (const fp of snapshotDesignFiles) {
             scanned.add(fp);
+            initialSnapshotParserScans.push(
+              runScanOnOpen(projectId, fp, activationToken, initialWatcherOperation).catch(() => null)
+            );
           }
-          initialSnapshotParserScans.push(
-            runBoundedScanOnOpenQueue(
-              projectId,
-              snapshotDesignFiles,
-              activationToken,
-              initialWatcherOperation
-            ).catch(() => null)
-          );
         }
       }
     }
