@@ -4871,6 +4871,34 @@ test('renderer acknowledges Add Files immediately and suppresses duplicate in-fl
   assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
 });
 
+test('renderer reports a bounded Add Files rejection and clears busy state', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let addCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => {
+        addCalls += 1;
+        return {
+          success: false,
+          error: 'add_files_selection_too_large',
+          maxFiles: 100,
+        };
+      },
+    },
+  });
+  vm.runInContext("state.selectedProjectId = 'bounded-add-project'; state.projects = [{ id: 'bounded-add-project', name: 'Bounded Add Project', status: 'watching', files: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(addCalls, 1);
+  assert.equal(elements['toast-message'].textContent, 'Select 100 files or fewer at a time.');
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].textContent, '+ Add Files');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+});
+
 test('renderer acknowledges Start Watching immediately and suppresses duplicate toggles', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const deferred = createDeferred();

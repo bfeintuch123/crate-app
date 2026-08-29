@@ -1024,12 +1024,36 @@ function isCurrentSessionSavedSource(project, file) {
   return !!(watchStart && addedAt >= watchStart);
 }
 
+function hasPersistedWatcherObservation(project, filePath) {
+  const normalizedPath = normalizeTrackedFilePath(filePath);
+  if (!project || !normalizedPath || !project.provenance || !Array.isArray(project.provenance.observations)) return false;
+  const fileNodeId = createNodeId(NODE_TYPES.FILE, { normalizedPath });
+  return project.provenance.observations.some(observation => (
+    observation &&
+    observation.relationType === EDGE_TYPES.SESSION_OBSERVED_FILE &&
+    observation.objectNodeId === fileNodeId &&
+    observation.observer &&
+    observation.observer.kind === OBSERVER_KINDS.CHOKIDAR &&
+    (observation.observer.method === 'add' || observation.observer.method === 'change')
+  ));
+}
+
+function isPersistedAcceptedWatcherSource(project, file) {
+  if (!project || !file || !Array.isArray(project.files)) return false;
+  const normalizedPath = normalizeTrackedFilePath(file.path);
+  const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
+  if (!normalizedPath || !PRIMARY_DESIGN_EXTENSIONS.has(ext) || !ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext)) return false;
+  if (!project.files.some(acceptedFile => normalizeTrackedFilePath(acceptedFile && acceptedFile.path) === normalizedPath)) return false;
+  return hasPersistedWatcherObservation(project, normalizedPath);
+}
+
 function isTrustedSessionProjectFile(project, file) {
   if (!file || typeof file.path !== 'string' || !file.path.trim()) return false;
   if (isAutoCaptureExcludedPath(file.path)) return false;
   if (isExplicitUserCapturedFile(file)) return true;
   if (isAcceptedPendingCapturedFile(project, file)) return true;
   if (isSavedOrConfirmedProjectFile(file)) return true;
+  if (isPersistedAcceptedWatcherSource(project, file)) return true;
   if (isCurrentSessionSavedSource(project, file)) return true;
   const captureEvidence = file.captureEvidence || {};
   return captureEvidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT &&
@@ -6989,6 +7013,7 @@ const BACKGROUND_WATCHER_DRAIN_TIMEOUT_MS = 15000;
 const CHOKIDAR_ADD_STAT_TIMEOUT_MS = 1000;
 const MAX_DEFERRED_WATCHER_OPERATIONS_PER_PROJECT = 64;
 const MAX_CURRENT_SESSION_FILESYSTEM_EVIDENCE_PER_PROJECT = 512;
+const MAX_MANUAL_ADD_FILE_SELECTION = 100;
 const currentSessionFilesystemEvidenceByProject = new Map();
 
 function currentSessionFilesystemEvidenceKey(projectId, filePath) {
@@ -10049,7 +10074,7 @@ const ILLUSTRATOR_SCOPE_SET_KEYS = ['baselineDocumentPaths', 'admittedDocumentPa
 function normalizeIllustratorDocumentName(value) { const safe = sanitizeLiveEvidenceText(value); return safe ? safe.toLowerCase() : null; } function getExplicitCaptureAppFamily(fileEntry, observation = {}) { const capture = fileEntry && fileEntry.captureEvidence, evidence = observation.liveEvidence || {}; for (const value of [observation.appFamily, evidence.appFamily, capture && capture.appFamily]) { const family = getScopedRecordAppFamily(value); if (family) return family; } return getScopedRecordAppFamily(fileEntry && fileEntry.source); }
 function getScopedFileAppFamily(project, fileEntry, observation = {}) { const explicit = getExplicitCaptureAppFamily(fileEntry, observation); if (explicit || !project || !fileEntry) return explicit; const key = getLiveEvidenceKeyHash(normalizeTrackedFilePath(fileEntry.path)), latest = key && project.liveEvidenceLedger?.candidates?.[key]?.latest; return getExplicitCaptureAppFamily(latest, latest || {}); } function isIllustratorSourceCandidate(file) { const family = getExplicitCaptureAppFamily(file); return family === 'illustrator' || ((!family || family === 'generic') && isExplicitUserCapturedFile(file) && ILLUSTRATOR_SOURCE_EXTENSIONS.has((file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase())); }
 function getIllustratorActivationScope(projectId, activationToken = null) { const scope = illustratorActivationScopes.get(projectId); return !scope || (activationToken !== null && scope.activationToken !== activationToken) ? null : scope; } function getFreshActiveWatchingProject(projectId, activationToken) { return isActiveWatchingProject(projectId, activationToken) ? getProjects().find(project => project && project.id === projectId) || null : null; }
-function isAcceptedIllustratorProjectFile(project, file) { return !!file && isIllustratorSourceCandidate(file) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
+function isAcceptedIllustratorProjectFile(project, file) { return !!file && (isIllustratorSourceCandidate(file) || isPersistedAcceptedWatcherSource(project, file)) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES = new Set(['illustrator-placed-item-file-query-failed', 'illustrator-placed-item-file-of-query-failed']);
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_RECOVERY_STATUSES = new Set([
   ...ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES,
@@ -13914,6 +13939,15 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   if (!operation.current()) return null;
 
   const filePaths = dialogResult.filePaths;
+  if (filePaths.length > MAX_MANUAL_ADD_FILE_SELECTION) {
+    operation.close();
+    return {
+      success: false,
+      error: 'add_files_selection_too_large',
+      fileCount: filePaths.length,
+      maxFiles: MAX_MANUAL_ADD_FILE_SELECTION,
+    };
+  }
   const result = mutateProject(projectId, (project) => {
     if (!operation.current()) return null;
     const acceptedByKey = new Map();

@@ -3466,8 +3466,12 @@ function setupEventListeners() {
     const button = event.currentTarget || $('#btn-add-files');
     try {
       await runRendererAction(`add-files:${state.selectedProjectId}`, button, 'Adding…', async () => {
-        const files = await window.crate.addFiles(state.selectedProjectId);
-        if (files) {
+        const result = await window.crate.addFiles(state.selectedProjectId);
+        if (result?.success === false && result.error === 'add_files_selection_too_large') {
+          showToast(`Select ${result.maxFiles} files or fewer at a time.`);
+          return;
+        }
+        if (Array.isArray(result)) {
           state.projects = await window.crate.getProjects();
           await renderFiles();
         }

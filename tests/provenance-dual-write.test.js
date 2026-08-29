@@ -13010,6 +13010,39 @@ test('manual add preserves file ledger entry and records one session observation
   }
 });
 
+test('Add Files enforces a bounded selection contract without partial mutation', async () => {
+  for (const count of [30, 263, 500]) {
+    const project = await createProject(`Bounded Add Files ${count}`);
+    const before = structuredClone(await getProject(project.id));
+    const filePaths = Array.from({ length: count }, (_, index) => (
+      path.join(TEST_HOME, 'Desktop', `bounded-add-${count}-${index + 1}.png`)
+    ));
+
+    manualDialogFor(filePaths);
+    const startedAt = Date.now();
+    const result = await callIpcRaw('projects:add-files', project.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    if (count === 30) {
+      assert.equal(Array.isArray(result), true);
+      assert.equal(result.length, count);
+      assert.ok(elapsedMs < 2000, `30-file Add Files took ${elapsedMs}ms`);
+      assert.equal((await getProject(project.id)).files.length, count);
+    } else {
+      assert.deepEqual(result, {
+        success: false,
+        error: 'add_files_selection_too_large',
+        fileCount: count,
+        maxFiles: 100,
+      });
+      assert.ok(elapsedMs < 1000, `${count}-file rejection took ${elapsedMs}ms`);
+      assert.deepEqual(await getProject(project.id), before);
+    }
+
+    await callIpcRaw('projects:delete', project.id);
+  }
+});
+
 test('manual image add is classified as an added asset rather than a project source', async () => {
   const project = await createProject('Manual image asset');
   const filePath = path.join(os.tmpdir(), 'campaign-photo.png');
@@ -14090,6 +14123,56 @@ test('pre-existing chokidar candidates remain pending across pause and resume wi
   assert.equal(ledgerEntry.observations.length, 1);
   assert.equal(ledgerEntry.latest.source, 'chokidar-add');
   assert.equal(ledgerEntry.latest.observerMethod, 'chokidar-add');
+});
+
+test('accepted chokidar Illustrator source remains visible across pause and resume', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Watched_Accepted.ai');
+  writeSyntheticAiFile(sourcePath, 'accepted after watching began');
+  let queryCount = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '987\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Watched accepted source resume');
+    await waitForCondition(() => queryCount >= 1, 'timed out waiting for Illustrator activation');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const currentStats = {
+      mtimeMs: stored.watchStartedAt + 1000,
+      birthtimeMs: stored.watchStartedAt + 1000,
+    };
+    await emitWatcherWithStats('add', sourcePath, currentStats);
+
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath && file.source === 'chokidar-add')
+    );
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
+
+    await callIpc('projects:pause', project.id);
+    const paused = await getProject(project.id);
+    assert.equal(paused.status, 'paused');
+    assert.equal(paused.files.some(file => file.path === sourcePath), true);
+
+    await callIpc('projects:start-watching', project.id);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath)
+    );
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
+    const reviewAssets = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(reviewAssets.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+  } finally {
+    setChildProcessHandler(null);
+  }
 });
 
 test('chokidar change records observation only for a previously unseen primary design file', async () => {
