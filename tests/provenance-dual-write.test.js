@@ -13052,6 +13052,11 @@ test('Add Files admits a single large selection exactly once', async () => {
     assert.equal(fresh.files.length, count);
     assert.equal(new Set(fresh.files.map(file => file.path)).size, count);
     assert.equal(getSessionObservedByMethod(fresh, 'projects:add-files').length, count);
+    if (count >= 263) {
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      assert.equal(workspace.files.length, count);
+      assert.deepEqual(workspace.pendingFiles, []);
+    }
 
     await callIpcRaw('projects:delete', project.id);
   }
