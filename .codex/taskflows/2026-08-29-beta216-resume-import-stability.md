@@ -31,16 +31,16 @@ Correct the confirmed Beta 2.15 watcher resume visibility defect and the multi-f
 1. Exact live base and clean isolated checkout: complete.
 2. Root cause evidence and narrow patch design: complete.
 3. Focused regression coverage and focused tests: complete.
-4. Complete serial source and regression validation: pending for the cap-removal follow-up.
-5. Small atomic follow-up commits, push, draft PR update, protected exact-head CI: pending.
-6. Fresh independent Luna/high read-only review: pending for the new exact head.
+4. Complete serial source and regression validation: complete locally; protected CI remains the authoritative dependency-complete gate.
+5. Small atomic follow-up commits, push, draft PR update, protected exact-head CI: pending on the final documentation-bound head.
+6. Fresh independent Luna/high read-only review: pending on the final documentation-bound head.
 
 ## Current handoff
 
-- Last verified head: a514d67f6d0a0458b487c8891e0f29017e82aba0.
-- Last verified checkout: /private/tmp/crate-beta-2.16-resume-import-stability, clean at the prior published head before this follow-up.
+- Last verified head: 38992c0ccfed72e96aaaca85a012cc3faabe66c3.
+- Last verified checkout: /private/tmp/crate-beta-2.16-resume-import-stability, clean at the published follow-up head.
 - Diagnosis: persisted watcher acceptance was not a durable Illustrator scope admission signal after reactivation; Add Files performed an unbounded first-scan fan-out after committing the selected batch, and the temporary 100-file cap hid that scalability defect.
-- Correction: provenance-backed accepted chokidar Illustrator sources remain visible after reactivation; Add Files now admits the complete selection, drains first scans through a four-worker internal queue, reports per-source failures without dropping successful files, and clears the renderer busy state for every terminal outcome.
-- Validation: cap-removal focused watcher/Add Files tests, renderer busy-state tests, complete serial source suite, adjacent regression suites, protected exact-head CI, and fresh independent review remain pending for this follow-up.
-- Next action: finish focused and serial validation, update the draft PR description, push the atomic follow-up commits, then bind CI and independent review to the new exact head.
+- Correction: provenance-backed accepted chokidar Illustrator sources remain visible after reactivation; Add Files now admits the complete selection, drains first scans through a four-worker internal queue, reports per-source failures without dropping successful files, and clears the renderer busy state for every terminal outcome. The 100-file product restriction and its rejection path are removed; internal queueing is invisible to the user.
+- Validation: focused large-selection and failure-path coverage is green; renderer/Figma scope is 145/145; adjacent watcher/lifecycle/Phase A/B/C suites are 25/25; complete serial source suite is 1035 passed, 3 local release-tooling dependency failures, and 1 skipped test out of 1039; `git diff --check` and syntax checks are green. Protected exact-head CI and fresh independent review remain pending.
+- Next action: commit and push this final taskflow receipt, bind protected CI to its exact head, then obtain the fresh independent Luna/high read-only review.
 - Blockers: release-tooling local dependency setup remains outside the source change and is delegated to CI’s dependency-complete environment.
