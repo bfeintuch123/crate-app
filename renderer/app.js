@@ -3467,8 +3467,15 @@ function setupEventListeners() {
     try {
       await runRendererAction(`add-files:${state.selectedProjectId}`, button, 'Adding…', async () => {
         const result = await window.crate.addFiles(state.selectedProjectId);
-        if (result?.success === false && result.error === 'add_files_selection_too_large') {
-          showToast(`Select ${result.maxFiles} files or fewer at a time.`);
+        if (result?.success === false) {
+          state.projects = await window.crate.getProjects();
+          await renderFiles();
+          if (result.error === 'add_files_partial_scan_failure') {
+            const count = Number.isSafeInteger(result.failedCount) ? result.failedCount : 1;
+            showToast(`${count} file${count === 1 ? '' : 's'} could not be scanned. Successful files were kept.`);
+          } else {
+            showToast('Crate could not add the selected files. Try again.');
+          }
           return;
         }
         if (Array.isArray(result)) {

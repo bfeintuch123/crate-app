@@ -4282,11 +4282,14 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
       requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
       completedSourceKeys: new Set(),
       inFlightBySource: new Map(),
+      queuedSourceKeys: new Set(),
       presentationMediaOccurrencesBySource: new Map(),
     };
     assetBaselineScans.set(projectId, state);
   } else {
+    state.queuedSourceKeys ||= new Set();
     state.requiredSourceKeys.add(sourceKey);
+    state.queuedSourceKeys?.delete(sourceKey);
   }
 
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
@@ -4306,7 +4309,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   // erase that proof and make the result depend on completion order.
   if (dependable) state.completedSourceKeys.add(scan.sourceKey);
 
-  if (state.inFlightBySource.size > 0) return;
+  if (state.inFlightBySource.size > 0 || state.queuedSourceKeys?.size > 0) return;
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
   if (!complete) {
     const failedSourceKeys = new Set(
@@ -4355,6 +4358,101 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   if (result || !current || !current.assetBaseline || current.assetBaseline.status !== 'awaiting-first-scan') {
     assetBaselineScans.delete(scan.projectId);
   }
+}
+
+const MANUAL_ADD_SCAN_CONCURRENCY = 4;
+
+function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
+  const project = getProjects().find(item => item.id === projectId);
+  if (!project || project.assetBaseline?.status !== 'awaiting-first-scan') return null;
+
+  let state = assetBaselineScans.get(projectId);
+  if (!state) {
+    const startedAt = Date.now();
+    state = {
+      startedAt,
+      requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
+      completedSourceKeys: new Set(),
+      inFlightBySource: new Map(),
+      queuedSourceKeys: new Set(),
+      presentationMediaOccurrencesBySource: new Map(),
+    };
+    assetBaselineScans.set(projectId, state);
+  }
+  state.queuedSourceKeys ||= new Set();
+
+  for (const sourcePath of sourcePaths) {
+    const sourceKey = normalizeTrackedFilePath(sourcePath);
+    if (sourceKey) state.requiredSourceKeys.add(sourceKey);
+  }
+  return state;
+}
+
+function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
+  const uniquePaths = [...new Map(
+    (Array.isArray(sourcePaths) ? sourcePaths : [])
+      .map(sourcePath => [normalizeTrackedFilePath(sourcePath), sourcePath])
+      .filter(([sourceKey, sourcePath]) => sourceKey && typeof sourcePath === 'string' && sourcePath)
+  ).values()];
+  const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
+  if (!state) return [];
+  for (const sourcePath of uniquePaths) {
+    const sourceKey = normalizeTrackedFilePath(sourcePath);
+    if (sourceKey) state.queuedSourceKeys.add(sourceKey);
+  }
+  return uniquePaths;
+}
+
+function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths) {
+  const state = assetBaselineScans.get(projectId);
+  if (!state) return;
+  for (const sourcePath of Array.isArray(sourcePaths) ? sourcePaths : []) {
+    const sourceKey = normalizeTrackedFilePath(sourcePath);
+    if (!sourceKey || !state.queuedSourceKeys?.has(sourceKey)) continue;
+    state.queuedSourceKeys.delete(sourceKey);
+    state.requiredSourceKeys.delete(sourceKey);
+  }
+  if (state.inFlightBySource.size === 0 && state.requiredSourceKeys.size === 0) {
+    assetBaselineScans.delete(projectId);
+  }
+}
+
+async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken, operation, options = {}) {
+  const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths);
+  const outcomes = new Array(queuedPaths.length);
+  let nextIndex = 0;
+
+  const runNext = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= queuedPaths.length) return;
+      const sourcePath = queuedPaths[index];
+      if (!operation.current()) {
+        outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+        continue;
+      }
+      try {
+        const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
+        if (!operation.current()) {
+          outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+        } else if (result && result.success === false) {
+          outcomes[index] = { path: sourcePath, success: false, error: result.error || 'scan_on_open_failed' };
+        } else {
+          outcomes[index] = { path: sourcePath, success: true };
+        }
+      } catch (_) {
+        outcomes[index] = { path: sourcePath, success: false, error: 'scan_on_open_failed' };
+      }
+    }
+  };
+
+  const workerCount = Math.min(MANUAL_ADD_SCAN_CONCURRENCY, queuedPaths.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runNext()));
+  if (!operation.current()) {
+    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths);
+    return { cancelled: true, outcomes };
+  }
+  return { cancelled: false, outcomes };
 }
 
 function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = true } = {}) {
@@ -7013,7 +7111,6 @@ const BACKGROUND_WATCHER_DRAIN_TIMEOUT_MS = 15000;
 const CHOKIDAR_ADD_STAT_TIMEOUT_MS = 1000;
 const MAX_DEFERRED_WATCHER_OPERATIONS_PER_PROJECT = 64;
 const MAX_CURRENT_SESSION_FILESYSTEM_EVIDENCE_PER_PROJECT = 512;
-const MAX_MANUAL_ADD_FILE_SELECTION = 100;
 const currentSessionFilesystemEvidenceByProject = new Map();
 
 function currentSessionFilesystemEvidenceKey(projectId, filePath) {
@@ -13244,10 +13341,15 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
           const scanned = scannedDesignFiles.get(projectId);
           for (const fp of snapshotDesignFiles) {
             scanned.add(fp);
-            initialSnapshotParserScans.push(
-              runScanOnOpen(projectId, fp, activationToken, initialWatcherOperation).catch(() => null)
-            );
           }
+          initialSnapshotParserScans.push(
+            runBoundedScanOnOpenQueue(
+              projectId,
+              snapshotDesignFiles,
+              activationToken,
+              initialWatcherOperation
+            ).catch(() => null)
+          );
         }
       }
     }
@@ -13883,13 +13985,14 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
         : [acceptedSourceForScan.path];
       const revisedScope = admitIllustratorSourcesForProject(projectId, baselineSources);
       if ((revisedScope && !operation.adoptScope(revisedScope)) || !operation.current()) return null;
-      await Promise.all(baselineSources.map(sourcePath => runScanOnOpen(
+      const scanReport = await runBoundedScanOnOpenQueue(
         projectId,
-        sourcePath,
+        baselineSources,
         operation.activationToken,
         operation,
         { allowPausedBaseline: true }
-      )));
+      );
+      if (scanReport.cancelled) return null;
       if (!operation.current()) return null;
     }
 
@@ -13921,91 +14024,108 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
 registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   const operation = captureProjectOperation(projectId);
   if (!operation) return null;
-  // M6: Filter to supported design + image file types
-  const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
-    .map(e => e.slice(1)); // strip leading dot
-  const dialogResult = await dialog.showOpenDialog({
-    properties: ['openFile', 'multiSelections'],
-    title: 'Add Files to Project',
-    filters: [
-      { name: 'Design & Image Files', extensions: [...new Set(supportedExts)] },
-      { name: 'All Files', extensions: ['*'] },
-    ],
-  });
-  // Show the app window after native dialog closes.
-  showTrayWindow();
+  try {
+    // M6: Filter to supported design + image file types.
+    const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
+      .map(e => e.slice(1)); // strip leading dot
+    const dialogResult = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections'],
+      title: 'Add Files to Project',
+      filters: [
+        { name: 'Design & Image Files', extensions: [...new Set(supportedExts)] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    });
+    // Show the app window after native dialog closes.
+    showTrayWindow();
 
-  if (dialogResult.canceled) return null;
-  if (!operation.current()) return null;
+    if (dialogResult.canceled) return null;
+    if (!operation.current()) return null;
 
-  const filePaths = dialogResult.filePaths;
-  if (filePaths.length > MAX_MANUAL_ADD_FILE_SELECTION) {
+    const filePaths = [...new Map(
+      dialogResult.filePaths
+        .map(filePath => [normalizeTrackedFilePath(filePath), filePath])
+        .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
+    ).values()];
+    const result = mutateProject(projectId, (project) => {
+      if (!operation.current()) return null;
+      const acceptedByKey = new Map();
+      const excludedKeys = new Set(project.excludedAssetKeys || []);
+      for (const file of project.files || []) {
+        const key = getTrackedFileDedupKey(file);
+        if (key && !acceptedByKey.has(key)) acceptedByKey.set(key, file);
+      }
+      for (const filePath of filePaths) {
+        const fileEntry = {
+          path: filePath,
+          name: path.basename(filePath),
+          ext: path.extname(filePath).toLowerCase(),
+          addedAt: Date.now(),
+          source: 'manual-browse', // M1
+        };
+        const key = getTrackedFileDedupKey(fileEntry);
+        const existingFile = acceptedByKey.get(key);
+        const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
+        const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
+        if (!existingFile) {
+          project.files.push(authorizedFile);
+          acceptedByKey.set(key, authorizedFile);
+        }
+        project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
+        for (const exclusionKey of [
+          getAssetReviewExclusionKey(existingFile),
+          getAssetReviewExclusionKey(pendingFile),
+          getAssetReviewExclusionKey(authorizedFile),
+          filePath,
+        ]) {
+          if (exclusionKey) excludedKeys.delete(exclusionKey);
+        }
+        recordSessionObservedFile(project, authorizedFile, {
+          kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+          method: 'projects:add-files',
+          payload: { authoritySource: 'manual-browse' },
+        });
+      }
+      project.files = deduplicateFiles(project.files);
+      project.excludedAssetKeys = [...excludedKeys];
+      return project.files;
+    });
+
+    if (!result || !operation.current()) return null;
+    const revisedScope = admitIllustratorSourcesForProject(projectId, filePaths);
+    if ((revisedScope && !operation.adoptScope(revisedScope)) || !operation.current()) return null;
+    sendProjectFileStateToRenderer(projectId, operation.activationToken);
+
+    const updatedProject = getProjects().find(project => project.id === projectId);
+    if (updatedProject?.assetBaseline?.status === 'awaiting-first-scan') {
+      const baselineSources = getProjectAssetBaselineSourcePaths(updatedProject);
+      const scanReport = await runBoundedScanOnOpenQueue(
+        projectId,
+        baselineSources,
+        operation.activationToken,
+        operation,
+        { allowPausedBaseline: true }
+      );
+      if (scanReport.cancelled || !operation.current()) return null;
+      const failedScans = scanReport.outcomes.filter(outcome => outcome && !outcome.success);
+      if (failedScans.length > 0) {
+        const view = getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId));
+        return {
+          success: false,
+          error: 'add_files_partial_scan_failure',
+          selectedCount: filePaths.length,
+          admittedCount: result.length,
+          completedCount: scanReport.outcomes.length - failedScans.length,
+          failedCount: failedScans.length,
+          scanResults: scanReport.outcomes,
+          files: view ? view.files : [],
+        };
+      }
+    }
+    return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
+  } finally {
     operation.close();
-    return {
-      success: false,
-      error: 'add_files_selection_too_large',
-      fileCount: filePaths.length,
-      maxFiles: MAX_MANUAL_ADD_FILE_SELECTION,
-    };
   }
-  const result = mutateProject(projectId, (project) => {
-    if (!operation.current()) return null;
-    const acceptedByKey = new Map();
-    const excludedKeys = new Set(project.excludedAssetKeys || []);
-    for (const file of project.files || []) {
-      const key = getTrackedFileDedupKey(file);
-      if (key && !acceptedByKey.has(key)) acceptedByKey.set(key, file);
-    }
-    for (const filePath of filePaths) {
-      const fileEntry = {
-        path: filePath,
-        name: path.basename(filePath),
-        ext: path.extname(filePath).toLowerCase(),
-        addedAt: Date.now(),
-        source: 'manual-browse', // M1
-      };
-      const key = getTrackedFileDedupKey(fileEntry);
-      const existingFile = acceptedByKey.get(key);
-      const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
-      const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
-      if (!existingFile) {
-        project.files.push(authorizedFile);
-        acceptedByKey.set(key, authorizedFile);
-      }
-      project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
-      for (const exclusionKey of [
-        getAssetReviewExclusionKey(existingFile),
-        getAssetReviewExclusionKey(pendingFile),
-        getAssetReviewExclusionKey(authorizedFile),
-        filePath,
-      ]) {
-        if (exclusionKey) excludedKeys.delete(exclusionKey);
-      }
-      recordSessionObservedFile(project, authorizedFile, {
-        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
-        method: 'projects:add-files',
-        payload: { authoritySource: 'manual-browse' },
-      });
-    }
-    project.files = deduplicateFiles(project.files);
-    project.excludedAssetKeys = [...excludedKeys];
-    return project.files;
-  });
-
-  if (!result || !operation.current()) return null;
-  const revisedScope = admitIllustratorSourcesForProject(projectId, filePaths);
-  if ((revisedScope && !operation.adoptScope(revisedScope)) || !operation.current()) return null;
-  const updatedProject = getProjects().find(project => project.id === projectId);
-  if (updatedProject?.assetBaseline?.status === 'awaiting-first-scan') {
-    const baselineSources = getProjectAssetBaselineSourcePaths(updatedProject);
-    await Promise.all(baselineSources.map(filePath => (
-      runScanOnOpen(projectId, filePath, operation.activationToken, operation, {
-        allowPausedBaseline: true,
-      })
-    )));
-    if (!operation.current()) return null;
-  }
-  return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
 });
 
 // --- Session file scan (Spotlight-based, runs at package time) ---

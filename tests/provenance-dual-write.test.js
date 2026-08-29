@@ -13010,36 +13010,85 @@ test('manual add preserves file ledger entry and records one session observation
   }
 });
 
-test('Add Files enforces a bounded selection contract without partial mutation', async () => {
+test('Add Files admits a single large selection exactly once', async () => {
   for (const count of [30, 263, 500]) {
-    const project = await createProject(`Bounded Add Files ${count}`);
-    const before = structuredClone(await getProject(project.id));
+    const project = await createProject(`Large Add Files ${count}`);
     const filePaths = Array.from({ length: count }, (_, index) => (
-      path.join(TEST_HOME, 'Desktop', `bounded-add-${count}-${index + 1}.png`)
+      path.join(TEST_HOME, 'Desktop', `large-add-${count}-${index + 1}.png`)
     ));
 
     manualDialogFor(filePaths);
     const startedAt = Date.now();
-    const result = await callIpcRaw('projects:add-files', project.id);
+    const result = await callIpc('projects:add-files', project.id);
     const elapsedMs = Date.now() - startedAt;
 
-    if (count === 30) {
-      assert.equal(Array.isArray(result), true);
-      assert.equal(result.length, count);
-      assert.ok(elapsedMs < 2000, `30-file Add Files took ${elapsedMs}ms`);
-      assert.equal((await getProject(project.id)).files.length, count);
-    } else {
-      assert.deepEqual(result, {
-        success: false,
-        error: 'add_files_selection_too_large',
-        fileCount: count,
-        maxFiles: 100,
-      });
-      assert.ok(elapsedMs < 1000, `${count}-file rejection took ${elapsedMs}ms`);
-      assert.deepEqual(await getProject(project.id), before);
-    }
+    assert.equal(Array.isArray(result), true);
+    assert.equal(result.length, count);
+    assert.ok(elapsedMs < 2000, `${count}-file Add Files took ${elapsedMs}ms`);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, count);
+    assert.equal(new Set(fresh.files.map(file => file.path)).size, count);
+    assert.equal(getSessionObservedByMethod(fresh, 'projects:add-files').length, count);
 
     await callIpcRaw('projects:delete', project.id);
+  }
+});
+
+test('large Add Files source scans use bounded concurrency and report per-file failures', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-large-add-files-scan-'));
+  const originalStat = fs.promises.stat;
+  let activeScans = 0;
+  let maxActiveScans = 0;
+  try {
+    const filePaths = Array.from({ length: 500 }, (_, index) => (
+      path.join(fixtureRoot, `bounded-source-${index + 1}.ai`)
+    ));
+    for (const filePath of filePaths) writeSyntheticAiFile(filePath, 'bounded scan source');
+    const project = await createProject('Large Add Files scan queue');
+    const trackedPaths = new Set(filePaths.map(filePath => path.resolve(filePath)));
+    fs.promises.stat = async function trackScanConcurrency(filePath, ...args) {
+      if (!trackedPaths.has(path.resolve(filePath))) return originalStat.call(fs.promises, filePath, ...args);
+      activeScans += 1;
+      maxActiveScans = Math.max(maxActiveScans, activeScans);
+      try {
+        await new Promise(resolve => setImmediate(resolve));
+        return originalStat.call(fs.promises, filePath, ...args);
+      } finally {
+        activeScans -= 1;
+      }
+    };
+
+    manualDialogFor(filePaths);
+    const result = await callIpc('projects:add-files', project.id);
+    assert.equal(Array.isArray(result), true);
+    assert.equal(result.length, 500);
+    assert.ok(maxActiveScans > 1);
+    assert.ok(maxActiveScans <= 4, `scan concurrency was ${maxActiveScans}`);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 500);
+    assert.equal(new Set(fresh.files.map(file => file.path)).size, 500);
+    await callIpcRaw('projects:delete', project.id);
+
+    const failedPath = path.join(fixtureRoot, 'failed-source.ai');
+    const healthyPath = path.join(fixtureRoot, 'healthy-source.ai');
+    writeSyntheticAiFile(healthyPath, 'healthy scan source');
+    fs.mkdirSync(failedPath);
+    const partialProject = await createProject('Partial Add Files scan');
+    manualDialogFor([healthyPath, failedPath]);
+    const partial = await callIpcRaw('projects:add-files', partialProject.id);
+    assert.equal(partial.success, false);
+    assert.equal(partial.error, 'add_files_partial_scan_failure');
+    assert.equal(partial.selectedCount, 2);
+    assert.equal(partial.admittedCount, 2);
+    assert.equal(partial.failedCount, 1);
+    assert.deepEqual(partial.scanResults.map(item => item.path), [healthyPath, failedPath]);
+    assert.equal(partial.scanResults.find(item => item.path === healthyPath).success, true);
+    assert.equal(partial.scanResults.find(item => item.path === failedPath).success, false);
+    assert.equal((await getProject(partialProject.id)).files.length, 2);
+    await callIpcRaw('projects:delete', partialProject.id);
+  } finally {
+    fs.promises.stat = originalStat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
