@@ -4395,10 +4395,11 @@ function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
       .filter(([sourceKey, sourcePath]) => sourceKey && typeof sourcePath === 'string' && sourcePath)
   ).values()];
   const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
-  if (!state) return [];
-  for (const sourcePath of uniquePaths) {
-    const sourceKey = normalizeTrackedFilePath(sourcePath);
-    if (sourceKey) state.queuedSourceKeys.add(sourceKey);
+  if (state) {
+    for (const sourcePath of uniquePaths) {
+      const sourceKey = normalizeTrackedFilePath(sourcePath);
+      if (sourceKey) state.queuedSourceKeys.add(sourceKey);
+    }
   }
   return uniquePaths;
 }
