@@ -1202,6 +1202,16 @@ function manualDialogFor(filePaths) {
   nextOpenDialogResult = { canceled: false, filePaths };
 }
 
+function getAddFilesResultFiles(result) {
+  return Array.isArray(result) ? result : result?.files || [];
+}
+
+function assertAddFilesPartialScanFailure(result) {
+  assert.equal(result?.success, false);
+  assert.equal(result?.error, 'add_files_partial_scan_failure');
+  assert.ok(Array.isArray(result?.scanResults));
+}
+
 function writeSyntheticAiFile(filePath, content = '') {
   fs.writeFileSync(filePath, `%PDF-1.7\n${content}\n%%EOF\n`);
 }
@@ -11564,7 +11574,9 @@ test('malformed AI and PDF sources remain accepted but cannot establish a depend
       fs.writeFileSync(sourcePath, fixture.content);
       const project = await createProject(`Malformed baseline ${fixture.name}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpcRaw('projects:add-files', project.id);
+      const result = await callIpcRaw('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -11586,7 +11598,9 @@ test('oversized AI and PDF sources remain accepted but cannot establish a depend
       fs.truncateSync(sourcePath, 301 * 1024 * 1024);
       const project = await createProject(`Oversized baseline ${ext}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpcRaw('projects:add-files', project.id);
+      const result = await callIpcRaw('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -11705,7 +11719,8 @@ test('failed first source parsing keeps the baseline unresolved and Package Revi
     const project = await createProject('Failed first scan');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await new Promise(resolve => originalSetTimeout(resolve, 50));
 
     const fresh = await getProject(project.id);
@@ -12133,7 +12148,8 @@ test('readable malformed ZIP-based sources do not establish an empty dependable 
     const project = await createProject('Malformed ZIP baseline');
     manualDialogFor([sourcePath]);
     const { result, output } = await captureConsoleDuring(() => callIpcRaw('projects:add-files', project.id));
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     assert.equal(output.includes(sourcePath), false);
     assert.equal(output.includes('invalid ZIP structure'), false);
     assert.match(output, /asset-baseline-scan-failed/);
@@ -12167,7 +12183,8 @@ test('post-preflight regex extraction failure keeps the baseline unresolved', as
     const project = await createProject('Regex extraction failure');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await waitForCondition(() => extractionAttempts > 0, 'expected strict regex extraction attempt');
     const fresh = await getProject(project.id);
     assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -12430,7 +12447,8 @@ test('post-preflight presentation extraction failure keeps the baseline unresolv
     const project = await createProject('Presentation extraction failure');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await waitForCondition(() => extractionAttempts > 0, 'expected strict presentation extraction attempt');
     assert.equal(validationAttempts, 1);
     const fresh = await getProject(project.id);
@@ -12479,7 +12497,8 @@ test('post-preflight structured ZIP extraction failures keep every baseline form
       const project = await createProject(`Structured ZIP failure ${ext}`);
       manualDialogFor([sourcePath]);
       const result = await callIpcRaw('projects:add-files', project.id);
-      assert.equal(result.some(file => file.path === sourcePath), true);
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
       assert.equal(validationAttempts, 1, `${ext} should pass one strict preflight`);
       assert.equal(extractionAttempts, 1, `${ext} should reach its structured extractor`);
       const fresh = await getProject(project.id);
@@ -12759,7 +12778,9 @@ test('InDesign first scan fails closed for unavailable or incomplete structured 
       setChildProcessHandler(scenario.handler);
       const project = await createProject(`InDesign fail closed: ${scenario.name}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpc('projects:add-files', project.id);
+      const result = await callIpc('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true, scenario.name);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan', scenario.name);
@@ -12987,7 +13008,9 @@ test('manual add preserves file ledger entry and records one session observation
   try {
     fs.writeFileSync(filePath, 'synthetic blank Illustrator source');
     manualDialogFor([filePath]);
-    const files = await callIpc('projects:add-files', project.id);
+    const result = await callIpc('projects:add-files', project.id);
+    const files = getAddFilesResultFiles(result);
+    assertAddFilesPartialScanFailure(result);
 
     assert.equal(files.length, 1);
     assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
@@ -13493,7 +13516,9 @@ test('provenance recording failure does not block manual file capture', async ()
   try {
     fs.writeFileSync(filePath, 'synthetic provenance-failure Illustrator source');
     manualDialogFor([filePath]);
-    const files = await callIpc('projects:add-files', project.id);
+    const result = await callIpc('projects:add-files', project.id);
+    const files = getAddFilesResultFiles(result);
+    assertAddFilesPartialScanFailure(result);
 
     assert.equal(files.length, 1);
     assert.equal(files[0].path, filePath);
@@ -14819,7 +14844,9 @@ test('manual add remains allowed for excluded-looking package output paths', asy
   fs.writeFileSync(filePath, 'manual add bytes');
 
   manualDialogFor([filePath]);
-  const files = await callIpc('projects:add-files', project.id);
+  const result = await callIpc('projects:add-files', project.id);
+  const files = getAddFilesResultFiles(result);
+  assertAddFilesPartialScanFailure(result);
 
   assert.equal(files.length, 1);
   assert.equal(files[0].path, filePath);
