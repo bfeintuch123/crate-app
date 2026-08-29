@@ -1202,6 +1202,16 @@ function manualDialogFor(filePaths) {
   nextOpenDialogResult = { canceled: false, filePaths };
 }
 
+function getAddFilesResultFiles(result) {
+  return Array.isArray(result) ? result : result?.files || [];
+}
+
+function assertAddFilesPartialScanFailure(result) {
+  assert.equal(result?.success, false);
+  assert.equal(result?.error, 'add_files_partial_scan_failure');
+  assert.ok(Array.isArray(result?.scanResults));
+}
+
 function writeSyntheticAiFile(filePath, content = '') {
   fs.writeFileSync(filePath, `%PDF-1.7\n${content}\n%%EOF\n`);
 }
@@ -11564,7 +11574,9 @@ test('malformed AI and PDF sources remain accepted but cannot establish a depend
       fs.writeFileSync(sourcePath, fixture.content);
       const project = await createProject(`Malformed baseline ${fixture.name}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpcRaw('projects:add-files', project.id);
+      const result = await callIpcRaw('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -11586,7 +11598,9 @@ test('oversized AI and PDF sources remain accepted but cannot establish a depend
       fs.truncateSync(sourcePath, 301 * 1024 * 1024);
       const project = await createProject(`Oversized baseline ${ext}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpcRaw('projects:add-files', project.id);
+      const result = await callIpcRaw('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -11705,7 +11719,8 @@ test('failed first source parsing keeps the baseline unresolved and Package Revi
     const project = await createProject('Failed first scan');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await new Promise(resolve => originalSetTimeout(resolve, 50));
 
     const fresh = await getProject(project.id);
@@ -12133,7 +12148,8 @@ test('readable malformed ZIP-based sources do not establish an empty dependable 
     const project = await createProject('Malformed ZIP baseline');
     manualDialogFor([sourcePath]);
     const { result, output } = await captureConsoleDuring(() => callIpcRaw('projects:add-files', project.id));
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     assert.equal(output.includes(sourcePath), false);
     assert.equal(output.includes('invalid ZIP structure'), false);
     assert.match(output, /asset-baseline-scan-failed/);
@@ -12167,7 +12183,8 @@ test('post-preflight regex extraction failure keeps the baseline unresolved', as
     const project = await createProject('Regex extraction failure');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await waitForCondition(() => extractionAttempts > 0, 'expected strict regex extraction attempt');
     const fresh = await getProject(project.id);
     assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
@@ -12430,7 +12447,8 @@ test('post-preflight presentation extraction failure keeps the baseline unresolv
     const project = await createProject('Presentation extraction failure');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
-    assert.equal(result.some(file => file.path === sourcePath), true);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     await waitForCondition(() => extractionAttempts > 0, 'expected strict presentation extraction attempt');
     assert.equal(validationAttempts, 1);
     const fresh = await getProject(project.id);
@@ -12479,7 +12497,8 @@ test('post-preflight structured ZIP extraction failures keep every baseline form
       const project = await createProject(`Structured ZIP failure ${ext}`);
       manualDialogFor([sourcePath]);
       const result = await callIpcRaw('projects:add-files', project.id);
-      assert.equal(result.some(file => file.path === sourcePath), true);
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
       assert.equal(validationAttempts, 1, `${ext} should pass one strict preflight`);
       assert.equal(extractionAttempts, 1, `${ext} should reach its structured extractor`);
       const fresh = await getProject(project.id);
@@ -12759,7 +12778,9 @@ test('InDesign first scan fails closed for unavailable or incomplete structured 
       setChildProcessHandler(scenario.handler);
       const project = await createProject(`InDesign fail closed: ${scenario.name}`);
       manualDialogFor([sourcePath]);
-      const files = await callIpc('projects:add-files', project.id);
+      const result = await callIpc('projects:add-files', project.id);
+      const files = getAddFilesResultFiles(result);
+      assertAddFilesPartialScanFailure(result);
       assert.equal(files.some(file => file.path === sourcePath), true, scenario.name);
       const fresh = await getProject(project.id);
       assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan', scenario.name);
@@ -12987,7 +13008,9 @@ test('manual add preserves file ledger entry and records one session observation
   try {
     fs.writeFileSync(filePath, 'synthetic blank Illustrator source');
     manualDialogFor([filePath]);
-    const files = await callIpc('projects:add-files', project.id);
+    const result = await callIpc('projects:add-files', project.id);
+    const files = getAddFilesResultFiles(result);
+    assertAddFilesPartialScanFailure(result);
 
     assert.equal(files.length, 1);
     assert.deepEqual(Object.keys(files[0]).sort(), ['addedAt', 'assetOrigin', 'ext', 'name', 'path', 'projectRole', 'source']);
@@ -13007,6 +13030,93 @@ test('manual add preserves file ledger entry and records one session observation
     );
   } finally {
     fs.rmSync(filePath, { force: true });
+  }
+});
+
+test('Add Files admits a single large selection exactly once', async () => {
+  for (const count of [30, 263, 500]) {
+    const project = await createProject(`Large Add Files ${count}`);
+    const filePaths = Array.from({ length: count }, (_, index) => (
+      path.join(TEST_HOME, 'Desktop', `large-add-${count}-${index + 1}.png`)
+    ));
+
+    manualDialogFor(filePaths);
+    const startedAt = Date.now();
+    const result = await callIpc('projects:add-files', project.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(Array.isArray(result), true);
+    assert.equal(result.length, count);
+    assert.ok(elapsedMs < 2000, `${count}-file Add Files took ${elapsedMs}ms`);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, count);
+    assert.equal(new Set(fresh.files.map(file => file.path)).size, count);
+    assert.equal(getSessionObservedByMethod(fresh, 'projects:add-files').length, count);
+    if (count >= 263) {
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      assert.equal(workspace.files.length, count);
+      assert.deepEqual(workspace.pendingFiles, []);
+    }
+
+    await callIpcRaw('projects:delete', project.id);
+  }
+});
+
+test('large Add Files source scans use bounded concurrency and report per-file failures', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-large-add-files-scan-'));
+  const originalStat = fs.promises.stat;
+  let activeScans = 0;
+  let maxActiveScans = 0;
+  try {
+    const filePaths = Array.from({ length: 500 }, (_, index) => (
+      path.join(fixtureRoot, `bounded-source-${index + 1}.ai`)
+    ));
+    for (const filePath of filePaths) writeSyntheticAiFile(filePath, 'bounded scan source');
+    const project = await createProject('Large Add Files scan queue');
+    const trackedPaths = new Set(filePaths.map(filePath => path.resolve(filePath)));
+    fs.promises.stat = async function trackScanConcurrency(filePath, ...args) {
+      if (!trackedPaths.has(path.resolve(filePath))) return originalStat.call(fs.promises, filePath, ...args);
+      activeScans += 1;
+      maxActiveScans = Math.max(maxActiveScans, activeScans);
+      try {
+        await new Promise(resolve => setImmediate(resolve));
+        return originalStat.call(fs.promises, filePath, ...args);
+      } finally {
+        activeScans -= 1;
+      }
+    };
+
+    manualDialogFor(filePaths);
+    const result = await callIpc('projects:add-files', project.id);
+    assert.equal(Array.isArray(result), true);
+    assert.equal(result.length, 500);
+    assert.ok(maxActiveScans > 1);
+    assert.ok(maxActiveScans <= 4, `scan concurrency was ${maxActiveScans}`);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 500);
+    assert.equal(new Set(fresh.files.map(file => file.path)).size, 500);
+    await callIpcRaw('projects:delete', project.id);
+
+    const failedPath = path.join(fixtureRoot, 'failed-source.ai');
+    const healthyPath = path.join(fixtureRoot, 'healthy-source.ai');
+    writeSyntheticAiFile(healthyPath, 'healthy scan source');
+    fs.mkdirSync(failedPath);
+    const partialProject = await createProject('Partial Add Files scan');
+    manualDialogFor([healthyPath, failedPath]);
+    const partial = await callIpcRaw('projects:add-files', partialProject.id);
+    assert.equal(partial.success, false);
+    assert.equal(partial.error, 'add_files_partial_scan_failure');
+    assert.equal(partial.selectedCount, 2);
+    assert.equal(partial.admittedCount, 2);
+    assert.equal(partial.failedCount, 1);
+    assert.deepEqual(partial.scanResults.map(item => item.path), [healthyPath, failedPath]);
+    assert.equal(partial.scanResults.find(item => item.path === healthyPath).success, true);
+    assert.equal(partial.scanResults.find(item => item.path === failedPath).success, false);
+    assert.equal((await getProject(partialProject.id)).files.length, 2);
+    await callIpcRaw('projects:delete', partialProject.id);
+  } finally {
+    fs.promises.stat = originalStat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -13411,7 +13521,9 @@ test('provenance recording failure does not block manual file capture', async ()
   try {
     fs.writeFileSync(filePath, 'synthetic provenance-failure Illustrator source');
     manualDialogFor([filePath]);
-    const files = await callIpc('projects:add-files', project.id);
+    const result = await callIpc('projects:add-files', project.id);
+    const files = getAddFilesResultFiles(result);
+    assertAddFilesPartialScanFailure(result);
 
     assert.equal(files.length, 1);
     assert.equal(files[0].path, filePath);
@@ -14092,6 +14204,56 @@ test('pre-existing chokidar candidates remain pending across pause and resume wi
   assert.equal(ledgerEntry.latest.observerMethod, 'chokidar-add');
 });
 
+test('accepted chokidar Illustrator source remains visible across pause and resume', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Watched_Accepted.ai');
+  writeSyntheticAiFile(sourcePath, 'accepted after watching began');
+  let queryCount = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '987\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      queryCount++;
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Watched accepted source resume');
+    await waitForCondition(() => queryCount >= 1, 'timed out waiting for Illustrator activation');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const currentStats = {
+      mtimeMs: stored.watchStartedAt + 1000,
+      birthtimeMs: stored.watchStartedAt + 1000,
+    };
+    await emitWatcherWithStats('add', sourcePath, currentStats);
+
+    let fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath && file.source === 'chokidar-add')
+    );
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
+
+    await callIpc('projects:pause', project.id);
+    const paused = await getProject(project.id);
+    assert.equal(paused.status, 'paused');
+    assert.equal(paused.files.some(file => file.path === sourcePath), true);
+
+    await callIpc('projects:start-watching', project.id);
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath)
+    );
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
+    const reviewAssets = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(reviewAssets.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
 test('chokidar change records observation only for a previously unseen primary design file', async () => {
   const project = await createProject('Chokidar change provenance');
   const filePath = path.join(os.tmpdir(), 'identity.ai');
@@ -14687,7 +14849,9 @@ test('manual add remains allowed for excluded-looking package output paths', asy
   fs.writeFileSync(filePath, 'manual add bytes');
 
   manualDialogFor([filePath]);
-  const files = await callIpc('projects:add-files', project.id);
+  const result = await callIpc('projects:add-files', project.id);
+  const files = getAddFilesResultFiles(result);
+  assertAddFilesPartialScanFailure(result);
 
   assert.equal(files.length, 1);
   assert.equal(files[0].path, filePath);

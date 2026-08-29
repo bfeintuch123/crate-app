@@ -4871,6 +4871,57 @@ test('renderer acknowledges Add Files immediately and suppresses duplicate in-fl
   assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
 });
 
+test('renderer reports a partial Add Files scan failure and clears busy state', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let addCalls = 0;
+  const project = { id: 'partial-add-project', name: 'Partial Add Project', status: 'watching', files: [], pendingFiles: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => {
+        addCalls += 1;
+        return {
+          success: false,
+          error: 'add_files_partial_scan_failure',
+          failedCount: 1,
+          files: [],
+        };
+      },
+      getProjects: async () => [project],
+      getAssetWorkspace: async () => ({ projectId: project.id, files: [], pendingFiles: [] }),
+    },
+  });
+  vm.runInContext("state.selectedProjectId = 'partial-add-project'; state.projects = [{ id: 'partial-add-project', name: 'Partial Add Project', status: 'watching', files: [], pendingFiles: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(addCalls, 1);
+  assert.equal(elements['toast-message'].textContent, '1 file could not be scanned. Successful files were kept.');
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].textContent, '+ Add Files');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+});
+
+test('renderer clears Add Files busy state after an IPC error', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => { throw new Error('synthetic Add Files error'); },
+    },
+  });
+  vm.runInContext("state.selectedProjectId = 'error-add-project'; state.projects = [{ id: 'error-add-project', name: 'Error Add Project', status: 'watching', files: [], pendingFiles: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(elements['toast-message'].textContent, 'Crate could not add files. Try again.');
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].textContent, '+ Add Files');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+});
+
 test('renderer acknowledges Start Watching immediately and suppresses duplicate toggles', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const deferred = createDeferred();
