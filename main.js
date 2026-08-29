@@ -14106,11 +14106,12 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
       const failedScans = scanReport.outcomes.filter(outcome => outcome && !outcome.success);
       if (failedScans.length > 0) {
         const view = getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId));
+        const admittedKeys = new Set((result || []).map(getTrackedFileDedupKey).filter(Boolean));
         return {
           success: false,
           error: 'add_files_partial_scan_failure',
           selectedCount: filePaths.length,
-          admittedCount: result.length,
+          admittedCount: filePaths.filter(filePath => admittedKeys.has(normalizeTrackedFilePath(filePath))).length,
           completedCount: scanReport.outcomes.length - failedScans.length,
           failedCount: failedScans.length,
           scanResults: scanReport.outcomes,
