@@ -1820,6 +1820,12 @@ test('Needs Review rows expose no individual Add or Skip controls', async () => 
   assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
 });
 
+test('Needs Review batch recovery copy names list-level retry actions', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
+  assert.doesNotMatch(source, /Try the individual actions/);
+  assert.match(source, /Review the list and try the batch action again/);
+});
+
 test('Review Before Packaging uses the approved terminology and retains keyboard and accessibility semantics', async () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   assert.match(html, /<span>Needs Review<\/span>/);

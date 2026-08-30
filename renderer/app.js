@@ -389,6 +389,12 @@ function renderVirtualAssetList(list, items, build) {
   virtual.build = build;
   list.style.position = 'relative';
   list.style.height = `${virtual.items.length * ASSET_REVIEW_ROW_HEIGHT}px`;
+  const logicalHeight = `${virtual.items.length * ASSET_REVIEW_ROW_HEIGHT}px`;
+  if (typeof list.style.setProperty === 'function') {
+    list.style.setProperty('--asset-review-logical-height', logicalHeight);
+  } else {
+    list.style['--asset-review-logical-height'] = logicalHeight;
+  }
   const viewportHeight = Number.isFinite(list.clientHeight) && list.clientHeight > 0
     ? list.clientHeight
     : ASSET_REVIEW_ROW_HEIGHT * 6;
@@ -1695,7 +1701,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       renderedUpdatedState = true;
       const actionLabel = decision === 'include' ? 'added' : 'skipped';
       if (appliedCount === 0) {
-        showToast('No eligible assets were updated. Try the individual actions.');
+        showToast('No eligible assets were updated. Review the list and try the batch action again.');
       } else if (failedCount > 0) {
         showToast(`${appliedCount} asset${appliedCount === 1 ? '' : 's'} ${actionLabel}; ${failedCount} left unchanged`);
       } else {
@@ -1704,7 +1710,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       return appliedCount > 0;
     } catch (error) {
       logRendererError('pending assets batch decision failed', error);
-      showToast('Crate could not update the assets. Try the individual actions again.');
+      showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
     } finally {
       if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });

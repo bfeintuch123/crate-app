@@ -91,7 +91,7 @@ test('asset presentation uses bounded virtualized information rows', () => {
   );
   assert.match(
     stability,
-    /\.asset-review-workspace \.asset-card-grid \.asset-file-row,[\s\S]*?\.asset-review-workspace \.missing-asset-grid \.pending-file\s*\{[\s\S]*?grid-template-columns:\s*36px minmax\(0, 1fr\) auto 28px;[\s\S]*?min-height:\s*58px;/,
+    /\.asset-review-workspace \.asset-card-grid \.asset-file-row,[\s\S]*?\.asset-review-workspace \.missing-asset-grid \.pending-file\s*\{[\s\S]*?grid-template-columns:\s*36px minmax\(0, 1fr\) auto 28px;[\s\S]*?grid-template-rows:\s*minmax\(0, 1fr\);[\s\S]*?height:\s*58px;[\s\S]*?min-height:\s*58px;/,
   );
   assert.match(stability, /\.asset-review-workspace \.asset-card-grid \.app-file-remove\s*\{[\s\S]*?grid-column:\s*4;/);
 });

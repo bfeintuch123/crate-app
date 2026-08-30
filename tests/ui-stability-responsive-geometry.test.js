@@ -85,14 +85,33 @@ function fixtureHtml() {
   </div>
   <pre id="geometry-result"></pre>
   <script>
+    const logicalRowHeight = 58;
+    const logicalRowCount = 263;
+    const mountedRowLimit = 36;
     const list = document.getElementById('added-assets-list');
-    list.style.height = String(263 * 58) + 'px';
-    for (let index = 0; index < Math.min(36, 263); index += 1) {
-      const row = document.createElement('div');
-      row.className = 'app-file asset-file-row';
-      row.innerHTML = '<span class="file-visual"><span class="file-visual-badge">PNG</span></span><div class="asset-file-copy"><div class="app-file-name">Synthetic_Figma_Asset_' + String(index + 1).padStart(4, '0') + '_with_a_long_name.png</div><div class="file-origin"><span class="file-origin-mark figma">F</span><span class="file-origin-label">Figma · Current Page</span></div></div><span class="file-status-badge linked">LNK</span><button class="app-file-remove">×</button>';
-      list.appendChild(row);
-    }
+    list.classList.add('asset-virtual-list');
+    list.style.position = 'relative';
+    list.style.height = String(logicalRowCount * logicalRowHeight) + 'px';
+    list.style.setProperty('--asset-review-logical-height', String(logicalRowCount * logicalRowHeight) + 'px');
+    list.style.overflow = 'auto';
+    const renderRange = start => {
+      list.replaceChildren();
+      const end = Math.min(logicalRowCount, start + mountedRowLimit);
+      for (let index = start; index < end; index += 1) {
+        const row = document.createElement('div');
+        row.className = 'app-file asset-file-row';
+        row.style.position = 'absolute';
+        row.style.top = String(index * logicalRowHeight) + 'px';
+        row.style.left = '0';
+        row.style.right = '0';
+        row.style.height = String(logicalRowHeight) + 'px';
+        row.style.minHeight = String(logicalRowHeight) + 'px';
+        row.dataset.assetIndex = String(index);
+        row.innerHTML = '<span class="file-visual"><span class="file-visual-badge">PNG</span></span><div class="asset-file-copy"><div class="app-file-name">Synthetic_Figma_Asset_' + String(index + 1).padStart(4, '0') + '_with_a_long_name.png</div><div class="file-origin"><span class="file-origin-mark figma">F</span><span class="file-origin-label">Figma · Current Page</span></div></div><span class="file-status-badge linked">LNK</span><button class="app-file-remove">×</button>';
+        list.appendChild(row);
+      }
+    };
+    renderRange(0);
 
     const rect = selector => document.querySelector(selector).getBoundingClientRect();
     const overlaps = (left, right) => !(
@@ -111,7 +130,7 @@ function fixtureHtml() {
     const content = document.querySelector('.app-content');
     const review = document.getElementById('asset-review-workspace');
     const grid = document.getElementById('added-assets-list');
-    const cards = Array.from(grid.children);
+    const initialCards = Array.from(grid.children);
     const reviewRect = rect('#asset-review-workspace');
     const headerRect = rect('#review-copy');
     const searchRect = rect('.asset-review-search');
@@ -120,7 +139,23 @@ function fixtureHtml() {
     const actionsRect = rect('.asset-review-toolbar .asset-panel-actions');
     const footerRect = rect('.asset-review-footer');
     const sidebarRect = rect('.app-sidebar');
-    const cardRects = cards.slice(0, 12).map(card => card.getBoundingClientRect());
+    const cardRects = initialCards.slice(0, 12).map(card => card.getBoundingClientRect());
+    const initialListRect = grid.getBoundingClientRect();
+    const initialRowRects = initialCards.slice(0, 12).map(card => card.getBoundingClientRect());
+    const initialRowHeight = initialRowRects[0]?.height ?? 0;
+    const initialRowTopDelta = initialRowRects[1]
+      ? initialRowRects[1].top - initialRowRects[0].top
+      : 0;
+    const initialAdjacentNonOverlap = initialRowRects.every((card, index) => (
+      index === 0 || card.top >= initialRowRects[index - 1].bottom - 0.5
+    ));
+    const maxScrollTop = Math.max(0, grid.scrollHeight - grid.clientHeight);
+    grid.scrollTop = maxScrollTop;
+    renderRange(logicalRowCount - mountedRowLimit);
+    const finalCards = Array.from(grid.children);
+    const finalRow = finalCards.find(card => card.dataset.assetIndex === String(logicalRowCount - 1));
+    const finalListRect = grid.getBoundingClientRect();
+    const finalRowRect = finalRow?.getBoundingClientRect() || null;
     const columns = getComputedStyle(grid).gridTemplateColumns.split(/\\s+/).filter(Boolean).length;
     const navigationLabelsVisible = Array.from(document.querySelectorAll('.app-tab')).every(button => {
       const value = button.getBoundingClientRect();
@@ -134,6 +169,23 @@ function fixtureHtml() {
       review: { clientWidth: review.clientWidth, scrollWidth: review.scrollWidth },
       columns,
       minimumCardWidth: Math.min(...cardRects.map(card => card.width)),
+      initialMountedRows: initialCards.length,
+      finalMountedRows: finalCards.length,
+      rowHeight: initialRowHeight,
+      rowTopDelta: initialRowTopDelta,
+      adjacentNonOverlap: initialAdjacentNonOverlap,
+      logicalScrollHeight: grid.scrollHeight,
+      logicalHeight: logicalRowCount * logicalRowHeight,
+      finalMountedIndex: finalCards.at(-1)?.dataset.assetIndex
+        ? Number(finalCards.at(-1).dataset.assetIndex)
+        : null,
+      lastRowVisible: Boolean(
+        finalRowRect
+        && finalRowRect.top >= finalListRect.top - 1
+        && finalRowRect.bottom <= finalListRect.bottom + 1
+      ),
+      finalScrollTop: grid.scrollTop,
+      initialListHeight: initialListRect.height,
       compactNavigationActive: matchMedia('(max-width: 760px)').matches,
       navigationLabelsVisible,
       desktopSidebarVisible: sidebarRect.width >= 180 && sidebarRect.height >= innerHeight - 2,
@@ -162,7 +214,12 @@ function runGeometryProbe(browser, width, height) {
       '--headless=new',
       '--disable-gpu',
       '--no-sandbox',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-component-update',
       '--allow-file-access-from-files',
+      `--user-data-dir=${path.join(temporaryDirectory, 'profile')}`,
       `--window-size=${width},${height}`,
       '--dump-dom',
       new URL(`file://${fixturePath}`).href,
@@ -206,6 +263,14 @@ test('real browser geometry keeps supported desktop Review Assets inside the Cra
     assert.equal(metrics.footerContained, true, `${label}: footer must stay inside Review Assets`);
     assert.equal(metrics.cardsContained, true, `${label}: cards must stay inside Review Assets`);
     assert.ok(metrics.minimumCardWidth >= 150, `${label}: asset presentation must remain readable`);
+    assert.equal(metrics.initialMountedRows, 36, `${label}: initial virtual window must stay bounded`);
+    assert.equal(metrics.finalMountedRows, 36, `${label}: final virtual window must stay bounded`);
+    assert.equal(metrics.rowHeight, 58, `${label}: virtual rows must have the fixed 58px height`);
+    assert.equal(metrics.rowTopDelta, 58, `${label}: virtual rows must advance by their fixed height`);
+    assert.equal(metrics.adjacentNonOverlap, true, `${label}: virtual rows must not overlap`);
+    assert.equal(metrics.logicalScrollHeight, metrics.logicalHeight, `${label}: logical scroll range must include every row`);
+    assert.equal(metrics.finalMountedIndex, 262, `${label}: final virtual window must mount the final logical row`);
+    assert.equal(metrics.lastRowVisible, true, `${label}: final logical row must be visible at the end of the scroll range`);
     assert.equal(metrics.query, 'synthetic query', `${label}: search state must survive layout`);
   }
 });

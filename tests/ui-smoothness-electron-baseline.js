@@ -471,7 +471,7 @@ async function auditFixture(assetCount) {
     const workspaceVisibleMs = Date.now() - projectClickAt;
     await waitForExpression(
       window,
-      `(${assetCount} === 0) || (document.querySelectorAll('#existing-assets-list > .asset-file-row, #added-assets-list > .asset-file-row').length <= 36 && document.querySelector('#added-assets-list, #existing-assets-list')?.style.height)`,
+      `(${assetCount} === 0) || ['#existing-assets-list', '#added-assets-list'].every(selector => { const list = document.querySelector(selector); return list && list.children.length <= 36 && list.style.height; })`,
       `${assetCount}-asset workspace`,
     );
     const workspaceMetrics = await waitForQuietMetrics(window);

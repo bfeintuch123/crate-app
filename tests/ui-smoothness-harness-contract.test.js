@@ -26,6 +26,7 @@ test('smoothness baseline covers empty, normal, and stress fixtures', () => {
   assert.match(harness, /app-wide-smoothness-baseline/);
   assert.match(harness, /assetCount === 30/);
   assert.match(harness, /previewRequests > 36/);
+  assert.match(harness, /\['#existing-assets-list', '#added-assets-list'\]\.every/);
   assert.match(harness, /minimumWindow:\s*DESKTOP_WINDOW_MINIMUM/);
 });
 
