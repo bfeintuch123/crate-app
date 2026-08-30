@@ -32,15 +32,21 @@ function wait(milliseconds) {
 
 function isAssetWorkspaceReady(expected) {
   return [
-    ['#project-file-list', expected.representedSourceFiles],
-    ['#existing-assets-list', expected.existingAssets],
-    ['#added-assets-list', expected.addedAssets],
-  ].every(([selector, count]) => {
+    ['#project-file-list', expected.representedSourceFiles, false],
+    ['#existing-assets-list', expected.existingAssets, true],
+    ['#added-assets-list', expected.addedAssets, true],
+  ].every(([selector, count, virtualized]) => {
     const list = document.querySelector(selector);
     if (!list || list.__assetReviewAllItems?.length !== count) return false;
     if (count === 0) {
       return !list.__assetReviewVirtualState && list.children.length === 1
         && list.children[0].className === 'asset-panel-empty';
+    }
+    if (!virtualized) {
+      return !list.__assetReviewVirtualState && !list.classList.contains('asset-virtual-list')
+        && !list.style.height && list.children.length === count
+        && Array.from(list.children).every(row => row.className.split(/\s+/).includes('asset-file-row')
+          && !row.style.position && !row.style.top && !row.getAttribute('aria-setsize'));
     }
     return list.__assetReviewVirtualState?.items.length === count
       && list.style.height === `${count * 58}px`

@@ -2221,8 +2221,15 @@ function renderAssetPanelList(list, project, files, options = {}) {
     }, item => `empty:${item.message}`);
     return;
   }
+  // Only Review Assets panels opt into fixed virtual rows. Working Files keeps
+  // its normal grid flow, spacing, and scroll position on same-project refreshes.
+  if (options.virtualized !== true && list.__assetReviewVirtualState) {
+    resetVirtualAssetList(list);
+    reconcileKeyedList(list, [], () => null);
+  }
   list.__assetReviewAllItems = allFiles;
-  renderVirtualAssetList(list, allFiles, buildRow);
+  if (options.virtualized === true) renderVirtualAssetList(list, allFiles, buildRow);
+  else reconcileKeyedList(list, allFiles, buildRow);
 }
 
 function createRecentAssetCard(project, file, { previewPriority = 0, loadVisual = true } = {}) {
@@ -2445,12 +2452,14 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     loadVisual: false,
   });
   renderAssetPanelList($('#existing-assets-list'), project, existingAssets, {
+    virtualized: true,
     emptyMessage: 'No existing assets found.',
     previewPriority: state.assetReviewOpen ? 0 : 10,
     loadVisual: false,
     selectable: true,
   });
   renderAssetPanelList($('#added-assets-list'), project, addedAssets, {
+    virtualized: true,
     emptyMessage: options.hasActiveCandidates
       ? 'No package-ready assets yet. Review the files Crate observed.'
       : 'New package-ready assets will appear here as you work.',

@@ -2059,6 +2059,128 @@ test('file visuals prefer raster thumbnails, then native icons, then bounded ext
   assert.equal(visuals[2].children[0].textContent, 'XYZ');
 });
 
+function assertNormalWorkingFileFlow(list, count) {
+  assert.equal(list.__assetReviewVirtualState, undefined);
+  assert.equal(list.classList.contains('asset-virtual-list'), false);
+  assert.equal(list.listeners.scroll?.length || 0, 0);
+  assert.equal(list.style.height || '', '');
+  assert.equal(list.style.position || '', '');
+  assert.equal(list.style['--asset-review-logical-height'], undefined);
+  assert.equal(list.children.length, Math.max(1, count));
+  for (const row of list.children) {
+    for (const property of ['position', 'top', 'left', 'right', 'minHeight']) {
+      assert.equal(row.style[property] || '', '', `normal flow must not retain ${property}`);
+    }
+    assert.equal(row.dataset.assetIndex, undefined);
+    assert.equal(row.getAttribute('aria-posinset'), undefined);
+    assert.equal(row.getAttribute('aria-setsize'), undefined);
+  }
+}
+
+test('dashboard Working Files preserves normal flow and source controls for empty, single, and multiple sources', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let current;
+  let previewRequests = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAssetWorkspace: async () => current.workspace,
+    getFileVisual: async () => { previewRequests += 1; return { kind: 'fallback' }; },
+  } });
+  for (const count of [0, 1, 4, 0, 4]) {
+    const files = Array.from({ length: count }, (_, index) => ({
+      name: `Working_${index}.ai`, ext: '.ai', appFamily: 'illustrator',
+      projectRole: 'source', protectedSource: true, sourceRecoveryAllowed: index === 3,
+      visualIdentity: `working-${index}`, visualRevision: `working-revision-${index}`,
+    }));
+    current = {
+      project: { id: 'working-flow', files, pendingFiles: [], excludedAssetKeys: [] },
+      workspace: { projectId: 'working-flow', files, pendingFiles: [] },
+    };
+    renderer.testProject = current.project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    await renderer.renderFiles();
+    const list = elements['project-file-list'];
+    assertNormalWorkingFileFlow(list, count);
+    assert.equal(elements['project-file-count'].textContent, String(count));
+    if (count === 0) {
+      assert.equal(list.children[0].textContent, 'Add a project file to begin.');
+    } else {
+      assert.match(getElementTreeText(list.children[0]), /Ready/);
+      assert.equal(list.children[0].children.some(child => child.tagName === 'BUTTON'), false);
+      if (count === 4) {
+        const recovery = list.children[3].children.find(child => child.tagName === 'BUTTON');
+        assert.equal(recovery.className, 'app-file-recovery');
+        assert.match(recovery.getAttribute('aria-label'), /Remove Working_3.ai and recover/);
+      }
+      list.scrollTop = 91;
+      const row = list.children[0];
+      await renderer.renderFiles();
+      assert.equal(list.children[0], row);
+      assert.equal(list.scrollTop, 91, 'same-project refresh preserves dashboard scrolling');
+    }
+  }
+  assert.equal(previewRequests, 0);
+});
+
+test('dashboard and Review Assets switching keeps layout modes and project-owned state separate', async () => {
+  const first = createUiSmoothnessFixture({ assetCount: 500 });
+  const second = cloneTestValue(first);
+  second.project.id = 'working-flow-project-b';
+  second.workspace.projectId = second.project.id;
+  let current = first;
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: { getAssetWorkspace: async () => current.workspace } });
+  renderer.testProjects = [first.project, second.project];
+  vm.runInContext('state.projects = testProjects; state.selectedProjectId = testProjects[0].id;', renderer);
+  await renderer.renderFiles();
+  const working = elements['project-file-list'];
+  const added = elements['added-assets-list'];
+  const workingRow = working.children[0];
+  working.scrollTop = 25;
+  renderer.openAssetReviewWorkspace();
+  added.clientHeight = 460;
+  added.scrollTop = 240 * 58;
+  added.dispatchEvent({ type: 'scroll' });
+  const selected = added.children[0];
+  selected.click();
+  renderer.closeAssetReviewWorkspace();
+  await renderer.renderFiles();
+  assertNormalWorkingFileFlow(working, first.expected.representedSourceFiles);
+  assert.equal(working.children[0], workingRow);
+  assert.equal(working.scrollTop, 25);
+  renderer.openAssetReviewWorkspace();
+  assert.equal(added.children[0], selected);
+  assert.equal(selected.getAttribute('aria-selected'), 'true');
+  assert.ok(added.children.length > 0 && added.children.length <= 36);
+  assert.equal(added.listeners.scroll.length, 1);
+  assert.equal(selected.style.top, `${Number(selected.dataset.assetIndex) * 58}px`);
+  current = second;
+  vm.runInContext('state.selectedProjectId = testProjects[1].id;', renderer);
+  await renderer.renderFiles();
+  renderer.closeAssetReviewWorkspace();
+  assertNormalWorkingFileFlow(working, second.expected.representedSourceFiles);
+  assert.notEqual(working.children[0], workingRow);
+  assert.equal(working.scrollTop, 0);
+  assert.equal(vm.runInContext('state.assetReviewSelectedKey', renderer), null);
+  assert.equal(added.listeners.scroll.length, 1);
+  assert.ok(added.children.every(row => row.getAttribute('aria-selected') === 'false'));
+});
+
+test('shared panel renderer drops prior virtual rows when returning a list to normal flow', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document);
+  const file = { name: 'Working.ai', projectRole: 'source', protectedSource: true, visualIdentity: 'working' };
+  const project = { id: 'mode-transition', files: [file] };
+  const list = document.querySelector('#project-file-list');
+  renderer.renderAssetPanelList(list, project, [file], { virtualized: true, loadVisual: false });
+  const virtualRow = list.children[0];
+  assert.equal(virtualRow.style.position, 'absolute');
+  renderer.renderAssetPanelList(list, project, [file], { loadVisual: false });
+  assertNormalWorkingFileFlow(list, 1);
+  assert.notEqual(list.children[0], virtualRow, 'rebuild rows to discard virtual position and ARIA');
+  list.dispatchEvent({ type: 'scroll' });
+  assertNormalWorkingFileFlow(list, 1);
+});
+
 test('Review Assets virtualizes 30, 263, and 500 asset datasets without default preview requests', async () => {
   for (const assetCount of [30, 263, 500]) {
     const fixture = createUiSmoothnessFixture({ assetCount });
@@ -2174,10 +2296,26 @@ test('smoothness completion accepts actual empty and mixed production lists and 
     await renderer.renderFiles();
     assert.equal(ready(fixture.expected), true);
     const sourceList = elements['project-file-list'];
-    const sourceHeight = sourceList.style.height;
-    sourceList.style.height = '';
-    assert.equal(ready(fixture.expected), false, 'missing geometry must not pass');
-    sourceList.style.height = sourceHeight;
+    const sourceRow = sourceList.children[0];
+    sourceList.removeChild(sourceRow);
+    assert.equal(ready(fixture.expected), false, 'missing working files must not pass');
+    sourceList.insertBefore(sourceRow, sourceList.children[0]);
+    sourceRow.style.position = 'absolute';
+    assert.equal(ready(fixture.expected), false, 'virtual positioning in Working Files must not pass');
+    sourceRow.style.position = '';
+    assert.equal(ready(fixture.expected), true);
+    if (assetCount > 0) {
+      const populated = elements[addedOnly ? 'added-assets-list' : 'existing-assets-list'];
+      const height = populated.style.height;
+      populated.style.height = '';
+      assert.equal(ready(fixture.expected), false, 'missing Review Assets geometry must not pass');
+      populated.style.height = height;
+      const row = populated.children[0];
+      const size = row.getAttribute('aria-setsize');
+      row.setAttribute('aria-setsize', '999');
+      assert.equal(ready(fixture.expected), false, 'stale virtual positional semantics must not pass');
+      row.setAttribute('aria-setsize', size);
+    }
     if (assetCount === 7) {
       const emptyList = elements[addedOnly ? 'existing-assets-list' : 'added-assets-list'];
       const placeholder = emptyList.children[0];
@@ -2188,7 +2326,7 @@ test('smoothness completion accepts actual empty and mixed production lists and 
     }
     const row = sourceList.children[0];
     row.setAttribute('aria-setsize', '999');
-    assert.equal(ready(fixture.expected), false, 'stale positional semantics must not pass');
+    assert.equal(ready(fixture.expected), false, 'Working Files must not retain virtual positional semantics');
   }
 });
 
