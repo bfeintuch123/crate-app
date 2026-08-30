@@ -1216,7 +1216,7 @@ test('Current Project separates protected sources, Existing Assets, and Added Wh
 
 test('Review Assets renders the accepted source card and omits scoped stale pending rows', async () => {
   const { document, elements } = createInteractiveRendererDom();
-  const project = {
+  const persistedProject = {
     id: 'resumed-illustrator-project',
     name: 'Resumed Illustrator Project',
     type: 'branding',
@@ -1230,10 +1230,18 @@ test('Review Assets renders the accepted source card and omits scoped stale pend
       visualIdentity: 'accepted-source-identity',
       visualRevision: 'accepted-source-revision',
     }],
-    pendingFiles: [],
+    pendingFiles: [{
+      name: 'Stale_Prior_Activation.ai',
+      path: '/synthetic/Stale_Prior_Activation.ai',
+      ext: '.ai',
+      captureSessionId: 'stale-prior-activation',
+      captureState: 'needs-save',
+      projectId: 'resumed-illustrator-project',
+    }],
     excludedAssetKeys: [],
     assetBaseline: { status: 'included', decision: 'include' },
   };
+  const project = { ...persistedProject, pendingFiles: [] };
   const renderer = loadRendererHelpers(document, {
     crate: {
       getProjects: async () => [project],
@@ -1244,6 +1252,8 @@ test('Review Assets renders the accepted source card and omits scoped stale pend
       }),
     },
   });
+  assert.equal(persistedProject.pendingFiles.length, 1);
+  assert.deepEqual(project.pendingFiles, []);
   renderer.testProject = project;
   vm.runInContext(`
     state.projects = [testProject];

@@ -14445,6 +14445,47 @@ test('accepted pending non-Illustrator sources never enter the Illustrator activ
   }
 });
 
+test('accepted pending app-family markers require exact canonical tokens', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Adversarial_Marker.ai');
+  writeSyntheticAiFile(sourcePath, 'adversarial app-family marker');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '654\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Adversarial app-family marker boundaries');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files = [
+      ...['not-illustrator', 'illustrator-helper', 'not-photoshop', 'illustrator/photoshop'].map((marker, index) => ({
+        ...makePendingFile(path.join(TEST_HOME, 'Desktop', `Adversarial_${index}.ai`), 'scan-on-open'),
+        acceptedPending: true,
+        acceptedPendingAppFamily: marker,
+        projectRole: 'source',
+        captureEvidence: { appFamily: marker },
+      })),
+    ];
+    for (const file of stored.files) writeSyntheticAiFile(file.path, `adversarial ${file.acceptedPendingAppFamily}`);
+    roundTripFakeStore();
+
+    await callIpcRaw('projects:pause', project.id);
+    await callIpcRaw('projects:start-watching', project.id);
+
+    const scope = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    assert.equal(scope.status, 'ready');
+    assert.deepEqual(scope.admittedDocumentPaths, []);
+    assert.deepEqual(scope.baselineDocumentPaths, []);
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.projectId, project.id);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
 test('resume hides stale pending rows while retaining the selected project source', async () => {
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Selected_Project.ai');
