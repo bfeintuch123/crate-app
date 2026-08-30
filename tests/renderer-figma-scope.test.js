@@ -131,6 +131,7 @@ function createElementStub(tagName = 'div') {
 
   let html = '';
   let text = '';
+  Object.defineProperty(element, 'parentElement', { get: () => element.parentNode || null });
   const htmlEscape = value => String(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -2145,6 +2146,251 @@ test('Review Assets preserves filter, selection, focus, and stable row identity 
   assert.equal(document.activeElement, elements['asset-review-search']);
   assert.equal(elements['added-assets-list'].children[0].dataset.renderKey, selectedKey);
   assert.equal(elements['added-assets-list'].children[0].getAttribute('aria-selected'), 'true');
+});
+
+function loadSmoothnessCompletionCheck(renderer) {
+  const source = fs.readFileSync(path.join(__dirname, 'ui-smoothness-electron-baseline.js'), 'utf8');
+  const start = source.indexOf('function isAssetWorkspaceReady(');
+  const end = source.indexOf('\nasync function settleLayout(', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(source.slice(start, end), renderer);
+  return renderer.isAssetWorkspaceReady;
+}
+
+test('smoothness completion accepts actual empty and mixed production lists and rejects incomplete renders', async () => {
+  for (const [assetCount, addedOnly] of [[0, false], [7, false], [7, true], [30, false]]) {
+    const fixture = createUiSmoothnessFixture({ assetCount });
+    if (addedOnly) {
+      fixture.workspace.files.forEach(file => { if (file.projectRole === 'asset') file.assetOrigin = 'added'; });
+      fixture.expected.existingAssets = 0;
+      fixture.expected.addedAssets = assetCount;
+    }
+    const { document, elements } = createInteractiveRendererDom();
+    const renderer = loadRendererHelpers(document, { crate: { getAssetWorkspace: async () => fixture.workspace } });
+    renderer.testProject = fixture.project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+    const ready = loadSmoothnessCompletionCheck(renderer);
+    assert.equal(ready(fixture.expected), false, 'unrendered lists must not pass even for zero assets');
+    await renderer.renderFiles();
+    assert.equal(ready(fixture.expected), true);
+    const sourceList = elements['project-file-list'];
+    const sourceHeight = sourceList.style.height;
+    sourceList.style.height = '';
+    assert.equal(ready(fixture.expected), false, 'missing geometry must not pass');
+    sourceList.style.height = sourceHeight;
+    if (assetCount === 7) {
+      const emptyList = elements[addedOnly ? 'existing-assets-list' : 'added-assets-list'];
+      const placeholder = emptyList.children[0];
+      emptyList.removeChild(placeholder);
+      assert.equal(ready(fixture.expected), false, 'missing empty state must not pass');
+      emptyList.appendChild(placeholder);
+      assert.equal(ready(fixture.expected), true);
+    }
+    const row = sourceList.children[0];
+    row.setAttribute('aria-setsize', '999');
+    assert.equal(ready(fixture.expected), false, 'stale positional semantics must not pass');
+  }
+});
+
+test('already mounted deep rows are repositioned through search and final rows remain reachable at 30/263/500', async () => {
+  for (const assetCount of [30, 263, 500]) {
+    const fixture = createUiSmoothnessFixture({ assetCount });
+    const { document, elements } = createInteractiveRendererDom();
+    let previewRequests = 0;
+    const renderer = loadRendererHelpers(document, { crate: {
+      getAssetWorkspace: async () => fixture.workspace,
+      getFileVisual: async () => { previewRequests += 1; return { kind: 'fallback' }; },
+    } });
+    renderer.testProject = fixture.project;
+    vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id; state.assetReviewOpen = true;', renderer);
+    await renderer.renderFiles();
+    const list = elements['added-assets-list'];
+    list.clientHeight = 460;
+    const targetIndex = assetCount === 30 ? 18 : 242;
+    list.scrollTop = targetIndex * 58;
+    list.dispatchEvent({ type: 'scroll' });
+    const target = list.children.find(row => row.dataset.assetIndex === String(targetIndex));
+    assert.ok(target, 'search target must already be mounted deep in the list');
+    const key = target.dataset.renderKey;
+    const file = list.__assetReviewAllItems[targetIndex];
+    assert.equal(target.style.top, `${targetIndex * 58}px`);
+    target.click();
+    renderer.searchName = file.name;
+    vm.runInContext('state.assetReviewQuery = searchName;', renderer);
+    renderer.applyAssetReviewFilter();
+    assert.equal(list.children.length, 1);
+    assert.equal(list.children[0], target, 'exercise the reused-row path');
+    assert.equal(target.style.top, '0px');
+    assert.equal(target.dataset.assetIndex, '0');
+    assert.equal(target.getAttribute('aria-posinset'), '1');
+    assert.equal(target.getAttribute('aria-setsize'), '1');
+    assert.equal(target.getAttribute('aria-selected'), 'true');
+    assert.equal(list.scrollTop, 0);
+
+    vm.runInContext("state.assetReviewQuery = '';", renderer);
+    renderer.applyAssetReviewFilter();
+    list.scrollTop = targetIndex * 58;
+    list.dispatchEvent({ type: 'scroll' });
+    const restored = list.children.find(row => row.dataset.renderKey === key);
+    assert.ok(restored);
+    assert.equal(restored.style.top, `${targetIndex * 58}px`);
+    assert.equal(restored.dataset.assetIndex, String(targetIndex));
+    assert.equal(restored.getAttribute('aria-posinset'), String(targetIndex + 1));
+    assert.equal(restored.getAttribute('aria-setsize'), String(assetCount - 7));
+    assert.equal(restored.getAttribute('aria-selected'), 'true');
+    list.scrollTop = Number.MAX_SAFE_INTEGER;
+    list.dispatchEvent({ type: 'scroll' });
+    const last = list.children.at(-1);
+    assert.equal(last.dataset.assetIndex, String(assetCount - 8));
+    assert.equal(last.getAttribute('aria-posinset'), String(assetCount - 7));
+    assert.ok(Number.parseInt(last.style.top, 10) < list.scrollTop + list.clientHeight);
+    assert.ok(list.children.length > 0 && list.children.length <= 36);
+    assert.equal(previewRequests, 0);
+  }
+});
+
+test('project switches clear selection and row action ownership even for shared visual identities', async () => {
+  const first = createUiSmoothnessFixture({ assetCount: 30 });
+  const second = cloneTestValue(first);
+  second.project.id = 'synthetic-shared-identity-project-b';
+  second.workspace.projectId = second.project.id;
+  let current = first;
+  const { document, elements } = createInteractiveRendererDom();
+  const removals = [];
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAssetWorkspace: async () => current.workspace,
+    getProjects: async () => [first.project, second.project],
+    removeFile: async (...args) => { removals.push(args); },
+  } });
+  renderer.testProjects = [first.project, second.project];
+  vm.runInContext('state.projects = testProjects; state.selectedProjectId = testProjects[0].id;', renderer);
+  await renderer.renderFiles();
+  const list = elements['added-assets-list'];
+  const oldRow = list.children[0];
+  oldRow.click();
+  assert.equal(oldRow.getAttribute('aria-selected'), 'true');
+  await renderer.renderFiles();
+  assert.equal(list.children[0], oldRow, 'same project retains its row');
+  assert.equal(oldRow.getAttribute('aria-selected'), 'true');
+  current = second;
+  vm.runInContext('state.selectedProjectId = testProjects[1].id;', renderer);
+  await renderer.renderFiles();
+  assert.equal(vm.runInContext('state.assetReviewSelectedKey', renderer), null);
+  assert.notEqual(list.children[0], oldRow);
+  assert.equal(list.children[0].getAttribute('aria-selected'), 'false');
+  list.children[0].children.find(child => child.tagName === 'BUTTON').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(removals.length, 1);
+  assert.equal(removals[0][0], second.project.id);
+});
+
+test('Added list tears down populated state, preserves its empty message through filters, and repopulates once', async () => {
+  const populated = createUiSmoothnessFixture({ assetCount: 30 });
+  const empty = cloneTestValue(populated);
+  empty.workspace.files = empty.workspace.files.filter(file => file.projectRole === 'source' || file.assetOrigin === 'existing');
+  let current = populated;
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: { getAssetWorkspace: async () => current.workspace } });
+  renderer.testProject = populated.project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  await renderer.renderFiles();
+  const list = elements['added-assets-list'];
+  assert.equal(list.listeners.scroll.length, 1);
+  current = empty;
+  await renderer.renderFiles();
+  const placeholder = list.children[0];
+  assert.equal(placeholder.className, 'asset-panel-empty');
+  assert.equal(placeholder.textContent, 'New package-ready assets will appear here as you work.');
+  assert.equal(list.__assetReviewVirtualState, undefined);
+  assert.equal(list.style.height, '');
+  assert.equal(list.style['--asset-review-logical-height'], undefined);
+  assert.equal(list.classList.contains('asset-virtual-list'), false);
+  assert.equal(list.listeners.scroll.length, 0);
+  vm.runInContext("state.assetReviewQuery = 'missing'; state.assetReviewFilter = 'added';", renderer);
+  renderer.applyAssetReviewFilter();
+  list.dispatchEvent({ type: 'scroll' });
+  assert.deepEqual(list.children, [placeholder]);
+  assert.equal(placeholder.classList.contains('filtered-out'), false);
+  vm.runInContext("state.assetReviewQuery = ''; state.assetReviewFilter = 'all';", renderer);
+  current = populated;
+  await renderer.renderFiles();
+  assert.equal(list.listeners.scroll.length, 1);
+  assert.equal(list.style.height, `${23 * 58}px`);
+  assert.ok(list.children.every(row => row.className !== 'asset-panel-empty'));
+});
+
+test('anonymous duplicate records retain object binding across windows and filters without guessing replacement identity', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document);
+  const files = Array.from({ length: 80 }, (_, index) => ({
+    name: 'Duplicate.png', ext: '.png', projectRole: 'asset', assetOrigin: 'added',
+    sourceName: `Source_${String(index).padStart(3, '0')}.ai`,
+  }));
+  const project = { id: 'anonymous-records', files, pendingFiles: [], excludedAssetKeys: [] };
+  renderer.renderAssetWorkspace(project, {}, files);
+  const list = elements['added-assets-list'];
+  list.clientHeight = 348;
+  const original = list.children[8];
+  const originalKey = original.dataset.renderKey;
+  const keys = files.map(file => renderer.getRendererItemKey(file));
+  assert.equal(new Set(keys).size, files.length);
+  assert.ok(keys.every(key => !key.includes('Duplicate') && !key.includes('Source_')));
+  list.scrollTop = 12 * 58;
+  list.dispatchEvent({ type: 'scroll' });
+  assert.equal(list.children.find(row => row.dataset.renderKey === originalKey), original);
+  original.click();
+  vm.runInContext("state.assetReviewQuery = 'Source_008';", renderer);
+  renderer.applyAssetReviewFilter();
+  assert.equal(list.children[0], original);
+  assert.equal(original.style.top, '0px');
+  assert.equal(original.getAttribute('aria-selected'), 'true');
+  vm.runInContext("state.assetReviewQuery = '';", renderer);
+  renderer.applyAssetReviewFilter();
+  for (let offset = 0; offset < files.length; offset += 6) {
+    list.scrollTop = offset * 58;
+    list.dispatchEvent({ type: 'scroll' });
+    assert.ok(list.children.length > 0 && list.children.length <= 36);
+    for (const row of list.children) assert.equal(row.dataset.renderKey, keys[Number(row.dataset.assetIndex)]);
+  }
+  const replacement = files.map(file => ({ ...file }));
+  renderer.renderAssetWorkspace(project, {}, replacement);
+  assert.ok(list.children.every(row => !keys.includes(row.dataset.renderKey)));
+  assert.ok(list.children.every(row => row.getAttribute('aria-selected') === 'false'));
+  renderer.renderAssetWorkspace({ ...project, id: 'anonymous-project-b' }, {}, files);
+  assert.equal(vm.runInContext('state.assetReviewSelectedKey', renderer), null);
+  assert.ok(list.children.every(row => row.getAttribute('aria-selected') === 'false'));
+});
+
+test('Needs Review filters reuse the composed anonymous records and keep positional selection consistent', async () => {
+  const fixture = createUiSmoothnessFixture({ assetCount: 7 });
+  fixture.project.pendingFiles = Array.from({ length: 50 }, (_, index) => ({
+    name: 'Duplicate pending.png', ext: '.png', captureState: 'pending',
+    captureEvidence: { appFamily: 'illustrator' },
+    path: `/synthetic/pending-${index}.png`,
+  }));
+  fixture.workspace.pendingFiles = fixture.project.pendingFiles.map((file, sourceIndex) => ({
+    name: file.name, ext: file.ext, sourceIndex, sourceName: `Pending_${sourceIndex}.ai`,
+  }));
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: { getAssetWorkspace: async () => fixture.workspace } });
+  renderer.testProject = fixture.project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+  await renderer.renderFiles();
+  const list = elements['pending-file-list'];
+  assert.equal(vm.runInContext('state.assetReviewLogicalItems.missing', renderer), list.__assetReviewAllItems);
+  list.scrollTop = 40 * 58;
+  list.dispatchEvent({ type: 'scroll' });
+  const row = list.children.find(item => item.dataset.assetIndex === '40');
+  assert.ok(row);
+  row.click();
+  vm.runInContext("state.assetReviewFilter = 'missing'; state.assetReviewQuery = 'Pending_40.ai';", renderer);
+  renderer.applyAssetReviewFilter();
+  assert.deepEqual(list.children, [row]);
+  assert.equal(row.style.top, '0px');
+  assert.equal(row.getAttribute('aria-posinset'), '1');
+  assert.equal(row.getAttribute('aria-setsize'), '1');
+  assert.equal(row.getAttribute('aria-selected'), 'true');
+  assert.match(getElementTreeText(row), /Duplicate pending/);
 });
 
 test('native file icons and image thumbnails stay sharp without cropped previews', () => {

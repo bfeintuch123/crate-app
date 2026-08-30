@@ -26,8 +26,15 @@ test('smoothness baseline covers empty, normal, and stress fixtures', () => {
   assert.match(harness, /app-wide-smoothness-baseline/);
   assert.match(harness, /assetCount === 30/);
   assert.match(harness, /previewRequests > 36/);
-  assert.match(harness, /\['#existing-assets-list', '#added-assets-list'\]\.every/);
+  assert.match(harness, /isAssetWorkspaceReady\.toString\(\)/);
   assert.match(harness, /minimumWindow:\s*DESKTOP_WINDOW_MINIMUM/);
+});
+
+test('smoothness evidence binds its source commit, dirty state, and verified canonical ancestor', () => {
+  assert.match(harness, /CANONICAL_BASE = '279dad5db5b5341c66d83bee9913849f17f0b9b1'/);
+  assert.doesNotMatch(harness, /d2a7be01/);
+  assert.match(harness, /gitRead\(\['merge-base', sourceCommit, CANONICAL_BASE\]\) !== CANONICAL_BASE/);
+  assert.match(harness, /canonicalBase: CANONICAL_BASE,\s+sourceCommit,\s+sourceTreeDirty,/);
 });
 
 test('smoothness baseline measures node, preview, event, hidden-render, and state stability', () => {

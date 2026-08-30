@@ -45,6 +45,7 @@ let state = {
   assetReviewFilter: 'all',
   assetReviewQuery: '',
   assetReviewSelectedKey: null,
+  assetReviewProjectId: null,
   assetReviewLogicalItems: {
     existing: [],
     added: [],
@@ -234,6 +235,7 @@ function getRendererViewState() {
     if (list && Number.isFinite(list.scrollTop)) assetScrollTops[id] = list.scrollTop;
   }
   return {
+    assetReviewProjectId: state.assetReviewProjectId,
     scrollTop: scroller && Number.isFinite(scroller.scrollTop) ? scroller.scrollTop : null,
     assetScrollTops,
     activeElement,
@@ -266,6 +268,7 @@ function findRendererFocusTarget(viewState) {
 
 function restoreRendererViewState(viewState) {
   if (!viewState) return;
+  if (viewState.assetReviewProjectId !== state.assetReviewProjectId) return;
   const scroller = $('.app-content');
   if (scroller && viewState.scrollTop !== null) scroller.scrollTop = viewState.scrollTop;
   for (const [id, scrollTop] of Object.entries(viewState.assetScrollTops || {})) {
@@ -278,14 +281,23 @@ function restoreRendererViewState(viewState) {
   }
 }
 
+const rendererFallbackItemKeys = new WeakMap();
+let rendererFallbackItemSequence = 0;
+
 function getRendererItemKey(item, index = 0) {
   if (!item || typeof item !== 'object') return `item:${index}`;
   const identity = getFileVisualIdentity(item);
   if (identity) return `visual:${identity}`;
   if (item.fileId) return `file-id:${item.fileId}`;
+  if (item.captureId) return `capture-id:${item.captureId}`;
   if (item.captureSessionId) return `capture:${item.captureSessionId}`;
-  const role = item.projectRole || item.assetOrigin || 'item';
-  return `${role}:${item.name || 'unnamed'}:${index}`;
+  // A record without an authoritative ID keeps its object identity through
+  // filtering and scrolling. A replacement snapshot gets a fresh key: neither
+  // its display name nor its position can prove it is the previous record.
+  if (!rendererFallbackItemKeys.has(item)) {
+    rendererFallbackItemKeys.set(item, `record:${++rendererFallbackItemSequence}`);
+  }
+  return rendererFallbackItemKeys.get(item);
 }
 
 function getRendererItemSignature(item) {
@@ -404,25 +416,54 @@ function renderVirtualAssetList(list, items, build) {
   reconcileKeyedList(
     list,
     virtual.items.slice(start, end),
-    (item, visibleIndex) => {
-      const index = start + visibleIndex;
-      const row = virtual.build(item, index);
-      row.style.position = 'absolute';
-      row.style.top = `${index * ASSET_REVIEW_ROW_HEIGHT}px`;
-      row.style.left = '0';
-      row.style.right = '0';
-      row.style.minHeight = `${ASSET_REVIEW_ROW_HEIGHT}px`;
-      row.dataset.assetIndex = String(index);
-      row.setAttribute('aria-posinset', String(index + 1));
-      row.setAttribute('aria-setsize', String(virtual.items.length));
-      return row;
-    },
+    (item, visibleIndex) => virtual.build(item, start + visibleIndex),
+    (item, visibleIndex) => getRendererItemKey(item, start + visibleIndex),
   );
-  for (const row of list.children || []) {
-    const selected = row.dataset?.renderKey === `visual:${state.assetReviewSelectedKey}`
-      || row.dataset?.renderKey === state.assetReviewSelectedKey;
+  Array.from(list.children || []).forEach((row, visibleIndex) => {
+    // Position belongs to this filtered list, not to the row's content
+    // signature. Retained rows need the same updates as newly built rows.
+    const index = start + visibleIndex;
+    row.style.position = 'absolute';
+    row.style.top = `${index * ASSET_REVIEW_ROW_HEIGHT}px`;
+    row.style.left = '0';
+    row.style.right = '0';
+    row.style.minHeight = `${ASSET_REVIEW_ROW_HEIGHT}px`;
+    row.dataset.assetIndex = String(index);
+    row.setAttribute('aria-posinset', String(index + 1));
+    row.setAttribute('aria-setsize', String(virtual.items.length));
+    const selected = row.dataset?.renderKey === state.assetReviewSelectedKey;
     row.setAttribute('aria-selected', String(selected));
     row.classList.toggle('is-selected', selected);
+  });
+}
+
+function resetVirtualAssetList(list) {
+  if (!list) return;
+  const virtual = list.__assetReviewVirtualState;
+  if (virtual) list.removeEventListener('scroll', virtual.onScroll);
+  delete list.__assetReviewVirtualState;
+  list.__assetReviewAllItems = [];
+  list.classList.remove('asset-virtual-list');
+  list.style.height = '';
+  list.style.position = '';
+  if (typeof list.style.removeProperty === 'function') {
+    list.style.removeProperty('--asset-review-logical-height');
+  } else {
+    delete list.style['--asset-review-logical-height'];
+  }
+  list.scrollTop = 0;
+}
+
+function setAssetReviewProject(projectId) {
+  if (state.assetReviewProjectId === projectId) return;
+  state.assetReviewProjectId = projectId;
+  state.assetReviewSelectedKey = null;
+  state.assetReviewLogicalItems = { existing: [], added: [], missing: [] };
+  for (const id of ['project-file-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
+    const list = $(`#${id}`);
+    if (!list) continue;
+    resetVirtualAssetList(list);
+    reconcileKeyedList(list, [], () => null);
   }
 }
 
@@ -1203,6 +1244,7 @@ async function renderFiles() {
 
   if (!state.selectedProjectId) {
     setActiveFileVisualProject(null);
+    setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -1213,6 +1255,7 @@ async function renderFiles() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
     setActiveFileVisualProject(null);
+    setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -1221,6 +1264,7 @@ async function renderFiles() {
   }
 
   setActiveFileVisualProject(project.id);
+  setAssetReviewProject(project.id);
 
   // Show empty state when project is packaged or not actively watching
   if (project.status === 'packaged') {
@@ -2092,7 +2136,7 @@ function createAssetFileRow(
     row.setAttribute('aria-selected', String(selected));
     row.classList.toggle('is-selected', selected);
     const select = () => {
-      state.assetReviewSelectedKey = getRendererItemKey(file);
+      state.assetReviewSelectedKey = row.dataset.renderKey || getRendererItemKey(file);
       const list = row.parentElement;
       if (list?.__assetReviewVirtualState) {
         renderVirtualAssetList(list, list.__assetReviewVirtualState.items, list.__assetReviewVirtualState.build);
@@ -2155,7 +2199,9 @@ function setAssetPanelCount(element, includedCount, totalCount = includedCount) 
 
 function renderAssetPanelList(list, project, files, options = {}) {
   if (!list) return;
+  setAssetReviewProject(project.id);
   const allFiles = Array.isArray(files) ? files : [];
+  allFiles.forEach(getRendererItemKey);
   const buildRow = file => createAssetFileRow(project, file, {
     excluded: file.excluded === true,
     protectedSource: file.protectedSource === true || options.protectedSource === true,
@@ -2166,7 +2212,7 @@ function renderAssetPanelList(list, project, files, options = {}) {
   });
   if (!Array.isArray(files) || files.length === 0) {
     const emptyMessage = options.emptyMessage || 'No assets in this group.';
-    list.__assetReviewAllItems = [];
+    resetVirtualAssetList(list);
     reconcileKeyedList(list, [{ empty: true, message: emptyMessage }], item => {
       const empty = document.createElement('div');
       empty.className = 'asset-panel-empty';
@@ -2233,7 +2279,7 @@ function applyAssetReviewFilter() {
         filterItems(items, category),
         list.__assetReviewVirtualState.build,
       );
-    } else {
+    } else if (!Array.isArray(list.__assetReviewAllItems)) {
       for (const row of list.children || []) {
         const rowCategory = row.dataset?.assetCategory || category;
         const matchesFilter = filter === 'all' || filter === rowCategory || (filter === 'excluded' && rowCategory === 'excluded');
@@ -2358,6 +2404,7 @@ function closeAssetReviewWorkspace() {
 
 function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   if (!project) return;
+  setAssetReviewProject(project.id);
   const files = Array.isArray(presentedFiles) ? presentedFiles : (Array.isArray(project.files) ? project.files : []);
   const physicalSourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
   const figmaSourceNames = new Set();
@@ -2421,11 +2468,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const pendingFiles = state.assetWorkspace?.projectId === project.id
     ? (state.assetWorkspace.pendingFiles || []).filter(file => file.excluded !== true)
     : [];
-  const pendingEntries = getVisiblePendingAssetEntries(project);
-  const pendingReviewFiles = pendingEntries.map(({ rawFile, sourceIndex }) => {
-    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, pendingFiles);
-    return presentation ? { ...rawFile, ...presentation } : { ...rawFile, sourceName: null };
-  });
+  const pendingReviewFiles = $('#pending-file-list')?.__assetReviewAllItems || [];
   state.assetReviewLogicalItems = {
     existing: existingAssets,
     added: addedAssets,
@@ -2590,28 +2633,32 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   const section = $('#pending-section');
   const list = $('#pending-file-list');
   if (!section || !list) return;
+  setAssetReviewProject(project.id);
 
-  const excluded = new Set(project.excludedAssetKeys || []);
-  const pending = (project.pendingFiles || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)));
   const presentations = Array.isArray(presentedPendingFiles)
     ? presentedPendingFiles.filter(file => file.excluded !== true)
     : [];
+  // Compose once against authoritative raw entries; filtering must reuse these
+  // objects rather than attempt to rebind a cloned presentation by its name.
+  const pending = getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
+      ? { ...rawFile, ...presentation }
+      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
+    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
+    return file;
+  });
+  pending.forEach(getRendererItemKey);
 
   if (pending.length === 0) {
     section.classList.add('hidden');
-    list.__assetReviewAllItems = [];
+    resetVirtualAssetList(list);
     reconcileKeyedList(list, [], () => null);
     return;
   }
 
   section.classList.remove('hidden');
-  const visiblePendingEntries = getVisiblePendingAssetEntries(project);
-  const buildPendingRow = rawFile => {
-    const sourceIndex = visiblePendingEntries.find(entry => entry.rawFile === rawFile)?.sourceIndex;
-    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
-    const file = presentation
-      ? { ...rawFile, ...presentation }
-      : { ...rawFile, protectedSource: true, visualIdentity: null };
+  const buildPendingRow = file => {
     const row = document.createElement('div');
     row.className = 'pending-file';
     row.setAttribute('role', 'listitem');
@@ -2622,7 +2669,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     row.setAttribute('aria-selected', String(selected));
     row.classList.toggle('is-selected', selected);
     const select = () => {
-      state.assetReviewSelectedKey = getRendererItemKey(file);
+      state.assetReviewSelectedKey = row.dataset.renderKey || getRendererItemKey(file);
       renderVirtualAssetList(list, list.__assetReviewVirtualState.items, list.__assetReviewVirtualState.build);
     };
     row.addEventListener('click', event => {
