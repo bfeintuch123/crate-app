@@ -11151,6 +11151,15 @@ test('Review Assets preview requests stay bounded for large projects and preserv
       ));
 
       metadataTestHooks.clearFileVisualProjectCache();
+      const workspaceAssembly = await measureProjectFileVisualRequests(
+        () => callIpcRaw('projects:get-asset-workspace', project.id)
+      );
+      const workspaceSerializedBytes = Buffer.byteLength(
+        JSON.stringify(workspaceAssembly.responses),
+        'utf8'
+      );
+
+      metadataTestHooks.clearFileVisualProjectCache();
       metadataTestHooks.clearFileVisualTypeIconCache();
       const legacyPath = await measureProjectFileVisualRequests(
         () => Promise.all(requests.map(request => callIpcRaw(...request))),
@@ -11164,6 +11173,15 @@ test('Review Assets preview requests stay bounded for large projects and preserv
       );
       measurements.push({
         assetCount,
+        workspaceAssembly: {
+          elapsedMs: workspaceAssembly.elapsedMs,
+          open: workspaceAssembly.open,
+          lstat: workspaceAssembly.lstat,
+          realpath: workspaceAssembly.realpath,
+          lstatSync: workspaceAssembly.lstatSync,
+          realpathSync: workspaceAssembly.realpathSync,
+          serializedBytes: workspaceSerializedBytes,
+        },
         legacyPath: {
           elapsedMs: legacyPath.elapsedMs,
           open: legacyPath.open,
