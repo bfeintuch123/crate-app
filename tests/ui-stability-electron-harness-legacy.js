@@ -41,13 +41,6 @@ function uniqueSizes(sizes) {
   });
 }
 
-function expectedAssetColumns(workspaceWidth) {
-  if (workspaceWidth <= 420) return 1;
-  if (workspaceWidth <= 560) return 2;
-  if (workspaceWidth <= 900) return 3;
-  return 4;
-}
-
 function rectanglesOverlap(first, second) {
   if (!first || !second) return false;
   return (
@@ -289,12 +282,8 @@ function evaluateGeometry(geometry, sizeLabel, requestedSize, windowContract, co
     }
   }
 
-  const expectedColumns = expectedAssetColumns(geometry.assetReview?.clientWidth || 0);
-  if (geometry.firstRowColumns !== expectedColumns) {
-    failures.push(
-      `${sizeLabel}: expected ${expectedColumns} asset columns at Review Assets width `
-      + `${geometry.assetReview?.clientWidth}, observed ${geometry.firstRowColumns}`,
-    );
+  if (geometry.firstRowColumns > 1) {
+    failures.push(`${sizeLabel}: Review Assets must render one information row per logical position`);
   }
   if (geometry.minimumMeasuredCardWidth !== null && geometry.minimumMeasuredCardWidth < 150) {
     failures.push(
@@ -369,7 +358,7 @@ async function run() {
     );
     await waitForExpression(
       window,
-      "document.querySelectorAll('#added-assets-list > .asset-file-row').length === 256",
+      "document.querySelectorAll('#added-assets-list > .asset-file-row').length <= 36 && parseInt(document.querySelector('#added-assets-list').style.height, 10) === 256 * 58",
       'large synthetic asset workspace',
     );
     await window.webContents.executeJavaScript(

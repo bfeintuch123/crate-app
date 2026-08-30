@@ -86,7 +86,8 @@ function fixtureHtml() {
   <pre id="geometry-result"></pre>
   <script>
     const list = document.getElementById('added-assets-list');
-    for (let index = 0; index < 263; index += 1) {
+    list.style.height = String(263 * 58) + 'px';
+    for (let index = 0; index < Math.min(36, 263); index += 1) {
       const row = document.createElement('div');
       row.className = 'app-file asset-file-row';
       row.innerHTML = '<span class="file-visual"><span class="file-visual-badge">PNG</span></span><div class="asset-file-copy"><div class="app-file-name">Synthetic_Figma_Asset_' + String(index + 1).padStart(4, '0') + '_with_a_long_name.png</div><div class="file-origin"><span class="file-origin-mark figma">F</span><span class="file-origin-label">Figma · Current Page</span></div></div><span class="file-status-badge linked">LNK</span><button class="app-file-remove">×</button>';

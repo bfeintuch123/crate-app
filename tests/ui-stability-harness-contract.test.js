@@ -114,7 +114,8 @@ test('UI stability harness navigates through the real project and Review Assets 
   assert.match(legacyHarness, /#btn-review-assets/);
   assert.match(legacyHarness, /#asset-review-workspace/);
   assert.match(legacyHarness, /#added-assets-list > \.asset-file-row/);
-  assert.match(legacyHarness, /length === 256/);
+  assert.match(legacyHarness, /length <= 36/);
+  assert.match(legacyHarness, /style\.height/);
   assert.match(legacyHarness, /#asset-review-search/);
   assert.ok(
     legacyHarness.includes('data-asset-filter="added"')

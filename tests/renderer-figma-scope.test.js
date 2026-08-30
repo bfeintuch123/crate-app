@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { createUiSmoothnessFixture } = require('./ui-smoothness-fixture');
 
 function createElementStub(tagName = 'div') {
   const classes = new Set();
@@ -1809,30 +1810,14 @@ test('Needs Review bulk controls remain disabled when no pending item has an ind
   assert.deepEqual(fixture.getPersisted().pendingFiles, [{ name: 'No identity.png', ext: '.png' }]);
 });
 
-test('individual pending Add and Skip actions keep their existing targets and labels', async () => {
-  const addFixture = await loadPendingBatchFixture({ id: 'pending-individual-add' });
-  const addRow = addFixture.elements['pending-file-list'].children[0];
-  const addActions = addRow.children.find(child => child.className === 'pending-actions');
-  addActions.children[0].click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(addFixture.calls[0], {
-    action: 'acceptPending',
-    projectId: addFixture.project.id,
-    target: addFixture.project.pendingFiles[0].path,
-  });
-
-  const skipFixture = await loadPendingBatchFixture({ id: 'pending-individual-skip' });
-  const skipRow = skipFixture.elements['pending-file-list'].children[0];
-  const skipActions = skipRow.children.find(child => child.className === 'pending-actions');
-  assert.equal(skipActions.children[0].textContent, '+ Add');
-  assert.equal(skipActions.children[1].textContent, 'Skip');
-  skipActions.children[1].click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(skipFixture.calls[0], {
-    action: 'rejectPending',
-    projectId: skipFixture.project.id,
-    target: skipFixture.project.pendingFiles[0].path,
-  });
+test('Needs Review rows expose no individual Add or Skip controls', async () => {
+  const fixture = await loadPendingBatchFixture({ id: 'pending-no-individual-actions' });
+  for (const row of fixture.elements['pending-file-list'].children) {
+    assert.equal(row.children.some(child => child.tagName === 'BUTTON'), false);
+    assert.equal(row.children.some(child => child.className === 'pending-actions'), false);
+  }
+  assert.equal(fixture.elements['btn-include-all-existing'].textContent, 'Add All');
+  assert.equal(fixture.elements['btn-skip-all-existing'].textContent, 'Skip All');
 });
 
 test('Review Before Packaging uses the approved terminology and retains keyboard and accessibility semantics', async () => {
@@ -1955,8 +1940,8 @@ test('excluded Added While Working assets remain visible and restore without a f
   assert.equal(elements['added-assets-list'].children.length, 1);
   const excludedRow = elements['added-assets-list'].children[0];
   assert.equal(excludedRow.className.includes('is-excluded'), true);
-  const restoreButton = excludedRow.children.find(child => child.className === 'app-file-restore');
-  assert.equal(restoreButton.textContent, 'Include');
+  const restoreButton = excludedRow.children.find(child => child.className === 'app-file-remove');
+  assert.equal(restoreButton.textContent, '\u00D7');
   assert.equal(restoreButton.getAttribute('aria-label'), 'Include Added.png in this project');
 
   vm.runInContext("state.assetReviewFilter = 'excluded';", renderer);
@@ -1967,7 +1952,7 @@ test('excluded Added While Working assets remain visible and restore without a f
 
   assert.deepEqual(toggles, [[project.id, added.visualIdentity]]);
   assert.equal(elements['filter-count-excluded'].textContent, '0');
-  assert.equal(elements['added-assets-list'].children[0].className.includes('is-excluded'), false);
+  assert.equal(elements['added-assets-list'].children.length, 0);
 });
 
 test('failed first-scan sources expose accessible recovery while healthy sources remain protected', async () => {
@@ -2058,14 +2043,102 @@ test('file visuals prefer raster thumbnails, then native icons, then bounded ext
     },
   } });
 
-  renderer.renderAssetWorkspace(project);
+  const visuals = project.files.map(file => renderer.createFileVisual(project.id, file));
   await new Promise(resolve => setImmediate(resolve));
 
-  const [photoRow, layoutRow, archiveRow] = elements['added-assets-list'].children;
-  assert.equal(photoRow.children[0].classList.contains('is-thumbnail'), true);
-  assert.equal(photoRow.children[0].dataset.fileIdentity, undefined);
-  assert.equal(layoutRow.children[0].classList.contains('is-icon'), true);
-  assert.equal(archiveRow.children[0].children[0].textContent, 'XYZ');
+  assert.equal(visuals[0].classList.contains('is-thumbnail'), true);
+  assert.equal(visuals[0].dataset.fileIdentity, undefined);
+  assert.equal(visuals[1].classList.contains('is-icon'), true);
+  assert.equal(visuals[2].children[0].textContent, 'XYZ');
+});
+
+test('Review Assets virtualizes 30, 263, and 500 asset datasets without default preview requests', async () => {
+  for (const assetCount of [30, 263, 500]) {
+    const fixture = createUiSmoothnessFixture({ assetCount });
+    let visualCalls = 0;
+    const { document, elements } = createInteractiveRendererDom();
+    const renderer = loadRendererHelpers(document, {
+      crate: {
+        getProjects: async () => [fixture.project],
+        getAssetWorkspace: async () => fixture.workspace,
+        getFileVisual: async () => {
+          visualCalls += 1;
+          return { kind: 'fallback' };
+        },
+      },
+    });
+    renderer.testProject = fixture.project;
+    vm.runInContext(`
+      state.projects = [testProject];
+      state.selectedProjectId = testProject.id;
+      state.assetReviewOpen = true;
+    `, renderer);
+    elements['tab-projects'].classList.remove('active');
+    elements['tab-current-project'].classList.add('active');
+
+    await renderer.renderFiles();
+
+    assert.equal(visualCalls, 0);
+    assert.ok(elements['existing-assets-list'].children.length <= 36);
+    assert.ok(elements['added-assets-list'].children.length <= 36);
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.existing.length', renderer), Math.min(7, assetCount));
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.added.length', renderer), Math.max(0, assetCount - 7));
+
+    elements['added-assets-list'].scrollTop = 10000;
+    elements['added-assets-list'].dispatchEvent({ type: 'scroll' });
+    assert.ok(elements['added-assets-list'].children.length <= 36);
+
+    vm.runInContext("state.assetReviewFilter = 'added'; state.assetReviewQuery = 'synthetic_smoothness_asset_0250';", renderer);
+    renderer.applyAssetReviewFilter();
+    assert.equal(elements['added-assets-list'].children.length, assetCount >= 250 ? 1 : 0);
+    if (assetCount >= 250) {
+      assert.match(getElementTreeText(elements['added-assets-list'].children[0]), /0250/);
+      assert.equal(elements['added-assets-list'].children[0].getAttribute('aria-setsize'), '1');
+    }
+  }
+});
+
+test('Review Assets preserves filter, selection, focus, and stable row identity across refresh', async () => {
+  const fixture = createUiSmoothnessFixture({ assetCount: 30 });
+  const { document, elements } = createInteractiveRendererDom();
+  const updatedFixture = createUiSmoothnessFixture({ assetCount: 30 });
+  updatedFixture.project.files[4].name = 'Synthetic_Smoothness_Asset_0004_Updated.png';
+  updatedFixture.workspace.files[4].name = updatedFixture.project.files[4].name;
+  let workspace = fixture.workspace;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getProjects: async () => [workspace === fixture.workspace ? fixture.project : updatedFixture.project],
+      getAssetWorkspace: async () => workspace,
+    },
+  });
+  renderer.testProject = fixture.project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.assetReviewOpen = true;
+    state.assetReviewFilter = 'added';
+    state.assetReviewQuery = 'synthetic_smoothness_asset';
+  `, renderer);
+  elements['tab-projects'].classList.remove('active');
+  elements['tab-current-project'].classList.add('active');
+  await renderer.renderFiles();
+
+  const selectedRow = elements['added-assets-list'].children[0];
+  const selectedKey = selectedRow.dataset.renderKey;
+  selectedRow.click();
+  elements['asset-review-search'].focus();
+  elements['app-content'].scrollTop = 317;
+  workspace = updatedFixture.workspace;
+  vm.runInContext('state.projects = [testProject];', renderer);
+  await renderer.renderFiles();
+
+  assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'added');
+  assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'synthetic_smoothness_asset');
+  assert.equal(vm.runInContext('state.assetReviewSelectedKey', renderer), selectedKey);
+  assert.equal(elements['app-content'].scrollTop, 317);
+  assert.equal(document.activeElement, elements['asset-review-search']);
+  assert.equal(elements['added-assets-list'].children[0].dataset.renderKey, selectedKey);
+  assert.equal(elements['added-assets-list'].children[0].getAttribute('aria-selected'), 'true');
 });
 
 test('native file icons and image thumbnails stay sharp without cropped previews', () => {

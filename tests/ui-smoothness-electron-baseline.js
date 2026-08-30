@@ -471,7 +471,7 @@ async function auditFixture(assetCount) {
     const workspaceVisibleMs = Date.now() - projectClickAt;
     await waitForExpression(
       window,
-      `document.querySelectorAll('#existing-assets-list > .asset-file-row, #added-assets-list > .asset-file-row').length === ${assetCount}`,
+      `(${assetCount} === 0) || (document.querySelectorAll('#existing-assets-list > .asset-file-row, #added-assets-list > .asset-file-row').length <= 36 && document.querySelector('#added-assets-list, #existing-assets-list')?.style.height)`,
       `${assetCount}-asset workspace`,
     );
     const workspaceMetrics = await waitForQuietMetrics(window);
@@ -616,8 +616,8 @@ function createFindings(results) {
       findings.push({ assetCount: result.assetCount, category: 'hidden-rerender', detail: 'A hidden Projects destination rebuilt after a file event.' });
     }
     const previewRequests = Number(result.workspaceMetrics?.getFileVisual || 0);
-    if (result.assetCount >= 263 && previewRequests < result.assetCount) {
-      findings.push({ assetCount: result.assetCount, category: 'preview-queue-coverage', detail: `${previewRequests} preview requests reached the bridge for ${result.assetCount} assets.` });
+    if (previewRequests > 36) {
+      findings.push({ assetCount: result.assetCount, category: 'preview-mount-bound', detail: `${previewRequests} preview requests exceeded the mounted-row ceiling.` });
     }
   }
 
