@@ -1241,6 +1241,11 @@ function makePendingFile(filePath, source = 'lastused-scan') {
   };
 }
 
+function roundTripFakeStore() {
+  fs.writeFileSync(storeInstance.path, JSON.stringify(storeInstance.data), { mode: 0o600 });
+  storeInstance.data = JSON.parse(fs.readFileSync(storeInstance.path, 'utf8'));
+}
+
 async function setProjectFiles(projectId, {
   files = [],
   pendingFiles = [],
@@ -14292,7 +14297,7 @@ test('accepted Illustrator pending source remains aligned across pause and resum
 
   try {
     const project = await createProject('Accepted native Illustrator reconciliation');
-    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    let stored = storeInstance.data.projects.find(item => item.id === project.id);
     const pendingFile = {
       ...makePendingFile(sourcePath, 'app-opened'),
       captureState: 'observed',
@@ -14308,6 +14313,9 @@ test('accepted Illustrator pending source remains aligned across pause and resum
 
     const accepted = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
     assert.equal(accepted.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(accepted.files.find(file => file.path === sourcePath).acceptedPendingAppFamily, 'illustrator');
+    roundTripFakeStore();
+    stored = storeInstance.data.projects.find(item => item.id === project.id);
 
     const stalePath = path.join(TEST_HOME, 'Desktop', 'Stale_Prior_Activation.ai');
     const pausedPath = path.join(TEST_HOME, 'Desktop', 'Created_While_Paused.ai');
@@ -14325,6 +14333,8 @@ test('accepted Illustrator pending source remains aligned across pause and resum
         evidenceStrength: 'structured-app-document',
       },
     });
+    roundTripFakeStore();
+    stored = storeInstance.data.projects.find(item => item.id === project.id);
 
     const projection = async () => {
       const scoped = await getProject(project.id);
@@ -14357,8 +14367,10 @@ test('accepted Illustrator pending source remains aligned across pause and resum
       workspaceStalePendingCount: beforePause.workspaceStalePendingCount,
     }, { rawFileCount: 1, scopedFileCount: 1, ipcFileCount: 1, workspaceFileCount: 1, rawStalePendingCount: 1, scopedStalePendingCount: 0, workspaceStalePendingCount: 0 });
 
+    const pausedWatcher = latestWatcherHandlers();
     await callIpcRaw('projects:pause', project.id);
     writeSyntheticAiFile(pausedPath, 'created while paused');
+    await pausedWatcher.add(pausedPath);
     const whilePaused = await projection();
     assert.deepEqual({
       rawFileCount: whilePaused.rawFileCount,
@@ -14393,6 +14405,41 @@ test('accepted Illustrator pending source remains aligned across pause and resum
     assert.equal(scope.status, 'ready');
     assert.deepEqual(scope.baselineDocumentPaths, []);
     assert.deepEqual(scope.admittedDocumentPaths.map(item => path.basename(item)), [path.basename(sourcePath).toLowerCase()]);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
+test('accepted pending non-Illustrator sources never enter the Illustrator activation scope', async () => {
+  resetTestHomeWorkspace();
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '654\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Non-Illustrator accepted source boundaries');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    stored.files = [
+      { ...makePendingFile(path.join(TEST_HOME, 'Desktop', 'Photoshop_Source.psd'), 'app-opened'), acceptedPending: true, acceptedPendingAppFamily: 'photoshop' },
+      { ...makePendingFile(path.join(TEST_HOME, 'Desktop', 'InDesign_Source.indd'), 'app-opened'), acceptedPending: true, acceptedPendingAppFamily: 'indesign' },
+      { ...makePendingFile(path.join(TEST_HOME, 'Desktop', 'Figma_Source.fig'), 'app-opened'), acceptedPending: true, acceptedPendingAppFamily: 'figma' },
+    ];
+    roundTripFakeStore();
+
+    await callIpcRaw('projects:pause', project.id);
+    await callIpcRaw('projects:start-watching', project.id);
+
+    const scope = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    assert.equal(scope.status, 'ready');
+    assert.deepEqual(scope.baselineDocumentPaths, []);
+    assert.deepEqual(scope.admittedDocumentPaths, []);
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.projectId, project.id);
+    assert.deepEqual(workspace.files.map(file => file.ext).sort(), ['.fig', '.indd', '.psd']);
   } finally {
     setChildProcessHandler(null);
   }

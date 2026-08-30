@@ -2152,6 +2152,22 @@ function stripLiveCaptureMetadata(fileEntry) {
   return cleanFileEntry;
 }
 
+function getAcceptedPendingAppFamily(fileEntry) {
+  const appFamily = getScopedRecordAppFamily(fileEntry?.acceptedPendingAppFamily)
+    || getExplicitCaptureAppFamily(fileEntry);
+  return appFamily && appFamily !== 'generic' ? appFamily : null;
+}
+
+function createAcceptedPendingFile(fileEntry) {
+  const acceptedFile = {
+    ...stripLiveCaptureMetadata(fileEntry),
+    acceptedPending: true,
+  };
+  const appFamily = getAcceptedPendingAppFamily(fileEntry);
+  if (appFamily) acceptedFile.acceptedPendingAppFamily = appFamily;
+  return acceptedFile;
+}
+
 function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
   if (!project || !fileEntry || !normalizedPath) {
@@ -4686,8 +4702,7 @@ function setProjectExistingAssetsDecision(projectId, decision) {
         }
         if (!acceptedKeys.has(dedupKey)) {
           const acceptedFile = {
-            ...stripLiveCaptureMetadata(file),
-            acceptedPending: true,
+            ...createAcceptedPendingFile(file),
           };
           project.files.push(acceptedFile);
           acceptedKeys.add(dedupKey);
@@ -10234,7 +10249,7 @@ const ILLUSTRATOR_SCOPE_SET_KEYS = ['baselineDocumentPaths', 'admittedDocumentPa
 function normalizeIllustratorDocumentName(value) { const safe = sanitizeLiveEvidenceText(value); return safe ? safe.toLowerCase() : null; } function getExplicitCaptureAppFamily(fileEntry, observation = {}) { const capture = fileEntry && fileEntry.captureEvidence, evidence = observation.liveEvidence || {}; for (const value of [observation.appFamily, evidence.appFamily, capture && capture.appFamily]) { const family = getScopedRecordAppFamily(value); if (family) return family; } return getScopedRecordAppFamily(fileEntry && fileEntry.source); }
 function getScopedFileAppFamily(project, fileEntry, observation = {}) { const explicit = getExplicitCaptureAppFamily(fileEntry, observation); if (explicit || !project || !fileEntry) return explicit; const key = getLiveEvidenceKeyHash(normalizeTrackedFilePath(fileEntry.path)), latest = key && project.liveEvidenceLedger?.candidates?.[key]?.latest; return getExplicitCaptureAppFamily(latest, latest || {}); } function isIllustratorSourceCandidate(file) { const family = getExplicitCaptureAppFamily(file); return family === 'illustrator' || ((!family || family === 'generic') && isExplicitUserCapturedFile(file) && ILLUSTRATOR_SOURCE_EXTENSIONS.has((file && (file.ext || path.extname(file.path || file.name || '')) || '').toLowerCase())); }
 function getIllustratorActivationScope(projectId, activationToken = null) { const scope = illustratorActivationScopes.get(projectId); return !scope || (activationToken !== null && scope.activationToken !== activationToken) ? null : scope; } function getFreshActiveWatchingProject(projectId, activationToken) { return isActiveWatchingProject(projectId, activationToken) ? getProjects().find(project => project && project.id === projectId) || null : null; }
-function isAcceptedIllustratorProjectFile(project, file) { return !!file && (isIllustratorSourceCandidate(file) || (file.acceptedPending === true && file.projectRole !== 'asset' && isProjectAssetBaselineSource(file)) || isPersistedAcceptedWatcherSource(project, file)) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
+function isAcceptedIllustratorProjectFile(project, file) { const ext = (file?.ext || path.extname(file?.path || '') || '').toLowerCase(); const acceptedPendingIllustratorSource = file?.acceptedPending === true && file.projectRole !== 'asset' && ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext) && (getAcceptedPendingAppFamily(file) === 'illustrator' || getScopedFileAppFamily(project, file) === 'illustrator') && isProjectAssetBaselineSource(file); return !!file && (isIllustratorSourceCandidate(file) || acceptedPendingIllustratorSource || isPersistedAcceptedWatcherSource(project, file)) && isTrustedSessionProjectFile(project, file); } function sameIllustratorActivationScope(a, b) { return a.status === b.status && ILLUSTRATOR_SCOPE_SET_KEYS.every(key => { const left = [...a[key]].sort(), right = [...b[key]].sort(); return left.length === right.length && left.every((value, index) => value === right[index]); }); } function reviseIllustratorActivationScope(projectId, scope, update) { if (!scope || illustratorActivationScopes.get(projectId) !== scope) return null; const next = { ...scope, ...Object.fromEntries(ILLUSTRATOR_SCOPE_SET_KEYS.map(key => [key, new Set(scope[key])])) }; update(next); if (illustratorActivationScopes.get(projectId) !== scope) return null; if (sameIllustratorActivationScope(scope, next)) return scope; next.revision = scope.revision + 1; illustratorActivationScopes.set(projectId, next); return next; }
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES = new Set(['illustrator-placed-item-file-query-failed', 'illustrator-placed-item-file-of-query-failed']);
 const ILLUSTRATOR_DIRECT_PATH_FALLBACK_RECOVERY_STATUSES = new Set([
   ...ILLUSTRATOR_DIRECT_PATH_FALLBACK_FAILURES,
@@ -14019,8 +14034,7 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
 
     if (!acceptedPaths.has(acceptedKey)) {
       const acceptedFile = {
-        ...stripLiveCaptureMetadata(file),
-        acceptedPending: true,
+        ...createAcceptedPendingFile(file),
       };
       project.files.push(acceptedFile);
       recordPendingFileDecision(project, acceptedFile, 'accepted');

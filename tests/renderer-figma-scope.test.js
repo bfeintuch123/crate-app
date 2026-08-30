@@ -1214,6 +1214,52 @@ test('Current Project separates protected sources, Existing Assets, and Added Wh
   assert.equal(removeButton.getAttribute('aria-label'), 'Exclude Added.png from this project');
 });
 
+test('Review Assets renders the accepted source card and omits scoped stale pending rows', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'resumed-illustrator-project',
+    name: 'Resumed Illustrator Project',
+    type: 'branding',
+    status: 'watching',
+    files: [{
+      name: 'Accepted_Native_Illustrator.ai',
+      ext: '.ai',
+      assetOrigin: 'added',
+      projectRole: 'source',
+      protectedSource: true,
+      visualIdentity: 'accepted-source-identity',
+      visualRevision: 'accepted-source-revision',
+    }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'included', decision: 'include' },
+  };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getProjects: async () => [project],
+      getAssetWorkspace: async projectId => ({
+        projectId,
+        files: project.files,
+        pendingFiles: [],
+      }),
+    },
+  });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.assetReviewOpen = true;
+  `, renderer);
+
+  await renderer.renderFiles();
+
+  assert.equal(elements['project-file-list'].children.length, 1);
+  assert.equal(getElementTreeText(elements['project-file-list']).includes('Accepted_Native_Illustrator.ai'), true);
+  assert.equal(elements['pending-file-list'].children.length, 0);
+  assert.equal(elements['pending-section'].classList.contains('hidden'), true);
+  assert.equal(elements['asset-review-workspace'].classList.contains('hidden'), false);
+});
+
 test('Current Project dashboard uses Working Files and privacy-safe mixed-app origin labels', () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
