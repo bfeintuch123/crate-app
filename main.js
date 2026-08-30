@@ -1024,6 +1024,29 @@ function isCurrentSessionSavedSource(project, file) {
   return !!(watchStart && addedAt >= watchStart);
 }
 
+function startWatchSession(project) {
+  if (!project || typeof project !== 'object') return null;
+  project.watchSessionId = crypto.randomUUID();
+  return project.watchSessionId;
+}
+
+function isCurrentWatchSessionPendingFile(project, file) {
+  if (!project || !file || project.status !== 'watching') return true;
+  if (isExplicitUserCapturedFile(file) || isAcceptedPendingCapturedFile(project, file)) return true;
+
+  const sessionId = typeof project.watchSessionId === 'string' ? project.watchSessionId.trim() : '';
+  const fileSessionId = typeof file.captureSessionId === 'string' ? file.captureSessionId.trim() : '';
+  if (sessionId && fileSessionId) {
+    return fileSessionId === sessionId;
+  }
+
+  const watchStart = Number.isFinite(project.watchStartedAt)
+    ? project.watchStartedAt
+    : Date.parse(project.watchStartedAt);
+  const addedAt = typeof file.addedAt === 'number' ? file.addedAt : Date.parse(file.addedAt);
+  return !Number.isFinite(watchStart) || !Number.isFinite(addedAt) || addedAt >= watchStart;
+}
+
 function hasPersistedWatcherObservation(project, filePath) {
   const normalizedPath = normalizeTrackedFilePath(filePath);
   if (!project || !normalizedPath || !project.provenance || !Array.isArray(project.provenance.observations)) return false;
@@ -2101,11 +2124,20 @@ function decorateLiveObservedFile(fileEntry, classification, observation = {}) {
     Object.assign(captureEvidence, classification.evidenceSummary);
   }
 
+  const captureSessionId = typeof observation.captureSessionId === 'string'
+    ? observation.captureSessionId.trim()
+    : '';
+  if (captureSessionId) captureEvidence.captureSessionId = captureSessionId;
+
   return {
     ...fileEntry,
     captureState,
     captureReason: reason,
     captureEvidence,
+    ...(captureSessionId ? {
+      captureSessionId,
+      captureSessionObserved: observation.captureSessionObserved !== false,
+    } : {}),
   };
 }
 
@@ -2249,7 +2281,12 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
 }
 
 function stageLiveObservedFile(project, fileEntry, observation = {}) {
-  observation = { ...observation, appFamily: getLiveCaptureAppFamily(fileEntry, observation) || 'generic' }; if (!isIllustratorScopedFileAllowed(project, fileEntry, observation)) return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, changed: false, file: fileEntry, reason: 'illustrator-activation-scope', captureReason: 'illustrator-activation-scope', captureState: LIVE_CAPTURE_STATES.IGNORED, normalizedPath: normalizeTrackedFilePath(fileEntry && fileEntry.path) };
+  observation = {
+    ...observation,
+    appFamily: getLiveCaptureAppFamily(fileEntry, observation) || 'generic',
+    captureSessionId: observation.captureSessionId || project?.watchSessionId || null,
+  };
+  if (!isIllustratorScopedFileAllowed(project, fileEntry, observation)) return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, changed: false, file: fileEntry, reason: 'illustrator-activation-scope', captureReason: 'illustrator-activation-scope', captureState: LIVE_CAPTURE_STATES.IGNORED, normalizedPath: normalizeTrackedFilePath(fileEntry && fileEntry.path) };
   const classification = classifyLiveObservedFile(project, fileEntry, observation);
   const normalizedPath = classification.normalizedPath;
   const evidenceChanged = recordLiveEvidence(project, fileEntry, classification);
@@ -2283,6 +2320,30 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
     }, classification, observation);
     project.pendingFiles[idx] = nextFile;
     return { ...classification, changed: true, evidenceChanged, file: nextFile };
+  }
+
+  if (
+    classification.decision === LIVE_CAPTURE_DECISIONS.KEEP_EXISTING &&
+    observation.captureSessionId &&
+    observation.captureSessionObserved !== false
+  ) {
+    const candidateKey = getTrackedFileDedupKey(fileEntry);
+    const idx = (project.pendingFiles || []).findIndex(file => (
+      getTrackedFileDedupKey(file) === candidateKey ||
+      normalizeTrackedFilePath(file && file.path) === normalizedPath
+    ));
+    const existingFile = idx === -1 ? null : project.pendingFiles[idx];
+    if (existingFile && (
+      existingFile.captureSessionId !== observation.captureSessionId ||
+      existingFile.captureSessionObserved === false
+    )) {
+      project.pendingFiles[idx] = {
+        ...existingFile,
+        captureSessionId: observation.captureSessionId,
+        captureSessionObserved: observation.captureSessionObserved !== false,
+      };
+      return { ...classification, changed: true, evidenceChanged, file: project.pendingFiles[idx] };
+    }
   }
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) {
@@ -7703,6 +7764,7 @@ function activateSingleWatchingProject(projectId, settings, { preserveWatchStart
   if (!preserveWatchStartedAt || !project.watchStartedAt) {
     project.watchStartedAt = Date.now();
   }
+  startWatchSession(project);
   project.figmaSession = buildFigmaSessionSnapshot(project, settings);
   normalizeAutoCaptureProjectState(project);
   safelyEnsureProjectProvenance(project);
@@ -10200,10 +10262,10 @@ function isIllustratorScopedFileAllowed(project, fileEntry, observation = {}) { 
 function getScopedRecordAppFamily(value) { const normalized = normalizeLiveCaptureReason(value, ''); if (!normalized) return null; if (CAPTURE_SOURCE_APP_FAMILY.has(value)) return CAPTURE_SOURCE_APP_FAMILY.get(value); if (normalized === 'illustrator' || normalized.startsWith('ai-') || normalized.includes('illustrator')) return 'illustrator'; if (normalized === 'photoshop' || normalized.startsWith('psd-') || normalized.startsWith('ps-') || normalized.includes('photoshop')) return 'photoshop'; if (normalized === 'indesign' || normalized.startsWith('indd-') || normalized.includes('indesign')) return 'indesign'; if (normalized === 'figma' || normalized.startsWith('fig-') || normalized.includes('figma')) return 'figma'; if (normalized.includes('powerpoint') || normalized.includes('keynote') || normalized.includes('presentation')) return 'presentation'; if (normalized === 'generic' || normalized.startsWith('lastused-') || normalized === 'manual-browse' || normalized === 'lsof') return 'generic'; return null; } function getScopedRecordFamilies(record) { const values = [record?.appFamily, record?.source, record?.explicitUserAuthority?.source, record?.captureEvidence?.appFamily, record?.captureEvidence?.source, record?.captureEvidence?.observerMethod, record?.latest?.appFamily, record?.latest?.source, record?.latest?.observerMethod, record?.observer?.appFamily, record?.observer?.method, record?.payload?.appFamily, record?.payload?.source, record?.payload?.authoritySource, record?.payload?.observer?.method]; return new Set(values.map(getScopedRecordAppFamily).filter(Boolean)); }
 const SCOPED_PRIMARY_PATH_FIELDS = ['path', 'filePath', 'localPath', 'normalizedPath']; function isScopedRecord(value) { return isRecord(value) && ['id', 'fileId', 'evidenceKey', 'path', 'source', 'appFamily', 'captureEvidence', 'latest', 'observer', 'relationType', 'subjectNodeId', 'objectNodeId', 'type'].some(key => Object.prototype.hasOwnProperty.call(value, key)); } function scopedRecordIdentities(entry) { const item = entry.item, ids = [item.id, item.fileId, item.evidenceKey]; if (!Array.isArray(entry.parent) && typeof entry.key === 'string' && !['captureEvidence', 'latest', 'observer', 'payload', 'metadata'].includes(entry.key)) ids.push(entry.key); return ids.filter(value => typeof value === 'string'); } function scopedRecordPrimaryPath(record, key, nodePaths, ledgerPaths) { const values = [...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.latest?.[field]), ...SCOPED_PRIMARY_PATH_FIELDS.map(field => record?.payload?.[field])]; for (const value of values) { const normalized = typeof value === 'string' && (path.isAbsolute(value) || /normalizedPath/.test(key || '')) ? normalizeTrackedFilePath(value) : null; if (normalized) return normalized; } return ledgerPaths.get(key) || nodePaths.get(record?.objectNodeId) || (typeof key === 'string' && path.isAbsolute(key) ? normalizeTrackedFilePath(key) : null); }
 function scopedRecordReferencesHidden(value, info, hiddenPaths, hiddenIds, nodePaths) { const ancestors = new Set(); let visited = 0; const visit = (item, key = '') => { if (++visited > 50000) return true; if (typeof item === 'string') { if (hiddenIds.has(item)) return true; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(item) : null, normalized = (path.isAbsolute(item) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(item) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return !!deniedPath && !(info.authorized && info.primaryPath === deniedPath); } if (!Array.isArray(item) && !isRecord(item)) return false; if (ancestors.has(item)) return true; ancestors.add(item); try { for (const childKey of Object.keys(item)) if (visit(item[childKey], childKey)) return true; return false; } catch (_) { return true; } finally { ancestors.delete(item); } }; return visit(value); }
-function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
+function getIllustratorScopedProjectView(project) { if (!project) return project; const scope = getIllustratorActivationScope(project.id), hiddenPaths = new Set(scope ? [...scope.baselineDocumentPaths, ...scope.excludedLinkedPaths] : []), hiddenPendingPaths = new Set(), stalePendingFiles = new Set(), scopeAllowedPaths = new Set(); for (const file of [...(project.files || []), ...(project.pendingFiles || [])]) { const filePath = normalizeTrackedFilePath(file?.path); if ((project.pendingFiles || []).includes(file) && !isCurrentWatchSessionPendingFile(project, file)) { hiddenPaths.add(filePath); hiddenPendingPaths.add(filePath); stalePendingFiles.add(file); } else if (!isIllustratorScopedFileAllowed(project, file)) hiddenPaths.add(filePath); else if (hiddenPaths.has(filePath) && !hiddenPendingPaths.has(filePath) && getScopedFileAppFamily(project, file) === 'illustrator') scopeAllowedPaths.add(filePath); } hiddenPaths.delete(null); if (!hiddenPaths.size) return project;
   const nodePaths = new Map(), ledgerPaths = new Map(); for (const hiddenPath of hiddenPaths) { nodePaths.set(createNodeId(NODE_TYPES.FILE, { normalizedPath: hiddenPath }), hiddenPath); const ledgerId = getLiveEvidenceKeyHash(hiddenPath); if (ledgerId) ledgerPaths.set(ledgerId, hiddenPath); } for (const [id, node] of Object.entries(project.provenance?.nodes || {})) { const nodePath = normalizeTrackedFilePath(node?.path || node?.normalizedPath); if (hiddenPaths.has(nodePath)) { nodePaths.set(id, nodePath); if (typeof node?.id === 'string') nodePaths.set(node.id, nodePath); } }
   const hiddenEntries = new WeakMap(), records = [], infos = [], infoByObject = new WeakMap(), markHidden = (parent, key) => { if (!parent) return false; let keys = hiddenEntries.get(parent); if (!keys) hiddenEntries.set(parent, keys = new Set()); const fresh = !keys.has(key); keys.add(key); return fresh; }, isHidden = (parent, key) => !!hiddenEntries.get(parent)?.has(key); let collected = 0; const collect = (value, parent, key, ancestors) => { if (!Array.isArray(value) && !isRecord(value)) return; if (++collected > 50000 || ancestors.has(value)) { markHidden(parent, key); return; } if (isScopedRecord(value)) records.push({ item: value, parent, key }); ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { if (path.isAbsolute(childKey) && hiddenPaths.has(normalizeTrackedFilePath(childKey))) markHidden(value, childKey); else collect(child, value, childKey, ancestors); } } catch (_) { markHidden(parent, key); } finally { ancestors.delete(value); } }; for (const [key, value] of Object.entries(project)) collect(value, project, key, new Set());
-  for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
+  for (const entry of records) { const families = getScopedRecordFamilies(entry.item); if ((project.files || []).includes(entry.item) || (project.pendingFiles || []).includes(entry.item)) { const family = getScopedFileAppFamily(project, entry.item); if (family) families.add(family); } const info = { families, primaryPath: scopedRecordPrimaryPath(entry.item, entry.key, nodePaths, ledgerPaths), authorized: false, entry }; infos.push(info); infoByObject.set(entry.item, info); } const allowedPaths = new Set(scopeAllowedPaths); for (const info of infos) if (!stalePendingFiles.has(info.entry.item) && hiddenPaths.has(info.primaryPath) && !info.families.has('illustrator') && (info.families.size || isExplicitUserCapturedFile(info.entry.item))) allowedPaths.add(info.primaryPath); for (const info of infos) info.authorized = !stalePendingFiles.has(info.entry.item) && allowedPaths.has(info.primaryPath) && ((scopeAllowedPaths.has(info.primaryPath) && info.families.size === 1 && info.families.has('illustrator')) || (!info.families.has('illustrator') && info.families.size > 0) || isExplicitUserCapturedFile(info.entry.item) || (info.entry.item.type === NODE_TYPES.FILE && info.families.size === 0));
   const hiddenIds = new Set(); let changed = true; while (changed) { changed = false; for (const info of infos) { const { entry } = info; if (isHidden(entry.parent, entry.key)) continue; const identities = scopedRecordIdentities(entry), keyHidden = typeof entry.key === 'string' && (hiddenIds.has(entry.key) || (path.isAbsolute(entry.key) && hiddenPaths.has(normalizeTrackedFilePath(entry.key)))), deniedPrimary = hiddenPaths.has(info.primaryPath) && !info.authorized; if (!keyHidden && !deniedPrimary && !identities.some(id => hiddenIds.has(id)) && !scopedRecordReferencesHidden(entry.item, info, hiddenPaths, hiddenIds, nodePaths)) continue; changed = markHidden(entry.parent, entry.key) || changed; for (const id of [...identities, ...(entry.item.evidenceIds || [])]) if (typeof id === 'string' && !hiddenIds.has(id)) { hiddenIds.add(id); changed = true; } } }
   const OMIT = Symbol('scoped-omit'); let filteredCount = 0; const filter = (value, parent = null, key = '', ancestors = new Set(), owner = null) => { if (parent && (isHidden(parent, key) || hiddenIds.has(key) || (path.isAbsolute(key) && hiddenPaths.has(normalizeTrackedFilePath(key))))) return OMIT; if (typeof value === 'string') { if (hiddenIds.has(value)) return OMIT; const nodePath = /NodeId$/i.test(key) ? nodePaths.get(value) : null, normalized = (path.isAbsolute(value) || /paths?$/i.test(key)) ? normalizeTrackedFilePath(value) : null, deniedPath = nodePath || (normalized && hiddenPaths.has(normalized) ? normalized : null); return deniedPath && !(owner?.authorized && owner.primaryPath === deniedPath) ? OMIT : value; } if (!Array.isArray(value) && !isRecord(value)) return value; if (++filteredCount > 50000 || ancestors.has(value)) return OMIT; const nextOwner = infoByObject.get(value) || owner, output = Array.isArray(value) ? [] : {}; ancestors.add(value); try { for (const [childKey, child] of Object.entries(value)) { const filtered = filter(child, value, childKey, ancestors, nextOwner); if (filtered !== OMIT) Array.isArray(output) ? output.push(filtered) : output[childKey] = filtered; } return output; } catch (_) { return OMIT; } finally { ancestors.delete(value); } }; const view = filter(project); return view === OMIT ? null : view; }
 function buildIllustratorSessionScope(project, activeState) {
@@ -13477,6 +13539,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
               source: 'chokidar-add',
               observerMethod: 'chokidar-add',
             },
+            captureSessionObserved: addBelongsToCurrentSession === true,
           });
           if (!staged.changed) return null;
           if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
