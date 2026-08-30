@@ -1044,6 +1044,15 @@ module.exports.__crateMetadataTestHooks = {
   getWatcherCoordinatorSnapshot(projectId) {
     return getWatcherCoordinator(projectId).snapshot(projectId);
   },
+  waitForWatcherIdle(projectId) {
+    return Promise.all([
+      getWatcherCoordinator(projectId).waitForIdle(projectId),
+      waitForLsofIdle(projectId),
+    ]);
+  },
+  getWatcherStartupTimer(projectId, kind) {
+    return watcherStartupTimers.get(projectId + ':' + kind);
+  },
   getIllustratorActivationScopeSnapshot(projectId) {
     const scope = getIllustratorActivationScope(projectId);
     if (!scope) return null;
@@ -1320,6 +1329,76 @@ async function measureProjectFileVisualRequests(requestFactory, timeoutMs = 3000
     fs.lstatSync = originalLstatSync;
     fs.realpathSync.native = originalRealpathSyncNative;
   }
+}
+
+async function pauseProjectsForFileVisualMeasurement(...projectIds) {
+  // Pause every fixture, including the separate ownership/safety project.
+  // Cancellation invalidates queued work but does not itself join in-flight IO.
+  for (const projectId of projectIds) {
+    const paused = await callIpcRaw('projects:pause', projectId);
+    assert.equal(paused.status, 'paused');
+  }
+  await Promise.all(projectIds.map(id => metadataTestHooks.waitForWatcherIdle(id)));
+  for (const projectId of projectIds) {
+    const snapshot = metadataTestHooks.getWatcherCoordinatorSnapshot(projectId);
+    assert.equal(snapshot.cancelled, true);
+    assert.equal(snapshot.running, false);
+    assert.deepEqual(snapshot.pendingKinds, []);
+    assert.equal(metadataTestHooks.isLsofPollInProgress(projectId), false);
+    for (const kind of ['lsof', 'live-app', 'last-used']) {
+      assert.equal(metadataTestHooks.getWatcherStartupTimer(projectId, kind), undefined);
+    }
+  }
+}
+
+async function cleanupFileVisualWatcherFixture(timers, fixtureRoot, projectIds) {
+  // Cleanup must not repeat the assertions under test. Public pause handlers run
+  // synchronously before callIpcRaw returns each promise; restore global timers
+  // before awaiting anything, even if a pause or later idle check rejects.
+  const pauses = projectIds.map(id => callIpcRaw('projects:pause', id));
+  timers.restore();
+  try {
+    await Promise.all(pauses);
+    await Promise.all(projectIds.map(id => metadataTestHooks.waitForWatcherIdle(id)));
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
+function controlFileVisualWatcherTimers() {
+  // Only used by deterministic watcher tests below. Production callbacks still
+  // execute unchanged; the test chooses their order instead of sleeping for them.
+  const originals = {
+    setTimeout: global.setTimeout, clearTimeout: global.clearTimeout,
+    setInterval: global.setInterval, clearInterval: global.clearInterval,
+  };
+  const timers = new Set();
+  const schedule = (repeating, fn, delay, ...args) => {
+    const timer = { repeating, delay, cancelled: false, callback: () => fn(...args), unref() {} };
+    timers.add(timer);
+    return timer;
+  };
+  global.setTimeout = (...args) => schedule(false, ...args);
+  global.setInterval = (...args) => schedule(true, ...args);
+  global.clearTimeout = timer => {
+    if (timers.has(timer)) timer.cancelled = true;
+    else originals.clearTimeout(timer);
+  };
+  global.clearInterval = timer => {
+    if (timers.has(timer)) timer.cancelled = true;
+    else originals.clearInterval(timer);
+  };
+  return {
+    fire(timer) {
+      assert.ok(timers.has(timer), 'expected a captured production timer');
+      assert.equal(timer.cancelled, false, 'cancelled timers must not fire');
+      if (!timer.repeating) timer.cancelled = true;
+      return timer.callback();
+    },
+    restore() {
+      Object.assign(global, originals);
+    },
+  };
 }
 
 async function settleAssetBaselineForUnrelatedPackageTest(projectId) {
@@ -11074,6 +11153,271 @@ test('raster thumbnail work uses a defensible byte and pixel bound with one boun
   assert.equal(metadataTestHooks.getFileVisualRasterWorkPending(), 0);
 });
 
+test('public project pause shuts down once and leaves another active project unchanged', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-pause-shutdown-'));
+  const timers = controlFileVisualWatcherTimers();
+  const projectIds = [];
+  try {
+    const project = await createProject('Pause shutdown');
+    projectIds.push(project.id);
+    const filePath = path.join(fixtureRoot, 'accepted.pdf');
+    writeSyntheticPdfFile(filePath);
+    manualDialogFor([filePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    const before = structuredClone(await getProject(project.id));
+    const generation = metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).generation;
+    const closeCount = watcherCloseCount;
+    const paused = await callIpcRaw('projects:pause', project.id);
+    assert.deepEqual(paused, { ...before, status: 'paused' });
+    assert.equal(watcherCloseCount, closeCount + 1);
+    assert.ok(metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).generation > generation);
+    await pauseProjectsForFileVisualMeasurement(project.id);
+    assert.equal(watcherCloseCount, closeCount + 1, 'repeated pause must not close a watcher twice');
+    roundTripFakeStore();
+    assert.deepEqual(await callIpcRaw('projects:get-files', project.id), paused.files);
+    assert.deepEqual((await getProject(project.id)).provenance, paused.provenance);
+
+    const otherProject = await createProject('Unaffected active project');
+    projectIds.push(otherProject.id);
+    const otherBefore = structuredClone(await getProject(otherProject.id));
+    const otherSnapshot = metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id);
+    const otherToken = metadataTestHooks.getActiveWatchingActivationToken(otherProject.id);
+    const otherStartup = metadataTestHooks.getWatcherStartupTimer(otherProject.id, 'live-app');
+    const writes = storeInstance.projectSetCount;
+    for (const id of ['missing-project', '', null, undefined, {}, 123]) {
+      assert.equal(await callIpcRaw('projects:pause', id), null);
+    }
+    assert.equal(storeInstance.projectSetCount, writes, 'unknown/invalid ids must not write');
+    assert.deepEqual(await callIpcRaw('projects:pause', project.id), paused);
+    assert.deepEqual(await getProject(otherProject.id), otherBefore);
+    assert.deepEqual(metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id), otherSnapshot);
+    assert.equal(metadataTestHooks.getActiveWatchingActivationToken(otherProject.id), otherToken);
+    assert.equal(otherStartup.cancelled, false);
+    assert.equal(watcherCloseCount, closeCount + 1);
+  } finally {
+    await cleanupFileVisualWatcherFixture(timers, fixtureRoot, projectIds);
+  }
+});
+
+test('Review Assets measurement cleanup restores timers and filesystem stubs after an assertion failure', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-preview-cleanup-'));
+  const before = {
+    setTimeout: global.setTimeout, clearTimeout: global.clearTimeout,
+    setInterval: global.setInterval, clearInterval: global.clearInterval,
+    open: fs.promises.open, lstat: fs.promises.lstat, realpath: fs.promises.realpath,
+    lstatSync: fs.lstatSync, realpathSync: fs.realpathSync.native,
+  };
+  const timers = controlFileVisualWatcherTimers();
+  await assert.rejects(async () => {
+    try {
+      await measureProjectFileVisualRequests(() => assert.fail('synthetic measurement failure'));
+    } finally {
+      await cleanupFileVisualWatcherFixture(timers, fixtureRoot, []);
+    }
+  }, /synthetic measurement failure/);
+  for (const key of ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval']) {
+    assert.equal(global[key], before[key]);
+  }
+  for (const key of ['open', 'lstat', 'realpath']) assert.equal(fs.promises[key], before[key]);
+  assert.equal(fs.lstatSync, before.lstatSync);
+  assert.equal(fs.realpathSync.native, before.realpathSync);
+  assert.equal(fs.existsSync(fixtureRoot), false);
+});
+
+test('Review Assets measurement isolates a cancelled startup refresh without hiding its native IO', { timeout: 10000 }, async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-preview-startup-'));
+  const timers = controlFileVisualWatcherTimers();
+  const projectIds = [];
+  try {
+    testNativeFileIconImage = createTestNativeImage(64);
+    const project = await createProject('Preview startup isolation');
+    projectIds.push(project.id);
+    const otherProject = await createProject('Preview startup safety');
+    projectIds.push(otherProject.id);
+    for (const [owner, filename] of [[project, 'document.pdf'], [otherProject, 'other-project.png']]) {
+      const filePath = path.join(fixtureRoot, filename);
+      fs.writeFileSync(filePath, 'synthetic preview fixture');
+      await setProjectFiles(owner.id, { files: [makePendingFile(filePath, 'manual-browse')] });
+    }
+    const measurePreviewWithCallback = async callback => {
+      metadataTestHooks.clearFileVisualTypeIconCache();
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      const presentation = workspace.files[0];
+      testBeforeFileIconResolve = callback;
+      try {
+        return await measureProjectFileVisualRequests(() => callIpcRaw(
+          'projects:get-file-visual', project.id, presentation.visualIdentity, presentation.visualRevision
+        ));
+      } finally {
+        testBeforeFileIconResolve = null;
+      }
+    };
+
+    const startup = metadataTestHooks.getWatcherStartupTimer(otherProject.id, 'live-app');
+    assert.equal(startup.delay, 500);
+    const contaminated = await measurePreviewWithCallback(async () => {
+      timers.fire(startup);
+      await metadataTestHooks.waitForWatcherIdle(otherProject.id);
+    });
+    assert.equal(contaminated.responses.kind, 'icon');
+    // Negative control: all native calls are counted, including the unrelated
+    // project's three status mutations, each normalizing its one file twice.
+    assert.equal(contaminated.realpathSync, 3 + (3 * 2));
+
+    await callIpcRaw('projects:start-watching', otherProject.id);
+    const pendingStartup = metadataTestHooks.getWatcherStartupTimer(otherProject.id, 'live-app');
+    await pauseProjectsForFileVisualMeasurement(...projectIds);
+    assert.equal(pendingStartup.cancelled, true);
+    const writesAfterPause = storeInstance.projectSetCount;
+    const isolated = await measurePreviewWithCallback(async () => {
+      // Even an already-dispatched stale callback cannot revive the paused lane.
+      pendingStartup.callback();
+      await metadataTestHooks.waitForWatcherIdle(otherProject.id);
+    });
+    assert.equal(isolated.responses.kind, 'icon');
+    assert.equal(isolated.realpathSync, 3);
+    assert.equal(storeInstance.projectSetCount, writesAfterPause);
+  } finally {
+    testBeforeFileIconResolve = null;
+    await cleanupFileVisualWatcherFixture(timers, fixtureRoot, projectIds);
+  }
+});
+
+test('Review Assets measurement waits for an in-flight startup refresh after pausing both projects', { timeout: 10000 }, async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-preview-drain-'));
+  const timers = controlFileVisualWatcherTimers();
+  const projectIds = [];
+  let releaseQuery;
+  let markQueryStarted;
+  const queryGate = new Promise(resolve => { releaseQuery = resolve; });
+  const queryStarted = new Promise(resolve => { markQueryStarted = resolve; });
+  let isolation = null;
+  try {
+    testNativeFileIconImage = createTestNativeImage(64);
+    const project = await createProject('Preview drain isolation');
+    projectIds.push(project.id);
+    const otherProject = await createProject('Preview drain safety');
+    projectIds.push(otherProject.id);
+    for (const [owner, filename] of [[project, 'document.pdf'], [otherProject, 'other-project.png']]) {
+      const filePath = path.join(fixtureRoot, filename);
+      fs.writeFileSync(filePath, 'synthetic drain fixture');
+      await setProjectFiles(owner.id, { files: [makePendingFile(filePath, 'manual-browse')] });
+    }
+    setChildProcessHandler(request => {
+      if (isIllustratorPgrepCheck(request)) {
+        markQueryStarted();
+        return queryGate.then(() => ({ stdout: '' }));
+      }
+      return { stdout: '' };
+    });
+    timers.fire(metadataTestHooks.getWatcherStartupTimer(otherProject.id, 'live-app'));
+    await queryStarted;
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id).runningKind, 'live-app');
+    const beforePause = metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id);
+    // A different scheduled observer queues behind the blocked live-app query;
+    // another live-app refresh would correctly coalesce with the running one.
+    timers.fire(metadataTestHooks.getWatcherStartupTimer(otherProject.id, 'last-used'));
+    assert.deepEqual(metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id).pendingKinds, ['last-used']);
+    let isolated = false;
+    isolation = pauseProjectsForFileVisualMeasurement(...projectIds).then(() => { isolated = true; });
+    // One event-loop turn proves the drain remains pending at the explicit IO
+    // barrier; no elapsed-time threshold determines success.
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(isolated, false);
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id).cancelled, true);
+    assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id).running, true);
+    const cancelled = metadataTestHooks.getWatcherCoordinatorSnapshot(otherProject.id);
+    assert.ok(cancelled.generation > beforePause.generation);
+    assert.deepEqual(cancelled.pendingKinds, []);
+    assert.equal(cancelled.counters.invalidated, beforePause.counters.invalidated + 1);
+    const writesAfterPause = storeInstance.projectSetCount;
+    releaseQuery();
+    await isolation;
+    assert.equal(isolated, true);
+    assert.equal(storeInstance.projectSetCount, writesAfterPause);
+
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const presentation = workspace.files[0];
+    metadataTestHooks.clearFileVisualTypeIconCache();
+    const preview = await measureProjectFileVisualRequests(() => callIpcRaw(
+      'projects:get-file-visual', project.id, presentation.visualIdentity, presentation.visualRevision
+    ));
+    assert.equal(preview.responses.kind, 'icon');
+    assert.equal(preview.realpathSync, 3);
+  } finally {
+    releaseQuery();
+    setChildProcessHandler(null);
+    try {
+      if (isolation) await isolation;
+    } finally {
+      await cleanupFileVisualWatcherFixture(timers, fixtureRoot, projectIds);
+    }
+  }
+});
+
+for (const appActive of [true, false]) {
+  test(`live-app background filesystem accounting at 30/263/500 assets with Crate ${appActive ? 'active' : 'backgrounded'}`, { timeout: 10000 }, async () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-refresh-cost-'));
+    const timers = controlFileVisualWatcherTimers();
+    const measurements = [];
+    const projectIds = [];
+    try {
+      testAppActive = appActive;
+      testMainWindowVisible = appActive;
+      setChildProcessHandler(() => ({ stdout: '' }));
+      for (const assetCount of [30, 263, 500]) {
+        const project = await createProject(`Background refresh ${assetCount}`);
+        projectIds.push(project.id);
+        const files = Array.from({ length: assetCount }, (_, index) => {
+          const filePath = path.join(fixtureRoot, `${assetCount}-${index}.png`);
+          fs.writeFileSync(filePath, createSyntheticPngBytes());
+          return makePendingFile(filePath, 'manual-browse');
+        });
+        await setProjectFiles(project.id, { files });
+        // Finish raw fixture schema normalization through the public read path
+        // before measuring the refresh. No scheduled observer has fired yet.
+        await getProject(project.id);
+        await metadataTestHooks.waitForWatcherIdle(project.id);
+        const beforeWrites = storeInstance.projectSetCount;
+        const beforeStarted = metadataTestHooks.getWatcherCoordinatorSnapshot(project.id).counters.started;
+        const startup = await measureProjectFileVisualRequests(async () => {
+          timers.fire(metadataTestHooks.getWatcherStartupTimer(project.id, 'live-app'));
+          await metadataTestHooks.waitForWatcherIdle(project.id);
+        });
+        // Initial app-not-running breadcrumbs are three real store mutations.
+        // Each normalizes N files twice: linear 6*N work, NOT a fixed preview bound.
+        assert.equal(startup.realpathSync, 6 * assetCount);
+        assert.equal(storeInstance.projectSetCount - beforeWrites, 3);
+        for (const api of ['open', 'lstat', 'realpath', 'lstatSync']) assert.equal(startup[api], 0);
+        for (const appFamily of ['illustrator', 'photoshop', 'indesign']) {
+          assert.equal(getLatestLiveAppStatus(await getProject(project.id), appFamily).errorCategory, 'app-not-running');
+        }
+        const afterStartup = structuredClone(await getProject(project.id));
+        const unchanged = await measureProjectFileVisualRequests(() => metadataTestHooks.pollPsForProject(
+          project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id)
+        ));
+        for (const api of ['open', 'lstat', 'realpath', 'lstatSync', 'realpathSync']) assert.equal(unchanged[api], 0);
+        assert.equal(storeInstance.projectSetCount - beforeWrites, 3);
+        assert.deepEqual(await getProject(project.id), afterStartup);
+        const completed = metadataTestHooks.getWatcherCoordinatorSnapshot(project.id);
+        assert.equal(completed.running, false);
+        assert.equal(completed.counters.started - beforeStarted, 2);
+        assert.deepEqual(completed.pendingKinds, []);
+        measurements.push({ assetCount, startup, unchanged, startupStoreWrites: 3 });
+        await pauseProjectsForFileVisualMeasurement(project.id);
+      }
+      if (process.env.CRATE_FILE_VISUAL_STRESS_REPORT === '1') {
+        process.stdout.write(`# file-visual-background ${JSON.stringify({ appActive, measurements })}\n`);
+      }
+    } finally {
+      testAppActive = true;
+      testMainWindowVisible = true;
+      setChildProcessHandler(null);
+      await cleanupFileVisualWatcherFixture(timers, fixtureRoot, projectIds);
+    }
+  });
+}
+
 test('Review Assets preview requests stay bounded for large projects and preserve project-owned safety', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-file-visual-stress-'));
   const assetCounts = [30, 263, 500];
@@ -11098,6 +11442,7 @@ test('Review Assets preview requests stay bounded for large projects and preserv
     testNativeFileIconImage = createTestNativeImage(64);
     const project = await createProject('Review Assets visual stress');
     const otherProject = await createProject('Review Assets other project');
+    await pauseProjectsForFileVisualMeasurement(project.id, otherProject.id);
     const otherAssetPath = path.join(fixtureRoot, 'other-project.png');
     fs.writeFileSync(otherAssetPath, createSyntheticPngBytes(24, 24, 0x71));
     await setProjectFiles(otherProject.id, {
