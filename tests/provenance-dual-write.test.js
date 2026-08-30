@@ -14195,8 +14195,12 @@ test('pre-existing chokidar candidates remain pending across pause and resume wi
 
   const fresh = await getProject(project.id);
   assert.equal(fresh.files.some(file => file.path === filePath), false);
-  assert.equal(fresh.pendingFiles.filter(file => file.path === filePath).length, 1);
-  const ledgerEntry = Object.values(fresh.liveEvidenceLedger.candidates)
+  assert.equal(fresh.pendingFiles.some(file => file.path === filePath), false);
+  assert.equal(storeInstance.data.projects
+    .find(item => item.id === project.id)
+    .pendingFiles.filter(file => file.path === filePath).length, 1);
+  const ledgerEntry = Object.values(storeInstance.data.projects
+    .find(item => item.id === project.id).liveEvidenceLedger.candidates)
     .find(entry => entry.latest && entry.latest.candidateName === path.basename(filePath));
   assert.ok(ledgerEntry);
   assert.equal(ledgerEntry.observations.length, 1);
@@ -14249,6 +14253,69 @@ test('accepted chokidar Illustrator source remains visible across pause and resu
     assert.equal(getSessionObservedByMethod(fresh, 'add').length, 1);
     const reviewAssets = await callIpcRaw('projects:get-asset-workspace', project.id);
     assert.equal(reviewAssets.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
+test('resume hides stale pending rows while retaining the selected project source', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Selected_Project.ai');
+  const stalePath = path.join(TEST_HOME, 'Desktop', 'Stale_Unrelated.ai');
+  const otherProjectPath = path.join(TEST_HOME, 'Desktop', 'Other_Project.ai');
+  writeSyntheticAiFile(sourcePath, 'selected project source');
+  writeSyntheticAiFile(stalePath, 'stale unrelated review row');
+  writeSyntheticAiFile(otherProjectPath, 'other project source');
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Selected project reconciliation');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    await emitWatcherWithStats('add', sourcePath, {
+      mtimeMs: stored.watchStartedAt + 1000,
+      birthtimeMs: stored.watchStartedAt + 1000,
+    });
+    await waitForProject(project.id, item => item.files.some(file => file.path === sourcePath));
+
+    stored.pendingFiles.push({
+      ...makePendingFile(stalePath, 'app-opened'),
+      addedAt: stored.watchStartedAt - 1000,
+      captureState: 'needs-save',
+      captureReason: 'unsaved-source-needs-save',
+      captureEvidence: {
+        source: 'app-opened',
+        appFamily: 'illustrator',
+        observerMethod: 'illustrator-active-session',
+        evidenceStrength: 'structured-app-document',
+      },
+    });
+
+    await callIpc('projects:pause', project.id);
+    const otherProject = await createProject('Other project reconciliation');
+    const otherStored = storeInstance.data.projects.find(item => item.id === otherProject.id);
+    await emitWatcherWithStats('add', otherProjectPath, {
+      mtimeMs: otherStored.watchStartedAt + 1000,
+      birthtimeMs: otherStored.watchStartedAt + 1000,
+    });
+    await waitForProject(otherProject.id, item => item.files.some(file => file.path === otherProjectPath));
+    await callIpc('projects:start-watching', project.id);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(fresh.pendingFiles.some(file => file.path === stalePath), false);
+    assert.equal(stored.pendingFiles.some(file => file.path === stalePath), true);
+
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.projectId, project.id);
+    assert.equal(workspace.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+    assert.equal(workspace.files.some(file => file.name === path.basename(otherProjectPath)), false);
+    assert.equal(workspace.pendingFiles.some(file => file.name === path.basename(stalePath)), false);
   } finally {
     setChildProcessHandler(null);
   }
