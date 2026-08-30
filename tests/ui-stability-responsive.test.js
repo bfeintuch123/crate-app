@@ -84,28 +84,16 @@ test('Review Assets responds to its own pane width instead of the outer window a
   );
 });
 
-test('asset presentation steps down from stable cards to a compact readable row', () => {
-  assert.match(stability, /\.asset-card-grid\s*\{\s*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\);/);
+test('asset presentation uses bounded virtualized information rows', () => {
   assert.match(
     stability,
-    /\.asset-card-grid \.asset-file-row\s*\{[\s\S]*?grid-template-rows:\s*112px auto auto;/,
+    /\.asset-review-workspace \.asset-card-grid,[\s\S]*?\.asset-review-workspace \.missing-asset-grid\s*\{[\s\S]*?display:\s*block;[\s\S]*?max-height:\s*460px;[\s\S]*?overflow:\s*auto;[\s\S]*?contain:\s*strict;/,
   );
   assert.match(
     stability,
-    /\.asset-card-grid \.file-visual\s*\{[\s\S]*?height:\s*112px;[\s\S]*?min-height:\s*112px;/,
+    /\.asset-review-workspace \.asset-card-grid \.asset-file-row,[\s\S]*?\.asset-review-workspace \.missing-asset-grid \.pending-file\s*\{[\s\S]*?grid-template-columns:\s*36px minmax\(0, 1fr\) auto 28px;[\s\S]*?grid-template-rows:\s*minmax\(0, 1fr\);[\s\S]*?height:\s*58px;[\s\S]*?min-height:\s*58px;/,
   );
-  assert.match(
-    stability,
-    /@container asset-review \(max-width:\s*900px\)[\s\S]*?grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/,
-  );
-  assert.match(
-    stability,
-    /@container asset-review \(max-width:\s*560px\)[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?grid-template-rows:\s*88px auto auto;[\s\S]*?height:\s*88px;[\s\S]*?min-height:\s*88px;/,
-  );
-  assert.match(
-    stability,
-    /@container asset-review \(max-width:\s*420px\)[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?grid-template-columns:\s*64px minmax\(0, 1fr\) auto;[\s\S]*?height:\s*60px;[\s\S]*?min-height:\s*60px;/,
-  );
+  assert.match(stability, /\.asset-review-workspace \.asset-card-grid \.app-file-remove\s*\{[\s\S]*?grid-column:\s*4;/);
 });
 
 test('Review Assets footer stays within the workspace and stacks at narrow widths', () => {

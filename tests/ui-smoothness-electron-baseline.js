@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { app, BrowserWindow } = require('electron');
 const {
   DESKTOP_WINDOW_MINIMUM,
@@ -19,6 +20,7 @@ const EVIDENCE_DIR = process.env.CRATE_SMOOTHNESS_EVIDENCE_DIR
   : null;
 const TEST_TIMEOUT_MS = 45_000;
 const QUIET_READS = 5;
+const CANONICAL_BASE = '279dad5db5b5341c66d83bee9913849f17f0b9b1';
 const temporaryUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-ui-smoothness-'));
 
 app.setPath('userData', temporaryUserData);
@@ -26,6 +28,31 @@ app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
 function wait(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function isAssetWorkspaceReady(expected) {
+  return [
+    ['#project-file-list', expected.representedSourceFiles, false],
+    ['#existing-assets-list', expected.existingAssets, true],
+    ['#added-assets-list', expected.addedAssets, true],
+  ].every(([selector, count, virtualized]) => {
+    const list = document.querySelector(selector);
+    if (!list || list.__assetReviewAllItems?.length !== count) return false;
+    if (count === 0) {
+      return !list.__assetReviewVirtualState && list.children.length === 1
+        && list.children[0].className === 'asset-panel-empty';
+    }
+    if (!virtualized) {
+      return !list.__assetReviewVirtualState && !list.classList.contains('asset-virtual-list')
+        && !list.style.height && list.children.length === count
+        && Array.from(list.children).every(row => row.className.split(/\s+/).includes('asset-file-row')
+          && !row.style.position && !row.style.top && !row.getAttribute('aria-setsize'));
+    }
+    return list.__assetReviewVirtualState?.items.length === count
+      && list.style.height === `${count * 58}px`
+      && list.children.length > 0 && list.children.length <= 36
+      && Array.from(list.children).every(row => row.getAttribute('aria-setsize') === String(count));
+  });
 }
 
 async function settleLayout(window) {
@@ -469,9 +496,13 @@ async function auditFixture(assetCount) {
       'Project Workspace visibility',
     );
     const workspaceVisibleMs = Date.now() - projectClickAt;
+    const expected = await window.webContents.executeJavaScript(
+      'window.crateSmoothnessHarness.getExpected()',
+      true,
+    );
     await waitForExpression(
       window,
-      `document.querySelectorAll('#existing-assets-list > .asset-file-row, #added-assets-list > .asset-file-row').length === ${assetCount}`,
+      `(${isAssetWorkspaceReady.toString()})(${JSON.stringify(expected)})`,
       `${assetCount}-asset workspace`,
     );
     const workspaceMetrics = await waitForQuietMetrics(window);
@@ -489,10 +520,6 @@ async function auditFixture(assetCount) {
     );
     await settleLayout(window);
     const reviewOpenMs = Date.now() - reviewClickAt;
-    const expected = await window.webContents.executeJavaScript(
-      'window.crateSmoothnessHarness.getExpected()',
-      true,
-    );
     const beforeState = await prepareReviewState(window, expected);
 
     await installMutationAudit(window);
@@ -616,8 +643,8 @@ function createFindings(results) {
       findings.push({ assetCount: result.assetCount, category: 'hidden-rerender', detail: 'A hidden Projects destination rebuilt after a file event.' });
     }
     const previewRequests = Number(result.workspaceMetrics?.getFileVisual || 0);
-    if (result.assetCount >= 263 && previewRequests < result.assetCount) {
-      findings.push({ assetCount: result.assetCount, category: 'preview-queue-coverage', detail: `${previewRequests} preview requests reached the bridge for ${result.assetCount} assets.` });
+    if (previewRequests > 36) {
+      findings.push({ assetCount: result.assetCount, category: 'preview-mount-bound', detail: `${previewRequests} preview requests exceeded the mounted-row ceiling.` });
     }
   }
 
@@ -631,6 +658,12 @@ function createFindings(results) {
 }
 
 async function run() {
+  const gitRead = args => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();
+  const sourceCommit = gitRead(['rev-parse', 'HEAD']);
+  if (gitRead(['merge-base', sourceCommit, CANONICAL_BASE]) !== CANONICAL_BASE) {
+    throw new Error('Smoothness evidence canonical base is not an ancestor of the tested source.');
+  }
+  const sourceTreeDirty = gitRead(['status', '--porcelain', '--untracked-files=no']) !== '';
   const results = [];
   for (const assetCount of SMOOTHNESS_ASSET_COUNTS) {
     results.push(await auditFixture(assetCount));
@@ -638,7 +671,9 @@ async function run() {
   const report = {
     schemaVersion: 1,
     kind: 'app-wide-smoothness-baseline',
-    canonicalBase: 'd2a7be01b89d3ff8bebfe3daf927aa34e6a16629',
+    canonicalBase: CANONICAL_BASE,
+    sourceCommit,
+    sourceTreeDirty,
     minimumWindow: DESKTOP_WINDOW_MINIMUM,
     assetCounts: SMOOTHNESS_ASSET_COUNTS,
     results,

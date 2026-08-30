@@ -484,6 +484,111 @@
         scroll-behavior: auto !important;
       }
     }
+
+    /* Review Assets uses bounded, badge-first rows with logical scroll ranges. */
+    .asset-review-workspace .asset-card-grid,
+    .asset-review-workspace .missing-asset-grid {
+      display: block;
+      position: relative;
+      max-height: 460px;
+      overflow: auto;
+      contain: strict;
+    }
+
+    .asset-review-workspace .asset-virtual-list::after {
+      content: '';
+      display: block;
+      height: var(--asset-review-logical-height, 0px);
+      pointer-events: none;
+    }
+
+    .asset-review-workspace .asset-card-grid:not(.asset-virtual-list) {
+      contain: layout paint style;
+    }
+
+    .asset-review-workspace .asset-card-grid .asset-file-row,
+    .asset-review-workspace .missing-asset-grid .pending-file {
+      box-sizing: border-box;
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) auto 28px;
+      grid-template-rows: minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      height: 58px;
+      min-height: 58px;
+      padding: 6px 8px;
+      border: 0;
+      border-top: 1px solid var(--gray-100);
+      border-radius: 0;
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .asset-review-workspace .asset-card-grid .asset-file-row:first-child,
+    .asset-review-workspace .missing-asset-grid .pending-file:first-child {
+      border-top: 0;
+    }
+
+    .asset-review-workspace .asset-card-grid .file-visual,
+    .asset-review-workspace .missing-asset-grid .file-visual {
+      grid-column: 1;
+      grid-row: 1;
+      width: 32px;
+      height: 32px;
+      min-height: 32px;
+      margin: 0;
+      background: var(--gray-50);
+    }
+
+    .asset-review-workspace .asset-card-grid .asset-file-copy,
+    .asset-review-workspace .missing-asset-grid .pending-file-copy {
+      grid-column: 2;
+      grid-row: 1;
+      min-width: 0;
+    }
+
+    .asset-review-workspace .asset-card-grid .file-status-badge,
+    .asset-review-workspace .missing-asset-grid .pending-state-badge {
+      grid-column: 3;
+      grid-row: 1;
+      align-self: center;
+      justify-self: end;
+    }
+
+    .asset-review-workspace .asset-card-grid .app-file-remove {
+      position: static;
+      grid-column: 4;
+      grid-row: 1;
+      z-index: auto;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+    }
+
+    .asset-review-workspace .asset-card-grid .app-file-restore {
+      grid-column: 4;
+      grid-row: 1;
+      align-self: center;
+      justify-self: end;
+    }
+
+    .asset-review-workspace .asset-card-grid .asset-file-row.is-selected,
+    .asset-review-workspace .missing-asset-grid .pending-file.is-selected {
+      background: #f4f0ed;
+    }
+
+    .asset-review-workspace .asset-card-grid .asset-file-row:focus-visible,
+    .asset-review-workspace .missing-asset-grid .pending-file:focus-visible {
+      z-index: 1;
+      outline: 2px solid var(--black);
+      outline-offset: -2px;
+    }
+
+    .asset-review-workspace .pending-file-reason {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>

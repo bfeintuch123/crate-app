@@ -20,6 +20,9 @@ const PACKAGE_OUTPUT_LAYOUT_MODES = Object.freeze({
   FLAT: 'flat',
   BY_EXTENSION: 'by-extension-v1',
 });
+const ASSET_REVIEW_ROW_HEIGHT = 58;
+const ASSET_REVIEW_OVERSCAN = 6;
+const ASSET_REVIEW_MOUNTED_ROW_LIMIT = 36;
 
 // ===== State =====
 let state = {
@@ -40,7 +43,14 @@ let state = {
   assetWorkspace: null,
   assetReviewOpen: false,
   assetReviewFilter: 'all',
-  assetReviewQuery: ''
+  assetReviewQuery: '',
+  assetReviewSelectedKey: null,
+  assetReviewProjectId: null,
+  assetReviewLogicalItems: {
+    existing: [],
+    added: [],
+    missing: [],
+  },
 };
 
 let rendererEventListenersBound = false;
@@ -219,8 +229,15 @@ function getRendererViewState() {
   const scroller = $('.app-content');
   const activeElement = document.activeElement;
   const activeRow = activeElement?.closest?.('[data-render-key]');
+  const assetScrollTops = {};
+  for (const id of ['existing-assets-list', 'added-assets-list', 'pending-file-list']) {
+    const list = $(`#${id}`);
+    if (list && Number.isFinite(list.scrollTop)) assetScrollTops[id] = list.scrollTop;
+  }
   return {
+    assetReviewProjectId: state.assetReviewProjectId,
     scrollTop: scroller && Number.isFinite(scroller.scrollTop) ? scroller.scrollTop : null,
+    assetScrollTops,
     activeElement,
     activeId: activeElement?.id || null,
     activeRenderKey: activeRow?.dataset?.renderKey || null,
@@ -251,21 +268,36 @@ function findRendererFocusTarget(viewState) {
 
 function restoreRendererViewState(viewState) {
   if (!viewState) return;
+  if (viewState.assetReviewProjectId !== state.assetReviewProjectId) return;
   const scroller = $('.app-content');
   if (scroller && viewState.scrollTop !== null) scroller.scrollTop = viewState.scrollTop;
+  for (const [id, scrollTop] of Object.entries(viewState.assetScrollTops || {})) {
+    const list = $(`#${id}`);
+    if (list && Number.isFinite(scrollTop)) list.scrollTop = scrollTop;
+  }
   const focusTarget = findRendererFocusTarget(viewState);
   if (focusTarget && typeof focusTarget.focus === 'function') {
     focusTarget.focus({ preventScroll: true });
   }
 }
 
+const rendererFallbackItemKeys = new WeakMap();
+let rendererFallbackItemSequence = 0;
+
 function getRendererItemKey(item, index = 0) {
   if (!item || typeof item !== 'object') return `item:${index}`;
   const identity = getFileVisualIdentity(item);
   if (identity) return `visual:${identity}`;
   if (item.fileId) return `file-id:${item.fileId}`;
-  const role = item.projectRole || item.assetOrigin || 'item';
-  return `${role}:${item.name || 'unnamed'}:${index}`;
+  if (item.captureId) return `capture-id:${item.captureId}`;
+  if (item.captureSessionId) return `capture:${item.captureSessionId}`;
+  // A record without an authoritative ID keeps its object identity through
+  // filtering and scrolling. A replacement snapshot gets a fresh key: neither
+  // its display name nor its position can prove it is the previous record.
+  if (!rendererFallbackItemKeys.has(item)) {
+    rendererFallbackItemKeys.set(item, `record:${++rendererFallbackItemSequence}`);
+  }
+  return rendererFallbackItemKeys.get(item);
 }
 
 function getRendererItemSignature(item) {
@@ -330,6 +362,118 @@ function reconcileKeyedList(list, items, build, keyForItem = getRendererItemKey)
       if (index >= 0) list.children.splice(index, 1);
     }
   }
+}
+
+function getAssetReviewSearchText(file) {
+  const sourceName = sanitizeRendererSourceName(file?.sourceName) || '';
+  return `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${sourceName}`.toLowerCase();
+}
+
+function getAssetReviewVirtualRange(list, itemCount) {
+  if (itemCount === 0) return { start: 0, end: 0 };
+  const scrollTop = Number.isFinite(list.scrollTop) ? Math.max(0, list.scrollTop) : 0;
+  const viewportHeight = Number.isFinite(list.clientHeight) && list.clientHeight > 0
+    ? list.clientHeight
+    : ASSET_REVIEW_ROW_HEIGHT * 6;
+  const firstVisible = Math.max(0, Math.floor(scrollTop / ASSET_REVIEW_ROW_HEIGHT) - ASSET_REVIEW_OVERSCAN);
+  const requestedCount = Math.ceil(viewportHeight / ASSET_REVIEW_ROW_HEIGHT) + (ASSET_REVIEW_OVERSCAN * 2);
+  const count = Math.min(ASSET_REVIEW_MOUNTED_ROW_LIMIT, Math.max(1, requestedCount));
+  return {
+    start: firstVisible,
+    end: Math.min(itemCount, firstVisible + count),
+  };
+}
+
+function renderVirtualAssetList(list, items, build) {
+  if (!list) return;
+  let virtual = list.__assetReviewVirtualState;
+  if (!virtual) {
+    virtual = {
+      items: [],
+      build,
+      onScroll: () => renderVirtualAssetList(list, virtual.items, virtual.build),
+    };
+    list.__assetReviewVirtualState = virtual;
+    list.classList.add('asset-virtual-list');
+    list.addEventListener('scroll', virtual.onScroll, { passive: true });
+  }
+  virtual.items = Array.isArray(items) ? items : [];
+  virtual.build = build;
+  list.style.position = 'relative';
+  list.style.height = `${virtual.items.length * ASSET_REVIEW_ROW_HEIGHT}px`;
+  const logicalHeight = `${virtual.items.length * ASSET_REVIEW_ROW_HEIGHT}px`;
+  if (typeof list.style.setProperty === 'function') {
+    list.style.setProperty('--asset-review-logical-height', logicalHeight);
+  } else {
+    list.style['--asset-review-logical-height'] = logicalHeight;
+  }
+  const viewportHeight = Number.isFinite(list.clientHeight) && list.clientHeight > 0
+    ? list.clientHeight
+    : ASSET_REVIEW_ROW_HEIGHT * 6;
+  const maxScrollTop = Math.max(0, (virtual.items.length * ASSET_REVIEW_ROW_HEIGHT) - viewportHeight);
+  if (Number.isFinite(list.scrollTop) && list.scrollTop > maxScrollTop) list.scrollTop = maxScrollTop;
+  const { start, end } = getAssetReviewVirtualRange(list, virtual.items.length);
+  reconcileKeyedList(
+    list,
+    virtual.items.slice(start, end),
+    (item, visibleIndex) => virtual.build(item, start + visibleIndex),
+    (item, visibleIndex) => getRendererItemKey(item, start + visibleIndex),
+  );
+  Array.from(list.children || []).forEach((row, visibleIndex) => {
+    // Position belongs to this filtered list, not to the row's content
+    // signature. Retained rows need the same updates as newly built rows.
+    const index = start + visibleIndex;
+    row.style.position = 'absolute';
+    row.style.top = `${index * ASSET_REVIEW_ROW_HEIGHT}px`;
+    row.style.left = '0';
+    row.style.right = '0';
+    row.style.minHeight = `${ASSET_REVIEW_ROW_HEIGHT}px`;
+    row.dataset.assetIndex = String(index);
+    row.setAttribute('aria-posinset', String(index + 1));
+    row.setAttribute('aria-setsize', String(virtual.items.length));
+    const selected = row.dataset?.renderKey === state.assetReviewSelectedKey;
+    row.setAttribute('aria-selected', String(selected));
+    row.classList.toggle('is-selected', selected);
+  });
+}
+
+function resetVirtualAssetList(list) {
+  if (!list) return;
+  const virtual = list.__assetReviewVirtualState;
+  if (virtual) list.removeEventListener('scroll', virtual.onScroll);
+  delete list.__assetReviewVirtualState;
+  list.__assetReviewAllItems = [];
+  list.classList.remove('asset-virtual-list');
+  list.style.height = '';
+  list.style.position = '';
+  if (typeof list.style.removeProperty === 'function') {
+    list.style.removeProperty('--asset-review-logical-height');
+  } else {
+    delete list.style['--asset-review-logical-height'];
+  }
+  list.scrollTop = 0;
+}
+
+function setAssetReviewProject(projectId) {
+  if (state.assetReviewProjectId === projectId) return;
+  state.assetReviewProjectId = projectId;
+  state.assetReviewSelectedKey = null;
+  state.assetReviewLogicalItems = { existing: [], added: [], missing: [] };
+  for (const id of ['project-file-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
+    const list = $(`#${id}`);
+    if (!list) continue;
+    resetVirtualAssetList(list);
+    reconcileKeyedList(list, [], () => null);
+  }
+}
+
+function setVirtualAssetItems(list, items, build) {
+  if (!list) return;
+  if (list.__assetReviewVirtualState) {
+    renderVirtualAssetList(list, items, build || list.__assetReviewVirtualState.build);
+    return;
+  }
+  renderVirtualAssetList(list, items, build);
 }
 
 function setRendererActionBusy(element, busy, busyLabel, idleLabel = null) {
@@ -1100,6 +1244,7 @@ async function renderFiles() {
 
   if (!state.selectedProjectId) {
     setActiveFileVisualProject(null);
+    setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -1110,6 +1255,7 @@ async function renderFiles() {
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
     setActiveFileVisualProject(null);
+    setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -1118,6 +1264,7 @@ async function renderFiles() {
   }
 
   setActiveFileVisualProject(project.id);
+  setAssetReviewProject(project.id);
 
   // Show empty state when project is packaged or not actively watching
   if (project.status === 'packaged') {
@@ -1598,7 +1745,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       renderedUpdatedState = true;
       const actionLabel = decision === 'include' ? 'added' : 'skipped';
       if (appliedCount === 0) {
-        showToast('No eligible assets were updated. Try the individual actions.');
+        showToast('No eligible assets were updated. Review the list and try the batch action again.');
       } else if (failedCount > 0) {
         showToast(`${appliedCount} asset${appliedCount === 1 ? '' : 's'} ${actionLabel}; ${failedCount} left unchanged`);
       } else {
@@ -1607,7 +1754,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       return appliedCount > 0;
     } catch (error) {
       logRendererError('pending assets batch decision failed', error);
-      showToast('Crate could not update the assets. Try the individual actions again.');
+      showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
     } finally {
       if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
@@ -1882,7 +2029,7 @@ function requestFileVisual(projectId, identity, revision, priority = null) {
   return request;
 }
 
-function createFileVisual(projectId, file, { priority = 0 } = {}) {
+function createFileVisual(projectId, file, { priority = 0, loadVisual = true } = {}) {
   const container = document.createElement('span');
   container.className = 'file-visual file-visual-fallback';
   container.setAttribute('aria-hidden', 'true');
@@ -1894,7 +2041,7 @@ function createFileVisual(projectId, file, { priority = 0 } = {}) {
   badge.textContent = getFileVisualFallbackLabel(file);
   container.appendChild(badge);
 
-  if (!projectId || !identity || !revision) return container;
+  if (!loadVisual || !projectId || !identity || !revision) return container;
   requestFileVisual(projectId, identity, revision, priority).then(result => applyResolvedFileVisual(container, result));
   return container;
 }
@@ -1944,8 +2091,8 @@ function appendAssetFileRestorationAction(row, project, file) {
   const restoreButton = document.createElement('button');
   const displayName = file && file.name ? file.name : 'this asset';
   restoreButton.type = 'button';
-  restoreButton.className = 'app-file-restore';
-  restoreButton.textContent = 'Include';
+  restoreButton.className = 'app-file-remove';
+  restoreButton.textContent = '\u00D7';
   restoreButton.title = `Include ${displayName}`;
   restoreButton.setAttribute('aria-label', `Include ${displayName} in this project`);
   restoreButton.addEventListener('click', async event => {
@@ -1967,7 +2114,14 @@ function appendAssetFileRestorationAction(row, project, file) {
 function createAssetFileRow(
   project,
   file,
-  { excluded = false, protectedSource = false, sourceRecoveryAllowed = false, previewPriority = 0 } = {}
+  {
+    excluded = false,
+    protectedSource = false,
+    sourceRecoveryAllowed = false,
+    previewPriority = 0,
+    loadVisual = true,
+    selectable = false,
+  } = {}
 ) {
   const row = document.createElement('div');
   row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
@@ -1975,8 +2129,33 @@ function createAssetFileRow(
   row.dataset.assetCategory = excluded
     ? 'excluded'
     : (file?.assetOrigin === 'existing' ? 'existing' : 'added');
-  row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
-  row.appendChild(createFileVisual(project && project.id, file, { priority: previewPriority }));
+  row.dataset.assetSearch = getAssetReviewSearchText(file);
+  if (selectable) {
+    const selected = state.assetReviewSelectedKey === getRendererItemKey(file);
+    row.tabIndex = 0;
+    row.setAttribute('aria-selected', String(selected));
+    row.classList.toggle('is-selected', selected);
+    const select = () => {
+      state.assetReviewSelectedKey = row.dataset.renderKey || getRendererItemKey(file);
+      const list = row.parentElement;
+      if (list?.__assetReviewVirtualState) {
+        renderVirtualAssetList(list, list.__assetReviewVirtualState.items, list.__assetReviewVirtualState.build);
+      }
+    };
+    row.addEventListener('click', event => {
+      if (event.target?.closest?.('button')) return;
+      select();
+    });
+    row.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      select();
+    });
+  }
+  row.appendChild(createFileVisual(project && project.id, file, {
+    priority: previewPriority,
+    loadVisual,
+  }));
 
   const copy = document.createElement('div');
   copy.className = 'asset-file-copy';
@@ -1988,10 +2167,13 @@ function createAssetFileRow(
   copy.appendChild(createAppOriginLabel(file, project, { includeSource: !protectedSource }));
   row.appendChild(copy);
 
+  let hasStatusBadge = false;
   if (file && file.embedded) {
     appendFileStatusBadge(row, 'EMB', 'embedded', 'Embedded - extracted at package time');
+    hasStatusBadge = true;
   } else if (file && file.linked === true) {
     appendFileStatusBadge(row, 'LNK', 'linked', 'Linked file - confirmed path');
+    hasStatusBadge = true;
   }
   if (protectedSource && sourceRecoveryAllowed) {
     appendFileStatusBadge(row, 'Scan failed', 'recovery', 'Remove this source to recover the project, then add a valid project file');
@@ -2002,6 +2184,7 @@ function createAssetFileRow(
     appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
     appendAssetFileRestorationAction(row, project, file);
   } else {
+    if (!hasStatusBadge) appendFileStatusBadge(row, 'Included', 'included', 'Included in this package');
     appendAssetFileRemovalAction(row, project, file);
   }
   return row;
@@ -2016,8 +2199,20 @@ function setAssetPanelCount(element, includedCount, totalCount = includedCount) 
 
 function renderAssetPanelList(list, project, files, options = {}) {
   if (!list) return;
+  setAssetReviewProject(project.id);
+  const allFiles = Array.isArray(files) ? files : [];
+  allFiles.forEach(getRendererItemKey);
+  const buildRow = file => createAssetFileRow(project, file, {
+    excluded: file.excluded === true,
+    protectedSource: file.protectedSource === true || options.protectedSource === true,
+    sourceRecoveryAllowed: file.sourceRecoveryAllowed === true,
+    previewPriority: options.previewPriority || 0,
+    loadVisual: options.loadVisual !== false,
+    selectable: options.selectable === true,
+  });
   if (!Array.isArray(files) || files.length === 0) {
     const emptyMessage = options.emptyMessage || 'No assets in this group.';
+    resetVirtualAssetList(list);
     reconcileKeyedList(list, [{ empty: true, message: emptyMessage }], item => {
       const empty = document.createElement('div');
       empty.className = 'asset-panel-empty';
@@ -2026,19 +2221,22 @@ function renderAssetPanelList(list, project, files, options = {}) {
     }, item => `empty:${item.message}`);
     return;
   }
-  reconcileKeyedList(list, files, file => createAssetFileRow(project, file, {
-    excluded: file.excluded === true,
-    protectedSource: file.protectedSource === true || options.protectedSource === true,
-    sourceRecoveryAllowed: file.sourceRecoveryAllowed === true,
-    previewPriority: options.previewPriority || 0,
-  }));
+  // Only Review Assets panels opt into fixed virtual rows. Working Files keeps
+  // its normal grid flow, spacing, and scroll position on same-project refreshes.
+  if (options.virtualized !== true && list.__assetReviewVirtualState) {
+    resetVirtualAssetList(list);
+    reconcileKeyedList(list, [], () => null);
+  }
+  list.__assetReviewAllItems = allFiles;
+  if (options.virtualized === true) renderVirtualAssetList(list, allFiles, buildRow);
+  else reconcileKeyedList(list, allFiles, buildRow);
 }
 
-function createRecentAssetCard(project, file, { previewPriority = 0 } = {}) {
+function createRecentAssetCard(project, file, { previewPriority = 0, loadVisual = true } = {}) {
   const card = document.createElement('div');
   card.className = 'recent-asset-card';
   card.setAttribute('role', 'listitem');
-  card.appendChild(createFileVisual(project.id, file, { priority: previewPriority }));
+  card.appendChild(createFileVisual(project.id, file, { priority: previewPriority, loadVisual }));
   const name = document.createElement('span');
   name.textContent = file?.name || 'Untitled asset';
   name.title = name.textContent;
@@ -2068,32 +2266,56 @@ function setCountText(id, value) {
 function applyAssetReviewFilter() {
   const filter = state.assetReviewFilter || 'all';
   const query = String(state.assetReviewQuery || '').trim().toLowerCase();
-  for (const listId of ['existing-assets-list', 'added-assets-list']) {
+  const logicalItems = state.assetReviewLogicalItems || {};
+  const filterItems = (items, category) => (Array.isArray(items) ? items : []).filter(file => {
+    const matchesFilter = filter === 'all'
+      || (filter === 'excluded' && file.excluded === true)
+      || (filter === category && file.excluded !== true);
+    return matchesFilter && (!query || getAssetReviewSearchText(file).includes(query));
+  });
+  const listDefinitions = [
+    { listId: 'existing-assets-list', category: 'existing', items: logicalItems.existing },
+    { listId: 'added-assets-list', category: 'added', items: logicalItems.added },
+  ];
+  for (const { listId, category, items } of listDefinitions) {
     const list = $(`#${listId}`);
     if (!list) continue;
-    for (const row of list.children || []) {
-      const category = row.dataset?.assetCategory || (listId.startsWith('existing') ? 'existing' : 'added');
-      const matchesFilter = filter === 'all' || filter === category;
-      const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
-      row.classList.toggle('filtered-out', !matchesFilter || !matchesQuery);
+    if (list.__assetReviewVirtualState) {
+      setVirtualAssetItems(
+        list,
+        filterItems(items, category),
+        list.__assetReviewVirtualState.build,
+      );
+    } else if (!Array.isArray(list.__assetReviewAllItems)) {
+      for (const row of list.children || []) {
+        const rowCategory = row.dataset?.assetCategory || category;
+        const matchesFilter = filter === 'all' || filter === rowCategory || (filter === 'excluded' && rowCategory === 'excluded');
+        const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
+        row.classList.toggle('filtered-out', !matchesFilter || !matchesQuery);
+      }
     }
     const section = list.parentElement || null;
     if (section && typeof section.classList?.toggle === 'function') {
-      const category = listId.startsWith('existing') ? 'existing' : 'added';
-      section.classList.toggle('filtered-out', !['all', category, 'excluded'].includes(filter));
+      section.classList.toggle('filtered-out', filter === 'missing' || filter === 'existing' && category !== 'existing' || filter === 'added' && category !== 'added' || filter === 'excluded' && filterItems(items, category).length === 0);
     }
   }
   const pending = $('#pending-section');
   const pendingList = $('#pending-file-list');
   if (pending && pendingList) {
-    let visiblePendingCount = 0;
-    for (const row of pendingList.children || []) {
-      const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
-      const visible = ['all', 'missing'].includes(filter) && matchesQuery;
-      row.classList.toggle('filtered-out', !visible);
-      if (visible) visiblePendingCount += 1;
+    const filteredPending = filterItems(logicalItems.missing, 'missing');
+    if (pendingList.__assetReviewVirtualState) {
+      setVirtualAssetItems(pendingList, filteredPending, pendingList.__assetReviewVirtualState.build);
+      pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || filteredPending.length === 0);
+    } else {
+      let visiblePendingCount = 0;
+      for (const row of pendingList.children || []) {
+        const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
+        const visible = ['all', 'missing'].includes(filter) && matchesQuery;
+        row.classList.toggle('filtered-out', !visible);
+        if (visible) visiblePendingCount += 1;
+      }
+      pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
     }
-    pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
   }
   $$('.asset-filter').forEach(button => {
     const active = button.dataset.assetFilter === filter;
@@ -2129,6 +2351,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     const recent = [...includedExisting, ...includedAdded].slice(-5).reverse();
     reconcileKeyedList(recentList, recent, file => createRecentAssetCard(project, file, {
       previewPriority: state.assetReviewOpen ? 10 : 0,
+      loadVisual: state.assetReviewOpen !== true,
     }));
     const remaining = Math.max(0, includedExisting.length + includedAdded.length - recent.length);
     const moreKey = 'recent-more';
@@ -2188,6 +2411,7 @@ function closeAssetReviewWorkspace() {
 
 function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   if (!project) return;
+  setAssetReviewProject(project.id);
   const files = Array.isArray(presentedFiles) ? presentedFiles : (Array.isArray(project.files) ? project.files : []);
   const physicalSourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
   const figmaSourceNames = new Set();
@@ -2225,16 +2449,23 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     protectedSource: true,
     emptyMessage: 'Add a project file to begin.',
     previewPriority: state.assetReviewOpen ? 10 : 0,
+    loadVisual: false,
   });
   renderAssetPanelList($('#existing-assets-list'), project, existingAssets, {
+    virtualized: true,
     emptyMessage: 'No existing assets found.',
     previewPriority: state.assetReviewOpen ? 0 : 10,
+    loadVisual: false,
+    selectable: true,
   });
   renderAssetPanelList($('#added-assets-list'), project, addedAssets, {
+    virtualized: true,
     emptyMessage: options.hasActiveCandidates
       ? 'No package-ready assets yet. Review the files Crate observed.'
       : 'New package-ready assets will appear here as you work.',
     previewPriority: state.assetReviewOpen ? 0 : 10,
+    loadVisual: false,
+    selectable: true,
   });
 
   setAssetPanelCount($('#project-file-count'), sourceFiles.length);
@@ -2246,6 +2477,12 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const pendingFiles = state.assetWorkspace?.projectId === project.id
     ? (state.assetWorkspace.pendingFiles || []).filter(file => file.excluded !== true)
     : [];
+  const pendingReviewFiles = $('#pending-file-list')?.__assetReviewAllItems || [];
+  state.assetReviewLogicalItems = {
+    existing: existingAssets,
+    added: addedAssets,
+    missing: pendingReviewFiles,
+  };
   renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles);
   applyAssetReviewFilter();
 
@@ -2405,40 +2642,60 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   const section = $('#pending-section');
   const list = $('#pending-file-list');
   if (!section || !list) return;
+  setAssetReviewProject(project.id);
 
-  const excluded = new Set(project.excludedAssetKeys || []);
-  const pending = (project.pendingFiles || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file)));
   const presentations = Array.isArray(presentedPendingFiles)
     ? presentedPendingFiles.filter(file => file.excluded !== true)
     : [];
+  // Compose once against authoritative raw entries; filtering must reuse these
+  // objects rather than attempt to rebind a cloned presentation by its name.
+  const pending = getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
+      ? { ...rawFile, ...presentation }
+      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
+    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
+    return file;
+  });
+  pending.forEach(getRendererItemKey);
 
   if (pending.length === 0) {
     section.classList.add('hidden');
+    resetVirtualAssetList(list);
     reconcileKeyedList(list, [], () => null);
     return;
   }
 
   section.classList.remove('hidden');
-  const visiblePendingEntries = getVisiblePendingAssetEntries(project);
-  reconcileKeyedList(list, pending, (rawFile, index) => {
-    const sourceIndex = visiblePendingEntries[index]?.sourceIndex;
-    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
-    const file = presentation
-      ? { ...rawFile, ...presentation }
-      : { ...rawFile, protectedSource: true, visualIdentity: null };
+  const buildPendingRow = file => {
     const row = document.createElement('div');
     row.className = 'pending-file';
     row.setAttribute('role', 'listitem');
     row.dataset.assetCategory = 'missing';
-    row.dataset.assetSearch = `${file?.name || ''} ${file?.ext || ''} ${file?.appFamily || ''} ${file?.sourceName || ''}`.toLowerCase();
+    row.dataset.assetSearch = getAssetReviewSearchText(file);
+    const selected = state.assetReviewSelectedKey === getRendererItemKey(file);
+    row.tabIndex = 0;
+    row.setAttribute('aria-selected', String(selected));
+    row.classList.toggle('is-selected', selected);
+    const select = () => {
+      state.assetReviewSelectedKey = row.dataset.renderKey || getRendererItemKey(file);
+      renderVirtualAssetList(list, list.__assetReviewVirtualState.items, list.__assetReviewVirtualState.build);
+    };
+    row.addEventListener('click', event => {
+      if (event.target?.closest?.('button')) return;
+      select();
+    });
+    row.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      select();
+    });
     const reason = getPendingFileReason(file);
     const stateLabel = getPendingCaptureState(file) === 'needs-save'
       ? 'Needs Save'
       : (getPendingCaptureState(file) === 'observed' ? 'Opened' : 'Needs Review');
 
-    row.appendChild(createFileVisual(project.id, file, {
-      priority: state.assetReviewOpen ? 0 : 10,
-    }));
+    row.appendChild(createFileVisual(project.id, file, { loadVisual: false }));
     const copy = document.createElement('span');
     copy.className = 'pending-file-copy';
     const name = document.createElement('span');
@@ -2457,64 +2714,10 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     stateBadge.textContent = stateLabel;
     row.appendChild(stateBadge);
 
-    const actions = document.createElement('div');
-    actions.className = 'pending-actions';
-    const acceptButton = document.createElement('button');
-    acceptButton.type = 'button';
-    acceptButton.className = 'btn-accept-pending';
-    acceptButton.textContent = '+ Add';
-    acceptButton.title = `Add ${file.name || 'this file'} to the project`;
-    acceptButton.setAttribute('aria-label', acceptButton.title);
-    const rejectButton = document.createElement('button');
-    rejectButton.type = 'button';
-    rejectButton.className = 'btn-reject-pending';
-    rejectButton.textContent = 'Skip';
-    rejectButton.title = `Skip ${file.name || 'this file'}`;
-    rejectButton.setAttribute('aria-label', rejectButton.title);
-    actions.appendChild(acceptButton);
-    actions.appendChild(rejectButton);
-    row.appendChild(actions);
-
-    acceptButton.addEventListener('click', async () => {
-      try {
-        await runRendererAction(
-          `pending-accept:${project.id}:${getRendererItemKey(file, index)}`,
-          acceptButton,
-          'Adding…',
-          async () => {
-            await window.crate.acceptPending(project.id, getFileVisualIdentity(file) || rawFile.path);
-            state.projects = await window.crate.getProjects();
-            await renderFiles();
-          },
-          '+ Add',
-        );
-      } catch (error) {
-        logRendererError('pending asset add failed', error);
-        showToast('Crate could not add that asset. Try again.');
-      }
-    });
-
-    rejectButton.addEventListener('click', async () => {
-      try {
-        await runRendererAction(
-          `pending-reject:${project.id}:${getRendererItemKey(file, index)}`,
-          rejectButton,
-          'Skipping…',
-          async () => {
-            await window.crate.rejectPending(project.id, getFileVisualIdentity(file) || rawFile.path);
-            state.projects = await window.crate.getProjects();
-            await renderFiles();
-          },
-          'Skip',
-        );
-      } catch (error) {
-        logRendererError('pending asset skip failed', error);
-        showToast('Crate could not skip that asset. Try again.');
-      }
-    });
-
     return row;
-  });
+  };
+  list.__assetReviewAllItems = pending;
+  renderVirtualAssetList(list, pending, buildPendingRow);
 }
 
 // ===== Render Settings =====
