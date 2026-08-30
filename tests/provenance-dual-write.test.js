@@ -1044,6 +1044,17 @@ module.exports.__crateMetadataTestHooks = {
   getWatcherCoordinatorSnapshot(projectId) {
     return getWatcherCoordinator(projectId).snapshot(projectId);
   },
+  getIllustratorActivationScopeSnapshot(projectId) {
+    const scope = getIllustratorActivationScope(projectId);
+    if (!scope) return null;
+    return {
+      status: scope.status,
+      baselineDocumentPaths: [...scope.baselineDocumentPaths].sort(),
+      admittedDocumentPaths: [...scope.admittedDocumentPaths].sort(),
+      allowedLinkedPaths: [...scope.allowedLinkedPaths].sort(),
+      excludedLinkedPaths: [...scope.excludedLinkedPaths].sort(),
+    };
+  },
   pauseWatcherCoordinatorForPackage(projectId) {
     return pauseWatcherCoordinatorForPackage(projectId);
   },
@@ -14258,14 +14269,145 @@ test('accepted chokidar Illustrator source remains visible across pause and resu
   }
 });
 
+test('accepted Illustrator pending source remains aligned across pause and resume projections', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Accepted_Native_Illustrator.ai');
+  writeSyntheticAiFile(sourcePath, 'accepted native Illustrator source');
+  let activationQueryCount = 0;
+  let illustratorProcessQueryCount = 0;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) {
+      illustratorProcessQueryCount++;
+      return { stdout: illustratorProcessQueryCount > 1 ? '654\n' : '' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      activationQueryCount++;
+      if (activationQueryCount === 1) return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+      return {
+        stdout: `DOC\t${sourcePath}\tAccepted_Native_Illustrator.ai\tfalse\ttrue\nCOMPLETE\t1\t0\n`,
+      };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Accepted native Illustrator reconciliation');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const pendingFile = {
+      ...makePendingFile(sourcePath, 'app-opened'),
+      captureState: 'observed',
+      captureReason: 'illustrator-active-session',
+      captureEvidence: {
+        source: 'app-opened',
+        appFamily: 'illustrator',
+        observerMethod: 'illustrator-active-session',
+        evidenceStrength: 'structured-app-document',
+      },
+    };
+    stored.pendingFiles = [pendingFile];
+
+    const accepted = await callIpcRaw('projects:accept-pending', project.id, sourcePath);
+    assert.equal(accepted.files.filter(file => file.path === sourcePath).length, 1);
+
+    const stalePath = path.join(TEST_HOME, 'Desktop', 'Stale_Prior_Activation.ai');
+    const pausedPath = path.join(TEST_HOME, 'Desktop', 'Created_While_Paused.ai');
+    writeSyntheticAiFile(stalePath, 'stale prior activation review row');
+    stored.pendingFiles.push({
+      ...makePendingFile(stalePath, 'app-opened'),
+      addedAt: stored.watchStartedAt - 1000,
+      captureSessionId: 'stale-prior-activation',
+      captureState: 'needs-save',
+      captureReason: 'illustrator-active-session',
+      captureEvidence: {
+        source: 'app-opened',
+        appFamily: 'illustrator',
+        observerMethod: 'illustrator-active-session',
+        evidenceStrength: 'structured-app-document',
+      },
+    });
+
+    const projection = async () => {
+      const scoped = await getProject(project.id);
+      const files = await callIpcRaw('projects:get-files', project.id);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      const rendered = workspace.files.find(file => file.name === path.basename(sourcePath));
+      return {
+        rawFileCount: stored.files.filter(file => file.path === sourcePath).length,
+        scopedFileCount: scoped.files.filter(file => file.path === sourcePath).length,
+        ipcFileCount: files.filter(file => file.path === sourcePath).length,
+        workspaceFileCount: workspace.files.filter(file => file.name === path.basename(sourcePath)).length,
+        rawStalePendingCount: stored.pendingFiles.filter(file => file.path === stalePath).length,
+        scopedStalePendingCount: scoped.pendingFiles.filter(file => file.path === stalePath).length,
+        workspaceStalePendingCount: workspace.pendingFiles.filter(file => file.name === path.basename(stalePath)).length,
+        workspaceProjectId: workspace.projectId,
+        visualIdentity: rendered?.visualIdentity || null,
+        projectRole: rendered?.projectRole || null,
+        protectedSource: rendered?.protectedSource === true,
+      };
+    };
+
+    const beforePause = await projection();
+    assert.deepEqual({
+      rawFileCount: beforePause.rawFileCount,
+      scopedFileCount: beforePause.scopedFileCount,
+      ipcFileCount: beforePause.ipcFileCount,
+      workspaceFileCount: beforePause.workspaceFileCount,
+      rawStalePendingCount: beforePause.rawStalePendingCount,
+      scopedStalePendingCount: beforePause.scopedStalePendingCount,
+      workspaceStalePendingCount: beforePause.workspaceStalePendingCount,
+    }, { rawFileCount: 1, scopedFileCount: 1, ipcFileCount: 1, workspaceFileCount: 1, rawStalePendingCount: 1, scopedStalePendingCount: 0, workspaceStalePendingCount: 0 });
+
+    await callIpcRaw('projects:pause', project.id);
+    writeSyntheticAiFile(pausedPath, 'created while paused');
+    const whilePaused = await projection();
+    assert.deepEqual({
+      rawFileCount: whilePaused.rawFileCount,
+      scopedFileCount: whilePaused.scopedFileCount,
+      ipcFileCount: whilePaused.ipcFileCount,
+      workspaceFileCount: whilePaused.workspaceFileCount,
+      rawStalePendingCount: whilePaused.rawStalePendingCount,
+      scopedStalePendingCount: whilePaused.scopedStalePendingCount,
+      workspaceStalePendingCount: whilePaused.workspaceStalePendingCount,
+    }, { rawFileCount: 1, scopedFileCount: 1, ipcFileCount: 1, workspaceFileCount: 1, rawStalePendingCount: 1, scopedStalePendingCount: 0, workspaceStalePendingCount: 0 });
+
+    await callIpcRaw('projects:start-watching', project.id);
+    const afterResume = await projection();
+    assert.deepEqual({
+      rawFileCount: afterResume.rawFileCount,
+      scopedFileCount: afterResume.scopedFileCount,
+      ipcFileCount: afterResume.ipcFileCount,
+      workspaceFileCount: afterResume.workspaceFileCount,
+      rawStalePendingCount: afterResume.rawStalePendingCount,
+      scopedStalePendingCount: afterResume.scopedStalePendingCount,
+      workspaceStalePendingCount: afterResume.workspaceStalePendingCount,
+    }, { rawFileCount: 1, scopedFileCount: 1, ipcFileCount: 1, workspaceFileCount: 1, rawStalePendingCount: 1, scopedStalePendingCount: 0, workspaceStalePendingCount: 0 });
+    assert.equal(afterResume.workspaceProjectId, project.id);
+    assert.match(afterResume.visualIdentity, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(afterResume.visualIdentity, beforePause.visualIdentity);
+    assert.equal(afterResume.projectRole, 'source');
+    assert.equal(afterResume.protectedSource, true);
+    assert.equal(stored.files.some(file => file.path === pausedPath), false);
+    assert.equal((await callIpcRaw('projects:get-files', project.id)).some(file => file.path === pausedPath), false);
+    assert.equal((await callIpcRaw('projects:get-asset-workspace', project.id)).files.some(file => file.name === path.basename(pausedPath)), false);
+    const scope = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    assert.equal(scope.status, 'ready');
+    assert.deepEqual(scope.baselineDocumentPaths, []);
+    assert.deepEqual(scope.admittedDocumentPaths.map(item => path.basename(item)), [path.basename(sourcePath).toLowerCase()]);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
 test('resume hides stale pending rows while retaining the selected project source', async () => {
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Selected_Project.ai');
   const stalePath = path.join(TEST_HOME, 'Desktop', 'Stale_Unrelated.ai');
   const otherProjectPath = path.join(TEST_HOME, 'Desktop', 'Other_Project.ai');
+  const otherProjectSameNamePath = path.join(TEST_HOME, 'Documents', 'Selected_Project.ai');
   writeSyntheticAiFile(sourcePath, 'selected project source');
   writeSyntheticAiFile(stalePath, 'stale unrelated review row');
   writeSyntheticAiFile(otherProjectPath, 'other project source');
+  writeSyntheticAiFile(otherProjectSameNamePath, 'other project same-name source');
   setChildProcessHandler(({ kind, command, args }) => {
     if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '' };
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
@@ -14303,7 +14445,12 @@ test('resume hides stale pending rows while retaining the selected project sourc
       mtimeMs: otherStored.watchStartedAt + 1000,
       birthtimeMs: otherStored.watchStartedAt + 1000,
     });
-    await waitForProject(otherProject.id, item => item.files.some(file => file.path === otherProjectPath));
+    await emitWatcherWithStats('add', otherProjectSameNamePath, {
+      mtimeMs: otherStored.watchStartedAt + 2000,
+      birthtimeMs: otherStored.watchStartedAt + 2000,
+    });
+    await waitForProject(otherProject.id, item => item.files.some(file => file.path === otherProjectPath)
+      && item.files.some(file => file.path === otherProjectSameNamePath));
     await callIpc('projects:start-watching', project.id);
 
     const fresh = await getProject(project.id);
@@ -14315,6 +14462,7 @@ test('resume hides stale pending rows while retaining the selected project sourc
     assert.equal(workspace.projectId, project.id);
     assert.equal(workspace.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
     assert.equal(workspace.files.some(file => file.name === path.basename(otherProjectPath)), false);
+    assert.equal(workspace.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
     assert.equal(workspace.pendingFiles.some(file => file.name === path.basename(stalePath)), false);
   } finally {
     setChildProcessHandler(null);
