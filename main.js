@@ -13938,6 +13938,7 @@ registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
 registerTrustedIpcHandler('projects:pause', (event, id) => {
   const project = mutateProject(id, (proj) => {
     proj.status = 'paused';
+    return proj;
   });
   if (project) {
     stopWatching(id);
