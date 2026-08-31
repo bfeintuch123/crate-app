@@ -13340,19 +13340,164 @@ test('legacy projects preserve accepted files without prompting and retain exact
     source: 'psd-linked',
   }];
 
-  const fresh = await getProject(project.id);
+  // Drive the normal persisted migration path first. The public project view
+  // may intentionally hide this legacy pending row after it is normalized.
+  await callIpc('projects:get-all');
+  const persisted = storeInstance.data.projects.find(item => item.id === project.id);
+  assert.ok(persisted, 'expected the migrated project to remain addressable by stable project ID');
 
-  assert.deepEqual(fresh.assetBaseline, {
+  assert.deepEqual(persisted.assetBaseline, {
     schemaVersion: 1,
     status: 'legacy-included',
     decision: 'include',
     establishedAt: stored.watchStartedAt,
   });
-  assert.deepEqual(fresh.excludedAssetKeys, [linkedPath, `${linkedPath} `]);
-  assert.equal(fresh.files[0].assetOrigin, 'existing');
-  assert.equal(fresh.files[0].projectRole, 'source');
-  assert.equal(fresh.pendingFiles[0].assetOrigin, 'existing');
-  assert.equal(fresh.pendingFiles[0].projectRole, 'asset');
+  assert.deepEqual(persisted.excludedAssetKeys, [linkedPath, `${linkedPath} `]);
+  assert.equal(persisted.files[0].path, sourcePath);
+  assert.equal(persisted.files[0].assetOrigin, 'existing');
+  assert.equal(persisted.files[0].projectRole, 'source');
+  assert.equal(persisted.pendingFiles[0].path, linkedPath);
+  assert.equal(persisted.pendingFiles[0].assetOrigin, 'existing');
+  assert.equal(persisted.pendingFiles[0].projectRole, 'asset');
+});
+
+test('stale pending projection hides pre-activation rows without deleting persisted state or crossing project boundaries', async () => {
+  const project = await createProject('Stale pending projection owner');
+  const unrelatedProject = await createProject('Unrelated pending projection project');
+  await callIpcRaw('projects:start-watching', project.id);
+
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  const unrelatedStored = storeInstance.data.projects.find(item => item.id === unrelatedProject.id);
+  assert.ok(stored);
+  assert.ok(unrelatedStored);
+  const watchStartedAt = Number(stored.watchStartedAt);
+  assert.equal(Number.isFinite(watchStartedAt), true);
+  assert.equal(stored.status, 'watching');
+
+  const acceptedSourcePath = path.join(os.tmpdir(), 'Stale projection accepted source.ai');
+  const stalePendingPath = path.join(os.tmpdir(), 'Stale projection linked asset.png');
+  const unrelatedPath = path.join(os.tmpdir(), 'Unrelated projection source.ai');
+  const exactExclusions = [stalePendingPath, `${stalePendingPath} `];
+  stored.assetBaseline = {
+    schemaVersion: 1,
+    status: 'empty',
+    decision: null,
+    establishedAt: watchStartedAt,
+  };
+  stored.files = [{
+    path: acceptedSourcePath,
+    name: path.basename(acceptedSourcePath),
+    ext: '.ai',
+    addedAt: watchStartedAt - 1000,
+    source: 'manual-browse',
+  }];
+  stored.pendingFiles = [{
+    path: stalePendingPath,
+    name: path.basename(stalePendingPath),
+    ext: '.png',
+    addedAt: watchStartedAt - 1,
+    source: 'psd-linked',
+  }];
+  stored.excludedAssetKeys = [...exactExclusions];
+  unrelatedStored.files = [{
+    path: unrelatedPath,
+    name: path.basename(unrelatedPath),
+    ext: '.ai',
+    addedAt: Number(unrelatedStored.watchStartedAt),
+    source: 'manual-browse',
+  }];
+  roundTripFakeStore();
+
+  const publicProjects = await callIpc('projects:get-all');
+  const publicProject = publicProjects.find(item => item.id === project.id);
+  const publicUnrelatedProject = publicProjects.find(item => item.id === unrelatedProject.id);
+  assert.ok(publicProject);
+  assert.ok(publicUnrelatedProject);
+  assert.equal(publicProject.files.some(file => file.path === acceptedSourcePath), true);
+  assert.equal(publicProject.pendingFiles.some(file => file.path === stalePendingPath), false);
+  assert.deepEqual(publicProject.excludedAssetKeys, []);
+  assert.equal(JSON.stringify(publicProject).includes(stalePendingPath), false);
+  assert.equal(publicProject.files.some(file => file.path === unrelatedPath), false);
+  assert.equal(publicUnrelatedProject.files.some(file => file.path === unrelatedPath), true);
+  assert.equal(JSON.stringify(publicUnrelatedProject).includes(stalePendingPath), false);
+
+  // The selected-project helper uses the same public scoped projection.
+  const selectedProject = await getProject(project.id);
+  assert.equal(selectedProject.pendingFiles.some(file => file.path === stalePendingPath), false);
+  assert.equal(JSON.stringify(selectedProject).includes(stalePendingPath), false);
+
+  const persisted = storeInstance.data.projects.find(item => item.id === project.id);
+  assert.ok(persisted, 'expected stale project to remain persisted');
+  assert.equal(persisted.pendingFiles.some(file => file.path === stalePendingPath), true);
+  assert.deepEqual(persisted.excludedAssetKeys, exactExclusions);
+});
+
+test('current-session pending projection preserves rows across a timing gap and at the watch-start boundary', async () => {
+  const project = await createProject('Current-session pending projection');
+  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+  assert.ok(stored);
+  const watchStartedAt = Number(stored.watchStartedAt);
+  const watchSessionId = typeof stored.watchSessionId === 'string' ? stored.watchSessionId.trim() : '';
+  assert.equal(Number.isFinite(watchStartedAt), true);
+  assert.notEqual(watchSessionId, '', 'current-session fixture requires an authoritative persisted session ID');
+
+  const acceptedSourcePath = path.join(os.tmpdir(), 'Current-session accepted source.ai');
+  const currentPendingPath = path.join(os.tmpdir(), 'Current-session linked asset.png');
+  const boundaryPendingPath = path.join(os.tmpdir(), 'Watch-start boundary linked asset.png');
+  const exactExclusions = [
+    currentPendingPath,
+    `${currentPendingPath} `,
+    boundaryPendingPath,
+    `${boundaryPendingPath} `,
+  ];
+  stored.assetBaseline = {
+    schemaVersion: 1,
+    status: 'empty',
+    decision: null,
+    establishedAt: watchStartedAt,
+  };
+  stored.files = [{
+    path: acceptedSourcePath,
+    name: path.basename(acceptedSourcePath),
+    ext: '.ai',
+    addedAt: watchStartedAt - 1000,
+    source: 'manual-browse',
+  }];
+  stored.pendingFiles = [{
+    path: currentPendingPath,
+    name: path.basename(currentPendingPath),
+    ext: '.png',
+    addedAt: watchStartedAt - 1,
+    captureSessionId: watchSessionId,
+    source: 'psd-linked',
+  }, {
+    path: boundaryPendingPath,
+    name: path.basename(boundaryPendingPath),
+    ext: '.png',
+    addedAt: watchStartedAt,
+    source: 'psd-linked',
+  }];
+  stored.excludedAssetKeys = [...exactExclusions];
+  roundTripFakeStore();
+
+  const publicProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.ok(publicProject);
+  assert.equal(publicProject.files.some(file => file.path === acceptedSourcePath), true);
+  assert.deepEqual(
+    publicProject.pendingFiles.map(file => file.path).sort(),
+    [currentPendingPath, boundaryPendingPath].sort()
+  );
+  assert.deepEqual(publicProject.excludedAssetKeys, exactExclusions);
+  assert.equal(publicProject.pendingFiles.find(file => file.path === currentPendingPath).captureSessionId, watchSessionId);
+  assert.equal(publicProject.pendingFiles.find(file => file.path === currentPendingPath).addedAt, watchStartedAt - 1);
+  assert.equal(publicProject.pendingFiles.find(file => file.path === boundaryPendingPath).addedAt, watchStartedAt);
+
+  const selectedProject = await getProject(project.id);
+  assert.deepEqual(
+    selectedProject.pendingFiles.map(file => file.path).sort(),
+    [currentPendingPath, boundaryPendingPath].sort()
+  );
+  assert.deepEqual(selectedProject.excludedAssetKeys, exactExclusions);
 });
 
 test('malformed or future asset baseline records fail closed instead of migrating as included', async () => {
