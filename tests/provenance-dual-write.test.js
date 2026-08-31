@@ -1064,6 +1064,12 @@ module.exports.__crateMetadataTestHooks = {
       excludedLinkedPaths: [...scope.excludedLinkedPaths].sort(),
     };
   },
+  createIllustratorProjectFilePathSnapshot(projectFiles) {
+    return createIllustratorProjectFilePathSnapshot(projectFiles);
+  },
+  isIllustratorScopedFileAllowed(project, fileEntry, observation) {
+    return isIllustratorScopedFileAllowed(project, fileEntry, observation);
+  },
   pauseWatcherCoordinatorForPackage(projectId) {
     return pauseWatcherCoordinatorForPackage(projectId);
   },
@@ -21493,4 +21499,200 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
+});
+
+test('lsof Illustrator scope normalizes stored project files once per poll phase', async () => {
+  resetTestHomeWorkspace();
+  const reproRoot = path.join(TEST_HOME, 'Documents', 'LsofScopeNormalization');
+  fs.mkdirSync(reproRoot, { recursive: true });
+  const handles = [
+    ...['.ttf', '.otf', '.woff', '.woff2', '.js', '.json', '.cache', '.tmp', '.db', '.bin', '.log', '.lock']
+      .flatMap((ext, index) => [0, 1].map(copy => path.join(reproRoot, 'Irrelevant', `resource-${index}-${copy}${ext}`))),
+    path.join(reproRoot, 'Sources', 'open-source.ai'),
+    path.join(reproRoot, 'Sources', 'open-source.pdf'),
+    path.join(reproRoot, 'Sources', 'open-source.psd'),
+    path.join(reproRoot, 'Links', 'linked-image.jpg'),
+    path.join(reproRoot, 'Links', 'linked-vector.svg'),
+    path.join(reproRoot, 'Sources', 'open-layout.indd'),
+  ];
+  const allHandles = [
+    ...handles,
+    ...Array.from({ length: 470 }, (_, index) => path.join(reproRoot, 'Irrelevant', `background-${index}.cache`)),
+  ];
+  for (const filePath of allHandles) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (['.ai', '.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'lsof scope normalization');
+    else fs.writeFileSync(filePath, `synthetic ${path.basename(filePath)}`);
+  }
+
+  let lsofOutput = '';
+  let processCommand = '/Applications/Adobe Illustrator.app/Contents/MacOS/Adobe Illustrator';
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+    }
+    if (kind === 'exec' && command.startsWith('/bin/ps ax -o pid= -o command=')) {
+      return { stdout: `321 ${processCommand}\n` };
+    }
+    if (kind === 'exec' && command.startsWith('/usr/sbin/lsof -F ptn -p 321')) {
+      return { stdout: lsofOutput };
+    }
+    return { stdout: '' };
+  });
+
+  const originalRealpathSyncNative = fs.realpathSync.native;
+  const originalAsyncRealpath = fs.promises.realpath;
+  let realpathCalls = 0;
+  let asyncRealpathCalls = 0;
+  fs.realpathSync.native = function countRealpathCalls(...args) {
+    realpathCalls += 1;
+    return originalRealpathSyncNative.apply(this, args);
+  };
+  fs.promises.realpath = async function countAsyncRealpathCalls(...args) {
+    asyncRealpathCalls += 1;
+    return originalAsyncRealpath.apply(this, args);
+  };
+
+  try {
+    const project = await createProject('Illustrator zero-document normalization regression');
+    await waitForCondition(
+      () => metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id)?.status === 'ready',
+      'timed out waiting for zero-document Illustrator scope'
+    );
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    clearTrackedTimers();
+
+    const counts = [];
+    for (const [storedAssetCount, handleCount] of [[30, 30], [263, 263], [500, 500]]) {
+      const storedRoot = path.join(reproRoot, 'Stored', String(storedAssetCount));
+      fs.mkdirSync(storedRoot, { recursive: true });
+      const storedFiles = [];
+      for (let index = 0; index < storedAssetCount; index++) {
+        const ext = ['.ai', '.jpg', '.png', '.pdf', '.ttf'][index % 5];
+        const filePath = path.join(storedRoot, `stored-asset-${index}${ext}`);
+        if (['.ai', '.pdf'].includes(ext)) writeSyntheticAiFile(filePath, 'stored source');
+        else fs.writeFileSync(filePath, `stored synthetic asset ${index}`);
+        storedFiles.push({
+          path: filePath,
+          name: path.basename(filePath),
+          ext,
+          addedAt: Date.now(),
+          source: 'chokidar-add',
+        });
+      }
+      await setProjectFiles(project.id, { files: storedFiles, pendingFiles: [] });
+      lsofOutput = allHandles.slice(0, handleCount).map((filePath, index) => `p321\nf${index + 1}\ntREG\nn${filePath}\n`).join('');
+      const before = realpathCalls;
+      const beforeAsync = asyncRealpathCalls;
+      await metadataTestHooks.pollLsofForProject(
+        project.id,
+        metadataTestHooks.getActiveWatchingActivationToken(project.id)
+      );
+      counts.push({ storedAssetCount, handleCount, sync: realpathCalls - before, async: asyncRealpathCalls - beforeAsync });
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.files.length, storedAssetCount);
+      assert.equal(fresh.pendingFiles.length, 0);
+    }
+
+    const irrelevantHandle = allHandles.find(filePath => filePath.endsWith('.cache'));
+    lsofOutput = `p321\nf999\ntREG\nn${irrelevantHandle}\n`;
+    const illustratorEmptyEligibleBefore = realpathCalls;
+    await metadataTestHooks.pollLsofForProject(
+      project.id,
+      metadataTestHooks.getActiveWatchingActivationToken(project.id)
+    );
+    const illustratorEmptyEligibleCalls = realpathCalls - illustratorEmptyEligibleBefore;
+    assert.ok(illustratorEmptyEligibleCalls < 500 + 400, `empty-eligible Illustrator poll added an eager first-pass asset scan: ${illustratorEmptyEligibleCalls}`);
+
+    processCommand = '/Applications/Adobe Photoshop 2025/Adobe Photoshop 2025.app/Contents/MacOS/Adobe Photoshop 2025';
+    const nonIllustratorEmptyEligibleBefore = realpathCalls;
+    await metadataTestHooks.pollLsofForProject(
+      project.id,
+      metadataTestHooks.getActiveWatchingActivationToken(project.id)
+    );
+    const nonIllustratorEmptyEligibleCalls = realpathCalls - nonIllustratorEmptyEligibleBefore;
+    assert.ok(nonIllustratorEmptyEligibleCalls < 500 + 400, `empty-eligible non-Illustrator poll added an eager first-pass asset scan: ${nonIllustratorEmptyEligibleCalls}`);
+
+    for (const count of counts) {
+      assert.equal(count.async, 0);
+      assert.ok(count.sync < 4 * count.storedAssetCount + 400, `${count.storedAssetCount}-file lsof scope regression: ${count.sync}`);
+    }
+    assert.ok(counts[2].sync - counts[1].sync < 4 * (500 - 263) + 400, 'handle growth regressed into asset-multiplicative work');
+    assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id).status, 'ready');
+    assert.deepEqual(metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id).baselineDocumentPaths, []);
+    assert.deepEqual(metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id).admittedDocumentPaths, []);
+  } finally {
+    fs.realpathSync.native = originalRealpathSyncNative;
+    fs.promises.realpath = originalAsyncRealpath;
+    setChildProcessHandler(null);
+  }
+});
+
+test('Illustrator lsof scope rejects stale same-length project-file snapshots', () => {
+  resetTestHomeWorkspace();
+  const root = path.join(TEST_HOME, 'Documents', 'LsofScopeSnapshotIdentity');
+  fs.mkdirSync(root, { recursive: true });
+  const pathA = path.join(root, 'candidate.ai');
+  const pathB = path.join(root, 'replacement.ai');
+  const pathC = path.join(root, 'third.ai');
+  for (const filePath of [pathA, pathB, pathC]) writeSyntheticAiFile(filePath, 'snapshot identity');
+  const acceptedFile = filePath => ({
+    path: filePath,
+    name: path.basename(filePath),
+    ext: '.ai',
+    addedAt: Date.now(),
+    source: 'manual-browse',
+    explicitUserAuthority: {
+      granted: true,
+      source: 'manual-browse',
+      method: 'test-authorized-file',
+      grantedAt: Date.now(),
+    },
+  });
+  const untrustedFile = filePath => ({
+    path: filePath,
+    name: path.basename(filePath),
+    ext: '.ai',
+    addedAt: Date.now(),
+    source: 'lsof',
+  });
+  const snapshotFor = files => metadataTestHooks.createIllustratorProjectFilePathSnapshot(files);
+  const candidate = { path: pathA, name: path.basename(pathA), ext: '.ai', source: 'lsof' };
+  const observation = { appFamily: 'illustrator' };
+
+  const originalForReplacement = untrustedFile(pathA);
+  const replacementProject = { id: 'snapshot-replacement', files: [originalForReplacement], pendingFiles: [] };
+  const replacementSnapshot = snapshotFor(replacementProject.files);
+  replacementProject.files[0] = acceptedFile(pathB);
+  assert.equal(metadataTestHooks.isIllustratorScopedFileAllowed(replacementProject, candidate, {
+    ...observation,
+    projectFilePaths: replacementSnapshot,
+  }), false);
+
+  const mutatedProjectFile = acceptedFile(pathA);
+  const mutatedProject = { id: 'snapshot-path-mutation', files: [mutatedProjectFile], pendingFiles: [] };
+  const mutatedSnapshot = snapshotFor(mutatedProject.files);
+  mutatedProjectFile.path = pathB;
+  assert.equal(metadataTestHooks.isIllustratorScopedFileAllowed(mutatedProject, candidate, {
+    ...observation,
+    projectFilePaths: mutatedSnapshot,
+  }), false);
+
+  const reorderedA = untrustedFile(pathA);
+  const reorderedB = acceptedFile(pathB);
+  const reorderedProject = { id: 'snapshot-reorder', files: [reorderedA, reorderedB], pendingFiles: [] };
+  const reorderedSnapshot = snapshotFor(reorderedProject.files);
+  reorderedProject.files.reverse();
+  assert.equal(metadataTestHooks.isIllustratorScopedFileAllowed(reorderedProject, candidate, {
+    ...observation,
+    projectFilePaths: reorderedSnapshot,
+  }), false);
+
+  const currentProject = { id: 'snapshot-control', files: [acceptedFile(pathA), acceptedFile(pathC)], pendingFiles: [] };
+  currentProject.files.reverse();
+  assert.equal(metadataTestHooks.isIllustratorScopedFileAllowed(currentProject, candidate, {
+    ...observation,
+    projectFilePaths: snapshotFor(currentProject.files),
+  }), true);
 });
