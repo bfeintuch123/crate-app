@@ -1067,7 +1067,16 @@ function isPersistedAcceptedWatcherSource(project, file) {
   const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
   if (!normalizedPath || !PRIMARY_DESIGN_EXTENSIONS.has(ext) || !ILLUSTRATOR_SOURCE_EXTENSIONS.has(ext)) return false;
   if (!project.files.some(acceptedFile => normalizeTrackedFilePath(acceptedFile && acceptedFile.path) === normalizedPath)) return false;
-  return hasPersistedWatcherObservation(project, normalizedPath);
+  return hasPersistedWatcherObservation(project, normalizedPath) || (Array.isArray(project.provenance?.observations) && project.provenance.observations.some(observation => (
+    observation &&
+    observation.relationType === EDGE_TYPES.SESSION_OBSERVED_FILE &&
+    observation.objectNodeId === createNodeId(NODE_TYPES.FILE, { normalizedPath }) &&
+    observation.observer &&
+    observation.observer.kind === OBSERVER_KINDS.APP_SCRIPT &&
+    observation.observer.method === 'app-opened' &&
+    observation.payload &&
+    observation.payload.appFamily === 'illustrator'
+  )));
 }
 
 function isTrustedSessionProjectFile(project, file) {
@@ -10372,6 +10381,7 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState, project = 
       continue;
     }
     if (!doc.documentPath) continue;
+    const saved = doc.modified !== true;
     evidenceRecords.push(createLiveAppEvidence({
       projectId,
       filePath: doc.documentPath,
@@ -10382,7 +10392,12 @@ function createIllustratorLiveEvidenceRecords(projectId, activeState, project = 
       sourceDocumentName: doc.documentName || path.basename(doc.documentPath),
       documentModified: doc.modified,
       evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
-      requiresSave: doc.modified,
+      requiresSave: !saved,
+      savedEvidence: saved,
+      filesystemSaved: saved,
+      allowDirect: saved,
+      forcePending: !saved,
+      evidenceReason: saved ? 'illustrator-saved-document' : 'app-live-evidence',
     }));
   }
   for (const link of (activeState && activeState.links) || []) {
@@ -10615,6 +10630,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
             payload: {
               method: evidence.source,
               channel: 'live-app-refresh',
+              appFamily: evidence.appFamily,
             },
           });
         }

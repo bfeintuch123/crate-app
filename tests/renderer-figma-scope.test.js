@@ -1372,6 +1372,43 @@ test('generic presentation assets preserve Keynote and PowerPoint source applica
   assert.equal(appText.includes('PowerPoint'), true);
 });
 
+test('unknown generic assets omit the generic origin marker while retaining meaningful source context', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'generic-origin-cleanup', files: [], pendingFiles: [], excludedAssetKeys: [] };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  const generic = {
+    name: 'standalone.png', ext: '.png', projectRole: 'asset', assetOrigin: 'added',
+    visualIdentity: 'generic', visualRevision: 'generic-r1',
+  };
+  const genericWithContext = {
+    ...generic, name: 'linked.png', sourceName: 'Brand-System.ai', visualIdentity: 'generic-context',
+  };
+  const illustrator = {
+    ...generic, name: 'illustrator-linked.png', appFamily: 'illustrator', sourceName: 'Brand-System.ai',
+    visualIdentity: 'illustrator',
+  };
+
+  assert.equal(renderer.createAppOriginLabel(generic, project), null);
+  const genericRowText = getElementTreeText(renderer.createAssetFileRow(project, generic, { loadVisual: false }));
+  assert.equal(genericRowText.includes('File'), false);
+  assert.equal(genericRowText.includes('•'), false);
+
+  const contextLabel = renderer.createAppOriginLabel(genericWithContext, project);
+  assert.ok(contextLabel);
+  assert.equal(getElementTreeText(contextLabel).trim(), 'Brand-System.ai');
+  assert.equal(getElementTreeText(contextLabel).includes('File'), false);
+  assert.equal(getElementTreeText(contextLabel).includes('•'), false);
+
+  renderer.renderAssetWorkspace(project, {}, [generic, genericWithContext]);
+  const originText = getElementTreeText(elements['asset-origin-list']);
+  assert.equal(originText.includes('File'), false);
+  assert.equal(originText.includes('•'), false);
+
+  const knownLabel = renderer.createAppOriginLabel(illustrator, project);
+  assert.ok(knownLabel);
+  assert.equal(getElementTreeText(knownLabel).includes('Illustrator · Brand-System.ai'), true);
+});
+
 test('Current Project review alert uses correct singular and plural copy', () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = { id: 'linking-copy', files: [], pendingFiles: [], excludedAssetKeys: [] };

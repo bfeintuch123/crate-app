@@ -14788,6 +14788,66 @@ test('accepted chokidar Illustrator source remains visible across pause and resu
   }
 });
 
+test('saved current-activation Illustrator document promotes to package-ready', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'Saved_Current_Activation.ai');
+  writeSyntheticAiFile(sourcePath, 'saved current-activation Illustrator source');
+  let activationQueryCount = 0;
+  let illustratorDocumentModified = true;
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '654\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
+      activationQueryCount++;
+      if (activationQueryCount === 1) return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+      return { stdout: `DOC\t${sourcePath}\tSaved_Current_Activation.ai\t${illustratorDocumentModified}\ttrue\nCOMPLETE\t1\t0\n` };
+    }
+    return { stdout: '' };
+  });
+
+  try {
+    const project = await createProject('Saved current activation Illustrator');
+    await waitForCondition(() => activationQueryCount >= 1, 'timed out waiting for initial Illustrator activation');
+    await runTrackedIntervalCallbacks();
+
+    let fresh = await waitForProject(
+      project.id,
+      item => item.pendingFiles.some(file => file.path === sourcePath)
+    );
+    assert.deepEqual(fresh.files, []);
+    assert.equal(fresh.pendingFiles.find(file => file.path === sourcePath).captureState, 'needs-save');
+
+    // The next structured active-document observation represents the same
+    // document after Illustrator saved and reopened it.
+    illustratorDocumentModified = false;
+    await runTrackedIntervalCallbacks();
+
+    fresh = await waitForProject(
+      project.id,
+      item => item.files.some(file => file.path === sourcePath)
+    );
+    assert.equal(fresh.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(fresh.pendingFiles.some(file => file.path === sourcePath), false);
+    const ledgerEntry = Object.values(fresh.liveEvidenceLedger.candidates || {})
+      .find(entry => entry.latest?.candidateName === path.basename(sourcePath));
+    assert.equal(ledgerEntry?.strongestState, 'package-ready');
+
+    roundTripFakeStore();
+    const rehydrated = await getProject(project.id);
+    assert.equal(rehydrated.files.filter(file => file.path === sourcePath).length, 1);
+    assert.equal(rehydrated.pendingFiles.some(file => file.path === sourcePath), false);
+    const workspaceBeforePause = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspaceBeforePause.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+
+    await callIpcRaw('projects:pause', project.id);
+    await callIpcRaw('projects:start-watching', project.id);
+    const workspaceAfterResume = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspaceAfterResume.files.filter(file => file.name === path.basename(sourcePath)).length, 1);
+    assert.equal((await getProject(project.id)).files.filter(file => file.path === sourcePath).length, 1);
+  } finally {
+    setChildProcessHandler(null);
+  }
+});
+
 test('accepted Illustrator pending source remains aligned across pause and resume projections', async () => {
   resetTestHomeWorkspace();
   const sourcePath = path.join(TEST_HOME, 'Desktop', 'Accepted_Native_Illustrator.ai');

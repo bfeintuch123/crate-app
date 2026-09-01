@@ -1590,8 +1590,11 @@ async function showExistingAssetsDecisionModal(project) {
   const sourcePresentation = getFileAppPresentation(sourceFile, project);
   const sourceLabel = $('#existing-assets-modal-source');
   if (sourceLabel) {
+    const sourceAppLabel = sourcePresentation.family === 'generic'
+      ? sanitizeRendererSourceName(sourceFile?.sourceName)
+      : sourcePresentation.label;
     sourceLabel.textContent = sourceFile
-      ? `${sourcePresentation.label} · ${sourceFile.name}`
+      ? `${sourceAppLabel ? `${sourceAppLabel} · ` : ''}${sourceFile.name}`
       : 'Working file';
   }
   $('#existing-assets-modal-title').textContent = `${assets.length} asset${assets.length === 1 ? ' was' : 's were'} already in this file`;
@@ -1608,7 +1611,7 @@ async function showExistingAssetsDecisionModal(project) {
     name.textContent = file.name || 'Untitled asset';
     name.title = name.textContent;
     item.appendChild(name);
-    item.appendChild(createAppOriginLabel(file, project));
+    appendAppOriginLabel(item, file, project);
     list.appendChild(item);
   }
   if (assets.length > 4) {
@@ -2164,7 +2167,7 @@ function createAssetFileRow(
   name.textContent = file && file.name ? file.name : 'Untitled file';
   name.title = name.textContent;
   copy.appendChild(name);
-  copy.appendChild(createAppOriginLabel(file, project, { includeSource: !protectedSource }));
+  appendAppOriginLabel(copy, file, project, { includeSource: !protectedSource });
   row.appendChild(copy);
 
   let hasStatusBadge = false;
@@ -2241,7 +2244,7 @@ function createRecentAssetCard(project, file, { previewPriority = 0, loadVisual 
   name.textContent = file?.name || 'Untitled asset';
   name.title = name.textContent;
   card.appendChild(name);
-  card.appendChild(createAppOriginLabel(file, project));
+  appendAppOriginLabel(card, file, project);
   return card;
 }
 
@@ -2376,7 +2379,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     const originCounts = new Map();
     for (const file of [...includedExisting, ...includedAdded]) {
       const label = getFileAppPresentation(file, project).label;
-      originCounts.set(label, (originCounts.get(label) || 0) + 1);
+      if (label) originCounts.set(label, (originCounts.get(label) || 0) + 1);
     }
     for (const [label, count] of [...originCounts.entries()].sort((a, b) => b[1] - a[1])) {
       appendDefinitionRow(originList, label, count);
@@ -2538,7 +2541,7 @@ const FILE_APP_PRESENTATION = {
   sketch: { label: 'Sketch', mark: 'S', className: 'sketch' },
   'adobe-xd': { label: 'Adobe XD', mark: 'Xd', className: 'adobe-xd' },
   affinity: { label: 'Affinity', mark: 'Af', className: 'affinity' },
-  generic: { label: 'File', mark: '•', className: 'generic' },
+  generic: { label: '', mark: '', className: 'generic' },
 };
 
 function getAppFamilyFromExtension(file) {
@@ -2575,26 +2578,36 @@ function getFileAppPresentation(file, project = null) {
 
 function createAppOriginLabel(file, project, { includeSource = true } = {}) {
   const app = getFileAppPresentation(file, project);
+  const safeSourceName = sanitizeRendererSourceName(file?.sourceName);
+  if (app.family === 'generic' && !safeSourceName) return null;
   const wrapper = document.createElement('div');
-  wrapper.className = 'file-origin';
-  const mark = document.createElement('span');
-  mark.className = `file-origin-mark ${app.className}`;
-  mark.textContent = app.mark;
-  mark.setAttribute('aria-hidden', 'true');
+  wrapper.className = `file-origin${app.family === 'generic' ? ' file-origin-context-only' : ''}`;
   const label = document.createElement('span');
   label.className = 'file-origin-label';
-  const safeSourceName = sanitizeRendererSourceName(file?.sourceName);
+  if (app.family !== 'generic') {
+    const mark = document.createElement('span');
+    mark.className = `file-origin-mark ${app.className}`;
+    mark.textContent = app.mark;
+    mark.setAttribute('aria-hidden', 'true');
+    wrapper.appendChild(mark);
+  }
   const sourceName = includeSource && app.family !== 'figma' && safeSourceName
     ? ` · ${safeSourceName}`
     : '';
   const figmaScope = app.family === 'figma' && projectHasFigmaContext(project)
     ? ` · ${getProjectFigmaScopeMode(project) === 'entire-file' ? 'Entire File' : 'Current Page'}`
     : '';
-  label.textContent = `${app.label}${sourceName || figmaScope}`;
+  label.textContent = app.family === 'generic'
+    ? safeSourceName
+    : `${app.label}${sourceName || figmaScope}`;
   label.title = label.textContent;
-  wrapper.appendChild(mark);
   wrapper.appendChild(label);
   return wrapper;
+}
+
+function appendAppOriginLabel(parent, file, project, options = {}) {
+  const originLabel = createAppOriginLabel(file, project, options);
+  if (originLabel) parent.appendChild(originLabel);
 }
 
 function getPendingCaptureState(file) {
@@ -3192,7 +3205,7 @@ function renderPackageReview(project, review, message = '') {
     name.className = 'modal-file-name';
     name.textContent = file.name || 'Unavailable file';
     item.appendChild(name);
-    item.appendChild(createAppOriginLabel(file, project));
+    appendAppOriginLabel(item, file, project);
     if (typeof file.packageFolder === 'string' && file.packageFolder) {
       const destination = document.createElement('div');
       destination.className = 'package-review-file-destination';
