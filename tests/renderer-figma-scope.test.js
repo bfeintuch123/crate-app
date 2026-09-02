@@ -3311,6 +3311,80 @@ test('stale notification review does not open after the user selects another pro
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
+test('notification does not select cached project data after its project-list epoch is fenced', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'notification-epoch-a', name: 'Notification Epoch A', status: 'watching', files: [] };
+  const projectB = { id: 'notification-epoch-b', name: 'Notification Epoch B', status: 'watching', files: [] };
+  const staleRefresh = createDeferred();
+  let packageTrigger;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: () => staleRefresh.promise,
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+  renderer.setupMainProcessListeners();
+
+  const transition = packageTrigger({ projectId: projectB.id });
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext('projectListReadEpoch += 1', renderer);
+  staleRefresh.resolve([projectA]);
+  await transition;
+
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectA.id);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+});
+
+test('notification rejects a joined refresh that was fenced under an older project-list epoch', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'notification-joined-a', name: 'Notification Joined A', status: 'watching', files: [] };
+  const projectB = { id: 'notification-joined-b', name: 'Notification Joined B', status: 'watching', files: [] };
+  const staleRefresh = createDeferred();
+  const handlers = {};
+  let packageTrigger;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: () => staleRefresh.promise,
+    onFilesUpdated: handler => { handlers.files = handler; },
+    onProjectUpdated: handler => { handlers.project = handler; },
+    onPendingFilesUpdated: handler => { handlers.pending = handler; },
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+  renderer.setupMainProcessListeners();
+
+  const backgroundRefresh = handlers.files({ projectId: projectA.id });
+  vm.runInContext('projectListReadEpoch += 1', renderer);
+  const transition = packageTrigger({ projectId: projectB.id });
+  staleRefresh.resolve([projectA]);
+  await backgroundRefresh;
+  await transition;
+
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectA.id);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+});
+
 test('notification-driven project switching does not replace an active success modal', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = { id: 'notification-success-a', name: 'Notification Success A', status: 'watching', files: [] };
@@ -3398,6 +3472,45 @@ test('older Existing Assets completion cannot dismiss a newer A modal after A-B-
   newDecision.resolve({ success: true });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+});
+
+test('superseded Existing Assets callback releases its hidden lease before close and reopen', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'decision-superseded-lease',
+    name: 'Superseded Lease',
+    status: 'watching',
+    files: [{ name: 'Current.png', path: '/synthetic/Current.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null },
+  };
+  const delayedWorkspace = createDeferred();
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAssetWorkspace: async () => delayedWorkspace.promise,
+  } });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+
+  const staleModal = renderer.showExistingAssetsDecisionModal(project, 0);
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext('packageReviewRequestId += 1', renderer);
+  delayedWorkspace.resolve({
+    projectId: project.id,
+    files: project.files,
+    pendingFiles: [],
+  });
+
+  assert.equal(await staleModal, false);
+  assert.equal(vm.runInContext('activeModalLease', renderer), null);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+
+  assert.equal(await renderer.showExistingAssetsDecisionModal(project), true);
+  const reopenedLease = vm.runInContext('activeModalLease', renderer);
+  assert.equal(reopenedLease.id, 'modal-existing-assets');
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  renderer.hideExistingAssetsDecisionModal();
+  assert.equal(vm.runInContext('activeModalLease', renderer), null);
 });
 
 test('distinct Figma source identities keep same-name Working Files separate', () => {

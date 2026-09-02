@@ -1727,6 +1727,7 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
   const lease = claimModalLease('modal-existing-assets');
   if (!lease) return false;
   const sessionId = lease.sessionId;
+  let modalSessionCommitted = false;
   const selectionEpoch = projectSelectionEpoch;
   const isCurrentPackageRequest = () => (
     (packageRequestId === null || packageReviewRequestId === packageRequestId) &&
@@ -1734,69 +1735,71 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
     projectSelectionEpoch === selectionEpoch &&
     isCurrentModalLease('modal-existing-assets', sessionId)
   );
-  if (!isCurrentPackageRequest()) return false;
-  if (!await ensureProjectAssetWorkspace(project)) {
-    releaseModalLease('modal-existing-assets', sessionId);
-    return false;
-  }
-  if (!isCurrentPackageRequest()) return false;
-  const assets = getExistingAssetsForDecision(project);
-  if (assets.length === 0) {
-    releaseModalLease('modal-existing-assets', sessionId);
-    return false;
-  }
+  try {
+    if (!isCurrentPackageRequest()) return false;
+    if (!await ensureProjectAssetWorkspace(project)) return false;
+    if (!isCurrentPackageRequest()) return false;
+    const assets = getExistingAssetsForDecision(project);
+    if (assets.length === 0) return false;
 
-  if (modal.classList.contains('hidden')) {
-    existingAssetsDecisionOpener = document.activeElement;
-  }
-  existingAssetsModalProjectId = project.id;
-  const decisionInFlightForProject = existingAssetsDecisionRequest &&
-    existingAssetsDecisionRequest.projectId === project.id &&
-    existingAssetsDecisionRequest.selectionEpoch === selectionEpoch;
-  const sourceFile = (state.assetWorkspace?.files || []).find(file => file.protectedSource === true || file.projectRole === 'source');
-  const sourcePresentation = getFileAppPresentation(sourceFile, project);
-  const sourceLabel = $('#existing-assets-modal-source');
-  if (sourceLabel) {
-    const sourceAppLabel = sourcePresentation.family === 'generic'
-      ? sanitizeRendererSourceName(sourceFile?.sourceName)
-      : sourcePresentation.label;
-    sourceLabel.textContent = sourceFile
-      ? `${sourceAppLabel ? `${sourceAppLabel} · ` : ''}${sourceFile.name}`
-      : 'Working file';
-  }
-  $('#existing-assets-modal-title').textContent = `${assets.length} asset${assets.length === 1 ? ' was' : 's were'} already in this file`;
-  $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} included by default`;
-  const list = $('#existing-assets-modal-list');
-  list.innerHTML = '';
-  for (const file of assets.slice(0, 4)) {
-    const item = document.createElement('div');
-    item.className = 'existing-assets-modal-item';
-    item.setAttribute('role', 'listitem');
-    item.appendChild(createFileVisual(project.id, file));
-    const name = document.createElement('span');
-    name.className = 'existing-assets-modal-name';
-    name.textContent = file.name || 'Untitled asset';
-    name.title = name.textContent;
-    item.appendChild(name);
-    appendAppOriginLabel(item, file, project);
-    list.appendChild(item);
-  }
-  if (assets.length > 4) {
-    const more = document.createElement('div');
-    more.className = 'existing-assets-modal-more';
-    more.textContent = `+ ${assets.length - 4} more`;
-    list.appendChild(more);
-  }
+    if (modal.classList.contains('hidden')) {
+      existingAssetsDecisionOpener = document.activeElement;
+    }
+    existingAssetsModalProjectId = project.id;
+    const decisionInFlightForProject = existingAssetsDecisionRequest &&
+      existingAssetsDecisionRequest.projectId === project.id &&
+      existingAssetsDecisionRequest.selectionEpoch === selectionEpoch;
+    const sourceFile = (state.assetWorkspace?.files || []).find(file => file.protectedSource === true || file.projectRole === 'source');
+    const sourcePresentation = getFileAppPresentation(sourceFile, project);
+    const sourceLabel = $('#existing-assets-modal-source');
+    if (sourceLabel) {
+      const sourceAppLabel = sourcePresentation.family === 'generic'
+        ? sanitizeRendererSourceName(sourceFile?.sourceName)
+        : sourcePresentation.label;
+      sourceLabel.textContent = sourceFile
+        ? `${sourceAppLabel ? `${sourceAppLabel} · ` : ''}${sourceFile.name}`
+        : 'Working file';
+    }
+    $('#existing-assets-modal-title').textContent = `${assets.length} asset${assets.length === 1 ? ' was' : 's were'} already in this file`;
+    $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} included by default`;
+    const list = $('#existing-assets-modal-list');
+    list.innerHTML = '';
+    for (const file of assets.slice(0, 4)) {
+      const item = document.createElement('div');
+      item.className = 'existing-assets-modal-item';
+      item.setAttribute('role', 'listitem');
+      item.appendChild(createFileVisual(project.id, file));
+      const name = document.createElement('span');
+      name.className = 'existing-assets-modal-name';
+      name.textContent = file.name || 'Untitled asset';
+      name.title = name.textContent;
+      item.appendChild(name);
+      appendAppOriginLabel(item, file, project);
+      list.appendChild(item);
+    }
+    if (assets.length > 4) {
+      const more = document.createElement('div');
+      more.className = 'existing-assets-modal-more';
+      more.textContent = `+ ${assets.length - 4} more`;
+      list.appendChild(more);
+    }
 
-  setModalBackgroundState(true);
-  modal.classList.remove('hidden');
-  existingAssetsModalSessionId = sessionId;
-  existingAssetsModalSelectionEpoch = selectionEpoch;
-  modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
-  modal.addEventListener('keydown', handleExistingAssetsDecisionKeydown);
-  setExistingAssetsDecisionButtonsDisabled(!!decisionInFlightForProject);
-  ($('#btn-include-existing-assets') || modal).focus();
-  return true;
+    setModalBackgroundState(true);
+    modal.classList.remove('hidden');
+    existingAssetsModalSessionId = sessionId;
+    existingAssetsModalSelectionEpoch = selectionEpoch;
+    modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
+    modal.addEventListener('keydown', handleExistingAssetsDecisionKeydown);
+    setExistingAssetsDecisionButtonsDisabled(!!decisionInFlightForProject);
+    ($('#btn-include-existing-assets') || modal).focus();
+    modalSessionCommitted = true;
+    return true;
+  } finally {
+    // A stale callback may finish after a close, project switch, or newer
+    // same-project request.  Release only the lease this callback claimed;
+    // a newer session with the same modal ID must remain authoritative.
+    if (!modalSessionCommitted) releaseModalLease('modal-existing-assets', sessionId);
+  }
 }
 
 async function syncExistingAssetsDecisionModal(project) {
@@ -4495,12 +4498,13 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
   if (
     refreshGeneration !== projectRefreshGeneration ||
     !projectListReadIsCurrent(projectListRead)
-  ) return;
+  ) return false;
   state.projects = Array.isArray(projects) ? projects : [];
   if (isTabActive('projects')) renderProjects();
   if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
     renderFiles();
   }
+  return true;
 }
 
 function refreshProjectState(projectId) {
@@ -4567,7 +4571,14 @@ function setupMainProcessListeners() {
     const notificationInitialSelectionEpoch = projectSelectionEpoch;
     const notificationInitialSelectionIntentEpoch = projectSelectionIntentEpoch;
     try {
-      await refreshProjectState(data.projectId);
+      const projectRefreshApplied = await refreshProjectState(data.projectId);
+      // refreshProjectState intentionally resolves even when its read was
+      // fenced.  Do not inspect the cached project snapshot until the read
+      // epoch is still current, or a stale notification can select an old
+      // project before the later guard runs.
+      // A notification can also join a refresh that began under an older
+      // epoch, so the promise result must confirm that this read applied.
+      if (projectRefreshApplied !== true || !projectListReadIsCurrent(projectListRead)) return;
       const projects = state.projects;
       const project = projects.find(candidate => candidate && candidate.id === data.projectId);
       // Validate the notification target before changing selection.  A late
