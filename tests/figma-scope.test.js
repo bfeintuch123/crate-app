@@ -7,6 +7,32 @@ const { FIGMA_NETWORK_LIMITS, createByteBudget } = require('../parsers/figma-net
 
 const FILE_KEY = 'FILE123';
 
+test('Figma asset dedup requires composite stable identity and fails closed for keyless records', () => {
+  const parser = new FigmaParser();
+  const keyless = [
+    { name: 'Same', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+  ];
+  assert.equal(parser.deduplicateFigmaAssets(keyless).length, 2);
+
+  const stable = [
+    { name: 'Same', fileKey: 'FILE_A', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', fileKey: 'FILE_A', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', fileKey: 'FILE_B', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+  ];
+  assert.equal(parser.deduplicateFigmaAssets(stable).length, 2);
+});
+
+test('Figma local names retain collision-safe identity entropy', () => {
+  const parser = new FigmaParser();
+  const first = parser.buildFigmaAssetName('Same Display Name', 'FILE_A\u00001:23');
+  const second = parser.buildFigmaAssetName('Same Display Name', 'FILE_A\u000012:3');
+
+  assert.notEqual(first, second);
+  assert.match(first, /^[a-f0-9]{16}__/u);
+  assert.match(second, /^[a-f0-9]{16}__/u);
+});
+
 async function captureConsole(fn) {
   const messages = [];
   const originalLog = console.log;

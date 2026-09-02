@@ -28,6 +28,7 @@ const {
 } = require('./figma-network');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // Try to load the optional fetch implementation.
 let fetch = null;
@@ -353,8 +354,12 @@ class FigmaParser extends BaseParser {
   deduplicateFigmaAssets(assets) {
     const seen = new Set();
     return assets.filter((asset) => {
-      const key = asset.imageRef || asset.url || asset.nodeId;
-      if (!key) return true;
+      const fileKey = String(asset.figmaFileKey || asset.fileKey || '').trim();
+      const assetKey = String(asset.figmaAssetKey || asset.imageRef || asset.url || asset.nodeId || '').trim();
+      // A node id or CDN URL is only meaningful within its Figma file.  Do
+      // not guess a file identity from a display name; retain keyless records.
+      if (!fileKey || !assetKey) return true;
+      const key = `${fileKey}\u0000${assetKey}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -369,9 +374,8 @@ class FigmaParser extends BaseParser {
     const safeBase = String(baseName || stableKey || 'figma-asset').trim();
     const key = String(stableKey || '').trim();
     if (!key) return safeBase;
-    const shortKey = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12);
-    if (!shortKey) return safeBase;
-    return `${safeBase}__${shortKey}`;
+    const keyDigest = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+    return `${keyDigest}__${safeBase}`;
   }
 
   /**
@@ -1716,8 +1720,10 @@ class FigmaParser extends BaseParser {
             assets.push({
               url,
               nodeId: imageRef,
-              name: this.buildFigmaAssetName(refNames[imageRef] || imageRef, imageRef),
+              name: this.buildFigmaAssetName(refNames[imageRef] || imageRef, `${fileKey}\0${imageRef}`),
               imageRef,
+              figmaFileKey: fileKey,
+              figmaAssetKey: imageRef,
               format: inferredFormat,
               fileKey,
               figmaPageId: scope.lockedPageId,
@@ -1831,9 +1837,11 @@ class FigmaParser extends BaseParser {
                 assets.push({
                   url,
                   nodeId,
-                  name: this.buildFigmaAssetName(nodeNames[nodeId] || nodeId, nodeId),
+                  name: this.buildFigmaAssetName(nodeNames[nodeId] || nodeId, `${fileKey}\0${nodeId}`),
                   format: 'png',
                   fileKey,
+                  figmaFileKey: fileKey,
+                  figmaAssetKey: nodeId,
                   figmaPageId: scope.lockedPageId,
                   figmaPageName: scope.lockedPageName,
                   source: 'figma-auto'

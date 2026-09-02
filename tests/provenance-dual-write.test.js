@@ -1094,6 +1094,12 @@ module.exports.__crateMetadataTestHooks = {
   createRendererFilePresentation(project, file) {
     return createRendererFilePresentation(project, file);
   },
+  getFigmaAssetDedupKey(record) {
+    return getFigmaAssetDedupKey(record);
+  },
+  getFigmaAssetCacheFileName(fileName, identityKey) {
+    return createFigmaAssetCacheFileName(fileName, identityKey);
+  },
 };
 `, filename);
 };
@@ -10362,6 +10368,71 @@ test('renderer presentation exposes a privacy-safe Figma working-file name', asy
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test('renderer presentation derives opaque stable Figma source identities from file keys', async () => {
+  const project = { id: 'figma-source-identity', files: [], excludedAssetKeys: [] };
+  const first = {
+    path: '/synthetic/Campaign_A.png',
+    name: 'Campaign_A.png',
+    ext: '.png',
+    source: 'figma-auto',
+    figmaFileName: 'Campaign',
+    figmaFileKey: 'figma-file-key-a',
+    assetOrigin: 'added',
+    projectRole: 'asset',
+  };
+  const second = { ...first, path: '/synthetic/Campaign_B.png', name: 'Campaign_B.png', figmaFileKey: 'figma-file-key-b' };
+  const keyless = { ...first, path: '/synthetic/Campaign_legacy.png', name: 'Campaign_legacy.png', figmaFileKey: undefined };
+  const firstPresentation = await metadataTestHooks.createRendererFilePresentation(project, first);
+  const repeatedPresentation = await metadataTestHooks.createRendererFilePresentation(project, first);
+  const secondPresentation = await metadataTestHooks.createRendererFilePresentation(project, second);
+  const keylessPresentation = await metadataTestHooks.createRendererFilePresentation(project, keyless);
+
+  assert.equal(firstPresentation.appFamily, 'figma');
+  assert.equal(firstPresentation.figmaSourceIdentity, repeatedPresentation.figmaSourceIdentity);
+  assert.notEqual(firstPresentation.figmaSourceIdentity, secondPresentation.figmaSourceIdentity);
+  assert.equal(firstPresentation.figmaSourceIdentity.includes(first.figmaFileKey), false);
+  assert.equal(firstPresentation.figmaSourceIdentity.includes(first.figmaFileName), false);
+  assert.equal(Object.hasOwn(keylessPresentation, 'figmaSourceIdentity'), false);
+  assert.equal(keylessPresentation.sourceName, first.figmaFileName);
+});
+
+test('persisted Figma asset identity remains idempotent across legacy and canonical records', () => {
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({ figmaFileKey: 'FILE_A', figmaAssetKey: 'NODE_1' }),
+    'FILE_A:NODE_1'
+  );
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({ figmaFileKey: 'FILE_A', figmaAssetKey: 'FILE_A:NODE_1' }),
+    'FILE_A:NODE_1'
+  );
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({
+      figmaFileKey: 'FILE_A',
+      figmaAssetIdentity: 'NODE_1',
+      figmaAssetDedupKey: 'FILE_A:NODE_1',
+    }),
+    'FILE_A:NODE_1'
+  );
+});
+
+test('long Figma cache names preserve identity entropy before the display portion', () => {
+  const longFileName = 'Figma File '.repeat(20);
+  const first = metadataTestHooks.getFigmaAssetCacheFileName(
+    `${longFileName}_hero`,
+    'FILE_A:NODE_1'
+  );
+  const second = metadataTestHooks.getFigmaAssetCacheFileName(
+    `${longFileName}_hero`,
+    'FILE_A:NODE_2'
+  );
+
+  assert.equal(first.length, 100);
+  assert.equal(second.length, 100);
+  assert.notEqual(first, second);
+  assert.match(first, /^[a-f0-9]{16}__/u);
+  assert.match(second, /^[a-f0-9]{16}__/u);
 });
 
 test('renderer presentation rejects path-shaped and URL-shaped source metadata', async () => {
