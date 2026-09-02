@@ -1490,6 +1490,7 @@ test('generic presentation assets preserve Keynote and PowerPoint source applica
   assert.equal(workspaceText.includes('PowerPoint · Launch.key'), false);
 
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     token: '00000000-0000-4000-8000-000000000305',
     materializable: true,
     files,
@@ -3103,6 +3104,62 @@ test('mismatched Package Review identity fails closed without showing another pr
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
+test('missing Package Review identity fails closed without enabling packaging', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'package-identity-missing', name: 'Package Identity Missing', status: 'watching', files: [{ name: 'Missing.ai', ext: '.ai' }] };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preparePackageReview: async () => ({ token: 'missing-identity-token', files: project.files, totalFiles: 1, materializable: true }),
+    getProjects: async () => [project],
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+  `, renderer);
+
+  elements['btn-confirm-package'].disabled = true;
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
+test('mismatched Package Review recovery leaves the renderer interactive', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'package-recovery-identity-a', name: 'Package Recovery A', status: 'watching', files: [{ name: 'A.ai', ext: '.ai' }] };
+  const projectB = { id: 'package-recovery-identity-b', name: 'Package Recovery B', status: 'watching', files: [{ name: 'B.ai', ext: '.ai' }] };
+  const packageResult = createDeferred();
+  const reviewA = { token: 'package-recovery-a-token', projectId: projectA.id, files: projectA.files, totalFiles: 1, materializable: true };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => null,
+    preparePackageReview: async () => reviewA,
+    getProjects: async () => [projectA, projectB],
+    packageProject: async () => packageResult.promise,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  const pendingConfirmation = renderer.confirmPackage();
+  await new Promise(resolve => setImmediate(resolve));
+  packageResult.resolve({
+    error: 'package_review_changed',
+    review: { token: 'wrong-project-token', projectId: projectB.id, files: projectB.files, totalFiles: 1, materializable: true },
+  });
+  await pendingConfirmation;
+
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
 test('notification-driven Package Review transition dismisses old content before refresh and eventually binds project B', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
@@ -3749,6 +3806,7 @@ test('Package Review uses the same project-owned visual identity without renderi
   } });
 
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     token: '00000000-0000-4000-8000-000000000111',
     materializable: true,
     files: [{
@@ -3775,6 +3833,7 @@ test('Package Review shows privacy-safe source context for visual assets', () =>
   const renderer = loadRendererHelpers(document, { crate: {} });
 
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     token: '00000000-0000-4000-8000-000000000112',
     materializable: true,
     files: [{
@@ -3794,6 +3853,7 @@ test('Package Review shows authoritative file-type destinations and the saved or
   const renderer = loadRendererHelpers(document, { crate: {} });
 
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     token: '00000000-0000-4000-8000-000000000114',
     materializable: true,
     planSummary: { outputLayoutMode: 'by-extension-v1' },
@@ -3825,6 +3885,7 @@ test('changing Package Review organization refreshes authority before packaging'
       calls.push(['review', projectId]);
       return {
         token: '00000000-0000-4000-8000-000000000115',
+        projectId: project.id,
         materializable: true,
         planSummary: { outputLayoutMode: 'by-extension-v1' },
         files: [{
@@ -4080,7 +4141,7 @@ test('Package Review shows the persisted Figma retry time', () => {
   };
   const renderer = loadRendererHelpers(document, { crate: {} });
 
-  renderer.renderPackageReview(project, { materializable: false, files: [] });
+  renderer.renderPackageReview(project, { projectId: project.id, materializable: false, files: [] });
 
   assert.equal(elements['modal-figma-warning'].textContent.includes('Try again after'), true);
   assert.equal(elements['btn-confirm-package'].disabled, true);
@@ -4093,6 +4154,7 @@ test('Package Review reports authoritative unavailable counts and resets blocked
 
   packageReviewDialog.scrollTop = 180;
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     materializable: false,
     message: 'Review required before packaging.',
     files: [
@@ -4118,6 +4180,7 @@ test('Package Review minimizes custom destination paths in renderer labels', () 
   vm.runInContext("state.packageOutputPath = '/Users/private/Client Work/Deliverables';", renderer);
 
   renderer.renderPackageReview(renderer.testProject, {
+    projectId: renderer.testProject.id,
     token: '00000000-0000-4000-8000-000000000113',
     materializable: true,
     files: [],
@@ -4140,6 +4203,7 @@ test('Package Review binds duplicate display names to distinct authoritative vis
   } });
 
   renderer.renderPackageReview(project, {
+    projectId: project.id,
     token: '00000000-0000-4000-8000-000000000112',
     materializable: true,
     files: [

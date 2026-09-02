@@ -3149,7 +3149,17 @@ function showPackageProgressModal() {
 }
 
 function hidePackageProgressModal() {
-  $('#modal-progress').classList.add('hidden');
+  $('#modal-progress')?.classList.add('hidden');
+  const anotherBlockingModalIsVisible = [
+    'modal-package',
+    'modal-existing-assets',
+    'modal-success',
+    'modal-upgrade',
+  ].some(id => {
+    const modal = $(`#${id}`);
+    return modal && !modal.classList.contains('hidden');
+  });
+  setModalBackgroundState(anotherBlockingModalIsVisible);
 }
 
 function showPackageSuccessModal() {
@@ -3266,7 +3276,7 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
 }
 
 function renderPackageReview(project, review, message = '') {
-  if (!project?.id || (review?.projectId && review.projectId !== project.id)) return false;
+  if (!project?.id || review?.projectId !== project.id) return false;
   setActiveFileVisualProject(project && project.id);
   packageReviewModalProjectId = project?.id || null;
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
@@ -3555,8 +3565,7 @@ async function showPackageModal({
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
   );
   if (!isCurrentRequest()) return false;
-  if (review?.projectId && review.projectId !== projectId) return false;
-    if (!review || review.error) {
+  if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         state.projects = await window.crate.getProjects();
         if (!isCurrentRequest()) return false;
@@ -3584,6 +3593,8 @@ async function showPackageModal({
       renderPackageReview(project, unavailableReview, failureMessage);
       return false;
     }
+
+    if (review.projectId !== projectId) return false;
 
     state.projects = await window.crate.getProjects();
     if (!isCurrentRequest()) return false;
