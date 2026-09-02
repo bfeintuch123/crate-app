@@ -14,6 +14,13 @@ Never use `main` as the PR base for Crate release work unless Bryant explicitly 
 - If multiple agents are involved, keep ownership boundaries explicit and avoid overlapping file edits.
 - Documentation-only workflow setup may edit docs and Codex configuration files, but must not touch app code, `package.json`, or `package-lock.json` unless Bryant explicitly scopes that work.
 
+## Major PR Routing
+- A major PR changes a major surface: watcher/admission; filesystem/path handling; provenance/project isolation; parsers/archive handling; packaging/quota; IPC; async/concurrency/cancellation/deadlines/stale-result handling; privacy/security; large-list state/performance; or signing/release.
+- Before ready-for-review or merge, a major PR requires protected CI that passed on the exact current head and a fresh independent read-only review by a distinct Luna agent at high reasoning effort. The highest-risk security, performance, or state-integrity changes require a second distinct independent reviewer.
+- Keep exactly one repository writer. A review finding returns to that writer for a normal follow-up commit; never rewrite history. Any head change invalidates earlier exact-head CI and review evidence, so repeat the required gates on the new head until a clean PASS.
+- The correction loop is bounded: after three writer follow-up cycles, or when the same blocking issue persists, stop and escalate to Bryant. Do not waive a required gate, silently lower the standard, or continue indefinitely.
+- Stop before marking a PR ready or merging; Bryant separately authorizes those gates. Docs/copy changes and exact version-only PRs use the lighter existing path unless their content affects safety or release integrity.
+
 ## Tool Roles
 Use Codex CLI for:
 - implementation

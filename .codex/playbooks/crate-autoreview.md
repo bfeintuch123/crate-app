@@ -34,6 +34,33 @@ If autoreview finds a problem, it must not stop at "request changes." It must ex
 
 Do not apply fixes automatically. Use fix-recommendation mode to prepare specific implementation guidance, then wait for Bryant's approval.
 
+## Major-PR Exact-Head Correction Loop
+Use this loop only when the Crate Fix Review Stack or an explicit workflow routes a major PR through corrective review. It supplements the existing autoreview modes; it does not change the review-only default or replace any stack playbook.
+
+Major surfaces are: watcher/admission; filesystem/path handling; provenance/project isolation; parsers/archive handling; packaging/quota; IPC; async/concurrency/cancellation/deadlines/stale-result handling; privacy/security; large-list state/performance; and signing/release.
+
+The required state machine is:
+
+```text
+UNBOUND
+  -> BIND exact PR base/head, changed-file boundary, and protected checks
+  -> CLASSIFY major surface and risk
+  -> RUN protected CI on that exact head
+  -> REVIEW with a fresh independent read-only Luna/high reviewer
+  -> [highest-risk security/performance/state-integrity?]
+       -> REVIEW with a second distinct independent read-only reviewer
+  -> CLEAN PASS, or FINDING / FAILED CHECK
+  -> WRITER FOLLOW-UP (normal commit, no history rewrite)
+  -> INVALIDATE all earlier CI/review evidence
+  -> BIND the new exact head and repeat
+```
+
+For a major PR, both protected exact-head CI and the required independent review(s) must be clean before the loop can report PASS. A failed check or actionable review finding pauses the loop and returns the issue to the sole repository writer with the exact evidence, affected scope, and requested validation. The reviewer remains read-only; the writer's follow-up is a separate authorized implementation step. A new commit always restarts the exact-head gates, even when the change appears unrelated to the prior finding.
+
+Track the correction-cycle count explicitly. After three writer follow-up cycles, or if the same blocking issue persists, terminate the loop and escalate to Bryant with the unresolved evidence and a proposed decision. Infrastructure or identity mismatches are not waivers: stop and rebind or escalate. Never continue without a fresh exact-head gate, waive the second reviewer for a highest-risk change, or lower the review standard to make the loop pass.
+
+Docs/copy and exact version-only PRs may use the lighter existing review path unless their content affects safety or release integrity. Do not mark a PR ready or merge from this loop; those are separate Bryant-authorized gates.
+
 ## Modes
 
 ### Standard Mode
