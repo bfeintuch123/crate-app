@@ -49,10 +49,11 @@ UNBOUND
   -> REVIEW with a fresh independent read-only Luna/high reviewer
   -> [highest-risk security/performance/state-integrity?]
        -> REVIEW with a second distinct independent read-only reviewer
-  -> CLEAN PASS, or FINDING / FAILED CHECK
-  -> WRITER FOLLOW-UP (normal commit, no history rewrite)
-  -> INVALIDATE all earlier CI/review evidence
-  -> BIND the new exact head and repeat
+  -> CLEAN PASS -> STOP before ready-for-review or merge
+  -> FINDING / FAILED CHECK
+       -> WRITER FOLLOW-UP (normal commit, no history rewrite)
+       -> INVALIDATE all earlier CI/review evidence
+       -> BIND the new exact head and repeat
 ```
 
 For a major PR, both protected exact-head CI and the required independent review(s) must be clean before the loop can report PASS. A failed check or actionable review finding pauses the loop and returns the issue to the sole repository writer with the exact evidence, affected scope, and requested validation. The reviewer remains read-only; the writer's follow-up is a separate authorized implementation step. A new commit always restarts the exact-head gates, even when the change appears unrelated to the prior finding.
