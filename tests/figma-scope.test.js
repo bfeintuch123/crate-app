@@ -23,6 +23,16 @@ test('Figma asset dedup requires composite stable identity and fails closed for 
   assert.equal(parser.deduplicateFigmaAssets(stable).length, 2);
 });
 
+test('Figma local names retain collision-safe identity entropy', () => {
+  const parser = new FigmaParser();
+  const first = parser.buildFigmaAssetName('Same Display Name', 'FILE_A\u00001:23');
+  const second = parser.buildFigmaAssetName('Same Display Name', 'FILE_A\u000012:3');
+
+  assert.notEqual(first, second);
+  assert.match(first, /^[a-f0-9]{16}__/u);
+  assert.match(second, /^[a-f0-9]{16}__/u);
+});
+
 async function captureConsole(fn) {
   const messages = [];
   const originalLog = console.log;

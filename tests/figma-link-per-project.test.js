@@ -3249,7 +3249,8 @@ test('parser-shaped Figma assets retain fileKey for Current Page Only packaging'
     assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
     const scanned = await waitForProject(project.id, item => item.files.length === 1, 'Figma asset should enter the ledger');
     assert.equal(scanned.files[0].figmaFileKey, 'FIG22');
-    assert.equal(scanned.files[0].figmaAssetKey, 'FIG22:img-parser-key');
+    assert.equal(scanned.files[0].figmaAssetKey, 'img-parser-key');
+    assert.equal(scanned.files[0].figmaAssetDedupKey, 'FIG22:img-parser-key');
 
     const outputDir = path.join(tmpRoot, 'out');
     const result = await callIpc('projects:package', project.id, outputDir);
@@ -3343,7 +3344,8 @@ test('Figma asset scan records cloud resource materialization provenance after l
   assert.equal(file.figmaPageId, '1:1');
   assert.equal(file.figmaPageName, 'Page One');
   assert.equal(file.figmaScopeMode, 'current-page');
-  assert.equal(file.figmaAssetKey, 'FIG22:img-hero');
+  assert.equal(file.figmaAssetKey, 'img-hero');
+  assert.equal(file.figmaAssetDedupKey, 'FIG22:img-hero');
   assert.equal(fs.readFileSync(file.path, 'utf8'), 'hero image bytes');
 
   const cloudNodes = getProvenanceNodes(fresh, NODE_TYPES.CLOUD_DOCUMENT);

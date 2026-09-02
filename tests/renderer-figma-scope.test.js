@@ -2834,6 +2834,11 @@ test('same-project Existing Assets workspace requests keep the newest response',
 
   assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'Newer.png');
   assert.equal(vm.runInContext('state.assetWorkspace.files[0].name', renderer), 'Newer.png');
+  const activeLease = vm.runInContext('activeModalLease', renderer);
+  assert.equal(activeLease.id, 'modal-existing-assets');
+  assert.ok(activeLease.sessionId > 1);
+  assert.equal(await renderer.showExistingAssetsDecisionModal(project), false, 'visible modal lease remains authoritative');
+  assert.equal(vm.runInContext('activeModalLease.id', renderer), 'modal-existing-assets');
 });
 
 test('same-project Package Review requests cannot overwrite the newest review', async () => {
@@ -2923,6 +2928,9 @@ test('Package Review clears on project switch, fences late responses, and render
   assert.equal(elements['modal-package'].classList.contains('hidden'), false);
   assert.equal(elements['modal-project-name'].textContent, projectA.name);
 
+  // Start the stale request while the modal is hidden, matching an in-flight
+  // user refresh without allowing a visible modal to be replaced.
+  vm.runInContext('hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });', renderer);
   const staleRequest = renderer.showPackageModal({ runPreScan: false });
   await new Promise(resolve => setImmediate(resolve));
   renderer.setSelectedProject(projectB.id);
@@ -3384,6 +3392,35 @@ test('distinct Figma source identities keep same-name Working Files separate', (
   assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 2);
   assert.equal(new Set(workingFiles.map(row => row.dataset.renderKey)).size, 2);
   assert.equal(getElementTreeText(elements['project-file-list']).match(/Figma · Current Page/g).length, 2);
+});
+
+test('authoritative tracked Figma source projection merges mixed materialized rows without raw keys', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'mixed-figma-source-projection',
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [{ key: 'PRIVATE_FILE_A' }, { key: 'PRIVATE_FILE_B' }],
+    files: [],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {
+    trackedFigmaFiles: [
+      { displayName: 'Campaign A', figmaSourceIdentity: 'opaque-source-a' },
+      { displayName: 'Campaign B', figmaSourceIdentity: 'opaque-source-b' },
+    ],
+  }, [{
+    name: 'Campaign_A.png', ext: '.png', appFamily: 'figma', sourceName: 'Campaign A',
+    figmaSourceIdentity: 'opaque-source-a', projectRole: 'asset', assetOrigin: 'added',
+    visualIdentity: 'figma-asset-a', visualRevision: 'figma-a-r1',
+  }]);
+
+  const workingFiles = elements['project-file-list'].children;
+  assert.equal(workingFiles.length, 2);
+  assert.equal(getElementTreeText(elements['project-file-list']).includes('Campaign B'), true);
+  assert.equal([...workingFiles].every(row => !row.dataset.renderKey.includes('PRIVATE_FILE_')), true);
 });
 
 test('keyless same-name Figma sources remain separate without synthetic display-name identity', () => {

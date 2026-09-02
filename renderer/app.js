@@ -73,6 +73,7 @@ let packageReviewModalSelectionEpoch = null;
 let packageReviewModalRequestId = null;
 let packageReviewModalSessionId = null;
 let projectSelectionEpoch = 0;
+let projectSelectionIntentEpoch = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
@@ -105,13 +106,23 @@ function hasModalInteraction() {
   return Boolean(activeModalLease) || getVisibleBlockingModalIds().length > 0;
 }
 
-function claimModalLease(id) {
+function claimModalLease(id, { replaceVisible = false } = {}) {
   if (!BLOCKING_MODAL_IDS.includes(id)) return null;
   if (activeModalLease && activeModalLease.id !== id) {
     const leasedModal = $(`#${activeModalLease.id}`);
     if (!leasedModal || leasedModal.classList.contains('hidden')) activeModalLease = null;
   }
   if (activeModalLease && activeModalLease.id !== id) return null;
+  if (activeModalLease && activeModalLease.id === id) {
+    const leasedModal = $(`#${id}`);
+    // A visible modal already owns this ID.  A second open attempt must not
+    // share its session or later release the visible modal's authority.
+    if (leasedModal && !leasedModal.classList.contains('hidden')) {
+      if (!replaceVisible) return null;
+      activeModalLease = null;
+    }
+    else activeModalLease = null;
+  }
   const visibleOtherModal = getVisibleBlockingModalIds().some(visibleId => visibleId !== id);
   if (visibleOtherModal) return null;
   if (!activeModalLease) activeModalLease = { id, sessionId: ++modalLeaseSequence };
@@ -537,6 +548,7 @@ function focusSelectedProjectTarget(projectId) {
 
 function setSelectedProject(projectId) {
   const nextProjectId = typeof projectId === 'string' && projectId ? projectId : null;
+  projectSelectionIntentEpoch += 1;
   if (state.selectedProjectId === nextProjectId) return false;
 
   state.selectedProjectId = nextProjectId;
@@ -1494,6 +1506,9 @@ async function renderFiles() {
   // Persistent project asset workspace
   renderAssetWorkspace(project, {
     hasActiveCandidates: visiblePendingFiles.length > 0,
+    trackedFigmaFiles: Array.isArray(assetWorkspace.trackedFigmaFiles)
+      ? assetWorkspace.trackedFigmaFiles
+      : null,
   }, assetWorkspace.files);
 
   // Package button — always enabled; click handler shows toast if no files
@@ -2611,6 +2626,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const figmaSourceIdentities = new Set();
   const keylessFigmaSourceNames = [];
   const figmaSourceFiles = [];
+  const trackedFigmaFiles = Array.isArray(options.trackedFigmaFiles) ? options.trackedFigmaFiles : null;
   for (const file of files) {
     if (file?.appFamily !== 'figma' || typeof file.sourceName !== 'string' || !file.sourceName.trim()) continue;
     const sourceName = file.sourceName.trim();
@@ -2639,13 +2655,21 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
       visualRevision: identity ? `figma-source:${identity}` : null,
     });
   }
-  // When the asset records have no source identity, use the authoritative
-  // tracked-file cardinality if it is available.  The display name labels the
-  // row only; it is never used as a deduplication key.
-  if (figmaSourceFiles.length === 0 && Array.isArray(project.figmaTrackedFiles)) {
-    for (const trackedFile of project.figmaTrackedFiles) {
-      const identity = [trackedFile?.figmaSourceIdentity, trackedFile?.figmaFileKey, trackedFile?.fileKey, trackedFile?.key]
-        .find(value => typeof value === 'string' && value.trim())?.trim() || null;
+  // Merge the authoritative safe tracked-file projection with materialized
+  // rows per source.  Its identity is opaque when present; keyless records
+  // remain separate objects and never use a display name as a key.
+  const authoritativeTrackedFiles = trackedFigmaFiles || (
+    figmaSourceFiles.length === 0 && Array.isArray(project.figmaTrackedFiles)
+      ? project.figmaTrackedFiles.map(trackedFile => ({
+        displayName: trackedFile?.displayName || trackedFile?.name || null,
+        figmaSourceIdentity: null,
+      }))
+      : []
+  );
+  for (const trackedFile of authoritativeTrackedFiles) {
+      const identity = typeof trackedFile?.figmaSourceIdentity === 'string' && trackedFile.figmaSourceIdentity.trim()
+        ? trackedFile.figmaSourceIdentity.trim()
+        : null;
       const sourceName = trackedFile?.displayName || trackedFile?.name || keylessFigmaSourceNames[figmaSourceFiles.length] || 'Figma file';
       if (identity && figmaSourceIdentities.has(identity)) continue;
       if (identity) figmaSourceIdentities.add(identity);
@@ -2662,7 +2686,6 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
         visualIdentity: identity ? `figma-source:${identity}` : null,
         visualRevision: identity ? `figma-source:${identity}` : null,
       });
-    }
   }
   const sourceFiles = [...physicalSourceFiles, ...figmaSourceFiles];
   const existingAssets = files.filter(file => (
@@ -3185,11 +3208,19 @@ function focusPackageReviewDialog() {
   focusTarget?.focus?.({ preventScroll: true });
 }
 
-function openPackageReviewDialog() {
+function openPackageReviewDialog(suppliedLease = null) {
   const modal = $('#modal-package');
   if (!modal || !packageReviewModalProjectId || (state.selectedProjectId && packageReviewModalProjectId !== state.selectedProjectId)) return false;
-  const lease = claimModalLease('modal-package');
-  if (!lease || (packageReviewModalSessionId !== null && lease.sessionId !== packageReviewModalSessionId)) return false;
+  const lease = suppliedLease || claimModalLease('modal-package');
+  if (!lease) return false;
+  if (suppliedLease) {
+    if (
+      packageReviewModalSessionId !== suppliedLease.sessionId ||
+      !isCurrentModalLease('modal-package', suppliedLease.sessionId)
+    ) return false;
+  } else {
+    packageReviewModalSessionId = lease.sessionId;
+  }
   packageReviewModalSessionId = lease.sessionId;
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
@@ -3399,9 +3430,9 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
   }
 }
 
-function renderPackageReview(project, review, message = '') {
+function renderPackageReview(project, review, message = '', suppliedLease = null) {
   if (!project?.id || review?.projectId !== project.id) return false;
-  const lease = claimModalLease('modal-package');
+  const lease = suppliedLease || claimModalLease('modal-package');
   if (!lease) return false;
   setActiveFileVisualProject(project && project.id);
   packageReviewModalProjectId = project?.id || null;
@@ -3539,7 +3570,7 @@ function renderPackageReview(project, review, message = '') {
   // Destination
   $('#modal-dest-path').textContent = getPackageDestinationLabel(state.packageOutputPath);
 
-  openPackageReviewDialog();
+  openPackageReviewDialog(lease);
   return true;
 }
 
@@ -3667,7 +3698,9 @@ async function showPackageModal({
   if (activeModalLease?.id === 'modal-progress' && packageReviewConfirmationInFlight) {
     hidePackageProgressModal();
   }
-  const lease = claimModalLease('modal-package');
+  const lease = claimModalLease('modal-package', {
+    replaceVisible: packageReviewConfirmationInFlight || !state.packageReviewToken,
+  });
   if (!lease) return false;
   const modalSessionId = lease.sessionId;
   const requestId = ++packageReviewRequestId;
@@ -3726,7 +3759,7 @@ async function showPackageModal({
       );
       const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
       if (!isCurrentRequest()) return false;
-      renderPackageReview(project, unavailableReview, failureMessage);
+      renderPackageReview(project, unavailableReview, failureMessage, lease);
       return false;
     }
 
@@ -3736,14 +3769,14 @@ async function showPackageModal({
     if (!isCurrentRequest()) return false;
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
-    renderPackageReview(project, review, successMessage || message);
+    renderPackageReview(project, review, successMessage || message, lease);
     return true;
   } catch (error) {
     logRendererError('Package Review recovery failed', error);
     const failureMessage = message || PACKAGE_REVIEW_RECOVERY_MESSAGE;
     if (project && isCurrentRequest()) {
       const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
-      if (isCurrentRequest()) renderPackageReview(project, unavailableReview, failureMessage);
+      if (isCurrentRequest()) renderPackageReview(project, unavailableReview, failureMessage, lease);
     }
     return false;
   } finally {
@@ -4515,11 +4548,23 @@ function setupMainProcessListeners() {
     const triggerId = ++notificationPackageTriggerId;
     notificationPackageTriggerInFlight = true;
     const projectListRead = captureProjectListRead();
+    const notificationInitialProjectId = state.selectedProjectId;
+    const notificationInitialSelectionEpoch = projectSelectionEpoch;
+    const notificationInitialSelectionIntentEpoch = projectSelectionIntentEpoch;
     try {
-      setSelectedProject(data.projectId);
-      const notificationSelectionEpoch = projectSelectionEpoch;
       await refreshProjectState(data.projectId);
       const projects = state.projects;
+      const project = projects.find(candidate => candidate && candidate.id === data.projectId);
+      // Validate the notification target before changing selection.  A late
+      // notification for a deleted project must not clear a valid workspace.
+      if (!project) return;
+      if (
+        state.selectedProjectId !== notificationInitialProjectId ||
+        projectSelectionEpoch !== notificationInitialSelectionEpoch ||
+        projectSelectionIntentEpoch !== notificationInitialSelectionIntentEpoch
+      ) return;
+      setSelectedProject(data.projectId);
+      const notificationSelectionEpoch = projectSelectionEpoch;
       if (
         triggerId !== notificationPackageTriggerId ||
         !projectListReadIsCurrent(projectListRead) ||
@@ -4527,14 +4572,11 @@ function setupMainProcessListeners() {
         projectSelectionEpoch !== notificationSelectionEpoch ||
         hasModalInteraction()
       ) return;
-      const project = projects.find(p => p.id === data.projectId);
-      if (project) {
-        if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
-          await showExistingAssetsDecisionModal(project);
-          return;
-        }
-        await showPackageModal();
+      if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
+        await showExistingAssetsDecisionModal(project);
+        return;
       }
+      await showPackageModal();
     } finally {
       if (triggerId === notificationPackageTriggerId) notificationPackageTriggerInFlight = false;
     }

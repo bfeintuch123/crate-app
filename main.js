@@ -604,8 +604,11 @@ function getFigmaAssetDedupKey(record) {
       : '');
 
   let assetKey = null;
-  if (typeof record.figmaAssetKey === 'string' && record.figmaAssetKey.trim()) {
-    assetKey = record.figmaAssetKey.trim();
+  if (typeof record.figmaAssetDedupKey === 'string' && record.figmaAssetDedupKey.trim()) {
+    return record.figmaAssetDedupKey.trim();
+  }
+  if (typeof record.figmaAssetIdentity === 'string' && record.figmaAssetIdentity.trim()) {
+    assetKey = record.figmaAssetIdentity.trim();
   } else if (typeof record.imageRef === 'string' && record.imageRef.trim()) {
     assetKey = record.imageRef.trim();
   } else if (typeof record.nodeId === 'string' && record.nodeId.trim()) {
@@ -618,6 +621,13 @@ function getFigmaAssetDedupKey(record) {
     } catch (e) {
       assetKey = record.url.trim().split('?')[0];
     }
+  } else if (typeof record.figmaAssetKey === 'string' && record.figmaAssetKey.trim()) {
+    assetKey = record.figmaAssetKey.trim();
+    // Older records stored the composite key in figmaAssetKey.  Read that
+    // representation compatibly, while all new records store the raw asset
+    // component separately from the composite dedup key.
+    const legacyPrefix = `${figmaFileKey}:`;
+    if (figmaFileKey && assetKey.startsWith(legacyPrefix)) assetKey = assetKey.slice(legacyPrefix.length);
   }
 
   // Node IDs and CDN URLs are only unique within a Figma file.  Without the
@@ -3714,6 +3724,18 @@ function createProjectFileVisualIdentity(projectId, file) {
     .digest('base64url');
 }
 
+function createFigmaSourceIdentity(projectId, figmaFileKey) {
+  if (typeof projectId !== 'string' || !projectId || typeof figmaFileKey !== 'string' || !figmaFileKey.trim()) {
+    return null;
+  }
+  return crypto.createHmac('sha256', fileVisualIdentitySecret)
+    .update('figma-source\0')
+    .update(projectId)
+    .update('\0')
+    .update(figmaFileKey.trim())
+    .digest('base64url');
+}
+
 function createProjectFileVisualRevisionFromStat(projectId, file, stat = null) {
   const authoritativeKey = getAssetReviewExclusionKey(file);
   if (typeof projectId !== 'string' || !projectId || typeof authoritativeKey !== 'string' || !authoritativeKey) {
@@ -3782,13 +3804,8 @@ async function createRendererFilePresentation(project, file) {
   const figmaFileKey = typeof file?.figmaFileKey === 'string' && file.figmaFileKey.trim()
     ? file.figmaFileKey.trim()
     : (typeof file?.fileKey === 'string' && file.fileKey.trim() ? file.fileKey.trim() : null);
-  const figmaSourceIdentity = appFamily === 'figma' && figmaFileKey
-    ? crypto.createHmac('sha256', fileVisualIdentitySecret)
-      .update('figma-source\0')
-      .update(project.id)
-      .update('\0')
-      .update(figmaFileKey)
-      .digest('base64url')
+  const figmaSourceIdentity = appFamily === 'figma'
+    ? createFigmaSourceIdentity(project.id, figmaFileKey)
     : null;
   return {
     name: typeof file?.name === 'string' && file.name ? file.name : 'Untitled file',
@@ -3866,10 +3883,22 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
       visualRecords,
     });
   }
+  const trackedFigmaFiles = (project.figmaTrackedFiles || []).map(trackedFile => {
+    const figmaFileKey = typeof trackedFile?.key === 'string' && trackedFile.key.trim()
+      ? trackedFile.key.trim()
+      : null;
+    const displayName = sanitizeRendererSourceName(trackedFile?.displayName || trackedFile?.name) || 'Figma file';
+    const figmaSourceIdentity = createFigmaSourceIdentity(project.id, figmaFileKey);
+    return {
+      displayName,
+      ...(figmaSourceIdentity ? { figmaSourceIdentity } : {}),
+    };
+  });
   return {
     projectId,
     files,
     pendingFiles,
+    trackedFigmaFiles,
   };
 }
 
@@ -9316,22 +9345,27 @@ async function ingestFigmaAssetsIntoProject(
     const figmaFileKey = typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
       ? asset.figmaFileKey.trim()
       : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null);
-    const figmaAssetKey = getFigmaAssetDedupKey({
+    const figmaAssetIdentity = typeof asset.imageRef === 'string' && asset.imageRef.trim()
+      ? asset.imageRef.trim()
+      : (typeof asset.nodeId === 'string' && asset.nodeId.trim()
+        ? asset.nodeId.trim()
+        : (typeof asset.url === 'string' && asset.url.trim() ? asset.url.trim().split('?')[0] : null));
+    const figmaAssetDedupKey = getFigmaAssetDedupKey({
       figmaFileKey,
       fileKey: asset.fileKey,
-      figmaAssetKey: asset.imageRef || asset.nodeId || asset.url,
+      figmaAssetIdentity,
       imageRef: asset.imageRef,
       nodeId: asset.nodeId,
       url: asset.url
     });
-    if (!figmaFileKey || !figmaAssetKey) {
+    if (!figmaFileKey || !figmaAssetIdentity || !figmaAssetDedupKey) {
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
-        `assetKeyPresent=${!!figmaAssetKey} reason=identity_unavailable`
+        `assetKeyPresent=${!!figmaAssetIdentity} reason=identity_unavailable`
       );
       continue;
     }
-    if (figmaAssetKey && existingFigmaAssetKeys.has(figmaAssetKey)) {
+    if (existingFigmaAssetKeys.has(figmaAssetDedupKey)) {
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `assetKeyPresent=true reason=existing_asset_key`
@@ -9377,9 +9411,9 @@ async function ingestFigmaAssetsIntoProject(
       if (!isCurrent()) return null;
       const projectPaths = new Set(proj.files.map(f => normalizeTrackedFilePath(f.path)));
       if (projectPaths.has(normalizedLocalPath)) return null;
-      if (figmaAssetKey) {
+      if (figmaAssetDedupKey) {
         const projectFigmaKeys = new Set(proj.files.map(getFigmaAssetDedupKey).filter(Boolean));
-        if (projectFigmaKeys.has(figmaAssetKey)) return null;
+        if (projectFigmaKeys.has(figmaAssetDedupKey)) return null;
       }
       const fileRecord = {
         path: localPath,
@@ -9392,7 +9426,9 @@ async function ingestFigmaAssetsIntoProject(
         figmaPageId: asset.figmaPageId || null,
         figmaPageName: asset.figmaPageName || null,
         figmaScopeMode: asset.figmaScopeMode || null,
-        figmaAssetKey
+        figmaAssetIdentity,
+        figmaAssetKey: figmaAssetIdentity,
+        figmaAssetDedupKey,
       };
       const staged = stageLiveObservedFile(proj, fileRecord, {
         allowDirect: true,
@@ -9410,7 +9446,7 @@ async function ingestFigmaAssetsIntoProject(
     if (result) {
       if (!isCurrent()) return addedCount;
       const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
-      const projectHasFigmaKey = figmaAssetKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetKey);
+      const projectHasFigmaKey = figmaAssetDedupKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetDedupKey);
       if (!projectHasLocalPath && !projectHasFigmaKey) {
         project.files.push({ ...result.fileRecord });
         project.files = deduplicateFiles(project.files);
@@ -9420,18 +9456,18 @@ async function ingestFigmaAssetsIntoProject(
         if (!isCurrent()) return null;
         const storedFile = (proj.files || []).find(file => (
           normalizeTrackedFilePath(file.path) === normalizedLocalPath &&
-          (!figmaAssetKey || getFigmaAssetDedupKey(file) === figmaAssetKey)
+          (!figmaAssetDedupKey || getFigmaAssetDedupKey(file) === figmaAssetDedupKey)
         )) || result.fileRecord;
         recordFigmaAssetProvenance(proj, storedFile, asset, contextLabel);
         return null;
       });
       addedCount++;
       existingPaths.add(normalizedLocalPath);
-      if (figmaAssetKey) existingFigmaAssetKeys.add(figmaAssetKey);
+      if (figmaAssetDedupKey) existingFigmaAssetKeys.add(figmaAssetDedupKey);
     } else {
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
-        `assetKeyPresent=${!!figmaAssetKey} localName=${formatFigmaLocalNameForLog(localPath)} reason=already_in_project`
+        `assetKeyPresent=${!!figmaAssetIdentity} localName=${formatFigmaLocalNameForLog(localPath)} reason=already_in_project`
       );
     }
   }

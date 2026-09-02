@@ -1094,6 +1094,9 @@ module.exports.__crateMetadataTestHooks = {
   createRendererFilePresentation(project, file) {
     return createRendererFilePresentation(project, file);
   },
+  getFigmaAssetDedupKey(record) {
+    return getFigmaAssetDedupKey(record);
+  },
 };
 `, filename);
 };
@@ -10390,6 +10393,25 @@ test('renderer presentation derives opaque stable Figma source identities from f
   assert.equal(firstPresentation.figmaSourceIdentity.includes(first.figmaFileName), false);
   assert.equal(Object.hasOwn(keylessPresentation, 'figmaSourceIdentity'), false);
   assert.equal(keylessPresentation.sourceName, first.figmaFileName);
+});
+
+test('persisted Figma asset identity remains idempotent across legacy and canonical records', () => {
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({ figmaFileKey: 'FILE_A', figmaAssetKey: 'NODE_1' }),
+    'FILE_A:NODE_1'
+  );
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({ figmaFileKey: 'FILE_A', figmaAssetKey: 'FILE_A:NODE_1' }),
+    'FILE_A:NODE_1'
+  );
+  assert.equal(
+    metadataTestHooks.getFigmaAssetDedupKey({
+      figmaFileKey: 'FILE_A',
+      figmaAssetIdentity: 'NODE_1',
+      figmaAssetDedupKey: 'FILE_A:NODE_1',
+    }),
+    'FILE_A:NODE_1'
+  );
 });
 
 test('renderer presentation rejects path-shaped and URL-shaped source metadata', async () => {
