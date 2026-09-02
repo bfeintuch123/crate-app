@@ -3160,7 +3160,7 @@ test('mismatched Package Review recovery leaves the renderer interactive', async
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
-test('notification-driven Package Review transition dismisses old content before refresh and eventually binds project B', async () => {
+test('notification-driven Package Review does not replace an active review', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
     id: 'notification-transition-a',
@@ -3178,15 +3178,10 @@ test('notification-driven Package Review transition dismisses old content before
     pendingFiles: [],
     excludedAssetKeys: [],
   };
-  const refresh = createDeferred();
   let packageTrigger;
-  let getProjectsCalls = 0;
   const noOp = () => {};
   const renderer = loadRendererHelpers(document, { crate: {
-    getProjects: () => {
-      getProjectsCalls += 1;
-      return getProjectsCalls === 1 ? refresh.promise : Promise.resolve([projectA, projectB]);
-    },
+    getProjects: async () => [projectA, projectB],
     preparePackageReview: async () => ({
       token: 'notification-transition-b-token',
       projectId: projectB.id,
@@ -3220,16 +3215,12 @@ test('notification-driven Package Review transition dismisses old content before
   renderer.setupMainProcessListeners();
 
   const transition = packageTrigger({ projectId: projectB.id });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectB.id);
-  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
-
-  refresh.resolve([projectA, projectB]);
   await transition;
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectA.id);
   assert.equal(elements['modal-package'].classList.contains('hidden'), false);
-  assert.equal(elements['modal-project-name'].textContent, projectB.name);
-  assert.equal(getElementTreeText(elements['modal-file-list']).includes('A.ai'), false);
-  assert.equal(getElementTreeText(elements['modal-file-list']).includes('B.ai'), true);
+  assert.equal(elements['modal-project-name'].textContent, projectA.name);
+  assert.equal(getElementTreeText(elements['modal-file-list']).includes('A.ai'), true);
+  assert.equal(getElementTreeText(elements['modal-file-list']).includes('B.ai'), false);
 });
 
 test('stale notification review does not open after the user selects another project during refresh', async () => {
@@ -3273,7 +3264,7 @@ test('stale notification review does not open after the user selects another pro
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
-test('notification-driven project switching closes success without leaving the renderer inert', async () => {
+test('notification-driven project switching does not replace an active success modal', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = { id: 'notification-success-a', name: 'Notification Success A', status: 'watching', files: [] };
   const projectB = { id: 'notification-success-b', name: 'Notification Success B', status: 'watching', files: [] };
@@ -3301,10 +3292,11 @@ test('notification-driven project switching closes success without leaving the r
 
   await packageTrigger({ projectId: projectB.id });
 
-  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
-  assert.equal(elements['app-sidebar'].inert, false);
-  assert.equal(elements['app-main'].inert, false);
-  assert.equal(vm.runInContext('packageReviewOpener', renderer), null);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectA.id);
+  assert.equal(elements['app-sidebar'].inert, true);
+  assert.equal(elements['app-main'].inert, true);
 });
 
 test('older Existing Assets completion cannot dismiss a newer A modal after A-B-A re-entry', async () => {
@@ -3392,6 +3384,28 @@ test('distinct Figma source identities keep same-name Working Files separate', (
   assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 2);
   assert.equal(new Set(workingFiles.map(row => row.dataset.renderKey)).size, 2);
   assert.equal(getElementTreeText(elements['project-file-list']).match(/Figma · Current Page/g).length, 2);
+});
+
+test('keyless same-name Figma sources remain separate without synthetic display-name identity', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'keyless-same-name-figma-sources',
+    figmaScopeMode: 'current-page',
+    files: [],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const files = [
+    { name: 'Campaign_A.png', ext: '.png', appFamily: 'figma', sourceName: 'Campaign', projectRole: 'asset', assetOrigin: 'added' },
+    { name: 'Campaign_B.png', ext: '.png', appFamily: 'figma', sourceName: 'campaign', projectRole: 'asset', assetOrigin: 'added' },
+  ];
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {}, files);
+
+  const workingFiles = elements['project-file-list'].children;
+  assert.equal(workingFiles.length, 2);
+  assert.equal([...workingFiles].some(row => String(row.dataset.renderKey).includes('name:')), false);
 });
 
 test('Added list tears down populated state, preserves its empty message through filters, and repopulates once', async () => {
@@ -4423,7 +4437,7 @@ test('notification-triggered packaging opens the Existing Assets decision instea
   assert.equal(elements['modal-package'].classList.contains('hidden'), true);
 });
 
-test('notification-triggered packaging closes another project existing-assets decision before review', async () => {
+test('notification-triggered packaging does not replace another project existing-assets decision', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const decisionProject = {
     id: 'notification-decision-project',
@@ -4482,13 +4496,13 @@ test('notification-triggered packaging closes another project existing-assets de
 
   await packageTrigger({ projectId: readyProject.id });
 
-  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
-  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
-  assert.equal(vm.runInContext('state.selectedProjectId', renderer), readyProject.id);
-  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), decisionProject.id);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), decisionProject.id);
 });
 
-test('an earlier decision completion cannot dismiss a later project Existing Assets alert', async () => {
+test('an in-flight Existing Assets decision blocks a competing notification transition', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
     id: 'decision-race-a',
@@ -4530,22 +4544,21 @@ test('an earlier decision completion cannot dismiss a later project Existing Ass
     state.projects = [${JSON.stringify(projectA)}, ${JSON.stringify(projectB)}];
     state.selectedProjectId = '${projectA.id}';
   `, renderer);
-  renderer.showExistingAssetsDecisionModal(projectA);
+  await renderer.showExistingAssetsDecisionModal(projectA);
   renderer.setupMainProcessListeners();
   const pendingDecision = renderer.submitExistingAssetsDecision('include');
 
   await packageTrigger({ projectId: projectB.id });
-  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'B.png');
-  assert.equal(elements['btn-include-existing-assets'].disabled, false);
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'A.png');
+  assert.equal(elements['btn-include-existing-assets'].disabled, true);
 
   resolveDecisionA({ success: true, project: projectA });
   await pendingDecision;
 
-  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectB.id);
-  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'B.png');
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 
 test('Package Review routes a newly settled baseline to the sole Existing Assets decision dialog', async () => {
@@ -5801,9 +5814,6 @@ test('package limit dialog traps keyboard focus, dismisses with Escape, and clea
   const renderer = loadRendererHelpers(document, { crate: {} });
   renderer.setupEventListeners();
   elements['btn-package'].focus();
-  elements['modal-package'].classList.remove('hidden');
-  elements['modal-success'].classList.remove('hidden');
-  elements['modal-v2-results'].classList.remove('hidden');
   vm.runInContext(`state.packageReviewToken = '00000000-0000-4000-8000-000000000401'`, renderer);
 
   renderer.showPackageLimitModal({ packageLimit: 25, daysLeft: 2 });
@@ -5858,6 +5868,23 @@ test('package limit dialog traps keyboard focus, dismisses with Escape, and clea
   elements['btn-dismiss-upgrade'].click();
   assert.equal(elements['modal-upgrade'].listeners.keydown.length, 0);
   assert.equal(document.activeElement, elements['btn-package']);
+});
+
+test('package limit dialog refuses to replace an already visible blocking modal', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  elements['modal-package'].classList.remove('hidden');
+  elements['modal-success'].classList.remove('hidden');
+  elements['modal-v2-results'].classList.remove('hidden');
+  vm.runInContext(`state.packageReviewToken = '00000000-0000-4000-8000-000000000401'`, renderer);
+
+  renderer.showPackageLimitModal({ packageLimit: 25, daysLeft: 2 });
+
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), '00000000-0000-4000-8000-000000000401');
+  assert.equal(elements['modal-upgrade'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), false);
+  assert.equal(elements['modal-v2-results'].classList.contains('hidden'), false);
 });
 
 test('renderer recovers rejected IPC and typed package errors in the same modal with fresh tokens', async () => {

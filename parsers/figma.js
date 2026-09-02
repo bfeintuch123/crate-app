@@ -353,8 +353,12 @@ class FigmaParser extends BaseParser {
   deduplicateFigmaAssets(assets) {
     const seen = new Set();
     return assets.filter((asset) => {
-      const key = asset.imageRef || asset.url || asset.nodeId;
-      if (!key) return true;
+      const fileKey = String(asset.figmaFileKey || asset.fileKey || '').trim();
+      const assetKey = String(asset.figmaAssetKey || asset.imageRef || asset.url || asset.nodeId || '').trim();
+      // A node id or CDN URL is only meaningful within its Figma file.  Do
+      // not guess a file identity from a display name; retain keyless records.
+      if (!fileKey || !assetKey) return true;
+      const key = `${fileKey}\u0000${assetKey}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;

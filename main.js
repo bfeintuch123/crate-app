@@ -620,8 +620,11 @@ function getFigmaAssetDedupKey(record) {
     }
   }
 
-  if (!assetKey) return null;
-  return figmaFileKey ? `${figmaFileKey}:${assetKey}` : assetKey;
+  // Node IDs and CDN URLs are only unique within a Figma file.  Without the
+  // authoritative file key, fail closed instead of collapsing unrelated
+  // keyless records or allowing a same-name path overwrite downstream.
+  if (!figmaFileKey || !assetKey) return null;
+  return `${figmaFileKey}:${assetKey}`;
 }
 
 // L1: Cache stat results to avoid redundant fs.statSync calls across invocations.
@@ -9321,6 +9324,13 @@ async function ingestFigmaAssetsIntoProject(
       nodeId: asset.nodeId,
       url: asset.url
     });
+    if (!figmaFileKey || !figmaAssetKey) {
+      console.log(
+        `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
+        `assetKeyPresent=${!!figmaAssetKey} reason=identity_unavailable`
+      );
+      continue;
+    }
     if (figmaAssetKey && existingFigmaAssetKeys.has(figmaAssetKey)) {
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +

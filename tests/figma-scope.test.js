@@ -7,6 +7,22 @@ const { FIGMA_NETWORK_LIMITS, createByteBudget } = require('../parsers/figma-net
 
 const FILE_KEY = 'FILE123';
 
+test('Figma asset dedup requires composite stable identity and fails closed for keyless records', () => {
+  const parser = new FigmaParser();
+  const keyless = [
+    { name: 'Same', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+  ];
+  assert.equal(parser.deduplicateFigmaAssets(keyless).length, 2);
+
+  const stable = [
+    { name: 'Same', fileKey: 'FILE_A', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', fileKey: 'FILE_A', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+    { name: 'Same', fileKey: 'FILE_B', nodeId: '1:1', url: 'https://cdn.example/a.png' },
+  ];
+  assert.equal(parser.deduplicateFigmaAssets(stable).length, 2);
+});
+
 async function captureConsole(fn) {
   const messages = [];
   const originalLog = console.log;

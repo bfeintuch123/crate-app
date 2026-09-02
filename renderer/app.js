@@ -71,11 +71,62 @@ let packageReviewRequestId = 0;
 let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
 let packageReviewModalRequestId = null;
+let packageReviewModalSessionId = null;
 let projectSelectionEpoch = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
 const rendererActionsInFlight = new Set();
+const BLOCKING_MODAL_IDS = [
+  'modal-existing-assets',
+  'modal-package',
+  'modal-success',
+  'modal-progress',
+  'modal-upgrade',
+  'modal-delete-confirm',
+  'modal-edit-figma-link',
+  'modal-clear-all',
+  'modal-v2-results',
+];
+let activeModalLease = null;
+let modalLeaseSequence = 0;
+let notificationPackageTriggerInFlight = false;
+let notificationPackageTriggerId = 0;
+let existingAssetsModalSessionId = null;
+
+function getVisibleBlockingModalIds() {
+  return BLOCKING_MODAL_IDS.filter(id => {
+    const modal = $(`#${id}`);
+    return modal && !modal.classList.contains('hidden');
+  });
+}
+
+function hasModalInteraction() {
+  return Boolean(activeModalLease) || getVisibleBlockingModalIds().length > 0;
+}
+
+function claimModalLease(id) {
+  if (!BLOCKING_MODAL_IDS.includes(id)) return null;
+  if (activeModalLease && activeModalLease.id !== id) {
+    const leasedModal = $(`#${activeModalLease.id}`);
+    if (!leasedModal || leasedModal.classList.contains('hidden')) activeModalLease = null;
+  }
+  if (activeModalLease && activeModalLease.id !== id) return null;
+  const visibleOtherModal = getVisibleBlockingModalIds().some(visibleId => visibleId !== id);
+  if (visibleOtherModal) return null;
+  if (!activeModalLease) activeModalLease = { id, sessionId: ++modalLeaseSequence };
+  return activeModalLease;
+}
+
+function isCurrentModalLease(id, sessionId) {
+  return Boolean(activeModalLease && activeModalLease.id === id && activeModalLease.sessionId === sessionId);
+}
+
+function releaseModalLease(id, sessionId = null) {
+  if (!activeModalLease || activeModalLease.id !== id) return;
+  if (sessionId !== null && activeModalLease.sessionId !== sessionId) return;
+  activeModalLease = null;
+}
 
 function redactRendererPrivatePaths(value) {
   // Delimiters and line breaks may appear in filenames, so redact the value tail.
@@ -490,6 +541,12 @@ function setSelectedProject(projectId) {
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
+  // A project switch invalidates every modal session.  The caller must not
+  // allow an async callback from the previous project to reopen a modal.
+  activeModalLease = null;
+  modalLeaseSequence += 1;
+  existingAssetsModalSessionId = null;
+  packageReviewModalSessionId = null;
   packageReviewRequestId += 1;
   packageReviewConfirmationId += 1;
   packageReviewConfirmationInFlight = false;
@@ -505,6 +562,12 @@ function setSelectedProject(projectId) {
     successModal.classList.add('hidden');
     successModal.removeEventListener('keydown', handlePackageSuccessKeydown);
   }
+  for (const id of ['modal-upgrade', 'modal-delete-confirm', 'modal-edit-figma-link', 'modal-clear-all', 'modal-v2-results']) {
+    $(`#${id}`)?.classList.add('hidden');
+  }
+  $('#modal-upgrade')?.removeEventListener('keydown', handlePackageLimitKeydown);
+  state.pendingDeleteId = null;
+  state.editFigmaProjectId = null;
   packageReviewOpener = null;
   setModalBackgroundState(false);
   setAssetReviewProject(nextProjectId);
@@ -1601,6 +1664,8 @@ function hideExistingAssetsDecisionModal({ restoreFocus = true } = {}) {
   if (!modal) return;
   modal.classList.add('hidden');
   modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
+  releaseModalLease('modal-existing-assets', existingAssetsModalSessionId);
+  existingAssetsModalSessionId = null;
   existingAssetsModalProjectId = null;
   existingAssetsModalSelectionEpoch = null;
   setModalBackgroundState(false);
@@ -1640,17 +1705,27 @@ async function ensureProjectAssetWorkspace(project) {
 async function showExistingAssetsDecisionModal(project, packageRequestId = null) {
   const modal = $('#modal-existing-assets');
   if (!modal || !project) return;
+  const lease = claimModalLease('modal-existing-assets');
+  if (!lease) return false;
+  const sessionId = lease.sessionId;
   const selectionEpoch = projectSelectionEpoch;
   const isCurrentPackageRequest = () => (
     (packageRequestId === null || packageReviewRequestId === packageRequestId) &&
     state.selectedProjectId === project.id &&
-    projectSelectionEpoch === selectionEpoch
+    projectSelectionEpoch === selectionEpoch &&
+    isCurrentModalLease('modal-existing-assets', sessionId)
   );
-  if (!isCurrentPackageRequest()) return;
-  if (!await ensureProjectAssetWorkspace(project)) return;
-  if (!isCurrentPackageRequest()) return;
+  if (!isCurrentPackageRequest()) return false;
+  if (!await ensureProjectAssetWorkspace(project)) {
+    releaseModalLease('modal-existing-assets', sessionId);
+    return false;
+  }
+  if (!isCurrentPackageRequest()) return false;
   const assets = getExistingAssetsForDecision(project);
-  if (assets.length === 0) return;
+  if (assets.length === 0) {
+    releaseModalLease('modal-existing-assets', sessionId);
+    return false;
+  }
 
   if (modal.classList.contains('hidden')) {
     existingAssetsDecisionOpener = document.activeElement;
@@ -1696,11 +1771,13 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
 
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
+  existingAssetsModalSessionId = sessionId;
   existingAssetsModalSelectionEpoch = selectionEpoch;
   modal.removeEventListener('keydown', handleExistingAssetsDecisionKeydown);
   modal.addEventListener('keydown', handleExistingAssetsDecisionKeydown);
   setExistingAssetsDecisionButtonsDisabled(!!decisionInFlightForProject);
   ($('#btn-include-existing-assets') || modal).focus();
+  return true;
 }
 
 async function syncExistingAssetsDecisionModal(project) {
@@ -1717,11 +1794,13 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
   if (!existingAssetsModalProjectId) return false;
   const projectId = existingAssetsModalProjectId;
   const modalSelectionEpoch = existingAssetsModalSelectionEpoch;
+  const modalSessionId = existingAssetsModalSessionId;
   if (
     $('#modal-existing-assets')?.classList.contains('hidden') ||
     state.selectedProjectId !== projectId ||
     modalSelectionEpoch === null ||
     modalSelectionEpoch !== projectSelectionEpoch
+    || !isCurrentModalLease('modal-existing-assets', modalSessionId)
   ) return false;
   if (
     existingAssetsDecisionRequest &&
@@ -1734,6 +1813,8 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
     projectSelectionEpoch === modalSelectionEpoch &&
     existingAssetsModalProjectId === projectId &&
     existingAssetsModalSelectionEpoch === modalSelectionEpoch &&
+    existingAssetsModalSessionId === modalSessionId &&
+    isCurrentModalLease('modal-existing-assets', modalSessionId) &&
     existingAssetsDecisionRequest === request
   );
   existingAssetsDecisionRequest = request;
@@ -2523,16 +2604,23 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   setAssetReviewProject(project.id);
   const files = Array.isArray(presentedFiles) ? presentedFiles : (Array.isArray(project.files) ? project.files : []);
   const physicalSourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
-  const figmaSourceNames = new Set();
+  const figmaSourceIdentities = new Set();
+  const keylessFigmaSourceNames = [];
   const figmaSourceFiles = [];
   for (const file of files) {
     if (file?.appFamily !== 'figma' || typeof file.sourceName !== 'string' || !file.sourceName.trim()) continue;
     const sourceName = file.sourceName.trim();
     const identity = typeof file.figmaSourceIdentity === 'string' && file.figmaSourceIdentity.trim()
       ? file.figmaSourceIdentity.trim()
-      : `name:${sourceName.toLowerCase()}`;
-    if (figmaSourceNames.has(identity)) continue;
-    figmaSourceNames.add(identity);
+      : null;
+    // A display name is not an identity.  Keyless records remain visible
+    // independently so same-name Figma files cannot hide one another.
+    if (!identity && Array.isArray(project.figmaTrackedFiles) && project.figmaTrackedFiles.length > 0) {
+      keylessFigmaSourceNames.push(sourceName);
+      continue;
+    }
+    if (identity && figmaSourceIdentities.has(identity)) continue;
+    if (identity) figmaSourceIdentities.add(identity);
     figmaSourceFiles.push({
       name: sourceName,
       ext: '',
@@ -2543,9 +2631,34 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
       protectedSource: true,
       sourceRecoveryAllowed: false,
       excluded: false,
-      visualIdentity: `figma-source:${identity}`,
-      visualRevision: `figma-source:${identity}`,
+      visualIdentity: identity ? `figma-source:${identity}` : null,
+      visualRevision: identity ? `figma-source:${identity}` : null,
     });
+  }
+  // When the asset records have no source identity, use the authoritative
+  // tracked-file cardinality if it is available.  The display name labels the
+  // row only; it is never used as a deduplication key.
+  if (figmaSourceFiles.length === 0 && Array.isArray(project.figmaTrackedFiles)) {
+    for (const trackedFile of project.figmaTrackedFiles) {
+      const identity = [trackedFile?.figmaSourceIdentity, trackedFile?.figmaFileKey, trackedFile?.fileKey, trackedFile?.key]
+        .find(value => typeof value === 'string' && value.trim())?.trim() || null;
+      const sourceName = trackedFile?.displayName || trackedFile?.name || keylessFigmaSourceNames[figmaSourceFiles.length] || 'Figma file';
+      if (identity && figmaSourceIdentities.has(identity)) continue;
+      if (identity) figmaSourceIdentities.add(identity);
+      figmaSourceFiles.push({
+        name: sourceName,
+        ext: '',
+        appFamily: 'figma',
+        sourceName: null,
+        assetOrigin: 'added',
+        projectRole: 'source',
+        protectedSource: true,
+        sourceRecoveryAllowed: false,
+        excluded: false,
+        visualIdentity: identity ? `figma-source:${identity}` : null,
+        visualRevision: identity ? `figma-source:${identity}` : null,
+      });
+    }
   }
   const sourceFiles = [...physicalSourceFiles, ...figmaSourceFiles];
   const existingAssets = files.filter(file => (
@@ -2946,17 +3059,6 @@ function renderFooter() {
   $('#footer-usage').textContent = `${used} of ${packageLimit} packages used this month`;
 }
 
-const PACKAGE_LIMIT_COMPETING_MODAL_IDS = [
-  'modal-existing-assets',
-  'modal-package',
-  'modal-success',
-  'modal-progress',
-  'modal-delete-confirm',
-  'modal-edit-figma-link',
-  'modal-clear-all',
-  'modal-v2-results',
-];
-
 function getPackageLimitFocusableElements() {
   const modal = $('#modal-upgrade');
   if (!modal) return [];
@@ -2970,8 +3072,10 @@ function getPackageLimitFocusableElements() {
 
 function hidePackageLimitModal({ restoreFocus = true } = {}) {
   const modal = $('#modal-upgrade');
+  if (!modal) return;
   modal.classList.add('hidden');
   modal.removeEventListener('keydown', handlePackageLimitKeydown);
+  releaseModalLease('modal-upgrade');
   setModalBackgroundState(false);
   const opener = upgradeModalOpener;
   upgradeModalOpener = null;
@@ -3003,13 +3107,18 @@ function handlePackageLimitKeydown(event) {
 }
 
 function showPackageLimitModal(result = {}, opener = document.activeElement || null) {
+  const lease = claimModalLease('modal-upgrade');
+  if (!lease) return false;
   const packageLimit = Number(result.packageLimit || state.usage.packageLimit || state.usage.limit) || 10;
   const title = $('#upgrade-title');
   if (title) title.textContent = `You've used all ${packageLimit} packages`;
   $('#upgrade-days-left').textContent = result.daysLeft;
   const modal = $('#modal-upgrade');
+  if (!modal) {
+    releaseModalLease('modal-upgrade', lease.sessionId);
+    return false;
+  }
   state.packageReviewToken = null;
-  for (const id of PACKAGE_LIMIT_COMPETING_MODAL_IDS) $(`#${id}`)?.classList.add('hidden');
   upgradeModalOpener = opener;
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
@@ -3017,6 +3126,7 @@ function showPackageLimitModal(result = {}, opener = document.activeElement || n
   modal.addEventListener('keydown', handlePackageLimitKeydown);
   const focusTarget = $('#btn-dismiss-upgrade') || getPackageLimitFocusableElements()[0] || modal;
   focusTarget.focus();
+  return true;
 }
 
 // ===== Package Flow =====
@@ -3034,11 +3144,12 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
 ]);
 
 function setModalBackgroundState(blocked) {
+  const shouldBlock = Boolean(blocked) || getVisibleBlockingModalIds().length > 0;
   for (const id of ['app-sidebar', 'app-main']) {
     const element = $(`#${id}`);
     if (!element) continue;
-    element.inert = blocked;
-    if (blocked) element.setAttribute('aria-hidden', 'true');
+    element.inert = shouldBlock;
+    if (shouldBlock) element.setAttribute('aria-hidden', 'true');
     else element.removeAttribute('aria-hidden');
   }
 }
@@ -3073,6 +3184,9 @@ function focusPackageReviewDialog() {
 function openPackageReviewDialog() {
   const modal = $('#modal-package');
   if (!modal || !packageReviewModalProjectId || (state.selectedProjectId && packageReviewModalProjectId !== state.selectedProjectId)) return false;
+  const lease = claimModalLease('modal-package');
+  if (!lease || (packageReviewModalSessionId !== null && lease.sessionId !== packageReviewModalSessionId)) return false;
+  packageReviewModalSessionId = lease.sessionId;
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
   focusPackageReviewDialog();
@@ -3081,6 +3195,8 @@ function openPackageReviewDialog() {
 
 function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false } = {}) {
   $('#modal-package')?.classList.add('hidden');
+  releaseModalLease('modal-package', packageReviewModalSessionId);
+  packageReviewModalSessionId = null;
   packageReviewModalProjectId = null;
   packageReviewModalSelectionEpoch = null;
   packageReviewModalRequestId = null;
@@ -3109,8 +3225,10 @@ function getPackageSuccessFocusableElements() {
 
 function hidePackageSuccessModal() {
   const modal = $('#modal-success');
+  if (!modal) return;
   modal.classList.add('hidden');
   modal.removeEventListener('keydown', handlePackageSuccessKeydown);
+  releaseModalLease('modal-success');
   setModalBackgroundState(false);
   const opener = packageReviewOpener;
   packageReviewOpener = null;
@@ -3145,33 +3263,33 @@ function handlePackageSuccessKeydown(event) {
 
 function showPackageProgressModal() {
   const modal = $('#modal-progress');
+  if (!modal) return false;
+  const lease = claimModalLease('modal-progress');
+  if (!lease) return false;
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
   modal.focus();
+  return true;
 }
 
 function hidePackageProgressModal() {
   $('#modal-progress')?.classList.add('hidden');
-  const anotherBlockingModalIsVisible = [
-    'modal-package',
-    'modal-existing-assets',
-    'modal-success',
-    'modal-upgrade',
-  ].some(id => {
-    const modal = $(`#${id}`);
-    return modal && !modal.classList.contains('hidden');
-  });
-  setModalBackgroundState(anotherBlockingModalIsVisible);
+  releaseModalLease('modal-progress');
+  setModalBackgroundState(false);
 }
 
 function showPackageSuccessModal() {
   const modal = $('#modal-success');
+  if (!modal) return false;
+  const lease = claimModalLease('modal-success');
+  if (!lease) return false;
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
   modal.removeEventListener('keydown', handlePackageSuccessKeydown);
   modal.addEventListener('keydown', handlePackageSuccessKeydown);
   const focusTarget = $('#btn-success-done') || getPackageSuccessFocusableElements()[0] || modal;
   focusTarget.focus();
+  return true;
 }
 
 function cancelPackageReview() {
@@ -3279,10 +3397,13 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
 
 function renderPackageReview(project, review, message = '') {
   if (!project?.id || review?.projectId !== project.id) return false;
+  const lease = claimModalLease('modal-package');
+  if (!lease) return false;
   setActiveFileVisualProject(project && project.id);
   packageReviewModalProjectId = project?.id || null;
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
   packageReviewModalRequestId = packageReviewRequestId;
+  packageReviewModalSessionId = lease.sessionId;
   const canPackage = review.materializable !== false && typeof review.token === 'string';
   state.packageReviewToken = canPackage ? review.token : null;
 
@@ -3537,6 +3658,14 @@ async function showPackageModal({
 } = {}) {
   const projectId = state.selectedProjectId;
   if (!projectId) return false;
+  // A refresh requested by the current package flow is a serialized
+  // transition from progress back to review, not a competing modal.
+  if (activeModalLease?.id === 'modal-progress' && packageReviewConfirmationInFlight) {
+    hidePackageProgressModal();
+  }
+  const lease = claimModalLease('modal-package');
+  if (!lease) return false;
+  const modalSessionId = lease.sessionId;
   const requestId = ++packageReviewRequestId;
   const projectRequestGeneration = assetWorkspaceRequestGeneration;
   const selectionEpoch = projectSelectionEpoch;
@@ -3544,7 +3673,8 @@ async function showPackageModal({
     packageReviewRequestId === requestId &&
     state.selectedProjectId === projectId &&
     projectSelectionEpoch === selectionEpoch &&
-    assetWorkspaceRequestGeneration === projectRequestGeneration
+    assetWorkspaceRequestGeneration === projectRequestGeneration &&
+    isCurrentModalLease('modal-package', modalSessionId)
   );
   if (!packageReviewOpener && !packageReviewConfirmationInFlight) {
     packageReviewOpener = document.activeElement || null;
@@ -3612,6 +3742,15 @@ async function showPackageModal({
       if (isCurrentRequest()) renderPackageReview(project, unavailableReview, failureMessage);
     }
     return false;
+  } finally {
+    const modal = $('#modal-package');
+    if (
+      packageReviewRequestId === requestId &&
+      isCurrentModalLease('modal-package', modalSessionId) &&
+      modal?.classList.contains('hidden')
+    ) {
+      releaseModalLease('modal-package', modalSessionId);
+    }
   }
 }
 
@@ -3681,20 +3820,23 @@ async function confirmPackage() {
     confirmButton?.disabled ||
     packageReviewModalProjectId !== project.id ||
     packageReviewModalSelectionEpoch !== projectSelectionEpoch ||
-    packageReviewModalRequestId !== packageReviewRequestId
+    packageReviewModalRequestId !== packageReviewRequestId ||
+    packageReviewModalSessionId === null
   ) return;
 
   const reviewToken = state.packageReviewToken;
   const reviewProjectId = project.id;
   const reviewSelectionEpoch = projectSelectionEpoch;
   const reviewRequestId = packageReviewModalRequestId;
+  const reviewModalSessionId = packageReviewModalSessionId;
   const confirmationId = ++packageReviewConfirmationId;
   const isCurrentConfirmation = () => (
     packageReviewConfirmationId === confirmationId &&
     state.selectedProjectId === reviewProjectId &&
     projectSelectionEpoch === reviewSelectionEpoch &&
     packageReviewRequestId === reviewRequestId &&
-    packageReviewModalRequestId === reviewRequestId
+    packageReviewModalRequestId === reviewRequestId &&
+    packageReviewModalSessionId === reviewModalSessionId
   );
   if (confirmButton) confirmButton.disabled = true;
   packageReviewConfirmationInFlight = true;
@@ -3703,6 +3845,7 @@ async function confirmPackage() {
     packageReviewModalProjectId = reviewProjectId;
     packageReviewModalSelectionEpoch = reviewSelectionEpoch;
     packageReviewModalRequestId = reviewRequestId;
+    packageReviewModalSessionId = reviewModalSessionId;
 
     // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
     let outputPath = state.packageOutputPath;
@@ -3717,7 +3860,7 @@ async function confirmPackage() {
 
     if (!isCurrentConfirmation()) return;
 
-    showPackageProgressModal();
+    if (!showPackageProgressModal()) return;
     const scanResult = await Promise.race([
       window.crate.preScanSession(project.id),
       new Promise(resolve => setTimeout(() => resolve(null), 12000))
@@ -3737,7 +3880,7 @@ async function confirmPackage() {
       if (typedError === 'limit_reached') {
         state.packageReviewToken = null;
         const opener = hidePackageReviewDialog();
-        $('#modal-progress').classList.add('hidden');
+        hidePackageProgressModal();
         showPackageLimitModal(result, opener);
         return;
       }
@@ -3791,10 +3934,14 @@ async function confirmPackage() {
 
 // ===== Delete Project =====
 function showDeleteConfirmation(projectId, projectName) {
+  const lease = claimModalLease('modal-delete-confirm');
+  if (!lease) return false;
   state.pendingDeleteId = projectId;
   $('#delete-confirm-title').textContent = `Remove ${projectName} from Crate?`;
   $('#delete-confirm-desc').textContent = 'The files on your computer are not affected.';
   $('#modal-delete-confirm').classList.remove('hidden');
+  setModalBackgroundState(true);
+  return true;
 }
 
 async function confirmDeleteProject() {
@@ -3810,6 +3957,8 @@ async function confirmDeleteProject() {
   state.pendingDeleteId = null;
   state.projects = await window.crate.getProjects();
   $('#modal-delete-confirm').classList.add('hidden');
+  releaseModalLease('modal-delete-confirm');
+  setModalBackgroundState(false);
   renderProjects();
   renderFooter();
 }
@@ -3820,6 +3969,8 @@ async function confirmClearAll() {
   setSelectedProject(null);
   state.projects = await window.crate.getProjects();
   $('#modal-clear-all').classList.add('hidden');
+  releaseModalLease('modal-clear-all');
+  setModalBackgroundState(false);
   renderProjects();
   renderFooter();
 }
@@ -3998,11 +4149,15 @@ function setupEventListeners() {
   // Clear all projects
   $('#btn-clear-all').addEventListener('click', () => {
     if (state.projects.length === 0) return;
+    if (!claimModalLease('modal-clear-all')) return;
     $('#modal-clear-all').classList.remove('hidden');
+    setModalBackgroundState(true);
   });
 
   $('#btn-clear-all-cancel').addEventListener('click', () => {
     $('#modal-clear-all').classList.add('hidden');
+    releaseModalLease('modal-clear-all');
+    setModalBackgroundState(false);
   });
 
   $('#btn-clear-all-confirm').addEventListener('click', confirmClearAll);
@@ -4011,6 +4166,8 @@ function setupEventListeners() {
   $('#btn-delete-cancel').addEventListener('click', () => {
     state.pendingDeleteId = null;
     $('#modal-delete-confirm').classList.add('hidden');
+    releaseModalLease('modal-delete-confirm');
+    setModalBackgroundState(false);
   });
 
   $('#btn-delete-confirm').addEventListener('click', confirmDeleteProject);
@@ -4053,6 +4210,8 @@ function setupEventListeners() {
   // V2 Results modal
   $('#btn-v2-done').addEventListener('click', () => {
     $('#modal-v2-results').classList.add('hidden');
+    releaseModalLease('modal-v2-results');
+    setModalBackgroundState(false);
     v2LastResult = null; // L8: release reference
   });
 
@@ -4061,6 +4220,8 @@ function setupEventListeners() {
       window.crate.openFolder(v2LastResult.outputDir);
     }
     $('#modal-v2-results').classList.add('hidden');
+    releaseModalLease('modal-v2-results');
+    setModalBackgroundState(false);
     v2LastResult = null; // L8: release reference
   });
 
@@ -4191,17 +4352,22 @@ function openEditFigmaLinkModal(projectId) {
 
   const modal = $('#modal-edit-figma-link');
   if (modal) {
+    if (!claimModalLease('modal-edit-figma-link')) return false;
     // Capture the triggering control before focusing the URL input. The
     // source-bound dialog controller consumes this marker when it observes opening.
     modal._crateOpener = document.activeElement;
     modal.classList.remove('hidden');
+    setModalBackgroundState(true);
   }
   if (urlInput) urlInput.focus();
+  return true;
 }
 
 function closeEditFigmaLinkModal() {
   state.editFigmaProjectId = null;
   $('#modal-edit-figma-link').classList.add('hidden');
+  releaseModalLease('modal-edit-figma-link');
+  setModalBackgroundState(false);
 }
 
 async function persistFigmaLinkEdit(payload, successMessage) {
@@ -4341,23 +4507,32 @@ function setupMainProcessListeners() {
 
   // Notification-triggered packaging still requires the same authoritative review.
   window.crate.onPackageTrigger(async (data) => {
+    if (hasModalInteraction() || notificationPackageTriggerInFlight) return;
+    const triggerId = ++notificationPackageTriggerId;
+    notificationPackageTriggerInFlight = true;
     const projectListRead = captureProjectListRead();
-    setSelectedProject(data.projectId);
-    const notificationSelectionEpoch = projectSelectionEpoch;
-    await refreshProjectState(data.projectId);
-    const projects = state.projects;
-    if (
-      !projectListReadIsCurrent(projectListRead) ||
-      state.selectedProjectId !== data.projectId ||
-      projectSelectionEpoch !== notificationSelectionEpoch
-    ) return;
-    const project = state.projects.find(p => p.id === data.projectId);
-    if (project) {
-      if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
-        await showExistingAssetsDecisionModal(project);
-        return;
+    try {
+      setSelectedProject(data.projectId);
+      const notificationSelectionEpoch = projectSelectionEpoch;
+      await refreshProjectState(data.projectId);
+      const projects = state.projects;
+      if (
+        triggerId !== notificationPackageTriggerId ||
+        !projectListReadIsCurrent(projectListRead) ||
+        state.selectedProjectId !== data.projectId ||
+        projectSelectionEpoch !== notificationSelectionEpoch ||
+        hasModalInteraction()
+      ) return;
+      const project = projects.find(p => p.id === data.projectId);
+      if (project) {
+        if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
+          await showExistingAssetsDecisionModal(project);
+          return;
+        }
+        await showPackageModal();
       }
-      await showPackageModal();
+    } finally {
+      if (triggerId === notificationPackageTriggerId) notificationPackageTriggerInFlight = false;
     }
   });
 
@@ -4512,6 +4687,7 @@ function showToast(message) {
 let v2LastResult = null;
 
 function showV2Results(result) {
+  if (!claimModalLease('modal-v2-results')) return false;
   v2LastResult = result;
 
   const masterName = result.masterFile.split('/').pop();
@@ -4544,6 +4720,8 @@ function showV2Results(result) {
   }
 
   $('#modal-v2-results').classList.remove('hidden');
+  setModalBackgroundState(true);
+  return true;
 }
 
 let v2PackageInFlight = false;
@@ -4552,7 +4730,7 @@ async function handleV2FileDrop(filePath, droppedFile = null) {
   v2PackageInFlight = true;
 
   try {
-    $('#modal-progress').classList.remove('hidden');
+    if (!showPackageProgressModal()) return;
 
     let result;
     try {
@@ -4563,7 +4741,7 @@ async function handleV2FileDrop(filePath, droppedFile = null) {
       showToast('Crate could not package that file. Try again.');
       return;
     } finally {
-      $('#modal-progress').classList.add('hidden');
+      hidePackageProgressModal();
     }
 
     if (result.error === 'limit_reached') {
