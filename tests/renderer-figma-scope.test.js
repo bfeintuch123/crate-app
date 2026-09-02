@@ -3273,6 +3273,40 @@ test('stale notification review does not open after the user selects another pro
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
+test('notification-driven project switching closes success without leaving the renderer inert', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'notification-success-a', name: 'Notification Success A', status: 'watching', files: [] };
+  const projectB = { id: 'notification-success-b', name: 'Notification Success B', status: 'watching', files: [] };
+  let packageTrigger;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: async () => [projectA],
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+    packageReviewOpener = document.querySelector('#btn-package');
+  `, renderer);
+  renderer.showPackageSuccessModal();
+  renderer.setupMainProcessListeners();
+
+  await packageTrigger({ projectId: projectB.id });
+
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['app-sidebar'].inert, false);
+  assert.equal(elements['app-main'].inert, false);
+  assert.equal(vm.runInContext('packageReviewOpener', renderer), null);
+});
+
 test('older Existing Assets completion cannot dismiss a newer A modal after A-B-A re-entry', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {

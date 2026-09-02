@@ -505,6 +505,8 @@ function setSelectedProject(projectId) {
     successModal.classList.add('hidden');
     successModal.removeEventListener('keydown', handlePackageSuccessKeydown);
   }
+  packageReviewOpener = null;
+  setModalBackgroundState(false);
   setAssetReviewProject(nextProjectId);
   focusSelectedProjectTarget(nextProjectId);
   return true;
