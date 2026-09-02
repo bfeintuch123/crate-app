@@ -2661,13 +2661,15 @@ test('project switches clear Working Files synchronously and fence delayed works
   assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 0);
   assert.equal(vm.runInContext('state.assetReviewProjectId', renderer), newProject.id);
 
-  oldWorkspaceRefresh.resolve({ projectId: oldProject.id, files: [oldSource], pendingFiles: [] });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(elements['working-assets-list'].children.length, 0);
-  assert.equal(getElementTreeText(elements['working-assets-list']).includes(oldSource.name), false);
-
   newWorkspace.resolve({ projectId: newProject.id, files: [newSource], pendingFiles: [] });
   await delayedNewRender;
+
+  const renderedNewRows = elements['working-assets-list'].children;
+  assert.equal(renderedNewRows.length, 1);
+  assert.equal(getElementTreeText(renderedNewRows[0]).includes(newSource.name), true);
+  assert.equal(getElementTreeText(elements['working-assets-list']).includes(oldSource.name), false);
+
+  oldWorkspaceRefresh.resolve({ projectId: oldProject.id, files: [oldSource], pendingFiles: [] });
   await delayedOldRender;
 
   const finalRows = elements['working-assets-list'].children;
@@ -2677,6 +2679,92 @@ test('project switches clear Working Files synchronously and fence delayed works
   assert.equal(new Set(finalRows.map(row => row.dataset.renderKey)).size, 1);
   assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 1);
   assert.equal(vm.runInContext('state.assetWorkspace.projectId', renderer), newProject.id);
+});
+
+test('delayed Existing Assets workspace responses cannot reopen a prior project modal', async () => {
+  const oldProject = {
+    id: 'modal-old-project',
+    name: 'Modal Old Project',
+    status: 'watching',
+    files: [
+      { name: 'Old.ai', path: '/synthetic/Old.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true },
+      { name: 'Old.png', path: '/synthetic/Old.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null },
+  };
+  const newProject = {
+    id: 'modal-new-project',
+    name: 'Modal New Project',
+    status: 'watching',
+    files: [{ name: 'New.ai', path: '/synthetic/New.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'included', decision: 'include' },
+  };
+  const oldWorkspace = createDeferred();
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getAssetWorkspace: async projectId => {
+        if (projectId === oldProject.id) return oldWorkspace.promise;
+        return { projectId: newProject.id, files: newProject.files, pendingFiles: [] };
+      },
+    },
+  });
+  renderer.testProjects = [oldProject, newProject];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+
+  const staleModal = renderer.showExistingAssetsDecisionModal(oldProject);
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext('state.selectedProjectId = testProjects[1].id;', renderer);
+  await renderer.renderFiles();
+  assert.equal(vm.runInContext('state.assetWorkspace.projectId', renderer), newProject.id);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+
+  oldWorkspace.resolve({ projectId: oldProject.id, files: oldProject.files, pendingFiles: [] });
+  await staleModal;
+
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(vm.runInContext('state.assetWorkspace.projectId', renderer), newProject.id);
+});
+
+test('distinct Figma source identities keep same-name Working Files separate', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'same-name-figma-sources',
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [{ status: 'tracked' }, { status: 'tracked' }],
+    files: [],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const files = [
+    {
+      name: 'Campaign_A.png', ext: '.png', appFamily: 'figma', sourceName: 'Campaign',
+      figmaSourceIdentity: 'opaque-figma-source-a', projectRole: 'asset', assetOrigin: 'added',
+      visualIdentity: 'figma-asset-a', visualRevision: 'figma-a-r1',
+    },
+    {
+      name: 'Campaign_B.png', ext: '.png', appFamily: 'figma', sourceName: 'campaign',
+      figmaSourceIdentity: 'opaque-figma-source-b', projectRole: 'asset', assetOrigin: 'added',
+      visualIdentity: 'figma-asset-b', visualRevision: 'figma-b-r1',
+    },
+  ];
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {}, files);
+
+  const workingFiles = elements['project-file-list'].children;
+  assert.equal(workingFiles.length, 2);
+  assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 2);
+  assert.equal(new Set(workingFiles.map(row => row.dataset.renderKey)).size, 2);
+  assert.equal(getElementTreeText(elements['project-file-list']).match(/Figma · Current Page/g).length, 2);
 });
 
 test('Added list tears down populated state, preserves its empty message through filters, and repopulates once', async () => {

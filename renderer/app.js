@@ -62,6 +62,7 @@ let existingAssetsDecisionRequest = null;
 let existingAssetsModalProjectId = null;
 let existingAssetsDecisionOpener = null;
 let fileWorkspaceRenderRequestId = 0;
+let assetWorkspaceRequestGeneration = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
@@ -457,6 +458,7 @@ function resetVirtualAssetList(list) {
 function setAssetReviewProject(projectId) {
   if (state.assetReviewProjectId === projectId) return;
   state.assetReviewProjectId = projectId;
+  assetWorkspaceRequestGeneration += 1;
   state.assetReviewSelectedKey = null;
   state.assetReviewLogicalItems = { working: [], existing: [], added: [], missing: [] };
   for (const id of ['project-file-list', 'working-assets-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
@@ -1560,10 +1562,13 @@ function hideExistingAssetsDecisionModal() {
 
 async function ensureProjectAssetWorkspace(project) {
   if (!project || !project.id) return null;
+  if (state.selectedProjectId !== project.id) return null;
+  const requestGeneration = assetWorkspaceRequestGeneration;
   if (state.assetWorkspace?.projectId === project.id) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
   try {
     const workspace = await window.crate.getAssetWorkspace(project.id);
+    if (requestGeneration !== assetWorkspaceRequestGeneration || state.selectedProjectId !== project.id) return null;
     if (!workspace || workspace.projectId !== project.id) return null;
     state.assetWorkspace = workspace;
     return workspace;
@@ -2431,7 +2436,9 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   for (const file of files) {
     if (file?.appFamily !== 'figma' || typeof file.sourceName !== 'string' || !file.sourceName.trim()) continue;
     const sourceName = file.sourceName.trim();
-    const identity = sourceName.toLowerCase();
+    const identity = typeof file.figmaSourceIdentity === 'string' && file.figmaSourceIdentity.trim()
+      ? file.figmaSourceIdentity.trim()
+      : `name:${sourceName.toLowerCase()}`;
     if (figmaSourceNames.has(identity)) continue;
     figmaSourceNames.add(identity);
     figmaSourceFiles.push({
@@ -3300,11 +3307,14 @@ function renderPackageReview(project, review, message = '') {
 }
 
 async function getUnavailableRendererReviewFiles(project) {
+  if (!project?.id || state.selectedProjectId !== project.id) return [];
+  const requestGeneration = assetWorkspaceRequestGeneration;
   const cachedWorkspace = state.assetWorkspace?.projectId === project?.id ? state.assetWorkspace : null;
   if (Array.isArray(cachedWorkspace?.files)) return cachedWorkspace.files;
   if (typeof window.crate?.getAssetWorkspace === 'function' && project?.id) {
     try {
       const workspace = await window.crate.getAssetWorkspace(project.id);
+      if (requestGeneration !== assetWorkspaceRequestGeneration || state.selectedProjectId !== project.id) return [];
       if (workspace?.projectId === project.id && Array.isArray(workspace.files)) return workspace.files;
     } catch (error) {
       logRendererError('Package Review asset workspace unavailable', error);
@@ -3426,6 +3436,11 @@ async function showPackageModal({
 } = {}) {
   const projectId = state.selectedProjectId;
   if (!projectId) return false;
+  const projectRequestGeneration = assetWorkspaceRequestGeneration;
+  const isCurrentProject = () => (
+    state.selectedProjectId === projectId &&
+    assetWorkspaceRequestGeneration === projectRequestGeneration
+  );
   if (!packageReviewOpener && !packageReviewConfirmationInFlight) {
     packageReviewOpener = document.activeElement || null;
   }
@@ -3438,6 +3453,7 @@ async function showPackageModal({
         window.crate.preScanSession(projectId),
         new Promise(resolve => setTimeout(() => resolve(null), 12000))
       ]);
+      if (!isCurrentProject()) return false;
     }
 
     const review = suppliedReview || await (
@@ -3445,9 +3461,11 @@ async function showPackageModal({
         ? window.crate.preparePackageReview(projectId)
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
     );
+    if (!isCurrentProject()) return false;
     if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         state.projects = await window.crate.getProjects();
+        if (!isCurrentProject()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
         hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
         if (project?.assetBaseline?.status === 'decision-required') {
@@ -3457,6 +3475,7 @@ async function showPackageModal({
       }
       try {
         state.projects = await window.crate.getProjects();
+        if (!isCurrentProject()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
       } catch (_) {
         // Keep the last safe project snapshot when refresh is unavailable.
@@ -3466,11 +3485,14 @@ async function showPackageModal({
         review?.diagnostics,
         project
       );
-      renderPackageReview(project, await createUnavailableRendererReview(project, failureMessage), failureMessage);
+      const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
+      if (!isCurrentProject()) return false;
+      renderPackageReview(project, unavailableReview, failureMessage);
       return false;
     }
 
     state.projects = await window.crate.getProjects();
+    if (!isCurrentProject()) return false;
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
     renderPackageReview(project, review, successMessage || message);
@@ -3478,7 +3500,10 @@ async function showPackageModal({
   } catch (error) {
     logRendererError('Package Review recovery failed', error);
     const failureMessage = message || PACKAGE_REVIEW_RECOVERY_MESSAGE;
-    if (project) renderPackageReview(project, await createUnavailableRendererReview(project, failureMessage), failureMessage);
+    if (project && isCurrentProject()) {
+      const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
+      if (isCurrentProject()) renderPackageReview(project, unavailableReview, failureMessage);
+    }
     return false;
   }
 }

@@ -3776,6 +3776,17 @@ async function createRendererFilePresentation(project, file) {
       : null
   );
   const sourceName = sanitizeRendererSourceName(sourceDocumentName || file?.figmaFileName) || null;
+  const figmaFileKey = typeof file?.figmaFileKey === 'string' && file.figmaFileKey.trim()
+    ? file.figmaFileKey.trim()
+    : (typeof file?.fileKey === 'string' && file.fileKey.trim() ? file.fileKey.trim() : null);
+  const figmaSourceIdentity = appFamily === 'figma' && figmaFileKey
+    ? crypto.createHmac('sha256', fileVisualIdentitySecret)
+      .update('figma-source\0')
+      .update(project.id)
+      .update('\0')
+      .update(figmaFileKey)
+      .digest('base64url')
+    : null;
   return {
     name: typeof file?.name === 'string' && file.name ? file.name : 'Untitled file',
     ext,
@@ -3783,6 +3794,7 @@ async function createRendererFilePresentation(project, file) {
     linked: DEPENDENCY_CAPTURE_SOURCES.has(getFileCaptureSource(file)),
     appFamily,
     sourceName,
+    ...(figmaSourceIdentity ? { figmaSourceIdentity } : {}),
     assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
     projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
     protectedSource: isProjectAssetBaselineSource(file),
