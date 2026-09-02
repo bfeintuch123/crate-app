@@ -1267,9 +1267,138 @@ test('Review Assets renders the accepted source card and omits scoped stale pend
 
   assert.equal(elements['project-file-list'].children.length, 1);
   assert.equal(getElementTreeText(elements['project-file-list']).includes('Accepted_Native_Illustrator.ai'), true);
+  assert.equal(elements['working-assets-list'].children.length, 1);
+  assert.equal(getElementTreeText(elements['working-assets-list']).includes('Accepted_Native_Illustrator.ai'), true);
+  assert.equal(getElementTreeText(elements['working-assets-list']).includes('Ready'), true);
   assert.equal(elements['pending-file-list'].children.length, 0);
   assert.equal(elements['pending-section'].classList.contains('hidden'), true);
   assert.equal(elements['asset-review-workspace'].classList.contains('hidden'), false);
+});
+
+test('Review Assets retains the admitted Ready source across Pause and Resume without cross-project or duplicate rows', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const source = {
+    path: '/synthetic/Accepted_Native_Illustrator.ai',
+    name: 'Accepted_Native_Illustrator.ai',
+    ext: '.ai',
+    appFamily: 'illustrator',
+    assetOrigin: 'added',
+    projectRole: 'source',
+    protectedSource: true,
+    visualIdentity: 'accepted-native-illustrator',
+    visualRevision: 'accepted-native-illustrator-r1',
+  };
+  const unrelated = {
+    path: '/synthetic/Other_Project.ai',
+    name: 'Other_Project.ai',
+    ext: '.ai',
+    appFamily: 'illustrator',
+    assetOrigin: 'added',
+    projectRole: 'source',
+    protectedSource: true,
+    visualIdentity: 'other-project-source',
+    visualRevision: 'other-project-source-r1',
+  };
+  const stale = {
+    path: '/synthetic/Stale_Prior_Activation.ai',
+    name: 'Stale_Prior_Activation.ai',
+    ext: '.ai',
+    captureState: 'needs-save',
+    visualIdentity: 'stale-prior-activation',
+    visualRevision: 'stale-prior-activation-r1',
+  };
+  const added = Array.from({ length: 263 }, (_, index) => ({
+    path: `/synthetic/Asset_${String(index).padStart(3, '0')}.png`,
+    name: `Asset_${String(index).padStart(3, '0')}.png`,
+    ext: '.png',
+    assetOrigin: 'added',
+    projectRole: 'asset',
+    visualIdentity: `asset-${index}`,
+    visualRevision: `asset-${index}-r1`,
+  }));
+  const projectId = 'selected-review-project';
+  let status = 'watching';
+  const excludedAssetKeys = [added[17].path];
+  const projectFor = () => ({
+    id: projectId,
+    name: 'Selected Review Project',
+    status,
+    files: [source, ...added],
+    // The main-process scoped project has already removed stale pending rows;
+    // the raw stale fixture is retained above only to make that boundary explicit.
+    pendingFiles: [],
+    excludedAssetKeys,
+  });
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getProjects: async () => [projectFor(), { id: 'other-project', files: [unrelated], pendingFiles: [] }],
+      getAssetWorkspace: async requestedProjectId => requestedProjectId === projectId
+        ? { projectId, files: [source, ...added].map(file => ({
+          ...file,
+          excluded: excludedAssetKeys.includes(file.path),
+        })), pendingFiles: [] }
+        : { projectId: requestedProjectId, files: [unrelated], pendingFiles: [] },
+    },
+  });
+  renderer.testProject = projectFor();
+  vm.runInContext(`
+    state.projects = [testProject, { id: 'other-project', files: [], pendingFiles: [] }];
+    state.selectedProjectId = '${projectId}';
+    state.assetReviewOpen = true;
+  `, renderer);
+
+  const snapshot = () => ({
+    workingRows: elements['working-assets-list'].children.filter(row => !row.classList.contains('filtered-out')),
+    workingText: getElementTreeText(elements['working-assets-list']),
+    workingLogicalCount: vm.runInContext('state.assetReviewLogicalItems.working.length', renderer),
+    addedLogicalCount: vm.runInContext('state.assetReviewLogicalItems.added.length', renderer),
+    addedMountedCount: elements['added-assets-list'].children.length,
+    addedSetSize: new Set(elements['added-assets-list'].children.map(row => row.dataset.renderKey)).size,
+    excludedLogicalCount: vm.runInContext('state.assetReviewLogicalItems.added.filter(file => file.excluded === true).length', renderer),
+    pendingText: getElementTreeText(elements['pending-file-list']),
+    reviewProjectId: vm.runInContext('state.assetReviewProjectId', renderer),
+  });
+
+  await renderer.renderFiles();
+  const beforePause = snapshot();
+  assert.equal(beforePause.workingRows.length, 1);
+  assert.equal(beforePause.workingText.includes(source.name), true);
+  assert.equal(beforePause.workingText.includes('Ready'), true);
+  assert.equal(beforePause.workingText.includes(unrelated.name), false);
+  assert.equal(beforePause.workingText.includes(stale.name), false);
+  assert.equal(beforePause.workingLogicalCount, 1);
+  assert.equal(beforePause.addedLogicalCount, 263);
+  assert.ok(beforePause.addedMountedCount <= 36);
+  assert.equal(beforePause.addedSetSize, beforePause.addedMountedCount);
+  assert.equal(beforePause.excludedLogicalCount, 1);
+  assert.equal(beforePause.pendingText.includes(stale.name), false);
+  assert.equal(beforePause.reviewProjectId, projectId);
+  const workingRow = elements['working-assets-list'].children[0];
+
+  status = 'paused';
+  await renderer.renderFiles();
+  const whilePaused = snapshot();
+  assert.equal(whilePaused.workingRows.length, 1);
+  assert.equal(whilePaused.workingText.includes(source.name), true);
+
+  status = 'watching';
+  await renderer.renderFiles();
+  const afterResume = snapshot();
+  assert.equal(afterResume.workingRows.length, 1);
+  assert.equal(elements['working-assets-list'].children[0], workingRow);
+  assert.equal(afterResume.workingText.includes(source.name), true);
+  assert.equal(afterResume.workingText.includes(unrelated.name), false);
+  assert.equal(afterResume.workingText.includes(stale.name), false);
+  assert.equal(afterResume.workingLogicalCount, 1);
+  assert.equal(afterResume.addedLogicalCount, 263);
+  assert.ok(afterResume.addedMountedCount <= 36);
+  assert.equal(afterResume.addedSetSize, afterResume.addedMountedCount);
+  assert.equal(afterResume.reviewProjectId, projectId);
+
+  vm.runInContext("state.assetReviewFilter = 'added';", renderer);
+  renderer.applyAssetReviewFilter();
+  assert.equal(elements['working-assets-list'].children[0].classList.contains('filtered-out'), true);
+  assert.equal(elements['added-assets-list'].children.length <= 36, true);
 });
 
 test('Current Project dashboard uses Working Files and privacy-safe mixed-app origin labels', () => {

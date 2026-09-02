@@ -2277,6 +2277,7 @@ function applyAssetReviewFilter() {
     return matchesFilter && (!query || getAssetReviewSearchText(file).includes(query));
   });
   const listDefinitions = [
+    { listId: 'working-assets-list', category: 'working', items: logicalItems.working },
     { listId: 'existing-assets-list', category: 'existing', items: logicalItems.existing },
     { listId: 'added-assets-list', category: 'added', items: logicalItems.added },
   ];
@@ -2289,17 +2290,25 @@ function applyAssetReviewFilter() {
         filterItems(items, category),
         list.__assetReviewVirtualState.build,
       );
-    } else if (!Array.isArray(list.__assetReviewAllItems)) {
+    } else {
+      const visibleKeys = new Set(filterItems(items, category).map(getRendererItemKey));
       for (const row of list.children || []) {
-        const rowCategory = row.dataset?.assetCategory || category;
-        const matchesFilter = filter === 'all' || filter === rowCategory || (filter === 'excluded' && rowCategory === 'excluded');
-        const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
-        row.classList.toggle('filtered-out', !matchesFilter || !matchesQuery);
+        if (category === 'working') {
+          row.classList.toggle('filtered-out', !visibleKeys.has(row.dataset?.renderKey));
+        } else if (!Array.isArray(list.__assetReviewAllItems)) {
+          const rowCategory = row.dataset?.assetCategory || category;
+          const matchesFilter = filter === 'all' || filter === rowCategory || (filter === 'excluded' && rowCategory === 'excluded');
+          const matchesQuery = !query || String(row.dataset?.assetSearch || '').includes(query);
+          row.classList.toggle('filtered-out', !matchesFilter || !matchesQuery);
+        }
       }
     }
     const section = list.parentElement || null;
     if (section && typeof section.classList?.toggle === 'function') {
-      section.classList.toggle('filtered-out', filter === 'missing' || filter === 'existing' && category !== 'existing' || filter === 'added' && category !== 'added' || filter === 'excluded' && filterItems(items, category).length === 0);
+      const isWorking = category === 'working';
+      section.classList.toggle('filtered-out', isWorking
+        ? filter !== 'all' || filterItems(items, category).length === 0
+        : filter === 'missing' || filter === 'existing' && category !== 'existing' || filter === 'added' && category !== 'added' || filter === 'excluded' && filterItems(items, category).length === 0);
     }
   }
   const pending = $('#pending-section');
@@ -2448,6 +2457,14 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     file.assetOrigin !== 'existing'
   ));
 
+  renderAssetPanelList($('#working-assets-list'), project, sourceFiles, {
+    protectedSource: true,
+    emptyMessage: 'No working files tracked yet.',
+    previewPriority: state.assetReviewOpen ? 10 : 0,
+    loadVisual: false,
+  });
+  setAssetPanelCount($('#working-assets-count'), sourceFiles.length);
+
   renderAssetPanelList($('#project-file-list'), project, sourceFiles, {
     protectedSource: true,
     emptyMessage: 'Add a project file to begin.',
@@ -2482,6 +2499,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     : [];
   const pendingReviewFiles = $('#pending-file-list')?.__assetReviewAllItems || [];
   state.assetReviewLogicalItems = {
+    working: sourceFiles,
     existing: existingAssets,
     added: addedAssets,
     missing: pendingReviewFiles,
@@ -2490,6 +2508,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   applyAssetReviewFilter();
 
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
+  $('#working-assets-section')?.classList.toggle('hidden', sourceFiles.length === 0);
   updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
   $('#project-dashboard')?.classList.toggle('hidden', state.assetReviewOpen === true);
   $('#asset-review-workspace')?.classList.toggle('hidden', state.assetReviewOpen !== true);
