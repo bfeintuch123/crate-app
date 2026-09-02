@@ -2588,6 +2588,97 @@ test('project switches clear selection and row action ownership even for shared 
   assert.equal(removals[0][0], second.project.id);
 });
 
+test('project switches clear Working Files synchronously and fence delayed workspace responses', async () => {
+  const oldSource = {
+    path: '/synthetic/old-project.ai',
+    name: 'Old_Project.ai',
+    ext: '.ai',
+    assetOrigin: 'added',
+    projectRole: 'source',
+    protectedSource: true,
+    visualIdentity: 'old-project-source',
+    visualRevision: 'old-project-source-r1',
+  };
+  const newSource = {
+    path: '/synthetic/new-project.ai',
+    name: 'New_Project.ai',
+    ext: '.ai',
+    assetOrigin: 'added',
+    projectRole: 'source',
+    protectedSource: true,
+    visualIdentity: 'new-project-source',
+    visualRevision: 'new-project-source-r1',
+  };
+  const oldProject = {
+    id: 'old-project',
+    name: 'Old Project',
+    status: 'watching',
+    files: [oldSource],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const newProject = {
+    id: 'new-project',
+    name: 'New Project',
+    status: 'watching',
+    files: [newSource],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const oldWorkspaceRefresh = createDeferred();
+  const newWorkspace = createDeferred();
+  let workspaceCalls = 0;
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getAssetWorkspace: projectId => {
+        workspaceCalls += 1;
+        if (workspaceCalls === 1) {
+          return Promise.resolve({ projectId: oldProject.id, files: [oldSource], pendingFiles: [] });
+        }
+        if (projectId === oldProject.id) return oldWorkspaceRefresh.promise;
+        return newWorkspace.promise;
+      },
+    },
+  });
+  renderer.testProjects = [oldProject, newProject];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+    state.assetReviewOpen = true;
+  `, renderer);
+
+  await renderer.renderFiles();
+  const oldRow = elements['working-assets-list'].children[0];
+  assert.equal(getElementTreeText(oldRow).includes(oldSource.name), true);
+  assert.equal(getElementTreeText(oldRow).includes('Ready'), true);
+
+  const delayedOldRender = renderer.renderFiles();
+  vm.runInContext('state.selectedProjectId = testProjects[1].id;', renderer);
+  const delayedNewRender = renderer.renderFiles();
+
+  assert.equal(elements['working-assets-list'].children.length, 0);
+  assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 0);
+  assert.equal(vm.runInContext('state.assetReviewProjectId', renderer), newProject.id);
+
+  oldWorkspaceRefresh.resolve({ projectId: oldProject.id, files: [oldSource], pendingFiles: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['working-assets-list'].children.length, 0);
+  assert.equal(getElementTreeText(elements['working-assets-list']).includes(oldSource.name), false);
+
+  newWorkspace.resolve({ projectId: newProject.id, files: [newSource], pendingFiles: [] });
+  await delayedNewRender;
+  await delayedOldRender;
+
+  const finalRows = elements['working-assets-list'].children;
+  assert.equal(finalRows.length, 1);
+  assert.equal(getElementTreeText(finalRows[0]).includes(newSource.name), true);
+  assert.equal(getElementTreeText(finalRows[0]).includes(oldSource.name), false);
+  assert.equal(new Set(finalRows.map(row => row.dataset.renderKey)).size, 1);
+  assert.equal(vm.runInContext('state.assetReviewLogicalItems.working.length', renderer), 1);
+  assert.equal(vm.runInContext('state.assetWorkspace.projectId', renderer), newProject.id);
+});
+
 test('Added list tears down populated state, preserves its empty message through filters, and repopulates once', async () => {
   const populated = createUiSmoothnessFixture({ assetCount: 30 });
   const empty = cloneTestValue(populated);

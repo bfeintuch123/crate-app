@@ -458,8 +458,8 @@ function setAssetReviewProject(projectId) {
   if (state.assetReviewProjectId === projectId) return;
   state.assetReviewProjectId = projectId;
   state.assetReviewSelectedKey = null;
-  state.assetReviewLogicalItems = { existing: [], added: [], missing: [] };
-  for (const id of ['project-file-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
+  state.assetReviewLogicalItems = { working: [], existing: [], added: [], missing: [] };
+  for (const id of ['project-file-list', 'working-assets-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
     const list = $(`#${id}`);
     if (!list) continue;
     resetVirtualAssetList(list);
