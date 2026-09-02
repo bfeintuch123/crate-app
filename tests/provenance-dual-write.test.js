@@ -10364,6 +10364,34 @@ test('renderer presentation exposes a privacy-safe Figma working-file name', asy
   }
 });
 
+test('renderer presentation derives opaque stable Figma source identities from file keys', async () => {
+  const project = { id: 'figma-source-identity', files: [], excludedAssetKeys: [] };
+  const first = {
+    path: '/synthetic/Campaign_A.png',
+    name: 'Campaign_A.png',
+    ext: '.png',
+    source: 'figma-auto',
+    figmaFileName: 'Campaign',
+    figmaFileKey: 'figma-file-key-a',
+    assetOrigin: 'added',
+    projectRole: 'asset',
+  };
+  const second = { ...first, path: '/synthetic/Campaign_B.png', name: 'Campaign_B.png', figmaFileKey: 'figma-file-key-b' };
+  const keyless = { ...first, path: '/synthetic/Campaign_legacy.png', name: 'Campaign_legacy.png', figmaFileKey: undefined };
+  const firstPresentation = await metadataTestHooks.createRendererFilePresentation(project, first);
+  const repeatedPresentation = await metadataTestHooks.createRendererFilePresentation(project, first);
+  const secondPresentation = await metadataTestHooks.createRendererFilePresentation(project, second);
+  const keylessPresentation = await metadataTestHooks.createRendererFilePresentation(project, keyless);
+
+  assert.equal(firstPresentation.appFamily, 'figma');
+  assert.equal(firstPresentation.figmaSourceIdentity, repeatedPresentation.figmaSourceIdentity);
+  assert.notEqual(firstPresentation.figmaSourceIdentity, secondPresentation.figmaSourceIdentity);
+  assert.equal(firstPresentation.figmaSourceIdentity.includes(first.figmaFileKey), false);
+  assert.equal(firstPresentation.figmaSourceIdentity.includes(first.figmaFileName), false);
+  assert.equal(Object.hasOwn(keylessPresentation, 'figmaSourceIdentity'), false);
+  assert.equal(keylessPresentation.sourceName, first.figmaFileName);
+});
+
 test('renderer presentation rejects path-shaped and URL-shaped source metadata', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-source-name-privacy-test-'));
   try {

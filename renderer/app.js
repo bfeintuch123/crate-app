@@ -63,6 +63,9 @@ let existingAssetsModalProjectId = null;
 let existingAssetsDecisionOpener = null;
 let fileWorkspaceRenderRequestId = 0;
 let assetWorkspaceRequestGeneration = 0;
+let assetWorkspaceRequestId = 0;
+let assetWorkspaceLoadedRequestId = 0;
+let packageReviewRequestId = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
@@ -1232,6 +1235,7 @@ function updateNamingPreview() {
 // ===== Render Files =====
 async function renderFiles() {
   const renderRequestId = ++fileWorkspaceRenderRequestId;
+  const workspaceRequestId = ++assetWorkspaceRequestId;
   const viewState = getRendererViewState();
   const noProject = $('#files-no-project');
   const filesView = $('#files-view');
@@ -1342,7 +1346,11 @@ async function renderFiles() {
       logRendererError('asset workspace unavailable', error);
     }
   }
-  if (renderRequestId !== fileWorkspaceRenderRequestId || state.selectedProjectId !== project.id) return;
+  if (
+    renderRequestId !== fileWorkspaceRenderRequestId ||
+    workspaceRequestId !== assetWorkspaceRequestId ||
+    state.selectedProjectId !== project.id
+  ) return;
   if (!assetWorkspace || assetWorkspace.projectId !== project.id) {
     assetWorkspace = {
       projectId: project.id,
@@ -1371,6 +1379,7 @@ async function renderFiles() {
     };
   }
   state.assetWorkspace = assetWorkspace;
+  assetWorkspaceLoadedRequestId = workspaceRequestId;
 
   // Pending files (Tier 2)
   renderPendingFiles(project, assetWorkspace.pendingFiles);
@@ -1564,13 +1573,22 @@ async function ensureProjectAssetWorkspace(project) {
   if (!project || !project.id) return null;
   if (state.selectedProjectId !== project.id) return null;
   const requestGeneration = assetWorkspaceRequestGeneration;
-  if (state.assetWorkspace?.projectId === project.id) return state.assetWorkspace;
+  if (
+    state.assetWorkspace?.projectId === project.id &&
+    assetWorkspaceLoadedRequestId === assetWorkspaceRequestId
+  ) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
+  const requestId = ++assetWorkspaceRequestId;
   try {
     const workspace = await window.crate.getAssetWorkspace(project.id);
-    if (requestGeneration !== assetWorkspaceRequestGeneration || state.selectedProjectId !== project.id) return null;
+    if (
+      requestId !== assetWorkspaceRequestId ||
+      requestGeneration !== assetWorkspaceRequestGeneration ||
+      state.selectedProjectId !== project.id
+    ) return null;
     if (!workspace || workspace.projectId !== project.id) return null;
     state.assetWorkspace = workspace;
+    assetWorkspaceLoadedRequestId = requestId;
     return workspace;
   } catch (error) {
     logRendererError('asset workspace unavailable', error);
@@ -1578,10 +1596,15 @@ async function ensureProjectAssetWorkspace(project) {
   }
 }
 
-async function showExistingAssetsDecisionModal(project) {
+async function showExistingAssetsDecisionModal(project, packageRequestId = null) {
   const modal = $('#modal-existing-assets');
   if (!modal || !project) return;
+  const isCurrentPackageRequest = () => (
+    packageRequestId === null || packageReviewRequestId === packageRequestId
+  );
+  if (!isCurrentPackageRequest()) return;
   if (!await ensureProjectAssetWorkspace(project)) return;
+  if (!isCurrentPackageRequest()) return;
   const assets = getExistingAssetsForDecision(project);
   if (assets.length === 0) return;
 
@@ -3307,19 +3330,8 @@ function renderPackageReview(project, review, message = '') {
 }
 
 async function getUnavailableRendererReviewFiles(project) {
-  if (!project?.id || state.selectedProjectId !== project.id) return [];
-  const requestGeneration = assetWorkspaceRequestGeneration;
-  const cachedWorkspace = state.assetWorkspace?.projectId === project?.id ? state.assetWorkspace : null;
-  if (Array.isArray(cachedWorkspace?.files)) return cachedWorkspace.files;
-  if (typeof window.crate?.getAssetWorkspace === 'function' && project?.id) {
-    try {
-      const workspace = await window.crate.getAssetWorkspace(project.id);
-      if (requestGeneration !== assetWorkspaceRequestGeneration || state.selectedProjectId !== project.id) return [];
-      if (workspace?.projectId === project.id && Array.isArray(workspace.files)) return workspace.files;
-    } catch (error) {
-      logRendererError('Package Review asset workspace unavailable', error);
-    }
-  }
+  const workspace = await ensureProjectAssetWorkspace(project);
+  if (Array.isArray(workspace?.files)) return workspace.files;
   // A raw project record cannot reliably reproduce stable exclusion identities.
   // Show no guessed inventory when the authoritative workspace is unavailable.
   return [];
@@ -3436,8 +3448,10 @@ async function showPackageModal({
 } = {}) {
   const projectId = state.selectedProjectId;
   if (!projectId) return false;
+  const requestId = ++packageReviewRequestId;
   const projectRequestGeneration = assetWorkspaceRequestGeneration;
-  const isCurrentProject = () => (
+  const isCurrentRequest = () => (
+    packageReviewRequestId === requestId &&
     state.selectedProjectId === projectId &&
     assetWorkspaceRequestGeneration === projectRequestGeneration
   );
@@ -3453,7 +3467,7 @@ async function showPackageModal({
         window.crate.preScanSession(projectId),
         new Promise(resolve => setTimeout(() => resolve(null), 12000))
       ]);
-      if (!isCurrentProject()) return false;
+      if (!isCurrentRequest()) return false;
     }
 
     const review = suppliedReview || await (
@@ -3461,21 +3475,21 @@ async function showPackageModal({
         ? window.crate.preparePackageReview(projectId)
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
     );
-    if (!isCurrentProject()) return false;
+    if (!isCurrentRequest()) return false;
     if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         state.projects = await window.crate.getProjects();
-        if (!isCurrentProject()) return false;
+        if (!isCurrentRequest()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
         hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
         if (project?.assetBaseline?.status === 'decision-required') {
-          await showExistingAssetsDecisionModal(project);
+          await showExistingAssetsDecisionModal(project, requestId);
           return false;
         }
       }
       try {
         state.projects = await window.crate.getProjects();
-        if (!isCurrentProject()) return false;
+        if (!isCurrentRequest()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
       } catch (_) {
         // Keep the last safe project snapshot when refresh is unavailable.
@@ -3486,13 +3500,13 @@ async function showPackageModal({
         project
       );
       const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
-      if (!isCurrentProject()) return false;
+      if (!isCurrentRequest()) return false;
       renderPackageReview(project, unavailableReview, failureMessage);
       return false;
     }
 
     state.projects = await window.crate.getProjects();
-    if (!isCurrentProject()) return false;
+    if (!isCurrentRequest()) return false;
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
     renderPackageReview(project, review, successMessage || message);
@@ -3500,9 +3514,9 @@ async function showPackageModal({
   } catch (error) {
     logRendererError('Package Review recovery failed', error);
     const failureMessage = message || PACKAGE_REVIEW_RECOVERY_MESSAGE;
-    if (project && isCurrentProject()) {
+    if (project && isCurrentRequest()) {
       const unavailableReview = await createUnavailableRendererReview(project, failureMessage);
-      if (isCurrentProject()) renderPackageReview(project, unavailableReview, failureMessage);
+      if (isCurrentRequest()) renderPackageReview(project, unavailableReview, failureMessage);
     }
     return false;
   }

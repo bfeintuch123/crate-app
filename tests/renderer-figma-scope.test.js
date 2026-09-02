@@ -2734,6 +2734,88 @@ test('delayed Existing Assets workspace responses cannot reopen a prior project 
   assert.equal(vm.runInContext('state.assetWorkspace.projectId', renderer), newProject.id);
 });
 
+test('same-project Existing Assets workspace requests keep the newest response', async () => {
+  const project = {
+    id: 'same-project-workspace-race',
+    name: 'Same Project Workspace Race',
+    status: 'watching',
+    files: [{ name: 'Current.png', path: '/synthetic/Current.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null },
+  };
+  const olderWorkspace = createDeferred();
+  const newerWorkspace = createDeferred();
+  let workspaceCalls = 0;
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      getAssetWorkspace: () => (++workspaceCalls === 1 ? olderWorkspace.promise : newerWorkspace.promise),
+    },
+  });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+
+  const olderModal = renderer.showExistingAssetsDecisionModal(project);
+  const newerModal = renderer.showExistingAssetsDecisionModal(project);
+  newerWorkspace.resolve({
+    projectId: project.id,
+    files: [{ name: 'Newer.png', path: '/synthetic/Newer.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+  });
+  await newerModal;
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'Newer.png');
+
+  olderWorkspace.resolve({
+    projectId: project.id,
+    files: [{ name: 'Older.png', path: '/synthetic/Older.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+  });
+  await olderModal;
+
+  assert.equal(elements['existing-assets-modal-list'].children[0].children[1].textContent, 'Newer.png');
+  assert.equal(vm.runInContext('state.assetWorkspace.files[0].name', renderer), 'Newer.png');
+});
+
+test('same-project Package Review requests cannot overwrite the newest review', async () => {
+  const project = {
+    id: 'same-project-package-race',
+    name: 'Same Project Package Race',
+    status: 'watching',
+    files: [{ name: 'Current.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const olderReview = createDeferred();
+  const newerReview = createDeferred();
+  let prepareCalls = 0;
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      preparePackageReview: () => (++prepareCalls === 1 ? olderReview.promise : newerReview.promise),
+      getProjects: async () => [project],
+    },
+  });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+  `, renderer);
+
+  const olderRequest = renderer.showPackageModal({ runPreScan: false });
+  const newerRequest = renderer.showPackageModal({ runPreScan: false });
+  const newer = { token: 'newer-package-token', projectId: project.id, files: project.files, totalFiles: 1, materializable: true };
+  newerReview.resolve(newer);
+  assert.equal(await newerRequest, true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), newer.token);
+
+  olderReview.resolve({ token: 'older-package-token', projectId: project.id, files: project.files, totalFiles: 1, materializable: true });
+  assert.equal(await olderRequest, false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), newer.token);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+});
+
 test('distinct Figma source identities keep same-name Working Files separate', () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
