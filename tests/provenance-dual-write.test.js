@@ -1097,6 +1097,9 @@ module.exports.__crateMetadataTestHooks = {
   getFigmaAssetDedupKey(record) {
     return getFigmaAssetDedupKey(record);
   },
+  getFigmaAssetCacheFileName(fileName, identityKey) {
+    return createFigmaAssetCacheFileName(fileName, identityKey);
+  },
 };
 `, filename);
 };
@@ -10412,6 +10415,24 @@ test('persisted Figma asset identity remains idempotent across legacy and canoni
     }),
     'FILE_A:NODE_1'
   );
+});
+
+test('long Figma cache names preserve identity entropy before the display portion', () => {
+  const longFileName = 'Figma File '.repeat(20);
+  const first = metadataTestHooks.getFigmaAssetCacheFileName(
+    `${longFileName}_hero`,
+    'FILE_A:NODE_1'
+  );
+  const second = metadataTestHooks.getFigmaAssetCacheFileName(
+    `${longFileName}_hero`,
+    'FILE_A:NODE_2'
+  );
+
+  assert.equal(first.length, 100);
+  assert.equal(second.length, 100);
+  assert.notEqual(first, second);
+  assert.match(first, /^[a-f0-9]{16}__/u);
+  assert.match(second, /^[a-f0-9]{16}__/u);
 });
 
 test('renderer presentation rejects path-shaped and URL-shaped source metadata', async () => {

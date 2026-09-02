@@ -9250,6 +9250,20 @@ function sanitizeFigmaAssetFormat(format) {
   return SAFE_FIGMA_ASSET_FORMATS.has(extension) ? extension : 'png';
 }
 
+function createFigmaAssetCacheFileName(fileName, identityKey) {
+  const safeName = String(fileName || 'figma-asset').replace(/[^a-zA-Z0-9_\-.]/g, '_');
+  if (safeName.length <= 100 || typeof identityKey !== 'string' || !identityKey.trim()) {
+    return safeName.substring(0, 100);
+  }
+
+  // Keep the identity-bearing digest before any user-controlled Figma file
+  // name. Long display names must not truncate the only collision-resistant
+  // portion of the cache path.
+  const identityDigest = crypto.createHash('sha256').update(identityKey.trim()).digest('hex').slice(0, 16);
+  const displayBudget = Math.max(1, 100 - identityDigest.length - 2);
+  return `${identityDigest}__${safeName.substring(0, displayBudget)}`;
+}
+
 /**
  * Download a Figma asset from CDN URL to local disk.
  * @returns {Promise<string|null>} Local file path or null on failure
@@ -9261,7 +9275,8 @@ async function downloadFigmaAsset(
   format = 'png',
   assetBudget = null,
   activationToken = null,
-  operationGuard = null
+  operationGuard = null,
+  identityKey = null
 ) {
   const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
   try {
@@ -9285,7 +9300,7 @@ async function downloadFigmaAsset(
 
     // v2.4.2: Use actual format from Figma API if available, fall back to png
     const ext = sanitizeFigmaAssetFormat(format);
-    const safeName = fileName.replace(/[^a-zA-Z0-9_\-.]/g, '_').substring(0, 100);
+    const safeName = createFigmaAssetCacheFileName(fileName, identityKey);
     const localPath = path.join(projectDir, `${safeName}.${ext}`);
 
     // Skip if already exists with same size
@@ -9382,7 +9397,8 @@ async function ingestFigmaAssetsIntoProject(
       assetFormat,
       assetBudget,
       activationToken,
-      operationGuard
+      operationGuard,
+      figmaAssetDedupKey
     );
 
     if (!isCurrent()) return addedCount;

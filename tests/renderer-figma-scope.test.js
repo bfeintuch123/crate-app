@@ -701,6 +701,45 @@ test('Edit Figma Link markup offers explicit replacement and removal controls', 
   assert.match(indexHtml, /Replace Figma URL \(optional\)/);
 });
 
+test('Edit Figma Link refuses arbitration without staging hidden state', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'edit-link-arbitration-project', files: [], pendingFiles: [] };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    activeModalLease = { id: 'modal-existing-assets', sessionId: 41 };
+  `, renderer);
+  elements['modal-existing-assets'].classList.remove('hidden');
+
+  assert.equal(renderer.openEditFigmaLinkModal(project.id), false);
+  assert.equal(vm.runInContext('state.editFigmaProjectId', renderer), null);
+  assert.equal(elements['modal-edit-figma-link'].classList.contains('hidden'), true);
+});
+
+test('Edit Figma Link async completion cannot close a newer modal session', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'edit-link-async-project', files: [], pendingFiles: [], figmaScopeMode: 'current-page' };
+  let resolveSave;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      setProjectFigmaLink: () => new Promise(resolve => { resolveSave = resolve; }),
+      getProjects: async () => [{ ...project, name: 'refreshed' }],
+    },
+  });
+  renderer.testProject = project;
+  vm.runInContext('state.projects = [testProject]', renderer);
+  assert.equal(renderer.openEditFigmaLinkModal(project.id), true);
+
+  const savePromise = renderer.saveEditFigmaLinkModal();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  renderer.closeEditFigmaLinkModal();
+  resolveSave({ success: true });
+
+  assert.equal(await savePromise, false);
+  assert.equal(elements['modal-edit-figma-link'].classList.contains('hidden'), true);
+});
+
 test('renderer Figma scope helper does not call pending or unresolved locks locked', () => {
   const renderer = loadRendererHelpers();
 
@@ -3421,6 +3460,35 @@ test('authoritative tracked Figma source projection merges mixed materialized ro
   assert.equal(workingFiles.length, 2);
   assert.equal(getElementTreeText(elements['project-file-list']).includes('Campaign B'), true);
   assert.equal([...workingFiles].every(row => !row.dataset.renderKey.includes('PRIVATE_FILE_')), true);
+});
+
+test('mixed keyed and keyless tracked Figma sources consume keyless labels independently', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'mixed-keyed-keyless-figma-sources',
+    figmaScopeMode: 'current-page',
+    figmaTrackedFiles: [{ key: 'PRIVATE_FILE_A' }, { key: null }],
+    files: [],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const renderer = loadRendererHelpers(document, { crate: {} });
+
+  renderer.renderAssetWorkspace(project, {
+    trackedFigmaFiles: [
+      { displayName: 'Campaign A', figmaSourceIdentity: 'opaque-source-a' },
+      { figmaSourceIdentity: null },
+    ],
+  }, [{
+    name: 'Campaign_A.png', ext: '.png', appFamily: 'figma', sourceName: 'Campaign A',
+    figmaSourceIdentity: 'opaque-source-a', projectRole: 'asset', assetOrigin: 'added',
+    visualIdentity: 'figma-asset-a', visualRevision: 'figma-a-r1',
+  }, {
+    name: 'Legacy_Campaign.png', ext: '.png', appFamily: 'figma', sourceName: 'Legacy Campaign',
+    projectRole: 'asset', assetOrigin: 'added', visualIdentity: 'figma-legacy', visualRevision: 'figma-l-r1',
+  }]);
+
+  assert.equal(getElementTreeText(elements['project-file-list']).includes('Legacy Campaign'), true);
 });
 
 test('keyless same-name Figma sources remain separate without synthetic display-name identity', () => {

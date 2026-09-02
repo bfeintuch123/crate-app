@@ -2625,6 +2625,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const physicalSourceFiles = files.filter(file => file && (file.protectedSource === true || file.projectRole === 'source'));
   const figmaSourceIdentities = new Set();
   const keylessFigmaSourceNames = [];
+  let keylessFigmaSourceNameCursor = 0;
   const figmaSourceFiles = [];
   const trackedFigmaFiles = Array.isArray(options.trackedFigmaFiles) ? options.trackedFigmaFiles : null;
   for (const file of files) {
@@ -2670,7 +2671,8 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
       const identity = typeof trackedFile?.figmaSourceIdentity === 'string' && trackedFile.figmaSourceIdentity.trim()
         ? trackedFile.figmaSourceIdentity.trim()
         : null;
-      const sourceName = trackedFile?.displayName || trackedFile?.name || keylessFigmaSourceNames[figmaSourceFiles.length] || 'Figma file';
+      const trackedDisplayName = trackedFile?.displayName || trackedFile?.name || null;
+      const sourceName = trackedDisplayName || keylessFigmaSourceNames[keylessFigmaSourceNameCursor++] || 'Figma file';
       if (identity && figmaSourceIdentities.has(identity)) continue;
       if (identity) figmaSourceIdentities.add(identity);
       figmaSourceFiles.push({
@@ -4365,7 +4367,10 @@ function setupEventListeners() {
 // ===== Edit Figma Link Modal (per-project) =====
 function openEditFigmaLinkModal(projectId) {
   const project = state.projects.find(p => p.id === projectId);
-  if (!project) return;
+  const modal = $('#modal-edit-figma-link');
+  if (!project || !modal) return false;
+  const lease = claimModalLease('modal-edit-figma-link');
+  if (!lease) return false;
   state.editFigmaProjectId = projectId;
 
   const urlInput = $('#edit-figma-url');
@@ -4387,15 +4392,11 @@ function openEditFigmaLinkModal(projectId) {
     errorEl.textContent = '';
   }
 
-  const modal = $('#modal-edit-figma-link');
-  if (modal) {
-    if (!claimModalLease('modal-edit-figma-link')) return false;
-    // Capture the triggering control before focusing the URL input. The
-    // source-bound dialog controller consumes this marker when it observes opening.
-    modal._crateOpener = document.activeElement;
-    modal.classList.remove('hidden');
-    setModalBackgroundState(true);
-  }
+  // Capture the triggering control before focusing the URL input. The
+  // source-bound dialog controller consumes this marker when it observes opening.
+  modal._crateOpener = document.activeElement;
+  modal.classList.remove('hidden');
+  setModalBackgroundState(true);
   if (urlInput) urlInput.focus();
   return true;
 }
@@ -4410,19 +4411,33 @@ function closeEditFigmaLinkModal() {
 async function persistFigmaLinkEdit(payload, successMessage) {
   const projectId = state.editFigmaProjectId;
   if (!projectId) return false;
+  const editModalSessionId = activeModalLease?.id === 'modal-edit-figma-link'
+    ? activeModalLease.sessionId
+    : null;
+  const editModalSelectionEpoch = projectSelectionEpoch;
+  const isCurrentEditModal = () => (
+    editModalSessionId !== null &&
+    state.editFigmaProjectId === projectId &&
+    projectSelectionEpoch === editModalSelectionEpoch &&
+    isCurrentModalLease('modal-edit-figma-link', editModalSessionId)
+  );
+  if (!isCurrentEditModal()) return false;
 
   const errorEl = $('#edit-figma-error');
   const result = await window.crate.setProjectFigmaLink(projectId, payload);
 
   if (!result || !result.success) {
-    if (errorEl) {
+    if (isCurrentEditModal() && errorEl) {
       errorEl.textContent = getFigmaLinkErrorMessage(result && result.error) || 'Failed to save Figma link.';
       errorEl.style.display = 'block';
     }
     return false;
   }
 
-  state.projects = await window.crate.getProjects();
+  if (!isCurrentEditModal()) return false;
+  const projects = await window.crate.getProjects();
+  if (!isCurrentEditModal()) return false;
+  state.projects = projects;
   closeEditFigmaLinkModal();
   renderFiles();
   renderProjects();
@@ -4452,13 +4467,13 @@ async function saveEditFigmaLinkModal() {
   const payload = rawUrl
     ? { action: 'replace', url: rawUrl, scopeMode }
     : { action: 'preserve', scopeMode };
-  await persistFigmaLinkEdit(payload, rawUrl ? 'Figma link updated' : 'Figma settings updated');
+  return persistFigmaLinkEdit(payload, rawUrl ? 'Figma link updated' : 'Figma settings updated');
 }
 
 async function removeEditFigmaLinkModal() {
   const scopeInput = $('#edit-figma-scope');
   const scopeMode = scopeInput ? scopeInput.value : 'current-page';
-  await persistFigmaLinkEdit({ action: 'remove', scopeMode }, 'Figma link removed');
+  return persistFigmaLinkEdit({ action: 'remove', scopeMode }, 'Figma link removed');
 }
 
 // ===== Tab State Helper =====
