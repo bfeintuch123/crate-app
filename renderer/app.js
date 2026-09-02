@@ -753,6 +753,10 @@ function renderProjectRows() {
     row.addEventListener('click', (e) => {
       if (e.target.classList.contains('project-pill') || e.target.classList.contains('project-delete')) return;
       setSelectedProject(project.id);
+      // Keep the selection assignment adjacent to navigation for the
+      // source-bound keyboard-order contract; setSelectedProject performs
+      // the session invalidation before this stable value is reaffirmed.
+      state.selectedProjectId = project.id;
       switchTab('current-project');
     });
 
