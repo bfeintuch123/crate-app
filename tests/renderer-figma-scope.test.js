@@ -2776,6 +2776,7 @@ test('project selection synchronously invalidates Existing Assets and stale Incl
     state.projects = testProjects;
     state.selectedProjectId = testProjects[0].id;
   `, renderer);
+  renderer.setupEventListeners();
 
   await renderer.showExistingAssetsDecisionModal(projectA);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
@@ -3040,6 +3041,68 @@ test('late Package Review change result cannot replace a newly selected project 
   assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
 });
 
+test('same-project Package Review refresh invalidates an in-flight confirmation', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = {
+    id: 'package-confirm-refresh-same-project',
+    name: 'Package Confirm Refresh',
+    status: 'watching',
+    files: [{ name: 'Refresh.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const firstReview = { token: 'package-confirm-refresh-first', projectId: project.id, files: project.files, totalFiles: 1, materializable: true };
+  const secondReview = { token: 'package-confirm-refresh-second', projectId: project.id, files: project.files, totalFiles: 1, materializable: true };
+  const packageResult = createDeferred();
+  let prepareCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => null,
+    preparePackageReview: async () => (++prepareCalls === 1 ? firstReview : secondReview),
+    getProjects: async () => [project],
+    packageProject: async () => packageResult.promise,
+  } });
+  renderer.testProject = project;
+  vm.runInContext(`
+    state.projects = [testProject];
+    state.selectedProjectId = testProject.id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  const pendingConfirmation = renderer.confirmPackage();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), false);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), secondReview.token);
+  packageResult.resolve({ folderPath: '/private/tmp/crate-synthetic-output/stale', copiedCount: 1, embeddedCount: 0 });
+  await pendingConfirmation;
+
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), secondReview.token);
+});
+
+test('mismatched Package Review identity fails closed without showing another project', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'package-identity-a', name: 'Package Identity A', status: 'watching', files: [{ name: 'A.ai', ext: '.ai' }] };
+  const projectB = { id: 'package-identity-b', name: 'Package Identity B', status: 'watching', files: [{ name: 'B.ai', ext: '.ai' }] };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preparePackageReview: async () => ({ token: 'wrong-project-token', projectId: projectB.id, files: projectB.files, totalFiles: 1, materializable: true }),
+    getProjects: async () => [projectA, projectB],
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
 test('notification-driven Package Review transition dismisses old content before refresh and eventually binds project B', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
@@ -3112,6 +3175,47 @@ test('notification-driven Package Review transition dismisses old content before
   assert.equal(getElementTreeText(elements['modal-file-list']).includes('B.ai'), true);
 });
 
+test('stale notification review does not open after the user selects another project during refresh', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = { id: 'notification-stale-a', name: 'Notification Stale A', status: 'watching', files: [{ name: 'A.ai', ext: '.ai' }] };
+  const projectB = { id: 'notification-stale-b', name: 'Notification Stale B', status: 'watching', files: [{ name: 'B.ai', ext: '.ai' }] };
+  const refresh = createDeferred();
+  let packageTrigger;
+  let getProjectsCalls = 0;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, { crate: {
+    getProjects: () => {
+      getProjectsCalls += 1;
+      return getProjectsCalls === 1 ? refresh.promise : Promise.resolve([projectA, projectB]);
+    },
+    preparePackageReview: async () => ({ token: 'stale-notification-token', projectId: projectB.id, files: projectB.files, totalFiles: 1, materializable: true }),
+    onFilesUpdated: noOp,
+    onProjectUpdated: noOp,
+    onPendingFilesUpdated: noOp,
+    onPackageTrigger: handler => { packageTrigger = handler; },
+    onFigmaAuthError: noOp,
+    onFigmaScanStarted: noOp,
+    onFigmaScanComplete: noOp,
+    onFigmaScanError: noOp,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+  renderer.setupMainProcessListeners();
+
+  const transition = packageTrigger({ projectId: projectB.id });
+  await new Promise(resolve => setImmediate(resolve));
+  renderer.setSelectedProject(projectA.id);
+  refresh.resolve([projectA, projectB]);
+  await transition;
+
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectA.id);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
 test('older Existing Assets completion cannot dismiss a newer A modal after A-B-A re-entry', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
@@ -3144,6 +3248,7 @@ test('older Existing Assets completion cannot dismiss a newer A modal after A-B-
     state.projects = testProjects;
     state.selectedProjectId = testProjects[0].id;
   `, renderer);
+  renderer.setupEventListeners();
 
   await renderer.showExistingAssetsDecisionModal(projectA);
   const pendingOldDecision = renderer.submitExistingAssetsDecision('include');
@@ -3151,7 +3256,8 @@ test('older Existing Assets completion cannot dismiss a newer A modal after A-B-
   renderer.setSelectedProject(projectB.id);
   renderer.setSelectedProject(projectA.id);
   await renderer.showExistingAssetsDecisionModal(projectA);
-  const pendingNewDecision = renderer.submitExistingAssetsDecision('skip');
+  assert.equal(elements['btn-review-existing-assets-later'].disabled, false);
+  elements['btn-review-existing-assets-later'].click();
   await new Promise(resolve => setImmediate(resolve));
 
   oldDecision.resolve({ success: true });
@@ -3160,7 +3266,7 @@ test('older Existing Assets completion cannot dismiss a newer A modal after A-B-
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
 
   newDecision.resolve({ success: true });
-  assert.equal(await pendingNewDecision, true);
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 

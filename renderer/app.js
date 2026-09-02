@@ -70,6 +70,7 @@ let assetWorkspaceLoadedRequestId = 0;
 let packageReviewRequestId = 0;
 let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
+let packageReviewModalRequestId = null;
 let projectSelectionEpoch = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
@@ -495,6 +496,7 @@ function setSelectedProject(projectId) {
   state.packageReviewToken = null;
   packageReviewModalProjectId = null;
   packageReviewModalSelectionEpoch = null;
+  packageReviewModalRequestId = null;
   hideExistingAssetsDecisionModal({ restoreFocus: false });
   hidePackageReviewDialog({ restoreFocus: false });
   hidePackageProgressModal();
@@ -1653,7 +1655,8 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
   }
   existingAssetsModalProjectId = project.id;
   const decisionInFlightForProject = existingAssetsDecisionRequest &&
-    existingAssetsDecisionRequest.projectId === project.id;
+    existingAssetsDecisionRequest.projectId === project.id &&
+    existingAssetsDecisionRequest.selectionEpoch === selectionEpoch;
   const sourceFile = (state.assetWorkspace?.files || []).find(file => file.protectedSource === true || file.projectRole === 'source');
   const sourcePresentation = getFileAppPresentation(sourceFile, project);
   const sourceLabel = $('#existing-assets-modal-source');
@@ -1754,7 +1757,7 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
     return true;
   } catch (error) {
     logRendererError('existing assets decision failed', error);
-    showToast('Crate could not save that choice. Try again.');
+    if (isCurrentDecision()) showToast('Crate could not save that choice. Try again.');
     return false;
   } finally {
     if (existingAssetsDecisionRequest === request) {
@@ -3078,6 +3081,7 @@ function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false 
   $('#modal-package')?.classList.add('hidden');
   packageReviewModalProjectId = null;
   packageReviewModalSelectionEpoch = null;
+  packageReviewModalRequestId = null;
   setModalBackgroundState(false);
   const opener = packageReviewOpener;
   if (!preserveOpener) packageReviewOpener = null;
@@ -3266,6 +3270,7 @@ function renderPackageReview(project, review, message = '') {
   setActiveFileVisualProject(project && project.id);
   packageReviewModalProjectId = project?.id || null;
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
+  packageReviewModalRequestId = packageReviewRequestId;
   const canPackage = review.materializable !== false && typeof review.token === 'string';
   state.packageReviewToken = canPackage ? review.token : null;
 
@@ -3544,13 +3549,13 @@ async function showPackageModal({
       if (!isCurrentRequest()) return false;
     }
 
-    const review = suppliedReview || await (
+  const review = suppliedReview || await (
       reviewedOutputPath === undefined
         ? window.crate.preparePackageReview(projectId)
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
-    );
-    if (!isCurrentRequest()) return false;
-    if (review?.projectId && review.projectId !== projectId) return false;
+  );
+  if (!isCurrentRequest()) return false;
+  if (review?.projectId && review.projectId !== projectId) return false;
     if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         state.projects = await window.crate.getProjects();
@@ -3662,17 +3667,21 @@ async function confirmPackage() {
     !state.packageReviewToken ||
     confirmButton?.disabled ||
     packageReviewModalProjectId !== project.id ||
-    packageReviewModalSelectionEpoch !== projectSelectionEpoch
+    packageReviewModalSelectionEpoch !== projectSelectionEpoch ||
+    packageReviewModalRequestId !== packageReviewRequestId
   ) return;
 
   const reviewToken = state.packageReviewToken;
   const reviewProjectId = project.id;
   const reviewSelectionEpoch = projectSelectionEpoch;
+  const reviewRequestId = packageReviewModalRequestId;
   const confirmationId = ++packageReviewConfirmationId;
   const isCurrentConfirmation = () => (
     packageReviewConfirmationId === confirmationId &&
     state.selectedProjectId === reviewProjectId &&
-    projectSelectionEpoch === reviewSelectionEpoch
+    projectSelectionEpoch === reviewSelectionEpoch &&
+    packageReviewRequestId === reviewRequestId &&
+    packageReviewModalRequestId === reviewRequestId
   );
   if (confirmButton) confirmButton.disabled = true;
   packageReviewConfirmationInFlight = true;
@@ -3680,6 +3689,7 @@ async function confirmPackage() {
     hidePackageReviewDialog({ preserveOpener: true });
     packageReviewModalProjectId = reviewProjectId;
     packageReviewModalSelectionEpoch = reviewSelectionEpoch;
+    packageReviewModalRequestId = reviewRequestId;
 
     // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
     let outputPath = state.packageOutputPath;
@@ -4320,9 +4330,14 @@ function setupMainProcessListeners() {
   window.crate.onPackageTrigger(async (data) => {
     const projectListRead = captureProjectListRead();
     setSelectedProject(data.projectId);
+    const notificationSelectionEpoch = projectSelectionEpoch;
     await refreshProjectState(data.projectId);
     const projects = state.projects;
-    if (!projectListReadIsCurrent(projectListRead)) return;
+    if (
+      !projectListReadIsCurrent(projectListRead) ||
+      state.selectedProjectId !== data.projectId ||
+      projectSelectionEpoch !== notificationSelectionEpoch
+    ) return;
     const project = state.projects.find(p => p.id === data.projectId);
     if (project) {
       if (project.assetBaseline && project.assetBaseline.status === 'decision-required') {
