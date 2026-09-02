@@ -98,6 +98,8 @@ Before merge, confirm:
 - regression, security, and provenance risks are reviewed when relevant
 - Bryant explicitly approved merge, unless the loop prompt preauthorized merge and all merge-readiness gates approve
 
+For a major PR, also require the exact-head correction loop in `crate-autoreview.md`: protected CI passed on the exact current head and a fresh independent read-only Luna/high review passed; add a second distinct independent reviewer for the highest-risk security, performance, or state-integrity changes. Keep one repository writer, route findings back as normal follow-up commits without history rewriting, and repeat both gates after every head change. The loop is bounded at three writer follow-up cycles; then stop and escalate rather than waive or lower a standard. Docs/copy and exact version-only PRs retain the lighter path unless safety or release integrity is affected. Stop before ready-for-review or merge; those remain separate Bryant-authorized gates.
+
 Stop if merge-readiness requests changes.
 
 ## Standard Final Report
