@@ -210,6 +210,9 @@ function createDocumentStub(elements = {}, options = {}) {
       if (selector === '.app-tab[data-tab="projects"]') {
         return attach((options.tabs || []).find(tab => tab.dataset.tab === 'projects') || null);
       }
+      if (selector === '.app-tab[data-tab="current-project"]') {
+        return attach((options.tabs || []).find(tab => tab.dataset.tab === 'current-project') || null);
+      }
       return null;
     },
     querySelectorAll: selector => {
@@ -2736,7 +2739,7 @@ test('delayed Existing Assets workspace responses cannot reopen a prior project 
 });
 
 test('project selection synchronously invalidates Existing Assets and stale Include or Skip fails closed', async () => {
-  const { document, elements } = createInteractiveRendererDom();
+  const { document, elements, tabs } = createInteractiveRendererDom();
   const projectA = {
     id: 'existing-assets-transition-a',
     name: 'Existing Assets A',
@@ -2781,6 +2784,7 @@ test('project selection synchronously invalidates Existing Assets and stale Incl
   renderer.setSelectedProject(projectB.id);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(document.activeElement, tabs.find(tab => tab.dataset.tab === 'current-project'));
 
   assert.equal(await renderer.submitExistingAssetsDecision('include'), false);
   assert.equal(await renderer.submitExistingAssetsDecision('skip'), false);
@@ -2935,6 +2939,107 @@ test('Package Review clears on project switch, fences late responses, and render
   assert.equal(getElementTreeText(elements['modal-file-list']).includes('A.ai'), false);
 });
 
+test('late Package Review confirmation success cannot complete after project switch', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = {
+    id: 'package-confirm-success-a',
+    name: 'Package Confirm Success A',
+    status: 'watching',
+    files: [{ name: 'A.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const projectB = { ...projectA, id: 'package-confirm-success-b', name: 'Package Confirm Success B' };
+  const packageResult = createDeferred();
+  let packageCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => null,
+    preparePackageReview: async () => ({
+      token: 'package-confirm-success-token',
+      projectId: projectA.id,
+      files: projectA.files,
+      totalFiles: 1,
+      materializable: true,
+    }),
+    getProjects: async () => [projectA, projectB],
+    packageProject: async () => {
+      packageCalls += 1;
+      return packageResult.promise;
+    },
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  const pendingConfirmation = renderer.confirmPackage();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(packageCalls, 1);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), false);
+
+  renderer.setSelectedProject(projectB.id);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+
+  packageResult.resolve({ folderPath: '/private/tmp/crate-synthetic-output/old-a', copiedCount: 1, embeddedCount: 0 });
+  await pendingConfirmation;
+
+  assert.equal(elements['modal-success'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectB.id);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
+test('late Package Review change result cannot replace a newly selected project review', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = {
+    id: 'package-confirm-error-a',
+    name: 'Package Confirm Error A',
+    status: 'watching',
+    files: [{ name: 'A.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source', protectedSource: true }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+  };
+  const projectB = { ...projectA, id: 'package-confirm-error-b', name: 'Package Confirm Error B' };
+  const packageResult = createDeferred();
+  const reviewA = {
+    token: 'package-confirm-error-a-token',
+    projectId: projectA.id,
+    files: projectA.files,
+    totalFiles: 1,
+    materializable: true,
+  };
+  const renderer = loadRendererHelpers(document, { crate: {
+    preScanSession: async () => null,
+    preparePackageReview: async () => reviewA,
+    getProjects: async () => [projectA, projectB],
+    packageProject: async () => packageResult.promise,
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+    state.settings = { namingTemplate: '{Project}_{Date}' };
+    state.packageOutputPath = '/private/tmp/crate-synthetic-output';
+  `, renderer);
+
+  assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
+  const pendingConfirmation = renderer.confirmPackage();
+  await new Promise(resolve => setImmediate(resolve));
+  renderer.setSelectedProject(projectB.id);
+  packageResult.resolve({ error: 'package_review_changed', review: reviewA });
+  await pendingConfirmation;
+
+  assert.equal(elements['modal-package'].classList.contains('hidden'), true);
+  assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), projectB.id);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+});
+
 test('notification-driven Package Review transition dismisses old content before refresh and eventually binds project B', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const projectA = {
@@ -3005,6 +3110,58 @@ test('notification-driven Package Review transition dismisses old content before
   assert.equal(elements['modal-project-name'].textContent, projectB.name);
   assert.equal(getElementTreeText(elements['modal-file-list']).includes('A.ai'), false);
   assert.equal(getElementTreeText(elements['modal-file-list']).includes('B.ai'), true);
+});
+
+test('older Existing Assets completion cannot dismiss a newer A modal after A-B-A re-entry', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const projectA = {
+    id: 'decision-reentry-a',
+    name: 'Decision Reentry A',
+    status: 'watching',
+    files: [{ name: 'A.png', path: '/synthetic/A.png', assetOrigin: 'existing', projectRole: 'asset' }],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null },
+  };
+  const projectB = { ...projectA, id: 'decision-reentry-b', name: 'Decision Reentry B' };
+  const oldDecision = createDeferred();
+  const newDecision = createDeferred();
+  let decisionCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAssetWorkspace: async projectId => ({
+      projectId,
+      files: projectId === projectA.id ? projectA.files : projectB.files,
+      pendingFiles: [],
+    }),
+    setExistingAssetsDecision: async () => {
+      decisionCalls += 1;
+      return (decisionCalls === 1 ? oldDecision : newDecision).promise;
+    },
+    getProjects: async () => [projectA, projectB],
+  } });
+  renderer.testProjects = [projectA, projectB];
+  vm.runInContext(`
+    state.projects = testProjects;
+    state.selectedProjectId = testProjects[0].id;
+  `, renderer);
+
+  await renderer.showExistingAssetsDecisionModal(projectA);
+  const pendingOldDecision = renderer.submitExistingAssetsDecision('include');
+  await new Promise(resolve => setImmediate(resolve));
+  renderer.setSelectedProject(projectB.id);
+  renderer.setSelectedProject(projectA.id);
+  await renderer.showExistingAssetsDecisionModal(projectA);
+  const pendingNewDecision = renderer.submitExistingAssetsDecision('skip');
+  await new Promise(resolve => setImmediate(resolve));
+
+  oldDecision.resolve({ success: true });
+  assert.equal(await pendingOldDecision, false);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
+
+  newDecision.resolve({ success: true });
+  assert.equal(await pendingNewDecision, true);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 
 test('distinct Figma source identities keep same-name Working Files separate', () => {

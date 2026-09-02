@@ -57,6 +57,7 @@ let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 let packageReviewOpener = null;
 let packageReviewConfirmationInFlight = false;
+let packageReviewConfirmationId = 0;
 let upgradeModalOpener = null;
 let existingAssetsDecisionRequest = null;
 let existingAssetsModalProjectId = null;
@@ -476,6 +477,12 @@ function setAssetReviewProject(projectId) {
   }
 }
 
+function focusSelectedProjectTarget(projectId) {
+  const tabName = projectId ? 'current-project' : 'projects';
+  const target = document.querySelector(`.app-tab[data-tab="${tabName}"]`);
+  target?.focus?.({ preventScroll: true });
+}
+
 function setSelectedProject(projectId) {
   const nextProjectId = typeof projectId === 'string' && projectId ? projectId : null;
   if (state.selectedProjectId === nextProjectId) return false;
@@ -483,12 +490,21 @@ function setSelectedProject(projectId) {
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
   packageReviewRequestId += 1;
+  packageReviewConfirmationId += 1;
+  packageReviewConfirmationInFlight = false;
   state.packageReviewToken = null;
   packageReviewModalProjectId = null;
   packageReviewModalSelectionEpoch = null;
   hideExistingAssetsDecisionModal({ restoreFocus: false });
   hidePackageReviewDialog({ restoreFocus: false });
+  hidePackageProgressModal();
+  const successModal = $('#modal-success');
+  if (successModal) {
+    successModal.classList.add('hidden');
+    successModal.removeEventListener('keydown', handlePackageSuccessKeydown);
+  }
   setAssetReviewProject(nextProjectId);
+  focusSelectedProjectTarget(nextProjectId);
   return true;
 }
 
@@ -1702,24 +1718,33 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
     modalSelectionEpoch === null ||
     modalSelectionEpoch !== projectSelectionEpoch
   ) return false;
-  if (existingAssetsDecisionRequest && existingAssetsDecisionRequest.projectId === projectId) return;
-  const request = { projectId };
+  if (
+    existingAssetsDecisionRequest &&
+    existingAssetsDecisionRequest.projectId === projectId &&
+    existingAssetsDecisionRequest.selectionEpoch === modalSelectionEpoch
+  ) return false;
+  const request = { projectId, selectionEpoch: modalSelectionEpoch };
+  const isCurrentDecision = () => (
+    state.selectedProjectId === projectId &&
+    projectSelectionEpoch === modalSelectionEpoch &&
+    existingAssetsModalProjectId === projectId &&
+    existingAssetsModalSelectionEpoch === modalSelectionEpoch &&
+    existingAssetsDecisionRequest === request
+  );
   existingAssetsDecisionRequest = request;
   const buttons = getExistingAssetsDecisionFocusableElements();
   buttons.forEach(button => { button.disabled = true; });
   try {
-    if (
-      state.selectedProjectId !== projectId ||
-      existingAssetsModalProjectId !== projectId ||
-      existingAssetsModalSelectionEpoch !== projectSelectionEpoch
-    ) return false;
+    if (!isCurrentDecision()) return false;
     const result = await window.crate.setExistingAssetsDecision(projectId, decision);
+    if (!isCurrentDecision()) return false;
     if (!result || !result.success) {
       showToast('Crate could not save that choice. Try again.');
       return false;
     }
     state.projects = await window.crate.getProjects();
-    if (existingAssetsModalProjectId === projectId) hideExistingAssetsDecisionModal();
+    if (!isCurrentDecision()) return false;
+    hideExistingAssetsDecisionModal();
     if (state.selectedProjectId === projectId && isFilesTabActive()) {
       await renderFiles();
       if (openReview) openAssetReviewWorkspace();
@@ -3237,6 +3262,7 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
 }
 
 function renderPackageReview(project, review, message = '') {
+  if (!project?.id || (review?.projectId && review.projectId !== project.id)) return false;
   setActiveFileVisualProject(project && project.id);
   packageReviewModalProjectId = project?.id || null;
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
@@ -3372,6 +3398,7 @@ function renderPackageReview(project, review, message = '') {
   $('#modal-dest-path').textContent = getPackageDestinationLabel(state.packageOutputPath);
 
   openPackageReviewDialog();
+  return true;
 }
 
 async function getUnavailableRendererReviewFiles(project) {
@@ -3523,6 +3550,7 @@ async function showPackageModal({
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
     );
     if (!isCurrentRequest()) return false;
+    if (review?.projectId && review.projectId !== projectId) return false;
     if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         state.projects = await window.crate.getProjects();
@@ -3640,7 +3668,9 @@ async function confirmPackage() {
   const reviewToken = state.packageReviewToken;
   const reviewProjectId = project.id;
   const reviewSelectionEpoch = projectSelectionEpoch;
+  const confirmationId = ++packageReviewConfirmationId;
   const isCurrentConfirmation = () => (
+    packageReviewConfirmationId === confirmationId &&
     state.selectedProjectId === reviewProjectId &&
     projectSelectionEpoch === reviewSelectionEpoch
   );
@@ -3678,6 +3708,7 @@ async function confirmPackage() {
 
     state.packageReviewToken = null;
     const result = await window.crate.packageProject(project.id, outputPath, reviewToken);
+    if (!isCurrentConfirmation()) return;
     if (!result || result.error) {
       const typedError = result?.error || 'package_failed';
       if (typedError === 'limit_reached') {
@@ -3723,10 +3754,12 @@ async function confirmPackage() {
     }
   } catch (error) {
     logRendererError('Package Review confirmation failed', error);
+    if (!isCurrentConfirmation()) return;
     state.packageReviewToken = null;
     hidePackageProgressModal();
     await showPackageModal({ message: PACKAGE_REVIEW_RECOVERY_MESSAGE, runPreScan: false });
   } finally {
+    if (packageReviewConfirmationId !== confirmationId) return;
     packageReviewConfirmationInFlight = false;
     hidePackageProgressModal();
     if (confirmButton) confirmButton.disabled = !state.packageReviewToken;
