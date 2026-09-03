@@ -4717,6 +4717,11 @@ function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths) {
 
 async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken, operation, options = {}) {
   const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths, operation);
+  // All workers in this one fenced queue start from the same project object.
+  // It is used only for read-only admission checks; authoritative operation
+  // checks still guard every mutation and final baseline write.
+  const queueProject = options.project || getProjects().find(project => project.id === projectId) || null;
+  const scanOptions = options.project ? options : { ...options, project: queueProject };
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4730,7 +4735,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         continue;
       }
       try {
-        const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
+        const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
         if (!operation.current()) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
         } else if (result && result.success === false) {
@@ -8034,11 +8039,14 @@ function captureProjectOperation(projectId) {
     return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken;
   };
   const fastCurrent = () => (
-    open &&
-    activationToken !== null &&
-    watchingActivationSequence === generation &&
-    watchingActivationTokens.get(projectId) === activationToken &&
-    illustratorActivationScopes.get(projectId)?.revision === scopeRevision
+    activationToken === null
+      ? baseCurrent()
+      : (
+        open &&
+        watchingActivationSequence === generation &&
+        watchingActivationTokens.get(projectId) === activationToken &&
+        illustratorActivationScopes.get(projectId)?.revision === scopeRevision
+      )
   );
   return {
     activationToken,
@@ -11914,8 +11922,16 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
 
   if (ext === '.psd') {
     if (options.addFilesAttempt) {
-      await runAddFilesPsdWorker(filePath, options.addFilesAttempt);
-      return null;
+      return {
+        kind: 'psd-worker-result',
+        result: await runAddFilesPsdWorker(filePath, options.addFilesAttempt),
+        sourceIdentity: {
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          dev: stat.dev,
+          ino: stat.ino,
+        },
+      };
     }
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
@@ -11940,6 +11956,8 @@ async function extractLinkedAssets(filePath, options = {}) {
   const extractorOptions = {
     strict,
     sourceBuffer: options.sourceBuffer,
+    validatedPsdResult: options.validatedPsdResult,
+    quiet: options.quiet,
     isCurrent: options.isCurrent,
     addFilesAttempt: options.addFilesAttempt,
   };
@@ -11987,7 +12005,8 @@ async function extractLinkedAssets(filePath, options = {}) {
 async function extractLinkedAssetsRegex(filePath, options = {}) {
   const strict = options.strict === true;
   const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-  const results = [];
+    const results = [];
+    const seenResults = new Set();
   try {
     const suppliedBuffer = Buffer.isBuffer(options.sourceBuffer) ? options.sourceBuffer : null;
     if (!suppliedBuffer) {
@@ -12014,7 +12033,13 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       let match;
       while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
         const linkedPath = match[0];
-        if (linkedPath !== filePath) results.push(linkedPath);
+        if (linkedPath !== filePath) {
+          const resultKey = normalizeTrackedFilePath(linkedPath) || linkedPath;
+          if (!seenResults.has(resultKey)) {
+            seenResults.add(resultKey);
+            results.push(linkedPath);
+          }
+        }
       }
       carry = content.slice(-carryBytes);
       bytesSinceYield += Math.min(chunkBytes, buf.length - offset);
@@ -12126,7 +12151,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     let psd = null;
     let workerResult = null;
     if (options.addFilesAttempt) {
-      workerResult = await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt);
+      const validatedIdentity = options.validatedPsdSourceIdentity;
+      if (options.validatedPsdResult && validatedIdentity && (
+        stat.size !== validatedIdentity.size ||
+        stat.mtimeMs !== validatedIdentity.mtimeMs ||
+        stat.dev !== validatedIdentity.dev ||
+        stat.ino !== validatedIdentity.ino
+      )) {
+        if (options.strict === true) throw new Error('asset_baseline_source_changed');
+        return [];
+      }
+      workerResult = options.validatedPsdResult || await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt);
     } else {
       const buf = await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
@@ -12637,7 +12672,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     : () => isBoundWatchingActivationCurrent(projectId, activationToken);
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
-  const currentProject = getProjects().find(p => p.id === projectId);
+  const currentProject = options.project || getProjects().find(p => p.id === projectId);
   if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) return;
 
   const baselineScan = options.establishBaseline === false
@@ -12651,7 +12686,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   try {
 
   if (!options.quiet) console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
-  const validatedSourceBuffer = baselineScan
+  const validatedSource = baselineScan
     ? await assertDependableAssetBaselineSource(filePath, {
       isCurrent,
       addFilesAttempt: options.addFilesAttempt,
@@ -12659,7 +12694,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
-    sourceBuffer: validatedSourceBuffer,
+    sourceBuffer: Buffer.isBuffer(validatedSource) ? validatedSource : undefined,
+    validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
     isCurrent,
     addFilesAttempt: options.addFilesAttempt,
   });
@@ -12758,6 +12794,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       addFilesAttempt: options.addFilesAttempt,
+      validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
+      validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
     });
     if (!isCurrent()) return;
     if (psdAssets.length > 0) {
@@ -14756,15 +14794,19 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
 
     if (!result || !operation.current()) {
       if (addFilesAttempt.state === 'timed-out' || addFilesAttempt.reason === 'timeout') {
+        const admittedKeys = new Set((result || []).map(getTrackedFileDedupKey).filter(Boolean));
         return {
           success: false,
           error: 'add_files_timeout',
           timeoutMs: addFilesOperationTimeoutMs,
           selectedCount: filePaths.length,
-          admittedCount: 0,
+          // Admission is synchronous. If it completed before the deadline
+          // fence was observed, report the persisted admission accurately;
+          // scanning has not started at this boundary.
+          admittedCount: filePaths.filter(filePath => admittedKeys.has(normalizeTrackedFilePath(filePath))).length,
           completedCount: 0,
-          failedCount: filePaths.length,
-          scanResults: filePaths.map(filePath => ({ path: filePath, success: false, error: 'add_files_timeout' })),
+          failedCount: 0,
+          scanResults: [],
           files: getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId))?.files || [],
         };
       }
@@ -15916,7 +15958,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
       // Skip tiny files — likely blank placeholders (e.g. blankMoviePosterImage)
       if (fileSize < 500) {
-        console.log(`[crate] skipped tiny embedded file: ${path.basename(zipPath)} (${fileSize} bytes)`);
+        if (!options.quiet) console.log(`[crate] skipped tiny embedded file: ${path.basename(zipPath)} (${fileSize} bytes)`);
         continue;
       }
 
@@ -15930,7 +15972,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         // Keynote generates composite slide screenshots named "st-{UUID}.jpg".
         // These are internal slide previews, not user content.
         if (/^st-[0-9a-f-]+\.jpe?g$/i.test(entryName)) {
-          console.log(`[crate] skipped Keynote slide thumbnail: ${entryName}`);
+          if (!options.quiet) console.log(`[crate] skipped Keynote slide thumbnail: ${entryName}`);
           continue;
         }
 
@@ -15941,7 +15983,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         // All follow the same {prefix}-{UUID}.jpg naming pattern as st- thumbnails.
         // These are NOT user content — they ship with the Keynote theme/template.
         if (/^(mt|bg|tx)-[0-9a-f-]+\.jpe?g$/i.test(entryName)) {
-          console.log(`[crate] skipped Keynote theme/template asset: ${entryName}`);
+          if (!options.quiet) console.log(`[crate] skipped Keynote theme/template asset: ${entryName}`);
           continue;
         }
 
@@ -15949,7 +15991,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         // Keynote creates e.g. "shopping (6)-small-9073.jpeg" for every inserted image.
         // The optional -NNNN is Keynote's numeric suffix appended to all embedded files.
         if (/-small(-\d{3,6})?\.[a-z]+$/i.test(entryName)) {
-          console.log(`[crate] skipped Keynote thumbnail variant: ${entryName}`);
+          if (!options.quiet) console.log(`[crate] skipped Keynote thumbnail variant: ${entryName}`);
           continue;
         }
 
@@ -15971,7 +16013,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         const baseName = path.basename(cleanedName, path.extname(cleanedName))
           .toLowerCase().replace(/\s+/g, ' ').trim();
         if (alreadyCapturedBases.has(baseName)) {
-          console.log(`[crate] skipped duplicate (already captured): ${entryName} → matches "${baseName}"`);
+          if (!options.quiet) console.log(`[crate] skipped duplicate (already captured): ${entryName} → matches "${baseName}"`);
           continue;
         }
       }
@@ -16008,7 +16050,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
           if (suppressedOccurrence) continue;
           if (extractedPresentationFingerprints.has(extractedFingerprint)) {
             if (capturedSizes.has(extractedSize)) {
-              console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes)`);
+              if (!options.quiet) console.log(`[crate] skipped duplicate (content match): ${path.basename(zipPath)} (${extractedSize} bytes)`);
             }
             continue;
           }
@@ -16088,7 +16130,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
             console.warn('[crate][provenance] presentation media extraction callback skipped:', provenanceErr.message);
           }
         }
-        console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
+        if (!options.quiet) console.log(`[crate] extracted embedded media: ${outputName} (date: ${m[2]})`);
       } catch (e) {
         if (e instanceof PackageTransactionInvariantError || e instanceof PackageReviewChangedError) throw e;
         if (options.failClosed) throw new PackageReviewChangedError();
