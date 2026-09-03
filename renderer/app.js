@@ -4136,10 +4136,12 @@ function setupEventListeners() {
     const button = event.currentTarget || $('#btn-add-files');
     const projectId = state.selectedProjectId;
     const selectionEpoch = projectSelectionEpoch;
+    const actionKey = `add-files:${projectId}`;
+    if (rendererActionsInFlight.has(actionKey)) return;
     const operationId = createRendererAddFilesOperationId();
     activeRendererAddFilesOperation = { projectId, operationId };
     try {
-      await runRendererAction(`add-files:${projectId}`, button, 'Adding…', async () => {
+      await runRendererAction(actionKey, button, 'Adding…', async () => {
         const attempt = createRendererDeadlineAttempt(rendererAddFilesOperationTimeoutMs);
         const isCurrent = () => (
           attempt.isCurrent() &&

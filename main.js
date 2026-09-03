@@ -81,6 +81,41 @@ async function runCancellableExecFile(command, args, options = {}) {
   }
 }
 
+async function runCancellableExec(command, options = {}) {
+  const attempt = options.addFilesAttempt;
+  const execOptions = { ...options };
+  delete execOptions.addFilesAttempt;
+  delete execOptions.isCurrent;
+  if (!attempt) return execAsync(command, execOptions);
+  if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  const controller = new AbortController();
+  const removeCancelListener = attempt.onCancel(() => controller.abort());
+  try {
+    return await execAsync(command, { ...execOptions, signal: controller.signal });
+  } finally {
+    removeCancelListener();
+  }
+}
+
+async function readFileWithAddFilesCancellation(filePath, attempt, knownSize = null) {
+  if (!attempt) return fs.promises.readFile(filePath);
+  if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  // Small bounded reads complete before a cancellation can materially race
+  // them; avoid adding AbortSignal setup overhead to large manual batches.
+  if (Number.isSafeInteger(knownSize) && knownSize <= 8 * 1024 * 1024) {
+    const result = await fs.promises.readFile(filePath);
+    if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+    return result;
+  }
+  const controller = new AbortController();
+  const removeCancelListener = attempt.onCancel(() => controller.abort());
+  try {
+    return await fs.promises.readFile(filePath, { signal: controller.signal });
+  } finally {
+    removeCancelListener();
+  }
+}
+
 function isAddFilesParserCurrent(options = {}) {
   return typeof options.isCurrent !== 'function' || options.isCurrent();
 }
@@ -4669,6 +4704,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
 
   const workerCount = Math.min(MANUAL_ADD_SCAN_CONCURRENCY, queuedPaths.length);
   const scanWork = Promise.all(Array.from({ length: workerCount }, () => runNext()));
+  const settledScanWork = scanWork.catch(() => {});
   const attempt = options.addFilesAttempt;
   if (attempt) {
     const outcome = await Promise.race([
@@ -4683,16 +4719,16 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
           outcomes[index] = { path: queuedPaths[index], success: false, error: 'add_files_timeout' };
         }
       }
-      return { cancelled: true, timedOut: true, outcomes };
+      return { cancelled: true, timedOut: true, outcomes, settled: settledScanWork };
     }
   } else {
     await scanWork;
   }
   if (!operation.current()) {
     cancelProjectAssetBaselineScanOperation(projectId, operation, queuedPaths);
-    return { cancelled: true, outcomes };
+    return { cancelled: true, outcomes, settled: settledScanWork };
   }
-  return { cancelled: false, outcomes };
+  return { cancelled: false, outcomes, settled: settledScanWork };
 }
 
 function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = true } = {}) {
@@ -11755,11 +11791,13 @@ function runAddFilesPsdWorker(filePath, attempt) {
 
 async function assertDependableAssetBaselineSource(filePath, options = {}) {
   const stat = await fs.promises.stat(filePath);
+  if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
   const ext = path.extname(filePath).toLowerCase();
   if (ext === '.ai' || ext === '.pdf') {
-    const sourceBuffer = await fs.promises.readFile(filePath);
+    const sourceBuffer = await readFileWithAddFilesCancellation(filePath, options.addFilesAttempt, stat.size);
+    if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
     const headerText = sourceBuffer.subarray(0, Math.min(sourceBuffer.length, 1024)).toString('latin1');
     const trailerText = sourceBuffer.subarray(Math.max(0, sourceBuffer.length - 2048)).toString('latin1');
     const pdfHeaderPattern = /(?:^|[\r\n])%PDF-(?:1\.[0-7]|2\.0)(?:\r\n|\r|\n)/;
@@ -11789,10 +11827,12 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
   } else if (STRICT_ZIP_ASSET_BASELINE_EXTENSIONS.has(ext)) {
-    await execFileAsync('/usr/bin/unzip', ['-tqq', filePath], {
+    await runCancellableExecFile('/usr/bin/unzip', ['-tqq', filePath], {
       timeout: 10000,
       encoding: 'utf8',
+      ...options,
     });
+    if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   }
   return null;
 }
@@ -11866,7 +11906,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
         return results;
       }
     }
-    const buf = suppliedBuffer || await fs.promises.readFile(filePath);
+    const buf = suppliedBuffer || await readFileWithAddFilesCancellation(filePath, options.addFilesAttempt);
     const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
     const chunkBytes = 1024 * 1024;
     const carryBytes = 32 * 1024;
@@ -12064,9 +12104,9 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
 
   try {
     // Check if InDesign is running
-    const { stdout: psCheck } = await execAsync(
+    const { stdout: psCheck } = await runCancellableExec(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
+      { timeout: 3000, encoding: 'utf8', ...options }
     );
 
     if (!psCheck.trim()) {
@@ -12077,7 +12117,7 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
     const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
       () => ({ 'crate-indd-query.applescript': INDD_APPLESCRIPT }),
       'crate-indd-query.applescript',
-      { timeout: 10000, encoding: 'utf8' }
+      { timeout: 10000, encoding: 'utf8', ...options }
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
     const activeState = strict
@@ -12261,7 +12301,7 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
  */
 async function extractLinkedAssetsZipMedia(filePath, options = {}) {
   try {
-    const buf = await fs.promises.readFile(filePath);
+    const buf = await readFileWithAddFilesCancellation(filePath, options.addFilesAttempt);
     return extractLinkedAssetsRegex(filePath, { ...options, sourceBuffer: buf });
   } catch (e) {
     if (options.strict === true) throw e;
@@ -12486,7 +12526,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const validatedSourceBuffer = baselineScan
-    ? await assertDependableAssetBaselineSource(filePath, { addFilesAttempt: options.addFilesAttempt })
+    ? await assertDependableAssetBaselineSource(filePath, {
+      isCurrent,
+      addFilesAttempt: options.addFilesAttempt,
+    })
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
@@ -14454,13 +14497,21 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     : crypto.randomUUID();
   let addFilesAttempt = null;
   let operation = baseOperation;
+  let backgroundScanWork = Promise.resolve();
   const operationController = {
     cancel() {
       baseOperation.close();
       return addFilesAttempt?.cancel('renderer-timeout') !== false;
     },
+    waitForSettled() {
+      return backgroundScanWork;
+    },
   };
   const projectOperations = activeAddFilesOperations.get(projectId) || new Map();
+  if (projectOperations.has(operationId)) {
+    baseOperation.close();
+    return { success: false, error: 'add_files_operation_conflict' };
+  }
   projectOperations.set(operationId, operationController);
   activeAddFilesOperations.set(projectId, projectOperations);
   try {
@@ -14552,6 +14603,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         operation,
         { allowPausedBaseline: true, addFilesAttempt }
       );
+      backgroundScanWork = scanReport.settled || Promise.resolve();
       if (scanReport.timedOut) {
         const view = getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId));
         const admittedKeys = new Set((result || []).map(getTrackedFileDedupKey).filter(Boolean));
@@ -14588,7 +14640,8 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
   } finally {
     operation.close();
     addFilesAttempt?.dispose();
-    projectOperations.delete(operationId);
+    await operationController.waitForSettled();
+    if (projectOperations.get(operationId) === operationController) projectOperations.delete(operationId);
     if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
   }
 });
