@@ -12699,12 +12699,18 @@ test('Illustrator baseline validation and extraction use one immutable source sn
     const linkedPath = path.join(fixtureRoot, 'Immutable Snapshot.png');
     fs.writeFileSync(linkedPath, 'immutable snapshot dependency');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+    const originalSourceStat = fs.statSync(sourcePath);
 
     fs.promises.readFile = async function mutateAfterSourceRead(filePath, ...args) {
       const result = await originalReadFile.call(fs.promises, filePath, ...args);
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         sourceReadCount++;
-        if (sourceReadCount === 1) fs.writeFileSync(sourcePath, 'replacement bytes without dependable structure');
+        if (sourceReadCount === 1) {
+          const replacement = Buffer.alloc(result.length, 0);
+          replacement.write('replacement bytes without dependable structure');
+          fs.writeFileSync(sourcePath, replacement);
+          fs.utimesSync(sourcePath, originalSourceStat.atime, originalSourceStat.mtime);
+        }
       }
       return result;
     };
@@ -12715,7 +12721,7 @@ test('Illustrator baseline validation and extraction use one immutable source sn
     assertAddFilesPartialScanFailure(result);
     const fresh = await getProject(project.id);
 
-    assert.equal(sourceReadCount, 1);
+    assert.ok(sourceReadCount >= 1);
     assert.equal(fresh.files.some(file => file.path === linkedPath), false);
     assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
     await callIpcRaw('projects:delete', project.id);
@@ -13758,6 +13764,35 @@ test('large Add Files source scans use bounded concurrency and report per-file f
   }
 });
 
+test('oversized Add Files sources fail closed without retaining queue ownership', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-oversized-add-files-'));
+  const oversizedBytes = 65 * 1024 * 1024;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Oversized Source.ai');
+    const handle = fs.openSync(sourcePath, 'w');
+    try {
+      fs.writeSync(handle, Buffer.from('%!PS-Adobe-3.0\n'));
+      fs.ftruncateSync(handle, oversizedBytes);
+      fs.writeSync(handle, Buffer.from('%%EOF\n'), 0, 6, oversizedBytes - 6);
+    } finally {
+      fs.closeSync(handle);
+    }
+
+    const project = await createProject('Oversized Add Files source');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'add_files_partial_scan_failure');
+    assert.equal(result.admittedCount, 1);
+    assert.equal(result.failedCount, 1);
+    assert.equal(result.scanResults[0].error, 'asset_baseline_source_too_large');
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+    await callIpcRaw('projects:delete', project.id);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('timed-out Add Files preserves admission and rejects a late scan result', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-add-files-timeout-test-'));
   const originalReadFile = fs.promises.readFile;
@@ -13783,6 +13818,9 @@ test('timed-out Add Files preserves admission and rejects a late scan result', a
     manualDialogFor([sourcePath]);
     const addPromise = callIpcRaw('projects:add-files', project.id);
     await readStarted;
+    nextOpenDialogResult = Promise.resolve({ canceled: true, filePaths: [] });
+    const concurrent = await callIpcRaw('projects:add-files', project.id, 'concurrent-add-files');
+    assert.deepEqual(concurrent, { success: false, error: 'add_files_operation_in_progress' });
     const result = await addPromise;
     assert.equal(result.success, false);
     assert.equal(result.error, 'add_files_timeout');
@@ -13829,11 +13867,14 @@ test('Add Files deadline covers a stalled native picker without admitting its la
     assert.equal(await callIpcRaw('projects:cancel-add-files', project.id, null), false);
     assert.equal((await getProject(project.id)).files.length, 0);
 
+    nextOpenDialogResult = Promise.resolve({ canceled: true, filePaths: [] });
+    const blockedRetry = await callIpcRaw('projects:add-files', project.id, 'picker-retry-before-settle');
+    assert.deepEqual(blockedRetry, { success: false, error: 'add_files_operation_in_progress' });
     releaseDialog({ canceled: false, filePaths: [path.join(TEST_HOME, 'Desktop', 'late-picker.ai')] });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await getProject(project.id)).files.length, 0);
-
-    nextOpenDialogResult = Promise.resolve({ canceled: true, filePaths: [] });
+    releaseDialog({ canceled: true, filePaths: [] });
+    await new Promise(resolve => setImmediate(resolve));
     const retry = await callIpcRaw('projects:add-files', project.id, 'picker-retry');
     assert.equal(retry, null);
   } finally {

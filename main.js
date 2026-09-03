@@ -170,6 +170,7 @@ const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 const ADD_FILES_OPERATION_TIMEOUT_MS = 30_000;
 let addFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
 const activeAddFilesOperations = new Map();
+const pendingNativeAddFilesPickers = new Set();
 const ADD_FILES_OPERATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
@@ -4803,6 +4804,15 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
           continue;
         }
         if (reservation.error) {
+          // Do not parse an input that cannot fit the reservation budget.
+          // Convert the queued item into an ordinary failed baseline scan so
+          // its queue ownership is released and recovery remains observable.
+          const failedScan = beginProjectAssetBaselineScan(projectId, sourcePath, activationToken, {
+            allowPaused: scanOptions.allowPausedBaseline === true,
+            operation,
+            project: queueProject,
+          });
+          if (failedScan) await completeProjectAssetBaselineScan(failedScan, false);
           outcomes[index] = { path: sourcePath, success: false, error: reservation.error };
           continue;
         }
@@ -11978,6 +11988,15 @@ function getAddFilesSourceIdentity(stat) {
   };
 }
 
+function getAddFilesSourceDigest(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+async function getAddFilesCurrentSourceDigest(filePath, attempt) {
+  const buffer = await readFileWithAddFilesCancellation(filePath, attempt);
+  return getAddFilesSourceDigest(buffer);
+}
+
 function isAddFilesSourceIdentityCurrent(stat, identity) {
   return !!stat && !!identity &&
     stat.size === identity.size &&
@@ -12014,6 +12033,7 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
       kind: 'source-buffer',
       buffer: sourceBuffer,
       sourceIdentity: getAddFilesSourceIdentity(stat),
+      sourceDigest: getAddFilesSourceDigest(sourceBuffer),
     };
   }
 
@@ -12036,6 +12056,7 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
         kind: 'psd-worker-result',
         result: workerResult,
         sourceIdentity: beforeWorkerIdentity,
+        sourceDigest: workerResult.sourceDigest,
       };
     }
     const buffer = await fs.promises.readFile(filePath);
@@ -12322,7 +12343,12 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     if (linkedFiles.length > 0) {
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       if (!isCurrent()) return [];
-      await fs.promises.mkdir(extractDir, { recursive: true });
+      ensureSafeCacheDirectory(
+        extractDir,
+        'psd-extract-directory',
+        OWNER_ONLY_DIR_MODE,
+        safeRealpath(os.tmpdir(), 'psd-extract-parent')
+      );
       if (!isCurrent()) return [];
       const usedEmbeddedNames = new Set((await fs.promises.readdir(extractDir)).map(name => name.toLowerCase())); for (const lf of linkedFiles) {
         if (!isCurrent()) return [];
@@ -12830,9 +12856,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   });
   if (!isCurrent()) return;
   const validatedIdentity = validatedSource?.sourceIdentity;
+  const validatedSourceDigest = validatedSource?.sourceDigest;
   const recheckValidatedIdentity = async () => {
-    if (!baselineScan || !validatedIdentity || validatedSource?.kind === 'source-buffer') return true;
+    if (!baselineScan || !validatedIdentity) return true;
     try {
+      if (validatedSourceDigest) {
+        return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt) === validatedSourceDigest;
+      }
       return isAddFilesSourceIdentityCurrent(
         await fs.promises.stat(filePath),
         validatedIdentity
@@ -14825,7 +14855,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     },
   };
   const projectOperations = activeAddFilesOperations.get(projectId) || new Map();
-  if ([...projectOperations.values()].some(candidate => candidate.pickerPending)) {
+  if (pendingNativeAddFilesPickers.has(projectId) || projectOperations.size > 0) {
     baseOperation.close();
     return { success: false, error: 'add_files_operation_in_progress' };
   }
@@ -14857,9 +14887,10 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       ],
     });
     pickerPending = true;
+    pendingNativeAddFilesPickers.add(projectId);
     pickerSettledPromise = dialogPromise.then(
-      () => { pickerPending = false; },
-      () => { pickerPending = false; }
+      () => { pickerPending = false; pendingNativeAddFilesPickers.delete(projectId); },
+      () => { pickerPending = false; pendingNativeAddFilesPickers.delete(projectId); }
     );
     const dialogOutcome = await Promise.race([
       dialogPromise.then(dialogResult => ({ dialogResult })),

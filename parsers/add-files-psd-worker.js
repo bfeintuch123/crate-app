@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const { readPsd } = require('ag-psd');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
@@ -11,7 +12,9 @@ function parsePsd(filePath) {
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
 
-  const psd = readPsd(fs.readFileSync(filePath), {
+  const sourceBuffer = fs.readFileSync(filePath);
+  const sourceDigest = crypto.createHash('sha256').update(sourceBuffer).digest('hex');
+  const psd = readPsd(sourceBuffer, {
     skipLayerImageData: true,
     skipCompositeImageData: true,
   });
@@ -32,7 +35,7 @@ function parsePsd(filePath) {
       name: typeof file.name === 'string' ? file.name : '',
       data: Buffer.from(file.data).toString('base64'),
     }));
-  return { entries, embedded };
+  return { entries, embedded, sourceDigest };
 }
 
 if (!port || typeof port.on !== 'function' || typeof port.postMessage !== 'function') {
