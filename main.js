@@ -4659,9 +4659,12 @@ function createAddFilesParseMemoryBudget(maxBytes = ADD_FILES_PARSE_MEMORY_BUDGE
       const isCurrent = typeof operation.currentFast === 'function'
         ? () => operation.currentFast()
         : () => operation.current();
+      const estimatedParseBytes = Number.isSafeInteger(sourceBytes)
+        ? Math.min(Number.MAX_SAFE_INTEGER, sourceBytes * 2)
+        : 0;
       const reservationBytes = Math.max(
         ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES,
-        Math.min(Number.isSafeInteger(sourceBytes) ? sourceBytes : 0, maxBytes)
+        estimatedParseBytes
       );
       while (reservedBytes > 0 && reservedBytes + reservationBytes > maxBytes) {
         if (!isCurrent()) return null;
@@ -4680,6 +4683,8 @@ function createAddFilesParseMemoryBudget(maxBytes = ADD_FILES_PARSE_MEMORY_BUDGE
     },
   };
 }
+
+const sharedAddFilesParseMemoryBudget = createAddFilesParseMemoryBudget();
 
 function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
   const project = getProjects().find(item => item.id === projectId);
@@ -4753,7 +4758,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   // checks still guard every mutation and final baseline write.
   const queueProject = options.project || getProjects().find(project => project.id === projectId) || null;
   const scanOptions = options.project ? options : { ...options, project: queueProject };
-  const parseMemoryBudget = options.parseMemoryBudget || createAddFilesParseMemoryBudget();
+  const parseMemoryBudget = options.parseMemoryBudget || sharedAddFilesParseMemoryBudget;
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4767,14 +4772,14 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         continue;
       }
       try {
-        let sourceStat = null;
+        let reservationStat = null;
         try {
-          sourceStat = await fs.promises.stat(sourcePath);
+          reservationStat = await fs.promises.stat(sourcePath);
         } catch (_) {
           // Let runScanOnOpen establish and complete the baseline record for
           // a missing source; the scan-level failure must remain observable.
         }
-        if (!sourceStat) {
+        if (!reservationStat) {
           const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
           if (!operation.current()) {
             outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
@@ -4789,7 +4794,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           continue;
         }
-        const reservation = await parseMemoryBudget.acquire(sourceStat.size, operation);
+        const reservation = await parseMemoryBudget.acquire(reservationStat.size, operation);
         if (!reservation) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           continue;
@@ -4798,7 +4803,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         try {
           result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, {
             ...scanOptions,
-            sourceStat,
+            reservationStat,
           });
         } finally {
           reservation.release();
@@ -11975,7 +11980,7 @@ function isAddFilesSourceIdentityCurrent(stat, identity) {
 }
 
 async function assertDependableAssetBaselineSource(filePath, options = {}) {
-  const stat = options.sourceStat || await fs.promises.stat(filePath);
+  const stat = await fs.promises.stat(filePath);
   if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
@@ -11983,6 +11988,10 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
   if (ext === '.ai' || ext === '.pdf') {
     const sourceBuffer = await readFileWithAddFilesCancellation(filePath, options.addFilesAttempt, stat.size);
     if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
+    const afterReadStat = await fs.promises.stat(filePath);
+    if (!isAddFilesSourceIdentityCurrent(afterReadStat, getAddFilesSourceIdentity(stat))) {
+      throw new Error('asset_baseline_source_changed');
+    }
     const headerText = sourceBuffer.subarray(0, Math.min(sourceBuffer.length, 1024)).toString('latin1');
     const trailerText = sourceBuffer.subarray(Math.max(0, sourceBuffer.length - 2048)).toString('latin1');
     const pdfHeaderPattern = /(?:^|[\r\n])%PDF-(?:1\.[0-7]|2\.0)(?:\r\n|\r|\n)/;
@@ -12010,10 +12019,16 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
 
   if (ext === '.psd') {
     if (options.addFilesAttempt) {
+      const beforeWorkerIdentity = getAddFilesSourceIdentity(stat);
+      const workerResult = await runAddFilesPsdWorker(filePath, options.addFilesAttempt);
+      const afterWorkerStat = await fs.promises.stat(filePath);
+      if (!isAddFilesSourceIdentityCurrent(afterWorkerStat, beforeWorkerIdentity)) {
+        throw new Error('asset_baseline_source_changed');
+      }
       return {
         kind: 'psd-worker-result',
-        result: await runAddFilesPsdWorker(filePath, options.addFilesAttempt),
-        sourceIdentity: getAddFilesSourceIdentity(stat),
+        result: workerResult,
+        sourceIdentity: beforeWorkerIdentity,
       };
     }
     const buffer = await fs.promises.readFile(filePath);
@@ -12227,11 +12242,11 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
 async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false;
   try {
     // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
-    const stat = options.sourceStat || await fs.promises.stat(psdFilePath);
+    const stat = await fs.promises.stat(psdFilePath);
     if (!isCurrent()) return [];
     if (stat.size > MAX_PARSE_FILE_SIZE) {
       if (options.strict === true) throw new Error('asset_baseline_source_too_large');
-      console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
+      if (!options.quiet) console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
       return [];
     }
     let psd = null;
@@ -12306,7 +12321,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     if (!isCurrent()) return []; keepInvocationFiles = true; return discoveredPaths;
   } catch (e) {
     if (!isCurrent()) return [];
-    console.error('[crate][psd-parser] Error parsing PSD:', e.message);
+    if (!options.quiet) console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     if (options.strict === true) throw e;
     return [];
   } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino); if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
@@ -12782,7 +12797,6 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     ? await assertDependableAssetBaselineSource(filePath, {
       isCurrent,
       addFilesAttempt: options.addFilesAttempt,
-      sourceStat: options.sourceStat,
     })
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
@@ -12796,7 +12810,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   if (!isCurrent()) return;
   const validatedIdentity = validatedSource?.sourceIdentity;
   const recheckValidatedIdentity = async () => {
-    if (!baselineScan || validatedSource?.kind !== 'validated-source') return true;
+    if (!baselineScan || !validatedIdentity || validatedSource?.kind === 'source-buffer') return true;
     try {
       return isAddFilesSourceIdentityCurrent(
         await fs.promises.stat(filePath),
@@ -12904,12 +12918,14 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       addFilesAttempt: options.addFilesAttempt,
-      sourceStat: options.sourceStat,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
+      quiet: options.quiet,
     });
     if (!isCurrent()) return;
     if (psdAssets.length > 0) {
+      if (!await recheckValidatedIdentity()) throw new Error('asset_baseline_source_changed');
+      if (operation && !operation.current()) return;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
           (proj.status !== 'watching' && !(baselineScan?.allowPaused && proj.status === 'paused')) ||
@@ -14773,17 +14789,24 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
   let addFilesAttempt = null;
   let operation = baseOperation;
   let backgroundScanWork = Promise.resolve();
+  let pickerPending = false;
+  let pickerSettledPromise = Promise.resolve();
   const operationController = {
     clientOperationId,
+    get pickerPending() { return pickerPending; },
     cancel() {
       baseOperation.close();
       return addFilesAttempt?.cancel('renderer-timeout') !== false;
     },
     waitForSettled() {
-      return backgroundScanWork;
+      return Promise.all([backgroundScanWork, pickerSettledPromise]);
     },
   };
   const projectOperations = activeAddFilesOperations.get(projectId) || new Map();
+  if ([...projectOperations.values()].some(candidate => candidate.pickerPending)) {
+    baseOperation.close();
+    return { success: false, error: 'add_files_operation_in_progress' };
+  }
   if (projectOperations.has(operationId) || (
     clientOperationId && [...projectOperations.values()].some(operation => operation.clientOperationId === clientOperationId)
   )) {
@@ -14811,6 +14834,11 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         { name: 'All Files', extensions: ['*'] },
       ],
     });
+    pickerPending = true;
+    pickerSettledPromise = dialogPromise.then(
+      () => { pickerPending = false; },
+      () => { pickerPending = false; }
+    );
     const dialogOutcome = await Promise.race([
       dialogPromise.then(dialogResult => ({ dialogResult })),
       addFilesAttempt.timeoutPromise.then(deadline => ({ deadline })),
@@ -14981,8 +15009,12 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     // Release targeted-cancellation ownership as soon as the IPC operation
     // ends. Any parser work still settling is already cancelled/fenced and
     // must not delay the user-visible result or retain the operation map.
-    if (projectOperations.get(operationId) === operationController) projectOperations.delete(operationId);
-    if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
+    const releaseOperation = () => {
+      if (projectOperations.get(operationId) === operationController) projectOperations.delete(operationId);
+      if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
+    };
+    if (pickerPending) pickerSettledPromise.then(releaseOperation, releaseOperation);
+    else releaseOperation();
     Promise.resolve(operationController.waitForSettled())
       .catch(() => {})
       .finally(() => addFilesAttempt?.dispose());

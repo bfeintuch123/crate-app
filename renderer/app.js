@@ -655,6 +655,7 @@ async function runRendererAction(key, element, busyLabel, action, idleLabel = nu
 function createRendererDeadlineAttempt(timeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS) {
   let active = true;
   let timer = null;
+  const deadlineAt = Date.now() + timeoutMs;
   let resolveTimeout;
   const timeoutPromise = new Promise(resolve => { resolveTimeout = resolve; });
   const cancel = reason => {
@@ -665,10 +666,15 @@ function createRendererDeadlineAttempt(timeoutMs = ADD_FILES_OPERATION_TIMEOUT_M
     resolveTimeout({ timedOut: reason === 'timeout', reason });
     return true;
   };
+  const expireIfNeeded = () => {
+    if (active && Date.now() >= deadlineAt) cancel('timeout');
+    return active;
+  };
   timer = setTimeout(() => cancel('timeout'), timeoutMs);
   return {
     timeoutMs,
-    isCurrent: () => active,
+    deadlineAt,
+    isCurrent: expireIfNeeded,
     timeoutPromise,
     cancel,
     dispose: () => {
