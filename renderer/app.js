@@ -7,6 +7,8 @@ try {
 // ===== Constants =====
 const MAX_PROJECTS = 7;
 const PROJECT_CREATION_REQUEST_TIMEOUT_MS = 30000;
+const ADD_FILES_OPERATION_TIMEOUT_MS = 30000;
+let rendererAddFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
 const PRIMARY_WORKING_FILE_EXTS = new Set([
   '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
@@ -624,6 +626,50 @@ async function runRendererAction(key, element, busyLabel, action, idleLabel = nu
     rendererActionsInFlight.delete(key);
     setRendererActionBusy(element, false, busyLabel, idleLabel);
   }
+}
+
+function createRendererDeadlineAttempt(timeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS) {
+  let active = true;
+  let timer = null;
+  let resolveTimeout;
+  const timeoutPromise = new Promise(resolve => { resolveTimeout = resolve; });
+  const cancel = reason => {
+    if (!active) return false;
+    active = false;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    resolveTimeout({ timedOut: reason === 'timeout', reason });
+    return true;
+  };
+  timer = setTimeout(() => cancel('timeout'), timeoutMs);
+  return {
+    timeoutMs,
+    isCurrent: () => active,
+    timeoutPromise,
+    cancel,
+    dispose: () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
+  };
+}
+
+async function runRendererDeadlineAttempt(work, attempt) {
+  let workPromise;
+  try {
+    workPromise = Promise.resolve(work(attempt));
+  } catch (error) {
+    workPromise = Promise.reject(error);
+  }
+  const outcome = await Promise.race([
+    workPromise.then(value => ({ timedOut: false, value })),
+    attempt.timeoutPromise,
+  ]);
+  if (outcome.timedOut) {
+    attempt.cancel(outcome.reason || 'timeout');
+    return outcome;
+  }
+  return outcome;
 }
 
 // ===== Init =====
@@ -1352,7 +1398,9 @@ function updateNamingPreview() {
 }
 
 // ===== Render Files =====
-async function renderFiles() {
+async function renderFiles(options = {}) {
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+  if (!isCurrent()) return false;
   const renderRequestId = ++fileWorkspaceRenderRequestId;
   const workspaceRequestId = ++assetWorkspaceRequestId;
   const viewState = getRendererViewState();
@@ -1360,6 +1408,7 @@ async function renderFiles() {
   const filesView = $('#files-view');
 
   // If no project is selected, try to auto-select an active one
+  if (!isCurrent()) return false;
   if (!state.selectedProjectId) {
     const watching = state.projects.find(p => p.status === 'watching');
     if (watching) {
@@ -1367,6 +1416,7 @@ async function renderFiles() {
     }
   }
 
+  if (!isCurrent()) return false;
   if (!state.selectedProjectId) {
     setActiveFileVisualProject(null);
     setAssetReviewProject(null);
@@ -1378,7 +1428,7 @@ async function renderFiles() {
   }
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
-  if (!project) {
+  if (!project || !isCurrent()) {
     setActiveFileVisualProject(null);
     setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div><div class="app-empty-desc">Choose a project or start a new one.</div>';
@@ -1466,6 +1516,7 @@ async function renderFiles() {
     }
   }
   if (
+    !isCurrent() ||
     renderRequestId !== fileWorkspaceRenderRequestId ||
     workspaceRequestId !== assetWorkspaceRequestId ||
     state.selectedProjectId !== project.id
@@ -1515,8 +1566,11 @@ async function renderFiles() {
   const packageBtn = $('#btn-package');
   packageBtn.disabled = false;
 
-  await syncExistingAssetsDecisionModal(project);
+  if (!isCurrent()) return false;
+  await syncExistingAssetsDecisionModal(project, { isCurrent });
+  if (!isCurrent()) return false;
   restoreRendererViewState(viewState);
+  return true;
 }
 
 function getAssetReviewExclusionKey(file) {
@@ -1721,7 +1775,8 @@ async function ensureProjectAssetWorkspace(project) {
   }
 }
 
-async function showExistingAssetsDecisionModal(project, packageRequestId = null) {
+async function showExistingAssetsDecisionModal(project, packageRequestId = null, options = {}) {
+  const isAttemptCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
   const modal = $('#modal-existing-assets');
   if (!modal || !project) return;
   const lease = claimModalLease('modal-existing-assets');
@@ -1733,6 +1788,7 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
     (packageRequestId === null || packageReviewRequestId === packageRequestId) &&
     state.selectedProjectId === project.id &&
     projectSelectionEpoch === selectionEpoch &&
+    isAttemptCurrent() &&
     isCurrentModalLease('modal-existing-assets', sessionId)
   );
   try {
@@ -1802,14 +1858,16 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
   }
 }
 
-async function syncExistingAssetsDecisionModal(project) {
+async function syncExistingAssetsDecisionModal(project, options = {}) {
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+  if (!isCurrent()) return false;
   const requiresDecision = project && project.assetBaseline && project.assetBaseline.status === 'decision-required';
   if (!requiresDecision) {
     if (existingAssetsModalProjectId) hideExistingAssetsDecisionModal();
     return;
   }
   if (existingAssetsModalProjectId === project.id && !$('#modal-existing-assets').classList.contains('hidden')) return;
-  await showExistingAssetsDecisionModal(project);
+  await showExistingAssetsDecisionModal(project, null, { isCurrent });
 }
 
 async function submitExistingAssetsDecision(decision, { openReview = false } = {}) {
@@ -4052,23 +4110,91 @@ function setupEventListeners() {
       return;
     }
     const button = event.currentTarget || $('#btn-add-files');
+    const projectId = state.selectedProjectId;
+    const selectionEpoch = projectSelectionEpoch;
     try {
-      await runRendererAction(`add-files:${state.selectedProjectId}`, button, 'Adding…', async () => {
-        const result = await window.crate.addFiles(state.selectedProjectId);
+      await runRendererAction(`add-files:${projectId}`, button, 'Adding…', async () => {
+        const attempt = createRendererDeadlineAttempt(rendererAddFilesOperationTimeoutMs);
+        const isCurrent = () => (
+          attempt.isCurrent() &&
+          state.selectedProjectId === projectId &&
+          projectSelectionEpoch === selectionEpoch
+        );
+        const isSelectionCurrent = () => (
+          state.selectedProjectId === projectId &&
+          projectSelectionEpoch === selectionEpoch
+        );
+        try {
+          const addOutcome = await runRendererDeadlineAttempt(
+            () => window.crate.addFiles(projectId),
+            attempt
+          );
+          if (addOutcome.timedOut) {
+            if (isSelectionCurrent()) {
+              showToast(`Crate could not finish adding files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+            }
+            return;
+          }
+          if (!isCurrent()) return;
+          const result = addOutcome.value;
         if (result?.success === false) {
-          state.projects = await window.crate.getProjects();
-          await renderFiles();
+          const refreshOutcome = await runRendererDeadlineAttempt(
+            () => window.crate.getProjects(),
+            attempt
+          );
+          if (refreshOutcome.timedOut || !isCurrent()) {
+            if (refreshOutcome.timedOut && isSelectionCurrent()) {
+              showToast(`Crate could not refresh the added files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+            }
+            return;
+          }
+          state.projects = refreshOutcome.value;
+          const renderOutcome = await runRendererDeadlineAttempt(
+            () => renderFiles({ isCurrent }),
+            attempt
+          );
+          if (renderOutcome.timedOut) {
+            if (isSelectionCurrent()) {
+              showToast(`Crate could not refresh the added files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+            }
+            return;
+          }
+          if (!isCurrent()) return;
           if (result.error === 'add_files_partial_scan_failure') {
             const count = Number.isSafeInteger(result.failedCount) ? result.failedCount : 1;
             showToast(`${count} file${count === 1 ? '' : 's'} could not be scanned. Successful files were kept.`);
+          } else if (result.error === 'add_files_timeout') {
+            showToast(`Crate could not finish scanning within ${Math.ceil((result.timeoutMs || attempt.timeoutMs) / 1000)} seconds. Selected files were kept; try again.`);
           } else {
             showToast('Crate could not add the selected files. Try again.');
           }
           return;
         }
         if (Array.isArray(result)) {
-          state.projects = await window.crate.getProjects();
-          await renderFiles();
+          const refreshOutcome = await runRendererDeadlineAttempt(
+            () => window.crate.getProjects(),
+            attempt
+          );
+          if (refreshOutcome.timedOut || !isCurrent()) {
+            if (refreshOutcome.timedOut && isSelectionCurrent()) {
+              showToast(`Crate could not refresh the added files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+            }
+            return;
+          }
+          state.projects = refreshOutcome.value;
+          const renderOutcome = await runRendererDeadlineAttempt(
+            () => renderFiles({ isCurrent }),
+            attempt
+          );
+          if (renderOutcome.timedOut) {
+            if (isSelectionCurrent()) {
+              showToast(`Crate could not refresh the added files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+            }
+            return;
+          }
+        }
+        } finally {
+          attempt.dispose();
         }
       }, '+ Add Files');
     } catch (error) {

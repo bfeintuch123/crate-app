@@ -6650,6 +6650,58 @@ test('renderer reports a partial Add Files scan failure and clears busy state', 
   assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
 });
 
+test('renderer times out a stalled Add Files reconciliation and fences its late refresh', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderGate = createDeferred();
+  const project = { id: 'stalled-refresh-project', name: 'Stalled Refresh', status: 'watching', files: [], pendingFiles: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => [project],
+      getProjects: async () => [project],
+      getAssetWorkspace: async () => renderGate.promise,
+    },
+  });
+  vm.runInContext("rendererAddFilesOperationTimeoutMs = 25; state.selectedProjectId = 'stalled-refresh-project'; state.projects = [{ id: 'stalled-refresh-project', name: 'Stalled Refresh', status: 'watching', files: [], pendingFiles: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].textContent, '+ Add Files');
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+  assert.match(elements['toast-message'].textContent, /refresh the added files within 1 seconds/u);
+
+  renderGate.resolve({ projectId: project.id, files: [], pendingFiles: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext('state.assetWorkspace', renderer), null);
+});
+
+test('renderer fences a superseded Add Files activation after a project switch', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const add = createDeferred();
+  const oldProject = { id: 'old-add-project', name: 'Old Add', status: 'watching', files: [] };
+  const newProject = { id: 'new-add-project', name: 'New Add', status: 'watching', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: () => add.promise,
+      getProjects: async () => [oldProject, newProject],
+      getAssetWorkspace: async projectId => ({ projectId, files: [], pendingFiles: [] }),
+    },
+  });
+  vm.runInContext("state.selectedProjectId = 'old-add-project'; state.projects = [testProject = { id: 'old-add-project', name: 'Old Add', status: 'watching', files: [] }];", renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  vm.runInContext("state.selectedProjectId = 'new-add-project'; projectSelectionEpoch += 1;", renderer);
+  add.resolve([oldProject]);
+  await add.promise;
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext('state.projects', renderer))), [oldProject]);
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
+});
+
 test('renderer clears Add Files busy state after an IPC error', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const renderer = loadRendererHelpers(document, {

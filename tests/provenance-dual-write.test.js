@@ -1020,6 +1020,14 @@ module.exports.__crateMetadataTestHooks = {
   clearAssetBaselineScans() {
     assetBaselineScans.clear();
   },
+  getAddFilesOperationTimeoutMs() {
+    return addFilesOperationTimeoutMs;
+  },
+  setAddFilesOperationTimeoutMs(value) {
+    const previous = addFilesOperationTimeoutMs;
+    if (Number.isFinite(value) && value >= 0) addFilesOperationTimeoutMs = value;
+    return previous;
+  },
   startInactivityChecker() {
     startInactivityChecker();
   },
@@ -13717,6 +13725,61 @@ test('large Add Files source scans use bounded concurrency and report per-file f
     await callIpcRaw('projects:delete', partialProject.id);
   } finally {
     fs.promises.stat = originalStat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('timed-out Add Files preserves admission and rejects a late scan result', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-add-files-timeout-test-'));
+  const originalReadFile = fs.promises.readFile;
+  const previousTimeout = metadataTestHooks.setAddFilesOperationTimeoutMs(25);
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+  const readGate = new Promise(resolve => { releaseRead = resolve; });
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Timed Out Source.ai');
+    const linkedPath = path.join(fixtureRoot, 'Late Linked Asset.png');
+    fs.writeFileSync(linkedPath, 'late result must be fenced');
+    writeSyntheticAiFile(sourcePath, `late link ${linkedPath}`);
+    fs.promises.readFile = async function deferTimedOutSource(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        markReadStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Timed-out Add Files');
+    manualDialogFor([sourcePath]);
+    const addPromise = callIpcRaw('projects:add-files', project.id);
+    await readStarted;
+    const result = await addPromise;
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'add_files_timeout');
+    assert.equal(result.timeoutMs, 25);
+    assert.equal(result.selectedCount, 1);
+    assert.equal(result.admittedCount, 1);
+    assert.equal(result.failedCount, 1);
+    assert.equal(result.scanResults[0].error, 'add_files_timeout');
+
+    let fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    assert.equal(fresh.packagedAt, null);
+    assert.equal(fresh.outputPath, null);
+
+    releaseRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 50));
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
+    metadataTestHooks.setAddFilesOperationTimeoutMs(previousTimeout);
+    metadataTestHooks.clearAssetBaselineScans();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });

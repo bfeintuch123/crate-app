@@ -62,6 +62,7 @@ const {
   writeFileIntoPackageExact,
 } = require('./parsers/package-safety');
 const { summarizeDiagnosticPackageErrors } = require('./diagnostic-summary');
+const { createAddFilesAttempt } = require('./parsers/add-files-operation');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./parsers/figma-redaction');
 const {
   FIGMA_NETWORK_LIMITS,
@@ -81,6 +82,8 @@ const OWNER_ONLY_FILE_MODE = 0o600;
 const PACKAGE_TRANSACTION_WORKER_PATH = path.join(__dirname, 'parsers', 'package-transaction-worker.js');
 const PACKAGE_TRANSACTION_CHUNK_BYTES = 1024 * 1024;
 const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
+const ADD_FILES_OPERATION_TIMEOUT_MS = 30_000;
+let addFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -4394,7 +4397,12 @@ function getProjectAssetBaselineSourcePaths(project) {
   return [...pathsByKey.values()];
 }
 
-function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = null, { allowPaused = false } = {}) {
+function beginProjectAssetBaselineScan(
+  projectId,
+  sourcePath,
+  activationToken = null,
+  { allowPaused = false, operation = null } = {}
+) {
   const project = getProjects().find(item => item.id === projectId);
   if (!project || (project.status !== 'watching' && !(allowPaused && project.status === 'paused'))) return null;
   if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
@@ -4412,18 +4420,37 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
       requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
       completedSourceKeys: new Set(),
       inFlightBySource: new Map(),
+      activeScans: new Set(),
       queuedSourceKeys: new Set(),
+      queuedScansByOperation: new Map(),
       presentationMediaOccurrencesBySource: new Map(),
     };
     assetBaselineScans.set(projectId, state);
   } else {
     state.queuedSourceKeys ||= new Set();
+    state.queuedScansByOperation ||= new Map();
     state.requiredSourceKeys.add(sourceKey);
-    state.queuedSourceKeys?.delete(sourceKey);
+    if (operation && state.queuedScansByOperation.has(operation)) {
+      const queued = state.queuedScansByOperation.get(operation);
+      queued.delete(sourceKey);
+      if (queued.size === 0) state.queuedScansByOperation.delete(operation);
+    }
+    const stillQueued = [...state.queuedScansByOperation.values()].some(queued => queued.has(sourceKey));
+    if (!stillQueued) state.queuedSourceKeys.delete(sourceKey);
   }
 
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
-  return { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
+  const scan = {
+    projectId,
+    sourceKey,
+    startedAt: state.startedAt,
+    activationToken,
+    allowPaused,
+    operation,
+  };
+  state.activeScans ||= new Set();
+  state.activeScans.add(scan);
+  return scan;
 }
 
 async function completeProjectAssetBaselineScan(scan, dependable) {
@@ -4431,9 +4458,18 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   const state = assetBaselineScans.get(scan.projectId);
   if (!state) return;
 
+  const wasActive = state.activeScans?.delete(scan) !== false;
+  const attemptWasCancelled = scan.operation && !scan.operation.current();
+
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
-  if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
-  else state.inFlightBySource.delete(scan.sourceKey);
+  if (wasActive) {
+    if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
+    else state.inFlightBySource.delete(scan.sourceKey);
+  }
+  // A timed-out or superseded Add Files attempt may settle after the IPC
+  // response. It can release its own in-flight slot, but it must not establish
+  // or rewrite the shared baseline from a late result.
+  if (attemptWasCancelled || scan.cancelled) return;
   // A duplicate observer can start more than one scan for the same source.
   // One dependable completion is sufficient; a later failed duplicate must not
   // erase that proof and make the result depend on completion order.
@@ -4490,6 +4526,27 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   }
 }
 
+function cancelProjectAssetBaselineScanOperation(projectId, operation, sourcePaths = []) {
+  const state = assetBaselineScans.get(projectId);
+  if (!state) return;
+  for (const scan of [...(state.activeScans || [])]) {
+    if (scan.operation !== operation) continue;
+    scan.cancelled = true;
+    state.activeScans.delete(scan);
+    const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
+    if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
+    else state.inFlightBySource.delete(scan.sourceKey);
+  }
+  const ownedQueue = state.queuedScansByOperation?.get(operation);
+  for (const sourceKey of ownedQueue || []) {
+    if (![...state.queuedScansByOperation.entries()]
+      .some(([owner, queued]) => owner !== operation && queued.has(sourceKey))) {
+      state.queuedSourceKeys?.delete(sourceKey);
+    }
+  }
+  if (ownedQueue) state.queuedScansByOperation.delete(operation);
+}
+
 const MANUAL_ADD_SCAN_CONCURRENCY = 4;
 
 function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
@@ -4504,12 +4561,15 @@ function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
       requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
       completedSourceKeys: new Set(),
       inFlightBySource: new Map(),
+      activeScans: new Set(),
       queuedSourceKeys: new Set(),
+      queuedScansByOperation: new Map(),
       presentationMediaOccurrencesBySource: new Map(),
     };
     assetBaselineScans.set(projectId, state);
   }
   state.queuedSourceKeys ||= new Set();
+  state.queuedScansByOperation ||= new Map();
 
   for (const sourcePath of sourcePaths) {
     const sourceKey = normalizeTrackedFilePath(sourcePath);
@@ -4518,7 +4578,7 @@ function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
   return state;
 }
 
-function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
+function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths, operation = null) {
   const uniquePaths = [...new Map(
     (Array.isArray(sourcePaths) ? sourcePaths : [])
       .map(sourcePath => [normalizeTrackedFilePath(sourcePath), sourcePath])
@@ -4526,10 +4586,16 @@ function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
   ).values()];
   const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
   if (state) {
+    const ownedQueue = operation
+      ? (state.queuedScansByOperation.get(operation) || new Set())
+      : null;
     for (const sourcePath of uniquePaths) {
       const sourceKey = normalizeTrackedFilePath(sourcePath);
-      if (sourceKey) state.queuedSourceKeys.add(sourceKey);
+      if (!sourceKey) continue;
+      state.queuedSourceKeys.add(sourceKey);
+      ownedQueue?.add(sourceKey);
     }
+    if (ownedQueue && ownedQueue.size > 0) state.queuedScansByOperation.set(operation, ownedQueue);
   }
   return uniquePaths;
 }
@@ -4549,7 +4615,7 @@ function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths) {
 }
 
 async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken, operation, options = {}) {
-  const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths);
+  const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths, operation);
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4578,9 +4644,28 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   };
 
   const workerCount = Math.min(MANUAL_ADD_SCAN_CONCURRENCY, queuedPaths.length);
-  await Promise.all(Array.from({ length: workerCount }, () => runNext()));
+  const scanWork = Promise.all(Array.from({ length: workerCount }, () => runNext()));
+  const attempt = options.addFilesAttempt;
+  if (attempt) {
+    const outcome = await Promise.race([
+      scanWork.then(() => ({ timedOut: false })),
+      attempt.timeoutPromise,
+    ]);
+    if (outcome.timedOut) {
+      attempt.cancel(outcome.reason || 'timeout');
+      cancelProjectAssetBaselineScanOperation(projectId, operation, queuedPaths);
+      for (let index = 0; index < queuedPaths.length; index++) {
+        if (!outcomes[index]) {
+          outcomes[index] = { path: queuedPaths[index], success: false, error: 'add_files_timeout' };
+        }
+      }
+      return { cancelled: true, timedOut: true, outcomes };
+    }
+  } else {
+    await scanWork;
+  }
   if (!operation.current()) {
-    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths);
+    cancelProjectAssetBaselineScanOperation(projectId, operation, queuedPaths);
     return { cancelled: true, outcomes };
   }
   return { cancelled: false, outcomes };
@@ -12248,6 +12333,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     ? null
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
+      operation,
     });
   let dependableScanCompleted = false;
   try {
@@ -14198,8 +14284,10 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
 });
 
 registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
-  const operation = captureProjectOperation(projectId);
-  if (!operation) return null;
+  const baseOperation = captureProjectOperation(projectId);
+  if (!baseOperation) return null;
+  let addFilesAttempt = null;
+  let operation = baseOperation;
   try {
     // M6: Filter to supported design + image file types.
     const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
@@ -14223,6 +14311,13 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
         .map(filePath => [normalizeTrackedFilePath(filePath), filePath])
         .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
     ).values()];
+    addFilesAttempt = createAddFilesAttempt({ timeoutMs: addFilesOperationTimeoutMs });
+    operation = {
+      activationToken: baseOperation.activationToken,
+      close: () => baseOperation.close(),
+      current: () => baseOperation.current() && addFilesAttempt.isCurrent(),
+      adoptScope: scope => baseOperation.adoptScope(scope) && addFilesAttempt.isCurrent(),
+    };
     const result = mutateProject(projectId, (project) => {
       if (!operation.current()) return null;
       const acceptedByKey = new Map();
@@ -14280,8 +14375,23 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
         baselineSources,
         operation.activationToken,
         operation,
-        { allowPausedBaseline: true }
+        { allowPausedBaseline: true, addFilesAttempt }
       );
+      if (scanReport.timedOut) {
+        const view = getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId));
+        const admittedKeys = new Set((result || []).map(getTrackedFileDedupKey).filter(Boolean));
+        return {
+          success: false,
+          error: 'add_files_timeout',
+          timeoutMs: addFilesOperationTimeoutMs,
+          selectedCount: filePaths.length,
+          admittedCount: filePaths.filter(filePath => admittedKeys.has(normalizeTrackedFilePath(filePath))).length,
+          completedCount: scanReport.outcomes.filter(outcome => outcome?.success).length,
+          failedCount: scanReport.outcomes.filter(outcome => outcome && !outcome.success).length,
+          scanResults: scanReport.outcomes,
+          files: view ? view.files : [],
+        };
+      }
       if (scanReport.cancelled || !operation.current()) return null;
       const failedScans = scanReport.outcomes.filter(outcome => outcome && !outcome.success);
       if (failedScans.length > 0) {
@@ -14302,6 +14412,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
     return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
   } finally {
     operation.close();
+    addFilesAttempt?.dispose();
   }
 });
 

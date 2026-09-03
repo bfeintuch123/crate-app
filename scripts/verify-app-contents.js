@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const RUNTIME_PARSER_FILES = Object.freeze([
+  'add-files-operation.js',
   'admission-budgets.js',
   'aftereffects.js',
   'ai.js',
