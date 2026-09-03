@@ -619,12 +619,17 @@ function setRendererActionBusy(element, busy, busyLabel, idleLabel = null) {
 async function runRendererAction(key, element, busyLabel, action, idleLabel = null) {
   if (rendererActionsInFlight.has(key)) return undefined;
   rendererActionsInFlight.add(key);
+  const actionToken = Symbol(key);
+  if (element) element.__rendererActionOwner = actionToken;
   setRendererActionBusy(element, true, busyLabel, idleLabel);
   try {
     return await action();
   } finally {
     rendererActionsInFlight.delete(key);
-    setRendererActionBusy(element, false, busyLabel, idleLabel);
+    if (element?.__rendererActionOwner === actionToken) {
+      delete element.__rendererActionOwner;
+      setRendererActionBusy(element, false, busyLabel, idleLabel);
+    }
   }
 }
 

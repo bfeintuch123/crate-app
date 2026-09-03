@@ -11780,36 +11780,39 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
  */
 async function extractLinkedAssets(filePath, options = {}) {
   const strict = options.strict === true;
+  const extractorOptions = {
+    strict,
+    sourceBuffer: options.sourceBuffer,
+    isCurrent: options.isCurrent,
+    addFilesAttempt: options.addFilesAttempt,
+  };
   const ext = path.extname(filePath).toLowerCase();
   try {
     switch (ext) {
       case '.ai':
       case '.pdf':
       case '.xd':
-        return await extractLinkedAssetsRegex(filePath, {
-          strict,
-          sourceBuffer: options.sourceBuffer,
-        });
+        return await extractLinkedAssetsRegex(filePath, extractorOptions);
       case '.psd':
-        return await extractLinkedAssetsPhotoshop(filePath, { strict });
+        return await extractLinkedAssetsPhotoshop(filePath, extractorOptions);
       case '.indd':
       case '.idml':
-        return await extractLinkedAssetsInDesign(filePath, { strict });
+        return await extractLinkedAssetsInDesign(filePath, extractorOptions);
       case '.sketch':
-        return await extractLinkedAssetsSketch(filePath, { strict });
+        return await extractLinkedAssetsSketch(filePath, extractorOptions);
       case '.afdesign':
       case '.afphoto':
       case '.afpub':
-        return await extractLinkedAssetsAffinity(filePath, { strict });
+        return await extractLinkedAssetsAffinity(filePath, extractorOptions);
       case '.key':
       case '.pptx':
-        return await extractLinkedAssetsZipMedia(filePath, { strict });
+        return await extractLinkedAssetsZipMedia(filePath, extractorOptions);
       case '.ppt':
-        return await extractLinkedAssetsRegex(filePath, { strict });
+        return await extractLinkedAssetsRegex(filePath, extractorOptions);
       case '.pxd':
-        return await extractLinkedAssetsPxd(filePath, { strict });
+        return await extractLinkedAssetsPxd(filePath, extractorOptions);
       case '.fig':
-        return await extractLinkedAssetsRegex(filePath, { strict });
+        return await extractLinkedAssetsRegex(filePath, extractorOptions);
       default:
         return [];
     }
@@ -11840,13 +11843,23 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       }
     }
     const buf = suppliedBuffer || await fs.promises.readFile(filePath);
-    const content = buf.toString('utf8');
-    let match;
-    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
-      const linkedPath = match[0];
-      if (linkedPath === filePath) continue; // skip self-reference
-      results.push(linkedPath);
+    const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+    const chunkBytes = 1024 * 1024;
+    const carryBytes = 32 * 1024;
+    let carry = '';
+    for (let offset = 0; offset < buf.length; offset += chunkBytes) {
+      if (!isCurrent()) return [];
+      const content = carry + buf.subarray(offset, offset + chunkBytes).toString('utf8');
+      LINKED_ASSET_REGEX.lastIndex = 0;
+      let match;
+      while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
+        const linkedPath = match[0];
+        if (linkedPath !== filePath) results.push(linkedPath);
+      }
+      carry = content.slice(-carryBytes);
+      await new Promise(resolve => setImmediate(resolve));
     }
+    if (!isCurrent()) return [];
   } catch (e) {
     if (strict) throw e;
   }
@@ -12184,20 +12197,13 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
  * externally linked files (rare but possible in Keynote).
  */
 async function extractLinkedAssetsZipMedia(filePath, options = {}) {
-  const results = [];
   try {
     const buf = await fs.promises.readFile(filePath);
-    const content = buf.toString('utf8');
-    const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-    let match;
-    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
-      if (match[0] === filePath) continue;
-      results.push(match[0]);
-    }
+    return extractLinkedAssetsRegex(filePath, { ...options, sourceBuffer: buf });
   } catch (e) {
     if (options.strict === true) throw e;
   }
-  return results;
+  return [];
 }
 
 /**
@@ -12420,6 +12426,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
     sourceBuffer: validatedSourceBuffer,
+    isCurrent,
+    addFilesAttempt: options.addFilesAttempt,
   });
   if (!isCurrent()) return;
   const latestProject = getProjects().find(item => item.id === projectId);

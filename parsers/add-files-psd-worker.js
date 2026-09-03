@@ -39,7 +39,8 @@ if (!port || typeof port.on !== 'function' || typeof port.postMessage !== 'funct
   throw new Error('Add Files PSD worker requires a parent port');
 }
 
-port.on('message', message => {
+port.on('message', event => {
+  const message = event && Object.prototype.hasOwnProperty.call(event, 'data') ? event.data : event;
   if (!message || message.type !== 'parse' || typeof message.filePath !== 'string') return;
   try {
     port.postMessage({ type: 'result', result: parsePsd(message.filePath) });
