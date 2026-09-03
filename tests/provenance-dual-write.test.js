@@ -13672,7 +13672,7 @@ test('manual add preserves file ledger entry and records one session observation
 });
 
 test('Add Files admits a single large selection exactly once', async () => {
-  for (const count of [30, 263, 500]) {
+  for (const count of [30, 263, 500, 1000]) {
     const project = await createProject(`Large Add Files ${count}`);
     const filePaths = Array.from({ length: count }, (_, index) => (
       path.join(TEST_HOME, 'Desktop', `large-add-${count}-${index + 1}.png`)

@@ -97,20 +97,23 @@ async function runCancellableExec(command, options = {}) {
   }
 }
 
-async function readFileWithAddFilesCancellation(filePath, attempt, knownSize = null) {
+async function readFileWithAddFilesCancellation(filePath, attempt) {
   if (!attempt) return fs.promises.readFile(filePath);
   if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
-  // Small bounded reads complete before a cancellation can materially race
-  // them; avoid adding AbortSignal setup overhead to large manual batches.
-  if (Number.isSafeInteger(knownSize) && knownSize <= 8 * 1024 * 1024) {
-    const result = await fs.promises.readFile(filePath);
-    if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
-    return result;
-  }
   const controller = new AbortController();
-  const removeCancelListener = attempt.onCancel(() => controller.abort());
+  let rejectCancellation;
+  const cancellation = new Promise((resolve, reject) => {
+    rejectCancellation = reject;
+  });
+  const removeCancelListener = attempt.onCancel(reason => {
+    controller.abort();
+    rejectCancellation(new Error(`add_files_parser_cancelled:${reason || 'cancelled'}`));
+  });
   try {
-    return await fs.promises.readFile(filePath, { signal: controller.signal });
+    return await Promise.race([
+      fs.promises.readFile(filePath, { signal: controller.signal }),
+      cancellation,
+    ]);
   } finally {
     removeCancelListener();
   }
@@ -5979,7 +5982,7 @@ function recordLsofAcceptedFileProvenance(project, fileEntry, processContext = {
   recordLsofAppOpenedFile(project, fileEntry, processContext);
 }
 
-function recordSessionObservedFile(project, fileEntry, observer = {}) {
+function recordSessionObservedFile(project, fileEntry, observer = {}, append = appendObservation) {
   try {
     if (!project || !fileEntry || typeof fileEntry.path !== 'string' || !fileEntry.path.trim()) return;
     const provenance = ensureProjectProvenance(project);
@@ -6049,9 +6052,28 @@ function recordSessionObservedFile(project, fileEntry, observer = {}) {
         ...(observerPayload || {}),
       },
     });
-    appendObservation(provenance, observation);
+    append(provenance, observation);
   } catch (e) {
     console.warn('[crate][provenance] session_observed_file skipped:', e.message);
+  }
+}
+
+function recordSessionObservedFiles(project, fileEntries, observer = {}) {
+  if (!project || !Array.isArray(fileEntries) || fileEntries.length === 0) return;
+  const provenance = ensureProjectProvenance(project);
+  if (!provenance) return;
+  const observedKeys = new Set(
+    (provenance.observations || [])
+      .map(observation => observation && observation.dedupeKey)
+      .filter(Boolean)
+  );
+  const appendBatch = (target, observation) => {
+    if (!observation || observedKeys.has(observation.dedupeKey)) return;
+    target.observations.push(observation);
+    observedKeys.add(observation.dedupeKey);
+  };
+  for (const fileEntry of fileEntries) {
+    recordSessionObservedFile(project, fileEntry, observer, appendBatch);
   }
 }
 
@@ -12397,7 +12419,8 @@ async function captureExistingPresentationMediaBaseline(
   projectId,
   presentationPath,
   baselineScan,
-  isCurrent
+  isCurrent,
+  options = {}
 ) {
   const ext = path.extname(presentationPath).toLowerCase();
   if (!baselineScan || (ext !== '.pptx' && ext !== '.key')) return;
@@ -12425,6 +12448,8 @@ async function captureExistingPresentationMediaBaseline(
       },
       onMaterialized: materialized => invocationFiles.push(materialized),
       onExtracted: extraction => extractionRecords.push(extraction),
+      isCurrent,
+      addFilesAttempt: options.addFilesAttempt,
     });
     if (!isCurrent()) return;
 
@@ -12692,7 +12717,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     }
   }
   if (baselineScan && (ext === '.pptx' || ext === '.key')) {
-    await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent);
+    await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent, options);
   }
   dependableScanCompleted = true;
   return { success: true };
@@ -14552,6 +14577,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         const key = getTrackedFileDedupKey(file);
         if (key && !acceptedByKey.has(key)) acceptedByKey.set(key, file);
       }
+      const manuallyObservedFiles = [];
       for (const filePath of filePaths) {
         const fileEntry = {
           path: filePath,
@@ -14577,12 +14603,13 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         ]) {
           if (exclusionKey) excludedKeys.delete(exclusionKey);
         }
-        recordSessionObservedFile(project, authorizedFile, {
-          kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
-          method: 'projects:add-files',
-          payload: { authoritySource: 'manual-browse' },
-        });
+        manuallyObservedFiles.push(authorizedFile);
       }
+      recordSessionObservedFiles(project, manuallyObservedFiles, {
+        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+        method: 'projects:add-files',
+        payload: { authoritySource: 'manual-browse' },
+      });
       project.files = deduplicateFiles(project.files);
       project.excludedAssetKeys = [...excludedKeys];
       return project.files;
@@ -14639,10 +14666,15 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
   } finally {
     operation.close();
-    addFilesAttempt?.dispose();
-    await operationController.waitForSettled();
+    if (addFilesAttempt?.isCurrent()) addFilesAttempt.cancel('cancelled');
+    // Release targeted-cancellation ownership as soon as the IPC operation
+    // ends. Any parser work still settling is already cancelled/fenced and
+    // must not delay the user-visible result or retain the operation map.
     if (projectOperations.get(operationId) === operationController) projectOperations.delete(operationId);
     if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
+    Promise.resolve(operationController.waitForSettled())
+      .catch(() => {})
+      .finally(() => addFilesAttempt?.dispose());
   }
 });
 
@@ -15574,22 +15606,25 @@ function getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths) {
   };
 }
 
-async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths) {
+async function extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths, options = {}) {
   try {
-    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
+    const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
       timeout: 10000, maxBuffer: 50 * 1024 * 1024,
-      encoding: 'buffer'
+      encoding: 'buffer',
+      ...options,
     });
     return { data, outputTail: ext === '.key' ? getKeynoteArchiveEntryOutputTail(zipPath) : null };
   } catch (exactError) {
     if (ext !== '.key') throw exactError;
+    if (!isAddFilesParserCurrent(options)) throw exactError;
 
     const fallback = getUniqueKeynoteWildcardFallback(zipPath, listedZipPaths);
     if (!fallback) throw exactError;
 
-    const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, fallback.wildcardPath], {
+    const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', presentationPath, fallback.wildcardPath], {
       timeout: 10000, maxBuffer: 50 * 1024 * 1024,
-      encoding: 'buffer'
+      encoding: 'buffer',
+      ...options,
     });
     return { data, outputTail: getKeynoteArchiveEntryOutputTail(zipPath, fallback.tail) || fallback.tail };
   }
@@ -15686,8 +15721,8 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
   try {
     // List the zip contents — format: "  length  MM-DD-YYYY HH:MM  filename"
-    const { stdout: listing } = await execFileAsync("/usr/bin/unzip", ["-l", presentationPath], {
-      timeout: 10000, encoding: 'utf8'
+    const { stdout: listing } = await runCancellableExecFile("/usr/bin/unzip", ["-l", presentationPath], {
+      timeout: 10000, encoding: 'utf8', ...options,
     });
 
     const listingLines = listing.split('\n');
@@ -15699,6 +15734,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       .filter(Boolean);
 
     for (const line of listingLines) {
+      if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
       // Match: length, date (MM-DD-YYYY), time (HH:MM), filename
       const m = line.match(/^\s+(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\s+(.+)$/);
       if (!m) continue;
@@ -15787,7 +15823,13 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       }
 
       try {
-        const { data, outputTail } = await extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths);
+        const { data, outputTail } = await extractEmbeddedArchiveEntryData(
+          presentationPath,
+          zipPath,
+          ext,
+          listedZipPaths,
+          options
+        );
         let extractedFingerprint = null;
 
         // v1.3.18: Content-based dedup for presentation media — skip if
@@ -15849,6 +15891,8 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         if (descriptor && typeof options.onPlanned === 'function') options.onPlanned(descriptor);
         if (options.planOnly) continue;
 
+        if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
+
         if (typeof options.onBeforeMaterialize === 'function') options.onBeforeMaterialize();
         const destPath = descriptor
           ? (typeof options.resolveOutputPath === 'function'
@@ -15867,7 +15911,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
         if (typeof options.materializeBuffer === 'function') {
           await options.materializeBuffer(destPath, data, OWNER_ONLY_FILE_MODE);
         } else {
-          fs.writeFileSync(destPath, data, { flag: 'wx' });
+          await fs.promises.writeFile(destPath, data, { flag: 'wx' });
         }
         if (typeof options.onAfterWrite === 'function') options.onAfterWrite(destPath);
         if (options.rollbackOnFailure || typeof options.onMaterialized === 'function') {

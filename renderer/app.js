@@ -686,7 +686,12 @@ async function runRendererDeadlineAttempt(work, attempt) {
     workPromise = Promise.reject(error);
   }
   const outcome = await Promise.race([
-    workPromise.then(value => ({ timedOut: false, value })),
+    // Keep late IPC failures attached to the raced promise so a timeout does
+    // not turn a legitimate late rejection into an unhandled renderer error.
+    workPromise.then(
+      value => ({ timedOut: false, value }),
+      error => { throw error; }
+    ),
     attempt.timeoutPromise,
   ]);
   if (outcome.timedOut) {
