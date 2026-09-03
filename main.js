@@ -124,6 +124,26 @@ async function readFileWithAddFilesCancellation(filePath, attempt, knownSize = n
   }
 }
 
+async function accessWithAddFilesCancellation(filePath, mode, attempt) {
+  if (!attempt) return fs.promises.access(filePath, mode);
+  if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  let rejectCancellation;
+  const cancellation = new Promise((resolve, reject) => {
+    rejectCancellation = reject;
+  });
+  const removeCancelListener = attempt.onCancel(reason => {
+    rejectCancellation(new Error(`add_files_parser_cancelled:${reason || 'cancelled'}`));
+  });
+  try {
+    return await Promise.race([
+      fs.promises.access(filePath, mode),
+      cancellation,
+    ]);
+  } finally {
+    removeCancelListener();
+  }
+}
+
 function isAddFilesParserCurrent(options = {}) {
   return typeof options.isCurrent !== 'function' || options.isCurrent();
 }
@@ -12485,6 +12505,23 @@ async function captureExistingPresentationMediaBaseline(
       }
     }
 
+    const extractedMediaInputs = [];
+    for (const extractedPath of extractedPaths) {
+      if (!isCurrent()) return;
+      await new Promise(resolve => setImmediate(resolve));
+      if (!isCurrent()) return;
+      const content = readOwnerOnlyCacheFileSync(
+        extractedPath,
+        tempDir,
+        'presentation-cache-file',
+        PRESENTATION_ASSET_FILE_MODE
+      );
+      extractedMediaInputs.push({
+        extractedPath,
+        contentFingerprint: getPackageContentFingerprint(content),
+      });
+    }
+
     const result = mutateProject(projectId, (proj) => {
       if (
         (proj.status !== 'watching' && !(baselineScan.allowPaused && proj.status === 'paused')) ||
@@ -12494,19 +12531,13 @@ async function captureExistingPresentationMediaBaseline(
 
       let changed = false;
       const acceptedFiles = [];
-      for (const extractedPath of extractedPaths) {
+      for (const { extractedPath, contentFingerprint } of extractedMediaInputs) {
         if (!isCurrent()) return null;
-        const content = readOwnerOnlyCacheFileSync(
-          extractedPath,
-          tempDir,
-          'presentation-cache-file',
-          PRESENTATION_ASSET_FILE_MODE
-        );
         const fileEntry = buildAutoCaptureFileEntry(extractedPath, 'scan-on-save-presentation', {
           assetOrigin: 'existing',
           projectRole: 'asset',
           assetBaselineSourcePath: presentationPath,
-          presentationContentFingerprint: getPackageContentFingerprint(content),
+          presentationContentFingerprint: contentFingerprint,
         });
         const baselineMetadataChanged = markExistingBaselineAssetMetadata(proj, fileEntry);
         const staged = stageLiveObservedFile(proj, fileEntry, {
@@ -12587,7 +12618,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const pExt = path.extname(p).toLowerCase();
     if (!DESIGN_FILE_EXTENSIONS.has(pExt)) continue;
     try {
-      await fs.promises.access(p, fs.constants.F_OK);
+      await accessWithAddFilesCancellation(p, fs.constants.F_OK, options.addFilesAttempt);
       if (!isCurrent()) return;
       validPaths.push(p);
     } catch (e) {

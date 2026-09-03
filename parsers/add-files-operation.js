@@ -21,6 +21,7 @@ function createAddFilesAttempt(options = {}) {
   const cancelListeners = new Set();
   let resolveTimeout;
   const timeoutPromise = new Promise(resolve => { resolveTimeout = resolve; });
+  const deadlineAt = now() + timeoutMs;
 
   const finishTimer = () => {
     if (timer !== null) clearTimer(timer);
@@ -48,8 +49,8 @@ function createAddFilesAttempt(options = {}) {
   timer = setTimer(() => cancel('timeout'), timeoutMs);
   return {
     timeoutMs,
-    deadlineAt: now() + timeoutMs,
-    isCurrent: () => state === 'active',
+    deadlineAt,
+    isCurrent: () => state === 'active' && now() < deadlineAt,
     get state() { return state; },
     get reason() { return reason; },
     timeoutPromise,
