@@ -144,6 +144,8 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'renderer/index.html',
   'renderer/styles.css',
   'assets/tray-icon.png',
+  'parsers/add-files-operation.js',
+  'parsers/add-files-psd-worker.js',
   'parsers/admission-budgets.js',
   'parsers/aftereffects.js',
   'parsers/ai.js',

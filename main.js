@@ -80,10 +80,12 @@ const TEMP_SCRIPT_FILE_MODE = 0o600;
 const OWNER_ONLY_DIR_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const PACKAGE_TRANSACTION_WORKER_PATH = path.join(__dirname, 'parsers', 'package-transaction-worker.js');
+const ADD_FILES_PSD_WORKER_PATH = path.join(__dirname, 'parsers', 'add-files-psd-worker.js');
 const PACKAGE_TRANSACTION_CHUNK_BYTES = 1024 * 1024;
 const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 const ADD_FILES_OPERATION_TIMEOUT_MS = 30_000;
 let addFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
+const activeAddFilesOperations = new Map();
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -4459,7 +4461,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   if (!state) return;
 
   const wasActive = state.activeScans?.delete(scan) !== false;
-  const attemptWasCancelled = scan.operation && !scan.operation.current();
+  const attemptIsCurrent = () => !scan.cancelled && (!scan.operation || scan.operation.current());
 
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
   if (wasActive) {
@@ -4469,7 +4471,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   // A timed-out or superseded Add Files attempt may settle after the IPC
   // response. It can release its own in-flight slot, but it must not establish
   // or rewrite the shared baseline from a late result.
-  if (attemptWasCancelled || scan.cancelled) return;
+  if (!attemptIsCurrent()) return;
   // A duplicate observer can start more than one scan for the same source.
   // One dependable completion is sufficient; a later failed duplicate must not
   // erase that proof and make the result depend on completion order.
@@ -4492,8 +4494,9 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
             .map(file => getAssetBaselineSourceRecoveryRecord(currentProject, file))
         )).filter(Boolean).sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash))
       : [];
+    if (!attemptIsCurrent()) return;
     const persisted = mutateProject(scan.projectId, project => {
-      if (project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+      if (project.assetBaseline?.status !== 'awaiting-first-scan' || !attemptIsCurrent()) return false;
       const validRouteKeys = new Set(
         (project.files || [])
           .filter(isProjectAssetBaselineSource)
@@ -4509,7 +4512,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
       else delete project.assetBaseline.failedRequiredSources;
       return true;
     });
-    if (persisted) sendToRenderer('project:updated', { projectId: scan.projectId });
+    if (persisted && attemptIsCurrent()) sendToRenderer('project:updated', { projectId: scan.projectId });
     return;
   }
 
@@ -11677,7 +11680,56 @@ const STRICT_ZIP_ASSET_BASELINE_EXTENSIONS = new Set([
   '.key', '.pptx', '.pxd', '.xd',
 ]);
 
-async function assertDependableAssetBaselineSource(filePath) {
+function runAddFilesPsdWorker(filePath, attempt) {
+  if (!utilityProcess || typeof utilityProcess.fork !== 'function') {
+    return Promise.reject(new Error('asset_baseline_psd_worker_unavailable'));
+  }
+  return new Promise((resolve, reject) => {
+    let child = null;
+    let settled = false;
+    let removeCancelListener = () => {};
+    const stop = () => {
+      try { child?.kill(); } catch (_) {}
+    };
+    const finish = (error, result = null) => {
+      if (settled) return;
+      settled = true;
+      removeCancelListener();
+      stop();
+      if (error) reject(error);
+      else resolve(result);
+    };
+    try {
+      child = utilityProcess.fork(ADD_FILES_PSD_WORKER_PATH, [], {
+        cwd: path.dirname(ADD_FILES_PSD_WORKER_PATH),
+        env: {},
+        execArgv: [],
+        stdio: 'ignore',
+        serviceName: 'Crate Add Files PSD Scan',
+        allowLoadingUnsignedLibraries: false,
+        disclaim: false,
+      });
+      child.once('error', error => finish(error));
+      child.once('exit', code => {
+        if (!settled && code !== 0) finish(new Error('asset_baseline_psd_worker_exited'));
+      });
+      child.on('message', message => {
+        if (!message || typeof message !== 'object') return finish(new Error('asset_baseline_psd_worker_invalid_result'));
+        if (message.type === 'error') return finish(new Error(message.error || 'asset_baseline_psd_worker_failed'));
+        if (message.type !== 'result' || !message.result || !Array.isArray(message.result.entries)) {
+          return finish(new Error('asset_baseline_psd_worker_invalid_result'));
+        }
+        finish(null, message.result);
+      });
+      removeCancelListener = attempt?.onCancel?.(() => finish(new Error('asset_baseline_psd_worker_cancelled'))) || (() => {});
+      child.postMessage({ type: 'parse', filePath });
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+async function assertDependableAssetBaselineSource(filePath, options = {}) {
   const stat = await fs.promises.stat(filePath);
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
@@ -11706,6 +11758,10 @@ async function assertDependableAssetBaselineSource(filePath) {
   }
 
   if (ext === '.psd') {
+    if (options.addFilesAttempt) {
+      await runAddFilesPsdWorker(filePath, options.addFilesAttempt);
+      return null;
+    }
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
   } else if (STRICT_ZIP_ASSET_BASELINE_EXTENSIONS.has(ext)) {
@@ -11864,37 +11920,56 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
       return [];
     }
-    const buf = await fs.promises.readFile(psdFilePath);
+    let psd = null;
+    let workerResult = null;
+    if (options.addFilesAttempt) {
+      workerResult = await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt);
+    } else {
+      const buf = await fs.promises.readFile(psdFilePath);
+      if (!isCurrent()) return [];
+      psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+    }
     if (!isCurrent()) return [];
-    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
     const discoveredPaths = [];
 
     // Walk layers for linkedFile.fullPath
-    function walkLayers(layers) {
-      if (!layers) return;
-      for (const layer of layers) {
-        if (layer.linkedFile && layer.linkedFile.fullPath) {
-          const fp = layer.linkedFile.fullPath;
-          if (fs.existsSync(fp)) {
-            discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
-          }
+    if (workerResult) {
+      for (const entry of workerResult.entries) {
+        if (typeof entry.filePath === 'string' && fs.existsSync(entry.filePath)) {
+          discoveredPaths.push({ filePath: entry.filePath, source: 'psd-linked' });
         }
-        if (layer.children) walkLayers(layer.children);
       }
+    } else {
+      function walkLayers(layers) {
+        if (!layers) return;
+        for (const layer of layers) {
+          if (layer.linkedFile && layer.linkedFile.fullPath) {
+            const fp = layer.linkedFile.fullPath;
+            if (fs.existsSync(fp)) {
+              discoveredPaths.push({ filePath: fp, source: 'psd-linked' });
+            }
+          }
+          if (layer.children) walkLayers(layer.children);
+        }
+      }
+      walkLayers(psd.children);
     }
-    walkLayers(psd.children);
 
     // Extract embedded files from psd.linkedFiles
-    if (psd.linkedFiles && psd.linkedFiles.length > 0) {
+    const linkedFiles = workerResult
+      ? workerResult.embedded
+      : (psd.linkedFiles || []);
+    if (linkedFiles.length > 0) {
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       if (!isCurrent()) return [];
       await fs.promises.mkdir(extractDir, { recursive: true });
       if (!isCurrent()) return [];
-      const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase())); for (const lf of psd.linkedFiles) {
+      const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase())); for (const lf of linkedFiles) {
         if (!lf.data) continue;
         const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
         const extractPath = path.join(extractDir, safeName);
-        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, Buffer.from(lf.data), { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
+        const embeddedData = typeof lf.data === 'string' ? Buffer.from(lf.data, 'base64') : Buffer.from(lf.data);
+        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, embeddedData, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
       }
       if (!isCurrent()) return []; for (const staged of invocationFiles) { fs.linkSync(staged.stagedPath, staged.extractPath); staged.committed = true; fs.unlinkSync(staged.stagedPath); const finalStat = fs.lstatSync(staged.extractPath); if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed'); discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName }); }
     }
@@ -12340,7 +12415,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const validatedSourceBuffer = baselineScan
-    ? await assertDependableAssetBaselineSource(filePath)
+    ? await assertDependableAssetBaselineSource(filePath, { addFilesAttempt: options.addFilesAttempt })
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
@@ -12440,7 +12515,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!baselineScan && Date.now() - lastParsed < 5000) return;
     if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
-    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, { strict: !!baselineScan });
+    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
+      strict: !!baselineScan,
+      addFilesAttempt: options.addFilesAttempt,
+    });
     if (!isCurrent()) return;
     if (psdAssets.length > 0) {
       const psdResult = mutateProject(projectId, (proj) => {
@@ -14283,11 +14361,27 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
   return project ? getIllustratorScopedProjectView(project).pendingFiles : [];
 });
 
+registerTrustedIpcHandler('projects:cancel-add-files', (event, projectId) => {
+  const operations = activeAddFilesOperations.get(projectId);
+  if (!operations || operations.size === 0) return false;
+  for (const operation of [...operations]) operation.cancel();
+  return true;
+});
+
 registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   const baseOperation = captureProjectOperation(projectId);
   if (!baseOperation) return null;
   let addFilesAttempt = null;
   let operation = baseOperation;
+  const operationController = {
+    cancel() {
+      baseOperation.close();
+      return addFilesAttempt?.cancel('renderer-timeout') !== false;
+    },
+  };
+  const projectOperations = activeAddFilesOperations.get(projectId) || new Set();
+  projectOperations.add(operationController);
+  activeAddFilesOperations.set(projectId, projectOperations);
   try {
     // M6: Filter to supported design + image file types.
     const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
@@ -14413,6 +14507,8 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   } finally {
     operation.close();
     addFilesAttempt?.dispose();
+    projectOperations.delete(operationController);
+    if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
   }
 });
 

@@ -18,6 +18,7 @@ function createAddFilesAttempt(options = {}) {
   let reason = null;
   let timer = null;
   let finalized = false;
+  const cancelListeners = new Set();
   let resolveTimeout;
   const timeoutPromise = new Promise(resolve => { resolveTimeout = resolve; });
 
@@ -31,6 +32,10 @@ function createAddFilesAttempt(options = {}) {
     reason = nextReason;
     finishTimer();
     resolveTimeout({ timedOut: state === 'timed-out', reason });
+    for (const listener of [...cancelListeners]) {
+      try { listener(reason); } catch (_) {}
+    }
+    cancelListeners.clear();
     return true;
   };
   const finalize = value => {
@@ -49,6 +54,15 @@ function createAddFilesAttempt(options = {}) {
     get reason() { return reason; },
     timeoutPromise,
     cancel,
+    onCancel(listener) {
+      if (typeof listener !== 'function') return () => {};
+      if (state !== 'active') {
+        try { listener(reason); } catch (_) {}
+        return () => {};
+      }
+      cancelListeners.add(listener);
+      return () => cancelListeners.delete(listener);
+    },
     finalize,
     dispose: finishTimer,
   };

@@ -4130,6 +4130,11 @@ function setupEventListeners() {
             attempt
           );
           if (addOutcome.timedOut) {
+            try {
+              if (typeof window.crate?.cancelAddFiles === 'function') {
+                Promise.resolve(window.crate.cancelAddFiles(projectId)).catch(() => {});
+              }
+            } catch (_) {}
             if (isSelectionCurrent()) {
               showToast(`Crate could not finish adding files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
             }

@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('crate', {
   setExistingAssetsDecision: (projectId, decision) => ipcRenderer.invoke('projects:set-existing-assets-decision', projectId, decision),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
   addFiles: (projectId) => ipcRenderer.invoke('projects:add-files', projectId),
+  cancelAddFiles: (projectId) => ipcRenderer.invoke('projects:cancel-add-files', projectId),
   preparePackageReview: (id, outputPath) => outputPath === undefined
     ? ipcRenderer.invoke('projects:prepare-package-review', id)
     : ipcRenderer.invoke('projects:prepare-package-review', id, outputPath),

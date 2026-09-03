@@ -5,6 +5,7 @@ const path = require('path');
 
 const RUNTIME_PARSER_FILES = Object.freeze([
   'add-files-operation.js',
+  'add-files-psd-worker.js',
   'admission-budgets.js',
   'aftereffects.js',
   'ai.js',
