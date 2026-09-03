@@ -4488,11 +4488,18 @@ function beginProjectAssetBaselineScan(
   projectId,
   sourcePath,
   activationToken = null,
-  { allowPaused = false, operation = null } = {}
+  { allowPaused = false, operation = null, project: capturedProject = null } = {}
 ) {
-  const project = getProjects().find(item => item.id === projectId);
+  const project = capturedProject || getProjects().find(item => item.id === projectId);
   if (!project || (project.status !== 'watching' && !(allowPaused && project.status === 'paused'))) return null;
-  if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
+  if (activationToken !== null) {
+    const operationCurrent = operation && typeof operation.currentFast === 'function'
+      ? operation.currentFast()
+      : operation && typeof operation.current === 'function'
+        ? operation.current()
+        : isActiveWatchingProject(projectId, activationToken);
+    if (!operationCurrent) return null;
+  }
   if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
   if (!isAcceptedProjectFilePath(project, sourcePath)) return null;
   const sourceKey = normalizeTrackedFilePath(sourcePath);
@@ -4546,7 +4553,12 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
   if (!state) return;
 
   const wasActive = state.activeScans?.delete(scan) !== false;
-  const attemptIsCurrent = () => !scan.cancelled && (!scan.operation || scan.operation.current());
+  const attemptIsCurrent = () => !scan.cancelled && (!scan.operation || (
+    typeof scan.operation.currentFast === 'function'
+      ? scan.operation.currentFast()
+      : scan.operation.current()
+  ));
+  const authoritativeAttemptIsCurrent = () => !scan.cancelled && (!scan.operation || scan.operation.current());
 
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
   if (wasActive) {
@@ -4579,7 +4591,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
             .map(file => getAssetBaselineSourceRecoveryRecord(currentProject, file))
         )).filter(Boolean).sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash))
       : [];
-    if (!attemptIsCurrent()) return;
+    if (!authoritativeAttemptIsCurrent()) return;
     const persisted = mutateProject(scan.projectId, project => {
       if (project.assetBaseline?.status !== 'awaiting-first-scan' || !attemptIsCurrent()) return false;
       const validRouteKeys = new Set(
@@ -4601,6 +4613,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
     return;
   }
 
+  if (!authoritativeAttemptIsCurrent()) return;
   const result = establishProjectAssetBaseline(
     scan.projectId,
     null,
@@ -12632,6 +12645,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
       operation,
+      project: currentProject,
     });
   let dependableScanCompleted = false;
   try {
@@ -12650,9 +12664,6 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     addFilesAttempt: options.addFilesAttempt,
   });
   if (!isCurrent()) return;
-  const latestProject = getProjects().find(item => item.id === projectId);
-  if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
-
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
   for (const p of linkedPaths) {
@@ -12669,6 +12680,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
 
   if (!isCurrent()) return;
+  if (validPaths.length > 0 && operation && !operation.current()) return;
   if (validPaths.length === 0) {
     if (!options.quiet) console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
   } else {
