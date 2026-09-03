@@ -13868,8 +13868,10 @@ test('Add Files deadline covers a stalled native picker without admitting its la
     assert.equal((await getProject(project.id)).files.length, 0);
 
     nextOpenDialogResult = Promise.resolve({ canceled: true, filePaths: [] });
-    const blockedRetry = await callIpcRaw('projects:add-files', project.id, 'picker-retry-before-settle');
-    assert.deepEqual(blockedRetry, { success: false, error: 'add_files_operation_in_progress' });
+    // The timed-out logical operation must not permanently deadlock retries,
+    // even though the native picker promise remains unresolved.
+    const retryBeforeSettle = await callIpcRaw('projects:add-files', project.id, 'picker-retry-before-settle');
+    assert.equal(retryBeforeSettle, null);
     releaseDialog({ canceled: false, filePaths: [path.join(TEST_HOME, 'Desktop', 'late-picker.ai')] });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await getProject(project.id)).files.length, 0);

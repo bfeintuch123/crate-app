@@ -170,7 +170,10 @@ const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 const ADD_FILES_OPERATION_TIMEOUT_MS = 30_000;
 let addFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
 const activeAddFilesOperations = new Map();
-const pendingNativeAddFilesPickers = new Set();
+// Project -> logical picker lease. A timed-out native dialog releases its
+// retry slot immediately, while the lease token keeps a late settlement from
+// deleting a newer picker lease for the same project.
+const pendingNativeAddFilesPickers = new Map();
 const ADD_FILES_OPERATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
@@ -14938,6 +14941,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
   let backgroundScanWork = Promise.resolve();
   let pickerPending = false;
   let pickerSettledPromise = Promise.resolve();
+  let releasePickerLease = () => {};
   const operationController = {
     clientOperationId,
     get pickerPending() { return pickerPending; },
@@ -14982,10 +14986,16 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       ],
     });
     pickerPending = true;
-    pendingNativeAddFilesPickers.add(projectId);
+    const pickerLease = Symbol(`add-files-picker:${projectId}`);
+    pendingNativeAddFilesPickers.set(projectId, pickerLease);
+    releasePickerLease = () => {
+      if (pendingNativeAddFilesPickers.get(projectId) === pickerLease) {
+        pendingNativeAddFilesPickers.delete(projectId);
+      }
+    };
     pickerSettledPromise = dialogPromise.then(
-      () => { pickerPending = false; pendingNativeAddFilesPickers.delete(projectId); },
-      () => { pickerPending = false; pendingNativeAddFilesPickers.delete(projectId); }
+      () => { pickerPending = false; releasePickerLease(); },
+      () => { pickerPending = false; releasePickerLease(); }
     );
     const dialogOutcome = await Promise.race([
       dialogPromise.then(dialogResult => ({ dialogResult })),
@@ -14994,6 +15004,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     if (dialogOutcome.deadline) {
       if (dialogOutcome.deadline.timedOut) {
         addFilesAttempt.cancel('timeout');
+        releasePickerLease();
         void dialogPromise.catch(() => {});
         return {
           success: false,
@@ -15161,6 +15172,10 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     }
     return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
   } finally {
+    // Timeout/cancellation may leave the native dialog unresolved. Release
+    // only this invocation's lease; a newer picker lease must survive the
+    // old dialog's eventual settlement.
+    releasePickerLease();
     operation.close();
     if (addFilesAttempt?.isCurrent()) addFilesAttempt.cancel('cancelled');
     // Release targeted-cancellation ownership as soon as the IPC operation
