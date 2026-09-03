@@ -27,6 +27,7 @@ const Store = require('electron-store');
 const chokidar = require('chokidar');
 const { execSync, exec, execFile, execFileSync } = require('child_process');
 const { promisify } = require('util');
+const { StringDecoder } = require('string_decoder');
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
@@ -4754,7 +4755,8 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   }
   if (!operation.current()) {
     cancelProjectAssetBaselineScanOperation(projectId, operation, queuedPaths);
-    return { cancelled: true, outcomes, settled: settledScanWork };
+    const timedOut = attempt?.state === 'timed-out' || attempt?.reason === 'timeout';
+    return { cancelled: true, timedOut, outcomes, settled: settledScanWork };
   }
   return { cancelled: false, outcomes, settled: settledScanWork };
 }
@@ -11959,10 +11961,11 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
     const carryBytes = 32 * 1024;
     const yieldBytes = 1024 * 1024;
     let bytesSinceYield = 0;
+    const decoder = new StringDecoder('utf8');
     let carry = '';
     for (let offset = 0; offset < buf.length; offset += chunkBytes) {
       if (!isCurrent()) return [];
-      const content = carry + buf.subarray(offset, offset + chunkBytes).toString('utf8');
+      const content = carry + decoder.write(buf.subarray(offset, offset + chunkBytes));
       LINKED_ASSET_REGEX.lastIndex = 0;
       let match;
       while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
@@ -11976,6 +11979,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
         await new Promise(resolve => setImmediate(resolve));
       }
     }
+    decoder.end();
     if (!isCurrent()) return [];
   } catch (e) {
     if (strict) throw e;
@@ -12579,7 +12583,9 @@ async function captureExistingPresentationMediaBaseline(
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
 async function runScanOnOpen(projectId, filePath, activationToken = null, operation = null, options = {}) {
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operation || operation.current());
+  const isCurrent = operation
+    ? () => operation.current()
+    : () => isBoundWatchingActivationCurrent(projectId, activationToken);
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
   const currentProject = getProjects().find(p => p.id === projectId);
@@ -12594,7 +12600,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   let dependableScanCompleted = false;
   try {
 
-  console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
+  if (!options.quiet) console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
   const validatedSourceBuffer = baselineScan
     ? await assertDependableAssetBaselineSource(filePath, {
       isCurrent,
@@ -12628,9 +12634,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   if (!isCurrent()) return;
   if (validPaths.length === 0) {
-    console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
+    if (!options.quiet) console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
   } else {
-    console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
+    if (!options.quiet) console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
 
     const revisedScope = admitIllustratorRelationshipPathsForProject(projectId, filePath, validPaths);
     if (operation && revisedScope && !operation.adoptScope(revisedScope)) return;
@@ -14551,20 +14557,23 @@ registerTrustedIpcHandler('projects:cancel-add-files', (event, projectId, operat
   const operations = activeAddFilesOperations.get(projectId);
   if (!operations || operations.size === 0) return false;
   if (typeof operationId !== 'string' || !ADD_FILES_OPERATION_ID_PATTERN.test(operationId)) return false;
-  const operation = operations.get(operationId);
+  const operation = operations.get(operationId) || [...operations.values()]
+    .find(candidate => candidate.clientOperationId === operationId);
   return operation ? operation.cancel() : false;
 });
 
 registerTrustedIpcHandler('projects:add-files', async (event, projectId, requestedOperationId) => {
   const baseOperation = captureProjectOperation(projectId);
   if (!baseOperation) return null;
-  const operationId = typeof requestedOperationId === 'string' && ADD_FILES_OPERATION_ID_PATTERN.test(requestedOperationId)
+  const clientOperationId = typeof requestedOperationId === 'string' && ADD_FILES_OPERATION_ID_PATTERN.test(requestedOperationId)
     ? requestedOperationId
-    : crypto.randomUUID();
+    : null;
+  const operationId = crypto.randomUUID();
   let addFilesAttempt = null;
   let operation = baseOperation;
   let backgroundScanWork = Promise.resolve();
   const operationController = {
+    clientOperationId,
     cancel() {
       baseOperation.close();
       return addFilesAttempt?.cancel('renderer-timeout') !== false;
@@ -14574,7 +14583,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     },
   };
   const projectOperations = activeAddFilesOperations.get(projectId) || new Map();
-  if (projectOperations.has(operationId)) {
+  if (projectOperations.has(operationId) || (
+    clientOperationId && [...projectOperations.values()].some(operation => operation.clientOperationId === clientOperationId)
+  )) {
     baseOperation.close();
     return { success: false, error: 'add_files_operation_conflict' };
   }
@@ -14627,7 +14638,22 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     showTrayWindow();
 
     if (dialogResult.canceled) return null;
-    if (!operation.current()) return null;
+    if (!operation.current()) {
+      if (addFilesAttempt.state === 'timed-out' || addFilesAttempt.reason === 'timeout') {
+        return {
+          success: false,
+          error: 'add_files_timeout',
+          timeoutMs: addFilesOperationTimeoutMs,
+          selectedCount: 0,
+          admittedCount: 0,
+          completedCount: 0,
+          failedCount: 0,
+          scanResults: [],
+          files: getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId))?.files || [],
+        };
+      }
+      return null;
+    }
 
     const filePaths = [...new Map(
       dialogResult.filePaths
@@ -14680,7 +14706,22 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       return project.files;
     });
 
-    if (!result || !operation.current()) return null;
+    if (!result || !operation.current()) {
+      if (addFilesAttempt.state === 'timed-out' || addFilesAttempt.reason === 'timeout') {
+        return {
+          success: false,
+          error: 'add_files_timeout',
+          timeoutMs: addFilesOperationTimeoutMs,
+          selectedCount: filePaths.length,
+          admittedCount: 0,
+          completedCount: 0,
+          failedCount: filePaths.length,
+          scanResults: filePaths.map(filePath => ({ path: filePath, success: false, error: 'add_files_timeout' })),
+          files: getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId))?.files || [],
+        };
+      }
+      return null;
+    }
     const revisedScope = admitIllustratorSourcesForProject(projectId, filePaths);
     if ((revisedScope && !operation.adoptScope(revisedScope)) || !operation.current()) return null;
     sendProjectFileStateToRenderer(projectId, operation.activationToken);
@@ -14693,7 +14734,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         baselineSources,
         operation.activationToken,
         operation,
-        { allowPausedBaseline: true, addFilesAttempt }
+        { allowPausedBaseline: true, addFilesAttempt, quiet: true }
       );
       backgroundScanWork = scanReport.settled || Promise.resolve();
       if (scanReport.timedOut) {

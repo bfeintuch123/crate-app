@@ -27,6 +27,10 @@ function createAddFilesAttempt(options = {}) {
     if (timer !== null) clearTimer(timer);
     timer = null;
   };
+  const expireIfNeeded = () => {
+    if (state === 'active' && now() >= deadlineAt) cancel('timeout');
+    return state;
+  };
   const cancel = (nextReason = 'cancelled') => {
     if (state !== 'active') return false;
     state = nextReason === 'timeout' ? 'timed-out' : 'cancelled';
@@ -50,7 +54,7 @@ function createAddFilesAttempt(options = {}) {
   return {
     timeoutMs,
     deadlineAt,
-    isCurrent: () => state === 'active' && now() < deadlineAt,
+    isCurrent: () => expireIfNeeded() === 'active',
     get state() { return state; },
     get reason() { return reason; },
     timeoutPromise,
@@ -80,7 +84,11 @@ async function runAddFilesAttempt(work, options = {}) {
     attempt.cancel(outcome.reason || 'timeout');
     return { ...outcome, attempt };
   }
-  if (!attempt.isCurrent()) {
+  const current = attempt.isCurrent();
+  if (attempt.state === 'timed-out' || attempt.reason === 'timeout') {
+    return { timedOut: true, reason: 'timeout', attempt };
+  }
+  if (!current) {
     return {
       timedOut: false,
       cancelled: true,

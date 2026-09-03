@@ -97,6 +97,31 @@ test('late renderer refresh is rejected after timeout and supersession', async (
   assert.equal(appliedProject, null);
 });
 
+test('wall-clock expiry wins when the timer callback is delayed', async () => {
+  const work = deferred();
+  let now = 0;
+  let timerCallback;
+  const run = runAddFilesAttempt(async () => work.promise, {
+    timeoutMs: 100,
+    now: () => now,
+    setTimeout: callback => {
+      timerCallback = callback;
+      return 1;
+    },
+    clearTimeout: () => {},
+  });
+
+  await Promise.resolve();
+  now = 100;
+  work.resolve({ success: true });
+  const outcome = await run;
+
+  assert.equal(outcome.timedOut, true);
+  assert.equal(outcome.reason, 'timeout');
+  assert.equal(outcome.attempt.state, 'timed-out');
+  assert.equal(typeof timerCallback, 'function');
+});
+
 test('cancellation models project switch and exact-once finalization', async () => {
   const clock = createFakeClock();
   const attempt = (await runAddFilesAttempt(async currentAttempt => {
