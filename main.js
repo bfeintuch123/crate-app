@@ -12314,6 +12314,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     }
     let psd = null;
     let workerResult = null;
+    let sourceDigest = null;
     if (options.addFilesAttempt) {
       const validatedIdentity = options.validatedPsdSourceIdentity;
       if (options.validatedPsdResult && validatedIdentity && (
@@ -12326,9 +12327,11 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         return [];
       }
       workerResult = options.validatedPsdResult || await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt);
+      sourceDigest = workerResult.sourceDigest || await getAddFilesCurrentSourceDigest(psdFilePath, options.addFilesAttempt);
     } else {
       const buf = await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
+      sourceDigest = getAddFilesSourceDigest(buf);
       psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
     }
     if (!isCurrent()) return [];
@@ -12374,14 +12377,14 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         safeRealpath(os.tmpdir(), 'psd-extract-parent')
       );
       if (!isCurrent()) return [];
-      const usedEmbeddedNames = new Set((await fs.promises.readdir(extractDir)).map(name => name.toLowerCase())); for (const lf of linkedFiles) {
+      const usedEmbeddedNames = new Set((await fs.promises.readdir(extractDir)).map(name => name.toLowerCase())); for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!isCurrent()) return [];
         await new Promise(resolve => setImmediate(resolve));
         if (!lf.data) continue;
         const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
         const extractPath = path.join(extractDir, safeName);
         const embeddedData = typeof lf.data === 'string' ? Buffer.from(lf.data, 'base64') : Buffer.from(lf.data);
-        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, embeddedData, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
+        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', embeddedIndex, identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, embeddedData, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
       }
       if (!isCurrent()) return [];
       for (const staged of invocationFiles) {
@@ -12406,7 +12409,13 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         fs.unlinkSync(staged.stagedPath);
         const finalStat = fs.lstatSync(staged.extractPath);
         if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed');
-        discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName });
+        discoveredPaths.push({
+          filePath: staged.extractPath,
+          source: 'psd-embedded',
+          embeddedOriginalName: staged.embeddedOriginalName,
+          embeddedIndex: staged.embeddedIndex,
+          sourceDigest,
+        });
       }
     }
 
@@ -13014,7 +13023,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!baselineScan && Date.now() - lastParsed < 5000) return;
     if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
-    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
+    let psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       addFilesAttempt: options.addFilesAttempt,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
@@ -13022,6 +13031,23 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       quiet: options.quiet,
     });
     if (!isCurrent()) { psdAssets.release?.(); return; }
+    if (!baselineScan) {
+      const currentPsdProject = getProjects().find(project => project.id === projectId);
+      const embeddedSourceDigest = psdAssets.find(asset => asset.source === 'psd-embedded')?.sourceDigest;
+      const hasExistingPsdEmbeddedAsset = currentPsdProject && [
+        ...(currentPsdProject.files || []),
+        ...(currentPsdProject.pendingFiles || []),
+      ].some(file => (
+        file && file.source === 'psd-embedded' &&
+        normalizeTrackedFilePath(file.parentPsd || '') === normalizeTrackedFilePath(filePath) &&
+        (!embeddedSourceDigest || file.sourceDigest === embeddedSourceDigest)
+      ));
+      if (hasExistingPsdEmbeddedAsset) {
+        const retainedAssets = psdAssets.filter(asset => asset.source !== 'psd-embedded');
+        if (retainedAssets.length !== psdAssets.length) psdAssets.release?.();
+        psdAssets = retainedAssets;
+      }
+    }
     if (psdAssets.length > 0) {
       if (!await recheckValidatedIdentity()) { psdAssets.release?.(); throw new Error('asset_baseline_source_changed'); }
       if (operation && !operation.current()) { psdAssets.release?.(); return; }
@@ -13035,7 +13061,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         const acceptedFiles = [];
         let changed = false;
         for (const asset of psdAssets) {
-          const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+          const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source, {
+            parentPsd: filePath,
+            embeddedOriginalName: asset.embeddedOriginalName || null,
+            embeddedIndex: Number.isInteger(asset.embeddedIndex) ? asset.embeddedIndex : null,
+            sourceDigest: asset.sourceDigest || null,
+          });
           let baselineMetadataChanged = false;
           if (baselineScan) {
             fileEntry.assetOrigin = 'existing';
@@ -15549,6 +15580,11 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     const psdFiles = project.files.filter(f => f.ext === '.psd');
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
+      const hasExistingPsdEmbeddedAssets = project.files.some(file => (
+        file && file.source === 'psd-embedded' &&
+        normalizeTrackedFilePath(file.parentPsd || '') === normalizeTrackedFilePath(psdFile.path)
+      ));
+      if (hasExistingPsdEmbeddedAssets) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
       if (!operationCurrent()) { psdAssets.release?.(); return; }
       for (const asset of psdAssets) {
