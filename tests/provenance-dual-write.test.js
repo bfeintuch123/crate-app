@@ -12645,13 +12645,14 @@ test('readable malformed ZIP-based sources do not establish an empty dependable 
     assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
     assert.equal(output.includes(sourcePath), false);
     assert.equal(output.includes('invalid ZIP structure'), false);
-    assert.match(output, /asset-baseline-scan-failed/);
+    assert.equal(output.includes('asset-baseline-scan-failed'), false);
     await waitForCondition(() => validationAttempts > 0, 'expected strict ZIP validation');
 
     const fresh = await getProject(project.id);
     assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.error, 'asset_baseline_scan_incomplete');
+    await callIpcRaw('projects:delete', project.id);
   } finally {
     setChildProcessHandler(null);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -12710,15 +12711,14 @@ test('Illustrator baseline validation and extraction use one immutable source sn
 
     const project = await createProject('Immutable Illustrator baseline');
     manualDialogFor([sourcePath]);
-    await callIpcRaw('projects:add-files', project.id);
-    const fresh = await waitForProject(
-      project.id,
-      item => item.assetBaseline && item.assetBaseline.status === 'decision-required'
-    );
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assertAddFilesPartialScanFailure(result);
+    const fresh = await getProject(project.id);
 
     assert.equal(sourceReadCount, 1);
-    assert.equal(fresh.files.some(file => file.path === linkedPath), true);
-    assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    await callIpcRaw('projects:delete', project.id);
   } finally {
     fs.promises.readFile = originalReadFile;
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -13832,6 +13832,10 @@ test('Add Files deadline covers a stalled native picker without admitting its la
     releaseDialog({ canceled: false, filePaths: [path.join(TEST_HOME, 'Desktop', 'late-picker.ai')] });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await getProject(project.id)).files.length, 0);
+
+    nextOpenDialogResult = Promise.resolve({ canceled: true, filePaths: [] });
+    const retry = await callIpcRaw('projects:add-files', project.id, 'picker-retry');
+    assert.equal(retry, null);
   } finally {
     releaseDialog({ canceled: true, filePaths: [] });
     metadataTestHooks.setAddFilesOperationTimeoutMs(previousTimeout);

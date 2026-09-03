@@ -4666,6 +4666,9 @@ function createAddFilesParseMemoryBudget(maxBytes = ADD_FILES_PARSE_MEMORY_BUDGE
         ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES,
         estimatedParseBytes
       );
+      if (reservationBytes > maxBytes) {
+        return { error: 'asset_baseline_source_too_large' };
+      }
       while (reservedBytes > 0 && reservedBytes + reservationBytes > maxBytes) {
         if (!isCurrent()) return null;
         await new Promise(resolve => setImmediate(resolve));
@@ -4797,6 +4800,10 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         const reservation = await parseMemoryBudget.acquire(reservationStat.size, operation);
         if (!reservation) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+          continue;
+        }
+        if (reservation.error) {
+          outcomes[index] = { path: sourcePath, success: false, error: reservation.error };
           continue;
         }
         let result;
@@ -12199,9 +12206,9 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
 
   try {
     // Check if Photoshop is running
-    const { stdout: psCheck } = await execAsync(
+    const { stdout: psCheck } = await runCancellableExec(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe Photoshop' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
+      { timeout: 3000, encoding: 'utf8', addFilesAttempt: options.addFilesAttempt }
     ).catch(() => ({ stdout: '' }));
 
     if (psCheck.trim()) {
@@ -12212,7 +12219,7 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
           'crate-ps-scan.applescript': psDoJavascriptAS(resolveScriptPath('crate-ps-scan.js')),
         }),
         'crate-ps-scan.applescript',
-        { timeout: 10000, encoding: 'utf8' }
+        { timeout: 10000, encoding: 'utf8', addFilesAttempt: options.addFilesAttempt }
       ).catch(() => ({ stdout: '' }));
 
       if (psPaths.trim()) {
@@ -12239,7 +12246,18 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
  * Complements the AppleScript/do-javascript approach — works even when
  * Photoshop is not running.
  */
-async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false;
+async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false; let invocationFilesReleased = false;
+  const releaseInvocationFiles = () => {
+    if (invocationFilesReleased) return;
+    invocationFilesReleased = true;
+    for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) {
+      try {
+        const stat = fs.lstatSync(cleanupPath);
+        const owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino);
+        if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath);
+      } catch (_) {}
+    }
+  };
   try {
     // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
     const stat = await fs.promises.stat(psdFilePath);
@@ -12318,13 +12336,16 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return []; for (const staged of invocationFiles) { if (!isCurrent()) return []; await new Promise(resolve => setImmediate(resolve)); fs.linkSync(staged.stagedPath, staged.extractPath); staged.committed = true; fs.unlinkSync(staged.stagedPath); const finalStat = fs.lstatSync(staged.extractPath); if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed'); discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName }); }
     }
 
-    if (!isCurrent()) return []; keepInvocationFiles = true; return discoveredPaths;
+    if (!isCurrent()) return [];
+    keepInvocationFiles = true;
+    Object.defineProperty(discoveredPaths, 'release', { value: releaseInvocationFiles });
+    return discoveredPaths;
   } catch (e) {
     if (!isCurrent()) return [];
     if (!options.quiet) console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     if (options.strict === true) throw e;
     return [];
-  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino); if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
+  } finally { if (!keepInvocationFiles) releaseInvocationFiles(); }
 }
 
 /**
@@ -12922,10 +12943,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
       quiet: options.quiet,
     });
-    if (!isCurrent()) return;
+    if (!isCurrent()) { psdAssets.release?.(); return; }
     if (psdAssets.length > 0) {
-      if (!await recheckValidatedIdentity()) throw new Error('asset_baseline_source_changed');
-      if (operation && !operation.current()) return;
+      if (!await recheckValidatedIdentity()) { psdAssets.release?.(); throw new Error('asset_baseline_source_changed'); }
+      if (operation && !operation.current()) { psdAssets.release?.(); return; }
       const psdResult = mutateProject(projectId, (proj) => {
         if (
           (proj.status !== 'watching' && !(baselineScan?.allowPaused && proj.status === 'paused')) ||
@@ -12973,6 +12994,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
         return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
       });
+      if (!psdResult) psdAssets.release?.();
       if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
@@ -15013,9 +15035,11 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       if (projectOperations.get(operationId) === operationController) projectOperations.delete(operationId);
       if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
     };
-    if (pickerPending) pickerSettledPromise.then(releaseOperation, releaseOperation);
-    else releaseOperation();
-    Promise.resolve(operationController.waitForSettled())
+    // Native picker cancellation is not portable. Release the logical slot
+    // immediately after timeout/cancellation so a late dialog cannot block a
+    // retry forever; operation.current() fences the late selection.
+    releaseOperation();
+    Promise.resolve(backgroundScanWork)
       .catch(() => {})
       .finally(() => addFilesAttempt?.dispose());
   }
@@ -15446,7 +15470,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
-      if (!operationCurrent()) return;
+      if (!operationCurrent()) { psdAssets.release?.(); return; }
       for (const asset of psdAssets) {
         const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
         if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
