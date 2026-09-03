@@ -8007,8 +8007,39 @@ function isBoundWatchingActivationCurrent(projectId, activationToken) {
   return activationToken === null || isActiveWatchingProject(projectId, activationToken);
 }
 
-function captureProjectOperation(projectId) { const project = getProjects().find(item => item && item.id === projectId); if (!project) return null; const status = project.status, generation = watchingActivationSequence, activationToken = status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; let scopeRevision = illustratorActivationScopes.get(projectId)?.revision, open = true; const baseCurrent = () => { const latest = getProjects().find(item => item && item.id === projectId), currentToken = latest?.status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken; }; return { activationToken, close() { open = false; }, current() { return baseCurrent() && (activationToken === null || illustratorActivationScopes.get(projectId)?.revision === scopeRevision); },
-    adoptScope(scope) { if (activationToken === null) return baseCurrent(); if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope || ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false; scopeRevision = scope.revision; return true; } }; }
+function captureProjectOperation(projectId) {
+  const project = getProjects().find(item => item && item.id === projectId);
+  if (!project) return null;
+  const status = project.status;
+  const generation = watchingActivationSequence;
+  const activationToken = status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null;
+  let scopeRevision = illustratorActivationScopes.get(projectId)?.revision;
+  let open = true;
+  const baseCurrent = () => {
+    const latest = getProjects().find(item => item && item.id === projectId);
+    const currentToken = latest?.status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null;
+    return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken;
+  };
+  const fastCurrent = () => (
+    open &&
+    activationToken !== null &&
+    watchingActivationSequence === generation &&
+    watchingActivationTokens.get(projectId) === activationToken &&
+    illustratorActivationScopes.get(projectId)?.revision === scopeRevision
+  );
+  return {
+    activationToken,
+    close() { open = false; },
+    current() { return baseCurrent() && (activationToken === null || illustratorActivationScopes.get(projectId)?.revision === scopeRevision); },
+    currentFast() { return fastCurrent(); },
+    adoptScope(scope) {
+      if (activationToken === null) return baseCurrent();
+      if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope || ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false;
+      scopeRevision = scope.revision;
+      return true;
+    },
+  };
+}
 
 function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
   const projects = getProjects();
@@ -12583,8 +12614,13 @@ async function captureExistingPresentationMediaBaseline(
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
 async function runScanOnOpen(projectId, filePath, activationToken = null, operation = null, options = {}) {
+  const operationCurrent = operation && typeof operation.currentFast === 'function'
+    ? () => operation.currentFast()
+    : operation && typeof operation.current === 'function'
+      ? () => operation.current()
+      : null;
   const isCurrent = operation
-    ? () => operation.current()
+    ? operationCurrent
     : () => isBoundWatchingActivationCurrent(projectId, activationToken);
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
