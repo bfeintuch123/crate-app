@@ -13813,6 +13813,32 @@ test('timed-out Add Files preserves admission and rejects a late scan result', a
   }
 });
 
+test('Add Files deadline covers a stalled native picker without admitting its late selection', async () => {
+  const previousTimeout = metadataTestHooks.setAddFilesOperationTimeoutMs(25);
+  let releaseDialog;
+  nextOpenDialogResult = new Promise(resolve => { releaseDialog = resolve; });
+  const project = await createProject('Picker deadline Add Files');
+  try {
+    const addPromise = callIpcRaw('projects:add-files', project.id, 'picker-deadline');
+    await new Promise(resolve => originalSetTimeout(resolve, 60));
+    const result = await addPromise;
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'add_files_timeout');
+    assert.equal(result.selectedCount, 0);
+    assert.equal(result.admittedCount, 0);
+    assert.equal(await callIpcRaw('projects:cancel-add-files', project.id, null), false);
+    assert.equal((await getProject(project.id)).files.length, 0);
+
+    releaseDialog({ canceled: false, filePaths: [path.join(TEST_HOME, 'Desktop', 'late-picker.ai')] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await getProject(project.id)).files.length, 0);
+  } finally {
+    releaseDialog({ canceled: true, filePaths: [] });
+    metadataTestHooks.setAddFilesOperationTimeoutMs(previousTimeout);
+    await callIpcRaw('projects:delete', project.id);
+  }
+});
+
 test('manual image add is classified as an added asset rather than a project source', async () => {
   const project = await createProject('Manual image asset');
   const filePath = path.join(os.tmpdir(), 'campaign-photo.png');

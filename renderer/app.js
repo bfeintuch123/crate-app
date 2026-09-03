@@ -4169,7 +4169,7 @@ function setupEventListeners() {
               }
             } catch (_) {}
             if (isSelectionCurrent()) {
-              showToast(`Crate could not finish adding files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Selected files were kept; try again.`);
+              showToast(`Crate could not finish adding files within ${Math.ceil(attempt.timeoutMs / 1000)} seconds. Any files already admitted were kept; try again.`);
             }
             return;
           }
@@ -4202,7 +4202,7 @@ function setupEventListeners() {
             const count = Number.isSafeInteger(result.failedCount) ? result.failedCount : 1;
             showToast(`${count} file${count === 1 ? '' : 's'} could not be scanned. Successful files were kept.`);
           } else if (result.error === 'add_files_timeout') {
-            showToast(`Crate could not finish scanning within ${Math.ceil((result.timeoutMs || attempt.timeoutMs) / 1000)} seconds. Selected files were kept; try again.`);
+            showToast(`Crate could not finish scanning within ${Math.ceil((result.timeoutMs || attempt.timeoutMs) / 1000)} seconds. Any files already admitted were kept; try again.`);
           } else {
             showToast('Crate could not add the selected files. Try again.');
           }
