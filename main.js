@@ -4649,6 +4649,37 @@ function cancelProjectAssetBaselineScanOperation(projectId, operation, sourcePat
 }
 
 const MANUAL_ADD_SCAN_CONCURRENCY = 4;
+const ADD_FILES_PARSE_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024;
+const ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES = 1024 * 1024;
+
+function createAddFilesParseMemoryBudget(maxBytes = ADD_FILES_PARSE_MEMORY_BUDGET_BYTES) {
+  let reservedBytes = 0;
+  return {
+    async acquire(sourceBytes, operation) {
+      const isCurrent = typeof operation.currentFast === 'function'
+        ? () => operation.currentFast()
+        : () => operation.current();
+      const reservationBytes = Math.max(
+        ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES,
+        Math.min(Number.isSafeInteger(sourceBytes) ? sourceBytes : 0, maxBytes)
+      );
+      while (reservedBytes > 0 && reservedBytes + reservationBytes > maxBytes) {
+        if (!isCurrent()) return null;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      if (!isCurrent()) return null;
+      reservedBytes += reservationBytes;
+      let released = false;
+      return {
+        release() {
+          if (released) return;
+          released = true;
+          reservedBytes = Math.max(0, reservedBytes - reservationBytes);
+        },
+      };
+    },
+  };
+}
 
 function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
   const project = getProjects().find(item => item.id === projectId);
@@ -4722,6 +4753,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   // checks still guard every mutation and final baseline write.
   const queueProject = options.project || getProjects().find(project => project.id === projectId) || null;
   const scanOptions = options.project ? options : { ...options, project: queueProject };
+  const parseMemoryBudget = options.parseMemoryBudget || createAddFilesParseMemoryBudget();
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4735,7 +4767,42 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         continue;
       }
       try {
-        const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
+        let sourceStat = null;
+        try {
+          sourceStat = await fs.promises.stat(sourcePath);
+        } catch (_) {
+          // Let runScanOnOpen establish and complete the baseline record for
+          // a missing source; the scan-level failure must remain observable.
+        }
+        if (!sourceStat) {
+          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
+          if (!operation.current()) {
+            outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+          } else if (result && result.success === false) {
+            outcomes[index] = { path: sourcePath, success: false, error: result.error || 'scan_on_open_failed' };
+          } else {
+            outcomes[index] = { path: sourcePath, success: true };
+          }
+          continue;
+        }
+        if (!operation.current()) {
+          outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+          continue;
+        }
+        const reservation = await parseMemoryBudget.acquire(sourceStat.size, operation);
+        if (!reservation) {
+          outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+          continue;
+        }
+        let result;
+        try {
+          result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, {
+            ...scanOptions,
+            sourceStat,
+          });
+        } finally {
+          reservation.release();
+        }
         if (!operation.current()) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
         } else if (result && result.success === false) {
@@ -11890,8 +11957,25 @@ function runAddFilesPsdWorker(filePath, attempt) {
   });
 }
 
+function getAddFilesSourceIdentity(stat) {
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    dev: stat.dev,
+    ino: stat.ino,
+  };
+}
+
+function isAddFilesSourceIdentityCurrent(stat, identity) {
+  return !!stat && !!identity &&
+    stat.size === identity.size &&
+    stat.mtimeMs === identity.mtimeMs &&
+    stat.dev === identity.dev &&
+    stat.ino === identity.ino;
+}
+
 async function assertDependableAssetBaselineSource(filePath, options = {}) {
-  const stat = await fs.promises.stat(filePath);
+  const stat = options.sourceStat || await fs.promises.stat(filePath);
   if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
@@ -11910,7 +11994,11 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
     if (!validHeader || !validTrailer) {
       throw new Error('asset_baseline_source_invalid_structure');
     }
-    return sourceBuffer;
+    return {
+      kind: 'source-buffer',
+      buffer: sourceBuffer,
+      sourceIdentity: getAddFilesSourceIdentity(stat),
+    };
   }
 
   const handle = await fs.promises.open(filePath, 'r');
@@ -11925,12 +12013,7 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
       return {
         kind: 'psd-worker-result',
         result: await runAddFilesPsdWorker(filePath, options.addFilesAttempt),
-        sourceIdentity: {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          dev: stat.dev,
-          ino: stat.ino,
-        },
+        sourceIdentity: getAddFilesSourceIdentity(stat),
       };
     }
     const buffer = await fs.promises.readFile(filePath);
@@ -11943,7 +12026,10 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
     });
     if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   }
-  return null;
+  return {
+    kind: 'validated-source',
+    sourceIdentity: getAddFilesSourceIdentity(stat),
+  };
 }
 
 /**
@@ -11992,7 +12078,7 @@ async function extractLinkedAssets(filePath, options = {}) {
         return [];
     }
   } catch (e) {
-    console.error(`[crate] scan-on-open: extractLinkedAssets error for ${path.basename(filePath)}:`, e.message);
+    if (!options.quiet) console.error(`[crate] scan-on-open: extractLinkedAssets error for ${path.basename(filePath)}:`, e.message);
     if (strict) throw e;
     return [];
   }
@@ -12141,7 +12227,7 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
 async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false;
   try {
     // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
-    const stat = await fs.promises.stat(psdFilePath);
+    const stat = options.sourceStat || await fs.promises.stat(psdFilePath);
     if (!isCurrent()) return [];
     if (stat.size > MAX_PARSE_FILE_SIZE) {
       if (options.strict === true) throw new Error('asset_baseline_source_too_large');
@@ -12563,6 +12649,7 @@ async function captureExistingPresentationMediaBaseline(
       onExtracted: extraction => extractionRecords.push(extraction),
       isCurrent,
       addFilesAttempt: options.addFilesAttempt,
+      quiet: options.quiet,
     });
     if (!isCurrent()) return;
 
@@ -12604,6 +12691,11 @@ async function captureExistingPresentationMediaBaseline(
         contentFingerprint: getPackageContentFingerprint(content),
       });
     }
+
+    if (options.sourceIdentity && !isAddFilesSourceIdentityCurrent(
+      await fs.promises.stat(presentationPath),
+      options.sourceIdentity
+    )) throw new Error('asset_baseline_source_changed');
 
     const result = mutateProject(projectId, (proj) => {
       if (
@@ -12690,16 +12782,31 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     ? await assertDependableAssetBaselineSource(filePath, {
       isCurrent,
       addFilesAttempt: options.addFilesAttempt,
+      sourceStat: options.sourceStat,
     })
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
-    sourceBuffer: Buffer.isBuffer(validatedSource) ? validatedSource : undefined,
+    sourceBuffer: validatedSource?.kind === 'source-buffer' ? validatedSource.buffer : undefined,
     validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
+    quiet: options.quiet,
     isCurrent,
     addFilesAttempt: options.addFilesAttempt,
   });
   if (!isCurrent()) return;
+  const validatedIdentity = validatedSource?.sourceIdentity;
+  const recheckValidatedIdentity = async () => {
+    if (!baselineScan || validatedSource?.kind !== 'validated-source') return true;
+    try {
+      return isAddFilesSourceIdentityCurrent(
+        await fs.promises.stat(filePath),
+        validatedIdentity
+      );
+    } catch (_) {
+      return false;
+    }
+  };
+  if (!await recheckValidatedIdentity()) throw new Error('asset_baseline_source_changed');
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
   for (const p of linkedPaths) {
@@ -12716,6 +12823,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
 
   if (!isCurrent()) return;
+  if (validPaths.length > 0 && !await recheckValidatedIdentity()) {
+    throw new Error('asset_baseline_source_changed');
+  }
   if (validPaths.length > 0 && operation && !operation.current()) return;
   if (validPaths.length === 0) {
     if (!options.quiet) console.log(`[crate] scan-on-open: found 0 linked assets in ${path.basename(filePath)}`);
@@ -12794,6 +12904,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       addFilesAttempt: options.addFilesAttempt,
+      sourceStat: options.sourceStat,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
     });
@@ -12854,12 +12965,16 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     }
   }
   if (baselineScan && (ext === '.pptx' || ext === '.key')) {
-    await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent, options);
+    await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent, {
+      ...options,
+      sourceIdentity: validatedIdentity,
+    });
   }
+  if (!await recheckValidatedIdentity()) throw new Error('asset_baseline_source_changed');
   dependableScanCompleted = true;
   return { success: true };
   } catch (error) {
-    console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
+    if (!options.quiet) console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
     return {
       success: false,
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
