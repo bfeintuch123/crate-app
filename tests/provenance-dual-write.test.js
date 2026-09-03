@@ -21279,8 +21279,9 @@ test('pre-package app-script parser and regex recovered additions record session
 });
 
 test('pre-package PSD recovery fails closed when embedded cache identity is stale or legacy', async () => {
-  for (const scenario of ['stale-digest', 'legacy-metadata']) {
+  for (const scenario of ['stale-digest', 'corrupted-cache', 'legacy-metadata']) {
     const tmpRoot = makeTempDir();
+    const previousPsdFixture = currentPsdFixture;
     let project = null;
     try {
       project = await createProject(`Prepackage PSD ${scenario}`);
@@ -21288,15 +21289,27 @@ test('pre-package PSD recovery fails closed when embedded cache identity is stal
       const embeddedPath = path.join(tmpRoot, 'embedded.png');
       const originalPsdBytes = Buffer.from('original PSD bytes');
       fs.writeFileSync(psdPath, scenario === 'stale-digest' ? 'changed PSD bytes' : originalPsdBytes);
-      fs.writeFileSync(embeddedPath, 'stale embedded cache bytes');
+      let extractDir = null;
+      if (scenario === 'corrupted-cache') {
+        extractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+        fs.mkdirSync(extractDir, { recursive: true, mode: 0o700 });
+        fs.chmodSync(extractDir, 0o700);
+        fs.writeFileSync(path.join(extractDir, 'embedded.png'), 'corrupted cache bytes', { mode: 0o600 });
+        currentPsdFixture = {
+          children: [],
+          linkedFiles: [{ name: 'embedded.png', data: Buffer.from('current embedded bytes') }],
+        };
+      }
       const embeddedFile = {
-        path: embeddedPath,
+        path: scenario === 'corrupted-cache'
+          ? path.join(os.tmpdir(), `crate-psd-extract-${project.id}`, 'embedded.png')
+          : embeddedPath,
         name: 'embedded.png',
         ext: '.png',
         addedAt: Date.now(),
         source: 'psd-embedded',
       };
-      if (scenario === 'stale-digest') {
+      if (scenario !== 'legacy-metadata') {
         embeddedFile.parentPsd = psdPath;
         embeddedFile.embeddedOriginalName = 'embedded.png';
         embeddedFile.embeddedIndex = 0;
@@ -21316,12 +21329,24 @@ test('pre-package PSD recovery fails closed when embedded cache identity is stal
       });
 
       const scan = await callIpcRaw('projects:pre-package-scan', project.id);
-      assert.equal(scan.error, 'package_scan_incomplete', scenario);
-      assert.equal(scan.diagnostics.failurePhase, 'pre-package-app-scan', scenario);
+      if (scenario === 'legacy-metadata') {
+        assert.equal(scan.error, undefined, scenario);
+        assert.equal(scan.newCount, 0, scenario);
+      } else {
+        assert.equal(scan.error, 'package_scan_incomplete', scenario);
+        assert.equal(scan.diagnostics.failurePhase, 'pre-package-app-scan', scenario);
+      }
       const fresh = await getProject(project.id);
-      assert.equal(fresh.files.some(file => file.path === embeddedPath), true, scenario);
+      if (scenario === 'legacy-metadata') {
+        assert.equal(fresh.files.some(file => file.source === 'psd-embedded'), false, scenario);
+        assert.equal(fresh.pendingFiles.some(file => file.source === 'psd-embedded'), true, scenario);
+      } else {
+        assert.equal(fresh.files.some(file => file.path === embeddedFile.path), true, scenario);
+      }
     } finally {
       if (project) await callIpcRaw('projects:delete', project.id);
+      currentPsdFixture = previousPsdFixture;
+      fs.rmSync(path.join(os.tmpdir(), `crate-psd-extract-${project ? project.id : ''}`), { recursive: true, force: true });
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   }

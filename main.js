@@ -15302,6 +15302,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   };
   let metadataDiscoveryFailed = false;
   let psdRecoveryIncomplete = false;
+  let projectRecoveryChanged = false;
 
   const discoveryStartedAt = Date.now();
   const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
@@ -15621,22 +15622,48 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
       const embeddedRecords = project.files.filter(file => file && file.source === 'psd-embedded');
-      // A legacy embedded record without the source digest and stable embedded
-      // identity cannot be proven to belong to the current PSD contents. Do
-      // not package it silently; require an explicit recovery pass instead.
-      if (embeddedRecords.some(file => (
+      const psdPathKey = normalizeTrackedFilePath(psdFile.path);
+      const malformedEmbeddedRecords = embeddedRecords.filter(file => (
         !normalizeTrackedFilePath(file.parentPsd || '') ||
         typeof file.sourceDigest !== 'string' ||
         !/^\w{64}$/.test(file.sourceDigest) ||
         !Number.isInteger(file.embeddedIndex) ||
         typeof file.embeddedOriginalName !== 'string' ||
         !file.embeddedOriginalName.trim()
-      ))) {
-        psdRecoveryIncomplete = true;
-        return;
+      ));
+      const malformedRelatedRecords = malformedEmbeddedRecords.filter(file => (
+        normalizeTrackedFilePath(file.parentPsd || '') === psdPathKey
+      ));
+      if (malformedEmbeddedRecords.length > 0) {
+        // Legacy rows without a usable parent/index/name/digest cannot be
+        // trusted as package inputs. Quarantine them so unrelated PSDs can
+        // still recover, but fail closed when the malformed row is tied to
+        // this source explicitly.
+        project.files = project.files.filter(file => !malformedEmbeddedRecords.includes(file));
+        project.pendingFiles = (project.pendingFiles || []).filter(file => (
+          !malformedEmbeddedRecords.includes(file)
+        ));
+        project.pendingFiles.push(...malformedEmbeddedRecords.map(file => ({
+          ...file,
+          captureState: 'pending',
+          captureReason: 'psd-embedded-recovery-required',
+          captureEvidence: {
+            schemaVersion: 1,
+            source: 'psd-embedded',
+            reason: 'psd-embedded-recovery-required',
+            state: 'pending',
+            needsSave: false,
+          },
+        })));
+        projectRecoveryChanged = true;
+        if (malformedRelatedRecords.length > 0) {
+          psdRecoveryIncomplete = true;
+          return;
+        }
       }
       const relatedEmbeddedRecords = embeddedRecords.filter(file => (
-        normalizeTrackedFilePath(file.parentPsd || '') === normalizeTrackedFilePath(psdFile.path)
+        !malformedEmbeddedRecords.includes(file) &&
+        normalizeTrackedFilePath(file.parentPsd || '') === psdPathKey
       ));
       if (relatedEmbeddedRecords.length > 0) {
         let currentSourceDigest;
@@ -15657,6 +15684,57 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         if (relatedEmbeddedRecords.some(file => file.sourceDigest !== currentSourceDigest)) {
           // Existing cache bytes are tied to an older PSD. Fail closed so the
           // stale embedded assets cannot remain packageable after a source edit.
+          psdRecoveryIncomplete = true;
+          return;
+        }
+        let extractedPsdAssets = null;
+        let cacheIdentityValid = false;
+        try {
+          extractedPsdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
+          if (!operationCurrent()) {
+            extractedPsdAssets?.release?.();
+            return;
+          }
+          const extractedEmbeddedAssets = extractedPsdAssets.filter(asset => asset.source === 'psd-embedded');
+          const extractDir = path.join(os.tmpdir(), `crate-psd-extract-${projectId}`);
+          const byIdentity = new Map(extractedEmbeddedAssets.map(asset => [
+            `${asset.embeddedIndex}:${asset.embeddedOriginalName || ''}`,
+            asset,
+          ]));
+          cacheIdentityValid = extractedEmbeddedAssets.length === relatedEmbeddedRecords.length;
+          if (cacheIdentityValid) {
+            ensureSafeCacheDirectory(
+              extractDir,
+              'psd-extract-directory',
+              OWNER_ONLY_DIR_MODE,
+              safeRealpath(os.tmpdir(), 'psd-extract-parent')
+            );
+            for (const file of relatedEmbeddedRecords) {
+              const extracted = byIdentity.get(`${file.embeddedIndex}:${file.embeddedOriginalName}`);
+              if (!extracted || extracted.sourceDigest !== currentSourceDigest) {
+                cacheIdentityValid = false;
+                break;
+              }
+              const cachedBytes = readOwnerOnlyCacheFileSync(
+                file.path,
+                extractDir,
+                'psd-embedded-cache'
+              );
+              const extractedBytes = fs.readFileSync(extracted.filePath);
+              if (getPackageContentFingerprint(cachedBytes) !== getPackageContentFingerprint(extractedBytes)) {
+                cacheIdentityValid = false;
+                break;
+              }
+            }
+          }
+        } catch (_) {
+          cacheIdentityValid = false;
+        } finally {
+          extractedPsdAssets?.release?.();
+        }
+        if (!cacheIdentityValid) {
+          // A matching parent digest is insufficient if the extracted cache
+          // was replaced or corrupted. Do not let those bytes reach packaging.
           psdRecoveryIncomplete = true;
           return;
         }
@@ -15829,7 +15907,7 @@ end tell`;
     }
   }
 
-  if (newCount > 0) {
+  if (newCount > 0 || projectRecoveryChanged) {
     project.files = deduplicateFiles(project.files);
     clearFileVisualProjectCache(projectId);
   }
