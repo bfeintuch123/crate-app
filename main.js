@@ -7370,7 +7370,7 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 }
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
-function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false } = {}) {
+function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, rollbackOnNull = false } = {}) {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
@@ -7382,10 +7382,17 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   // boundary. A generic structural fallback remains available for any future
   // caller that cannot prove this contract.
   let before = null;
-  if (persistIfChanged && !trustResultChanged) {
+  if (rollbackOnNull || (persistIfChanged && !trustResultChanged)) {
     try { before = JSON.stringify(project); } catch (_) { before = null; }
   }
   const result = fn(project, projects);
+  if (rollbackOnNull && result === null && before !== null) {
+    try {
+      const restored = JSON.parse(before);
+      for (const key of Object.keys(project)) delete project[key];
+      Object.assign(project, restored);
+    } catch (_) {}
+  }
   const resultChanged = !!(result && result.changed === true);
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
     normalizeAutoCaptureProjectState(project);
@@ -13006,7 +13013,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
       }
       return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
-    });
+    }, { rollbackOnNull: true });
 
     if (result && isCurrent()) {
       lastFileActivity.set(projectId, Date.now());
@@ -13102,7 +13109,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           }
         }
         return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
-      });
+      }, { rollbackOnNull: true });
       if (!psdResult) psdAssets.release?.();
       if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
@@ -15021,52 +15028,60 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         .map(filePath => [normalizeTrackedFilePath(filePath), filePath])
         .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
     ).values()];
-    const result = mutateProject(projectId, (project) => {
-      if (!operation.current()) return null;
-      const acceptedByKey = new Map();
-      const excludedKeys = new Set(project.excludedAssetKeys || []);
-      for (const file of project.files || []) {
-        const key = getTrackedFileDedupKey(file);
-        if (key && !acceptedByKey.has(key)) acceptedByKey.set(key, file);
-      }
-      const manuallyObservedFiles = [];
-      for (const filePath of filePaths) {
+    let result = null;
+    for (let offset = 0; offset < filePaths.length; offset += 64) {
+      if (!operation.current()) break;
+      const batch = filePaths.slice(offset, offset + 64);
+      const batchResult = mutateProject(projectId, (project) => {
         if (!operation.current()) return null;
-        const fileEntry = {
-          path: filePath,
-          name: path.basename(filePath),
-          ext: path.extname(filePath).toLowerCase(),
-          addedAt: Date.now(),
-          source: 'manual-browse', // M1
-        };
-        const key = getTrackedFileDedupKey(fileEntry);
-        const existingFile = acceptedByKey.get(key);
-        const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
-        const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
-        if (!existingFile) {
-          project.files.push(authorizedFile);
-          acceptedByKey.set(key, authorizedFile);
+        const acceptedByKey = new Map();
+        const excludedKeys = new Set(project.excludedAssetKeys || []);
+        for (const file of project.files || []) {
+          const key = getTrackedFileDedupKey(file);
+          if (key && !acceptedByKey.has(key)) acceptedByKey.set(key, file);
         }
-        project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
-        for (const exclusionKey of [
-          getAssetReviewExclusionKey(existingFile),
-          getAssetReviewExclusionKey(pendingFile),
-          getAssetReviewExclusionKey(authorizedFile),
-          filePath,
-        ]) {
-          if (exclusionKey) excludedKeys.delete(exclusionKey);
+        const manuallyObservedFiles = [];
+        for (const filePath of batch) {
+          if (!operation.current()) return null;
+          const fileEntry = {
+            path: filePath,
+            name: path.basename(filePath),
+            ext: path.extname(filePath).toLowerCase(),
+            addedAt: Date.now(),
+            source: 'manual-browse', // M1
+          };
+          const key = getTrackedFileDedupKey(fileEntry);
+          const existingFile = acceptedByKey.get(key);
+          const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
+          const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
+          if (!existingFile) {
+            project.files.push(authorizedFile);
+            acceptedByKey.set(key, authorizedFile);
+          }
+          project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
+          for (const exclusionKey of [
+            getAssetReviewExclusionKey(existingFile),
+            getAssetReviewExclusionKey(pendingFile),
+            getAssetReviewExclusionKey(authorizedFile),
+            filePath,
+          ]) {
+            if (exclusionKey) excludedKeys.delete(exclusionKey);
+          }
+          manuallyObservedFiles.push(authorizedFile);
         }
-        manuallyObservedFiles.push(authorizedFile);
-      }
-      recordSessionObservedFiles(project, manuallyObservedFiles, {
-        kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
-        method: 'projects:add-files',
-        payload: { authoritySource: 'manual-browse' },
-      });
-      project.files = deduplicateFiles(project.files);
-      project.excludedAssetKeys = [...excludedKeys];
-      return project.files;
-    });
+        recordSessionObservedFiles(project, manuallyObservedFiles, {
+          kind: OBSERVER_KINDS.MANUAL_USER_ACTION,
+          method: 'projects:add-files',
+          payload: { authoritySource: 'manual-browse' },
+        });
+        project.files = deduplicateFiles(project.files);
+        project.excludedAssetKeys = [...excludedKeys];
+        return project.files;
+      }, { rollbackOnNull: true });
+      if (batchResult) result = batchResult;
+      if (!operation.current()) break;
+      if (offset + batch.length < filePaths.length) await new Promise(resolve => setImmediate(resolve));
+    }
 
     if (!result || !operation.current()) {
       if (addFilesAttempt.state === 'timed-out' || addFilesAttempt.reason === 'timeout') {
@@ -15590,7 +15605,12 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       for (const asset of psdAssets) {
         const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
         if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
-        const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+        const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source, {
+          parentPsd: psdFile.path,
+          embeddedOriginalName: asset.embeddedOriginalName || null,
+          embeddedIndex: Number.isInteger(asset.embeddedIndex) ? asset.embeddedIndex : null,
+          sourceDigest: asset.sourceDigest || null,
+        });
         const staged = stagePrePackageFile(project, fileEntry, {
           relationshipSourcePath: psdFile.path,
           appFamily: 'photoshop',
