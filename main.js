@@ -64,6 +64,26 @@ const {
 const { summarizeDiagnosticPackageErrors } = require('./diagnostic-summary');
 const { createAddFilesAttempt } = require('./parsers/add-files-operation');
 const { redactUrlAndCredentialText, redactPrivatePathText } = require('./parsers/figma-redaction');
+
+async function runCancellableExecFile(command, args, options = {}) {
+  const attempt = options.addFilesAttempt;
+  const execOptions = { ...options };
+  delete execOptions.addFilesAttempt;
+  delete execOptions.isCurrent;
+  if (!attempt) return execFileAsync(command, args, execOptions);
+  if (!attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  const controller = new AbortController();
+  const removeCancelListener = attempt.onCancel(() => controller.abort());
+  try {
+    return await execFileAsync(command, args, { ...execOptions, signal: controller.signal });
+  } finally {
+    removeCancelListener();
+  }
+}
+
+function isAddFilesParserCurrent(options = {}) {
+  return typeof options.isCurrent !== 'function' || options.isCurrent();
+}
 const {
   FIGMA_NETWORK_LIMITS,
   createByteBudget,
@@ -86,6 +106,7 @@ const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 const ADD_FILES_OPERATION_TIMEOUT_MS = 30_000;
 let addFilesOperationTimeoutMs = ADD_FILES_OPERATION_TIMEOUT_MS;
 const activeAddFilesOperations = new Map();
+const ADD_FILES_OPERATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -245,7 +266,7 @@ async function runOsascriptInPrivateTemp(buildScripts, entryScriptName, options 
       throw new Error('Missing temporary entry script');
     }
 
-    return await execFileAsync('/usr/bin/osascript', [entryScriptPath], options);
+    return await runCancellableExecFile('/usr/bin/osascript', [entryScriptPath], options);
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -10949,7 +10970,7 @@ function parseInDesignActiveSessionOutput(output) {
   return { documents, links, diagnostics };
 }
 
-function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
+async function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath, options = {}) {
   const rows = String(output || '').split('\n').map(line => line.trim()).filter(Boolean);
   const documents = new Map();
   const linkCountsByDocument = new Map();
@@ -10958,7 +10979,10 @@ function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
   const parseCount = value => (/^\d+$/.test(value || '') ? Number(value) : null);
   const isBooleanText = value => value === 'true' || value === 'false';
 
-  for (const line of rows) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    if (!isAddFilesParserCurrent(options)) throw new Error('asset_baseline_indesign_snapshot_cancelled');
+    if (rowIndex > 0 && rowIndex % 256 === 0) await new Promise(resolve => setImmediate(resolve));
+    const line = rows[rowIndex];
     if (terminal) throw new Error('asset_baseline_indesign_snapshot_incomplete');
     const parts = line.split('\t');
     if (parts[0] === 'DOC') {
@@ -11846,6 +11870,8 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
     const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
     const chunkBytes = 1024 * 1024;
     const carryBytes = 32 * 1024;
+    const yieldBytes = 8 * 1024 * 1024;
+    let bytesSinceYield = 0;
     let carry = '';
     for (let offset = 0; offset < buf.length; offset += chunkBytes) {
       if (!isCurrent()) return [];
@@ -11857,13 +11883,42 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
         if (linkedPath !== filePath) results.push(linkedPath);
       }
       carry = content.slice(-carryBytes);
-      await new Promise(resolve => setImmediate(resolve));
+      bytesSinceYield += Math.min(chunkBytes, buf.length - offset);
+      if (bytesSinceYield >= yieldBytes) {
+        bytesSinceYield = 0;
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
     if (!isCurrent()) return [];
   } catch (e) {
     if (strict) throw e;
   }
   return results;
+}
+
+async function collectRegexMatchesCooperatively(content, regex, options = {}) {
+  const matches = [];
+  const text = String(content || '');
+  const isCurrent = () => isAddFilesParserCurrent(options);
+  const chunkChars = 1024 * 1024;
+  const carryChars = 32 * 1024;
+  const yieldChars = 8 * 1024 * 1024;
+  let carry = '';
+  let charsSinceYield = 0;
+  for (let offset = 0; offset < text.length; offset += chunkChars) {
+    if (!isCurrent()) return null;
+    const chunk = carry + text.slice(offset, offset + chunkChars);
+    regex.lastIndex = 0;
+    let match;
+    while ((match = regex.exec(chunk)) !== null) matches.push(match);
+    carry = chunk.slice(-carryChars);
+    charsSinceYield += Math.min(chunkChars, text.length - offset);
+    if (charsSinceYield >= yieldChars) {
+      charsSinceYield = 0;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+  return isCurrent() ? matches : null;
 }
 
 /**
@@ -12026,7 +12081,7 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
     const activeState = strict
-      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath)
+      ? await parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath, options)
       : parseInDesignActiveSessionOutput(inddPaths);
 
     const results = activeState.links
@@ -12048,8 +12103,8 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
   const results = [];
   try {
     // List zip contents and find Spreads/*.xml or Resources/*.xml
-    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-      timeout: 10000, encoding: 'utf8'
+    const { stdout: listing } = await runCancellableExecFile('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8', ...options,
     });
     const xmlEntries = [];
     for (const line of listing.split('\n')) {
@@ -12061,14 +12116,16 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
     }
 
     for (const entry of xmlEntries) {
+      if (!isAddFilesParserCurrent(options)) return [];
       try {
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
-          timeout: 8000, encoding: 'utf8'
+        const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8', ...options,
         });
         // Look for LinkResourceURI attributes
         const uriRegex = /LinkResourceURI="file:([^"]+)"/gi;
-        let match;
-        while ((match = uriRegex.exec(data)) !== null) {
+        const uriMatches = await collectRegexMatchesCooperatively(data, uriRegex, options);
+        if (uriMatches === null) return [];
+        for (const match of uriMatches) {
           let uri = match[1];
           // Decode URI-encoded paths
           try { uri = decodeURIComponent(uri); } catch (e) {}
@@ -12080,7 +12137,9 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
         }
         // Also try the regex approach for any raw absolute paths
         const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27<>]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+        const rawMatches = await collectRegexMatchesCooperatively(data, LINKED_ASSET_REGEX, options);
+        if (rawMatches === null) return [];
+        for (const match of rawMatches) {
           results.push(match[0]);
         }
       } catch (e) {
@@ -12102,8 +12161,8 @@ async function extractLinkedAssetsSketch(filePath, options = {}) {
   const results = [];
   try {
     // List zip contents
-    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-      timeout: 10000, encoding: 'utf8'
+    const { stdout: listing } = await runCancellableExecFile('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8', ...options,
     });
     const jsonEntries = [];
     for (const line of listing.split('\n')) {
@@ -12114,14 +12173,16 @@ async function extractLinkedAssetsSketch(filePath, options = {}) {
     }
 
     for (const entry of jsonEntries) {
+      if (!isAddFilesParserCurrent(options)) return [];
       try {
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
-          timeout: 8000, encoding: 'utf8'
+        const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8', ...options,
         });
         // Scan for absolute file paths in JSON
         const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-        let match;
-        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+        const matches = await collectRegexMatchesCooperatively(data, LINKED_ASSET_REGEX, options);
+        if (matches === null) return [];
+        for (const match of matches) {
           results.push(match[0]);
         }
       } catch (e) {
@@ -12144,8 +12205,8 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
   const results = [];
   try {
     // List zip contents
-    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-      timeout: 10000, encoding: 'utf8'
+    const { stdout: listing } = await runCancellableExecFile('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8', ...options,
     });
     const entries = [];
     for (const line of listing.split('\n')) {
@@ -12161,13 +12222,15 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
     }
 
     for (const entry of entries) {
+      if (!isAddFilesParserCurrent(options)) return [];
       try {
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
-          timeout: 8000, encoding: 'utf8'
+        const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8', ...options,
         });
         const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-        let match;
-        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+        const matches = await collectRegexMatchesCooperatively(data, LINKED_ASSET_REGEX, options);
+        if (matches === null) return [];
+        for (const match of matches) {
           results.push(match[0]);
         }
       } catch (e) {
@@ -12214,8 +12277,8 @@ async function extractLinkedAssetsPxd(filePath, options = {}) {
   // .pxd is zip-based — try both structured and regex approaches
   const results = [];
   try {
-    const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', filePath], {
-      timeout: 10000, encoding: 'utf8'
+    const { stdout: listing } = await runCancellableExecFile('/usr/bin/unzip', ['-l', filePath], {
+      timeout: 10000, encoding: 'utf8', ...options,
     });
     const entries = [];
     for (const line of listing.split('\n')) {
@@ -12230,13 +12293,15 @@ async function extractLinkedAssetsPxd(filePath, options = {}) {
     }
 
     for (const entry of entries) {
+      if (!isAddFilesParserCurrent(options)) return [];
       try {
-        const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
-          timeout: 8000, encoding: 'utf8'
+        const { stdout: data } = await runCancellableExecFile('/usr/bin/unzip', ['-p', filePath, entry], {
+          timeout: 8000, encoding: 'utf8', ...options,
         });
         const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
-        let match;
-        while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
+        const matches = await collectRegexMatchesCooperatively(data, LINKED_ASSET_REGEX, options);
+        if (matches === null) return [];
+        for (const match of matches) {
           results.push(match[0]);
         }
       } catch (e) {
@@ -14369,16 +14434,24 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
   return project ? getIllustratorScopedProjectView(project).pendingFiles : [];
 });
 
-registerTrustedIpcHandler('projects:cancel-add-files', (event, projectId) => {
+registerTrustedIpcHandler('projects:cancel-add-files', (event, projectId, operationId) => {
   const operations = activeAddFilesOperations.get(projectId);
   if (!operations || operations.size === 0) return false;
-  for (const operation of [...operations]) operation.cancel();
-  return true;
+  if (typeof operationId === 'string' && ADD_FILES_OPERATION_ID_PATTERN.test(operationId)) {
+    const operation = operations.get(operationId);
+    return operation ? operation.cancel() : false;
+  }
+  let cancelled = false;
+  for (const operation of operations.values()) cancelled = operation.cancel() || cancelled;
+  return cancelled;
 });
 
-registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
+registerTrustedIpcHandler('projects:add-files', async (event, projectId, requestedOperationId) => {
   const baseOperation = captureProjectOperation(projectId);
   if (!baseOperation) return null;
+  const operationId = typeof requestedOperationId === 'string' && ADD_FILES_OPERATION_ID_PATTERN.test(requestedOperationId)
+    ? requestedOperationId
+    : crypto.randomUUID();
   let addFilesAttempt = null;
   let operation = baseOperation;
   const operationController = {
@@ -14387,8 +14460,8 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
       return addFilesAttempt?.cancel('renderer-timeout') !== false;
     },
   };
-  const projectOperations = activeAddFilesOperations.get(projectId) || new Set();
-  projectOperations.add(operationController);
+  const projectOperations = activeAddFilesOperations.get(projectId) || new Map();
+  projectOperations.set(operationId, operationController);
   activeAddFilesOperations.set(projectId, projectOperations);
   try {
     // M6: Filter to supported design + image file types.
@@ -14515,7 +14588,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
   } finally {
     operation.close();
     addFilesAttempt?.dispose();
-    projectOperations.delete(operationController);
+    projectOperations.delete(operationId);
     if (projectOperations.size === 0) activeAddFilesOperations.delete(projectId);
   }
 });

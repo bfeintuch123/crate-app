@@ -488,6 +488,14 @@ class TestUtilityProcess extends EventEmitter {
         });
       }
       if (this.suppressedMessages.has(message.type)) return;
+      if (message.type === 'parse' && path.basename(this.modulePath) === 'add-files-psd-worker.js') {
+        try {
+          this.respond({ type: 'result', result: createTestPsdWorkerResult() });
+        } catch (error) {
+          this.respond({ type: 'error', error: error && error.message ? error.message : 'asset_baseline_psd_worker_failed' });
+        }
+        return;
+      }
       if (message.type === 'init-session') {
         this.ownedOutputs = message.ownedOutputs || [];
         this.identity = message.identity;
@@ -959,6 +967,27 @@ setStub('child_process', () => ({
 }));
 
 let currentPsdFixture = { children: [], linkedFiles: [] };
+function createTestPsdWorkerResult() {
+  const fixture = typeof currentPsdFixture === 'function' ? currentPsdFixture() : currentPsdFixture;
+  if (fixture instanceof Error) throw fixture;
+  const entries = [];
+  const walkLayers = layers => {
+    for (const layer of layers || []) {
+      if (layer.linkedFile && typeof layer.linkedFile.fullPath === 'string') {
+        entries.push({ filePath: layer.linkedFile.fullPath, source: 'psd-linked' });
+      }
+      walkLayers(layer.children);
+    }
+  };
+  walkLayers(fixture?.children);
+  const embedded = (fixture?.linkedFiles || [])
+    .filter(file => file && file.data)
+    .map(file => ({
+      name: typeof file.name === 'string' ? file.name : '',
+      data: Buffer.from(file.data).toString('base64'),
+    }));
+  return { entries, embedded };
+}
 setStub('ag-psd', () => ({
   readPsd: () => {
     if (currentPsdFixture instanceof Error) throw currentPsdFixture;

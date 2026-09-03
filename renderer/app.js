@@ -79,6 +79,7 @@ let projectSelectionIntentEpoch = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
+let activeRendererAddFilesOperation = null;
 const rendererActionsInFlight = new Set();
 const BLOCKING_MODAL_IDS = [
   'modal-existing-assets',
@@ -548,10 +549,28 @@ function focusSelectedProjectTarget(projectId) {
   target?.focus?.({ preventScroll: true });
 }
 
+function createRendererAddFilesOperationId() {
+  try {
+    const randomUUID = globalThis.crypto?.randomUUID;
+    if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
+  } catch (_) {}
+  return `renderer-add-files-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 function setSelectedProject(projectId) {
   const nextProjectId = typeof projectId === 'string' && projectId ? projectId : null;
   projectSelectionIntentEpoch += 1;
   if (state.selectedProjectId === nextProjectId) return false;
+
+  const previousProjectId = state.selectedProjectId;
+  const activeAddFiles = activeRendererAddFilesOperation;
+  if (
+    previousProjectId &&
+    activeAddFiles?.projectId === previousProjectId &&
+    typeof window.crate?.cancelAddFiles === 'function'
+  ) {
+    Promise.resolve(window.crate.cancelAddFiles(previousProjectId, activeAddFiles.operationId)).catch(() => {});
+  }
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
@@ -4117,6 +4136,8 @@ function setupEventListeners() {
     const button = event.currentTarget || $('#btn-add-files');
     const projectId = state.selectedProjectId;
     const selectionEpoch = projectSelectionEpoch;
+    const operationId = createRendererAddFilesOperationId();
+    activeRendererAddFilesOperation = { projectId, operationId };
     try {
       await runRendererAction(`add-files:${projectId}`, button, 'Adding…', async () => {
         const attempt = createRendererDeadlineAttempt(rendererAddFilesOperationTimeoutMs);
@@ -4131,13 +4152,13 @@ function setupEventListeners() {
         );
         try {
           const addOutcome = await runRendererDeadlineAttempt(
-            () => window.crate.addFiles(projectId),
+            () => window.crate.addFiles(projectId, operationId),
             attempt
           );
           if (addOutcome.timedOut) {
             try {
               if (typeof window.crate?.cancelAddFiles === 'function') {
-                Promise.resolve(window.crate.cancelAddFiles(projectId)).catch(() => {});
+                Promise.resolve(window.crate.cancelAddFiles(projectId, operationId)).catch(() => {});
               }
             } catch (_) {}
             if (isSelectionCurrent()) {
@@ -4205,6 +4226,9 @@ function setupEventListeners() {
         }
         } finally {
           attempt.dispose();
+          if (activeRendererAddFilesOperation?.operationId === operationId) {
+            activeRendererAddFilesOperation = null;
+          }
         }
       }, '+ Add Files');
     } catch (error) {
