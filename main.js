@@ -11993,8 +11993,29 @@ function getAddFilesSourceDigest(buffer) {
 }
 
 async function getAddFilesCurrentSourceDigest(filePath, attempt) {
-  const buffer = await readFileWithAddFilesCancellation(filePath, attempt);
-  return getAddFilesSourceDigest(buffer);
+  if (attempt && !attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+    let settled = false;
+    let removeCancelListener = () => {};
+    const settle = (error, digest) => {
+      if (settled) return;
+      settled = true;
+      removeCancelListener();
+      if (error) reject(error);
+      else resolve(digest);
+    };
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('error', error => settle(error));
+    stream.on('end', () => settle(null, hash.digest('hex')));
+    if (attempt) {
+      removeCancelListener = attempt.onCancel(reason => {
+        stream.destroy();
+        settle(new Error(`add_files_parser_cancelled:${reason || 'cancelled'}`));
+      });
+    }
+  });
 }
 
 function isAddFilesSourceIdentityCurrent(stat, identity) {
@@ -12069,9 +12090,12 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
     });
     if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   }
+  const sourceDigest = await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt);
+  if (!isAddFilesParserCurrent(options)) throw new Error('add_files_parser_cancelled');
   return {
     kind: 'validated-source',
     sourceIdentity: getAddFilesSourceIdentity(stat),
+    sourceDigest,
   };
 }
 
@@ -12359,7 +12383,31 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         const embeddedData = typeof lf.data === 'string' ? Buffer.from(lf.data, 'base64') : Buffer.from(lf.data);
         const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, embeddedData, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
       }
-      if (!isCurrent()) return []; for (const staged of invocationFiles) { if (!isCurrent()) return []; await new Promise(resolve => setImmediate(resolve)); fs.linkSync(staged.stagedPath, staged.extractPath); staged.committed = true; fs.unlinkSync(staged.stagedPath); const finalStat = fs.lstatSync(staged.extractPath); if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed'); discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName }); }
+      if (!isCurrent()) return [];
+      for (const staged of invocationFiles) {
+        if (!isCurrent()) return [];
+        await new Promise(resolve => setImmediate(resolve));
+        let linked = false;
+        for (let attempt = 0; attempt < 100 && !linked; attempt++) {
+          try {
+            fs.linkSync(staged.stagedPath, staged.extractPath);
+            linked = true;
+          } catch (error) {
+            if (!error || error.code !== 'EEXIST') throw error;
+            const currentNames = new Set((fs.readdirSync(staged.extractDir) || []).map(name => name.toLowerCase()));
+            for (const name of usedEmbeddedNames) currentNames.add(name);
+            const nextName = reserveUniqueName(staged.embeddedOriginalName, currentNames);
+            usedEmbeddedNames.add(nextName.toLowerCase());
+            staged.extractPath = path.join(staged.extractDir, nextName);
+          }
+        }
+        if (!linked) throw cacheSafetyError('psd-extract-file', 'name-exhausted');
+        staged.committed = true;
+        fs.unlinkSync(staged.stagedPath);
+        const finalStat = fs.lstatSync(staged.extractPath);
+        if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed');
+        discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName });
+      }
     }
 
     if (!isCurrent()) return [];
@@ -14916,9 +14964,6 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       return null;
     }
     const dialogResult = dialogOutcome.dialogResult;
-    // Show the app window after native dialog closes.
-    showTrayWindow();
-
     if (dialogResult.canceled) return null;
     if (!operation.current()) {
       if (addFilesAttempt.state === 'timed-out' || addFilesAttempt.reason === 'timeout') {
@@ -14936,6 +14981,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       }
       return null;
     }
+    // Show the app window only for a still-current picker result. A native
+    // dialog may resolve after timeout and must not foreground the app late.
+    showTrayWindow();
 
     const filePaths = [...new Map(
       dialogResult.filePaths
@@ -14952,6 +15000,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       }
       const manuallyObservedFiles = [];
       for (const filePath of filePaths) {
+        if (!operation.current()) return null;
         const fileEntry = {
           path: filePath,
           name: path.basename(filePath),
