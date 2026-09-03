@@ -4652,16 +4652,19 @@ function cancelProjectAssetBaselineScanOperation(projectId, operation, sourcePat
 const MANUAL_ADD_SCAN_CONCURRENCY = 4;
 const ADD_FILES_PARSE_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024;
 const ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES = 1024 * 1024;
+const ADD_FILES_PSD_PARSE_MEMORY_MULTIPLIER = 4;
+const MANUAL_ADD_FILES_ADMISSION_BATCH_SIZE = 512;
 
 function createAddFilesParseMemoryBudget(maxBytes = ADD_FILES_PARSE_MEMORY_BUDGET_BYTES) {
   let reservedBytes = 0;
   return {
-    async acquire(sourceBytes, operation) {
+    async acquire(sourceBytes, operation, { parser = 'default' } = {}) {
       const isCurrent = typeof operation.currentFast === 'function'
         ? () => operation.currentFast()
         : () => operation.current();
+      const multiplier = parser === 'psd' ? ADD_FILES_PSD_PARSE_MEMORY_MULTIPLIER : 2;
       const estimatedParseBytes = Number.isSafeInteger(sourceBytes)
-        ? Math.min(Number.MAX_SAFE_INTEGER, sourceBytes * 2)
+        ? Math.min(Number.MAX_SAFE_INTEGER, sourceBytes * multiplier)
         : 0;
       const reservationBytes = Math.max(
         ADD_FILES_PARSE_MEMORY_MIN_RESERVATION_BYTES,
@@ -4798,7 +4801,11 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           continue;
         }
-        const reservation = await parseMemoryBudget.acquire(reservationStat.size, operation);
+        const reservation = await parseMemoryBudget.acquire(
+          reservationStat.size,
+          operation,
+          { parser: path.extname(sourcePath).toLowerCase() === '.psd' ? 'psd' : 'default' }
+        );
         if (!reservation) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           continue;
@@ -12000,7 +12007,9 @@ function getAddFilesSourceDigest(buffer) {
 }
 
 async function getAddFilesCurrentSourceDigest(filePath, attempt) {
-  if (attempt && !attempt.isCurrent()) throw new Error('add_files_parser_cancelled');
+  if (attempt && typeof attempt.isCurrent === 'function' && !attempt.isCurrent()) {
+    throw new Error('add_files_parser_cancelled');
+  }
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
     const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
@@ -12016,7 +12025,7 @@ async function getAddFilesCurrentSourceDigest(filePath, attempt) {
     stream.on('data', chunk => hash.update(chunk));
     stream.on('error', error => settle(error));
     stream.on('end', () => settle(null, hash.digest('hex')));
-    if (attempt) {
+    if (attempt && typeof attempt.onCancel === 'function') {
       removeCancelListener = attempt.onCancel(reason => {
         stream.destroy();
         settle(new Error(`add_files_parser_cancelled:${reason || 'cancelled'}`));
@@ -15029,9 +15038,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
     ).values()];
     let result = null;
-    for (let offset = 0; offset < filePaths.length; offset += 64) {
+    for (let offset = 0; offset < filePaths.length; offset += MANUAL_ADD_FILES_ADMISSION_BATCH_SIZE) {
       if (!operation.current()) break;
-      const batch = filePaths.slice(offset, offset + 64);
+      const batch = filePaths.slice(offset, offset + MANUAL_ADD_FILES_ADMISSION_BATCH_SIZE);
       const batchResult = mutateProject(projectId, (project) => {
         if (!operation.current()) return null;
         const acceptedByKey = new Map();
@@ -15277,6 +15286,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     metadataFallbackCount: 0,
   };
   let metadataDiscoveryFailed = false;
+  let psdRecoveryIncomplete = false;
 
   const discoveryStartedAt = Date.now();
   const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
@@ -15595,11 +15605,48 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     const psdFiles = project.files.filter(f => f.ext === '.psd');
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
-      const hasExistingPsdEmbeddedAssets = project.files.some(file => (
-        file && file.source === 'psd-embedded' &&
+      const embeddedRecords = project.files.filter(file => file && file.source === 'psd-embedded');
+      // A legacy embedded record without the source digest and stable embedded
+      // identity cannot be proven to belong to the current PSD contents. Do
+      // not package it silently; require an explicit recovery pass instead.
+      if (embeddedRecords.some(file => (
+        !normalizeTrackedFilePath(file.parentPsd || '') ||
+        typeof file.sourceDigest !== 'string' ||
+        !/^\w{64}$/.test(file.sourceDigest) ||
+        !Number.isInteger(file.embeddedIndex) ||
+        typeof file.embeddedOriginalName !== 'string' ||
+        !file.embeddedOriginalName.trim()
+      ))) {
+        psdRecoveryIncomplete = true;
+        return;
+      }
+      const relatedEmbeddedRecords = embeddedRecords.filter(file => (
         normalizeTrackedFilePath(file.parentPsd || '') === normalizeTrackedFilePath(psdFile.path)
       ));
-      if (hasExistingPsdEmbeddedAssets) continue;
+      if (relatedEmbeddedRecords.length > 0) {
+        let currentSourceDigest;
+        try {
+          const beforeDigestStat = await fs.promises.stat(psdFile.path);
+          currentSourceDigest = await getAddFilesCurrentSourceDigest(psdFile.path, {
+            isCurrent: operationCurrent,
+          });
+          const afterDigestStat = await fs.promises.stat(psdFile.path);
+          if (!isAddFilesSourceIdentityCurrent(afterDigestStat, getAddFilesSourceIdentity(beforeDigestStat))) {
+            psdRecoveryIncomplete = true;
+            return;
+          }
+        } catch (_) {
+          psdRecoveryIncomplete = true;
+          return;
+        }
+        if (relatedEmbeddedRecords.some(file => file.sourceDigest !== currentSourceDigest)) {
+          // Existing cache bytes are tied to an older PSD. Fail closed so the
+          // stale embedded assets cannot remain packageable after a source edit.
+          psdRecoveryIncomplete = true;
+          return;
+        }
+        continue;
+      }
       const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
       if (!operationCurrent()) { psdAssets.release?.(); return; }
       for (const asset of psdAssets) {
@@ -15704,6 +15751,17 @@ end tell`;
       phaseElapsedMs: appScanElapsedMs,
     });
     return createPackageReviewErrorResult(projectId, 'package_scan_incomplete');
+  }
+  if (psdRecoveryIncomplete) {
+    const recoveryDiagnostic = {
+      ...scanMetrics,
+      failurePhase: 'pre-package-app-scan',
+      phaseElapsedMs: appScanElapsedMs,
+    };
+    incompletePackageScans.add(projectId);
+    packageScanDiagnosticState.set(projectId, recoveryDiagnostic);
+    invalidatePackageReviewForProject(projectId);
+    return createPackageReviewErrorResult(projectId, 'package_scan_incomplete', recoveryDiagnostic);
   }
   if (!operationCurrent()) return null;
 

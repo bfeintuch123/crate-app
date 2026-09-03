@@ -21276,6 +21276,55 @@ test('pre-package app-script parser and regex recovered additions record session
   }
 });
 
+test('pre-package PSD recovery fails closed when embedded cache identity is stale or legacy', async () => {
+  for (const scenario of ['stale-digest', 'legacy-metadata']) {
+    const tmpRoot = makeTempDir();
+    let project = null;
+    try {
+      project = await createProject(`Prepackage PSD ${scenario}`);
+      const psdPath = path.join(tmpRoot, 'source.psd');
+      const embeddedPath = path.join(tmpRoot, 'embedded.png');
+      const originalPsdBytes = Buffer.from('original PSD bytes');
+      fs.writeFileSync(psdPath, scenario === 'stale-digest' ? 'changed PSD bytes' : originalPsdBytes);
+      fs.writeFileSync(embeddedPath, 'stale embedded cache bytes');
+      const embeddedFile = {
+        path: embeddedPath,
+        name: 'embedded.png',
+        ext: '.png',
+        addedAt: Date.now(),
+        source: 'psd-embedded',
+      };
+      if (scenario === 'stale-digest') {
+        embeddedFile.parentPsd = psdPath;
+        embeddedFile.embeddedOriginalName = 'embedded.png';
+        embeddedFile.embeddedIndex = 0;
+        embeddedFile.sourceDigest = crypto.createHash('sha256').update(originalPsdBytes).digest('hex');
+      }
+      await setProjectFiles(project.id, {
+        files: [
+          {
+            path: psdPath,
+            name: 'source.psd',
+            ext: '.psd',
+            addedAt: Date.now(),
+            source: 'manual-browse',
+          },
+          embeddedFile,
+        ],
+      });
+
+      const scan = await callIpcRaw('projects:pre-package-scan', project.id);
+      assert.equal(scan.error, 'package_scan_incomplete', scenario);
+      assert.equal(scan.diagnostics.failurePhase, 'pre-package-app-scan', scenario);
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.files.some(file => file.path === embeddedPath), true, scenario);
+    } finally {
+      if (project) await callIpcRaw('projects:delete', project.id);
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test('pre-package recovery provenance failure does not block broad candidate quarantine', async () => {
   resetTestHomeWorkspace();
   const figPath = path.join(TEST_HOME, 'Desktop', 'failure-open.fig');
