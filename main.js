@@ -13047,7 +13047,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       ].some(file => (
         file && file.source === 'psd-embedded' &&
         normalizeTrackedFilePath(file.parentPsd || '') === normalizeTrackedFilePath(filePath) &&
-        (!embeddedSourceDigest || file.sourceDigest === embeddedSourceDigest)
+        (!file.sourceDigest || !embeddedSourceDigest || file.sourceDigest === embeddedSourceDigest)
       ));
       if (hasExistingPsdEmbeddedAsset) {
         const retainedAssets = psdAssets.filter(asset => asset.source !== 'psd-embedded');
