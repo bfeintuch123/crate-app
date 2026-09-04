@@ -355,27 +355,27 @@ Codex must not treat silence as approval for any stop gate. If a loop reaches a 
 ## Loop Types
 
 ### Crate Fix Review Stack
-Every autonomous Crate code-fix loop must use this stack unless Bryant explicitly scopes the work as docs-only, review-only, or no-review.
+This is the shared routing for focused Crate fixes and autonomous code-fix loops. Select playbooks by demonstrated scope and risk, not as a fixed reading or execution sequence. A small diff does not exempt a major surface from required review.
 
-Mandatory playbooks:
-- `crate-bug-triage.md` before editing to classify the failure, evidence quality, severity, and whether a fix is actually warranted.
-- `clawpatch-fix.md` for the implementation path so the change stays small, branch-gated, and test-backed.
-- `crate-autoreview.md` before and after the fix to challenge assumptions, stale evidence, over-scope, and release-blocking risk.
-- `crate-regression-detector.md` to identify blast radius and required focused checks.
-- `crate-security-scan.md` to check token, path, package, parser, shell, filesystem-boundary, and privacy risks.
-- `crate-provenance-review.md` when the change touches package output, Figma, diagnostics, live evidence, provenance, pending files, asset classification, or session decisions.
-- `crate-runner-loop.md` to record repeatable command evidence, environment, branch/commit, pass/fail, duration, failures, and next action.
-- `review-crate-pr.md` before merge when a PR exists or merge is preauthorized.
-- `crate-handoff.md` whenever the loop stops, blocks, or needs a restartable next prompt.
+Core path:
+- Before editing, identify the failure, current evidence, expected behavior, affected risks, and whether a fix is warranted. Use `crate-bug-triage.md` for ambiguous reports, uncertain diagnosis, or failures needing deeper classification; obtain missing evidence before implementing an unsupported fix.
+- Use `clawpatch-fix.md` for the smallest safe implementation within the approved action set. Run the relevant suite from `.codex/checks/crate-check-suites.md` and focused regression checks. Review the resulting diff against the diagnosis, acceptance criteria, and affected risks.
+- Record repeatable command evidence using `crate-runner-loop.md`: environment, branch/commit, pass/fail, duration, failures, and next action. Use `crate-handoff.md` when stopping, blocked, or transferring restartable work.
 
-Stack rules:
-- Do not skip triage and autoreview just because the likely fix seems obvious.
-- Do not edit code before classifying whether the issue is a real app bug, QA setup problem, automation blocker, product follow-up, stale report, dependency/security issue, or release blocker.
-- Use the strictest stop gate from all selected playbooks.
-- If a playbook says to stop, the loop stops even if the preauthorization mode would otherwise allow more work.
-- Preserve privacy filters across all evidence, logs, QA reports, runner output, and handoffs.
-- For dependency remediation, use the Security / Dependency Loop rules in addition to this stack.
-- For release-gate failures, use this stack only for the remediation branch; run `crate-release-gate.md` again only after the fix merges and Bryant approves the next QA prerelease.
+Specialist routing:
+- Use `crate-autoreview.md` for its stated review triggers and modes, and for uncertain or high-risk fixes. Every major PR follows its mandatory exact-head correction loop and `AGENTS.md` Major PR Routing, regardless of diff size or loop mode.
+- Use `crate-regression-detector.md` when blast radius or regression coverage needs investigation beyond the focused checks.
+- Use `crate-security-scan.md` for token, path, package, parser, shell, filesystem-boundary, dependency, or privacy risks.
+- Use `crate-provenance-review.md` when touching package output, Figma, diagnostics, live evidence, provenance, pending files, asset classification, or session decisions.
+- Use `review-crate-pr.md` for PR review and before merge. Review-only requests stay read-only under the relevant review playbook.
+
+Review and correction rules:
+- Give reviewers the exact target, context, acceptance criteria, and known risks. Reviewers choose how to investigate within required playbooks and gates; add investigation or passes to resolve evidence gaps, not as ritual repetition.
+- Verify findings against the actual code and task before accepting implementation changes. Keep reviewers read-only and return verified findings to the sole writer under the applicable correction authorization.
+- If a correction fails, reassess the diagnosis before widening implementation or validation. Preserve failed regression assertions until their meaning is understood; do not remove them merely to make checks pass.
+- Continue already-authorized in-scope work without another approval unless an applicable stop or approval gate is reached. This routing grants no new authority and does not override selected playbook gates or the major-PR correction-cycle limit.
+- Use the strictest applicable stop gate and preserve privacy filters across evidence, logs, QA reports, runner output, and handoffs.
+- For dependency remediation, also use the Security / Dependency Loop rules. For release-gate failures, this route covers only the remediation branch; rerun `crate-release-gate.md` only after the fix merges and Bryant approves the next QA prerelease.
 
 ### 1. Autonomous Crate Failure Loop
 Purpose:
@@ -727,8 +727,7 @@ Failure source: <qa-smoke|tester-report|github-issue|release-gate-failure|depend
 Goal: triage and fix <exact failure> from <version/artifact/PR/report>.
 Allowed actions:
 - verify repo path, remote, branch, base, and clean tree
-- classify the failure with `crate-bug-triage.md`
-- use the Crate Fix Review Stack
+- classify the failure and select checks/reviews using the Crate Fix Review Stack routing
 - create a focused branch from latest origin/v2.4.x only if classification supports a real fix
 - inspect the exact failing command, error text, report, or privacy-safe artifact
 - identify the smallest plausible code or docs surface
@@ -777,7 +776,7 @@ The old smoke-failure loop is retained as a named variant:
 Autonomous Smoke Failure Fix Loop = Autonomous Crate Failure Loop with Failure source: qa-smoke
 ```
 
-Use this variant when the input is a Jenna installed-app smoke report or another structured QA smoke result. It must still use the Crate Fix Review Stack before implementation and before merge.
+Use this variant when the input is a Jenna installed-app smoke report or another structured QA smoke result. Use the same Crate Fix Review Stack routing and applicable gates as the general failure loop.
 
 Required final output:
 - failure source and classification

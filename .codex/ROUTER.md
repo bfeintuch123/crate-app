@@ -34,11 +34,11 @@ Run `python3 .codex/tools/crate_doctor.py` before release, deploy, long-running 
 | --- | --- | --- | --- |
 | "What is the current Crate status?" | `.codex/state/current-workstream.md` | `.codex/playbooks/crate-workstream-status.md` | read-only |
 | "Synthesize this Jenna report" | `.codex/playbooks/crate-qa-results-synthesizer.md` | `.codex/playbooks/crate-bug-triage.md` when action is needed | read-only unless approved |
-| "Crate failure, triage/fix it" | `.codex/playbooks/crate-codex-loops.md` Autonomous Crate Failure Loop | Crate Fix Review Stack: `crate-bug-triage.md`, `clawpatch-fix.md`, `crate-autoreview.md`, `crate-regression-detector.md`, `crate-security-scan.md`, `crate-provenance-review.md`, `crate-runner-loop.md`, `review-crate-pr.md`, `crate-handoff.md` | use Bryant's requested loop mode |
-| "Smoke failed, fix it" | `.codex/playbooks/crate-codex-loops.md` Autonomous Smoke Failure Fix Loop variant | same Crate Fix Review Stack as Crate Failure Loop | use Bryant's requested loop mode |
+| "Crate failure, triage/fix it" | `.codex/playbooks/crate-codex-loops.md` Autonomous Crate Failure Loop | Crate Fix Review Stack routing in that playbook | use Bryant's requested loop mode |
+| "Smoke failed, fix it" | `.codex/playbooks/crate-codex-loops.md` Autonomous Smoke Failure Fix Loop variant | same risk-based routing as Crate Failure Loop | use Bryant's requested loop mode |
 | "Run the internal QA release gate" | `.codex/playbooks/crate-release-gate.md` | `crate-autoreview.md`, `crate-security-scan.md`, `crate-regression-detector.md`, `crate-provenance-review.md`, `crate-handoff.md` | release-gate only when explicitly approved |
 | "Review this PR for merge" | `.codex/playbooks/review-crate-pr.md` | `crate-autoreview.md`, `crate-regression-detector.md`, `crate-security-scan.md`, `crate-provenance-review.md` as scope requires | read-only until merge approved |
-| "Make a small bug fix" | `.codex/playbooks/clawpatch-fix.md` | relevant check suite from `.codex/checks/crate-check-suites.md` | no-autonomy unless Bryant grants loop mode |
+| "Make a small bug fix" | `.codex/playbooks/clawpatch-fix.md` | Crate Fix Review Stack routing in `.codex/playbooks/crate-codex-loops.md`; small diffs retain all applicable major-PR gates | no-autonomy unless Bryant grants loop mode |
 | "Triage tester feedback" | `tester-feedback-loop` for intake and private evidence custody | `tester-canonicalization-loop`, then `crate-qa-results-synthesizer.md` and `crate-bug-triage.md` when action is needed | read-only |
 | "Run Jenna GUI QA" | `.codex/playbooks/crate-computer-use-qa.md` | `crate-gui-repro-flow.md` for repros | explicit app/file approval required |
 | "Create a handoff" | `.codex/playbooks/crate-handoff.md` | `.agents/skills/crate-handoff/SKILL.md` | read-only |
