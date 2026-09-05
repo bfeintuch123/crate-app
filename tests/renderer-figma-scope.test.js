@@ -6669,6 +6669,164 @@ test('renderer clears Add Files busy state after an IPC error', async () => {
   assert.equal(elements['btn-add-files'].getAttribute('aria-busy'), 'false');
 });
 
+test('renderer fences a late Add Files reconciliation after a project switch', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const addResult = createDeferred();
+  const refreshResult = createDeferred();
+  const oldProject = { id: 'late-add-project', name: 'Late Add Project', status: 'watching', files: [] };
+  const cancelCalls = [];
+  let refreshCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crypto: { randomUUID: () => 'late-add-operation' },
+    crate: {
+      addFiles: () => addResult.promise,
+      cancelAddFiles: (...args) => { cancelCalls.push(args); return Promise.resolve(true); },
+      getProjects: () => {
+        refreshCalls += 1;
+        return refreshResult.promise;
+      },
+    },
+  });
+  vm.runInContext(`
+    state.projects = [${JSON.stringify(oldProject)}];
+    state.selectedProjectId = '${oldProject.id}';
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  addResult.resolve([oldProject]);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(refreshCalls, 1);
+
+  renderer.setSelectedProject('newly-selected-project');
+  refreshResult.resolve([{ ...oldProject, files: [{ path: '/stale/late.png' }] }]);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext('state.projects', renderer))), [oldProject]);
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'newly-selected-project');
+  assert.equal(cancelCalls.length, 1);
+  assert.deepEqual(cancelCalls[0], [oldProject.id, 'late-add-operation']);
+});
+
+test('renderer bounds a stuck Add Files refresh and fences its late response', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const refreshResult = createDeferred();
+  const oldProject = { id: 'stuck-refresh-project', name: 'Stuck Refresh Project', status: 'watching', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => [oldProject],
+      getProjects: () => refreshResult.promise,
+    },
+  }, {
+    setTimeout: (callback, delay, ...args) => setTimeout(callback, delay === 12000 ? 5 : delay, ...args),
+    clearTimeout,
+  });
+  vm.runInContext(`
+    state.projects = [${JSON.stringify(oldProject)}];
+    state.selectedProjectId = '${oldProject.id}';
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(elements['btn-add-files'].disabled, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext('state.projects', renderer))), [oldProject]);
+
+  refreshResult.resolve([{ ...oldProject, files: [{ path: '/stale/refresh.png' }] }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext('state.projects', renderer))), [oldProject]);
+});
+
+test('renderer bounds a stuck Add Files render and fences its late workspace response', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const workspaceResult = createDeferred();
+  const oldProject = { id: 'stuck-render-project', name: 'Stuck Render Project', status: 'watching', files: [] };
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => [oldProject],
+      getProjects: async () => [oldProject],
+      getAssetWorkspace: () => workspaceResult.promise,
+      cancelAddFiles: () => Promise.resolve(true),
+    },
+  }, {
+    setTimeout: (callback, delay, ...args) => setTimeout(callback, delay === 12000 ? 5 : delay, ...args),
+    clearTimeout,
+  });
+  vm.runInContext(`
+    state.projects = [${JSON.stringify(oldProject)}];
+    state.selectedProjectId = '${oldProject.id}';
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(elements['btn-add-files'].disabled, false);
+
+  renderer.setSelectedProject('newly-selected-render-project');
+  workspaceResult.resolve({ projectId: oldProject.id, files: [], pendingFiles: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext('state.selectedProjectId', renderer), 'newly-selected-render-project');
+  assert.notEqual(vm.runInContext('state.assetWorkspace?.projectId', renderer), oldProject.id);
+});
+
+test('Add Files decision reconciliation uses the render-cached workspace before opening the real modal', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const secondWorkspaceCall = createDeferred();
+  const project = {
+    id: 'cached-decision-add-project',
+    name: 'Cached Decision Add Project',
+    status: 'watching',
+    files: [
+      { name: 'Working.ai', path: '/synthetic/Working.ai', ext: '.ai', assetOrigin: 'added', projectRole: 'source' },
+      { name: 'Existing.png', path: '/synthetic/Existing.png', ext: '.png', assetOrigin: 'existing', projectRole: 'asset' },
+    ],
+    pendingFiles: [],
+    excludedAssetKeys: [],
+    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+  };
+  const workspace = {
+    projectId: project.id,
+    files: project.files.map(file => ({
+      ...file,
+      protectedSource: file.projectRole === 'source',
+      excluded: false,
+      visualIdentity: file.path,
+      visualRevision: 'revision-1',
+    })),
+    pendingFiles: [],
+  };
+  let workspaceCalls = 0;
+  const renderer = loadRendererHelpers(document, {
+    crate: {
+      addFiles: async () => [project],
+      getProjects: async () => [project],
+      getAssetWorkspace: async () => {
+        workspaceCalls += 1;
+        return workspaceCalls === 1 ? workspace : secondWorkspaceCall.promise;
+      },
+    },
+  }, {
+    setTimeout: (callback, delay, ...args) => setTimeout(callback, delay === 12000 ? 20 : delay, ...args),
+    clearTimeout,
+  });
+  vm.runInContext(`
+    state.projects = [${JSON.stringify(project)}];
+    state.selectedProjectId = '${project.id}';
+  `, renderer);
+  renderer.setupEventListeners();
+
+  elements['btn-add-files'].click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(workspaceCalls, 1);
+  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+
+  secondWorkspaceCall.resolve(workspace);
+  await new Promise(resolve => setImmediate(resolve));
+});
+
 test('renderer acknowledges Start Watching immediately and suppresses duplicate toggles', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const deferred = createDeferred();

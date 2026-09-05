@@ -166,6 +166,7 @@ let testLastFileIconOptions = null;
 let testBeforeFileIconResolve = null;
 let testBrowserWindowCreateCount = 0;
 let testMainWindowShowCount = 0;
+let testShowOpenDialogCount = 0;
 const testNotifications = [];
 const testMessageBoxes = [];
 const testRendererEvents = [];
@@ -618,6 +619,45 @@ class TestUtilityProcess extends EventEmitter {
         });
         return;
       }
+      if (
+        message.type === 'parse' &&
+        (this.modulePath.endsWith('add-files-regex-worker.js') || this.modulePath.endsWith('add-files-psd-worker.js'))
+      ) {
+        try {
+          if (this.modulePath.endsWith('add-files-regex-worker.js')) {
+            const { parseRegex } = require('../parsers/add-files-regex-worker');
+            this.respond({ type: 'result', result: parseRegex(message.filePath) });
+          } else {
+            const stat = fs.statSync(message.filePath);
+            const sourceBuffer = fs.readFileSync(message.filePath);
+            const entries = [];
+            const walkLayers = layers => {
+              for (const layer of layers || []) {
+                if (layer.linkedFile?.fullPath) entries.push({ filePath: layer.linkedFile.fullPath, source: 'psd-linked' });
+                walkLayers(layer.children);
+              }
+            };
+            walkLayers(currentPsdFixture.children);
+            for (const file of currentPsdFixture.linkedFiles || []) {
+              if (file.linkedFile?.fullPath) entries.push({ filePath: file.linkedFile.fullPath, source: 'psd-linked' });
+            }
+            this.respond({
+              type: 'result',
+              result: {
+                sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
+                sourceDigest: crypto.createHash('sha256').update(sourceBuffer).digest('hex'),
+                entries,
+                embedded: (currentPsdFixture.linkedFiles || [])
+                  .filter(file => file?.data)
+                  .map(file => ({ name: file.name || '', data: Buffer.from(file.data).toString('base64') })),
+              },
+            });
+          }
+        } catch (error) {
+          this.respond({ type: 'error', error: error.message });
+        }
+        return;
+      }
       this.fail();
     } catch (_) {
       this.fail();
@@ -668,7 +708,10 @@ setStub('electron', () => ({
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
   },
   dialog: {
-    showOpenDialog: async () => nextOpenDialogResult,
+    showOpenDialog: async () => {
+      testShowOpenDialogCount += 1;
+      return nextOpenDialogResult;
+    },
     showSaveDialog: async () => ({ canceled: true }),
     showMessageBox: async options => {
       testMessageBoxes.push(options);
@@ -13717,6 +13760,333 @@ test('large Add Files source scans use bounded concurrency and report per-file f
     await callIpcRaw('projects:delete', partialProject.id);
   } finally {
     fs.promises.stat = originalStat;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files keeps the native picker unbounded and cancels cleanly before selection', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-picker-'));
+  let releasePicker;
+  const picker = new Promise(resolve => { releasePicker = resolve; });
+  const project = await createProject('Focused slow Add Files picker');
+  const sourcePath = path.join(fixtureRoot, 'picker-source.ai');
+  try {
+    nextOpenDialogResult = picker;
+    const addPromise = callIpcRaw('projects:add-files', project.id, 'focused-picker-operation');
+    await new Promise(resolve => originalSetTimeout(resolve, 0));
+    assert.equal(
+      await callIpcRaw('projects:cancel-add-files', project.id, 'focused-picker-operation'),
+      true
+    );
+    releasePicker({ canceled: false, filePaths: [sourcePath] });
+    assert.equal(await addPromise, null);
+    assert.equal((await getProject(project.id)).files.some(file => file.path === sourcePath), false);
+  } finally {
+    nextOpenDialogResult = { canceled: true };
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files production PSD worker timeout kills the utility process and fences a late result', async () => {
+  const fixtureRoot = makeTempDir();
+  const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-production-timeout');
+  const originalTestSetTimeout = global.setTimeout;
+  let workerChild = null;
+  let parseRequested = false;
+  let lateResult = null;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'production-timeout.psd');
+    const linkedPath = path.join(fixtureRoot, 'production-timeout-linked.png');
+    fs.writeFileSync(sourcePath, 'controlled PSD source bytes');
+    fs.writeFileSync(linkedPath, 'controlled linked bytes');
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: linkedPath } }],
+      linkedFiles: [{ name: 'late-embedded.png', data: Buffer.from('late embedded bytes') }],
+    };
+    setUtilityProcessHandler(({ phase, modulePath, message, child }) => {
+      if (!modulePath.endsWith('add-files-psd-worker.js')) return;
+      if (phase === 'fork') {
+        workerChild = child;
+        child.suppressedResponses.add('result');
+      } else if (phase === 'message' && message.type === 'parse') {
+        parseRequested = true;
+      } else if (phase === 'response' && message.type === 'result') {
+        lateResult = message;
+      }
+    });
+    global.setTimeout = (callback, delay, ...args) => originalTestSetTimeout(
+      callback,
+      delay === 30_000 ? 25 : delay,
+      ...args
+    );
+
+    const project = await createProject('Production PSD worker timeout');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id, 'production-psd-timeout');
+
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(parseRequested, true);
+    assert.ok(workerChild);
+    assert.equal(workerChild.options.serviceName, 'Crate Add Files PSD Parser');
+    assert.equal(workerChild.killed, true);
+    assert.ok(lateResult);
+    const admitted = getAddFilesResultFiles(result);
+    assert.equal(admitted.some(file => file.path === sourcePath), true);
+    assert.equal(admitted.some(file => file.path === linkedPath), false);
+
+    workerChild.suppressedResponses.delete('result');
+    workerChild.respond(lateResult);
+    await new Promise(resolve => originalSetTimeout(resolve, 0));
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(JSON.stringify(fresh.provenance || {}).includes(linkedPath), false);
+    assert.equal(
+      fs.existsSync(extractDir) ? fs.readdirSync(extractDir).length : 0,
+      0
+    );
+  } finally {
+    global.setTimeout = originalTestSetTimeout;
+    setUtilityProcessHandler(null);
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files production PSD worker rejects a source replacement before admission', async () => {
+  const fixtureRoot = makeTempDir();
+  const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-production-replacement');
+  let workerChild = null;
+  let parseRequested = false;
+  let replaced = false;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'production-replacement.psd');
+    const linkedPath = path.join(fixtureRoot, 'production-replacement-linked.png');
+    fs.writeFileSync(sourcePath, 'controlled PSD source bytes');
+    fs.writeFileSync(linkedPath, 'controlled linked bytes');
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    currentPsdFixture = {
+      children: [{ linkedFile: { fullPath: linkedPath } }],
+      linkedFiles: [{ name: 'replacement-embedded.png', data: Buffer.from('replacement bytes') }],
+    };
+    setUtilityProcessHandler(({ phase, modulePath, message, child }) => {
+      if (!modulePath.endsWith('add-files-psd-worker.js')) return;
+      if (phase === 'fork') workerChild = child;
+      if (phase === 'message' && message.type === 'parse') parseRequested = true;
+      if (phase === 'response' && message.type === 'result' && !replaced) {
+        replaced = true;
+        fs.appendFileSync(sourcePath, '\nreplacement bytes');
+      }
+    });
+
+    const project = await createProject('Production PSD source replacement');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id, 'production-psd-replacement');
+
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(parseRequested, true);
+    assert.equal(replaced, true);
+    assert.ok(workerChild);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.files.some(file => file.path === linkedPath), false);
+    assert.equal(JSON.stringify(fresh.provenance || {}).includes(linkedPath), false);
+    assert.equal(
+      fs.existsSync(extractDir) ? fs.readdirSync(extractDir).length : 0,
+      0
+    );
+    workerChild.kill();
+  } finally {
+    setUtilityProcessHandler(null);
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files production PSD staging cleanup removes owned output after cancellation', async () => {
+  const fixtureRoot = makeTempDir();
+  const originalWriteFile = fs.promises.writeFile;
+  let extractDir = null;
+  let workerChild = null;
+  let parseRequested = false;
+  let stagedWriteSeen = false;
+  let pauseIssued = false;
+  try {
+    const sourcePath = path.join(fixtureRoot, 'production-staging.psd');
+    fs.writeFileSync(sourcePath, 'controlled PSD source bytes');
+    currentPsdFixture = {
+      children: [],
+      linkedFiles: [{ name: 'staged-embedded.png', data: Buffer.from('staged embedded bytes') }],
+    };
+    const project = await createProject('Production PSD staging cleanup');
+    extractDir = path.join(os.tmpdir(), `crate-psd-extract-${project.id}`);
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    setUtilityProcessHandler(({ phase, modulePath, message, child }) => {
+      if (!modulePath.endsWith('add-files-psd-worker.js')) return;
+      if (phase === 'fork') workerChild = child;
+      if (phase === 'message' && message.type === 'parse') parseRequested = true;
+    });
+    fs.promises.writeFile = async function gateProductionPsdStage(filePath, ...args) {
+      const result = await originalWriteFile.call(fs.promises, filePath, ...args);
+      if (!stagedWriteSeen && path.dirname(path.resolve(filePath)) === path.resolve(extractDir)) {
+        stagedWriteSeen = true;
+        await callIpcRaw('projects:pause', project.id);
+        pauseIssued = true;
+      }
+      return result;
+    };
+
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id, 'production-psd-staging');
+
+    assert.equal(result, null);
+    assert.equal(parseRequested, true);
+    assert.equal(stagedWriteSeen, true);
+    assert.equal(pauseIssued, true);
+    assert.ok(workerChild);
+    assert.equal(
+      fs.existsSync(extractDir) ? fs.readdirSync(extractDir).length : 0,
+      0
+    );
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.path === sourcePath), true);
+    assert.equal(fresh.files.some(file => file.name === 'staged-embedded.png'), false);
+  } finally {
+    fs.promises.writeFile = originalWriteFile;
+    setUtilityProcessHandler(null);
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('concurrent Add Files requests share one native picker and reject the second request', async () => {
+  let releasePicker;
+  const picker = new Promise(resolve => { releasePicker = resolve; });
+  const project = await createProject('Concurrent Add Files picker');
+  const pickerCallsBefore = testShowOpenDialogCount;
+  try {
+    nextOpenDialogResult = picker;
+    const first = callIpcRaw('projects:add-files', project.id, 'concurrent-picker-first');
+    await new Promise(resolve => originalSetTimeout(resolve, 0));
+    const second = await callIpcRaw('projects:add-files', project.id, 'concurrent-picker-second');
+    assert.deepEqual(second, { success: false, error: 'add_files_operation_in_progress' });
+    assert.equal(testShowOpenDialogCount - pickerCallsBefore, 1);
+    releasePicker({ canceled: true, filePaths: [] });
+    assert.equal(await first, null);
+  } finally {
+    nextOpenDialogResult = { canceled: true };
+  }
+});
+
+test('Add Files times out one source, continues the queue, and retries with a fresh lease', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-timeout-'));
+  const originalReadFile = fs.promises.readFile;
+  const trackedSetTimeout = global.setTimeout;
+  let releaseSlowRead;
+  let slowReadStarted;
+  const slowReadGate = new Promise(resolve => { releaseSlowRead = resolve; });
+  const slowReadStartedPromise = new Promise(resolve => { slowReadStarted = resolve; });
+  let blockSlowRead = true;
+  const filePaths = Array.from({ length: 6 }, (_, index) => (
+    path.join(fixtureRoot, `bounded-${index + 1}.ai`)
+  ));
+  try {
+    for (const filePath of filePaths) writeSyntheticAiFile(filePath, 'focused bounded scan source');
+    fs.promises.readFile = async function focusedReadGate(filePath, ...args) {
+      if (blockSlowRead && path.resolve(filePath) === path.resolve(filePaths[0])) {
+        slowReadStarted();
+        await slowReadGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+    global.setTimeout = (callback, delay, ...args) => trackedSetTimeout(
+      callback,
+      delay === 30000 ? 250 : delay,
+      ...args
+    );
+
+    const project = await createProject('Focused Add Files timeout queue');
+    manualDialogFor(filePaths);
+    const firstScan = callIpcRaw('projects:add-files', project.id, 'focused-timeout-operation');
+    await slowReadStartedPromise;
+    const partial = await firstScan;
+    assertAddFilesPartialScanFailure(partial);
+    assert.equal(partial.selectedCount, filePaths.length);
+    assert.equal(partial.admittedCount, filePaths.length);
+    assert.equal(partial.failedCount, 1);
+    assert.equal(partial.scanResults.find(item => item.path === filePaths[0]).error, 'add_files_scan_timeout');
+    assert.equal(partial.scanResults.filter(item => item.success).length, filePaths.length - 1);
+
+    releaseSlowRead();
+    await new Promise(resolve => originalSetTimeout(resolve, 25));
+    blockSlowRead = false;
+    manualDialogFor(filePaths);
+    const retry = await callIpcRaw('projects:add-files', project.id, 'focused-retry-operation');
+    assert.equal(Array.isArray(retry), true);
+    assert.equal(retry.length, filePaths.length);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
+  } finally {
+    global.setTimeout = trackedSetTimeout;
+    fs.promises.readFile = originalReadFile;
+    releaseSlowRead();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files fences a late scan after the watching project changes generation', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-stale-'));
+  const originalReadFile = fs.promises.readFile;
+  let releaseRead;
+  let readStarted;
+  const readGate = new Promise(resolve => { releaseRead = resolve; });
+  const readStartedPromise = new Promise(resolve => { readStarted = resolve; });
+  const sourcePath = path.join(fixtureRoot, 'stale-source.ai');
+  const linkedPath = path.join(fixtureRoot, 'stale-linked.png');
+  try {
+    fs.writeFileSync(linkedPath, 'stale linked asset');
+    writeSyntheticAiFile(sourcePath, `focused stale link ${linkedPath}`);
+    fs.promises.readFile = async function staleReadGate(filePath, ...args) {
+      if (path.resolve(filePath) === path.resolve(sourcePath)) {
+        readStarted();
+        await readGate;
+      }
+      return originalReadFile.call(fs.promises, filePath, ...args);
+    };
+
+    const project = await createProject('Focused stale Add Files source');
+    manualDialogFor([sourcePath]);
+    const addPromise = callIpcRaw('projects:add-files', project.id, 'focused-stale-operation');
+    await readStartedPromise;
+    await createProject('Focused generation replacement');
+    releaseRead();
+    assert.equal(await addPromise, null);
+
+    const stored = await getProject(project.id);
+    assert.equal(stored.files.some(file => file.path === sourcePath), true);
+    assert.equal(stored.files.some(file => file.path === linkedPath), false);
+    assert.equal(JSON.stringify(stored.provenance).includes(linkedPath), false);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    releaseRead();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Add Files establishes the initial watcher baseline through the real handler', async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-baseline-'));
+  const sourcePath = path.join(fixtureRoot, 'baseline-source.ai');
+  try {
+    writeSyntheticAiFile(sourcePath, 'focused baseline source');
+    const project = await createProject('Focused initial Add Files baseline');
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id, 'focused-baseline-operation');
+    assert.equal(Array.isArray(result), true);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.assetBaseline.status, 'empty');
+    assert.equal(fresh.files.find(file => file.path === sourcePath).projectRole, 'source');
+  } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });

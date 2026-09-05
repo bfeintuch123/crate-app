@@ -7,6 +7,7 @@ try {
 // ===== Constants =====
 const MAX_PROJECTS = 7;
 const PROJECT_CREATION_REQUEST_TIMEOUT_MS = 30000;
+const ADD_FILES_RENDER_RECONCILE_TIMEOUT_MS = 12000;
 const PRESENTATION_FILE_EXTS = new Set(['.ppt', '.pptx', '.key']);
 const PRIMARY_WORKING_FILE_EXTS = new Set([
   '.ai', '.psd', '.indd', '.idml', '.fig', '.sketch', '.xd',
@@ -78,6 +79,7 @@ let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
 const rendererActionsInFlight = new Set();
+let activeAddFilesOperation = null;
 const BLOCKING_MODAL_IDS = [
   'modal-existing-assets',
   'modal-package',
@@ -551,6 +553,14 @@ function setSelectedProject(projectId) {
   projectSelectionIntentEpoch += 1;
   if (state.selectedProjectId === nextProjectId) return false;
 
+  if (activeAddFilesOperation && activeAddFilesOperation.projectId !== nextProjectId) {
+    const pending = activeAddFilesOperation;
+    activeAddFilesOperation = null;
+    try {
+      window.crate?.cancelAddFiles?.(pending.projectId, pending.operationId)?.catch?.(() => {});
+    } catch (_) {}
+  }
+
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
   // A project switch invalidates every modal session.  The caller must not
@@ -623,6 +633,32 @@ async function runRendererAction(key, element, busyLabel, action, idleLabel = nu
   } finally {
     rendererActionsInFlight.delete(key);
     setRendererActionBusy(element, false, busyLabel, idleLabel);
+  }
+}
+
+async function reconcileAddFilesRendererState(operation, selectionEpoch, selectionIntentEpoch) {
+  const isCurrent = () => (
+    activeAddFilesOperation === operation &&
+    state.selectedProjectId === operation.projectId &&
+    projectSelectionEpoch === selectionEpoch &&
+    projectSelectionIntentEpoch === selectionIntentEpoch
+  );
+  const reconciliation = (async () => {
+    const projects = await window.crate.getProjects();
+    if (!isCurrent()) return false;
+    state.projects = Array.isArray(projects) ? projects : [];
+    if (!isCurrent()) return false;
+    await renderFiles({ isCurrent });
+    return isCurrent();
+  })();
+  let timeoutId = null;
+  const timeout = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve(false), ADD_FILES_RENDER_RECONCILE_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([reconciliation, timeout]);
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
   }
 }
 
@@ -1352,9 +1388,13 @@ function updateNamingPreview() {
 }
 
 // ===== Render Files =====
-async function renderFiles() {
+async function renderFiles(renderOptions = {}) {
   const renderRequestId = ++fileWorkspaceRenderRequestId;
   const workspaceRequestId = ++assetWorkspaceRequestId;
+  const isRenderCurrent = typeof renderOptions.isCurrent === 'function'
+    ? renderOptions.isCurrent
+    : () => true;
+  if (!isRenderCurrent()) return;
   const viewState = getRendererViewState();
   const noProject = $('#files-no-project');
   const filesView = $('#files-view');
@@ -1468,7 +1508,8 @@ async function renderFiles() {
   if (
     renderRequestId !== fileWorkspaceRenderRequestId ||
     workspaceRequestId !== assetWorkspaceRequestId ||
-    state.selectedProjectId !== project.id
+    state.selectedProjectId !== project.id ||
+    !isRenderCurrent()
   ) return;
   if (!assetWorkspace || assetWorkspace.projectId !== project.id) {
     assetWorkspace = {
@@ -1515,7 +1556,9 @@ async function renderFiles() {
   const packageBtn = $('#btn-package');
   packageBtn.disabled = false;
 
+  if (!isRenderCurrent()) return;
   await syncExistingAssetsDecisionModal(project);
+  if (!isRenderCurrent()) return;
   restoreRendererViewState(viewState);
 }
 
@@ -4052,12 +4095,19 @@ function setupEventListeners() {
       return;
     }
     const button = event.currentTarget || $('#btn-add-files');
+    const operationId = typeof window.crypto?.randomUUID === 'function'
+      ? window.crypto.randomUUID()
+      : `add-files-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const operation = { projectId: state.selectedProjectId, operationId };
+    const selectionEpoch = projectSelectionEpoch;
+    const selectionIntentEpoch = projectSelectionIntentEpoch;
+    activeAddFilesOperation = operation;
     try {
       await runRendererAction(`add-files:${state.selectedProjectId}`, button, 'Adding…', async () => {
-        const result = await window.crate.addFiles(state.selectedProjectId);
+        const result = await window.crate.addFiles(operation.projectId, operation.operationId);
         if (result?.success === false) {
-          state.projects = await window.crate.getProjects();
-          await renderFiles();
+          const reconciled = await reconcileAddFilesRendererState(operation, selectionEpoch, selectionIntentEpoch);
+          if (!reconciled) return;
           if (result.error === 'add_files_partial_scan_failure') {
             const count = Number.isSafeInteger(result.failedCount) ? result.failedCount : 1;
             showToast(`${count} file${count === 1 ? '' : 's'} could not be scanned. Successful files were kept.`);
@@ -4067,13 +4117,16 @@ function setupEventListeners() {
           return;
         }
         if (Array.isArray(result)) {
-          state.projects = await window.crate.getProjects();
-          await renderFiles();
+          await reconcileAddFilesRendererState(operation, selectionEpoch, selectionIntentEpoch);
         }
       }, '+ Add Files');
     } catch (error) {
       logRendererError('Add Files failed', error);
-      showToast('Crate could not add files. Try again.');
+      if (activeAddFilesOperation === operation) {
+        showToast('Crate could not add files. Try again.');
+      }
+    } finally {
+      if (activeAddFilesOperation === operation) activeAddFilesOperation = null;
     }
   });
 

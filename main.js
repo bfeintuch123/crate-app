@@ -68,6 +68,8 @@ const {
   createByteBudget,
   fetchBufferWithLimits,
 } = require('./parsers/figma-network');
+const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
+const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -79,8 +81,14 @@ const TEMP_SCRIPT_FILE_MODE = 0o600;
 const OWNER_ONLY_DIR_MODE = 0o700;
 const OWNER_ONLY_FILE_MODE = 0o600;
 const PACKAGE_TRANSACTION_WORKER_PATH = path.join(__dirname, 'parsers', 'package-transaction-worker.js');
+const ADD_FILES_PSD_WORKER_PATH = path.join(__dirname, 'parsers', 'add-files-psd-worker.js');
+const ADD_FILES_REGEX_WORKER_PATH = path.join(__dirname, 'parsers', 'add-files-regex-worker.js');
 const PACKAGE_TRANSACTION_CHUNK_BYTES = 1024 * 1024;
 const PACKAGE_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
+const ADD_FILES_SCAN_TIMEOUT_MS = 30_000;
+const ADD_FILES_OPERATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
+const activeAddFilesOperations = new Map();
+const pendingNativeAddFilesPickers = new Map();
 const CACHE_CLEANUP_BATCH_SIZE = 25;
 const CACHE_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
 const CRATE_PROJECT_CACHE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -4412,6 +4420,7 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
       requiredSourceKeys: getProjectAssetBaselineSourceKeys(project, startedAt),
       completedSourceKeys: new Set(),
       inFlightBySource: new Map(),
+      activeScans: new Set(),
       queuedSourceKeys: new Set(),
       presentationMediaOccurrencesBySource: new Map(),
     };
@@ -4422,18 +4431,33 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
     state.queuedSourceKeys?.delete(sourceKey);
   }
 
+  state.activeScans ||= new Set();
+  const scan = { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
+  state.activeScans.add(scan);
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
-  return { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
+  return scan;
+}
+
+function releaseProjectAssetBaselineScan(scan) {
+  if (!scan) return false;
+  const state = assetBaselineScans.get(scan.projectId);
+  if (!state || !state.activeScans?.has(scan)) return false;
+  state.activeScans.delete(scan);
+  const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
+  if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
+  else state.inFlightBySource.delete(scan.sourceKey);
+  return true;
 }
 
 async function completeProjectAssetBaselineScan(scan, dependable) {
   if (!scan) return;
   const state = assetBaselineScans.get(scan.projectId);
   if (!state) return;
-
-  const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
-  if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
-  else state.inFlightBySource.delete(scan.sourceKey);
+  if (scan.cancelled) {
+    releaseProjectAssetBaselineScan(scan);
+    return;
+  }
+  releaseProjectAssetBaselineScan(scan);
   // A duplicate observer can start more than one scan for the same source.
   // One dependable completion is sufficient; a later failed duplicate must not
   // erase that proof and make the result depend on completion order.
@@ -4563,11 +4587,55 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         continue;
       }
       try {
-        const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
-        if (!operation.current()) {
+        if (options.addFilesScan !== true) {
+          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
+          if (!operation.current()) {
+            outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
+          } else if (result && result.success === false) {
+            outcomes[index] = { path: sourcePath, success: false, error: result.error || 'scan_on_open_failed' };
+          } else {
+            outcomes[index] = { path: sourcePath, success: true };
+          }
+          continue;
+        }
+        const scanOutcome = await runBoundedAddFilesScan(
+          async scanLease => {
+            const releaseScanLease = options.onScanLease?.(scanLease);
+            const releaseOnCancel = scanLease.onCancel(() => releaseScanLease?.());
+            try {
+              return await runScanOnOpen(
+                projectId,
+                sourcePath,
+                activationToken,
+                {
+                  activationToken,
+                  current: () => operation.current() && scanLease.current(),
+                  onCancel: scanLease.onCancel,
+                  adoptScope: scope => operation.adoptScope(scope) && scanLease.current(),
+                },
+                { ...options, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
+              );
+            } finally {
+              releaseOnCancel();
+              releaseScanLease?.();
+            }
+          },
+          {
+            timeoutMs: options.scanTimeoutMs || ADD_FILES_SCAN_TIMEOUT_MS,
+            parentCurrent: operation.current,
+          }
+        );
+        if (scanOutcome.timedOut) {
+          releaseProjectAssetBaselineScan(scanOutcome.lease.baselineScan);
+          outcomes[index] = { path: sourcePath, success: false, error: 'add_files_scan_timeout' };
+        } else if (scanOutcome.cancelled || !operation.current()) {
           outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
-        } else if (result && result.success === false) {
-          outcomes[index] = { path: sourcePath, success: false, error: result.error || 'scan_on_open_failed' };
+        } else if (scanOutcome.value && scanOutcome.value.success === false) {
+          outcomes[index] = {
+            path: sourcePath,
+            success: false,
+            error: scanOutcome.value.error || 'scan_on_open_failed',
+          };
         } else {
           outcomes[index] = { path: sourcePath, success: true };
         }
@@ -11592,11 +11660,134 @@ const STRICT_ZIP_ASSET_BASELINE_EXTENSIONS = new Set([
   '.key', '.pptx', '.pxd', '.xd',
 ]);
 
-async function assertDependableAssetBaselineSource(filePath) {
+function getAddFilesSourceIdentity(stat) {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+  };
+}
+
+function isAddFilesSourceIdentityCurrent(stat, identity) {
+  return !!(
+    stat && identity && stat.isFile() &&
+    stat.dev === identity.dev &&
+    stat.ino === identity.ino &&
+    stat.size === identity.size &&
+    stat.mtimeMs === identity.mtimeMs
+  );
+}
+
+function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
+  if (!utilityProcess || typeof utilityProcess.fork !== 'function') {
+    return Promise.reject(new Error(options.unavailableError || 'asset_baseline_worker_unavailable'));
+  }
+  return new Promise((resolve, reject) => {
+    let child = null;
+    let settled = false;
+    let removeCancelListener = () => {};
+    const stopChild = () => {
+      try { child?.kill(); } catch (_) {}
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      removeCancelListener();
+      if (error) {
+        stopChild();
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    try {
+      child = utilityProcess.fork(workerPath, [], {
+        cwd: path.dirname(filePath),
+        env: {},
+        execArgv: [],
+        stdio: 'ignore',
+        serviceName: options.serviceName || 'Crate Add Files Parser',
+        allowLoadingUnsignedLibraries: false,
+        disclaim: false,
+      });
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    child.once('error', error => finish(error));
+    child.once('exit', () => {
+      if (!settled) finish(new Error(options.exitedError || 'asset_baseline_worker_exited'));
+    });
+    child.once('spawn', () => {
+      if (!settled) child.postMessage({ type: 'parse', filePath });
+    });
+    child.on('message', message => {
+      if (settled || !message || typeof message !== 'object') return;
+      if (message.type === 'error') {
+        finish(new Error(typeof message.error === 'string'
+          ? message.error
+          : (options.failedError || 'asset_baseline_worker_failed')));
+        return;
+      }
+      if (message.type !== 'result' || !message.result || !options.isResult?.(message.result)) {
+        finish(new Error(options.invalidResultError || 'asset_baseline_worker_invalid_result'));
+        return;
+      }
+      finish(null, message.result);
+    });
+    if (scanLease && typeof scanLease.onCancel === 'function') {
+      const unsubscribe = scanLease.onCancel(() => {
+        finish(new Error('add_files_parser_cancelled'));
+      });
+      if (settled) unsubscribe();
+      else removeCancelListener = unsubscribe;
+    }
+  });
+}
+
+function runAddFilesPsdWorker(filePath, scanLease) {
+  return runAddFilesWorker(ADD_FILES_PSD_WORKER_PATH, filePath, scanLease, {
+    unavailableError: 'asset_baseline_psd_worker_unavailable',
+    failedError: 'asset_baseline_psd_worker_failed',
+    invalidResultError: 'asset_baseline_psd_worker_invalid_result',
+    exitedError: 'asset_baseline_psd_worker_exited',
+    serviceName: 'Crate Add Files PSD Parser',
+    isResult: result => Array.isArray(result.entries),
+  });
+}
+
+function runAddFilesRegexWorker(filePath, scanLease) {
+  return runAddFilesWorker(ADD_FILES_REGEX_WORKER_PATH, filePath, scanLease, {
+    unavailableError: 'asset_baseline_regex_worker_unavailable',
+    failedError: 'asset_baseline_regex_worker_failed',
+    invalidResultError: 'asset_baseline_regex_worker_invalid_result',
+    exitedError: 'asset_baseline_regex_worker_exited',
+    serviceName: 'Crate Add Files Regex Parser',
+    isResult: result => Array.isArray(result.paths),
+  });
+}
+
+async function assertDependableAssetBaselineSource(filePath, options = {}) {
   const stat = await fs.promises.stat(filePath);
   if (!stat.isFile()) throw new Error('asset_baseline_source_not_file');
   if (stat.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
   const ext = path.extname(filePath).toLowerCase();
+  if (options.addFilesAttempt && REGEX_SOURCE_EXTENSIONS.has(ext)) {
+    const sourceIdentity = getAddFilesSourceIdentity(stat);
+    const result = await runAddFilesRegexWorker(filePath, options.addFilesAttempt);
+    if (options.isCurrent && !options.isCurrent()) throw new Error('add_files_parser_cancelled');
+    const currentStat = await fs.promises.stat(filePath);
+    if (!isAddFilesSourceIdentityCurrent(currentStat, sourceIdentity)) {
+      throw new Error('asset_baseline_source_changed');
+    }
+    return {
+      kind: 'regex-worker-result',
+      result,
+      sourceIdentity,
+      sourceDigest: result.sourceDigest,
+    };
+  }
   if (ext === '.ai' || ext === '.pdf') {
     const sourceBuffer = await fs.promises.readFile(filePath);
     const headerText = sourceBuffer.subarray(0, Math.min(sourceBuffer.length, 1024)).toString('latin1');
@@ -11620,6 +11811,22 @@ async function assertDependableAssetBaselineSource(filePath) {
     await handle.close();
   }
 
+  if (ext === '.psd' && options.addFilesAttempt) {
+    const sourceIdentity = getAddFilesSourceIdentity(stat);
+    const result = await runAddFilesPsdWorker(filePath, options.addFilesAttempt);
+    if (!options.isCurrent?.()) throw new Error('add_files_parser_cancelled');
+    const currentStat = await fs.promises.stat(filePath);
+    if (!isAddFilesSourceIdentityCurrent(currentStat, sourceIdentity)) {
+      throw new Error('asset_baseline_source_changed');
+    }
+    return {
+      kind: 'psd-worker-result',
+      result,
+      sourceIdentity,
+      sourceDigest: result.sourceDigest,
+    };
+  }
+
   if (ext === '.psd') {
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
@@ -11630,6 +11837,13 @@ async function assertDependableAssetBaselineSource(filePath) {
     });
   }
   return null;
+}
+
+async function getAddFilesCurrentSourceDigest(filePath, scanLease) {
+  if (scanLease && !scanLease.current()) throw new Error('add_files_parser_cancelled');
+  const sourceBuffer = await fs.promises.readFile(filePath);
+  if (scanLease && !scanLease.current()) throw new Error('add_files_parser_cancelled');
+  return crypto.createHash('sha256').update(sourceBuffer).digest('hex');
 }
 
 /**
@@ -11648,6 +11862,8 @@ async function extractLinkedAssets(filePath, options = {}) {
         return await extractLinkedAssetsRegex(filePath, {
           strict,
           sourceBuffer: options.sourceBuffer,
+          addFilesAttempt: options.addFilesAttempt,
+          validatedRegexResult: options.validatedRegexResult,
         });
       case '.psd':
         return await extractLinkedAssetsPhotoshop(filePath, { strict });
@@ -11664,11 +11880,19 @@ async function extractLinkedAssets(filePath, options = {}) {
       case '.pptx':
         return await extractLinkedAssetsZipMedia(filePath, { strict });
       case '.ppt':
-        return await extractLinkedAssetsRegex(filePath, { strict });
+        return await extractLinkedAssetsRegex(filePath, {
+          strict,
+          addFilesAttempt: options.addFilesAttempt,
+          validatedRegexResult: options.validatedRegexResult,
+        });
       case '.pxd':
         return await extractLinkedAssetsPxd(filePath, { strict });
       case '.fig':
-        return await extractLinkedAssetsRegex(filePath, { strict });
+        return await extractLinkedAssetsRegex(filePath, {
+          strict,
+          addFilesAttempt: options.addFilesAttempt,
+          validatedRegexResult: options.validatedRegexResult,
+        });
       default:
         return [];
     }
@@ -11688,6 +11912,13 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
   const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
   const results = [];
   try {
+    if (options.validatedRegexResult && Array.isArray(options.validatedRegexResult.paths)) {
+      return [...options.validatedRegexResult.paths];
+    }
+    if (options.addFilesAttempt && !Buffer.isBuffer(options.sourceBuffer)) {
+      const workerResult = await runAddFilesRegexWorker(filePath, options.addFilesAttempt);
+      return [...workerResult.paths];
+    }
     const suppliedBuffer = Buffer.isBuffer(options.sourceBuffer) ? options.sourceBuffer : null;
     if (!suppliedBuffer) {
       // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM.
@@ -11779,9 +12010,22 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
       return [];
     }
-    const buf = await fs.promises.readFile(psdFilePath);
-    if (!isCurrent()) return [];
-    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+    let psd = null;
+    let workerResult = options.validatedPsdResult || null;
+    if (workerResult) {
+      const expectedIdentity = options.validatedPsdSourceIdentity || workerResult.sourceIdentity;
+      if (!isAddFilesSourceIdentityCurrent(stat, expectedIdentity)) {
+        if (options.strict === true) throw new Error('asset_baseline_source_changed');
+        return [];
+      }
+    } else if (options.addFilesAttempt) {
+      workerResult = await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt);
+      if (!isCurrent()) return [];
+    } else {
+      const buf = await fs.promises.readFile(psdFilePath);
+      if (!isCurrent()) return [];
+      psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+    }
     const discoveredPaths = [];
 
     // Walk layers for linkedFile.fullPath
@@ -11797,21 +12041,71 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (layer.children) walkLayers(layer.children);
       }
     }
-    walkLayers(psd.children);
+    if (workerResult) {
+      for (const entry of workerResult.entries || []) {
+        if (!isCurrent()) return [];
+        if (typeof entry.filePath === 'string') {
+          try {
+            await fs.promises.access(entry.filePath, fs.constants.F_OK);
+            discoveredPaths.push({ filePath: entry.filePath, source: 'psd-linked' });
+          } catch (_) {}
+        }
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    } else {
+      walkLayers(psd.children);
+    }
 
     // Extract embedded files from psd.linkedFiles
-    if (psd.linkedFiles && psd.linkedFiles.length > 0) {
+    const linkedFiles = workerResult ? workerResult.embedded || [] : psd.linkedFiles || [];
+    if (linkedFiles.length > 0) {
       const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
       if (!isCurrent()) return [];
       await fs.promises.mkdir(extractDir, { recursive: true });
       if (!isCurrent()) return [];
-      const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase())); for (const lf of psd.linkedFiles) {
+      const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase()));
+      for (const [embeddedIndex, lf] of linkedFiles.entries()) {
+        if (!isCurrent()) return [];
         if (!lf.data) continue;
         const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
         const extractPath = path.join(extractDir, safeName);
-        const stagedPath = safeCacheTempPath(extractPath), staged = { stagedPath, extractPath, extractDir, embeddedOriginalName: lf.name || '', identity: null, committed: false }; invocationFiles.push(staged); await fs.promises.writeFile(stagedPath, Buffer.from(lf.data), { flag: 'wx', mode: OWNER_ONLY_FILE_MODE }); const stagedStat = fs.lstatSync(stagedPath); if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) throw cacheSafetyError('psd-extract-file', 'unsafe'); staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
+        const data = typeof lf.data === 'string' ? Buffer.from(lf.data, 'base64') : Buffer.from(lf.data);
+        const stagedPath = safeCacheTempPath(extractPath);
+        const staged = {
+          stagedPath,
+          extractPath,
+          extractDir,
+          embeddedOriginalName: lf.name || '',
+          embeddedIndex,
+          identity: null,
+          committed: false,
+        };
+        invocationFiles.push(staged);
+        await fs.promises.writeFile(stagedPath, data, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE });
+        const stagedStat = fs.lstatSync(stagedPath);
+        if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) {
+          throw cacheSafetyError('psd-extract-file', 'unsafe');
+        }
+        staged.identity = { dev: stagedStat.dev, ino: stagedStat.ino };
       }
-      if (!isCurrent()) return []; for (const staged of invocationFiles) { fs.linkSync(staged.stagedPath, staged.extractPath); staged.committed = true; fs.unlinkSync(staged.stagedPath); const finalStat = fs.lstatSync(staged.extractPath); if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) throw cacheSafetyError('psd-extract-file', 'changed'); discoveredPaths.push({ filePath: staged.extractPath, source: 'psd-embedded', embeddedOriginalName: staged.embeddedOriginalName }); }
+      if (!isCurrent()) return [];
+      for (const staged of invocationFiles) {
+        if (!isCurrent()) return [];
+        fs.linkSync(staged.stagedPath, staged.extractPath);
+        staged.committed = true;
+        fs.unlinkSync(staged.stagedPath);
+        const finalStat = fs.lstatSync(staged.extractPath);
+        if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) {
+          throw cacheSafetyError('psd-extract-file', 'changed');
+        }
+        discoveredPaths.push({
+          filePath: staged.extractPath,
+          source: 'psd-embedded',
+          embeddedOriginalName: staged.embeddedOriginalName,
+          embeddedIndex: staged.embeddedIndex,
+          sourceDigest: workerResult?.sourceDigest || null,
+        });
+      }
     }
 
     if (!isCurrent()) return []; keepInvocationFiles = true; return discoveredPaths;
@@ -12249,18 +12543,42 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
     });
+  if (options.addFilesScanLease) options.addFilesScanLease.baselineScan = baselineScan;
+  if (baselineScan && options.addFilesScanLease) {
+    options.addFilesScanLease.onCancel(() => {
+      baselineScan.cancelled = true;
+    });
+  }
   let dependableScanCompleted = false;
   try {
 
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
-  const validatedSourceBuffer = baselineScan
-    ? await assertDependableAssetBaselineSource(filePath)
+  const validatedSource = baselineScan
+    ? await assertDependableAssetBaselineSource(filePath, {
+      isCurrent,
+      addFilesAttempt: options.addFilesAttempt,
+    })
     : null;
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: !!baselineScan,
-    sourceBuffer: validatedSourceBuffer,
+    sourceBuffer: Buffer.isBuffer(validatedSource) ? validatedSource : undefined,
+    addFilesAttempt: options.addFilesAttempt,
+    validatedRegexResult: validatedSource?.kind === 'regex-worker-result' ? validatedSource.result : undefined,
+    validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
+    validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
   });
   if (!isCurrent()) return;
+  const recheckValidatedSource = async () => {
+    if (!baselineScan || !validatedSource) return true;
+    if (validatedSource.kind === 'psd-worker-result') {
+      return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt) === validatedSource.sourceDigest;
+    }
+    if (validatedSource.kind === 'regex-worker-result') {
+      return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt) === validatedSource.sourceDigest;
+    }
+    return true;
+  };
+  if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
   const latestProject = getProjects().find(item => item.id === projectId);
   if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
 
@@ -12354,8 +12672,14 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!baselineScan && Date.now() - lastParsed < 5000) return;
     if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
-    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, { strict: !!baselineScan });
+    const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
+      strict: !!baselineScan,
+      addFilesAttempt: options.addFilesAttempt,
+      validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
+      validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
+    });
     if (!isCurrent()) return;
+    if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdAssets.length > 0) {
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -12414,6 +12738,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   if (baselineScan && (ext === '.pptx' || ext === '.key')) {
     await captureExistingPresentationMediaBaseline(projectId, filePath, baselineScan, isCurrent);
   }
+  if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
   dependableScanCompleted = true;
   return { success: true };
   } catch (error) {
@@ -14197,13 +14522,67 @@ registerTrustedIpcHandler('projects:reject-pending', (event, projectId, filePath
   return project ? getIllustratorScopedProjectView(project).pendingFiles : [];
 });
 
-registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
-  const operation = captureProjectOperation(projectId);
-  if (!operation) return null;
+registerTrustedIpcHandler('projects:cancel-add-files', (event, projectId, operationId) => {
+  if (typeof projectId !== 'string' || typeof operationId !== 'string' || !ADD_FILES_OPERATION_ID_PATTERN.test(operationId)) {
+    return false;
+  }
+  const operation = activeAddFilesOperations.get(projectId);
+  const controller = operation?.get(operationId);
+  return !!controller && controller.cancel();
+});
+
+registerTrustedIpcHandler('projects:add-files', async (event, projectId, requestedOperationId) => {
+  const baseOperation = captureProjectOperation(projectId);
+  if (!baseOperation) return null;
+  const operationId = typeof requestedOperationId === 'string' && ADD_FILES_OPERATION_ID_PATTERN.test(requestedOperationId)
+    ? requestedOperationId
+    : crypto.randomUUID();
+  const existingOperations = activeAddFilesOperations.get(projectId);
+  if (pendingNativeAddFilesPickers.has(projectId) || existingOperations?.size) {
+    baseOperation.close();
+    return { success: false, error: 'add_files_operation_in_progress' };
+  }
+
+  let cancelled = false;
+  const activeScanLeases = new Set();
+  const controller = {
+    cancel() {
+      if (cancelled) return false;
+      cancelled = true;
+      baseOperation.close();
+      for (const scanLease of activeScanLeases) scanLease.cancel('operation-cancelled');
+      return true;
+    },
+  };
+  const operations = new Map([[operationId, controller]]);
+  activeAddFilesOperations.set(projectId, operations);
+  const operation = {
+    activationToken: baseOperation.activationToken,
+    close() {
+      cancelled = true;
+      baseOperation.close();
+    },
+    current() {
+      return !cancelled && baseOperation.current();
+    },
+    adoptScope(scope) {
+      return !cancelled && baseOperation.adoptScope(scope);
+    },
+  };
+  let pickerLease = null;
+  const releasePickerLease = () => {
+    if (pickerLease && pendingNativeAddFilesPickers.get(projectId) === pickerLease) {
+      pendingNativeAddFilesPickers.delete(projectId);
+    }
+    pickerLease = null;
+  };
+
   try {
     // M6: Filter to supported design + image file types.
     const supportedExts = [...PRIMARY_DESIGN_EXTENSIONS, ...DESIGN_FILE_EXTENSIONS]
       .map(e => e.slice(1)); // strip leading dot
+    pickerLease = Symbol(`add-files-picker:${projectId}`);
+    pendingNativeAddFilesPickers.set(projectId, pickerLease);
     const dialogResult = await dialog.showOpenDialog({
       properties: ['openFile', 'multiSelections'],
       title: 'Add Files to Project',
@@ -14212,11 +14591,10 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
         { name: 'All Files', extensions: ['*'] },
       ],
     });
-    // Show the app window after native dialog closes.
+    releasePickerLease();
+    // Show the app window only after a still-current native picker closes.
+    if (dialogResult.canceled || !operation.current()) return null;
     showTrayWindow();
-
-    if (dialogResult.canceled) return null;
-    if (!operation.current()) return null;
 
     const filePaths = [...new Map(
       dialogResult.filePaths
@@ -14280,7 +14658,15 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
         baselineSources,
         operation.activationToken,
         operation,
-        { allowPausedBaseline: true }
+        {
+          addFilesScan: true,
+          allowPausedBaseline: true,
+          scanTimeoutMs: ADD_FILES_SCAN_TIMEOUT_MS,
+          onScanLease(scanLease) {
+            activeScanLeases.add(scanLease);
+            return () => activeScanLeases.delete(scanLease);
+          },
+        }
       );
       if (scanReport.cancelled || !operation.current()) return null;
       const failedScans = scanReport.outcomes.filter(outcome => outcome && !outcome.success);
@@ -14301,7 +14687,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId) => {
     }
     return getIllustratorScopedProjectView(getProjects().find(project => project.id === projectId)).files;
   } finally {
+    releasePickerLease();
     operation.close();
+    if (activeAddFilesOperations.get(projectId) === operations) activeAddFilesOperations.delete(projectId);
   }
 });
 
