@@ -29,7 +29,8 @@ contextBridge.exposeInMainWorld('crate', {
   getFileVisual: (projectId, visualIdentity, visualRevision) => ipcRenderer.invoke('projects:get-file-visual', projectId, visualIdentity, visualRevision),
   setExistingAssetsDecision: (projectId, decision) => ipcRenderer.invoke('projects:set-existing-assets-decision', projectId, decision),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
-  addFiles: (projectId) => ipcRenderer.invoke('projects:add-files', projectId),
+  addFiles: (projectId, operationId) => ipcRenderer.invoke('projects:add-files', projectId, operationId),
+  cancelAddFiles: (projectId, operationId) => ipcRenderer.invoke('projects:cancel-add-files', projectId, operationId),
   preparePackageReview: (id, outputPath) => outputPath === undefined
     ? ipcRenderer.invoke('projects:prepare-package-review', id)
     : ipcRenderer.invoke('projects:prepare-package-review', id, outputPath),

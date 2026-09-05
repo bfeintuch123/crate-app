@@ -370,7 +370,7 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(ipcHandlers.has('projects:set-existing-assets-decision'), true);
     assert.equal(ipcHandlers.has('projects:get-asset-workspace'), true);
     assert.equal(ipcHandlers.has('projects:get-file-visual'), true);
-    assert.equal(ipcHandlers.size, 34);
+    assert.equal(ipcHandlers.size, 35);
     assert.throws(
       () => ipcHandlers.get('projects:get-all')({}),
       /blocked an untrusted renderer request/
