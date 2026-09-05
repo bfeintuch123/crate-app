@@ -11686,8 +11686,10 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
   return new Promise((resolve, reject) => {
     let child = null;
     let settled = false;
+    let terminationRequested = false;
     let removeCancelListener = () => {};
     const stopChild = () => {
+      terminationRequested = true;
       try { child?.kill(); } catch (_) {}
     };
     const finish = (error, value) => {
@@ -11720,6 +11722,11 @@ function runAddFilesWorker(workerPath, filePath, scanLease, options = {}) {
       if (!settled) finish(new Error(options.exitedError || 'asset_baseline_worker_exited'));
     });
     child.once('spawn', () => {
+      // A pre-spawn kill can return false because the child has no PID yet.
+      if (terminationRequested) {
+        stopChild();
+        return;
+      }
       if (!settled) child.postMessage({ type: 'parse', filePath });
     });
     child.on('message', message => {
