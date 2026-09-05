@@ -29,7 +29,7 @@ function harness(kind) {
   };
   child.postMessage = message => messages.push(message);
   const context = {
-    path,
+    path, setImmediate,
     utilityProcess: { fork: () => child },
     ADD_FILES_PSD_WORKER_PATH: 'psd-worker.js',
     ADD_FILES_REGEX_WORKER_PATH: 'regex-worker.js',
@@ -52,7 +52,10 @@ function harness(kind) {
   };
   return {
     child, kills, messages, lease,
-    run: () => context[`runAddFiles${kind}Worker`]('/synthetic/source', lease),
+    run: () => context[`runAddFiles${kind}Worker`]('/synthetic/source', lease, {
+      sessionId: 'test', finalReceived: false, check() {}, setWorkerExit() {},
+      async consume(message) { this.finalReceived = true; return message.result; },
+    }),
     spawn: () => { alive = true; child.emit('spawn'); },
     timeout: () => deadline(),
     get alive() { return alive; },
@@ -84,7 +87,7 @@ for (const kind of ['Psd', 'Regex']) {
       assert.deepEqual(h.kills, [false, true]);
       assert.equal(h.alive, false);
       assert.deepEqual(h.messages, []);
-      h.child.emit('message', { type: 'result', result: h.result });
+      h.child.emit('message', { type: 'result', sessionId: 'test', seq: 0, result: h.result });
       h.child.emit('exit', 0);
       await Promise.resolve();
       assert.equal(resolutions, 0);
@@ -105,7 +108,7 @@ for (const kind of ['Psd', 'Regex']) {
       if (reason === 'timeout') h.timeout();
       else h.lease.cancel();
       await assert.rejects(work, /add_files_parser_cancelled/);
-      h.child.emit('message', { type: 'result', result: h.result });
+      h.child.emit('message', { type: 'result', sessionId: 'test', seq: 0, result: h.result });
       assert.deepEqual(h.kills, [true]);
       assert.equal(h.alive, false);
       assert.equal(h.listeners, 0);
@@ -118,7 +121,7 @@ for (const kind of ['Psd', 'Regex']) {
     const work = h.run();
     h.spawn();
     assert.equal(h.messages.length, 1);
-    h.child.emit('message', { type: 'result', result: h.result });
+    h.child.emit('message', { type: 'result', sessionId: 'test', seq: 0, result: h.result });
     assert.equal(await work, h.result);
     assert.equal(h.listeners, 0);
     h.timeout();

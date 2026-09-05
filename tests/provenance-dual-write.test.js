@@ -489,6 +489,10 @@ class TestUtilityProcess extends EventEmitter {
         });
       }
       if (this.suppressedMessages.has(message.type)) return;
+      if (this.psdPortHandler) {
+        this.psdPortHandler({ data: message });
+        return;
+      }
       if (message.type === 'init-session') {
         this.ownedOutputs = message.ownedOutputs || [];
         this.identity = message.identity;
@@ -628,30 +632,24 @@ class TestUtilityProcess extends EventEmitter {
             const { parseRegex } = require('../parsers/add-files-regex-worker');
             this.respond({ type: 'result', result: parseRegex(message.filePath) });
           } else {
-            const stat = fs.statSync(message.filePath);
-            const sourceBuffer = fs.readFileSync(message.filePath);
-            const entries = [];
-            const walkLayers = layers => {
-              for (const layer of layers || []) {
-                if (layer.linkedFile?.fullPath) entries.push({ filePath: layer.linkedFile.fullPath, source: 'psd-linked' });
-                walkLayers(layer.children);
-              }
-            };
-            walkLayers(currentPsdFixture.children);
-            for (const file of currentPsdFixture.linkedFiles || []) {
-              if (file.linkedFile?.fullPath) entries.push({ filePath: file.linkedFile.fullPath, source: 'psd-linked' });
-            }
-            this.respond({
-              type: 'result',
-              result: {
-                sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
-                sourceDigest: crypto.createHash('sha256').update(sourceBuffer).digest('hex'),
-                entries,
-                embedded: (currentPsdFixture.linkedFiles || [])
-                  .filter(file => file?.data)
-                  .map(file => ({ name: file.name || '', data: Buffer.from(file.data).toString('base64') })),
+            const { startAddFilesPsdWorker } = require('../parsers/add-files-psd-worker');
+            const fixture = structuredClone(currentPsdFixture);
+            startAddFilesPsdWorker({
+              on: (_, handler) => { this.psdPortHandler = handler; },
+              postMessage: payload => this.respond(payload),
+            }, {
+              exit: code => { this.psdPortHandler = null; this.emit('exit', code); },
+              parse: filePath => {
+                if (fixture instanceof Error) throw fixture;
+                const stat = fs.statSync(filePath);
+                return {
+                  psd: fixture,
+                  sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
+                  sourceDigest: crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'),
+                };
               },
             });
+            this.psdPortHandler({ data: message });
           }
         } catch (error) {
           this.respond({ type: 'error', error: error.message });
@@ -12112,9 +12110,30 @@ test('oversized AI and PDF sources remain accepted but cannot establish a depend
   }
 });
 
+// Gate the first issued read of each streamed digest as well as legacy watcher
+// readFile snapshots, so the concurrency assertions exercise both entry paths.
+function interceptBaselineSourceReads(intercept) {
+  const readFile = fs.promises.readFile;
+  const open = fs.promises.open;
+  fs.promises.readFile = (filePath, ...args) => intercept(filePath, () => readFile.call(fs.promises, filePath, ...args));
+  fs.promises.open = async (filePath, ...args) => {
+    const handle = await open.call(fs.promises, filePath, ...args);
+    if (args[0] !== 'r') return handle;
+    const read = handle.read.bind(handle);
+    let firstRead = true;
+    handle.read = (...readArgs) => {
+      if (!firstRead) return read(...readArgs);
+      firstRead = false;
+      return intercept(filePath, () => read(...readArgs));
+    };
+    return handle;
+  };
+  return () => { fs.promises.readFile = readFile; fs.promises.open = open; };
+}
+
 test('first-scan boundary keeps dependencies existing while concurrent unrelated activity is added', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-first-scan-boundary-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   let releaseRead;
   let markReadStarted;
   const readStarted = new Promise(resolve => { markReadStarted = resolve; });
@@ -12127,13 +12146,13 @@ test('first-scan boundary keeps dependencies existing while concurrent unrelated
     fs.writeFileSync(concurrentPath, 'concurrent unrelated bytes');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
 
-    fs.promises.readFile = async function deferFirstSourceRead(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function deferFirstSourceRead(filePath, read) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         markReadStarted();
         await readGate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('First scan concurrency boundary');
     manualDialogFor([sourcePath]);
@@ -12159,7 +12178,7 @@ test('first-scan boundary keeps dependencies existing while concurrent unrelated
     assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
     assert.equal(fresh.files.find(file => file.path === concurrentPath).assetOrigin, 'added');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     releaseRead();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12167,7 +12186,7 @@ test('first-scan boundary keeps dependencies existing while concurrent unrelated
 
 test('Package Review waits for the first dependable scan before requiring the existing-assets decision', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-first-scan-package-gate-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   let releaseRead;
   let markReadStarted;
   const readStarted = new Promise(resolve => { markReadStarted = resolve; });
@@ -12178,13 +12197,13 @@ test('Package Review waits for the first dependable scan before requiring the ex
     fs.writeFileSync(linkedPath, 'existing gate dependency');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
 
-    fs.promises.readFile = async function deferSourceRead(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function deferSourceRead(filePath, read) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         markReadStarted();
         await readGate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('First scan package gate');
     manualDialogFor([sourcePath]);
@@ -12203,7 +12222,7 @@ test('Package Review waits for the first dependable scan before requiring the ex
     const review = await reviewPromise;
     assert.equal(review.error, 'asset_baseline_decision_required');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     releaseRead();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12441,7 +12460,7 @@ test('malformed and future failed-source recovery state never makes a source rem
 
 test('concurrent first source scans settle as one existing-assets cohort regardless of completion order', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-multi-source-baseline-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   const gates = new Map();
   try {
     const sourceA = path.join(fixtureRoot, 'Existing A.ai');
@@ -12460,14 +12479,14 @@ test('concurrent first source scans settle as one existing-assets cohort regardl
       const gate = new Promise(resolve => { release = resolve; });
       gates.set(path.resolve(sourcePath), { started, startedPromise, gate, release });
     }
-    fs.promises.readFile = async function deferSourceReads(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function deferSourceReads(filePath, read) {
       const deferred = gates.get(path.resolve(filePath));
       if (deferred) {
         deferred.started();
         await deferred.gate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('Concurrent first sources');
     manualDialogFor([sourceA, sourceB]);
@@ -12488,7 +12507,7 @@ test('concurrent first source scans settle as one existing-assets cohort regardl
     assert.equal(fresh.files.find(file => file.path === sourceA).projectRole, 'source');
     assert.equal(fresh.files.find(file => file.path === sourceB).projectRole, 'source');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     for (const deferred of gates.values()) deferred.release();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12496,7 +12515,7 @@ test('concurrent first source scans settle as one existing-assets cohort regardl
 
 test('a source accepted during an active first scan joins the required baseline cohort', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-late-baseline-source-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   const gates = new Map();
   try {
     const sourceA = path.join(fixtureRoot, 'Initial Source.ai');
@@ -12515,14 +12534,14 @@ test('a source accepted during an active first scan joins the required baseline 
       const gate = new Promise(resolve => { release = resolve; });
       gates.set(path.resolve(sourcePath), { release, started, hasStarted: () => hasStarted, gate });
     }
-    fs.promises.readFile = async function deferLateSourceReads(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function deferLateSourceReads(filePath, read) {
       const deferred = gates.get(path.resolve(filePath));
       if (deferred) {
         deferred.started();
         await deferred.gate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('Late accepted baseline source');
     manualDialogFor([sourceA]);
@@ -12569,7 +12588,7 @@ test('a source accepted during an active first scan joins the required baseline 
       assert.equal(fresh.files.find(file => file.path === sourcePath).projectRole, 'source');
     }
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     for (const deferred of gates.values()) deferred.release();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12577,7 +12596,7 @@ test('a source accepted during an active first scan joins the required baseline 
 
 test('duplicate first scans of one source remain dependable when a later duplicate fails', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-duplicate-baseline-scan-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   const gates = [];
   async function waitForScan(scan, message) {
     let timer;
@@ -12598,9 +12617,9 @@ test('duplicate first scans of one source remain dependable when a later duplica
     fs.writeFileSync(linkedPath, 'existing dependency');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
 
-    fs.promises.readFile = async function deferDuplicateSourceReads(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function deferDuplicateSourceReads(filePath, read) {
       if (path.resolve(filePath) !== path.resolve(sourcePath)) {
-        return originalReadFile.call(fs.promises, filePath, ...args);
+        return read();
       }
       let release;
       const gate = new Promise(resolve => { release = resolve; });
@@ -12608,8 +12627,8 @@ test('duplicate first scans of one source remain dependable when a later duplica
       gates.push(entry);
       await gate;
       if (entry.attempt === 1) throw new Error('forced duplicate scan failure');
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('Duplicate first source scans');
     manualDialogFor([sourcePath]);
@@ -12633,7 +12652,7 @@ test('duplicate first scans of one source remain dependable when a later duplica
     );
     assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     for (const gate of gates) gate.release();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12706,18 +12725,18 @@ test('readable malformed ZIP-based sources do not establish an empty dependable 
 
 test('post-preflight regex extraction failure keeps the baseline unresolved', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-regex-extraction-failure-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   let extractionAttempts = 0;
   try {
     const sourcePath = path.join(fixtureRoot, 'Transient Read Failure.ai');
     writeSyntheticAiFile(sourcePath, 'valid readable source before extraction');
-    fs.promises.readFile = async function failSourceExtraction(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function failSourceExtraction(filePath, read) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         extractionAttempts++;
         throw new Error('forced post-preflight source read failure');
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('Regex extraction failure');
     manualDialogFor([sourcePath]);
@@ -12730,7 +12749,7 @@ test('post-preflight regex extraction failure keeps the baseline unresolved', as
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.error, 'asset_baseline_scan_incomplete');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
@@ -12771,7 +12790,7 @@ test('Illustrator baseline validation and extraction use one immutable source sn
 
 test('stable Illustrator Add Files completes with one parser read and separate digest rechecks', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-immutable-ai-baseline-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   const originalReadFileSync = fs.readFileSync;
   let parserReadCount = 0;
   let digestReadCount = 0;
@@ -12785,13 +12804,13 @@ test('stable Illustrator Add Files completes with one parser read and separate d
       if (path.resolve(filePath) === path.resolve(sourcePath)) parserReadCount++;
       return originalReadFileSync.call(fs, filePath, ...args);
     };
-    fs.promises.readFile = async function countDigestReads(filePath, ...args) {
-      const result = await originalReadFile.call(fs.promises, filePath, ...args);
+    restoreReads = interceptBaselineSourceReads(async function countDigestReads(filePath, read) {
+      const result = await read();
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         digestReadCount++;
       }
       return result;
-    };
+    });
 
     const project = await createProject('Immutable Illustrator baseline');
     manualDialogFor([sourcePath]);
@@ -12808,7 +12827,7 @@ test('stable Illustrator Add Files completes with one parser read and separate d
     assert.equal(fresh.files.some(file => file.path === linkedPath), true);
     assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     fs.readFileSync = originalReadFileSync;
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -12816,7 +12835,7 @@ test('stable Illustrator Add Files completes with one parser read and separate d
 
 test('changed Illustrator source refuses dependable Add Files completion', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-immutable-ai-baseline-test-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   let digestReadCount = 0;
   try {
     const sourcePath = path.join(fixtureRoot, 'Immutable Snapshot.ai');
@@ -12824,27 +12843,28 @@ test('changed Illustrator source refuses dependable Add Files completion', async
     fs.writeFileSync(linkedPath, 'immutable snapshot dependency');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
 
-    fs.promises.readFile = async function mutateAfterSourceRead(filePath, ...args) {
-      const result = await originalReadFile.call(fs.promises, filePath, ...args);
+    restoreReads = interceptBaselineSourceReads(async function mutateAfterSourceRead(filePath, read) {
+      const result = await read();
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         digestReadCount++;
         if (digestReadCount === 1) fs.writeFileSync(sourcePath, 'replacement bytes without dependable structure');
       }
       return result;
-    };
+    });
 
     const project = await createProject('Immutable Illustrator baseline');
     manualDialogFor([sourcePath]);
     const result = await callIpcRaw('projects:add-files', project.id);
     assertAddFilesPartialScanFailure(result);
     assert.equal(getAddFilesResultFiles(result).some(file => file.path === sourcePath), true);
-    assert.equal(digestReadCount, 2);
+    // The streaming identity/EOF fence detects the mutation in the first digest.
+    assert.equal(digestReadCount, 1);
     const fresh = await getProject(project.id);
     assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.error, 'asset_baseline_scan_incomplete');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
@@ -14024,7 +14044,7 @@ test('Add Files production PSD worker rejects a source replacement before admiss
 
 test('Add Files production PSD staging cleanup removes owned output after cancellation', async () => {
   const fixtureRoot = makeTempDir();
-  const originalWriteFile = fs.promises.writeFile;
+  const originalOpen = fs.promises.open;
   let extractDir = null;
   let workerChild = null;
   let parseRequested = false;
@@ -14045,14 +14065,21 @@ test('Add Files production PSD staging cleanup removes owned output after cancel
       if (phase === 'fork') workerChild = child;
       if (phase === 'message' && message.type === 'parse') parseRequested = true;
     });
-    fs.promises.writeFile = async function gateProductionPsdStage(filePath, ...args) {
-      const result = await originalWriteFile.call(fs.promises, filePath, ...args);
-      if (!stagedWriteSeen && path.dirname(path.resolve(filePath)) === path.resolve(extractDir)) {
-        stagedWriteSeen = true;
-        await callIpcRaw('projects:pause', project.id);
-        pauseIssued = true;
+    fs.promises.open = async function gateProductionPsdStage(filePath, ...args) {
+      const handle = await originalOpen.call(fs.promises, filePath, ...args);
+      if (path.dirname(path.resolve(filePath)) === path.resolve(extractDir)) {
+        const write = handle.write.bind(handle);
+        handle.write = async (...writeArgs) => {
+          const result = await write(...writeArgs);
+          if (!stagedWriteSeen) {
+            stagedWriteSeen = true;
+            await callIpcRaw('projects:pause', project.id);
+            pauseIssued = true;
+          }
+          return result;
+        };
       }
-      return result;
+      return handle;
     };
 
     manualDialogFor([sourcePath]);
@@ -14062,6 +14089,7 @@ test('Add Files production PSD staging cleanup removes owned output after cancel
     assert.equal(parseRequested, true);
     assert.equal(stagedWriteSeen, true);
     assert.equal(pauseIssued, true);
+    await new Promise(resolve => originalSetTimeout(resolve, 30));
     assert.ok(workerChild);
     assert.equal(
       fs.existsSync(extractDir) ? fs.readdirSync(extractDir).length : 0,
@@ -14071,7 +14099,7 @@ test('Add Files production PSD staging cleanup removes owned output after cancel
     assert.equal(fresh.files.some(file => file.path === sourcePath), true);
     assert.equal(fresh.files.some(file => file.name === 'staged-embedded.png'), false);
   } finally {
-    fs.promises.writeFile = originalWriteFile;
+    fs.promises.open = originalOpen;
     setUtilityProcessHandler(null);
     if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -14099,7 +14127,7 @@ test('concurrent Add Files requests share one native picker and reject the secon
 
 test('Add Files times out one source, continues the queue, and retries with a fresh lease', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-timeout-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   const trackedSetTimeout = global.setTimeout;
   let releaseSlowRead;
   let slowReadStarted;
@@ -14111,13 +14139,13 @@ test('Add Files times out one source, continues the queue, and retries with a fr
   ));
   try {
     for (const filePath of filePaths) writeSyntheticAiFile(filePath, 'focused bounded scan source');
-    fs.promises.readFile = async function focusedReadGate(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function focusedReadGate(filePath, read) {
       if (blockSlowRead && path.resolve(filePath) === path.resolve(filePaths[0])) {
         slowReadStarted();
         await slowReadGate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
     global.setTimeout = (callback, delay, ...args) => trackedSetTimeout(
       callback,
       delay === 30000 ? 250 : delay,
@@ -14146,7 +14174,7 @@ test('Add Files times out one source, continues the queue, and retries with a fr
     assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
   } finally {
     global.setTimeout = trackedSetTimeout;
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     releaseSlowRead();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -14154,7 +14182,7 @@ test('Add Files times out one source, continues the queue, and retries with a fr
 
 test('Add Files fences a late scan after the watching project changes generation', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-focused-add-stale-'));
-  const originalReadFile = fs.promises.readFile;
+  let restoreReads = () => {};
   let releaseRead;
   let readStarted;
   const readGate = new Promise(resolve => { releaseRead = resolve; });
@@ -14164,13 +14192,13 @@ test('Add Files fences a late scan after the watching project changes generation
   try {
     fs.writeFileSync(linkedPath, 'stale linked asset');
     writeSyntheticAiFile(sourcePath, `focused stale link ${linkedPath}`);
-    fs.promises.readFile = async function staleReadGate(filePath, ...args) {
+    restoreReads = interceptBaselineSourceReads(async function staleReadGate(filePath, read) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         readStarted();
         await readGate;
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
+      return read();
+    });
 
     const project = await createProject('Focused stale Add Files source');
     manualDialogFor([sourcePath]);
@@ -14185,7 +14213,7 @@ test('Add Files fences a late scan after the watching project changes generation
     assert.equal(stored.files.some(file => file.path === linkedPath), false);
     assert.equal(JSON.stringify(stored.provenance).includes(linkedPath), false);
   } finally {
-    fs.promises.readFile = originalReadFile;
+    restoreReads();
     releaseRead();
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -15885,10 +15913,12 @@ test('generic change rescans a file accepted through Add Files while stat is pen
   let releaseStat;
   let markStatStarted;
   let sourceReadCount = 0;
+  let deferredStatIssued = false;
   const statStarted = new Promise(resolve => { markStatStarted = resolve; });
   const statGate = new Promise(resolve => { releaseStat = resolve; });
   fs.promises.stat = async function deferSourceStat(filePath, ...args) {
-    if (path.resolve(filePath) === path.resolve(sourcePath)) {
+    if (!deferredStatIssued && path.resolve(filePath) === path.resolve(sourcePath)) {
+      deferredStatIssued = true;
       markStatStarted();
       return statGate;
     }
@@ -22314,4 +22344,77 @@ test('Illustrator lsof scope rejects stale same-length project-file snapshots', 
     ...observation,
     projectFilePaths: snapshotFor(currentProject.files),
   }), true);
+});
+
+test('Add Files PSD final digest failure cleans promoted files before any row acceptance', async () => {
+  const root = makeTempDir();
+  let restoreReads = () => {};
+  const previousFixture = currentPsdFixture;
+  let extractDir;
+  try {
+    const sourcePath = path.join(root, 'final-digest.psd');
+    fs.writeFileSync(sourcePath, 'controlled source');
+    fs.utimesSync(sourcePath, 1700000000, 1700000000);
+    currentPsdFixture = { linkedFiles: [{ name: 'unaccepted.bin', data: Buffer.from('owned bytes') }] };
+    let digests = 0;
+    restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+      if (filePath === sourcePath && ++digests === 3) {
+        fs.writeFileSync(sourcePath, 'replacement bytes');
+        fs.utimesSync(sourcePath, 1700000000, 1700000000);
+      }
+      return read();
+    });
+    const project = await createProject('PSD final digest fence');
+    extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+    manualDialogFor([sourcePath]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assertAddFilesPartialScanFailure(result);
+    assert.equal(digests, 3);
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.name === 'unaccepted.bin'), false);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    assert.equal(fs.readdirSync(extractDir).length, 0);
+  } finally {
+    restoreReads(); currentPsdFixture = previousFixture;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Add Files PSD failed sibling and retry preserve successful source files and baseline proof', async () => {
+  const root = makeTempDir();
+  const previousFixture = currentPsdFixture;
+  let extractDir;
+  try {
+    const good = path.join(root, 'good.psd'), bad = path.join(root, 'retry.psd');
+    fs.writeFileSync(good, 'controlled good'); fs.writeFileSync(bad, 'controlled retry');
+    let fail = true;
+    setUtilityProcessHandler(({ phase, modulePath, message }) => {
+      if (phase !== 'message' || message.type !== 'parse' || !modulePath.endsWith('add-files-psd-worker.js')) return;
+      currentPsdFixture = fail && message.filePath === bad ? new Error('controlled parser failure')
+        : { linkedFiles: [{ name: message.filePath === good ? 'good.bin' : 'retried.bin', data: Buffer.from('owned sibling bytes') }] };
+    });
+    const project = await createProject('PSD sibling retry');
+    extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+    manualDialogFor([good, bad]);
+    const first = await callIpcRaw('projects:add-files', project.id);
+    assertAddFilesPartialScanFailure(first);
+    assert.equal(first.failedCount, 1);
+    let fresh = await getProject(project.id);
+    const sibling = fresh.files.find(file => file.name === 'good.bin');
+    assert.ok(sibling);
+    const inode = fs.statSync(sibling.path).ino;
+    fail = false;
+    manualDialogFor([bad]);
+    const retry = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(Array.isArray(retry), true);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.files.some(file => file.name === 'retried.bin'), true);
+    assert.equal(fs.statSync(sibling.path).ino, inode);
+    assert.equal(fresh.assetBaseline.status, 'decision-required');
+  } finally {
+    setUtilityProcessHandler(null); currentPsdFixture = previousFixture;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
