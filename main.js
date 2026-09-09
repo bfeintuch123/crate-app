@@ -4527,7 +4527,8 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   }
 
   state.activeScans ||= new Set();
-  const scan = { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
+  state.revision = (state.revision || 0) + 1;
+  const scan = { projectId, sourceKey, state, startedAt: state.startedAt, activationToken, allowPaused };
   state.activeScans.add(scan);
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
   return scan;
@@ -4535,7 +4536,7 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
 
 function releaseProjectAssetBaselineScan(scan) {
   if (!scan) return false;
-  const state = assetBaselineScans.get(scan.projectId);
+  const state = scan.state;
   if (!state || !state.activeScans?.has(scan)) return false;
   state.activeScans.delete(scan);
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
@@ -4544,22 +4545,26 @@ function releaseProjectAssetBaselineScan(scan) {
   return true;
 }
 
-async function completeProjectAssetBaselineScan(scan, dependable) {
+async function completeProjectAssetBaselineScan(scan, dependable, isCurrent = () => true) {
   if (!scan) return;
-  const state = assetBaselineScans.get(scan.projectId);
-  if (!state) return;
-  if (scan.cancelled) {
-    releaseProjectAssetBaselineScan(scan);
-    return;
-  }
-  releaseProjectAssetBaselineScan(scan);
+  const state = scan.state;
+  // Release only the original ticket, even after its baseline owner retires.
+  if (!releaseProjectAssetBaselineScan(scan)) return;
+  const ownsBaseline = () => assetBaselineScans.get(scan.projectId) === state && !scan.cancelled && isCurrent();
+  if (!ownsBaseline()) return;
+  state.revision = (state.revision || 0) + 1;
+  const completionRevision = state.revision;
   // A duplicate observer can start more than one scan for the same source.
   // One dependable completion is sufficient; a later failed duplicate must not
   // erase that proof and make the result depend on completion order.
   if (dependable) state.completedSourceKeys.add(scan.sourceKey);
 
-  if (state.inFlightBySource.size > 0 || state.queuedSourceKeys?.size > 0) return;
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
+  // Complete proof belongs to the authorized winner. Redundant duplicate scans
+  // need not keep it pending until that winner's operation has already closed.
+  if (state.queuedSourceKeys?.size > 0 || (!complete && state.inFlightBySource.size > 0)) return;
+  const canFinalize = () => ownsBaseline() && state.revision === completionRevision &&
+    !state.queuedSourceKeys?.size && (complete || state.inFlightBySource.size === 0);
   if (!complete) {
     const failedSourceKeys = new Set(
       [...state.requiredSourceKeys].filter(key => !state.completedSourceKeys.has(key))
@@ -4575,8 +4580,9 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
             .map(file => getAssetBaselineSourceRecoveryRecord(currentProject, file))
         )).filter(Boolean).sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash))
       : [];
+    if (!canFinalize()) return;
     const persisted = mutateProject(scan.projectId, project => {
-      if (project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+      if (!canFinalize() || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
       const validRouteKeys = new Set(
         (project.files || [])
           .filter(isProjectAssetBaselineSource)
@@ -4592,7 +4598,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
       else delete project.assetBaseline.failedRequiredSources;
       return true;
     });
-    if (persisted) sendToRenderer('project:updated', { projectId: scan.projectId });
+    if (persisted && canFinalize()) sendToRenderer('project:updated', { projectId: scan.projectId });
     return;
   }
 
@@ -4601,10 +4607,10 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
     null,
     scan.activationToken,
     state.startedAt,
-    { allowPaused: scan.allowPaused }
+    { allowPaused: scan.allowPaused, isCurrent: canFinalize }
   );
   const current = getProjects().find(item => item.id === scan.projectId);
-  if (result || !current || !current.assetBaseline || current.assetBaseline.status !== 'awaiting-first-scan') {
+  if (canFinalize() && (result || !current || !current.assetBaseline || current.assetBaseline.status !== 'awaiting-first-scan')) {
     assetBaselineScans.delete(scan.projectId);
   }
 }
@@ -4629,6 +4635,7 @@ function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
     assetBaselineScans.set(projectId, state);
   }
   state.queuedSourceKeys ||= new Set();
+  state.revision = (state.revision || 0) + 1;
 
   for (const sourcePath of sourcePaths) {
     const sourceKey = normalizeTrackedFilePath(sourcePath);
@@ -4653,22 +4660,23 @@ function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
   return uniquePaths;
 }
 
-function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths) {
-  const state = assetBaselineScans.get(projectId);
+function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths, state) {
   if (!state) return;
+  state.revision = (state.revision || 0) + 1;
   for (const sourcePath of Array.isArray(sourcePaths) ? sourcePaths : []) {
     const sourceKey = normalizeTrackedFilePath(sourcePath);
     if (!sourceKey || !state.queuedSourceKeys?.has(sourceKey)) continue;
     state.queuedSourceKeys.delete(sourceKey);
     state.requiredSourceKeys.delete(sourceKey);
   }
-  if (state.inFlightBySource.size === 0 && state.requiredSourceKeys.size === 0) {
+  if (assetBaselineScans.get(projectId) === state && state.inFlightBySource.size === 0 && state.requiredSourceKeys.size === 0) {
     assetBaselineScans.delete(projectId);
   }
 }
 
 async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken, operation, options = {}) {
   const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths);
+  const baselineQueueState = assetBaselineScans.get(projectId);
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4743,7 +4751,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   const workerCount = Math.min(MANUAL_ADD_SCAN_CONCURRENCY, queuedPaths.length);
   await Promise.all(Array.from({ length: workerCount }, () => runNext()));
   if (!operation.current()) {
-    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths);
+    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths, baselineQueueState);
     return { cancelled: true, outcomes };
   }
   return { cancelled: false, outcomes };
@@ -4758,6 +4766,7 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
     establishProjectAssetBaseline(projectId, null, null, Date.now(), { allowPaused });
     return;
   }
+  state.revision = (state.revision || 0) + 1;
   const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   for (const key of [...state.requiredSourceKeys]) {
     if (acceptedKeys.has(key)) continue;
@@ -4822,8 +4831,9 @@ function establishProjectAssetBaseline(
   sourcePath,
   activationToken = null,
   scanStartedAt = Date.now(),
-  { allowPaused = false } = {}
+  { allowPaused = false, isCurrent = () => true } = {}
 ) {
+  if (!isCurrent()) return null;
   const baselineScanState = assetBaselineScans.get(projectId);
   const presentationMediaOccurrences = normalizePresentationMediaOccurrences(
     baselineScanState
@@ -4831,6 +4841,7 @@ function establishProjectAssetBaseline(
       : []
   );
   const result = mutateProject(projectId, (project) => {
+    if (!isCurrent()) return null;
     if (project.status !== 'watching' && !(allowPaused && project.status === 'paused')) return null;
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
     if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
@@ -4871,7 +4882,7 @@ function establishProjectAssetBaseline(
     };
   });
 
-  if (result && result.changed) {
+  if (result && result.changed && isCurrent()) {
     invalidatePackageReviewForProject(projectId);
     sendToRenderer('project:updated', { projectId });
   }
@@ -7974,6 +7985,24 @@ function getActiveWatchingActivationToken(projectId) {
 
 function isBoundWatchingActivationCurrent(projectId, activationToken) {
   return activationToken === null || isActiveWatchingProject(projectId, activationToken);
+}
+
+// Generic change events historically follow fresh accepted-source state, not a
+// frozen Illustrator scope. Bind account and activation before metadata awaits;
+// parser children add their strict scope lease only after source revalidation.
+function captureWatchingScanEvent(projectId, activationToken) {
+  const assertAccountCurrent = captureAccountAuthorization();
+  const generation = watchingActivationSequence;
+  let open = true;
+  return {
+    close() { open = false; },
+    current() {
+      if (!open) return false;
+      try { assertAccountCurrent(); }
+      catch (_) { open = false; return false; }
+      return watchingActivationSequence === generation && isActiveWatchingProject(projectId, activationToken);
+    },
+  };
 }
 
 function captureProjectOperation(projectId) {
@@ -12901,6 +12930,8 @@ async function captureExistingPresentationMediaBaseline(
     const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
       source: 'scan-on-save-presentation',
       logicalPresentationPath: presentationPath,
+      onBeforeMaterialize: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
+      onBeforeWrite: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
       failClosed: true,
       rollbackOnFailure: true,
       onCandidate: candidate => {
@@ -12917,7 +12948,7 @@ async function captureExistingPresentationMediaBaseline(
     if (!isCurrent()) return;
 
     const scanState = assetBaselineScans.get(projectId);
-    if (scanState && scanState.startedAt === baselineScan.startedAt) {
+    if (scanState === baselineScan.state && isCurrent()) {
       scanState.presentationMediaOccurrencesBySource ||= new Map();
       scanState.presentationMediaOccurrencesBySource.set(
         baselineScan.sourceKey,
@@ -12997,13 +13028,22 @@ async function captureExistingPresentationMediaBaseline(
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
 async function runScanOnOpen(projectId, filePath, activationToken = null, operation = null, options = {}) {
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operation || operation.current());
+  // Compatibility callers without a parent lease bind authority at parser entry;
+  // this does not authorize or audit work done earlier by their polling roots.
+  const ownsOperation = !operation;
+  operation ||= captureProjectOperation(projectId);
+  let baselineScan = null;
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current() &&
+    (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
-  if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
+  if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) { if (ownsOperation) operation?.close(); return; }
   const currentProject = getProjects().find(p => p.id === projectId);
-  if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) return;
+  if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) {
+    if (ownsOperation) operation?.close();
+    return;
+  }
 
-  const baselineScan = options.establishBaseline === false
+  baselineScan = options.establishBaseline === false
     ? null
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
@@ -13239,8 +13279,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
     };
   } finally {
-    if (psdTransaction) await psdTransaction.finish();
-    await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted && isCurrent());
+    try {
+      if (psdTransaction) await psdTransaction.finish();
+      await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
+    } finally { if (ownsOperation) operation?.close(); }
   }
 }
 
@@ -13252,33 +13294,51 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
  * For embedded smart objects: marks as embedded (source: 'scan-on-save-embedded', embedded: true).
  * Never breaks the session — all errors caught silently.
  */
-function scheduleScanOnSave(projectId, psdFilePath, activationToken = null) {
-  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
-  const key = `${projectId}:${psdFilePath}`;
-  if (scanOnSaveTimers.has(key)) {
-    clearTimeout(scanOnSaveTimers.get(key));
-  }
-  const timerId = setTimeout(() => {
-    if (scanOnSaveTimers.get(key) === timerId) {
-      scanOnSaveTimers.delete(key);
-    }
-    runScanOnSave(projectId, psdFilePath, activationToken).catch(() => {});
-  }, 2000);
-  scanOnSaveTimers.set(key, timerId);
+function scheduleOwnedSaveScan(timers, projectId, filePath, activationToken, operation, run) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
+  if (!isCurrent()) { if (!operation) ownedOperation?.close(); return Promise.resolve(); }
+  const key = `${projectId}:${filePath}`;
+  timers.get(key)?.cancel();
+  return new Promise(resolve => {
+    const settle = () => { if (!operation) ownedOperation.close(); resolve(); };
+    const pending = {
+      cancel() {
+        clearTimeout(pending.timer);
+        if (timers.get(key) === pending) timers.delete(key);
+        settle();
+      },
+      timer: null,
+    };
+    pending.timer = setTimeout(async () => {
+      if (timers.get(key) !== pending) return;
+      timers.delete(key);
+      try { if (isCurrent()) await run(projectId, filePath, activationToken, ownedOperation); }
+      catch (_) { /* Scan errors never break the watching session. */ }
+      finally { settle(); }
+    }, 2000);
+    timers.set(key, pending);
+  });
 }
 
-async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
+function scheduleScanOnSave(projectId, psdFilePath, activationToken = null, operation = null) {
+  return scheduleOwnedSaveScan(scanOnSaveTimers, projectId, psdFilePath, activationToken, operation, runScanOnSave);
+}
+
+async function runScanOnSave(projectId, psdFilePath, activationToken = null, operation = null) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
   try {
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, psdFilePath)) return;
 
     const stat = await fs.promises.stat(psdFilePath);
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     if (stat.size > MAX_PARSE_FILE_SIZE) return;
 
     const buf = await fs.promises.readFile(psdFilePath);
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
 
     const newEntries = [];
@@ -13325,10 +13385,10 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
       }
     }
 
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+      if (!isCurrent()) return null;
       const currentEmbeddedKeys = new Set(
         newEntries
           .filter(entry => entry.source === 'scan-on-save-embedded')
@@ -13364,7 +13424,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
     });
 
     if (result) {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+      if (!isCurrent()) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendProjectFileStateToRenderer(projectId, activationToken);
@@ -13372,6 +13432,8 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
   } catch (e) {
     // L2: Log so failures are debuggable — never break the session
     console.log('[scan-on-save] ag-psd parse failed:', e.message);
+  } finally {
+    if (!operation) ownedOperation?.close();
   }
 }
 
@@ -13380,24 +13442,17 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
  * When a presentation is saved (Cmd+S), extract embedded media immediately
  * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
  */
-function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null) {
-  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
-  const key = `${projectId}:${filePath}`;
-  if (scanOnSavePresentationTimers.has(key)) {
-    clearTimeout(scanOnSavePresentationTimers.get(key));
-  }
-  const timerId = setTimeout(() => {
-    if (scanOnSavePresentationTimers.get(key) === timerId) {
-      scanOnSavePresentationTimers.delete(key);
-    }
-    runScanOnSavePresentation(projectId, filePath, activationToken).catch(() => {});
-  }, 2000);
-  scanOnSavePresentationTimers.set(key, timerId);
+function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null, operation = null) {
+  return scheduleOwnedSaveScan(scanOnSavePresentationTimers, projectId, filePath, activationToken, operation, runScanOnSavePresentation);
 }
 
-async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null) {
+async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null, operation = null) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
+  const invocationFiles = [];
+  let keepInvocationFiles = false;
   try {
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const ext = path.extname(presentationPath).toLowerCase();
     if (ext !== '.pptx' && ext !== '.key') return;
     const base = path.basename(presentationPath, ext);
@@ -13410,7 +13465,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     // Build dedup sets from existing project files
     const currentProjects = getProjects();
     const project = currentProjects.find(p => p.id === projectId);
-    if (!project || !isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!project || !isCurrent()) return;
     const projectFiles = project.files || [];
 
     // Name-based dedup for .key files. Do not add prior scan-on-save media to
@@ -13491,7 +13546,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', presentationPath], {
       timeout: 10000, encoding: 'utf8'
     });
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const newEntries = [];
 
@@ -13536,12 +13591,12 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       }
 
       try {
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
           timeout: 10000, maxBuffer: 50 * 1024 * 1024,
           encoding: 'buffer'
         });
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         let extractedFingerprint = null;
 
         // Content-based dedup for presentation media.
@@ -13591,8 +13646,9 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         }
         if (!destPath) continue;
 
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
+        invocationFiles.push(captureOwnedDirectCacheFile(destPath, tempDir, 'presentation-cache-file'));
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
         newEntries.push({
@@ -13610,10 +13666,10 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     }
 
     if (newEntries.length === 0) return;
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+      if (!isCurrent()) return null;
       let changed = false;
 
       for (const entry of newEntries) {
@@ -13640,8 +13696,13 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
     });
 
+    const saved = getProjects().find(item => item.id === projectId);
+    // Preserve only files referenced by the accepted saved result, including pending rows.
+    const referenced = new Set([...(saved?.files || []), ...(saved?.pendingFiles || [])].map(file => file.path));
+    removeOwnedDirectCacheFiles(invocationFiles.filter(record => !referenced.has(record.filePath)));
+    keepInvocationFiles = true;
     if (result) {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+      if (!isCurrent()) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendProjectFileStateToRenderer(projectId, activationToken);
@@ -13649,6 +13710,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
   } catch (e) {
     console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
   } finally {
+    if (!keepInvocationFiles) removeOwnedDirectCacheFiles(invocationFiles);
+    if (!operation) ownedOperation?.close();
     scheduleDeletedProjectCacheCleanup(projectId);
   }
 }
@@ -14522,13 +14585,18 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   // v2.2.2: Also triggers scan-on-open when a design file is modified
   watcher.on('change', async (filePath, suppliedStats = null) => {
     if (!isActiveWatchingProject(projectId, activationToken)) return;
+    const operation = captureWatchingScanEvent(projectId, activationToken);
+    const isCurrent = () => isActiveWatchingProject(projectId, activationToken) && !!operation?.current();
+    let childrenOwnOperation = false;
+    try {
+    if (!isCurrent()) return;
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
     if (name.startsWith('.') || name === 'Thumbs.db') return;
     if (name.startsWith('~$')) return;
 
     await new Promise(resolve => setTimeout(resolve, 500));
-    if (!isActiveWatchingProject(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     // v2.2.6: Only re-scan PRIMARY design source files on change.
     // Same rationale as the 'add' handler — image/media changes are noise here.
@@ -14544,11 +14612,11 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
         if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
       }
-      if (!isActiveWatchingProject(projectId, activationToken)) return;
+      if (!isCurrent()) return;
 
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
-        if (!isActiveWatchingProject(projectId, activationToken)) return null;
+        if (!isCurrent()) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
           appFamily: 'generic',
@@ -14564,35 +14632,48 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
-      if (result) {
+      if (result && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
         sendProjectFileStateToRenderer(projectId, activationToken);
       }
 
+      if (!isCurrent()) return;
+      const children = [];
       const updatedProject = getProjects().find(p => p.id === projectId);
       const sourceIsAccepted = isAcceptedProjectFilePath(updatedProject, filePath);
+      if (!sourceIsAccepted || !isCurrent()) return;
+      const scopedChild = captureProjectOperation(projectId);
+      const childOperation = {
+        current: () => isCurrent() && !!scopedChild?.current(),
+        adoptScope: scope => isCurrent() && !!scopedChild?.adoptScope(scope),
+      };
 
       // v2.2.2: When a design file changes, re-scan for linked assets
       // (designer may have added new links). Fire-and-forget.
       // C3: Skip runScanOnOpen for .psd — scheduleScanOnSave handles it with debounce
       // to avoid double ag-psd parse on every .psd save event.
       if (sourceIsAccepted && SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
-        runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
+        children.push(runScanOnOpen(projectId, filePath, activationToken, childOperation));
       }
 
       // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
       if (sourceIsAccepted && ext === '.psd') {
-        scheduleScanOnSave(projectId, filePath, activationToken);
+        children.push(scheduleScanOnSave(projectId, filePath, activationToken, childOperation));
       }
 
       // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
       if (sourceIsAccepted && (ext === '.pptx' || ext === '.key')) {
-        scheduleScanOnSavePresentation(projectId, filePath, activationToken);
+        children.push(scheduleScanOnSavePresentation(projectId, filePath, activationToken, childOperation));
       }
+      // Chokidar does not await child scans. Transfer lifetime ownership while
+      // preserving the callback's existing fire-and-forget return contract.
+      childrenOwnOperation = true;
+      Promise.allSettled(children).finally(() => { scopedChild?.close(); operation.close(); });
     }
 
     // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed from 'change' handler too.
+    } finally { if (!childrenOwnOperation) operation?.close(); }
   });
 
   watchers.set(projectId, watcher);
@@ -14625,16 +14706,16 @@ function stopWatching(projectId, { invalidateActivation = true } = {}) {
   designFilePids.delete(projectId);
   if (invalidateActivation) assetBaselineScans.delete(projectId);
   // v2.5.0: Clean up scan-on-save timers for this project
-  for (const [key, timerId] of scanOnSaveTimers) {
+  for (const [key, pending] of scanOnSaveTimers) {
     if (key.startsWith(projectId + ':')) {
-      clearTimeout(timerId);
+      pending.cancel();
       scanOnSaveTimers.delete(key);
     }
   }
   // v2.5.3: Clean up presentation scan-on-save timers
-  for (const [key, timerId] of scanOnSavePresentationTimers) {
+  for (const [key, pending] of scanOnSavePresentationTimers) {
     if (key.startsWith(projectId + ':')) {
-      clearTimeout(timerId);
+      pending.cancel();
       scanOnSavePresentationTimers.delete(key);
     }
   }
@@ -19795,12 +19876,12 @@ app.on('before-quit', () => {
   }
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
-  for (const [, timerId] of scanOnSaveTimers) {
-    clearTimeout(timerId);
+  for (const [, pending] of scanOnSaveTimers) {
+    pending.cancel();
   }
   scanOnSaveTimers.clear();
-  for (const [, timerId] of scanOnSavePresentationTimers) {
-    clearTimeout(timerId);
+  for (const [, pending] of scanOnSavePresentationTimers) {
+    pending.cancel();
   }
   scanOnSavePresentationTimers.clear();
   // Explicitly destroy tray + window so quit isn't blocked by live windows.
