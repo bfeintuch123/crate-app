@@ -7976,8 +7976,49 @@ function isBoundWatchingActivationCurrent(projectId, activationToken) {
   return activationToken === null || isActiveWatchingProject(projectId, activationToken);
 }
 
-function captureProjectOperation(projectId) { const project = getProjects().find(item => item && item.id === projectId); if (!project) return null; const status = project.status, generation = watchingActivationSequence, activationToken = status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; let scopeRevision = illustratorActivationScopes.get(projectId)?.revision, open = true; const baseCurrent = () => { const latest = getProjects().find(item => item && item.id === projectId), currentToken = latest?.status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken; }; return { activationToken, close() { open = false; }, current() { return baseCurrent() && (activationToken === null || illustratorActivationScopes.get(projectId)?.revision === scopeRevision); },
-    adoptScope(scope) { if (activationToken === null) return baseCurrent(); if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope || ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false; scopeRevision = scope.revision; return true; } }; }
+function captureProjectOperation(projectId) {
+  const project = getProjects().find(item => item && item.id === projectId);
+  if (!project) return null;
+  const assertAccountCurrent = captureAccountAuthorization();
+  const status = project.status;
+  const generation = watchingActivationSequence;
+  const activationToken = status === 'watching'
+    ? watchingActivationTokens.get(projectId) ?? null
+    : null;
+  let scopeRevision = illustratorActivationScopes.get(projectId)?.revision;
+  let open = true;
+  const baseCurrent = () => {
+    if (!open) return false;
+    try {
+      assertAccountCurrent();
+    } catch (_) {
+      // Retire this lease even if a later refresh permits new operations.
+      open = false;
+      return false;
+    }
+    const latest = getProjects().find(item => item && item.id === projectId);
+    const currentToken = latest?.status === 'watching'
+      ? watchingActivationTokens.get(projectId) ?? null
+      : null;
+    return !!latest && latest.status === status &&
+      watchingActivationSequence === generation && currentToken === activationToken;
+  };
+  return {
+    activationToken,
+    close() { open = false; },
+    current() {
+      return baseCurrent() && (activationToken === null ||
+        illustratorActivationScopes.get(projectId)?.revision === scopeRevision);
+    },
+    adoptScope(scope) {
+      if (activationToken === null) return baseCurrent();
+      if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope ||
+          ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false;
+      scopeRevision = scope.revision;
+      return true;
+    },
+  };
+}
 
 function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
   const projects = getProjects();

@@ -1025,6 +1025,11 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
   const source = fs.readFileSync(filename, 'utf8');
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  captureProjectOperation,
+  getProjectOperationScope(projectId) { return illustratorActivationScopes.get(projectId); },
+  getAddFilesOwnership(projectId) {
+    return { picker: pendingNativeAddFilesPickers.has(projectId), operations: activeAddFilesOperations.get(projectId)?.size || 0 };
+  },
   getFigmaPackageTransferBlock(projectId) {
     return {
       present: figmaPackageTransferBlocks.has(projectId),
@@ -2034,7 +2039,8 @@ function isExpectedStagedPackageWrite(filePath, outputDir, outputName) {
   return !!getPrivateStagedPackageRoot(filePath, outputDir) && path.basename(filePath) === outputName;
 }
 
-async function assertPackageActivationDriftFailsClosed(scenario, mutateActivation) {
+async function assertPackageActivationDriftFailsClosed(scenario, mutateActivation, accountExpiry = false) {
+  const originalAccountNow = testAccountSession.now;
   const tmpRoot = makeTempDir();
   const originalOpen = fs.promises.open;
   let releaseWrite = () => {};
@@ -2099,11 +2105,21 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     ]);
     assert.equal(firstResult, null, `package completed before deferred write: ${JSON.stringify(firstResult)}`);
     await mutateActivation(project);
+    const before = JSON.stringify(storeInstance.get('projects', []));
+    const rejected = accountExpiry ? assert.rejects(packagePromise, /Sign in to Crate/) : null;
+    if (accountExpiry) {
+      testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      assert.equal(testAccountSession.canUseWorkspace(), false);
+    }
     testRendererEvents.length = 0;
     releaseWrite();
-    const result = await packagePromise;
-
-    assert.deepEqual(result, { error: 'stale_activation' });
+    if (accountExpiry) {
+      await rejected;
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
+      assert.deepEqual(fs.readdirSync(outputDir), [], 'no published or staging output survives expiry');
+    } else {
+      assert.deepEqual(await packagePromise, { error: 'stale_activation' });
+    }
     assert.equal(fs.existsSync(packagePath), false);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 0);
     assert.equal(
@@ -2123,6 +2139,7 @@ async function assertPackageActivationDriftFailsClosed(scenario, mutateActivatio
     );
   } finally {
     releaseWrite();
+    testAccountSession.now = originalAccountNow;
     fs.promises.open = originalOpen;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -22546,4 +22563,114 @@ test('Add Files retains both concurrent PSDs with identical embedded names and d
     if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+for (const mode of ['delayed-expiry', 'notified-expiry', 'valid']) {
+  test(`project authorization Add Files ${mode} preserves the admission boundary and releases ownership`, async () => {
+    const originalNow = testAccountSession.now;
+    let release = () => {};
+    try {
+      const project = await createProject('Synthetic account admission');
+      await callIpcRaw('projects:pause', project.id);
+      const selected = path.join(TEST_HOME, 'Documents', 'account-admission.png');
+      fs.writeFileSync(selected, createSyntheticPngBytes());
+      const before = JSON.stringify(storeInstance.get('projects', []));
+      nextOpenDialogResult = new Promise(resolve => { release = resolve; });
+      const adding = callIpcRaw('projects:add-files', project.id, 'account_boundary_test');
+      const completion = mode === 'valid' ? adding : assert.rejects(adding, /Sign in to Crate/);
+      assert.deepEqual(metadataTestHooks.getAddFilesOwnership(project.id), { picker: true, operations: 1 });
+      if (mode !== 'valid') testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      if (mode === 'notified-expiry') testAccountSession.publish('offline');
+      assert.equal(testAccountSession.canUseWorkspace(), mode === 'valid');
+      release({ canceled: false, filePaths: [selected] });
+      await completion;
+      assert.deepEqual(metadataTestHooks.getAddFilesOwnership(project.id), { picker: false, operations: 0 });
+      const stored = storeInstance.get('projects', []).find(item => item.id === project.id);
+      if (mode !== 'valid') {
+        assert.equal(JSON.stringify(storeInstance.get('projects', [])), before, 'saved project and provenance bytes must be unchanged');
+        assert.equal(stored.files.some(file => file.path === selected), false);
+        testAccountSession.now = originalNow;
+        await testAccountSession.restore();
+        manualDialogFor([selected]);
+        assert.ok(Array.isArray(await callIpcRaw('projects:add-files', project.id, 'fresh_account_operation')));
+      }
+      const fresh = storeInstance.get('projects', []).find(item => item.id === project.id);
+      assert.equal(fresh.files.filter(file => file.path === selected).length, 1);
+      assert.deepEqual(metadataTestHooks.getAddFilesOwnership(project.id), { picker: false, operations: 0 });
+    } finally {
+      release({ canceled: true }); testAccountSession.now = originalNow;
+      await testAccountSession.restore();
+    }
+  });
+}
+
+for (const invalidation of ['clock', 'generation', 'identity']) {
+  for (const predicate of ['current', 'adoptScope']) {
+    test(`project authorization ${predicate} retires on ${invalidation} without an account event`, async () => {
+      const originalNow = testAccountSession.now;
+      try {
+        const project = await createProject('Synthetic operation fence');
+        const operation = metadataTestHooks.captureProjectOperation(project.id);
+        const scope = metadataTestHooks.getProjectOperationScope(project.id);
+        const generation = testAccountSession.generation;
+        const identity = testAccountSession.status.identity;
+        assert.equal(operation.current(), true);
+        const sequence = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+        if (invalidation === 'clock') testAccountSession.now = () => testAccountSession.accessExpiresAt;
+        if (invalidation === 'generation') testAccountSession.invalidate();
+        if (invalidation === 'identity') testAccountSession.status = { ...testAccountSession.status, identity: { id: 'replacement-account' } };
+        assert.equal(metadataTestHooks.getActiveWatchingActivationToken(project.id), sequence, 'no watcher event supplied the fence');
+        assert.equal(operation[predicate](scope), false);
+        // Restore otherwise-valid credentials: a lease which observed denial must stay retired.
+        testAccountSession.now = originalNow;
+        testAccountSession.generation = generation;
+        testAccountSession.status = { ...testAccountSession.status, identity };
+        assert.equal(testAccountSession.canUseWorkspace(), true);
+        assert.equal(operation.current(), false);
+        assert.equal(operation.adoptScope(scope), false);
+        assert.equal(metadataTestHooks.captureProjectOperation(project.id).current(), true);
+      } finally {
+        testAccountSession.now = originalNow;
+        await testAccountSession.restore();
+      }
+    });
+  }
+}
+
+test('project authorization valid same-identity refresh and scope adoption retain the lease', async () => {
+  const originalProvider = testAccountSession.provider, originalCredentials = testAccountSession.credentials;
+  try {
+    const identity = { id: '11111111-1111-4111-8111-111111111111', email: 'synthetic@example.test', verified: true };
+    testAccountSession.record = { identity, refreshToken: 'synthetic-refresh' };
+    testAccountSession.publish('signed_in', '', identity);
+    const project = await createProject('Synthetic refresh compatibility');
+    const operation = metadataTestHooks.captureProjectOperation(project.id);
+    const scope = metadataTestHooks.getProjectOperationScope(project.id);
+    const generation = testAccountSession.generation;
+    testAccountSession.provider = {
+      refresh: async () => ({ access_token: 'synthetic-new-access', refresh_token: 'synthetic-new-refresh' }),
+      validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 7200000 }),
+      me: async () => identity,
+    };
+    testAccountSession.credentials = { write() {} };
+    await testAccountSession.refresh();
+    assert.equal(testAccountSession.accessToken, 'synthetic-new-access');
+    assert.equal(testAccountSession.generation, generation);
+    assert.equal(operation.current(), true);
+    scope.revision++;
+    assert.equal(operation.current(), false, 'scope must first be adopted');
+    assert.equal(operation.adoptScope(scope), true);
+    assert.equal(operation.current(), true);
+    operation.close();
+    assert.equal(operation.current(), false);
+    assert.equal(operation.adoptScope(scope), false);
+  } finally {
+    testAccountSession.provider = originalProvider; testAccountSession.credentials = originalCredentials;
+    await testAccountSession.restore();
+  }
+});
+
+test('project authorization expiry during deferred package write prevents publication and quota consumption', async () => {
+  await assertPackageActivationDriftFailsClosed('account-expiry', async () => {}, true);
 });
