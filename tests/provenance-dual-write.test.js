@@ -1088,6 +1088,15 @@ module.exports.__crateMetadataTestHooks = {
     };
     return () => { createAddFilesPsdTransaction = original; };
   },
+  pausePsdExtraction(wait) {
+    const original = extractPsdAssets;
+    extractPsdAssets = async (...args) => {
+      const assets = await original(...args);
+      await wait(assets);
+      return assets;
+    };
+    return () => { extractPsdAssets = original; };
+  },
   pausePsdAcceptance(wait) {
     const original = preparePsdBaselineAcceptance;
     preparePsdBaselineAcceptance = async (...args) => {
@@ -23543,3 +23552,41 @@ test('PSD reuse watcher stage replaced at write completion preserves foreign ino
     assertPsdOriginalsPreserved(f);
   } finally { fs.promises.writeFile = originalWrite; fs.promises.open = originalOpen; f.cleanup(); }
 });
+
+
+for (const watcher of [false, true]) for (const changedSource of [false, true]) for (const replacement of ['output', 'directory']) {
+  test(`PSD reuse original promotion ownership watcher ${watcher} changed source ${changedSource} replacement ${replacement}`, async () => {
+    const f = await makePsdReuseFixture();
+    let restore = () => {};
+    try {
+      if (changedSource) fs.writeFileSync(f.source, 'changed source needing fresh receipt');
+      const saved = await getProject(f.project.id);
+      const rowsBefore = JSON.stringify(saved.files), provenanceBefore = JSON.stringify(saved.provenance);
+      const receiptsBefore = [...f.owner.psdOutputReceipts];
+      let replacementPath, replacementInode, preservedOriginalPath;
+      restore = metadataTestHooks.pausePsdExtraction(async assets => {
+        replacementPath = assets.find(asset => asset.source === 'psd-embedded').filePath;
+        if (replacement === 'directory') {
+          preservedOriginalPath = path.join(f.root, 'owned-directory', path.basename(f.rows[0].path));
+          fs.renameSync(f.extractDir, path.dirname(preservedOriginalPath));
+          fs.mkdirSync(f.extractDir);
+        } else {
+          preservedOriginalPath = f.rows[0].path;
+          fs.renameSync(replacementPath, path.join(f.root, 'owned-output.bin'));
+        }
+        fs.writeFileSync(replacementPath, f.originals[0].bytes);
+        replacementInode = fs.lstatSync(replacementPath).ino;
+      });
+      assert.equal((await f.scan({ watcher })).success, false);
+      const fresh = await getProject(f.project.id);
+      assert.equal(JSON.stringify(fresh.files), rowsBefore);
+      assert.equal(JSON.stringify(fresh.provenance), provenanceBefore);
+      assert.deepEqual([...f.owner.psdOutputReceipts], receiptsBefore);
+      assert.equal(fs.lstatSync(replacementPath).ino, replacementInode);
+      assert.deepEqual(fs.readFileSync(replacementPath), f.originals[0].bytes);
+      assert.equal(fs.statSync(preservedOriginalPath).ino, f.originals[0].stat.ino);
+      assert.equal(f.owner.activeScans.size, 0);
+      assert.equal(f.owner.requiredReservations?.size || 0, 0);
+    } finally { restore(); f.cleanup(); }
+  });
+}

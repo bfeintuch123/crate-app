@@ -13182,10 +13182,21 @@ async function readPsdBaselineSnapshot(filePath, isCurrent, directory = null) {
 function findPsdBaselineReceiptRow(project, receipt) {
   return (project[receipt.collection] || []).find(row => JSON.stringify(row) === receipt.row);
 }
-async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, assets, isCurrent) {
+function assertBaselinePsdOutputOwnership(outputs) {
+  for (const stage of outputs) {
+    assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+    const stat = fs.lstatSync(stage.extractPath);
+    if (!stage.committed || !stage.identity || !isDirectCacheChild(stage.extractDir, stage.extractPath) ||
+        stat.isSymbolicLink() || !stat.isFile() || stat.dev !== stage.identity.dev || stat.ino !== stage.identity.ino) {
+      throw new Error('asset_baseline_psd_output_changed');
+    }
+  }
+}
+async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, assets, isCurrent, ownedOutputs) {
   const owner = baselineScan.state;
   owner.psdOutputReceipts ||= new Map();
   const receipts = owner.psdOutputReceipts;
+  const outputOwners = new Map(ownedOutputs.map(stage => [stage.extractPath, stage]));
   const sourceRow = getProjects().find(project => project.id === projectId)?.files
     .find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
   const sourceRowSnapshot = JSON.stringify(sourceRow);
@@ -13198,7 +13209,10 @@ async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, v
     const key = JSON.stringify([normalizeTrackedFilePath(filePath), source.realPath, source.identity,
       source.digest, asset.embeddedIndex, asset.embeddedOriginalName]);
     const previous = receipts.get(key);
+    const ownedOutput = outputOwners.get(asset.filePath);
+    if (ownedOutput) assertBaselinePsdOutputOwnership([ownedOutput]);
     const output = await readPsdBaselineSnapshot(asset.filePath, isCurrent, directory);
+    if (ownedOutput) assertBaselinePsdOutputOwnership([ownedOutput]);
     if (output.digest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
     let borrowed = null;
     if (previous) {
@@ -13216,6 +13230,9 @@ async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, v
     if (!isCurrent() || assetBaselineScans.get(projectId) !== owner || !selectionCurrent() ||
         !project.files.some(row => JSON.stringify(row) === sourceRowSnapshot)) throw new Error('stale_project_operation');
     assertPsdBaselineSnapshot(source);
+    // Watcher stages retain their original descriptor/directory identities.
+    // A freshly hashed identical-byte replacement never acquires ownership.
+    assertBaselinePsdOutputOwnership(ownedOutputs);
     for (const item of items) {
       assertPsdBaselineSnapshot(item.output);
       if (item.previous) {
@@ -13435,7 +13452,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         // Another full scan may accept while hashing. Recompare its receipt;
         // never publish based on a stale absence. No await follows this loop.
         for (let attempt = 0; attempt < 4; attempt++) {
-          acceptance = await preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, psdAssets, isCurrent);
+          acceptance = await preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, psdAssets, isCurrent, baselinePsdOutputs);
           if (acceptance.selectionCurrent()) break;
         }
       }
