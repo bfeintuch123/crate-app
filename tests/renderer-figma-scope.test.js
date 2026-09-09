@@ -7226,3 +7226,71 @@ for (const decision of ['include', 'skip']) for (const rejected of [false, true]
     assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
   });
 }
+
+function accountCreationFixture(overrides = {}) {
+  const f = accountModalFixture({
+    getProjects: async () => [{ id: 'account-modal-project', files: [] }],
+    getSettings: async () => ({}), getUsage: async () => ({}),
+    getFigmaStatus: async () => ({ connected: false }), ...overrides,
+  });
+  f.renderer.setupEventListeners();
+  f.elements['input-project-name'].value = 'Synthetic new project';
+  return f;
+}
+for (const outcome of ['authorization-rejection', 'authorization-rejection-persisted', 'success']) {
+  test(`settled project creation after account transition reconciles without old selection (${outcome})`, async () => {
+    const held = createDeferred(), read = createDeferred();
+    const f = accountCreationFixture({ createProject: () => held.promise, getProjects: () => read.promise });
+    const creating = f.renderer.createProject(); f.transition();
+    if (outcome.startsWith('authorization-rejection')) held.reject(new Error('Sign in to Crate to use your workspace.'));
+    else held.resolve({ id: 'created-old-account', files: [] });
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'reconciling');
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    read.resolve([{ id: 'account-modal-project', files: [] }, ...(outcome !== 'authorization-rejection' ? [{ id: 'created-old-account', files: [] }] : [])]);
+    await creating;
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'account-modal-project');
+    assert.equal(vm.runInContext('state.projects.length', f.renderer), outcome !== 'authorization-rejection' ? 2 : 1);
+    assert.doesNotMatch(f.elements['project-creation-status'].textContent, /Restart/);
+  });
+}
+test('account transition during creation refresh cannot merge or select the stale result', async () => {
+  const held = createDeferred();let reads = 0;
+  const f = accountCreationFixture({ createProject: async () => ({ id: 'old-created', files: [] }), getProjects: () => ++reads === 1 ? held.promise : Promise.resolve([{ id: 'new-selection', files: [] }]) });
+  const creating = f.renderer.createProject();await new Promise(setImmediate);f.transition();
+  vm.runInContext("state.projects=[{id:'new-selection',files:[]}];state.selectedProjectId='new-selection';", f.renderer);
+  held.resolve([{ id: 'old-created', files: [] }]);await creating;
+  assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'new-selection');
+  assert.equal(vm.runInContext('state.projects.map(p=>p.id).join()', f.renderer), 'new-selection');
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+});
+test('settled account rejection while signed out stays locked until current account projects reconcile', async () => {
+  const held=createDeferred(),read=createDeferred();
+  const f=accountCreationFixture({createProject:()=>held.promise,getProjects:()=>read.promise});
+  const creating=f.renderer.createProject();
+  vm.runInContext("accountStartupLoaded=true;acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});",f.renderer);
+  held.reject(new Error('Sign in to Crate to use your workspace.'));await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'reconciling');
+  vm.runInContext("acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'B'}});",f.renderer);
+  read.resolve([{id:'account-modal-project',files:[]}]);await new Promise(setImmediate);
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'idle');
+});
+test('unclassified creation rejection after account transition remains unresolved', async () => {
+  const held=createDeferred();const f=accountCreationFixture({createProject:()=>held.promise});
+  const creating=f.renderer.createProject();f.transition();held.reject(new Error('IPC transport disappeared'));await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'unresolved');
+});
+
+test('workspace read begun before retired creation settles cannot unlock reconciliation', async () => {
+  const created=createDeferred(),oldRead=createDeferred(),currentRead=createDeferred();let reads=0;
+  const f=accountCreationFixture({createProject:()=>created.promise,getProjects:()=>++reads===1?oldRead.promise:currentRead.promise});
+  const creating=f.renderer.createProject();vm.runInContext('accountStartupLoaded=true',f.renderer);f.transition();
+  created.resolve({id:'saved-project',files:[]});await new Promise(setImmediate);
+  oldRead.resolve([{id:'stale-list',files:[]}]);await new Promise(setImmediate);
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'reconciling');
+  assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'account-modal-project');
+  currentRead.resolve([{id:'account-modal-project',files:[]},{id:'saved-project',files:[]}]);await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'idle');
+  assert.equal(vm.runInContext('state.projects.length',f.renderer),2);
+});

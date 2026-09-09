@@ -701,6 +701,7 @@ async function getAccountCurrentProjects() {
 
 async function loadAccountWorkspace() {
   const epoch = accountWorkspaceEpoch;
+  const readEpoch = projectListReadEpoch;
 
   try {
     const [projects, settings, usage] = await Promise.all([
@@ -708,10 +709,14 @@ async function loadAccountWorkspace() {
       window.crate.getSettings(),
       window.crate.getUsage(),
     ]);
-    if (epoch !== accountWorkspaceEpoch || !accountStatus.canUseWorkspace) return;
+    if (epoch !== accountWorkspaceEpoch || readEpoch !== projectListReadEpoch || !accountStatus.canUseWorkspace) return;
     state.projects = Array.isArray(projects) ? projects : [];
     state.settings = settings && typeof settings === 'object' ? settings : {};
     state.usage = usage && typeof usage === 'object' ? usage : {};
+    if (projectCreationPhase === 'reconciling') {
+      finishProjectCreationAttempt();
+      setProjectCreationStatus('Account changed. Review your projects before starting another.');
+    }
     try {
       if (typeof window.crate.reportRendererStartupDataComplete === 'function') {
         window.crate.reportRendererStartupDataComplete();
@@ -943,13 +948,15 @@ function setProjectCreationStatus(message) {
 function setProjectCreationPhase(phase) {
   projectCreationPhase = phase;
   const locked = isProjectCreationLocked();
-  const busy = phase === 'creating';
+  const busy = phase === 'creating' || phase === 'reconciling';
 
   const createButton = $('#btn-create-project');
   if (createButton) {
     const atCap = state.projects.length >= MAX_PROJECTS;
     createButton.disabled = locked || atCap;
-    createButton.textContent = phase === 'creating'
+    createButton.textContent = phase === 'reconciling'
+      ? 'Checking projects\u2026'
+      : phase === 'creating'
       ? 'Starting\u2026'
       : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching');
     createButton.setAttribute('aria-busy', busy ? 'true' : 'false');
@@ -976,6 +983,17 @@ function setProjectCreationPhase(phase) {
 function finishProjectCreationAttempt() {
   projectListReadEpoch += 1;
   setProjectCreationPhase('idle');
+}
+
+async function reconcileRetiredProjectCreation() {
+  // Only a settled create response or the main account-authorization rejection
+  // reaches here. Either may follow persistence, so keep creation locked until
+  // a fresh current-account read accounts for all saved projects. Timeouts and
+  // unknown transport failures retain the existing unresolved lock.
+  projectListReadEpoch += 1;
+  setProjectCreationPhase('reconciling');
+  setProjectCreationStatus('Account changed. Checking saved projects.');
+  if (accountStatus.canUseWorkspace) await loadAccountWorkspace();
 }
 
 function enterProjectCreationUnresolved(message) {
@@ -1090,6 +1108,7 @@ async function createProject() {
     figmaError.textContent = '';
   }
 
+  const creationAccountEpoch = accountWorkspaceEpoch;
   projectListReadEpoch += 1;
   setProjectCreationPhase('creating');
   let createRequestTimer = null;
@@ -1128,12 +1147,23 @@ async function createProject() {
     const typedError = hasTypedError ? result.error : null;
     const figmaLinkErrorMessage = getFigmaLinkErrorMessage(typedError);
     const knownNonPersistingError = typedError === 'max_projects_reached' || !!figmaLinkErrorMessage;
+    const accountRejected = typeof createError?.message === 'string' &&
+      createError.message.endsWith('Sign in to Crate to use your workspace.');
+    if (creationAccountEpoch !== accountWorkspaceEpoch &&
+        ((!hasTypedError && result?.id) || knownNonPersistingError || accountRejected)) {
+      await reconcileRetiredProjectCreation();
+      return;
+    }
     if (!hasTypedError && result && result.id) {
       try {
         const projects = await getAccountCurrentProjects();
-        if (Array.isArray(projects)) state.projects = projects;
+        if (creationAccountEpoch === accountWorkspaceEpoch && Array.isArray(projects)) state.projects = projects;
       } catch (refreshError) {
         logRendererError('Project creation state could not refresh', refreshError);
+      }
+      if (creationAccountEpoch !== accountWorkspaceEpoch) {
+        await reconcileRetiredProjectCreation();
+        return;
       }
       completeProjectCreation(state.projects.find(project => project.id === result.id) || result);
       return;
