@@ -23073,7 +23073,7 @@ test('retry ownership watcher cannot consume a queued same-path reservation', as
     const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
     const state = metadataTestHooks.getBaselineState(f.project.id);
     const watcher = metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[0], f.operation.activationToken);
-    assert.equal(state.queuedSourceKeys.has(f.paths[0].toLowerCase()), true);
+    assert.equal(state.queuedSourceKeys.has(normalizeLedgerPathForTest(f.paths[0])), true);
     await metadataTestHooks.completeProjectAssetBaselineScan(watcher, true, f.operation.current);
     await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, queue, 1), true, f.operation.current);
     assert.equal((await getProject(f.project.id)).assetBaseline.status, 'awaiting-first-scan');
@@ -23089,7 +23089,7 @@ test('retry ownership cancelled old queue preserves same-owner newer reservation
     const newer = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
     metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, old, state);
     assert.equal(metadataTestHooks.getBaselineState(f.project.id), state);
-    assert.deepEqual([...state.queuedSourceKeys].sort(), f.paths.map(source => source.toLowerCase()).sort());
+    assert.deepEqual([...state.queuedSourceKeys].sort(), f.paths.map(normalizeLedgerPathForTest).sort());
     for (let index = 0; index < newer.length; index++) {
       await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, newer, index), true, f.operation.current);
     }
@@ -23148,12 +23148,12 @@ for (const heldSource of ['good', 'bad']) for (const phase of ['read', 'finish']
         return read();
       });
       else restoreFinish = metadataTestHooks.pausePsdFinish(async scan => {
-        if (scan.sourceKey === paths[heldSource].toLowerCase()) await gate.wait();
+        if (scan.sourceKey === normalizeLedgerPathForTest(paths[heldSource])) await gate.wait();
       });
       manualDialogFor([paths.bad]);
       const retry = callIpcRaw('projects:add-files', project.id);
       await gate.started;
-      const other = paths[heldSource === 'good' ? 'bad' : 'good'].toLowerCase();
+      const other = normalizeLedgerPathForTest(paths[heldSource === 'good' ? 'bad' : 'good']);
       await waitForCondition(() => !owner.inFlightBySource.has(other), 'other sibling must settle first');
       assert.equal(metadataTestHooks.getBaselineState(project.id), owner);
       assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
@@ -23356,7 +23356,7 @@ for (const mode of ['missing', 'modified', 'symlink', 'replaced']) {
       assert.equal(JSON.stringify((await getProject(f.project.id)).files), saved);
       assert.equal(f.owner.requiredReservations?.size || 0, 0);
       assert.equal(f.owner.activeScans.size, 0);
-      assert.equal(f.owner.completedSourceKeys.has(f.source.toLowerCase()), true);
+      assert.equal(f.owner.completedSourceKeys.has(normalizeLedgerPathForTest(f.source)), true);
       assert.deepEqual(fs.readdirSync(f.extractDir), mode === 'missing' ? [] : [path.basename(old.path)]);
       if (replacement) assert.equal(fs.lstatSync(old.path).ino, replacement.ino);
       if (mode === 'symlink') assert.equal(fs.readFileSync(foreign, 'utf8'), 'foreign bytes');
