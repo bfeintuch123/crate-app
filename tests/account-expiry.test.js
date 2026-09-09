@@ -65,3 +65,68 @@ test('rotation followed by backend outage retains expiry for the old verified ac
  f.provider.me=async()=>{throw {kind:'offline'};};await f.session.refresh();assert.equal(f.session.snapshot().canUseWorkspace,true);
  f.tick(101);expiry.fn();assert.equal(f.session.snapshot().canUseWorkspace,false);assert.match(f.session.snapshot().message,/needs to be checked/);f.session.shutdown();
 });
+
+for (const phase of ['waiting', 'exchange', 'validate', 'me']) {
+ test(`cancel restores automatic renewal and fences abandoned ${phase} sign-in`, async () => {
+  const f = fixture();
+  f.provider.validate = async t => ({ subject: t.access_token, expiresAt: 120000 });
+  await f.session.begin(); await f.session.callback(f.cb(A));
+  f.provider.refresh = async () => { throw { kind: 'offline' }; };
+  await f.session.refresh();
+  assert.equal(f.session.snapshot().state, 'offline');
+  const oldRefresh = f.session.refreshTimer, oldExpiry = f.session.accessTimer;
+  const delayed = gate();
+  if (phase !== 'waiting') f.provider[phase] = () => delayed.promise;
+  await f.session.begin();
+  const abandonedCallback = f.cb(B);
+  const operation = phase === 'waiting' ? null : f.session.callback(abandonedCallback);
+  // Drain the immediate provider stages to reach the selected held stage.
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.session.snapshot().state, phase === 'waiting' ? 'waiting' : 'verifying');
+  let refreshCalls = 0;
+  f.provider.refresh = async token => { refreshCalls++; assert.equal(token, A); return f.tokens(A); };
+  oldRefresh.fn(); await f.session.refresh();
+  assert.equal(refreshCalls, 0, 'pending and verifying attempts exclude refresh');
+  f.session.cancel();
+  assert.equal(f.session.snapshot().canUseWorkspace, true);
+  assert.equal(f.isScheduled(oldRefresh), false);
+  const renewedTimer = f.session.refreshTimer;
+  assert.notEqual(renewedTimer, oldRefresh);
+  assert.equal(f.isScheduled(renewedTimer), true);
+  assert.equal(renewedTimer.delay, 60000);
+  const revision = f.session.snapshot().revision, record = f.session.record;
+  if (phase === 'waiting') await f.session.callback(abandonedCallback);
+  else {
+   delayed.resolve(phase === 'exchange' ? f.tokens(B) : phase === 'validate' ? { subject: B, expiresAt: 240000 } : ident(B));
+   await operation;
+  }
+  assert.equal(f.session.snapshot().revision, revision);
+  assert.equal(f.session.record, record);
+  assert.equal(f.saved().identity.id, A);
+  f.provider.validate = async t => ({ subject: t.access_token, expiresAt: 240000 });
+  f.provider.me = async t => ident(t);
+  oldRefresh.fn(); oldExpiry.fn();
+  assert.equal(refreshCalls, 0, 'old generation timers remain inert');
+  f.tick(60000); renewedTimer.fn(); await f.session.refreshing;
+  assert.equal(refreshCalls, 1);
+  assert.equal(f.session.snapshot().state, 'signed_in');
+  assert.equal(f.session.accessExpiresAt, 240000);
+  f.tick(120001); oldExpiry.fn();
+  assert.equal(f.session.snapshot().canUseWorkspace, true, 'automatic renewal survives original expiry');
+  assert.equal(f.saved().identity.id, A);
+  f.session.shutdown();
+ });
+}
+test('cancel does not schedule renewal or grant access for expired or signed-out sessions', async () => {
+ for (const state of ['expired', 'signed_out']) {
+  const f = fixture(); let calls = 0;
+  if (state === 'expired') { await f.session.begin(); await f.session.callback(f.cb(A)); f.tick(101); }
+  await f.session.begin(); f.session.cancel();
+  f.provider.refresh = async () => { calls++; return f.tokens(A); };
+  assert.equal(f.session.snapshot().canUseWorkspace, false);
+  assert.equal(f.session.accessTimer, null);
+  assert.equal(f.isScheduled(f.session.refreshTimer), false);
+  assert.equal(calls, 0);
+  f.session.shutdown();
+ }
+});

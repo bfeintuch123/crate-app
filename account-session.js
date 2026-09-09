@@ -57,7 +57,10 @@ class AccountSession extends EventEmitter {
   }
   cancel() {
     this.invalidate();
-    if (this.record && this.accessToken && this.now() < this.accessExpiresAt) this.authorizeUntil(this.accessExpiresAt);
+    if (this.record && this.accessToken && this.now() < this.accessExpiresAt) {
+      this.authorizeUntil(this.accessExpiresAt);
+      this.schedule(this.accessExpiresAt);
+    }
     return this.publish(this.record ? 'offline' : 'signed_out', 'Sign-in canceled.');
   }
   async callback(input) {
