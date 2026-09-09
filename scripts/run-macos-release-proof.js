@@ -8,6 +8,12 @@ const path = require('node:path');
 const AUTHENTICATED_SOURCE_FILES = Object.freeze([
   'package.json',
   'package-lock.json',
+  'runtime-identity.json',
+  'account-config.json',
+  'account-config.js',
+  'account-credential-store.js',
+  'account-provider.js',
+  'account-session.js',
   'scripts/install-approved-canvas-prebuild.js',
   'scripts/patch-helper-info-plists.js',
   'scripts/run-macos-release-proof.js',

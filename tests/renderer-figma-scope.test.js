@@ -34,6 +34,7 @@ function createElementStub(tagName = 'div') {
       },
       contains: (name) => classes.has(name),
     },
+    contains: node => !!node && (node === element || element.children.some(child => child === node || child.contains?.(node))),
     appendChild: child => {
       if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
         child.parentNode.removeChild(child);
@@ -131,6 +132,7 @@ function createElementStub(tagName = 'div') {
 
   let html = '';
   let text = '';
+  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument });
   Object.defineProperty(element, 'parentElement', { get: () => element.parentNode || null });
   const htmlEscape = value => String(value)
     .replace(/&/g, '&amp;')
@@ -200,6 +202,7 @@ function createDocumentStub(elements = {}, options = {}) {
   };
 
   document = {
+    getElementById,
     listeners,
     activeElement: body,
     addEventListener: (type, fn) => { listeners[type] = fn; },
@@ -352,6 +355,11 @@ function createPackageDetailsDom() {
 }
 
 function loadRendererHelpers(document = createDocumentStub(), windowOverrides = {}, contextOverrides = {}) {
+  // Existing workspace tests run as an authenticated account; gate tests supply their own snapshot.
+  if (windowOverrides.crate && !windowOverrides.crate.getAccount) {
+    windowOverrides.crate.getAccount = async () => ({ revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'test-account', email: 'pilot@example.test' }, message: '' });
+    windowOverrides.crate.onAccountChanged = () => {};
+  }
   const context = {
     console,
     document,
@@ -5289,7 +5297,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(css, /\.package-review-modal\s*\{(?=[^}]*position:\s*relative;)(?=[^}]*overflow-x:\s*hidden;)(?=[^}]*overflow-y:\s*auto;)[^}]*\}/);
   assert.match(css, /\.toggle input:focus-visible \+ \.toggle-slider\s*\{(?=[^}]*outline:\s*2px solid var\(--black\);)(?=[^}]*outline-offset:\s*3px;)[^}]*\}/);
   assert.match(html, /id="modal-upgrade"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-describedby="upgrade-subtitle"/);
-  assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Maybe later[\s\S]*<\/button>/);
+  assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Close[\s\S]*<\/button>/);
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
 });
 
@@ -6333,10 +6341,10 @@ test('renderer shows the authoritative package quota in Settings, sidebar, and l
   renderer.renderFooter();
   renderer.showPackageLimitModal({ daysLeft: 12, packageLimit: 25 });
 
-  assert.equal(elements['plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['plan-title'].textContent, 'Package usage');
   assert.equal(elements['plan-info'].textContent, '25 packages/month \u00B7 10/25 used');
   assert.equal(elements['plan-badge'].textContent, 'Beta tester');
-  assert.equal(elements['sidebar-plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['sidebar-plan-title'].textContent, 'Package usage');
   assert.equal(elements['footer-usage'].textContent, '10 of 25 packages used this month');
   assert.equal(elements['upgrade-title'].textContent, "You've used all 25 packages");
   assert.equal(elements['upgrade-days-left'].textContent, '12');
@@ -6392,6 +6400,7 @@ test('Quick Package drop uses preload File handling while Browse keeps its exist
 
   loadRendererHelpers(document, { crate: crateBridge });
   document.listeners.DOMContentLoaded();
+  await new Promise(setImmediate); // Allow the authenticated startup check to reach the data requests.
   const startupUsageRequests = usageRequests;
 
   const dropHandlers = elements['v2-drop-zone'].listeners.drop;
@@ -6970,3 +6979,250 @@ test('renderer schedules visible preview work before lower-priority offscreen wo
 
   assert.deepEqual(calls.map(call => call[1]), ['visible', 'nearby', 'offscreen']);
 });
+
+test('full-window welcome requires an account even with existing projects or a remembered identity', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document);
+  const welcome = document.querySelector('#account-welcome');
+  welcome.classList.add('hidden');
+  for (const stateName of ['unconfigured', 'checking', 'signed_out', 'waiting', 'verifying', 'expired', 'error', 'offline']) {
+    renderer.stateName = stateName;
+    vm.runInContext(`state.projects = [{id:'existing',name:'Existing',files:[]}]; accountStatus = { revision: 1, state: stateName, identity: {email:'pilot@example.test'}, canUseWorkspace: false, message: '' }; renderAccount();`, renderer);
+    assert.equal(elements.app.classList.contains('account-onboarding'), true, stateName);
+    assert.equal(elements['app-sidebar'].inert, true);
+    assert.equal(elements['app-main'].inert, true);
+  }
+  vm.runInContext(`accountStatus = {revision:2,state:'signed_in',canUseWorkspace:true,identity:{email:'pilot@example.test'},message:''}; renderAccount();`, renderer);
+  assert.equal(elements.app.classList.contains('account-onboarding'), false);
+  assert.equal(elements['app-main'].inert, false);
+  vm.runInContext(`accountStatus = {revision:3,state:'signed_out',canUseWorkspace:false,identity:null,message:''}; renderAccount();`, renderer);
+  assert.equal(elements.app.classList.contains('account-onboarding'), true);
+});
+test('welcome has no anonymous bypass and remains the default before script initialization', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  assert.doesNotMatch(html, /welcome-local|Continue using local|sign-in is optional/i);
+  assert.match(html, /id="app" class="account-onboarding"/);
+  assert.match(html, /class="account-welcome"/);
+});
+test('signed-out startup does not request workspace data; sign-in loads it and logout rejects late startup data', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let changed, reads = 0;
+  const pending = createDeferred();
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAccount: async () => ({revision:1,state:'signed_out',canUseWorkspace:false,identity:null,message:''}),
+    onAccountChanged: callback => { changed = callback; },
+    getProjects: () => { reads++; return pending.promise; },
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({connected:false}),
+    onFilesUpdated: () => {}, onProjectUpdated: () => {}, onPendingFilesUpdated: () => {}, onPackageTrigger: () => {}, onFigmaAuthError: () => {}, onFigmaScanStarted: () => {}, onFigmaScanComplete: () => {}, onFigmaScanError: () => {},
+  }});
+  await document.listeners.DOMContentLoaded();
+  assert.equal(reads, 0);
+  changed({revision:2,state:'signed_in',canUseWorkspace:true,identity:{id:'a',email:'pilot@example.test'},message:''});
+  assert.equal(reads, 1);
+  changed({revision:3,state:'signed_out',canUseWorkspace:false,identity:null,message:''});
+  pending.resolve([{id:'late-project',files:[]}]);
+  await new Promise(setImmediate);
+  assert.equal(vm.runInContext('state.projects.length',renderer),0);
+  assert.equal(elements.app.classList.contains('account-onboarding'),true);
+});
+
+test('Settings vertical tabs keep one pane visible and support arrows, Home, End and activation', () => {
+  const keys = ['general', 'packaging', 'integrations', 'privacy', 'account', 'billing'];
+  const panels = Object.fromEntries(keys.map(key => ['settings-panel-' + key, createElementStub('section')]));
+  const tabs = keys.map(key => {
+    const tab = createElementStub('button');
+    tab.setAttribute('aria-controls', 'settings-panel-' + key);
+    return tab;
+  });
+  const document = createDocumentStub(panels, { tabs });
+  const originalQuery = document.querySelectorAll.bind(document);
+  document.querySelectorAll = selector => selector === '[data-settings-tab]' ? tabs : originalQuery(selector);
+  const renderer = loadRendererHelpers(document);
+  renderer.initializeSettingsNavigation();
+  const selected = index => {
+    for (let i = 0; i < keys.length; i++) {
+      assert.equal(tabs[i].getAttribute('aria-selected'), String(i === index));
+      assert.equal(tabs[i].tabIndex, i === index ? 0 : -1);
+      assert.equal(panels['settings-panel-' + keys[i]].hidden, i !== index);
+    }
+  };
+  tabs[4].click(); selected(4);
+  const press = (index, key) => {
+    let prevented = false;
+    tabs[index].dispatchEvent({ type: 'keydown', key, preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+  };
+  press(4, 'ArrowDown'); selected(5); assert.equal(document.activeElement, tabs[5]);
+  press(5, 'ArrowDown'); selected(0);
+  press(0, 'ArrowUp'); selected(5);
+  press(5, 'Home'); selected(0);
+  press(0, 'End'); selected(5);
+  tabs[2].click(); selected(2);
+});
+
+// Deferred startup and welcome focus regressions from independent review.
+const signed = revision => ({revision, state:'signed_in', canUseWorkspace:true, identity:{id:'synthetic-a',email:'review@example.test'},message:''});
+const out = revision => ({revision,state:'signed_out',canUseWorkspace:false,identity:null,message:''});
+function fixture(defer) {
+ const {document,elements} = createInteractiveRendererDom();
+ let changed, reads=0, resolve;
+ const pending = new Promise(r => {resolve=r;});
+ const renderer = loadRendererHelpers(document,{crate:{
+  getAccount:async()=>signed(1),onAccountChanged:callback=>{changed=callback;},
+  getProjects:()=>{reads++;return defer&&reads===1?pending:Promise.resolve([{id:'fresh-project',files:[]}]);},
+  getSettings:async()=>({}),getUsage:async()=>({}),getFigmaStatus:async()=>({connected:false}),
+  onFilesUpdated:()=>{},onProjectUpdated:()=>{},onPendingFilesUpdated:()=>{},onPackageTrigger:()=>{},onFigmaAuthError:()=>{},onFigmaScanStarted:()=>{},onFigmaScanComplete:()=>{},onFigmaScanError:()=>{},
+ }});
+ return {document,elements,renderer,resolve,changed:s=>changed(s),reads:()=>reads};
+}
+test('control: initial signed-in startup reads and renders existing local projects',async()=>{
+ const f=fixture(false);await f.document.listeners.DOMContentLoaded();
+ assert.equal(f.reads(),1);assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'fresh-project');
+});
+test('repro: sign-out/sign-in during initial workspace load loses replacement load',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();
+ await new Promise(setImmediate);assert.equal(f.reads(),1);
+ f.changed(out(2));f.changed(signed(3));
+ f.resolve([{id:'stale-project',files:[]}]);await initializing;await new Promise(setImmediate);
+ const actual={reads:f.reads(),projectCount:vm.runInContext('state.projects.length',f.renderer),startupComplete:vm.runInContext('accountStartupLoaded',f.renderer),welcomeHidden:f.elements.app.classList.contains('account-onboarding')===false};
+ console.log('STARTUP_RACE_RECEIPT',JSON.stringify(actual));
+ assert.equal(actual.reads,2,'current authorized session must schedule a replacement workspace load');
+ assert.equal(actual.projectCount,1);
+});
+test('control: sign-out/sign-in after completed startup reloads local projects',async()=>{
+ const f=fixture(false);await f.document.listeners.DOMContentLoaded();
+ f.changed(out(2));f.changed(signed(3));await new Promise(setImmediate);
+ assert.equal(f.reads(),2);assert.equal(vm.runInContext('state.projects.length',f.renderer),1);
+});
+test('repro: waiting transition must move focus from hidden Sign in to visible Reopen',()=>{
+ const {document,elements}=createInteractiveRendererDom();
+ const renderer=loadRendererHelpers(document);
+ const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ vm.runInContext("accountStatus={revision:1,state:'signed_out',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ document.querySelector('#welcome-signin').focus();
+ vm.runInContext("accountStatus={revision:2,state:'waiting',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ const signin=document.querySelector('#welcome-signin'),reopen=document.querySelector('#welcome-reopen');
+ console.log('WAITING_FOCUS_RECEIPT',JSON.stringify({signinHidden:signin.classList.contains('hidden'),reopenHidden:reopen.classList.contains('hidden'),activeIsSignin:document.activeElement===signin,activeIsReopen:document.activeElement===reopen}));
+ assert.equal(document.activeElement===reopen,true,'pending welcome must focus its visible Reopen action');
+});
+test('repro: verifying transition must move focus from hidden Reopen to visible Cancel',()=>{
+ const {document}=createInteractiveRendererDom();
+ const renderer=loadRendererHelpers(document);
+ const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ vm.runInContext("accountStatus={revision:1,state:'waiting',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ document.querySelector('#welcome-reopen').focus();
+ vm.runInContext("accountStatus={revision:2,state:'verifying',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ const reopen=document.querySelector('#welcome-reopen'),cancel=document.querySelector('#welcome-cancel');
+ console.log('VERIFYING_FOCUS_RECEIPT',JSON.stringify({reopenHidden:reopen.classList.contains('hidden'),cancelHidden:cancel.classList.contains('hidden'),activeIsReopen:document.activeElement===reopen,activeIsCancel:document.activeElement===cancel}));
+ assert.equal(document.activeElement===cancel,true,'verification welcome must focus its visible Cancel action');
+});
+
+test('startup sign-out without reentry stays locked and never reloads stale local data',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();await new Promise(setImmediate);
+ f.changed(out(2));f.resolve([{id:'stale-project',files:[]}]);await initializing;
+ assert.equal(f.reads(),1);assert.equal(vm.runInContext('state.projects.length',f.renderer),0);assert.equal(f.elements.app.classList.contains('account-onboarding'),true);
+});
+test('repeated startup account transitions load the latest allowed epoch once',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();await new Promise(setImmediate);
+ f.changed(out(2));f.changed(signed(3));f.changed(out(4));f.changed(signed(5));f.changed(signed(6));
+ f.resolve([{id:'stale-project',files:[]}]);await initializing;
+ assert.equal(f.reads(),2);assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'fresh-project');
+});
+test('welcome cancel/error retargets hidden focus and repeated states preserve usable focus',()=>{
+ const {document}=createInteractiveRendererDom();const renderer=loadRendererHelpers(document);const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ const status=state=>vm.runInContext(`accountStatus={revision:1,state:'${state}',canUseWorkspace:false,identity:null,message:''};renderAccount();`,renderer);
+ status('waiting');document.querySelector('#welcome-cancel').focus();status('waiting');assert.equal(document.activeElement,document.querySelector('#welcome-cancel'));
+ status('signed_out');assert.equal(document.activeElement,document.querySelector('#welcome-signin'));
+ status('verifying');status('error');assert.equal(document.activeElement,document.querySelector('#welcome-signin'));
+});
+test('successful welcome return rejects a hidden Settings opener and returns to Projects',()=>{
+ const {document}=createInteractiveRendererDom();const renderer=loadRendererHelpers(document);const welcome=document.querySelector('#account-welcome');
+ welcome.appendChild(document.querySelector('#welcome-signin'));
+ const projects=document.querySelector('.app-tab[data-tab="projects"]');
+ vm.runInContext("accountWelcomeOpener=document.querySelector('#account-signin');accountStatus={state:'signed_out',canUseWorkspace:false,identity:null};renderAccount();",renderer);
+ document.querySelector('#welcome-signin').focus();
+ vm.runInContext("accountStatus={state:'signed_in',canUseWorkspace:true,identity:{id:'A',email:'a@example.test'}};renderAccount();",renderer);
+ assert.equal(document.activeElement,projects);
+});
+
+function accountModalFixture(crate = {}) {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'account-modal-project', files: [{ name: 'Asset.png', path: '/synthetic/Asset.png', assetOrigin: 'existing', projectRole: 'asset' }], pendingFiles: [], excludedAssetKeys: [], assetBaseline: { status: 'decision-required', decision: null } };
+  const renderer = loadRendererHelpers(document, { crate });
+  renderer.testProject = project;
+  vm.runInContext("state.projects=[testProject];state.selectedProjectId=testProject.id;accountStatus={revision:1,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}};", renderer);
+  const transition = () => vm.runInContext("acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}});", renderer);
+  return { document, elements, project, renderer, transition };
+}
+
+test('account expiry retires Existing Assets choices before same-account sign-in', async () => {
+  const decisions = [];
+  const f = accountModalFixture({ setExistingAssetsDecision: async (...args) => { decisions.push(args); return { success: true }; } });
+  await f.renderer.showExistingAssetsDecisionModal(f.project);
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), false);
+  f.transition();
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(await f.renderer.submitExistingAssetsDecision('skip'), false);
+  assert.deepEqual(decisions, []);
+  assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+});
+
+test('deferred Existing Assets preparation cannot reopen after account expiry and reentry', async () => {
+  const held = createDeferred();
+  const f = accountModalFixture({ getAssetWorkspace: () => held.promise });
+  const opening = f.renderer.showExistingAssetsDecisionModal(f.project);
+  await new Promise(setImmediate);
+  f.transition();
+  held.resolve({ projectId: f.project.id, files: f.project.files, pendingFiles: [] });
+  assert.equal(await opening, false);
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), null);
+});
+
+test('allowed account refresh preserves modal inert and aria-hidden background', async () => {
+  const f = accountModalFixture();
+  await f.renderer.showExistingAssetsDecisionModal(f.project);
+  vm.runInContext("acceptAccountSnapshot({revision:2,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}})", f.renderer);
+  for (const id of ['app-main', 'app-sidebar']) {
+    assert.equal(f.elements[id].inert, true);
+    assert.equal(f.elements[id].getAttribute('aria-hidden'), 'true');
+  }
+  assert.equal(f.elements['modal-existing-assets'].inert, false);
+});
+
+test('deferred project reads and watcher refresh cannot overwrite workspace after account transition', async () => {
+  const held = createDeferred();
+  const f = accountModalFixture({ getProjects: () => held.promise });
+  const read = vm.runInContext('(async()=>{state.projects=await getAccountCurrentProjects()})()', f.renderer);
+  const rejected = assert.rejects(read, /account_workspace_changed/);
+  const refresh = f.renderer.refreshProjectState(f.project.id);
+  f.transition();
+  held.resolve([{ id: 'stale-read', files: [] }]);
+  await rejected; await refresh;
+  assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+});
+
+for (const decision of ['include', 'skip']) for (const rejected of [false, true]) for (const identity of ['A', 'B']) {
+  test(`pending asset batch retires after account transition (decision=${decision}, reject=${rejected}, identity=${identity})`, async () => {
+    let resolve, reject;
+    const held = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const calls = [];
+    const completed = decision === 'include' ? { pendingFiles: [] } : [];
+    const method = decision === 'include' ? 'acceptPending' : 'rejectPending';
+    const f = accountModalFixture({ [method]: async (_projectId, target) => {
+      calls.push(target);
+      return calls.length === 1 ? held : completed;
+    } });
+    const batch = f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'first' }, { target: 'second' }]);
+    assert.deepEqual(calls, ['first']);
+    vm.runInContext(`acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'${identity}'}});`, f.renderer);
+    if (rejected) reject(new Error('Sign in to Crate to use your workspace.'));
+    else resolve(completed);
+    assert.equal(await batch, false);
+    assert.deepEqual(calls, ['first']);
+    assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+  });
+}

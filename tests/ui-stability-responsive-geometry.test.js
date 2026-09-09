@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const childProcess = require('child_process');
 const { DESKTOP_WINDOW_MINIMUM } = require('../startup-phase-journal');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
@@ -36,7 +36,7 @@ function findBrowser() {
   }
 
   for (const command of ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser']) {
-    const result = spawnSync('/usr/bin/env', ['sh', '-lc', `command -v ${command}`], {
+    const result = childProcess.spawnSync('/usr/bin/env', ['sh', '-lc', `command -v ${command}`], {
       encoding: 'utf8',
       timeout: 5_000,
     });
@@ -222,6 +222,9 @@ function productionWorkingFilesFixture() {
         getAssetWorkspace: async () => workspace,
         getFileVisual: async () => { previewRequests += 1; return { kind: 'fallback' }; },
       };
+      // This geometry probe measures the authenticated workspace, not onboarding.
+      accountStatus = { revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'geometry-account' }, message: '' };
+      renderAccount();
       document.querySelector('#tab-projects').classList.remove('active');
       document.querySelector('#tab-current-project').classList.add('active');
       const working = document.querySelector('#project-file-list');
@@ -294,7 +297,7 @@ function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
   fs.writeFileSync(fixturePath, html, 'utf8');
 
   try {
-    const result = spawnSync(browser, [
+    const result = childProcess.spawnSync(browser, [
       '--headless=new',
       '--disable-gpu',
       '--no-sandbox',
@@ -313,6 +316,8 @@ function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
       maxBuffer: 8 * 1024 * 1024,
     });
 
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, `browser terminated with ${result.signal}`);
     assert.equal(result.status, 0, result.stderr || `browser exited with ${result.status}`);
     const match = result.stdout.match(/<pre id="geometry-result">([^<]+)<\/pre>/);
     assert.ok(match, 'geometry probe must emit structured results');
@@ -321,6 +326,34 @@ function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 }
+
+// Exercise the real helper with successful DOM output even when the process failed.
+const probeResult = {
+  status: 0,
+  signal: null,
+  stdout: '<pre id="geometry-result">{&quot;results&quot;:[&quot;A&amp;B&quot;]}</pre>',
+  stderr: '',
+};
+
+for (const [label, failure, expected] of [
+  ['timeout with zero exit status', { error: Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' }) }, /ETIMEDOUT/],
+  ['spawn error', { error: Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' }) }, /ENOENT/],
+  ['signal with zero exit status', { signal: 'SIGTERM' }, /SIGTERM/],
+  ['nonzero exit status', { status: 1 }, /browser exited with 1/],
+  ['missing exit status', { status: null }, /browser exited with null/],
+]) {
+  test(`geometry probe rejects ${label} despite valid DOM`, (t) => {
+    const spawn = t.mock.method(childProcess, 'spawnSync', () => ({ ...probeResult, ...failure }));
+    assert.throws(() => runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), expected);
+    assert.equal(spawn.mock.callCount(), 1);
+  });
+}
+
+test('geometry probe accepts clean exit and parses escaped DOM', (t) => {
+  const spawn = t.mock.method(childProcess, 'spawnSync', () => ({ ...probeResult }));
+  assert.deepEqual(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), { results: ['A&B'] });
+  assert.equal(spawn.mock.callCount(), 1);
+});
 
 const browser = findBrowser();
 

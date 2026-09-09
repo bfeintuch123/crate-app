@@ -18,6 +18,20 @@ function packageDroppedFile(file) {
 }
 
 contextBridge.exposeInMainWorld('crate', {
+  // Main owns account credentials; only sanitized status crosses this bridge.
+  getAccount: () => ipcRenderer.invoke('account:get'),
+  beginAccountSignIn: () => ipcRenderer.invoke('account:begin'),
+  reopenAccountBrowser: () => ipcRenderer.invoke('account:reopen'),
+  cancelAccountSignIn: () => ipcRenderer.invoke('account:cancel'),
+  signOutAccount: () => ipcRenderer.invoke('account:logout'),
+  manageAccount: () => ipcRenderer.invoke('account:manage'),
+  refreshAccount: () => ipcRenderer.invoke('account:refresh'),
+  onAccountChanged: callback => {
+    const listener = (_event, snapshot) => callback(snapshot);
+    ipcRenderer.on('account:changed', listener);
+    return () => ipcRenderer.removeListener('account:changed', listener);
+  },
+
   // Projects
   getProjects: () => ipcRenderer.invoke('projects:get-all'),
   createProject: (name, type, figmaScopeMode, figmaUrl) => ipcRenderer.invoke('projects:create', name, type, figmaScopeMode, figmaUrl),

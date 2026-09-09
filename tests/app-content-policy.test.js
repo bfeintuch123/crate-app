@@ -22,6 +22,13 @@ const {
 const EXPECTED_BUILD_FILES = Object.freeze([
   'main.js',
   'startup-phase-journal.js',
+  'runtime-identity.json',
+  'account-config.json',
+  'account-config.js',
+  'account-credential-store.js',
+  'account-provider.js',
+  'account-session.js',
+
   'preload.js',
   'provenance.js',
   'diagnostic-summary.js',
@@ -150,6 +157,7 @@ test('mac build metadata requests strict transport and omits unused permissions'
 
 test('packaged-content policy accepts the required runtime and dependencies', () => {
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/startup-phase-journal.js'), true);
+  assert.equal(REQUIRED_ASAR_ENTRIES.includes('/account-config.json'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/diagnostic-summary.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-credential-store.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-redaction.js'), true);

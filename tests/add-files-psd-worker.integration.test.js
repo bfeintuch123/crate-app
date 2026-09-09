@@ -21,7 +21,7 @@ try {
 
 const workerPath = path.join(__dirname, '..', 'parsers', 'add-files-psd-worker.js');
 
-function createSyntheticPsd() {
+function createSyntheticPsd(bytes = 'embedded-worker-bytes') {
   const linkedId = '11111111-1111-4111-8111-111111111111';
   const embeddedId = '22222222-2222-4222-8222-222222222222';
   return agPsd.writePsdBuffer({
@@ -56,7 +56,7 @@ function createSyntheticPsd() {
       {
         id: embeddedId,
         name: 'embedded.png',
-        data: Buffer.from('embedded-worker-bytes'),
+        data: Buffer.from(bytes),
       },
     ],
   });
@@ -122,10 +122,10 @@ function harness(t, options = {}) {
   vm.createContext(context);
   vm.runInContext(production, context);
   let counter = 0;
-  const start = async (sourcePath = path.join(root, 'source.psd'), timeoutMs = 3000) => {
+  const start = async (sourcePath = path.join(root, 'source.psd'), timeoutMs = 3000, sharedProjectId = null) => {
     const lease = createAddFilesScanLease({ timeoutMs });
     const release = await context.acquireAddFilesPsdTransferSlot(lease);
-    const projectId = `test-${counter++}`;
+    const projectId = sharedProjectId || `test-${counter++}`;
     const transaction = context.createAddFilesPsdTransaction(projectId, lease, () => lease.current(), release);
     const promise = context.runAddFilesPsdWorker(sourcePath, lease, transaction);
     promise.catch(() => {});
@@ -360,7 +360,7 @@ for (const fault of ['seq', 'offset', 'backing', 'oversize', 'duplicate', 'eof',
   });
 }
 
-for (const fault of ['file-replacement', 'directory-replacement', 'link-failure', 'close-failure']) {
+for (const fault of ['file-replacement', 'directory-replacement', 'collision', 'link-failure', 'close-failure']) {
   test(`owned cleanup preserves unrelated files after ${fault}`, async t => {
     let closeFailed = false;
     const h = harness(t, { parsed: parsed([{ name: 'asset.bin', data: new Uint8Array(8) }]), io: {
@@ -377,8 +377,12 @@ for (const fault of ['file-replacement', 'directory-replacement', 'link-failure'
     let unrelated;
     if (fault === 'file-replacement') { fs.renameSync(stage, stage + '.owned'); fs.writeFileSync(stage, 'unrelated'); unrelated = stage; }
     if (fault === 'directory-replacement') { fs.renameSync(run.extractDir, run.extractDir + '.owned'); fs.mkdirSync(run.extractDir); unrelated = path.join(run.extractDir, 'unrelated'); fs.writeFileSync(unrelated, 'unrelated'); }
-    if (fault === 'link-failure') { unrelated = path.join(run.extractDir, 'asset.bin'); fs.writeFileSync(unrelated, 'unrelated'); }
-    assert.throws(() => run.transaction.promote());
+    if (fault === 'collision' || fault === 'link-failure') { unrelated = path.join(run.extractDir, 'asset.bin'); fs.writeFileSync(unrelated, 'unrelated'); }
+    if (fault === 'link-failure') h.fsView.linkSync = () => { throw Object.assign(new Error('link denied'), { code: 'EACCES' }); };
+    if (fault === 'collision') {
+      const entries = run.transaction.promote();
+      assert.notEqual(entries[0].filePath, unrelated);
+    } else assert.throws(() => run.transaction.promote());
     await run.finish();
     assert.equal(fs.readFileSync(unrelated, 'utf8'), 'unrelated');
   });
@@ -474,3 +478,53 @@ for (const fault of ['text-cap', 'text-total', 'record-index', 'final-count']) {
     assert.equal(fs.existsSync(run.extractDir) ? fs.readdirSync(run.extractDir).length : 0, 0);
   });
 }
+
+for (const acceptSecond of [true, false]) {
+  test(`same-project concurrent PSD names preserve distinct bytes and ownership (accept second: ${acceptSecond})`, async t => {
+    const h = harness(t);
+    const a = path.join(h.root, 'a.psd'), b = path.join(h.root, 'b.psd');
+    fs.writeFileSync(a, createSyntheticPsd('first-source-bytes'));
+    fs.writeFileSync(b, createSyntheticPsd('second-source-bytes'));
+    const first = await h.start(a, 10000, 'shared');
+    const second = await h.start(b, 10000, 'shared');
+    const results = await Promise.all([first.promise, second.promise]);
+    const firstEntry = first.transaction.promote()[0];
+    first.transaction.accept({ files: [{ path: firstEntry.filePath }] });
+    const secondEntry = second.transaction.promote()[0];
+    assert.notEqual(firstEntry.filePath, secondEntry.filePath);
+    for (const [entry, bytes, result] of [[firstEntry, 'first-source-bytes', results[0]], [secondEntry, 'second-source-bytes', results[1]]]) {
+      assert.equal(fs.readFileSync(entry.filePath, 'utf8'), bytes);
+      assert.equal(entry.embeddedOriginalName, 'embedded.png');
+      assert.equal(entry.embeddedIndex, 0);
+      assert.equal(entry.sourceDigest, result.sourceDigest);
+    }
+    if (acceptSecond) second.transaction.accept({ files: [{ path: secondEntry.filePath }] });
+    else { second.lease.cancel(); assert.throws(() => second.transaction.assertReady(), /cancelled/); }
+    await Promise.all([first.finish(), second.finish()]);
+    assert.equal(fs.readFileSync(firstEntry.filePath, 'utf8'), 'first-source-bytes');
+    assert.equal(fs.existsSync(secondEntry.filePath), acceptSecond);
+    assert.equal(fs.readdirSync(first.extractDir).length, acceptSecond ? 2 : 1);
+  });
+}
+
+test('legacy PSD extraction retries a destination claimed after both name snapshots', async t => {
+  let writes = 0;
+  const bothStaged = deferred();
+  const h = harness(t, { io: { async writeFile(...args) {
+    await fs.promises.writeFile(...args);
+    if (++writes === 2) bothStaged.resolve();
+    await bothStaged.promise;
+  } } });
+  h.context.readPsd = bytes => ({ linkedFiles: [{ name: 'shared.bin', data: bytes }] });
+  vm.runInContext(section('async function extractPsdAssets(', '\n/**'), h.context);
+  const a = path.join(h.root, 'a.psd'), b = path.join(h.root, 'b.psd');
+  fs.writeFileSync(a, 'legacy a'); fs.writeFileSync(b, 'legacy b');
+  const [first, second] = await Promise.all([
+    h.context.extractPsdAssets(a, 'legacy', () => true, { strict: true }),
+    h.context.extractPsdAssets(b, 'legacy', () => true, { strict: true }),
+  ]);
+  assert.notEqual(first[0].filePath, second[0].filePath);
+  assert.equal(fs.readFileSync(first[0].filePath, 'utf8'), 'legacy a');
+  assert.equal(fs.readFileSync(second[0].filePath, 'utf8'), 'legacy b');
+  assert.equal(fs.readdirSync(path.dirname(first[0].filePath)).length, 2);
+});

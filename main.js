@@ -9,6 +9,15 @@ const {
   Notification,
   utilityProcess,
 } = require('electron');
+const { AccountSession } = require('./account-session');
+const { AccountCredentialStore } = require('./account-credential-store');
+const { createAccountProvider } = require('./account-provider');
+const { loadAccountConfig, CALLBACK: ACCOUNT_CALLBACK } = require('./account-config');
+let accountSession = null;
+let accountCallbackWithoutAttempt = false;
+let accountWatchRecoveryReady = false;
+let accountWorkspaceAllowed = false;
+let accountWorkspaceId = null;
 const path = require('path');
 const fs = require('fs');
 const {
@@ -170,12 +179,98 @@ function assertTrustedRendererIpc(event) {
   }
 }
 
+function captureAccountAuthorization() {
+  const generation = accountSession?.generation;
+  const identity = accountSession?.snapshot().identity?.id;
+  return () => {
+    if (!accountSession?.canUseWorkspace() || accountSession.generation !== generation || accountSession.snapshot().identity?.id !== identity) {
+      throw new Error('Sign in to Crate to use your workspace.');
+    }
+  };
+}
+
 function registerTrustedIpcHandler(channel, handler) {
   ipcMain.handle(channel, (event, ...args) => {
     assertTrustedRendererIpc(event);
-    return handler(event, ...args);
+    if (!channel.startsWith('account:') && !accountSession?.canUseWorkspace()) {
+      throw new Error('Sign in to Crate to use your workspace.');
+    }
+    const assertCurrent = channel.startsWith('account:') ? null : captureAccountAuthorization();
+    const result = handler(event, ...args);
+    if (assertCurrent && result && typeof result.then === 'function') {
+      return result.then(value => { assertCurrent(); return value; });
+    }
+    return result;
   });
 }
+
+function initializeAccountSession() {
+  const config = loadAccountConfig();
+  accountSession = new AccountSession({
+    config,
+    provider: config ? createAccountProvider(config) : null,
+    credentials: config ? new AccountCredentialStore({
+      safeStorage: require('electron').safeStorage,
+      userDataPath: app.getPath('userData'),
+      binding: `${config.issuer}|${config.clientId}`,
+    }) : null,
+    openExternal: url => shell.openExternal(url),
+  });
+  accountSession.on('change', snapshot => {
+    const allowed = snapshot.canUseWorkspace;
+    const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
+    if (accountWorkspaceAllowed && (!allowed || identityChanged)) {
+      // Invalidate the existing project-operation fences before any late scan/package result.
+      watchingActivationSequence++;
+      closeInactivityPrompts();
+      for (const project of getProjects()) stopWatching(project.id);
+    }
+    const resume = allowed && (!accountWorkspaceAllowed || identityChanged);
+    accountWorkspaceAllowed = allowed; accountWorkspaceId = snapshot.identity?.id;
+    if (resume && accountWatchRecoveryReady) {
+      const project = getProjects().find(project => project.status === 'watching');
+      if (project) {
+        lastFileActivity.set(project.id, Date.now());
+        void startWatching(project.id, { preserveWatchStartedAt: true }).catch(() => {});
+      }
+    }
+    if (trayWindow && !trayWindow.isDestroyed()) trayWindow.webContents.send('account:changed', snapshot);
+  });
+  for (const [channel, method] of Object.entries({
+    'account:get': 'snapshot', 'account:begin': 'begin', 'account:reopen': 'reopen',
+    'account:cancel': 'cancel', 'account:logout': 'logout', 'account:manage': 'manage', 'account:refresh': 'refresh',
+  })) registerTrustedIpcHandler(channel, (_event, ...args) => {
+    if (args.length) throw new Error('Invalid account request.');
+    return accountSession[method]();
+  });
+  // Packaged LaunchServices registration is declared in package.json. A source run
+  // never takes over the installed app's protocol handler.
+  void accountSession.restore().then(() => {
+    if (accountCallbackWithoutAttempt && !accountSession.pending && !accountSession.snapshot().identity) {
+      accountSession.publish(accountSession.snapshot().state, 'This browser sign-in has no active request. Start sign-in again in Crate.');
+    }
+    accountCallbackWithoutAttempt = false;
+  });
+}
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (typeof url !== 'string' || !url.startsWith(`${ACCOUNT_CALLBACK}?`)) return;
+  // No active in-memory PKCE attempt on cold launch: require a fresh sign-in.
+  if (accountSession) {
+    const session = accountSession, attempt = session.pending, generation = session.generation;
+    const revision = session.snapshot().revision;
+    void session.callback(url).then(result => {
+      // Only a consumed, current browser return may raise this candidate window.
+      // Replays, wrong state and a result overtaken by logout/retry stay inert.
+      if (attempt && session === accountSession && generation === session.generation &&
+          !session.pending && result.revision > revision && result.revision === session.snapshot().revision &&
+          ['signed_in', 'error'].includes(result.state)) {
+        showMainWindow({ reason: 'account-browser-return' });
+      }
+    }).catch(() => {});
+  } else accountCallbackWithoutAttempt = true;
+});
 
 function registerStartupDiagnosticIpc() {
   if (!ipcMain || typeof ipcMain.on !== 'function') return;
@@ -7969,6 +8064,22 @@ function reserveUniqueName(name, usedNames) {
   return candidate;
 }
 
+// Concurrent PSDs may reserve the same name while their bytes are staged.
+// Only an exclusive link claims the destination; never replace a sibling.
+function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndOwned) {
+  for (let attempt = 0; attempt < 1024; attempt++) {
+    assertCurrentAndOwned();
+    try {
+      fs.linkSync(stage.stagedPath, stage.extractPath);
+      return;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      stage.extractPath = path.join(extractDir, reserveUniqueName(stage.embeddedOriginalName, usedNames));
+    }
+  }
+  throw cacheSafetyError('psd-extract-file', 'name-collision-limit');
+}
+
 function getEmbeddedPsdDedupKey(file) {
   const parent = normalizeTrackedFilePath(file.parentPsd || file.path || '');
   const index = Number.isInteger(file.embeddedIndex) ? file.embeddedIndex : '';
@@ -11854,8 +11965,10 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     promote() {
       check();
       for (const stage of stages) {
-        ownedPath(stage, stage.stagedPath);
-        fs.linkSync(stage.stagedPath, stage.extractPath);
+        promoteEmbeddedPsdStage(stage, extractDir, usedNames, () => {
+          check();
+          ownedPath(stage, stage.stagedPath);
+        });
         stage.promoted = true;
         ownedPath(stage, stage.extractPath);
         fs.unlinkSync(stage.stagedPath);
@@ -12365,6 +12478,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       await fs.promises.mkdir(extractDir, { recursive: true });
       if (!isCurrent()) return [];
+      const directoryIdentity = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory');
       const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase()));
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!isCurrent()) return [];
@@ -12393,7 +12507,15 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       for (const staged of invocationFiles) {
         if (!isCurrent()) return [];
-        fs.linkSync(staged.stagedPath, staged.extractPath);
+        promoteEmbeddedPsdStage(staged, extractDir, usedEmbeddedNames, () => {
+          if (!isCurrent()) throw new Error('add_files_parser_cancelled');
+          assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
+          const stat = fs.lstatSync(staged.stagedPath);
+          if (!isDirectCacheChild(extractDir, staged.stagedPath) || stat.isSymbolicLink() || !stat.isFile() ||
+              stat.dev !== staged.identity.dev || stat.ino !== staged.identity.ino) {
+            throw cacheSafetyError('psd-extract-file', 'changed');
+          }
+        });
         staged.committed = true;
         fs.unlinkSync(staged.stagedPath);
         const finalStat = fs.lstatSync(staged.extractPath);
@@ -14481,9 +14603,15 @@ function stopWatching(projectId, { invalidateActivation = true } = {}) {
 
 let inactivityCheckerInterval = null; // C4: stored so it can be cleared on quit
 const activeNativeNotifications = new Set();
+const inactivityPromptCancellations = new Set();
+function closeInactivityPrompts() {
+  for (const cancel of inactivityPromptCancellations) { try { cancel(); } catch (_) {} }
+  inactivityPromptCancellations.clear();
+}
 
 function startInactivityChecker() {
   inactivityCheckerInterval = setInterval(() => {
+    if (!accountSession?.canUseWorkspace()) return;
     const projects = getProjects();
     const settings = store.get('settings');
 
@@ -14500,6 +14628,11 @@ function startInactivityChecker() {
           continue;
         }
 
+        const assertAccountCurrent = captureAccountAuthorization();
+        const operation = captureProjectOperation(project.id);
+        const isCurrent = () => {
+          try { assertAccountCurrent(); return !!operation?.current(); } catch (_) { return false; }
+        };
         // v2.4.2: Fallback — if the app window is not visible, show native Notification
         if (!trayWindow || trayWindow.isDestroyed() || !trayWindow.isVisible()) {
           inactivityNotified.add(project.id);
@@ -14509,7 +14642,11 @@ function startInactivityChecker() {
               body: `No new design files for "${project.name}" in 3 hours. Click to open Crate.`,
               silent: false,
             });
+            const close = () => notif.close();
+            inactivityPromptCancellations.add(close);
+            notif.on('close', () => inactivityPromptCancellations.delete(close));
             notif.on('click', () => {
+              if (!isCurrent()) return;
               lastFileActivity.set(project.id, Date.now());
               inactivityNotified.delete(project.id);
               showMainWindow();
@@ -14522,7 +14659,12 @@ function startInactivityChecker() {
         inactivityNotified.add(project.id);
 
         // Center-screen dialog alert (not corner notification)
-        dialog.showMessageBox({
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        inactivityPromptCancellations.add(cancel);
+        // A parent is required for AbortSignal cancellation on macOS.
+        dialog.showMessageBox(trayWindow, {
+          signal: controller.signal,
           type: 'question',
           title: 'Crate — Still working?',
           message: `⏸ Still working on "${project.name}"?`,
@@ -14531,6 +14673,7 @@ function startInactivityChecker() {
           defaultId: 0,
           cancelId: 0
         }).then(({ response }) => {
+          if (!isCurrent()) return;
           if (response === 0) {
             // Keep Watching — reset timer
             lastFileActivity.set(project.id, Date.now());
@@ -14550,7 +14693,7 @@ function startInactivityChecker() {
               trayWindow.webContents.send('package:trigger', { projectId: project.id });
             }
           }
-        });
+        }).catch(() => {}).finally(() => inactivityPromptCancellations.delete(cancel));
       }
     }
   }, 60 * 1000); // Check every minute
@@ -14572,6 +14715,7 @@ registerTrustedIpcHandler('projects:get-all', () => {
 });
 
 registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'automatic', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   if (projectCreationInFlight) return { error: 'project_creation_in_flight' };
 
   const creation = (async () => {
@@ -14614,6 +14758,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
       outputPath: null
     };
     safelyEnsureProjectProvenance(newProject);
+    assertAccountCurrent();
     projects.push(newProject);
     clearFileVisualProjectCache();
     store.set('projects', projects);
@@ -14632,6 +14777,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
 // payload: { action: 'preserve'|'replace'|'remove', url?: string, scopeMode }
 // A blank replacement preserves the current link; removal must be explicit.
 registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, payload = {}) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const project = getProjects().find(p => p.id === projectId);
   if (!project) return { success: false, error: 'project_not_found' };
 
@@ -14659,6 +14805,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     if (!preflight.success) return { success: false, error: preflight.error };
   }
 
+  assertAccountCurrent();
   const settings = store.get('settings') || {};
   const updated = mutateProject(projectId, (proj) => {
     proj.figmaTrackedFiles = figmaTrackedFiles;
@@ -14718,6 +14865,7 @@ registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, proje
 });
 
 registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileIdOrPath) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const currentProject = getProjects().find(project => project.id === projectId);
   const currentFile = currentProject && currentProject.files.find(file => (
     matchesProjectFileIdentity(currentProject.id, file, fileIdOrPath)
@@ -14728,6 +14876,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
   );
   let removed = false;
   let changed = false;
+  assertAccountCurrent();
   const result = mutateProject(projectId, (project) => {
     // C2: Use fileId for removal when available (embedded files share the parent PSD path).
     // Fall back to path match for non-embedded files.
@@ -19134,6 +19283,7 @@ registerTrustedIpcHandler('v2:browse-file', async () => {
 });
 
 registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const { packageMasterFile } = require('./parsers/index.js');
 
   if (packageInFlight) return { error: 'package_in_flight' };
@@ -19152,10 +19302,18 @@ registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
     const baseName = path.basename(filePath, path.extname(filePath));
     const dateStr = new Date().toISOString().split('T')[0];
     const folderName = `${baseName}_${dateStr}`;
-    const destFolder = path.join(outputDir, folderName);
+    const destination = createPrivatePackageDestination(inspectPrivatePackageDestination(outputDir, folderName));
+    const destFolder = destination.destFolder;
+    let published = false;
 
     try {
-      const result = await packageMasterFile(filePath, destFolder);
+      const result = await packageMasterFile(filePath, destination.stagingFolder);
+      assertAccountCurrent();
+      const tree = capturePrivateStagedPackageTree(destination.stagingFolder, result.files.map(file => path.relative(destination.stagingFolder, file.copied)));
+      assertAccountCurrent();
+      publishPrivatePackageDestination(destination, tree);
+      published = true;
+      result.files = result.files.map(file => ({ ...file, copied: path.join(destFolder, path.relative(destination.stagingFolder, file.copied)) }));
       rememberGeneratedPackageOutputPath(destFolder);
       incrementPackageUsage();
       return {
@@ -19169,6 +19327,8 @@ registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
       };
     } catch (err) {
       return { error: err.message };
+    } finally {
+      if (!published) await cleanupPrivatePackageDestination(destination);
     }
   } finally {
     packageInFlight = false;
@@ -19208,6 +19368,7 @@ registerTrustedIpcHandler('figma:status', async () => {
 });
 
 registerTrustedIpcHandler('figma:connect', async (event, token) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
 
@@ -19219,6 +19380,7 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
     return { success: false, error };
   }
 
+  assertAccountCurrent();
   const stored = await parser.storeToken(token);
 
   if (!stored) {
@@ -19231,6 +19393,7 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
   for (const project of projects) {
     if (!projectHasFigmaTrackedFiles(project)) continue;
     const preflight = await preflightProjectFigmaConnection(project);
+    assertAccountCurrent();
     if (!preflight.success) {
       const warningUpdate = markProjectFigmaConnectionUnavailable(project.id);
       if (warningUpdate) sendToRenderer('project:updated', { projectId: project.id });
@@ -19471,6 +19634,7 @@ app.whenReady().then(async () => {
     createMainWindow();
     showMainWindow({ reason: 'startup' });
     createTray();
+    initializeAccountSession();
     migrateFigmaCredentialStorageInBackground();
 
     const activeProjectCacheIds = safeStoredProjectCacheIds();
@@ -19485,8 +19649,9 @@ app.whenReady().then(async () => {
     startupPhaseJournal.mark('watch-recovery-start');
     const activeProject = repairPersistedWatchingProjects();
     startupPhaseJournal.mark('watch-state-repair-complete');
+    accountWatchRecoveryReady = true;
     let watchRecoveryPhase = 'watch-recovery-complete';
-    if (activeProject) {
+    if (activeProject && accountSession.canUseWorkspace()) {
       try {
         startupPhaseJournal.mark('watch-resume-start');
         const recoveredProject = await startWatching(activeProject.id, { preserveWatchStartedAt: true });
@@ -19518,6 +19683,7 @@ app.on('activate', () => {
 });
 
 app.on('did-become-active', () => {
+  if (accountSession?.snapshot().state === 'offline') void accountSession.refresh();
   if (isPackageAutoForegroundSuppressed()) return;
   showMainWindow({ reason: 'did-become-active' });
 });
@@ -19540,6 +19706,8 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', () => {
+  closeInactivityPrompts();
+  accountSession?.shutdown();
   startupPhaseJournal.mark('before-quit');
   startupPhaseJournal.close();
   isQuitting = true;

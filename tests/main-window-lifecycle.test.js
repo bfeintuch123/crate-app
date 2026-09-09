@@ -6,8 +6,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { CALLBACK } = require('../account-config');
 
 test('main window uses normal macOS app lifecycle', async () => {
+  const { createTransformer } = require('app-builder-lib/out/fileTransformer');
+  const root = path.resolve(__dirname, '..');
+  const packagedMetadata = JSON.parse(await createTransformer(root, {}, {})(path.join(root, 'package.json')));
+  assert.equal(Object.hasOwn(packagedMetadata, 'build'), false);
+  const { AccountCredentialStore: RealCredentialStore } = require('../account-credential-store');
   const originalResolve = Module._resolveFilename;
   const originalLoad = Module._load;
   const originalSetInterval = global.setInterval;
@@ -27,15 +33,38 @@ test('main window uses normal macOS app lifecycle', async () => {
   const errorLogs = [];
   const isolatedHome = path.join(os.tmpdir(), `crate-main-window-test-home-${process.pid}-${Date.now()}`);
   const isolatedLogs = path.join(isolatedHome, 'logs');
+  let isolatedUserData = path.join(isolatedHome, 'normal-crate-user-data');
   fs.mkdirSync(isolatedLogs, { recursive: true });
   let appReady = false;
   let readyCallback = null;
   let appFocusCount = 0;
   let appShowCount = 0;
+  let account;
+  const { AccountSession: RealAccountSession } = require('../account-session');
 
   function setStub(name, factory) {
     stubs.set(name, factory);
   }
+
+  const expectedProfile = () => path.join(isolatedHome, 'normal-crate-user-data');
+  setStub('./package.json', () => packagedMetadata);
+  setStub('./account-credential-store', () => ({ AccountCredentialStore: class extends RealCredentialStore {
+    constructor(options) {
+      assert.equal(isolatedUserData, expectedProfile());
+      assert.equal(options.userDataPath, expectedProfile());
+      super(options);
+    }
+  } }));
+  setStub('./account-config', () => ({ ...require('../account-config'), loadAccountConfig: () => ({
+    provider: 'https://project.supabase.co', origin: 'https://accounts.example.test',
+    clientId: 'synthetic-client', publicKey: 'sb_publishable_synthetic_test_key_123',
+    issuer: 'https://project.supabase.co/auth/v1', callback: CALLBACK,
+    redirectUri: 'https://accounts.example.test/auth/desktop/callback',
+  }) }));
+  setStub('./account-session', () => ({ AccountSession: class extends RealAccountSession { constructor(options) {
+    assert.equal(isolatedUserData, expectedProfile());
+    super(options); account = this;
+  } } }));
 
   Module._resolveFilename = function patchedResolve(request, parent, ...rest) {
     if (stubs.has(request)) return `\0stub:${request}`;
@@ -145,7 +174,8 @@ test('main window uses normal macOS app lifecycle', async () => {
 
   class FakeStore {
     constructor(opts = {}) {
-      this.path = path.join(isolatedHome, 'user-data', 'config.json');
+      assert.equal(isolatedUserData, expectedProfile());
+      this.path = path.join(isolatedUserData, 'config.json');
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
       fs.writeFileSync(this.path, '{}', { mode: 0o600 });
       this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
@@ -186,7 +216,8 @@ test('main window uses normal macOS app lifecycle', async () => {
       isReady: () => appReady,
       show: () => { appShowCount += 1; },
       focus: () => { appFocusCount += 1; },
-      getPath: name => name === 'logs' ? isolatedLogs : path.join(isolatedHome, 'user-data'),
+      getPath: name => name === 'logs' ? isolatedLogs : name === 'appData' ? isolatedHome : isolatedUserData,
+      setPath: (name, value) => { if (name === 'userData') isolatedUserData = value; },
       dock: { setMenu: () => {} },
     },
     BrowserWindow: TestBrowserWindow,
@@ -365,12 +396,25 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(startupPhases().filter(phase => phase === 'child-process-gone').length, 1);
     assert.equal(startupPhases().filter(phase => phase === 'preload-error').length, 1);
 
+    for (const [channel, handler] of ipcHandlers) {
+      if (!channel.startsWith('account:')) assert.throws(() => handler(trustedEvent), /Sign in to Crate/, channel);
+    }
+    assert.equal(ipcHandlers.get('account:get')(trustedEvent).canUseWorkspace, false);
+    // A verified synthetic session unlocks the same existing project handlers.
+    account.record = { identity: { id: 'pilot' } }; account.accessToken = 'synthetic'; account.accessExpiresAt = Date.now() + 60000;
+    account.publish('signed_in', '', { id: 'pilot' });
     assert.deepEqual(ipcHandlers.get('projects:get-all')(trustedEvent), []);
     assert.equal(ipcHandlers.has('projects:prepare-package-review'), true);
     assert.equal(ipcHandlers.has('projects:set-existing-assets-decision'), true);
     assert.equal(ipcHandlers.has('projects:get-asset-workspace'), true);
     assert.equal(ipcHandlers.has('projects:get-file-visual'), true);
-    assert.equal(ipcHandlers.size, 35);
+    assert.equal(ipcHandlers.size, 42);
+    for (const channel of ['account:get','account:begin','account:reopen','account:cancel','account:logout','account:manage','account:refresh']) {
+      assert.equal(ipcHandlers.has(channel), true, channel);
+      assert.throws(() => ipcHandlers.get(channel)({}), /blocked an untrusted renderer request/);
+      assert.throws(() => ipcHandlers.get(channel)(trustedEvent, 'unexpected'), /Invalid account request/);
+    }
+    assert.equal(ipcHandlers.get('account:get')(trustedEvent).canUseWorkspace, true);
     assert.throws(
       () => ipcHandlers.get('projects:get-all')({}),
       /blocked an untrusted renderer request/
@@ -580,6 +624,20 @@ test('main window uses normal macOS app lifecycle', async () => {
       'main-window-show-requested',
       'main-window-visible',
     ]);
+    const returnedWindow = windows[3], beforeReturn = returnedWindow.focusCount;
+    const state = 'a'.repeat(43);
+    account.pending = { state, expires: Date.now() + 60000, generation: account.generation };
+    const event = { preventDefault() {} };
+    appHandlers.get('open-url')(event, CALLBACK + '?state=' + 'b'.repeat(43) + '&error=access_denied');
+    await Promise.resolve();
+    assert.equal(returnedWindow.focusCount, beforeReturn, 'wrong state must not raise the window');
+    appHandlers.get('open-url')(event, CALLBACK + '?state=' + state + '&error=access_denied');
+    await Promise.resolve();
+    assert.equal(returnedWindow.focusCount, beforeReturn + 1, 'verified browser cancellation returns to candidate');
+    assert.match(account.snapshot().message, /canceled/);
+    appHandlers.get('open-url')(event, CALLBACK + '?state=' + state + '&error=access_denied');
+    await Promise.resolve();
+    assert.equal(returnedWindow.focusCount, beforeReturn + 1, 'replayed return must remain inert');
     appHandlers.get('before-quit')();
     assert.equal(startupPhases().at(-1), 'before-quit');
   } finally {
@@ -612,12 +670,15 @@ test('startup recovery recreates window if first launch window closes before bec
   const windows = [];
   const timeouts = new Set();
   const isolatedHome = path.join(os.tmpdir(), `crate-main-window-hidden-startup-test-home-${process.pid}-${Date.now()}`);
+  let isolatedUserData = path.join(isolatedHome, 'normal-crate-user-data');
   let appReady = false;
   let readyCallback = null;
 
   function setStub(name, factory) {
     stubs.set(name, factory);
   }
+
+
 
   Module._resolveFilename = function patchedResolve(request, parent, ...rest) {
     if (stubs.has(request)) return `\0stub:${request}`;
@@ -694,7 +755,7 @@ test('startup recovery recreates window if first launch window closes before bec
 
   class FakeStore {
     constructor(opts = {}) {
-      this.path = path.join(isolatedHome, 'user-data', 'config.json');
+      this.path = path.join(isolatedUserData, 'config.json');
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
       fs.writeFileSync(this.path, '{}', { mode: 0o600 });
       this.data = JSON.parse(JSON.stringify(opts.defaults || {}));
@@ -733,7 +794,8 @@ test('startup recovery recreates window if first launch window closes before bec
       isReady: () => appReady,
       show: () => {},
       focus: () => {},
-      getPath: () => path.join(isolatedHome, 'user-data'),
+      getPath: name => name === 'appData' ? isolatedHome : isolatedUserData,
+      setPath: (name, value) => { if (name === 'userData') isolatedUserData = value; },
       dock: { setMenu: () => {} },
     },
     BrowserWindow: TestBrowserWindow,

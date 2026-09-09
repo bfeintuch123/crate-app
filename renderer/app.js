@@ -548,12 +548,12 @@ function focusSelectedProjectTarget(projectId) {
   target?.focus?.({ preventScroll: true });
 }
 
-function setSelectedProject(projectId) {
+function setSelectedProject(projectId, { invalidate = false, restoreFocus = true } = {}) {
   const nextProjectId = typeof projectId === 'string' && projectId ? projectId : null;
   projectSelectionIntentEpoch += 1;
-  if (state.selectedProjectId === nextProjectId) return false;
+  if (state.selectedProjectId === nextProjectId && !invalidate) return false;
 
-  if (activeAddFilesOperation && activeAddFilesOperation.projectId !== nextProjectId) {
+  if (activeAddFilesOperation && (invalidate || activeAddFilesOperation.projectId !== nextProjectId)) {
     const pending = activeAddFilesOperation;
     activeAddFilesOperation = null;
     try {
@@ -593,7 +593,7 @@ function setSelectedProject(projectId) {
   packageReviewOpener = null;
   setModalBackgroundState(false);
   setAssetReviewProject(nextProjectId);
-  focusSelectedProjectTarget(nextProjectId);
+  if (restoreFocus) focusSelectedProjectTarget(nextProjectId);
   return true;
 }
 
@@ -644,7 +644,7 @@ async function reconcileAddFilesRendererState(operation, selectionEpoch, selecti
     projectSelectionIntentEpoch === selectionIntentEpoch
   );
   const reconciliation = (async () => {
-    const projects = await window.crate.getProjects();
+    const projects = await getAccountCurrentProjects();
     if (!isCurrent()) return false;
     state.projects = Array.isArray(projects) ? projects : [];
     if (!isCurrent()) return false;
@@ -680,6 +680,27 @@ async function init() {
   }
 
   setupMainProcessListeners();
+  await initializeAccountUI();
+  const startupEpoch = accountWorkspaceEpoch;
+  if (accountStatus.canUseWorkspace) await loadAccountWorkspace();
+  else {
+    try { window.crate.reportRendererStartupDataComplete?.(); } catch (_) {}
+    reportVisibleRenderer();
+  }
+  accountStartupLoaded = true;
+  if (accountStatus.canUseWorkspace && startupEpoch !== accountWorkspaceEpoch) await loadAccountWorkspace();
+  renderAccount();
+}
+
+async function getAccountCurrentProjects() {
+  const epoch = accountWorkspaceEpoch;
+  const projects = await window.crate.getProjects();
+  if (epoch !== accountWorkspaceEpoch) throw new Error('account_workspace_changed');
+  return projects;
+}
+
+async function loadAccountWorkspace() {
+  const epoch = accountWorkspaceEpoch;
 
   try {
     const [projects, settings, usage] = await Promise.all([
@@ -687,6 +708,7 @@ async function init() {
       window.crate.getSettings(),
       window.crate.getUsage(),
     ]);
+    if (epoch !== accountWorkspaceEpoch || !accountStatus.canUseWorkspace) return;
     state.projects = Array.isArray(projects) ? projects : [];
     state.settings = settings && typeof settings === 'object' ? settings : {};
     state.usage = usage && typeof usage === 'object' ? usage : {};
@@ -704,9 +726,16 @@ async function init() {
     } catch (_) {}
   }
 
+  if (epoch !== accountWorkspaceEpoch || !accountStatus.canUseWorkspace) return;
   renderProjects();
   renderSettingsControls();
   renderFooter();
+  renderAccount();
+  reportVisibleRenderer();
+  renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
+}
+
+function reportVisibleRenderer() {
   try {
     if (typeof window.crate.reportRendererFirstRenderComplete === 'function') {
       window.crate.reportRendererFirstRenderComplete();
@@ -726,7 +755,6 @@ async function init() {
       });
     }
   } catch (_) {}
-  renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
 }
 
 // ===== Tab Switching =====
@@ -817,7 +845,7 @@ function renderProjectRows() {
       try {
         await runRendererAction(`watch:${project.id}`, pill, busyLabel, async () => {
           await window.crate[action](project.id);
-          state.projects = await window.crate.getProjects();
+          state.projects = await getAccountCurrentProjects();
           if (isTabActive('projects')) renderProjects();
           if (state.selectedProjectId === project.id && isTabActive('current-project')) await renderFiles();
         }, pillText);
@@ -1102,7 +1130,7 @@ async function createProject() {
     const knownNonPersistingError = typedError === 'max_projects_reached' || !!figmaLinkErrorMessage;
     if (!hasTypedError && result && result.id) {
       try {
-        const projects = await window.crate.getProjects();
+        const projects = await getAccountCurrentProjects();
         if (Array.isArray(projects)) state.projects = projects;
       } catch (refreshError) {
         logRendererError('Project creation state could not refresh', refreshError);
@@ -1893,7 +1921,7 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
       showToast('Crate could not save that choice. Try again.');
       return false;
     }
-    state.projects = await window.crate.getProjects();
+    state.projects = await getAccountCurrentProjects();
     if (!isCurrentDecision()) return false;
     hideExistingAssetsDecisionModal();
     if (state.selectedProjectId === projectId && isFilesTabActive()) {
@@ -1932,7 +1960,7 @@ async function submitExistingAssetsBatchDecision(decision) {
         showToast('Crate could not update Existing Assets. Try again.');
         return false;
       }
-      state.projects = await window.crate.getProjects();
+      state.projects = await getAccountCurrentProjects();
       await renderFiles();
       renderedUpdatedState = true;
       showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
@@ -1955,6 +1983,12 @@ function getPendingFilesFromDecisionResult(result, decision) {
 }
 
 async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  if (!isCurrent()) return false;
   const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
   const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
   const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
@@ -1964,6 +1998,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
     let renderedUpdatedState = false;
     try {
       for (const candidate of pendingCandidates) {
+        if (!isCurrent()) return false;
         if (!candidate.target) {
           failedCount += 1;
           continue;
@@ -1973,6 +2008,7 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
           const result = decision === 'include'
             ? await window.crate.acceptPending(project.id, candidate.target)
             : await window.crate.rejectPending(project.id, candidate.target);
+          if (!isCurrent()) return false;
           const remainingPendingFiles = getPendingFilesFromDecisionResult(result, decision);
           const candidateTargets = new Set([candidate.target, candidate.stableTarget].filter(Boolean));
           const applied = Array.isArray(remainingPendingFiles) && !remainingPendingFiles.some(file => (
@@ -1981,13 +2017,18 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
           if (applied) appliedCount += 1;
           else failedCount += 1;
         } catch (error) {
+          if (!isCurrent()) return false;
           logRendererError('pending asset batch item failed', error);
           failedCount += 1;
         }
       }
 
-      state.projects = await window.crate.getProjects();
+      if (!isCurrent()) return false;
+      const projects = await getAccountCurrentProjects();
+      if (!isCurrent()) return false;
+      state.projects = projects;
       await renderFiles();
+      if (!isCurrent()) return false;
       renderedUpdatedState = true;
       const actionLabel = decision === 'include' ? 'added' : 'skipped';
       if (appliedCount === 0) {
@@ -1999,14 +2040,15 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       }
       return appliedCount > 0;
     } catch (error) {
+      if (!isCurrent()) return false;
       logRendererError('pending assets batch decision failed', error);
       showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
     } finally {
-      if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
+      if (isCurrent() && !renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
     }
   }, clickedButton?.textContent || null);
-  restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
+  if (isCurrent()) restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
   return result;
 }
 
@@ -2320,7 +2362,7 @@ function appendAssetFileRemovalAction(row, project, file, { recovery = false } =
     removeButton.disabled = true;
     try {
       await window.crate.removeFile(project.id, getFileVisualIdentity(file));
-      state.projects = await window.crate.getProjects();
+      state.projects = await getAccountCurrentProjects();
       await renderFiles();
     } catch (error) {
       logRendererError(recovery ? 'source recovery failed' : 'asset exclusion failed', error);
@@ -2346,7 +2388,7 @@ function appendAssetFileRestorationAction(row, project, file) {
     restoreButton.disabled = true;
     try {
       await window.crate.removeFile(project.id, getFileVisualIdentity(file));
-      state.projects = await window.crate.getProjects();
+      state.projects = await getAccountCurrentProjects();
       await renderFiles();
     } catch (error) {
       logRendererError('asset restoration failed', error);
@@ -3039,6 +3081,125 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   renderVirtualAssetList(list, pending, buildPendingRow);
 }
 
+// ===== Account (workspace access requires a verified session) =====
+let accountStatus = { revision: -1, state: 'checking', identity: null, message: '' };
+let accountStartupLoaded = false;
+let accountWorkspaceEpoch = 0;
+let accountWelcomeOpener = null;
+function accountFocusAvailable(element) {
+  if (!element || element.disabled || !element.isConnected) return false;
+  for (let node = element; node; node = node.parentElement) {
+    if (node.hidden || node.inert || node.classList?.contains('hidden')) return false;
+  }
+  return true;
+}
+function renderAccount() {
+  const status = accountStatus;
+  const labels = { signed_out: 'Signed out', unconfigured: 'Account sign-in is not configured in this build yet.', waiting: 'Finish signing in in your browser', verifying: 'Verifying your sign-in…', checking: 'Checking your saved sign-in…', signed_in: 'Signed in', offline: 'Offline · last known account', expired: 'Sign in again', error: 'Account needs attention' };
+  const stateLabel = $('#account-state'); if (!stateLabel) return;
+  stateLabel.textContent = labels[status.state] || 'Account unavailable';
+  $('#account-identity').textContent = status.identity?.email || '';
+  const accountName = $('#account-name'); if (accountName) accountName.textContent = status.identity?.name || 'Not set';
+  const details = $('#account-details'); if (details) details.hidden = !status.identity;
+  stateLabel.dataset.state = status.state;
+  $('#account-methods').textContent = status.identity?.methods?.length ? status.identity.methods.map(method => method === 'google' ? 'Google' : 'Email').join(' · ') : 'Unavailable';
+  $('#account-message').textContent = status.message || '';
+  const pending = ['waiting', 'verifying'].includes(status.state);
+  $('#account-signin').classList.toggle('hidden', pending || status.state === 'signed_in');
+  $('#account-signin').disabled = ['unconfigured', 'checking'].includes(status.state);
+  $('#account-signin').textContent = ['error','expired','offline'].includes(status.state) ? 'Sign in again' : 'Sign in via browser';
+  $('#account-reopen').classList.toggle('hidden', status.state !== 'waiting');
+  $('#account-cancel').classList.toggle('hidden', !pending);
+  $('#account-retry').classList.toggle('hidden', status.state !== 'offline');
+  $('#account-manage').classList.toggle('hidden', !status.identity || pending);
+  $('#account-signout').classList.toggle('hidden', !status.identity && !['error','expired'].includes(status.state));
+  const welcome = $('#account-welcome');
+  if (welcome) {
+    const hide = status.canUseWorkspace === true;
+    const wasVisible = !welcome.classList.contains('hidden');
+    const hadFocus = welcome.contains(document.activeElement);
+    welcome.classList.toggle('hidden', hide);
+    $('#app').classList.toggle('account-onboarding', !hide);
+    setModalBackgroundState(!hide);
+    for (const modal of document.querySelectorAll('.modal-overlay')) modal.inert = !hide;
+    $('#welcome-account-state').textContent = labels[status.state] || 'Account unavailable';
+    $('#welcome-account-message').textContent = status.message || '';
+    $('#welcome-signin').classList.toggle('hidden', pending);
+    $('#welcome-signin').disabled = ['unconfigured', 'checking'].includes(status.state);
+    $('#welcome-reopen').classList.toggle('hidden', status.state !== 'waiting');
+    $('#welcome-cancel').classList.toggle('hidden', !pending);
+    $('#welcome-retry').classList.toggle('hidden', status.state !== 'offline');
+    $('#welcome-signout').classList.toggle('hidden', pending || (!status.identity && !['error','expired'].includes(status.state)));
+    if (hide && hadFocus) (accountFocusAvailable(accountWelcomeOpener) ? accountWelcomeOpener : document.querySelector('.app-tab[data-tab="projects"]'))?.focus();
+    if (!hide && (!wasVisible || !welcome.contains(document.activeElement) || !accountFocusAvailable(document.activeElement))) ($('#welcome-signin').disabled ? welcome : status.state === 'waiting' ? $('#welcome-reopen') : status.state === 'verifying' ? $('#welcome-cancel') : $('#welcome-signin')).focus();
+  }
+}
+async function runAccountAction(method) {
+  if (method === 'beginAccountSignIn') {
+    if ($('#account-welcome').classList.contains('hidden')) accountWelcomeOpener = document.activeElement;
+  }
+  try { const snapshot = await window.crate[method](); acceptAccountSnapshot(snapshot); }
+  catch (_) { accountStatus = { ...accountStatus, message: 'Account request could not complete. Try again.' }; }
+  renderAccount();
+}
+function acceptAccountSnapshot(snapshot) {
+  if (snapshot.revision < accountStatus.revision) return;
+  const wasAllowed = accountStatus.canUseWorkspace === true;
+  const previousId = accountStatus.identity?.id;
+  accountStatus = snapshot;
+  if (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id) accountWorkspaceEpoch++;
+  if (wasAllowed && (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id)) {
+    // Retire the same modal/selection leases as a project switch, preserving
+    // the local selection and records without associating them with an account.
+    projectRefreshGeneration += 1;
+    projectListReadEpoch += 1;
+    assetWorkspaceRequestGeneration += 1;
+    assetWorkspaceRequestId += 1;
+    state.assetWorkspace = null;
+    notificationPackageTriggerId += 1;
+    notificationPackageTriggerInFlight = false;
+    setSelectedProject(state.selectedProjectId, { invalidate: true, restoreFocus: false });
+  }
+  renderAccount();
+  if (accountStartupLoaded && snapshot.canUseWorkspace && (!wasAllowed || previousId !== snapshot.identity?.id)) void loadAccountWorkspace();
+}
+async function initializeAccountUI() {
+  initializeSettingsNavigation();
+  renderAccount();
+  if (!window.crate?.getAccount) return;
+  window.crate.onAccountChanged(acceptAccountSnapshot);
+  const actions = { 'account-signin': 'beginAccountSignIn', 'account-reopen': 'reopenAccountBrowser', 'account-cancel': 'cancelAccountSignIn', 'account-signout': 'signOutAccount', 'account-manage': 'manageAccount', 'account-retry': 'refreshAccount', 'welcome-signin': 'beginAccountSignIn', 'welcome-reopen': 'reopenAccountBrowser', 'welcome-cancel': 'cancelAccountSignIn', 'welcome-retry': 'refreshAccount', 'welcome-signout': 'signOutAccount' };
+  for (const [id, method] of Object.entries(actions)) document.getElementById(id)?.addEventListener('click', () => runAccountAction(method));
+  for (const panel of document.querySelectorAll('.account-panel, .account-welcome')) panel.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && ['waiting','verifying'].includes(accountStatus.state)) { event.preventDefault(); void runAccountAction('cancelAccountSignIn'); }
+  });
+  await runAccountAction('getAccount');
+}
+
+function initializeSettingsNavigation() {
+  const tabs = [...document.querySelectorAll('[data-settings-tab]')];
+  const select = (tab, focus = false) => {
+    for (const candidate of tabs) {
+      const active = candidate === tab;
+      candidate.setAttribute('aria-selected', String(active));
+      candidate.tabIndex = active ? 0 : -1;
+      const panel = document.getElementById(candidate.getAttribute('aria-controls'));
+      if (panel) panel.hidden = !active;
+    }
+    if (focus) tab.focus();
+  };
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => select(tab));
+    tab.addEventListener('keydown', event => {
+      const index = tabs.indexOf(tab);
+      const next = event.key === 'ArrowDown' ? (index + 1) % tabs.length
+        : event.key === 'ArrowUp' ? (index + tabs.length - 1) % tabs.length
+        : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+      if (next >= 0) { event.preventDefault(); select(tabs[next], true); }
+    });
+  }
+}
+
 // ===== Render Settings =====
 function renderSettingsControls() {
   $('#input-naming-template').value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
@@ -3049,15 +3210,14 @@ function renderSettingsControls() {
 
   const used = Number(state.usage.packagesThisMonth) || 0;
   const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
-  const planName = state.usage.planName || 'Free';
   const planId = state.usage.planId || 'free';
   const planTitle = $('#plan-title');
   const planBadge = $('#plan-badge');
-  if (planTitle) planTitle.textContent = planName;
+  if (planTitle) planTitle.textContent = 'Package usage';
   $('#plan-info').textContent = `${packageLimit} packages/month \u00B7 ${used}/${packageLimit} used`;
   if (planBadge) {
     const isClosedBeta = planId === 'closed-beta';
-    planBadge.textContent = isClosedBeta ? 'Beta tester' : 'Current plan';
+    planBadge.textContent = isClosedBeta ? 'Beta tester' : 'This Mac';
     planBadge.className = `quota-state-badge ${isClosedBeta ? 'beta' : 'upgrade'}`;
   }
   const limitState = $('#quota-limit-state');
@@ -3083,6 +3243,7 @@ async function renderSettings() {
   }
 
   renderSettingsControls();
+  renderAccount();
   renderFigmaSettings().catch((e) => logRendererError('Figma settings refresh failed', e));
 }
 
@@ -3128,9 +3289,8 @@ function updateSettingsNamingPreview() {
 function renderFooter() {
   const used = Number(state.usage.packagesThisMonth) || 0;
   const packageLimit = Number(state.usage.packageLimit || state.usage.limit) || 10;
-  const planName = state.usage.planName || 'Free';
   const planTitle = $('#sidebar-plan-title');
-  if (planTitle) planTitle.textContent = planName;
+  if (planTitle) planTitle.textContent = 'Package usage';
   $('#footer-usage').textContent = `${used} of ${packageLimit} packages used this month`;
 }
 
@@ -3219,7 +3379,7 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
 ]);
 
 function setModalBackgroundState(blocked) {
-  const shouldBlock = Boolean(blocked) || getVisibleBlockingModalIds().length > 0;
+  const shouldBlock = Boolean(blocked) || accountStatus.canUseWorkspace === false || getVisibleBlockingModalIds().length > 0;
   for (const id of ['app-sidebar', 'app-main']) {
     const element = $(`#${id}`);
     if (!element) continue;
@@ -3784,7 +3944,7 @@ async function showPackageModal({
   if (!isCurrentRequest()) return false;
   if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
-        state.projects = await window.crate.getProjects();
+        state.projects = await getAccountCurrentProjects();
         if (!isCurrentRequest()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
         hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
@@ -3794,7 +3954,7 @@ async function showPackageModal({
         }
       }
       try {
-        state.projects = await window.crate.getProjects();
+        state.projects = await getAccountCurrentProjects();
         if (!isCurrentRequest()) return false;
         project = state.projects.find(item => item.id === projectId) || project;
       } catch (_) {
@@ -3813,7 +3973,7 @@ async function showPackageModal({
 
     if (review.projectId !== projectId) return false;
 
-    state.projects = await window.crate.getProjects();
+    state.projects = await getAccountCurrentProjects();
     if (!isCurrentRequest()) return false;
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
@@ -3952,7 +4112,7 @@ async function confirmPackage() {
     ]);
     if (!isCurrentConfirmation()) return;
     if (scanResult) {
-      state.projects = await window.crate.getProjects();
+      state.projects = await getAccountCurrentProjects();
       if (!isCurrentConfirmation()) return;
       project = state.projects.find(p => p.id === project.id) || project;
     }
@@ -3996,7 +4156,7 @@ async function confirmPackage() {
     showPackageSuccessModal();
 
     try {
-      state.projects = await window.crate.getProjects();
+      state.projects = await getAccountCurrentProjects();
       state.usage = await window.crate.getUsage();
       renderFiles();
       renderFooter();
@@ -4040,7 +4200,7 @@ async function confirmDeleteProject() {
   }
 
   state.pendingDeleteId = null;
-  state.projects = await window.crate.getProjects();
+  state.projects = await getAccountCurrentProjects();
   $('#modal-delete-confirm').classList.add('hidden');
   releaseModalLease('modal-delete-confirm');
   setModalBackgroundState(false);
@@ -4052,7 +4212,7 @@ async function confirmDeleteProject() {
 async function confirmClearAll() {
   await window.crate.deleteAllProjects();
   setSelectedProject(null);
-  state.projects = await window.crate.getProjects();
+  state.projects = await getAccountCurrentProjects();
   $('#modal-clear-all').classList.add('hidden');
   releaseModalLease('modal-clear-all');
   setModalBackgroundState(false);
@@ -4491,7 +4651,7 @@ async function persistFigmaLinkEdit(payload, successMessage) {
   }
 
   if (!isCurrentEditModal()) return false;
-  const projects = await window.crate.getProjects();
+  const projects = await getAccountCurrentProjects();
   if (!isCurrentEditModal()) return false;
   state.projects = projects;
   closeEditFigmaLinkModal();

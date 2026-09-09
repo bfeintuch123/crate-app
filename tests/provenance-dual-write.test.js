@@ -169,6 +169,7 @@ let testMainWindowShowCount = 0;
 let testShowOpenDialogCount = 0;
 const testNotifications = [];
 const testMessageBoxes = [];
+let testMessageBoxHold = null;
 const testRendererEvents = [];
 const trustedRendererMainFrame = {
   url: pathToFileURL(path.join(MAIN_UNDER_TEST_ROOT, 'renderer', 'index.html')).href,
@@ -226,6 +227,7 @@ class TestNotification {
   }
   static isSupported() { return testNotificationSupported; }
   show() { this.shown = true; }
+  close() { this.closed = true; this.handlers.get('close')?.(); }
   on(channel, handler) { this.handlers.set(channel, handler); }
 }
 
@@ -711,8 +713,10 @@ setStub('electron', () => ({
       return nextOpenDialogResult;
     },
     showSaveDialog: async () => ({ canceled: true }),
-    showMessageBox: async options => {
+    showMessageBox: async (parentOrOptions, possibleOptions) => {
+      const options = possibleOptions || parentOrOptions;
       testMessageBoxes.push(options);
+      if (testMessageBoxHold) return testMessageBoxHold(options);
       return { response: 0 };
     },
     showErrorBox: () => {},
@@ -1064,6 +1068,15 @@ module.exports.__crateMetadataTestHooks = {
   startInactivityChecker() {
     startInactivityChecker();
   },
+  pauseRecoveryRecord(wait) {
+    const original = getAssetBaselineSourceRecoveryRecord;
+    getAssetBaselineSourceRecoveryRecord = async (...args) => {
+      const record = await original(...args);
+      await wait();
+      return record;
+    };
+    return () => { getAssetBaselineSourceRecoveryRecord = original; };
+  },
   getActiveWatchingActivationToken(projectId) {
     return getActiveWatchingActivationToken(projectId);
   },
@@ -1144,6 +1157,18 @@ module.exports.__crateMetadataTestHooks = {
 };
 `, filename);
 };
+// Product behavior tests exercise an authenticated workspace; account-specific
+// integration tests separately verify denial, expiry, and stale-operation fences.
+const { AccountSession: RealAccountSession } = require('../account-session');
+let testAccountSession;
+setStub('./account-session', () => ({ AccountSession: class extends RealAccountSession {
+  constructor(options) { super(options); testAccountSession = this; }
+  async restore() {
+    this.record = { identity: { id: 'test-account' } };
+    this.accessToken = 'synthetic-access'; this.accessExpiresAt = Date.now() + 3600000;
+    return this.publish('signed_in', '', { id: 'test-account' });
+  }
+} }));
 let metadataTestHooks;
 try {
   ({ __crateMetadataTestHooks: metadataTestHooks } = require(mainModulePath));
@@ -22412,6 +22437,110 @@ test('Add Files PSD failed sibling and retry preserve successful source files an
     assert.equal(fresh.files.some(file => file.name === 'retried.bin'), true);
     assert.equal(fs.statSync(sibling.path).ino, inode);
     assert.equal(fresh.assetBaseline.status, 'decision-required');
+  } finally {
+    setUtilityProcessHandler(null); currentPsdFixture = previousFixture;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('account removal fence rejects recovery eligibility that resolves after logout', async () => {
+  const fixtureRoot = makeTempDir();
+  let release, entered, restoreRecovery = () => {};
+  const held = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  try {
+    const sourcePath = path.join(fixtureRoot, 'Failed Source.ai');
+    fs.writeFileSync(sourcePath, 'malformed Illustrator bytes');
+    const project = await createProject('Account removal fence');
+    manualDialogFor([sourcePath]);
+    await callIpcRaw('projects:add-files', project.id);
+    metadataTestHooks.clearAssetBaselineScans();
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const failedSource = workspace.files.find(file => file.name === 'Failed Source.ai');
+    assert.equal(failedSource.sourceRecoveryAllowed, true);
+    const before = JSON.stringify(storeInstance.get('projects', []));
+    restoreRecovery = metadataTestHooks.pauseRecoveryRecord(async () => { entered(); await held; });
+    const removal = callIpcRaw('projects:remove-file', project.id, failedSource.visualIdentity);
+    const rejected = assert.rejects(removal, /account|sign.in|authorization/i);
+    await started;
+    await testAccountSession.logout();
+    release();
+    await rejected;
+    assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
+    assert.equal(fs.existsSync(sourcePath), true);
+  } finally {
+    release(); restoreRecovery(); await testAccountSession.restore();
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('account inactivity fence closes prompts and rejects their late actions after logout', async () => {
+  const fixtureRoot = makeTempDir(), originalDateNow = Date.now;
+  let now = originalDateNow(), release = () => {};
+  try {
+    Date.now = () => now;
+    for (const mode of ['notification', 'keep', 'pause', 'package']) {
+      const project = await createProject('Account inactivity ' + mode);
+      const sourcePath = path.join(fixtureRoot, mode + '.ai');
+      fs.writeFileSync(sourcePath, 'inactivity fixture');
+      await setProjectFiles(project.id, { files: [{ path: sourcePath, name: mode + '.ai', ext: '.ai', addedAt: now, source: 'manual-browse' }] });
+      testMainWindowVisible = mode !== 'notification';
+      testNotificationSupported = true;
+      testMessageBoxes.length = 0; testNotifications.length = 0;
+      testMessageBoxHold = () => new Promise(resolve => { release = () => resolve({ response: { keep: 0, pause: 1, package: 2 }[mode] }); });
+      metadataTestHooks.startInactivityChecker();
+      now += 180 * 60 * 1000;
+      await runTrackedIntervalCallbacks();
+      const notification = testNotifications[0], box = testMessageBoxes[0];
+      if (mode === 'notification') assert.equal(notification.shown, true);
+      else { assert.equal(testMessageBoxes.length, 1); assert.equal(box.signal.aborted, false); }
+      await testAccountSession.logout();
+      const before = JSON.stringify(storeInstance.get('projects', []));
+      const sentBefore = testRendererEvents.length;
+      const showsBefore = testMainWindowShowCount;
+      if (mode === 'notification') { assert.equal(notification.closed, true); notification.handlers.get('click')(); }
+      else { assert.equal(box.signal.aborted, true); release(); }
+      await new Promise(resolve => originalSetTimeout(resolve, 0));
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
+      assert.equal(testMainWindowShowCount, showsBefore);
+      assert.equal(testRendererEvents.slice(sentBefore).some(event => event.channel === 'package:trigger'), false);
+      const prompts = testMessageBoxes.length + testNotifications.length;
+      now += 180 * 60 * 1000; await runTrackedIntervalCallbacks();
+      assert.equal(testMessageBoxes.length + testNotifications.length, prompts, 'locked ticks show no prompts');
+      testMessageBoxHold = null;
+      await testAccountSession.restore();
+      await callIpc('projects:delete', project.id);
+    }
+  } finally {
+    release(); testMessageBoxHold = null; Date.now = originalDateNow;
+    await testAccountSession.restore(); fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+
+test('Add Files retains both concurrent PSDs with identical embedded names and distinct bytes', async () => {
+  const root = makeTempDir(), previousFixture = currentPsdFixture;
+  let extractDir;
+  try {
+    const a = path.join(root, 'a.psd'), b = path.join(root, 'b.psd');
+    fs.writeFileSync(a, 'source a'); fs.writeFileSync(b, 'source b');
+    setUtilityProcessHandler(({ phase, modulePath, message }) => {
+      if (phase !== 'message' || message.type !== 'parse' || !modulePath.endsWith('add-files-psd-worker.js')) return;
+      currentPsdFixture = { linkedFiles: [{ name: 'shared.bin', data: Buffer.from(message.filePath === a ? 'bytes a' : 'bytes b') }] };
+    });
+    const project = await createProject('Concurrent PSD names');
+    extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+    manualDialogFor([a, b]);
+    const result = await callIpcRaw('projects:add-files', project.id);
+    assert.equal(Array.isArray(result), true);
+    const fresh = await getProject(project.id);
+    const embedded = fresh.files.filter(file => file.source === 'psd-embedded');
+    assert.equal(embedded.length, 2);
+    assert.notEqual(embedded[0].path, embedded[1].path);
+    assert.deepEqual(embedded.map(file => fs.readFileSync(file.path, 'utf8')).sort(), ['bytes a', 'bytes b']);
+    assert.equal(fresh.assetBaseline.status, 'decision-required');
+    assert.equal(fs.readdirSync(extractDir).length, 2);
   } finally {
     setUtilityProcessHandler(null); currentPsdFixture = previousFixture;
     if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
