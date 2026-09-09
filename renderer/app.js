@@ -1149,8 +1149,10 @@ async function createProject() {
     const knownNonPersistingError = typedError === 'max_projects_reached' || !!figmaLinkErrorMessage;
     const accountRejected = typeof createError?.message === 'string' &&
       createError.message.endsWith('Sign in to Crate to use your workspace.');
-    if (creationAccountEpoch !== accountWorkspaceEpoch &&
-        ((!hasTypedError && result?.id) || knownNonPersistingError || accountRejected)) {
+    // Main checks token expiry before the account-change notification reaches
+    // this renderer. Its settled rejection must reconcile even at the old epoch.
+    if (accountRejected || (creationAccountEpoch !== accountWorkspaceEpoch &&
+        ((!hasTypedError && result?.id) || knownNonPersistingError))) {
       await reconcileRetiredProjectCreation();
       return;
     }

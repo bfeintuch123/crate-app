@@ -7294,3 +7294,93 @@ test('workspace read begun before retired creation settles cannot unlock reconci
   assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'idle');
   assert.equal(vm.runInContext('state.projects.length',f.renderer),2);
 });
+
+for (const identity of ['A', 'B']) {
+  test(`clock expiry before account notification reconciles creation after sign-in (${identity})`, async t => {
+    const { AccountSession } = require('../account-session');
+    let now = 1000;
+    const session = new AccountSession({ config: {}, now: () => now });
+    t.after(() => session.shutdown());
+    session.record = { identity: { id: 'A' } };
+    session.accessToken = 'synthetic-access';
+    session.authorizeUntil(now + 60_000);
+    session.publish('signed_in', '', { id: 'A' });
+    // Use main's production authorization closure, including its direct clock
+    // check, without launching Electron or touching credentials.
+    const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+    const authorizationSource = mainSource.slice(mainSource.indexOf('function captureAccountAuthorization()'),
+      mainSource.indexOf('function registerTrustedIpcHandler'));
+    const authorize = vm.runInNewContext(`${authorizationSource}; captureAccountAuthorization()`, { accountSession: session });
+    let createCalls = 0, mutations = 0, reads = 0;
+    const currentRead = createDeferred();
+    const f = accountCreationFixture({
+      createProject: async () => {
+        createCalls++;
+        authorize();
+        mutations++;
+        return { id: 'unexpected-project', files: [] };
+      },
+      getProjects: () => {
+        reads++;
+        if (!session.canUseWorkspace()) return Promise.reject(new Error('Sign in to Crate to use your workspace.'));
+        return currentRead.promise;
+      },
+    });
+    vm.runInContext('accountStartupLoaded=true', f.renderer);
+    const epoch = vm.runInContext('accountWorkspaceEpoch', f.renderer);
+    session.on('change', snapshot => {
+      f.renderer.nextSnapshot = snapshot;
+      vm.runInContext('acceptAccountSnapshot(nextSnapshot)', f.renderer);
+    });
+    // Advance the actual session clock without firing its notification timer.
+    now = session.accessExpiresAt;
+    assert.equal(session.canUseWorkspace(), false);
+    assert.equal(vm.runInContext('accountStatus.canUseWorkspace', f.renderer), true);
+    await f.renderer.createProject();
+    assert.equal(vm.runInContext('accountWorkspaceEpoch', f.renderer), epoch);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'reconciling');
+    assert.equal(reads, 1, 'the known settled rejection attempts an authoritative read immediately');
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    await f.renderer.createProject();
+    assert.equal(createCalls, 1, 'denied reconciliation must not permit duplicate creation');
+    assert.equal(mutations, 0);
+
+    session.publish('expired');
+    session.record = { identity: { id: identity } };
+    session.accessToken = 'synthetic-reauthenticated-access';
+    session.authorizeUntil(now + 60_000);
+    session.publish('signed_in', '', { id: identity });
+    assert.equal(reads, 2);
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    await f.renderer.createProject();
+    assert.equal(createCalls, 1, 'sign-in alone must not unlock creation before the list settles');
+    currentRead.resolve([{ id: 'account-modal-project', files: [] }, { id: 'already-saved', files: [] }]);
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+    assert.equal(f.elements['btn-create-project'].disabled, false);
+    assert.equal(vm.runInContext('state.projects.map(p=>p.id).join()', f.renderer), 'account-modal-project,already-saved');
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'account-modal-project');
+    assert.equal(createCalls, 1);
+    assert.equal(mutations, 0);
+    assert.doesNotMatch(f.elements['project-creation-status'].textContent, /Restart/);
+  });
+}
+
+test('ambiguous creation rejection stays unresolved after reauthentication and an authoritative list', async () => {
+  let createCalls = 0, reads = 0;
+  const f = accountCreationFixture({
+    createProject: async () => { createCalls++; throw new Error('IPC transport disappeared'); },
+    getProjects: async () => { reads++; return [{ id: 'account-modal-project', files: [] }]; },
+  });
+  vm.runInContext('accountStartupLoaded=true', f.renderer);
+  await f.renderer.createProject();
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'unresolved');
+  assert.equal(reads, 0);
+  f.transition();
+  await new Promise(setImmediate);
+  assert.equal(reads, 1);
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'unresolved');
+  assert.equal(f.elements['btn-create-project'].disabled, true);
+  await f.renderer.createProject();
+  assert.equal(createCalls, 1);
+});
