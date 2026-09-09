@@ -1078,6 +1078,34 @@ module.exports.__crateMetadataTestHooks = {
   startInactivityChecker() {
     startInactivityChecker();
   },
+  pausePsdFinish(wait) {
+    const original = createAddFilesPsdTransaction;
+    createAddFilesPsdTransaction = (...args) => {
+      const transaction = original(...args);
+      const finish = transaction.finish.bind(transaction);
+      transaction.finish = async () => { await wait(args[1].baselineScan); return finish(); };
+      return transaction;
+    };
+    return () => { createAddFilesPsdTransaction = original; };
+  },
+  pausePsdAcceptance(wait) {
+    const original = preparePsdBaselineAcceptance;
+    preparePsdBaselineAcceptance = async (...args) => {
+      const acceptance = await original(...args);
+      await wait(acceptance, args);
+      return acceptance;
+    };
+    return () => { preparePsdBaselineAcceptance = original; };
+  },
+  pauseRecoveryEligibility(wait) {
+    const original = isFailedRequiredAssetBaselineSource;
+    isFailedRequiredAssetBaselineSource = async (...args) => {
+      const eligible = await original(...args);
+      await wait();
+      return eligible;
+    };
+    return () => { isFailedRequiredAssetBaselineSource = original; };
+  },
   pauseRecoveryRecord(wait) {
     const original = getAssetBaselineSourceRecoveryRecord;
     getAssetBaselineSourceRecoveryRecord = async (...args) => {
@@ -22998,3 +23026,520 @@ for (const mode of ['clock', 'generation', 'identity']) {
     } finally { gate.release(); fs.promises.stat = originalStat; fs.promises.readFile = originalRead; testAccountSession.now = originalNow; await testAccountSession.restore(); }
   });
 }
+
+async function makeRetryOwnershipFixture() {
+  const root = makeTempDir();
+  const paths = ['first.ai', 'second.ai'].map(name => path.join(root, name));
+  paths.forEach(source => writeSyntheticAiFile(source, 'synthetic retry ownership'));
+  const project = await createProject('Retry obligation ownership');
+  await setProjectFiles(project.id, { files: paths.map(source => ({ path: source, name: path.basename(source), ext: '.ai', source: 'manual-browse', addedAt: 0 })), preserveAwaitingAssetBaseline: true });
+  const operation = metadataTestHooks.captureProjectOperation(project.id);
+  return { root, paths, project, operation };
+}
+function startReservedRetry(fixture, queue, index) {
+  return metadataTestHooks.beginProjectAssetBaselineScan(fixture.project.id, queue[index], fixture.operation.activationToken, {
+    baselineReservation: queue.baselineReservations?.[index],
+  });
+}
+for (const first of [0, 1]) for (const failure of [false, true]) {
+  test(`retry ownership retained proof waits for required active work order ${first} failure ${failure}`, async () => {
+    const f = await makeRetryOwnershipFixture();
+    try {
+      const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+      const state = metadataTestHooks.getBaselineState(f.project.id);
+      state.requiredSourceKeys.forEach(source => state.completedSourceKeys.add(source));
+      const scans = [startReservedRetry(f, queue, 0), startReservedRetry(f, queue, 1)];
+      await metadataTestHooks.completeProjectAssetBaselineScan(scans[first], true, f.operation.current);
+      assert.equal((await getProject(f.project.id)).assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(metadataTestHooks.getBaselineState(f.project.id), state);
+      await metadataTestHooks.completeProjectAssetBaselineScan(scans[1 - first], !failure, f.operation.current);
+      assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+      assert.equal(state.completedSourceKeys.size, 2, 'failed retry retains applicable earlier proof');
+    } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+}
+test('retry ownership watcher cannot consume a queued same-path reservation', async () => {
+  const f = await makeRetryOwnershipFixture();
+  try {
+    const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+    const state = metadataTestHooks.getBaselineState(f.project.id);
+    const watcher = metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[0], f.operation.activationToken);
+    assert.equal(state.queuedSourceKeys.has(f.paths[0].toLowerCase()), true);
+    await metadataTestHooks.completeProjectAssetBaselineScan(watcher, true, f.operation.current);
+    await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, queue, 1), true, f.operation.current);
+    assert.equal((await getProject(f.project.id)).assetBaseline.status, 'awaiting-first-scan');
+    await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, queue, 0), true, f.operation.current);
+    assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+  } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+test('retry ownership cancelled old queue preserves same-owner newer reservation', async () => {
+  const f = await makeRetryOwnershipFixture();
+  try {
+    const old = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+    const state = metadataTestHooks.getBaselineState(f.project.id);
+    const newer = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+    metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, old, state);
+    assert.equal(metadataTestHooks.getBaselineState(f.project.id), state);
+    assert.deepEqual([...state.queuedSourceKeys].sort(), f.paths.map(source => source.toLowerCase()).sort());
+    for (let index = 0; index < newer.length; index++) {
+      await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, newer, index), true, f.operation.current);
+    }
+    assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+  } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+for (const winnerFirst of [true, false]) for (const duplicateSucceeds of [true, false]) {
+  test(`retry ownership duplicate cohort winner first ${winnerFirst} duplicate success ${duplicateSucceeds}`, async () => {
+    const f = await makeRetryOwnershipFixture();
+    try {
+      const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+      const first = startReservedRetry(f, queue, 0);
+      const duplicate = metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[0], f.operation.activationToken);
+      await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, queue, 1), true, f.operation.current);
+      if (!winnerFirst) {
+        await metadataTestHooks.completeProjectAssetBaselineScan(duplicate, duplicateSucceeds, f.operation.current);
+        assert.equal((await getProject(f.project.id)).assetBaseline.status, 'awaiting-first-scan', 'duplicate cannot settle explicit required work');
+      }
+      await metadataTestHooks.completeProjectAssetBaselineScan(first, true, f.operation.current);
+      assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+      if (winnerFirst) {
+        f.operation.close();
+        const saved = JSON.stringify(storeInstance.get('projects', []));
+        await metadataTestHooks.completeProjectAssetBaselineScan(duplicate, duplicateSucceeds, f.operation.current);
+        assert.equal(JSON.stringify(storeInstance.get('projects', [])), saved);
+      }
+    } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+}
+
+for (const heldSource of ['good', 'bad']) for (const phase of ['read', 'finish']) {
+  test(`retry ownership production PSD ${heldSource} held at ${phase} preserves required work and sibling bytes`, async () => {
+    const root = makeTempDir(), gate = deferredScanBoundary();
+    const previous = currentPsdFixture;
+    let restoreReads = () => {}, restoreFinish = () => {}, extractDir;
+    try {
+      const paths = { good: path.join(root, 'good.psd'), bad: path.join(root, 'retry.psd') };
+      Object.values(paths).forEach(source => fs.writeFileSync(source, 'controlled PSD'));
+      let fail = true;
+      setUtilityProcessHandler(({ phase, modulePath, message }) => {
+        if (phase !== 'message' || message.type !== 'parse' || !modulePath.endsWith('add-files-psd-worker.js')) return;
+        currentPsdFixture = fail && message.filePath === paths.bad ? new Error('synthetic failure')
+          : { linkedFiles: [{ name: message.filePath === paths.good ? 'good.bin' : 'retried.bin', data: Buffer.from('owned sibling bytes') }] };
+      });
+      const project = await createProject('Controlled PSD retry order');
+      extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+      manualDialogFor(Object.values(paths));
+      assertAddFilesPartialScanFailure(await callIpcRaw('projects:add-files', project.id));
+      const sibling = (await getProject(project.id)).files.find(file => file.name === 'good.bin');
+      const inode = fs.statSync(sibling.path).ino, bytes = fs.readFileSync(sibling.path);
+      const owner = metadataTestHooks.getBaselineState(project.id);
+      fail = false;
+      let reads = 0;
+      if (phase === 'read') restoreReads = interceptBaselineSourceReads(async (source, read) => {
+        if (source === paths[heldSource] && ++reads === 1) await gate.wait();
+        return read();
+      });
+      else restoreFinish = metadataTestHooks.pausePsdFinish(async scan => {
+        if (scan.sourceKey === paths[heldSource].toLowerCase()) await gate.wait();
+      });
+      manualDialogFor([paths.bad]);
+      const retry = callIpcRaw('projects:add-files', project.id);
+      await gate.started;
+      const other = paths[heldSource === 'good' ? 'bad' : 'good'].toLowerCase();
+      await waitForCondition(() => !owner.inFlightBySource.has(other), 'other sibling must settle first');
+      assert.equal(metadataTestHooks.getBaselineState(project.id), owner);
+      assert.equal((await getProject(project.id)).assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(owner.activeScans.size, 1);
+      if (phase === 'finish') assert.equal((await getProject(project.id)).files.some(file => file.name === 'retried.bin'), true, 'accepted output precedes held transaction finish');
+      gate.release();
+      assert.ok(Array.isArray(await retry));
+      const fresh = await getProject(project.id);
+      assert.equal(fresh.assetBaseline.status, 'decision-required');
+      assert.equal(fs.statSync(sibling.path).ino, inode);
+      assert.deepEqual(fs.readFileSync(sibling.path), bytes);
+      assert.equal(fresh.files.filter(file => file.name === 'good.bin').length, 1);
+      assert.equal(fresh.files.filter(file => file.name === 'retried.bin').length, 1);
+      assert.equal(fs.readdirSync(extractDir).length, 2);
+    } finally {
+      gate.release(); restoreReads(); restoreFinish(); setUtilityProcessHandler(null); currentPsdFixture = previous;
+      if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('retry ownership production genuine retry failure reports failure and retains earlier sibling proof', async () => {
+  const root = makeTempDir(), previous = currentPsdFixture;
+  let extractDir;
+  try {
+    const good = path.join(root, 'good.psd'), bad = path.join(root, 'bad.psd');
+    [good, bad].forEach(source => fs.writeFileSync(source, 'controlled PSD'));
+    let failing = bad;
+    setUtilityProcessHandler(({ phase, modulePath, message }) => {
+      if (phase !== 'message' || message.type !== 'parse' || !modulePath.endsWith('add-files-psd-worker.js')) return;
+      currentPsdFixture = message.filePath === failing ? new Error('genuine synthetic parser failure')
+        : { linkedFiles: [{ name: message.filePath === good ? 'good.bin' : 'retried.bin', data: Buffer.from('retained proof bytes') }] };
+    });
+    const project = await createProject('Truthful required retry failure');
+    extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+    manualDialogFor([good, bad]);
+    assertAddFilesPartialScanFailure(await callIpcRaw('projects:add-files', project.id));
+    const sibling = (await getProject(project.id)).files.find(file => file.name === 'good.bin');
+    const inode = fs.statSync(sibling.path).ino;
+    failing = good;
+    manualDialogFor([bad]);
+    const retry = await callIpcRaw('projects:add-files', project.id);
+    assertAddFilesPartialScanFailure(retry);
+    assert.equal(retry.failedCount, 1);
+    assert.equal(retry.scanResults.find(item => item.path === good).success, false);
+    assert.equal(retry.scanResults.find(item => item.path === bad).success, true);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'decision-required');
+    assert.equal(fs.statSync(sibling.path).ino, inode);
+    assert.deepEqual(fs.readFileSync(sibling.path), Buffer.from('retained proof bytes'));
+  } finally {
+    setUtilityProcessHandler(null); currentPsdFixture = previous;
+    if (extractDir) fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('retry ownership late cancelled completion cannot settle a new cohort in the same owner', async () => {
+  const f = await makeRetryOwnershipFixture();
+  try {
+    const oldQueue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+    const old = startReservedRetry(f, oldQueue, 0);
+    const state = old.state, oldCohort = old.cohort;
+    metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, oldQueue, state);
+    const fresh = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, f.paths);
+    const active = startReservedRetry(f, fresh, 0);
+    assert.notEqual(active.cohort, oldCohort);
+    await metadataTestHooks.completeProjectAssetBaselineScan(old, true, f.operation.current);
+    assert.equal(state.completedSourceKeys.size, 0);
+    assert.equal(state.activeScans.has(active), true);
+    assert.equal(state.queuedSourceKeys.size, 1);
+    await metadataTestHooks.completeProjectAssetBaselineScan(active, true, f.operation.current);
+    await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, fresh, 1), true, f.operation.current);
+    assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+  } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('retry ownership recovery removal cannot pass a newly reserved retry during identity lookup', async () => {
+  const f = await makeRetryOwnershipFixture(), gate = deferredScanBoundary();
+  let restore = () => {};
+  try {
+    const scan = metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[0], f.operation.activationToken);
+    await metadataTestHooks.completeProjectAssetBaselineScan(scan, false, f.operation.current);
+    restore = metadataTestHooks.pauseRecoveryRecord(gate.wait);
+    const removal = callIpcRaw('projects:remove-file', f.project.id, f.paths[0]);
+    await gate.started;
+    metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, [f.paths[0]]);
+    const state = metadataTestHooks.getBaselineState(f.project.id);
+    gate.release(); await removal;
+    assert.equal((await getProject(f.project.id)).files.some(file => file.path === f.paths[0]), true);
+    assert.equal(metadataTestHooks.getBaselineState(f.project.id), state);
+    assert.equal(state.queuedSourceKeys.size, 1);
+  } finally { gate.release(); restore(); f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('retry ownership authorized failed-source removal leaves other queued retry required', async () => {
+  const f = await makeRetryOwnershipFixture();
+  try {
+    await metadataTestHooks.completeProjectAssetBaselineScan(metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[1], f.operation.activationToken), true, f.operation.current);
+    const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, [f.paths[1]]);
+    await callIpcRaw('projects:remove-file', f.project.id, f.paths[0]);
+    const fresh = await getProject(f.project.id);
+    assert.equal(fresh.files.some(file => file.path === f.paths[0]), false);
+    assert.equal(fresh.assetBaseline.status, 'awaiting-first-scan');
+    await metadataTestHooks.completeProjectAssetBaselineScan(startReservedRetry(f, queue, 0), true, f.operation.current);
+    assert.equal((await getProject(f.project.id)).assetBaseline.status, 'empty');
+  } finally { f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test('PSD reuse removal eligibility rechecks owner in helper-to-caller continuation', async () => {
+  const f = await makeRetryOwnershipFixture(), gate = deferredScanBoundary();
+  let restore = () => {};
+  try {
+    const scan = metadataTestHooks.beginProjectAssetBaselineScan(f.project.id, f.paths[0], f.operation.activationToken);
+    await metadataTestHooks.completeProjectAssetBaselineScan(scan, false, f.operation.current);
+    restore = metadataTestHooks.pauseRecoveryEligibility(gate.wait);
+    const removal = callIpcRaw('projects:remove-file', f.project.id, f.paths[0]);
+    await gate.started;
+    const queue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, [f.paths[0]]);
+    const owner = metadataTestHooks.getBaselineState(f.project.id);
+    gate.release(); await removal;
+    assert.equal((await getProject(f.project.id)).files.some(file => file.path === f.paths[0]), true);
+    assert.equal(metadataTestHooks.getBaselineState(f.project.id), owner);
+    assert.equal(owner.queuedSourceKeys.size, 1);
+    metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, queue, owner);
+  } finally { gate.release(); restore(); f.operation.close(); fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+async function makePsdReuseFixture({ entries = [{ name: 'asset.bin', data: Buffer.from('original output') }], watcherFirst = false } = {}) {
+  const root = makeTempDir(), previous = currentPsdFixture;
+  const source = path.join(root, 'source.psd'), bad = path.join(root, 'bad.psd');
+  [source, bad].forEach(file => fs.writeFileSync(file, 'stable source bytes'));
+  const project = await createProject('PSD source output identity');
+  const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + project.id);
+  setUtilityProcessHandler(({ phase, modulePath, message }) => {
+    if (phase !== 'message' || message.type !== 'parse' || !modulePath.endsWith('add-files-psd-worker.js')) return;
+    currentPsdFixture = message.filePath === bad ? new Error('required sibling fails') : { linkedFiles: entries };
+  });
+  if (watcherFirst) {
+    await setProjectFiles(project.id, { files: [source, bad].map(file => ({ path: file, name: path.basename(file), ext: '.psd', source: 'manual-browse', addedAt: 0 })), preserveAwaitingAssetBaseline: true });
+    currentPsdFixture = { linkedFiles: entries };
+    const operation = metadataTestHooks.captureProjectOperation(project.id);
+    try { assert.equal((await metadataTestHooks.runScanOnOpen(project.id, source, operation.activationToken, operation)).success, true); }
+    finally { operation.close(); }
+  } else {
+    manualDialogFor([source, bad]);
+    assertAddFilesPartialScanFailure(await callIpcRaw('projects:add-files', project.id));
+  }
+  const owner = metadataTestHooks.getBaselineState(project.id);
+  const rows = (await getProject(project.id)).files.filter(file => file.source === 'psd-embedded');
+  const originals = rows.map(row => ({ row, stat: fs.statSync(row.path), bytes: fs.readFileSync(row.path) }));
+  return { root, source, bad, project, owner, rows, originals, extractDir, entries,
+    async scan({ sourcePath = source, watcher = false, operation = null } = {}) {
+      operation ||= metadataTestHooks.captureProjectOperation(project.id);
+      const queue = watcher ? null : metadataTestHooks.reserveProjectAssetBaselineScanQueue(project.id, [sourcePath]);
+      const lease = { current: () => operation.current(), onCancel: () => () => {} };
+      currentPsdFixture = { linkedFiles: entries };
+      try {
+        return await metadataTestHooks.runScanOnOpen(project.id, sourcePath, operation.activationToken, operation, {
+          ...(watcher ? {} : { addFilesAttempt: lease, addFilesScanLease: lease, baselineReservation: queue.baselineReservations[0] }),
+        });
+      } finally { operation.close(); }
+    },
+    cleanup() { setUtilityProcessHandler(null); currentPsdFixture = previous; fs.rmSync(extractDir, { recursive: true, force: true }); fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+function assertPsdOriginalsPreserved(f) {
+  for (const original of f.originals) {
+    assert.equal(fs.statSync(original.row.path).ino, original.stat.ino);
+    assert.deepEqual(fs.readFileSync(original.row.path), original.bytes);
+  }
+}
+for (const watcherFirst of [false, true]) for (const watcher of [false, true]) {
+  test(`PSD reuse same source watcher first ${watcherFirst} retry watcher ${watcher}`, async () => {
+    const f = await makePsdReuseFixture({ watcherFirst });
+    try {
+      assert.equal((await f.scan({ watcher })).success, true);
+      assertPsdOriginalsPreserved(f);
+      assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 1);
+      assert.equal(fs.readdirSync(f.extractDir).length, 1);
+      assert.equal(f.owner.requiredReservations?.size || 0, 0);
+      assert.equal(f.owner.activeScans.size, 0);
+    } finally { f.cleanup(); }
+  });
+}
+for (const mode of ['missing', 'modified', 'symlink', 'replaced']) {
+  test(`PSD reuse ${mode} accepted output fails closed without touching old row or replacement`, async () => {
+    const f = await makePsdReuseFixture();
+    try {
+      const old = f.rows[0], foreign = path.join(f.root, 'foreign.bin');
+      if (mode === 'missing') fs.unlinkSync(old.path);
+      if (mode === 'modified') fs.writeFileSync(old.path, 'modified bytes');
+      if (mode === 'symlink') { fs.writeFileSync(foreign, 'foreign bytes'); fs.unlinkSync(old.path); fs.symlinkSync(foreign, old.path); }
+      if (mode === 'replaced') { fs.renameSync(old.path, foreign); fs.writeFileSync(old.path, f.originals[0].bytes); }
+      const replacement = mode === 'missing' ? null : fs.lstatSync(old.path);
+      const saved = JSON.stringify((await getProject(f.project.id)).files);
+      assert.equal((await f.scan()).success, false);
+      assert.equal(JSON.stringify((await getProject(f.project.id)).files), saved);
+      assert.equal(f.owner.requiredReservations?.size || 0, 0);
+      assert.equal(f.owner.activeScans.size, 0);
+      assert.equal(f.owner.completedSourceKeys.has(f.source.toLowerCase()), true);
+      assert.deepEqual(fs.readdirSync(f.extractDir), mode === 'missing' ? [] : [path.basename(old.path)]);
+      if (replacement) assert.equal(fs.lstatSync(old.path).ino, replacement.ino);
+      if (mode === 'symlink') assert.equal(fs.readFileSync(foreign, 'utf8'), 'foreign bytes');
+    } finally { f.cleanup(); }
+  });
+}
+for (const mode of ['content', 'identity']) {
+  test(`PSD reuse changed source ${mode} creates distinct output preserving old row`, async () => {
+    const f = await makePsdReuseFixture();
+    try {
+      if (mode === 'identity') fs.renameSync(f.source, path.join(f.root, 'old-source.psd'));
+      fs.writeFileSync(f.source, mode === 'identity' ? 'stable source bytes' : 'changed source bytes');
+      assert.equal((await f.scan()).success, true);
+      assertPsdOriginalsPreserved(f);
+      assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 2);
+      assert.equal(fs.readdirSync(f.extractDir).length, 2);
+    } finally { f.cleanup(); }
+  });
+}
+test('PSD reuse repeated embedded names retain distinct indices on retry', async () => {
+  const f = await makePsdReuseFixture({ entries: [0, 1].map(() => ({ name: 'same.bin', data: Buffer.from('identical entry bytes') })) });
+  try {
+    assert.equal((await f.scan()).success, true);
+    assertPsdOriginalsPreserved(f);
+    assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 2);
+    assert.equal(fs.readdirSync(f.extractDir).length, 2);
+  } finally { f.cleanup(); }
+});
+for (const identical of [false, true]) {
+  test(`PSD reuse distinct same-name sources identical bytes ${identical} remain separate`, async () => {
+    const f = await makePsdReuseFixture();
+    try {
+      const otherDir = path.join(f.root, 'other'); fs.mkdirSync(otherDir);
+      const other = path.join(otherDir, 'source.psd'); fs.copyFileSync(f.source, other);
+      const projects = storeInstance.get('projects', []), project = projects.find(project => project.id === f.project.id);
+      project.files.push({ ...project.files.find(file => file.path === f.source), path: other, id: 'distinct-source' });
+      storeInstance.set('projects', projects);
+      if (!identical) f.entries[0] = { name: 'asset.bin', data: Buffer.from('different asset bytes') };
+      assert.equal((await f.scan({ sourcePath: other })).success, true);
+      assertPsdOriginalsPreserved(f);
+      assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 2);
+      assert.equal(fs.readdirSync(f.extractDir).length, 2);
+    } finally { f.cleanup(); }
+  });
+}
+for (const mode of ['replace-output', 'modify-output', 'replace-row', 'cancel', 'expiry', 'new-owner']) {
+  test(`PSD reuse ${mode} after comparison denies late acceptance and preserves borrowed output`, async () => {
+    const f = await makePsdReuseFixture(), gate = deferredScanBoundary();
+    const originalNow = testAccountSession.now;
+    let restore = () => {};
+    try {
+      const operation = metadataTestHooks.captureProjectOperation(f.project.id);
+      restore = metadataTestHooks.pausePsdAcceptance(gate.wait);
+      const scan = f.scan({ operation }); await gate.started;
+      let inode = f.originals[0].stat.ino;
+      if (mode === 'replace-output') { fs.renameSync(f.rows[0].path, path.join(f.root, 'borrowed.bin')); fs.writeFileSync(f.rows[0].path, 'foreign replacement'); inode = fs.statSync(f.rows[0].path).ino; }
+      if (mode === 'modify-output') { fs.writeFileSync(f.rows[0].path, 'different bytes'); fs.utimesSync(f.rows[0].path, f.originals[0].stat.atime, f.originals[0].stat.mtime); }
+      if (mode === 'replace-row') { const projects = storeInstance.get('projects', []); projects.find(project => project.id === f.project.id).files.find(row => row.path === f.rows[0].path).id = 'replacement-row'; storeInstance.set('projects', projects); }
+      if (mode === 'cancel') operation.close();
+      if (mode === 'expiry') testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      if (mode === 'new-owner') { metadataTestHooks.clearAssetBaselineScans(); metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, [f.source]); }
+      const saved = JSON.stringify(storeInstance.get('projects', []).find(project => project.id === f.project.id).files);
+      gate.release(); const result = await scan;
+      assert.notEqual(result?.success, true);
+      assert.equal(JSON.stringify(storeInstance.get('projects', []).find(project => project.id === f.project.id).files), saved);
+      assert.equal(fs.statSync(f.rows[0].path).ino, inode);
+      assert.equal(fs.readdirSync(f.extractDir).length, 1);
+      if (mode === 'new-owner') assert.equal(metadataTestHooks.getBaselineState(f.project.id).queuedSourceKeys.size, 1);
+    } finally { gate.release(); restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+for (const watcher of [false, true]) {
+  test(`PSD reuse concurrent required retry and watcher ${watcher} accept one output`, async () => {
+    const f = await makePsdReuseFixture(), gate = deferredScanBoundary();
+    let restore = () => {}, prepared = 0;
+    try {
+      // A new source snapshot makes both preparations initially see no receipt.
+      fs.writeFileSync(f.source, 'new concurrent source snapshot');
+      restore = metadataTestHooks.pausePsdAcceptance(async () => { if (++prepared <= 2) await gate.wait(); });
+      const first = f.scan(), second = f.scan({ watcher });
+      await waitForCondition(() => prepared === 2, 'both scans prepared against the same receipt map');
+      gate.release();
+      assert.deepEqual((await Promise.all([first, second])).map(result => result.success), [true, true]);
+      assertPsdOriginalsPreserved(f);
+      assert.equal(fs.readdirSync(f.extractDir).length, 2);
+      assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 2);
+      assert.equal(f.owner.requiredReservations?.size || 0, 0);
+      assert.equal(f.owner.activeScans.size, 0);
+    } finally { gate.release(); restore(); f.cleanup(); }
+  });
+}
+test('PSD reuse later corrupt entry causes no partial row acceptance', async () => {
+  const f = await makePsdReuseFixture({ entries: ['first.bin', 'second.bin'].map(name => ({ name, data: Buffer.from(name) })) });
+  try {
+    fs.writeFileSync(f.rows[1].path, 'corrupted second output');
+    const saved = JSON.stringify((await getProject(f.project.id)).files);
+    assert.equal((await f.scan()).success, false);
+    assert.equal(JSON.stringify((await getProject(f.project.id)).files), saved);
+    assert.equal(fs.readdirSync(f.extractDir).length, 2);
+    assert.equal(fs.statSync(f.rows[0].path).ino, f.originals[0].stat.ino);
+  } finally { f.cleanup(); }
+});
+
+for (const watcherFirst of [false, true]) {
+  test(`PSD reuse mixed no-data and repeated embedded names cross path watcher first ${watcherFirst}`, async () => {
+    const f = await makePsdReuseFixture({ watcherFirst, entries: [
+      { name: 'linked-only.bin' }, { name: 'repeated.bin', data: Buffer.from('first entry') },
+      { name: 'another-linked.bin' }, { name: 'repeated.bin', data: Buffer.from('second entry') },
+    ] });
+    try {
+      assert.equal((await f.scan({ watcher: !watcherFirst })).success, true);
+      assertPsdOriginalsPreserved(f);
+      assert.equal(fs.readdirSync(f.extractDir).length, 2);
+      assert.equal((await getProject(f.project.id)).files.filter(row => row.source === 'psd-embedded').length, 2);
+    } finally { f.cleanup(); }
+  });
+}
+for (const mode of ['cancel', 'expiry']) {
+  test(`PSD reuse ${mode} during transaction finish preserves borrowed inode with no late metadata`, async () => {
+    const f = await makePsdReuseFixture(), gate = deferredScanBoundary();
+    let restore = () => {};
+    const originalNow = testAccountSession.now;
+    try {
+      const operation = metadataTestHooks.captureProjectOperation(f.project.id);
+      restore = metadataTestHooks.pausePsdFinish(gate.wait);
+      const scan = f.scan({ operation }); await gate.started;
+      const saved = JSON.stringify(storeInstance.get('projects', [])); testRendererEvents.length = 0;
+      if (mode === 'cancel') operation.close();
+      else testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      gate.release(); await scan;
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), saved);
+      assert.equal(testRendererEvents.filter(event => event.data?.projectId === f.project.id).length, 0);
+      assertPsdOriginalsPreserved(f);
+      assert.equal(fs.readdirSync(f.extractDir).length, 1);
+      assert.equal(f.owner.activeScans.size, 0);
+    } finally { gate.release(); restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+test('PSD reuse replacement of redundant new output is never cleaned as owned', async () => {
+  const f = await makePsdReuseFixture(), gate = deferredScanBoundary();
+  let restore = () => {};
+  try {
+    let redundant;
+    restore = metadataTestHooks.pausePsdAcceptance(async acceptance => { redundant = acceptance.items[0].output.path; await gate.wait(); });
+    const scan = f.scan(); await gate.started;
+    fs.renameSync(redundant, path.join(f.root, 'owned-redundant.bin'));
+    fs.writeFileSync(redundant, 'foreign redundant replacement');
+    const identity = fs.statSync(redundant).ino;
+    gate.release(); assert.equal((await scan).success, false);
+    assertPsdOriginalsPreserved(f);
+    assert.equal(fs.statSync(redundant).ino, identity);
+    assert.equal(fs.readFileSync(redundant, 'utf8'), 'foreign redundant replacement');
+    assert.equal((await getProject(f.project.id)).files.filter(row => row.source === 'psd-embedded').length, 1);
+  } finally { gate.release(); restore(); f.cleanup(); }
+});
+test('PSD reuse replaced extraction directory preserves old row and foreign directory contents', async () => {
+  const f = await makePsdReuseFixture();
+  try {
+    const saved = JSON.stringify((await getProject(f.project.id)).files);
+    fs.renameSync(f.extractDir, path.join(f.root, 'original-extraction'));
+    fs.mkdirSync(f.extractDir); fs.writeFileSync(f.rows[0].path, 'foreign directory output');
+    const inode = fs.statSync(f.rows[0].path).ino;
+    assert.equal((await f.scan()).success, false);
+    assert.equal(JSON.stringify((await getProject(f.project.id)).files), saved);
+    assert.equal(fs.statSync(f.rows[0].path).ino, inode);
+    assert.equal(fs.readFileSync(f.rows[0].path, 'utf8'), 'foreign directory output');
+    assert.equal(fs.readdirSync(f.extractDir).length, 1);
+  } finally { f.cleanup(); }
+});
+
+test('PSD reuse watcher stage replaced at write completion preserves foreign inode', async () => {
+  const f = await makePsdReuseFixture();
+  const originalWrite = fs.promises.writeFile, originalOpen = fs.promises.open;
+  let replacementPath, replacementInode;
+  const replace = filePath => {
+    if (replacementPath || path.dirname(String(filePath)) !== f.extractDir) return;
+    replacementPath = filePath;
+    fs.renameSync(filePath, path.join(f.root, 'owned-stage.bin'));
+    fs.writeFileSync(filePath, f.originals[0].bytes);
+    replacementInode = fs.statSync(filePath).ino;
+  };
+  try {
+    fs.promises.writeFile = async (filePath, ...args) => { const result = await originalWrite.call(fs.promises, filePath, ...args); replace(filePath); return result; };
+    fs.promises.open = async (filePath, ...args) => {
+      const handle = await originalOpen.call(fs.promises, filePath, ...args);
+      const writeFile = handle.writeFile.bind(handle);
+      handle.writeFile = async (...writeArgs) => { const result = await writeFile(...writeArgs); replace(filePath); return result; };
+      return handle;
+    };
+    assert.equal((await f.scan({ watcher: true })).success, false);
+    assert.ok(replacementPath);
+    assert.equal(fs.lstatSync(replacementPath).ino, replacementInode);
+    assertPsdOriginalsPreserved(f);
+  } finally { fs.promises.writeFile = originalWrite; fs.promises.open = originalOpen; f.cleanup(); }
+});

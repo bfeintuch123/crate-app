@@ -4497,7 +4497,36 @@ function getProjectAssetBaselineSourcePaths(project) {
   return [...pathsByKey.values()];
 }
 
-function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = null, { allowPaused = false } = {}) {
+// Required queue work is independent of retained proof and concurrent observers.
+function getAssetBaselineObserverCohort(state, sourceKey) {
+  state.observerCohorts ||= new Map();
+  let cohort = state.observerCohorts.get(sourceKey);
+  if (!cohort || (cohort.scans.size === 0 && cohort.reservations.size === 0)) {
+    cohort = { scans: new Set(), reservations: new Set(), dependable: false };
+    state.observerCohorts.set(sourceKey, cohort);
+  }
+  return cohort;
+}
+
+function refreshAssetBaselineQueuedKeys(state) {
+  state.queuedSourceKeys = new Set([...state.requiredReservations || []]
+    .filter(reservation => reservation.status === 'queued').map(reservation => reservation.sourceKey));
+}
+
+function settleAssetBaselineReservation(reservation) {
+  if (!reservation || !reservation.state.requiredReservations?.delete(reservation)) return;
+  reservation.status = 'settled';
+  reservation.cohort.reservations.delete(reservation);
+  reservation.state.revision = (reservation.state.revision || 0) + 1;
+  refreshAssetBaselineQueuedKeys(reservation.state);
+}
+
+function hasRequiredAssetBaselineWork(state) {
+  return !!(state.requiredReservations?.size || [...state.observerCohorts?.values() || []]
+    .some(cohort => !cohort.dependable && cohort.scans.size > 0));
+}
+
+function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = null, { allowPaused = false, baselineReservation = null } = {}) {
   const project = getProjects().find(item => item.id === projectId);
   if (!project || (project.status !== 'watching' && !(allowPaused && project.status === 'paused'))) return null;
   if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
@@ -4508,6 +4537,9 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   if (!sourceKey || !isProjectAssetBaselineSource(acceptedSource)) return null;
 
   let state = assetBaselineScans.get(projectId);
+  if (baselineReservation && (baselineReservation.state !== state ||
+      baselineReservation.sourceKey !== sourceKey || baselineReservation.status !== 'queued' ||
+      !state?.requiredReservations?.has(baselineReservation))) return null;
   if (!state) {
     const startedAt = Date.now();
     state = {
@@ -4523,12 +4555,17 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   } else {
     state.queuedSourceKeys ||= new Set();
     state.requiredSourceKeys.add(sourceKey);
-    state.queuedSourceKeys?.delete(sourceKey);
   }
 
+  const cohort = baselineReservation?.cohort || getAssetBaselineObserverCohort(state, sourceKey);
+  if (baselineReservation) {
+    baselineReservation.status = 'active';
+    refreshAssetBaselineQueuedKeys(state);
+  }
   state.activeScans ||= new Set();
   state.revision = (state.revision || 0) + 1;
-  const scan = { projectId, sourceKey, state, startedAt: state.startedAt, activationToken, allowPaused };
+  const scan = { projectId, sourceKey, state, cohort, baselineReservation, startedAt: state.startedAt, activationToken, allowPaused };
+  cohort.scans.add(scan);
   state.activeScans.add(scan);
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
   return scan;
@@ -4539,6 +4576,8 @@ function releaseProjectAssetBaselineScan(scan) {
   const state = scan.state;
   if (!state || !state.activeScans?.has(scan)) return false;
   state.activeScans.delete(scan);
+  scan.cohort?.scans.delete(scan);
+  settleAssetBaselineReservation(scan.baselineReservation);
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
   if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
   else state.inFlightBySource.delete(scan.sourceKey);
@@ -4552,19 +4591,22 @@ async function completeProjectAssetBaselineScan(scan, dependable, isCurrent = ()
   if (!releaseProjectAssetBaselineScan(scan)) return;
   const ownsBaseline = () => assetBaselineScans.get(scan.projectId) === state && !scan.cancelled && isCurrent();
   if (!ownsBaseline()) return;
+  if (dependable) {
+    state.completedSourceKeys.add(scan.sourceKey);
+    scan.cohort.dependable = true;
+  }
+  await finalizeProjectAssetBaselineScan(scan, isCurrent);
+}
+
+async function finalizeProjectAssetBaselineScan(scan, isCurrent) {
+  const state = scan.state;
+  const ownsBaseline = () => assetBaselineScans.get(scan.projectId) === state && !scan.cancelled && isCurrent();
+  if (!ownsBaseline()) return;
   state.revision = (state.revision || 0) + 1;
   const completionRevision = state.revision;
-  // A duplicate observer can start more than one scan for the same source.
-  // One dependable completion is sufficient; a later failed duplicate must not
-  // erase that proof and make the result depend on completion order.
-  if (dependable) state.completedSourceKeys.add(scan.sourceKey);
-
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
-  // Complete proof belongs to the authorized winner. Redundant duplicate scans
-  // need not keep it pending until that winner's operation has already closed.
-  if (state.queuedSourceKeys?.size > 0 || (!complete && state.inFlightBySource.size > 0)) return;
-  const canFinalize = () => ownsBaseline() && state.revision === completionRevision &&
-    !state.queuedSourceKeys?.size && (complete || state.inFlightBySource.size === 0);
+  if (hasRequiredAssetBaselineWork(state)) return;
+  const canFinalize = () => ownsBaseline() && state.revision === completionRevision && !hasRequiredAssetBaselineWork(state);
   if (!complete) {
     const failedSourceKeys = new Set(
       [...state.requiredSourceKeys].filter(key => !state.completedSourceKeys.has(key))
@@ -4651,26 +4693,32 @@ function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
       .filter(([sourceKey, sourcePath]) => sourceKey && typeof sourcePath === 'string' && sourcePath)
   ).values()];
   const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
-  if (state) {
-    for (const sourcePath of uniquePaths) {
-      const sourceKey = normalizeTrackedFilePath(sourcePath);
-      if (sourceKey) state.queuedSourceKeys.add(sourceKey);
-    }
-  }
+  const reservations = uniquePaths.map(sourcePath => {
+    if (!state) return null;
+    const sourceKey = normalizeTrackedFilePath(sourcePath);
+    const cohort = getAssetBaselineObserverCohort(state, sourceKey);
+    const reservation = { state, sourceKey, cohort, status: 'queued' };
+    state.requiredReservations ||= new Set();
+    state.requiredReservations.add(reservation);
+    cohort.reservations.add(reservation);
+    return reservation;
+  });
+  if (state) refreshAssetBaselineQueuedKeys(state);
+  // Keep the existing path-array interface; tokens are private to this queue.
+  Object.defineProperty(uniquePaths, 'baselineReservations', { value: reservations });
   return uniquePaths;
 }
 
 function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths, state) {
   if (!state) return;
-  state.revision = (state.revision || 0) + 1;
-  for (const sourcePath of Array.isArray(sourcePaths) ? sourcePaths : []) {
-    const sourceKey = normalizeTrackedFilePath(sourcePath);
-    if (!sourceKey || !state.queuedSourceKeys?.has(sourceKey)) continue;
-    state.queuedSourceKeys.delete(sourceKey);
-    state.requiredSourceKeys.delete(sourceKey);
-  }
-  if (assetBaselineScans.get(projectId) === state && state.inFlightBySource.size === 0 && state.requiredSourceKeys.size === 0) {
-    assetBaselineScans.delete(projectId);
+  for (const reservation of sourcePaths?.baselineReservations || []) {
+    if (reservation?.state !== state) continue;
+    for (const scan of [...state.activeScans || []]) {
+      if (scan.baselineReservation !== reservation) continue;
+      scan.cancelled = true;
+      releaseProjectAssetBaselineScan(scan);
+    }
+    settleAssetBaselineReservation(reservation);
   }
 }
 
@@ -4685,13 +4733,15 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
       const index = nextIndex++;
       if (index >= queuedPaths.length) return;
       const sourcePath = queuedPaths[index];
+      const baselineReservation = queuedPaths.baselineReservations[index];
+      const scanOptions = { ...options, baselineReservation };
       if (!operation.current()) {
         outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
         continue;
       }
       try {
         if (options.addFilesScan !== true) {
-          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
+          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
           if (!operation.current()) {
             outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           } else if (result && result.success === false) {
@@ -4716,7 +4766,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
                   onCancel: scanLease.onCancel,
                   adoptScope: scope => operation.adoptScope(scope) && scanLease.current(),
                 },
-                { ...options, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
+                { ...scanOptions, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
               );
             } finally {
               releaseOnCancel();
@@ -4744,6 +4794,9 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         }
       } catch (_) {
         outcomes[index] = { path: sourcePath, success: false, error: 'scan_on_open_failed' };
+      } finally {
+        // Includes a scan rejected before it could claim its reservation.
+        settleAssetBaselineReservation(baselineReservation);
       }
     }
   };
@@ -4753,6 +4806,12 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   if (!operation.current()) {
     cancelProjectAssetBaselineScanQueue(projectId, queuedPaths, baselineQueueState);
     return { cancelled: true, outcomes };
+  }
+  if (baselineQueueState) {
+    await finalizeProjectAssetBaselineScan({
+      projectId, state: baselineQueueState, activationToken,
+      allowPaused: options.allowPausedBaseline === true,
+    }, operation.current);
   }
   return { cancelled: false, outcomes };
 }
@@ -4772,10 +4831,19 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
     if (acceptedKeys.has(key)) continue;
     state.requiredSourceKeys.delete(key);
     state.completedSourceKeys.delete(key);
+    for (const scan of [...state.activeScans || []]) {
+      if (scan.sourceKey !== key) continue;
+      scan.cancelled = true;
+      releaseProjectAssetBaselineScan(scan);
+    }
+    for (const reservation of [...state.requiredReservations || []]) {
+      if (reservation.sourceKey === key) settleAssetBaselineReservation(reservation);
+    }
+    state.observerCohorts?.delete(key);
     state.inFlightBySource.delete(key);
     state.presentationMediaOccurrencesBySource?.delete(key);
   }
-  if (state.inFlightBySource.size > 0) return;
+  if (hasRequiredAssetBaselineWork(state)) return;
   if (![...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key))) return;
   const result = establishProjectAssetBaseline(projectId, null, null, state.startedAt, { allowPaused });
   const current = getProjects().find(item => item.id === projectId);
@@ -4784,15 +4852,17 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
   }
 }
 
-async function isFailedRequiredAssetBaselineSource(project, file) {
+async function isFailedRequiredAssetBaselineSource(project, file, { receipt = false } = {}) {
   if (!project || !file || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
   const state = assetBaselineScans.get(project.id);
   const sourceKey = normalizeTrackedFilePath(file.path);
+  const revision = state?.revision;
   if (state && !(
       sourceKey &&
       state.requiredSourceKeys.has(sourceKey) &&
       !state.completedSourceKeys.has(sourceKey) &&
-      !state.inFlightBySource.has(sourceKey)
+      !state.inFlightBySource.has(sourceKey) &&
+      ![...state.requiredReservations || []].some(reservation => reservation.sourceKey === sourceKey)
   )) return false;
 
   // Live scan state identifies which source failed, but path identity alone is
@@ -4803,11 +4873,21 @@ async function isFailedRequiredAssetBaselineSource(project, file) {
     .find(candidate => candidate.sourceKeyHash === sourceKeyHash);
   if (!record) return false;
   const currentRecord = await getAssetBaselineSourceRecoveryRecord(project, file);
-  return !!(
-    currentRecord &&
-    currentRecord.sourceKeyHash === record.sourceKeyHash &&
-    currentRecord.physicalIdentityHash === record.physicalIdentityHash
+  const current = candidate => !!(
+    candidate && candidate.assetBaseline?.status === 'awaiting-first-scan' &&
+    candidate.files?.some(item => JSON.stringify(item) === JSON.stringify(file)) &&
+    assetBaselineScans.get(project.id) === state && state?.revision === revision &&
+    normalizeFailedRequiredAssetBaselineSources(candidate, candidate.assetBaseline)
+      .some(item => item.sourceKeyHash === record.sourceKeyHash && item.physicalIdentityHash === record.physicalIdentityHash) &&
+    currentRecord && currentRecord.sourceKeyHash === record.sourceKeyHash &&
+    currentRecord.physicalIdentityHash === record.physicalIdentityHash &&
+    (() => { try {
+      const stat = fs.lstatSync(file.path, { bigint: true });
+      return !stat.isSymbolicLink() && getAssetBaselineSourcePhysicalIdentityHash(candidate, stat) === record.physicalIdentityHash;
+    } catch (_) { return false; } })()
   );
+  if (!current(getProjects().find(item => item.id === project.id))) return false;
+  return receipt ? current : true;
 }
 
 function hasInFlightAssetBaselineScan(projectId) {
@@ -11972,7 +12052,8 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         if (message.index !== (embedded ? embeddedCount : entryCount) || (!embedded && (sawEmbedded || message.byteLength !== 0))) invalid();
         sawEmbedded ||= embedded;
         record = { kind: message.kind, index: message.index, textUnits: message.textUnits,
-          byteLength: message.byteLength, text: '', written: 0, stage: null };
+          byteLength: message.byteLength, text: '', written: 0, stage: null,
+          hash: embedded ? crypto.createHash('sha256') : null };
       } else if (message.type === 'text') {
         if (!record || record.stage || typeof message.text !== 'string' || !message.text.length
           || message.text.length > 16384 || message.text.length > record.textUnits - record.text.length) invalid();
@@ -11995,6 +12076,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           offset += bytesWritten;
           record.written += bytesWritten;
         }
+        record.hash.update(message.bytes);
         assertCacheFileDescriptorIdentity(stage.handle.fd, stage.stagedPath, directoryIdentity, 'psd-extract-file');
       } else if (message.type === 'record-end') {
         if (!record || record.text.length !== record.textUnits || record.written !== record.byteLength) invalid();
@@ -12007,6 +12089,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           stage.handle = null;
           check();
           ownedPath(stage, stage.stagedPath);
+          stage.outputDigest = record.hash.digest('hex');
           embeddedCount++;
         } else {
           entries.push({ filePath: record.text, source: 'psd-linked' });
@@ -12045,7 +12128,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         if (ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
       }
       return stages.map(stage => ({ filePath: stage.extractPath, source: 'psd-embedded',
-        embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex, sourceDigest }));
+        embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex, sourceDigest, outputDigest: stage.outputDigest }));
     },
     assertReady() {
       check();
@@ -12278,6 +12361,11 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
   if (ext === '.psd') {
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
+    if (!isAddFilesSourceIdentityCurrent(await fs.promises.stat(filePath), getAddFilesSourceIdentity(stat))) {
+      throw new Error('asset_baseline_source_changed');
+    }
+    return { kind: 'psd-buffer-result', buffer, sourceIdentity: getAddFilesSourceIdentity(stat),
+      sourceDigest: crypto.createHash('sha256').update(buffer).digest('hex') };
   } else if (STRICT_ZIP_ASSET_BASELINE_EXTENSIONS.has(ext)) {
     await execFileAsync('/usr/bin/unzip', ['-tqq', filePath], {
       timeout: 10000,
@@ -12502,7 +12590,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       workerResult = await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt, options.psdTransaction);
       if (!isCurrent()) return [];
     } else {
-      const buf = await fs.promises.readFile(psdFilePath);
+      const buf = options.sourceBuffer || await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
       psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
     }
@@ -12549,7 +12637,9 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       await fs.promises.mkdir(extractDir, { recursive: true });
       if (!isCurrent()) return [];
       const directoryIdentity = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory');
+      options.onOwnedPsdOutputs?.(invocationFiles);
       const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase()));
+      let baselineEmbeddedOrdinal = 0;
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!isCurrent()) return [];
         if (!lf.data) continue;
@@ -12561,14 +12651,33 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           stagedPath,
           extractPath,
           extractDir,
+          directoryIdentity,
           embeddedOriginalName: lf.name || '',
-          embeddedIndex,
+          // The streamed parser numbers embedded records only. Preserve the
+          // legacy index for other callers, but share its ordinal for receipts.
+          embeddedIndex: options.onOwnedPsdOutputs ? baselineEmbeddedOrdinal++ : embeddedIndex,
+          outputDigest: crypto.createHash('sha256').update(data).digest('hex'),
           identity: null,
           committed: false,
         };
         invocationFiles.push(staged);
-        await fs.promises.writeFile(stagedPath, data, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE });
+        if (options.onOwnedPsdOutputs) {
+          const handle = await fs.promises.open(stagedPath,
+            fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), OWNER_ONLY_FILE_MODE);
+          try {
+            const opened = fs.fstatSync(handle.fd);
+            staged.identity = { dev: opened.dev, ino: opened.ino };
+            if (!isCurrent()) throw new Error('stale_project_operation');
+            await handle.writeFile(data);
+            assertCacheFileDescriptorIdentity(handle.fd, stagedPath, directoryIdentity, 'psd-extract-file');
+          } finally { await handle.close(); }
+        } else {
+          await fs.promises.writeFile(stagedPath, data, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE });
+        }
         const stagedStat = fs.lstatSync(stagedPath);
+        if (staged.identity && (stagedStat.dev !== staged.identity.dev || stagedStat.ino !== staged.identity.ino)) {
+          throw cacheSafetyError('psd-extract-file', 'changed');
+        }
         if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) {
           throw cacheSafetyError('psd-extract-file', 'unsafe');
         }
@@ -12598,6 +12707,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           embeddedOriginalName: staged.embeddedOriginalName,
           embeddedIndex: staged.embeddedIndex,
           sourceDigest: workerResult?.sourceDigest || null,
+          outputDigest: staged.outputDigest,
         });
       }
     }
@@ -12608,7 +12718,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     if (options.strict === true) throw e;
     return [];
-  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino); if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
+  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = staged.identity ? (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino) : !options.onOwnedPsdOutputs; if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
 }
 
 /**
@@ -13023,6 +13133,123 @@ async function captureExistingPresentationMediaBaseline(
   }
 }
 
+// Baseline receipts are private to one owner. They prove an earlier accepted
+// asset, never authority for a new scan or ownership of its borrowed output.
+function psdBaselineFileIdentity(stat) {
+  return { ...getAddFilesSourceIdentity(stat), ctimeMs: stat.ctimeMs };
+}
+function assertPsdBaselineSnapshot(snapshot) {
+  if (snapshot.directory) assertCacheDirectoryIdentity(snapshot.directory, 'psd-extract-directory');
+  const stat = fs.lstatSync(snapshot.path);
+  if (stat.isSymbolicLink() || !isAddFilesSourceIdentityCurrent(stat, snapshot.identity) ||
+      stat.ctimeMs !== snapshot.identity.ctimeMs || fs.realpathSync(snapshot.path) !== snapshot.realPath) {
+    throw new Error('asset_baseline_psd_output_changed');
+  }
+}
+async function readPsdBaselineSnapshot(filePath, isCurrent, directory = null) {
+  const check = () => { if (!isCurrent()) throw new Error('stale_project_operation'); };
+  check();
+  const initial = fs.lstatSync(filePath);
+  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error('asset_baseline_psd_output_changed');
+  const snapshot = { path: filePath, realPath: fs.realpathSync(filePath),
+    identity: psdBaselineFileIdentity(initial), directory };
+  assertPsdBaselineSnapshot(snapshot);
+  const handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    check();
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (offset < initial.size) {
+      check();
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset);
+      check();
+      if (bytesRead <= 0) throw new Error('asset_baseline_psd_output_changed');
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    const final = await handle.stat();
+    check();
+    if (!isAddFilesSourceIdentityCurrent(final, snapshot.identity) || final.ctimeMs !== snapshot.identity.ctimeMs) {
+      throw new Error('asset_baseline_psd_output_changed');
+    }
+    snapshot.digest = hash.digest('hex');
+  } finally { await handle.close(); }
+  check();
+  assertPsdBaselineSnapshot(snapshot);
+  return snapshot;
+}
+function findPsdBaselineReceiptRow(project, receipt) {
+  return (project[receipt.collection] || []).find(row => JSON.stringify(row) === receipt.row);
+}
+async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, assets, isCurrent) {
+  const owner = baselineScan.state;
+  owner.psdOutputReceipts ||= new Map();
+  const receipts = owner.psdOutputReceipts;
+  const sourceRow = getProjects().find(project => project.id === projectId)?.files
+    .find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const sourceRowSnapshot = JSON.stringify(sourceRow);
+  const source = await readPsdBaselineSnapshot(filePath, isCurrent);
+  if (!isAddFilesSourceIdentityCurrent(fs.lstatSync(filePath), validatedSource.sourceIdentity) ||
+      source.digest !== validatedSource.sourceDigest) throw new Error('asset_baseline_source_changed');
+  const directory = captureCacheDirectoryIdentity(path.join(os.tmpdir(), 'crate-psd-extract-' + projectId), 'psd-extract-directory');
+  const items = [];
+  for (const asset of assets.filter(asset => asset.source === 'psd-embedded')) {
+    const key = JSON.stringify([normalizeTrackedFilePath(filePath), source.realPath, source.identity,
+      source.digest, asset.embeddedIndex, asset.embeddedOriginalName]);
+    const previous = receipts.get(key);
+    const output = await readPsdBaselineSnapshot(asset.filePath, isCurrent, directory);
+    if (output.digest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+    let borrowed = null;
+    if (previous) {
+      previous.assertAccountCurrent();
+      assertPsdBaselineSnapshot(previous.output);
+      borrowed = await readPsdBaselineSnapshot(previous.output.path, isCurrent, previous.output.directory);
+      if (borrowed.digest !== previous.output.digest || borrowed.digest !== output.digest) {
+        throw new Error('asset_baseline_psd_output_changed');
+      }
+    }
+    items.push({ asset, key, previous, output, borrowed });
+  }
+  const selectionCurrent = () => items.every(item => receipts.get(item.key) === item.previous);
+  const check = project => {
+    if (!isCurrent() || assetBaselineScans.get(projectId) !== owner || !selectionCurrent() ||
+        !project.files.some(row => JSON.stringify(row) === sourceRowSnapshot)) throw new Error('stale_project_operation');
+    assertPsdBaselineSnapshot(source);
+    for (const item of items) {
+      assertPsdBaselineSnapshot(item.output);
+      if (item.previous) {
+        item.previous.assertAccountCurrent();
+        if (!findPsdBaselineReceiptRow(project, item.previous)) throw new Error('asset_baseline_psd_output_changed');
+        assertPsdBaselineSnapshot(item.previous.output);
+        assertPsdBaselineSnapshot(item.borrowed);
+      }
+    }
+  };
+  return { items, selectionCurrent, check, remember(project) {
+    check(project);
+    for (const item of items) {
+      if (item.previous) continue;
+      for (const collection of ['files', 'pendingFiles']) {
+        const row = (project[collection] || []).find(row => row.path === item.asset.filePath && row.source === 'psd-embedded');
+        if (row) receipts.set(item.key, { output: item.output, collection, row: JSON.stringify(row),
+          assertAccountCurrent: captureAccountAuthorization() });
+      }
+    }
+  } };
+}
+function finishBaselinePsdOutputs(outputs) {
+  for (const stage of outputs) {
+    if (!stage.committed || stage.accepted || !stage.identity) continue;
+    try {
+      assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+      const stat = fs.lstatSync(stage.extractPath);
+      if (isDirectCacheChild(stage.extractDir, stage.extractPath) && !stat.isSymbolicLink() && stat.isFile() &&
+          stat.dev === stage.identity.dev && stat.ino === stage.identity.ino) fs.unlinkSync(stage.extractPath);
+    } catch (_) { /* A replacement is never ours to remove. */ }
+  }
+}
+
 /**
  * Run scan-on-open for a design file: extract linked assets and merge into project.
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
@@ -13047,7 +13274,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     ? null
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
+      baselineReservation: options.baselineReservation,
     });
+  if (options.baselineReservation && !baselineScan) {
+    if (ownsOperation) operation?.close();
+    return { success: false, error: 'stale_project_operation' };
+  }
   if (options.addFilesScanLease) options.addFilesScanLease.baselineScan = baselineScan;
   if (baselineScan && options.addFilesScanLease) {
     options.addFilesScanLease.onCancel(() => {
@@ -13056,6 +13288,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
   let dependableScanCompleted = false;
   let psdTransaction = null;
+  let baselinePsdOutputs = [];
   try {
 
   if (ext === '.psd' && options.addFilesAttempt) {
@@ -13082,7 +13315,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   if (!isCurrent()) return;
   const recheckValidatedSource = async () => {
     if (!baselineScan || !validatedSource) return true;
-    if (validatedSource.kind === 'psd-worker-result') {
+    if (validatedSource.kind === 'psd-worker-result' || validatedSource.kind === 'psd-buffer-result') {
       return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
     }
     if (validatedSource.kind === 'regex-worker-result') {
@@ -13187,6 +13420,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       psdTransaction,
+      sourceBuffer: validatedSource?.kind === 'psd-buffer-result' ? validatedSource.buffer : undefined,
+      onOwnedPsdOutputs: baselineScan ? outputs => { baselinePsdOutputs = outputs; } : undefined,
       addFilesAttempt: options.addFilesAttempt,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
@@ -13195,6 +13430,15 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdTransaction && !await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdAssets.length > 0) {
+      let acceptance = null;
+      if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
+        // Another full scan may accept while hashing. Recompare its receipt;
+        // never publish based on a stale absence. No await follows this loop.
+        for (let attempt = 0; attempt < 4; attempt++) {
+          acceptance = await preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, psdAssets, isCurrent);
+          if (acceptance.selectionCurrent()) break;
+        }
+      }
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -13208,10 +13452,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
             throw new Error('asset_baseline_source_changed');
           }
         }
-        // v2.4.0: normalize paths before comparing to prevent duplicates
+        // Validate every candidate before mutating any row; mutateProject does
+        // not roll back a partially modified project when its callback throws.
+        acceptance?.check(proj);
         const acceptedFiles = [];
         let changed = false;
         for (const asset of psdAssets) {
+          if (acceptance?.items.some(item => item.asset === asset && item.previous)) continue;
           const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
           let baselineMetadataChanged = false;
           if (baselineScan) {
@@ -13254,6 +13501,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         if (!psdRowsAccepted) throw new Error('add_files_parser_cancelled');
         psdTransaction.accept(getProjects().find(proj => proj.id === projectId));
       }
+      if (psdRowsAccepted) {
+        const acceptedProject = getProjects().find(proj => proj.id === projectId);
+        const acceptedPaths = new Set([...(acceptedProject.files || []), ...(acceptedProject.pendingFiles || [])].map(row => row.path));
+        for (const stage of baselinePsdOutputs) stage.accepted = acceptedPaths.has(stage.extractPath);
+        acceptance?.remember(acceptedProject);
+      }
       if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
@@ -13280,8 +13533,15 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     };
   } finally {
     try {
-      if (psdTransaction) await psdTransaction.finish();
-      await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
+      try {
+        if (psdTransaction) await psdTransaction.finish();
+        finishBaselinePsdOutputs(baselinePsdOutputs);
+      } catch (error) {
+        dependableScanCompleted = false;
+        throw error;
+      } finally {
+        await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
+      }
     } finally { if (ownsOperation) operation?.close(); }
   }
 }
@@ -14992,9 +15252,9 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
   const currentFile = currentProject && currentProject.files.find(file => (
     matchesProjectFileIdentity(currentProject.id, file, fileIdOrPath)
   ));
-  const failedSourceRemovalAllowed = !!(
+  const failedSourceRemovalAllowed = (
     currentProject && currentFile && isProjectAssetBaselineSource(currentFile) &&
-    await isFailedRequiredAssetBaselineSource(currentProject, currentFile)
+    await isFailedRequiredAssetBaselineSource(currentProject, currentFile, { receipt: true })
   );
   let removed = false;
   let changed = false;
@@ -15008,7 +15268,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
     if (
       removedFile &&
       isProjectAssetBaselineSource(removedFile) &&
-      !failedSourceRemovalAllowed
+      !(failedSourceRemovalAllowed && failedSourceRemovalAllowed(project))
     ) {
       return project.files;
     }
