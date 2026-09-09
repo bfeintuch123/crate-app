@@ -700,6 +700,7 @@ async function getAccountCurrentProjects() {
 }
 
 async function loadAccountWorkspace() {
+  if (projectCreationPhase === 'reconciling') return requestProjectCreationRecovery();
   const epoch = accountWorkspaceEpoch;
   const readEpoch = projectListReadEpoch;
 
@@ -713,10 +714,6 @@ async function loadAccountWorkspace() {
     state.projects = Array.isArray(projects) ? projects : [];
     state.settings = settings && typeof settings === 'object' ? settings : {};
     state.usage = usage && typeof usage === 'object' ? usage : {};
-    if (projectCreationPhase === 'reconciling') {
-      finishProjectCreationAttempt();
-      setProjectCreationStatus('Account changed. Review your projects before starting another.');
-    }
     try {
       if (typeof window.crate.reportRendererStartupDataComplete === 'function') {
         window.crate.reportRendererStartupDataComplete();
@@ -916,6 +913,11 @@ function updateAddProjectButton() {
 // ===== New Project Form =====
 let projectCreationPhase = 'idle';
 let projectListReadEpoch = 0;
+let projectCreationAttemptId = 0;
+let projectCreationRecoveryRead = null;
+let projectCreationFollowUpRead = null;
+let projectCreationRecoveryRetry = null;
+const PROJECT_RECOVERY_READ_TIMEOUT_MS = 10_000;
 
 function projectListReadIsCurrent(epoch) {
   return epoch === projectListReadEpoch && projectCreationPhase === 'idle';
@@ -948,14 +950,14 @@ function setProjectCreationStatus(message) {
 function setProjectCreationPhase(phase) {
   projectCreationPhase = phase;
   const locked = isProjectCreationLocked();
-  const busy = phase === 'creating' || phase === 'reconciling';
+  const busy = phase === 'creating' || (phase === 'reconciling' && !!projectCreationRecoveryRead);
 
   const createButton = $('#btn-create-project');
   if (createButton) {
     const atCap = state.projects.length >= MAX_PROJECTS;
     createButton.disabled = locked || atCap;
     createButton.textContent = phase === 'reconciling'
-      ? 'Checking projects\u2026'
+      ? (busy ? 'Checking projects\u2026' : 'Check saved projects to continue')
       : phase === 'creating'
       ? 'Starting\u2026'
       : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching');
@@ -977,26 +979,125 @@ function setProjectCreationPhase(phase) {
 
   const form = $('#new-project-form');
   if (form) form.setAttribute('aria-busy', busy ? 'true' : 'false');
+  if (projectCreationRecoveryRetry) {
+    projectCreationRecoveryRetry.classList.toggle('hidden', phase !== 'reconciling');
+    projectCreationRecoveryRetry.disabled = phase !== 'reconciling' || busy || !accountStatus.canUseWorkspace;
+  }
   if (phase === 'creating') setProjectCreationStatus('Starting project. Please wait.');
 }
 
+function detachProjectCreationRecoveryRead() {
+  const owner = projectCreationRecoveryRead;
+  projectCreationRecoveryRead = null;
+  if (owner) {
+    clearTimeout(owner.timer);
+    owner.detach();
+  }
+}
+
 function finishProjectCreationAttempt() {
+  detachProjectCreationRecoveryRead();
   projectListReadEpoch += 1;
   setProjectCreationPhase('idle');
 }
 
+function renderProjectCreationRecovery() {
+  if (!projectCreationRecoveryRetry) {
+    const button = document.createElement('button');
+    button.id = 'btn-retry-project-recovery';
+    button.type = 'button';
+    button.className = 'btn btn-secondary';
+    button.textContent = 'Check saved projects again';
+    button.style.marginTop = '8px';
+    button.addEventListener('click', () => {
+      if (!button.disabled) void requestProjectCreationRecovery();
+    });
+    getProjectCreationStatus();
+    $('#new-project-form').appendChild(button);
+    projectCreationRecoveryRetry = button;
+  }
+  setProjectCreationPhase('reconciling');
+  setProjectCreationStatus(projectCreationRecoveryRead
+    ? 'Checking saved projects before you can start another.'
+    : accountStatus.canUseWorkspace
+    ? 'Saved projects could not be checked. Check again before starting another.'
+    : 'Sign in to check saved projects before starting another.');
+}
+
+function requestProjectCreationRecovery() {
+  if (projectCreationPhase !== 'reconciling') return;
+  if (!accountStatus.canUseWorkspace) {
+    renderProjectCreationRecovery();
+    return;
+  }
+  if (projectCreationRecoveryRead) {
+    // A later authorization/retry trigger must survive a denied pending read.
+    // One successful current read satisfies all demand; failures consume at
+    // most one queued trigger, never generating their own automatic retries.
+    projectCreationRecoveryRead.requestedAgain = true;
+    return projectCreationRecoveryRead.promise;
+  }
+  const owner = {
+    attempt: projectCreationAttemptId,
+    accountEpoch: accountWorkspaceEpoch,
+    readEpoch: projectListReadEpoch,
+    requestedAgain: false,
+    timer: null,
+    detach: null,
+    promise: null,
+  };
+  projectCreationRecoveryRead = owner;
+  const isCurrent = () => projectCreationRecoveryRead === owner &&
+    owner.attempt === projectCreationAttemptId && owner.accountEpoch === accountWorkspaceEpoch &&
+    owner.readEpoch === projectListReadEpoch && projectCreationPhase === 'reconciling';
+  const stopped = new Promise(resolve => {
+    owner.detach = () => resolve({ stopped: true });
+    owner.timer = setTimeout(owner.detach, PROJECT_RECOVERY_READ_TIMEOUT_MS);
+  });
+  let read;
+  try { read = window.crate.getProjects(); }
+  catch (error) { read = Promise.reject(error); }
+  owner.promise = (async () => {
+    try {
+      const result = await Promise.race([
+        Promise.resolve(read).then(projects => ({ projects }), error => ({ error })),
+        stopped,
+      ]);
+      if (!isCurrent()) return;
+      if (accountStatus.canUseWorkspace && Array.isArray(result.projects)) {
+        state.projects = result.projects;
+        finishProjectCreationAttempt();
+        setProjectCreationStatus('Review your saved projects before starting another.');
+        renderProjects();
+      }
+    } finally {
+      clearTimeout(owner.timer);
+      // A retired read, including its rejection/finally, cannot release the
+      // current generation's owner or an entirely new creation attempt.
+      if (isCurrent()) {
+        projectCreationRecoveryRead = null;
+        const retry = owner.requestedAgain && accountStatus.canUseWorkspace;
+        renderProjectCreationRecovery();
+        if (retry) await requestProjectCreationRecovery();
+      }
+    }
+  })();
+  renderProjectCreationRecovery();
+  return owner.promise;
+}
+
 async function reconcileRetiredProjectCreation() {
-  // Only a settled create response or the main account-authorization rejection
-  // reaches here. Either may follow persistence, so keep creation locked until
-  // a fresh current-account read accounts for all saved projects. Timeouts and
-  // unknown transport failures retain the existing unresolved lock.
+  // Only known settled results reach this path. Main can reject after saving,
+  // so recovery reads saved projects and never repeats the original creation.
+  // Unknown transport outcomes and create deadlines stay unresolved.
+  detachProjectCreationRecoveryRead();
   projectListReadEpoch += 1;
   setProjectCreationPhase('reconciling');
-  setProjectCreationStatus('Account changed. Checking saved projects.');
-  if (accountStatus.canUseWorkspace) await loadAccountWorkspace();
+  await requestProjectCreationRecovery();
 }
 
 function enterProjectCreationUnresolved(message) {
+  detachProjectCreationRecoveryRead();
   projectListReadEpoch += 1;
   setProjectCreationPhase('unresolved');
   setProjectCreationStatus(message);
@@ -1108,6 +1209,7 @@ async function createProject() {
     figmaError.textContent = '';
   }
 
+  const creationAttempt = ++projectCreationAttemptId;
   const creationAccountEpoch = accountWorkspaceEpoch;
   projectListReadEpoch += 1;
   setProjectCreationPhase('creating');
@@ -1158,8 +1260,17 @@ async function createProject() {
     }
     if (!hasTypedError && result && result.id) {
       try {
-        const projects = await getAccountCurrentProjects();
-        if (creationAccountEpoch === accountWorkspaceEpoch && Array.isArray(projects)) state.projects = projects;
+        // Creation has settled successfully. An account transition must be
+        // able to retire this follow-up even if the IPC read never settles.
+        const owner = {};
+        const retired = new Promise(resolve => { owner.detach = () => resolve(null); });
+        projectCreationFollowUpRead = owner;
+        try {
+          const projects = await Promise.race([getAccountCurrentProjects(), retired]);
+          if (creationAccountEpoch === accountWorkspaceEpoch && Array.isArray(projects)) state.projects = projects;
+        } finally {
+          if (projectCreationFollowUpRead === owner) projectCreationFollowUpRead = null;
+        }
       } catch (refreshError) {
         logRendererError('Project creation state could not refresh', refreshError);
       }
@@ -1190,7 +1301,7 @@ async function createProject() {
     }
   } finally {
     if (createRequestTimer) clearTimeout(createRequestTimer);
-    if (projectCreationPhase === 'creating') finishProjectCreationAttempt();
+    if (creationAttempt === projectCreationAttemptId && projectCreationPhase === 'creating') finishProjectCreationAttempt();
   }
 }
 
@@ -3176,10 +3287,15 @@ async function runAccountAction(method) {
 }
 function acceptAccountSnapshot(snapshot) {
   if (snapshot.revision < accountStatus.revision) return;
+  const newerSnapshot = snapshot.revision > accountStatus.revision;
   const wasAllowed = accountStatus.canUseWorkspace === true;
   const previousId = accountStatus.identity?.id;
   accountStatus = snapshot;
-  if (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id) accountWorkspaceEpoch++;
+  if (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id) {
+    accountWorkspaceEpoch++;
+    projectCreationFollowUpRead?.detach();
+    detachProjectCreationRecoveryRead();
+  }
   if (wasAllowed && (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id)) {
     // Retire the same modal/selection leases as a project switch, preserving
     // the local selection and records without associating them with an account.
@@ -3193,7 +3309,9 @@ function acceptAccountSnapshot(snapshot) {
     setSelectedProject(state.selectedProjectId, { invalidate: true, restoreFocus: false });
   }
   renderAccount();
-  if (accountStartupLoaded && snapshot.canUseWorkspace && (!wasAllowed || previousId !== snapshot.identity?.id)) void loadAccountWorkspace();
+  if (projectCreationPhase === 'reconciling') {
+    if (newerSnapshot) void requestProjectCreationRecovery();
+  } else if (accountStartupLoaded && snapshot.canUseWorkspace && (!wasAllowed || previousId !== snapshot.identity?.id)) void loadAccountWorkspace();
 }
 async function initializeAccountUI() {
   initializeSettingsNavigation();

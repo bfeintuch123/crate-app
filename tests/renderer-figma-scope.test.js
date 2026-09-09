@@ -7384,3 +7384,226 @@ test('ambiguous creation rejection stays unresolved after reauthentication and a
   await f.renderer.createProject();
   assert.equal(createCalls, 1);
 });
+
+// Settled creation recovery matrix: real session clock + production main IPC
+// authorization wrapper; only provider, persistence and IPC delivery are synthetic.
+function settledRecoveryFixture(t) {
+  const { AccountSession } = require('../account-session');
+  const identity = suffix => ({ id: `11111111-1111-4111-8111-11111111111${suffix}`, email: 'synthetic@example.test', verified: true, methods: ['email'] });
+  let now = 1000, creates = 0, mutations = 0;
+  const refreshGate = createDeferred(), createGate = createDeferred(), reads = [], timers = [], snapshots = [];
+  const session = new AccountSession({ config: {}, now: () => now,
+    provider: { refresh: () => refreshGate.promise, validate: async () => ({ subject: identity(1).id, expiresAt: now + 60000 }), me: async () => identity(1), revoke: async () => {} },
+    credentials: { write() {}, clear() {} } });
+  t.after(() => session.shutdown());
+  const allow = (id = 1) => { session.record = { identity: identity(id), refreshToken: 'synthetic-refresh' }; session.accessToken = 'synthetic-access'; session.authorizeUntil(now + 60000); session.publish('signed_in', '', identity(id)); };
+  allow();
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handlers = {};
+  const main = vm.createContext({ accountSession: session, ipcMain: { handle: (name, fn) => { handlers[name] = fn; } }, assertTrustedRendererIpc() {} });
+  vm.runInContext(source.slice(source.indexOf('function captureAccountAuthorization()'), source.indexOf('function initializeAccountSession()')), main);
+  main.create = () => createGate.promise;
+  vm.runInContext("registerTrustedIpcHandler('projects:create', () => create())", main);
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {
+    createProject: () => { creates++; return handlers['projects:create']({}); },
+    getProjects: () => { const read = createDeferred(); read.authorized = session.canUseWorkspace(); reads.push(read); return read.promise; },
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({ connected: false }),
+  } }, { setTimeout: (callback, delay) => { const timer = { callback, delay, cleared: false }; timers.push(timer); return timer; }, clearTimeout: timer => { if (timer) timer.cleared = true; } });
+  const evaluate = code => vm.runInContext(code, renderer);
+  renderer.initial = session.snapshot();
+  evaluate("state.projects=[{id:'selected',files:[]}];state.selectedProjectId='selected';accountStatus=initial;accountStartupLoaded=true;");
+  renderer.setupEventListeners(); elements['input-project-name'].value = 'Synthetic project';
+  session.on('change', snapshot => { snapshots.push(snapshot); renderer.incoming = snapshot; evaluate('acceptAccountSnapshot(incoming)'); });
+  const list = (count = 2) => Array.from({ length: count }, (_, i) => ({ id: i === 0 ? 'selected' : `saved-${i}`, files: [] }));
+  const expire = (notify = false) => { now = session.accessExpiresAt; if (notify) session.publish('expired'); };
+  const rejectRead = index => reads[index].reject(new Error('Sign in to Crate to use your workspace.'));
+  const assertLocked = phase => { assert.equal(evaluate('projectCreationPhase'), phase); assert.equal(elements['btn-create-project'].disabled, true); assert.equal(creates, 1); assert.equal(evaluate('state.selectedProjectId'), 'selected'); };
+  const assertRecovered = (count = 2) => {
+    assert.equal(evaluate('projectCreationPhase'), 'idle');
+    assert.deepEqual(JSON.parse(evaluate('JSON.stringify(state.projects)')), list(count));
+    assert.equal(evaluate('state.selectedProjectId'), 'selected');
+    assert.equal(elements['btn-create-project'].disabled, count >= evaluate('MAX_PROJECTS'));
+    assert.equal(evaluate('projectCreationRecoveryRead'), null);
+    assert.equal(creates, 1);
+  };
+  return { renderer, document, elements, evaluate, session, reads, timers, snapshots, allow, expire, list, rejectRead, assertLocked, assertRecovered, creates: () => creates, mutations: () => mutations,
+    start: () => renderer.createProject(),
+    settle: value => createGate.resolve(value), reject: error => createGate.reject(error),
+    persist: () => { mutations++; createGate.resolve({ id: 'saved-1', files: [] }); },
+    renew: async () => { refreshGate.resolve({ access_token: 'new-synthetic', refresh_token: 'new-synthetic-refresh' }); await session.refreshing; },
+    fire: delay => { const timer = timers.find(item => !item.cleared && item.delay === delay); assert.ok(timer, `active ${delay}ms deadline`); timer.callback(); },
+  };
+}
+const recoveryTurn = () => new Promise(setImmediate);
+
+for (const id of [1, 2]) test(`recovery matrix 01: pending create remains exclusive across identity ${id}`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  f.expire(true); f.allow(id); f.reads[0].resolve(f.list()); await recoveryTurn();
+  f.assertLocked('creating'); await f.start(); assert.equal(f.creates(), 1);
+  f.settle({ error: 'max_projects_reached' }); await recoveryTurn();
+  f.assertLocked('reconciling'); f.reads[1].resolve(f.list()); await creating; f.assertRecovered();
+});
+
+test('recovery matrix 02,04,11,12: same identity refresh demand survives pending denied read and coalesces', async t => {
+  const f = settledRecoveryFixture(t); const refreshing = f.session.refresh();
+  f.expire(); const creating = f.start(); await recoveryTurn(); f.assertLocked('reconciling');
+  assert.equal(f.reads.length, 1); assert.equal(f.reads[0].authorized, false);
+  await f.renew(); await refreshing;
+  for (let i = 0; i < 5; i++) f.session.publish('signed_in');
+  assert.equal(f.reads.length, 1, 'authorized demand coalesces behind denied pending read');
+  f.rejectRead(0); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'failed owner must honor newer authorization demand');
+  assert.equal(f.reads[1].authorized, true); f.assertLocked('reconciling');
+  const owner = f.evaluate('projectCreationRecoveryRead'); assert.ok(owner);
+  for (let i = 0; i < 5; i++) f.session.publish('signed_in');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), owner); assert.equal(f.reads.length, 2);
+  f.reads[1].resolve(f.list()); await creating; await recoveryTurn();
+  f.assertRecovered(); assert.equal(f.reads.length, 2); assert.equal(f.mutations(), 0);
+  assert.ok(f.snapshots.every(snapshot => snapshot.canUseWorkspace && snapshot.state === 'signed_in'));
+});
+
+test('recovery matrix 04: sole allowed snapshot after denied read has already settled recovers', async t => {
+  const f = settledRecoveryFixture(t); const refreshing = f.session.refresh(); f.expire();
+  const creating = f.start(); await recoveryTurn(); f.rejectRead(0); await creating;
+  f.assertLocked('reconciling'); await f.renew(); await refreshing;
+  assert.equal(f.reads.length, 2); f.assertLocked('reconciling');
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+  assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].canUseWorkspace, true);
+});
+
+for (const timing of ['before-result', 'between-result-and-read', 'during-read']) {
+  test(`recovery matrix 03,05: expiry ${timing} retires reads and recovers`, async t => {
+    const f = settledRecoveryFixture(t); const creating = f.start();
+    if (timing === 'before-result') f.expire(true);
+    f.reject(new Error('Sign in to Crate to use your workspace.'));
+    if (timing === 'between-result-and-read') f.expire(true);
+    await recoveryTurn();
+    if (timing === 'during-read') f.expire(true);
+    f.assertLocked('reconciling'); const retired = [...f.reads];
+    f.allow(); await recoveryTurn();
+    assert.equal(f.reads.length, retired.length + 1);
+    for (const read of retired) read.resolve([{ id: 'retired', files: [] }]);
+    await recoveryTurn(); f.assertLocked('reconciling');
+    assert.equal(f.evaluate('state.projects[0].id'), 'selected');
+    f.reads.at(-1).resolve(f.list()); await creating; await recoveryTurn(); f.assertRecovered();
+  });
+}
+
+for (const id of [1, 2]) test(`recovery matrix 06: logout then identity ${id} requires a current read`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  f.rejectRead(0); await creating; await f.session.logout(); f.allow(id);
+  f.assertLocked('reconciling'); assert.equal(f.reads.length, 2);
+  await f.start(); assert.equal(f.creates(), 1);
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+});
+
+test('recovery matrix 07: production main post-persistence authorization rejection requires saved list', async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.expire(); f.persist();
+  await recoveryTurn(); f.assertLocked('reconciling'); assert.equal(f.mutations(), 1);
+  f.rejectRead(0); await creating; f.allow(); f.reads[1].resolve(f.list()); await recoveryTurn();
+  f.assertRecovered(); assert.equal(f.mutations(), 1);
+});
+
+for (const outcome of ['success', 'known-error']) test(`recovery matrix 08: stale ${outcome} preserves selection and cap`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  // Renderer observes expiry then a renewal while main's operation remains in
+  // the same session generation, permitting the settled success/error through.
+  f.expire(true); f.allow();
+  f.settle(outcome === 'success' ? { id: 'old-created', files: [] } : { error: 'max_projects_reached' });
+  await recoveryTurn(); f.assertLocked('reconciling');
+  f.reads[0].resolve([{ id: 'stale-pre-settlement', files: [] }]); await recoveryTurn();
+  f.assertLocked('reconciling'); const count = f.evaluate('MAX_PROJECTS');
+  f.reads[1].resolve(f.list(count)); await creating; f.assertRecovered(count);
+  assert.equal(f.evaluate("state.projects.some(p=>p.id==='old-created')"), false);
+});
+
+test('recovery matrix 09: transition during successful create follow-up read fences selection', async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.settle({ id: 'old-created', files: [] });
+  await recoveryTurn(); f.expire(true); f.allow(2);
+  f.reads[0].resolve([{ id: 'old-created', files: [] }]); await recoveryTurn();
+  f.assertLocked('reconciling'); f.reads[1].resolve([{ id: 'pre-settlement', files: [] }]);
+  await recoveryTurn(); f.assertLocked('reconciling');
+  f.reads[2].resolve(f.list()); await creating; f.assertRecovered();
+});
+
+for (const settleOld of ['resolve', 'reject']) test(`recovery matrix 10,13,16: retired ${settleOld}/finally cannot block or clear new owner or attempt`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  const old = f.reads[0]; f.allow(2); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'never-settling retired request cannot block new identity');
+  const owner = f.evaluate('projectCreationRecoveryRead'); assert.ok(owner);
+  // Keep the old promise pending through recovery and start another create.
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+  const pending = createDeferred(); f.renderer.window.crate.createProject = () => pending.promise;
+  const second = f.start(); assert.equal(f.evaluate('projectCreationPhase'), 'creating');
+  if (settleOld === 'resolve') old.resolve([{ id: 'retired', files: [] }]); else old.reject(new Error('late denied'));
+  await creating; await recoveryTurn();
+  assert.equal(f.evaluate('projectCreationPhase'), 'creating');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), null);
+  assert.equal(f.evaluate('state.projects.map(p=>p.id).join()'), 'selected,saved-1');
+  pending.resolve({ error: 'max_projects_reached' }); await second;
+});
+
+for (const failure of ['error', 'deadline', 'invalid-list']) test(`recovery matrix 14: ${failure} exposes bounded saved-project retry without account events`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.reject(new Error('Sign in to Crate to use your workspace.'));
+  await recoveryTurn();
+  if (failure === 'error') f.reads[0].reject(new Error('read failed'));
+  else if (failure === 'deadline') f.fire(10000);
+  else f.reads[0].resolve(null);
+  await recoveryTurn(); f.assertLocked('reconciling');
+  const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
+  assert.ok(retry); assert.equal(retry.disabled, false); assert.equal(retry.classList.contains('hidden'), false);
+  assert.equal(retry.textContent, 'Check saved projects again');
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  retry.click(); retry.click(); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'double retry coalesces'); f.assertLocked('reconciling');
+  f.reads[1].resolve(f.list()); await creating; await recoveryTurn(); f.assertRecovered();
+  if (failure === 'deadline') { f.reads[0].resolve([{ id: 'late', files: [] }]); await recoveryTurn(); f.assertRecovered(); }
+  assert.equal(f.snapshots.length, 0);
+});
+
+for (const outcome of ['transport', 'unknown-typed', 'deadline']) test(`recovery matrix 15: ${outcome} remains unresolved after account/list/late result`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  if (outcome === 'transport') f.reject(new Error('transport disappeared'));
+  else if (outcome === 'unknown-typed') f.settle({ error: 'unknown_persistence' });
+  else f.fire(30000);
+  await creating; f.assertLocked('unresolved'); f.expire(true); f.allow(2);
+  f.reads[0].resolve(f.list()); if (outcome === 'deadline') f.persist();
+  await recoveryTurn(); f.assertLocked('unresolved'); await f.start(); assert.equal(f.creates(), 1);
+  const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
+  assert.ok(!retry?.listeners.click?.length || retry.classList.contains('hidden'));
+});
+
+for (const outcome of ['resolve', 'reject']) test(`recovery matrix 13: retired ${outcome}/finally leaves replacement read owned and locked`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  const retired = f.reads[0]; f.allow(2); const current = f.evaluate('projectCreationRecoveryRead');
+  assert.ok(current); assert.equal(f.reads.length, 2);
+  if (outcome === 'resolve') retired.resolve([{ id: 'retired', files: [] }]); else retired.reject(new Error('denied'));
+  await creating; await recoveryTurn(); f.assertLocked('reconciling');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), current);
+  assert.equal(f.evaluate('state.projects[0].id'), 'selected');
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+});
+
+for (const outcome of ['resolve', 'reject']) test(`recovery matrix 09,10: never-settling success follow-up detaches; pre-settlement ${outcome} is fenced`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.settle({ id: 'old-created', files: [] });
+  await recoveryTurn(); const retiredFollowUp = f.reads[0]; f.expire(true); f.allow(2);
+  const preSettlement = f.reads[1]; await recoveryTurn();
+  assert.equal(f.reads.length, 3, 'settled creation must recover without retired follow-up settling');
+  f.assertLocked('reconciling'); const owner = f.evaluate('projectCreationRecoveryRead');
+  if (outcome === 'resolve') preSettlement.resolve([{ id: 'old-list', files: [] }]); else preSettlement.reject(new Error('old-read-failed'));
+  await recoveryTurn(); f.assertLocked('reconciling'); assert.equal(f.evaluate('projectCreationRecoveryRead'), owner);
+  f.reads[2].resolve(f.list()); await creating; f.assertRecovered();
+  retiredFollowUp.reject(new Error('late follow-up denial')); await recoveryTurn(); f.assertRecovered();
+});
+
+test('recovery matrix 11: replayed snapshot cannot generate an error retry loop', async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  // Repeated delivery of the same revision is not a new authorization demand.
+  f.renderer.replay = f.evaluate('accountStatus');
+  assert.equal(f.renderer.replay.canUseWorkspace, true, 'replay the original allowed snapshot');
+  for (let i = 0; i < 8; i++) f.evaluate('acceptAccountSnapshot(replay)');
+  f.rejectRead(0); await creating; await recoveryTurn();
+  assert.equal(f.reads.length, 1); f.assertLocked('reconciling');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), null);
+});
