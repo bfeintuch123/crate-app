@@ -2,7 +2,7 @@
   "name": "crate-app",
   "version": "3.0.0-beta.2.21",
   "productName": "Crate",
-  "description": "Universal project file packager for graphic designers — macOS desktop app",
+  "description": "Universal project file packager for graphic designers \u2014 macOS desktop app",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -14,6 +14,7 @@
     "canvas": "^3.2.1",
     "chokidar": "^3.6.0",
     "electron-store": "^8.2.0",
+    "jose": "6.2.12",
     "node-fetch": "^2.7.0",
     "pako": "^2.1.0"
   },
@@ -30,6 +31,14 @@
   },
   "build": {
     "appId": "com.crate.app",
+    "protocols": [
+      {
+        "name": "Crate account sign-in",
+        "schemes": [
+          "com.get-crate.app"
+        ]
+      }
+    ],
     "electronFuses": {
       "runAsNode": false,
       "enableNodeOptionsEnvironmentVariable": false,
@@ -41,6 +50,12 @@
     "files": [
       "main.js",
       "startup-phase-journal.js",
+      "runtime-identity.json",
+      "account-config.json",
+      "account-config.js",
+      "account-credential-store.js",
+      "account-provider.js",
+      "account-session.js",
       "preload.js",
       "provenance.js",
       "diagnostic-summary.js",

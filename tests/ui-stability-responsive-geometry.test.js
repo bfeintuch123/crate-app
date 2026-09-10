@@ -5,7 +5,9 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const childProcess = require('child_process');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const { DESKTOP_WINDOW_MINIMUM } = require('../startup-phase-journal');
 
 const rendererDir = path.join(__dirname, '..', 'renderer');
@@ -36,7 +38,7 @@ function findBrowser() {
   }
 
   for (const command of ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser']) {
-    const result = spawnSync('/usr/bin/env', ['sh', '-lc', `command -v ${command}`], {
+    const result = childProcess.spawnSync('/usr/bin/env', ['sh', '-lc', `command -v ${command}`], {
       encoding: 'utf8',
       timeout: 5_000,
     });
@@ -222,6 +224,9 @@ function productionWorkingFilesFixture() {
         getAssetWorkspace: async () => workspace,
         getFileVisual: async () => { previewRequests += 1; return { kind: 'fallback' }; },
       };
+      // This geometry probe measures the authenticated workspace, not onboarding.
+      accountStatus = { revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'geometry-account' }, message: '' };
+      renderAccount();
       document.querySelector('#tab-projects').classList.remove('active');
       document.querySelector('#tab-current-project').classList.add('active');
       const working = document.querySelector('#project-file-list');
@@ -288,13 +293,74 @@ function productionWorkingFilesFixture() {
   return html.replace('</body>', `<pre id="geometry-result"></pre><script src="app.js"></script><script>${probe}</script></body>`);
 }
 
-function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
+// Chrome may finish --dump-dom without exiting. Close only this isolated
+// browser through its private pipe, then require a clean native process exit.
+function collectGeometryDom(browser, args) {
+  return new Promise(resolve => {
+    const child = childProcess.spawn(browser, [...args, '--remote-debugging-pipe'], {
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '', protocol = '', error = null, closeSent = false;
+    let bytes = 0;
+    const fail = failure => {
+      error ||= failure;
+      child.kill('SIGKILL');
+    };
+    const timer = setTimeout(() => {
+      fail(Object.assign(new Error('Chrome geometry probe ETIMEDOUT'), { code: 'ETIMEDOUT' }));
+    }, 30_000);
+    const accountBytes = chunk => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 8 * 1024 * 1024) {
+        fail(new Error('Chrome geometry probe exceeded output limit'));
+        return false;
+      }
+      return true;
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdio[4].setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      if (!accountBytes(chunk)) return;
+      stdout += chunk;
+      if (!error && !closeSent && /<\/html>\s*$/.test(stdout)) {
+        closeSent = true;
+        child.stdio[3].write(JSON.stringify({ id: 1, method: 'Browser.close' }) + '\0');
+      }
+    });
+    child.stderr.on('data', chunk => { if (accountBytes(chunk)) stderr += chunk; });
+    child.stdio[4].on('data', chunk => {
+      if (!accountBytes(chunk)) return;
+      protocol += chunk;
+      let end;
+      while ((end = protocol.indexOf('\0')) !== -1) {
+        const frame = protocol.slice(0, end);
+        protocol = protocol.slice(end + 1);
+        try {
+          const response = JSON.parse(frame);
+          if (response.id === 1 && response.error) fail(new Error('Chrome rejected Browser.close'));
+        } catch (_) { fail(new Error('Chrome returned malformed close protocol')); }
+      }
+    });
+    for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) {
+      stream.on('error', fail);
+    }
+    child.on('error', failure => { error ||= failure; });
+    child.on('close', (status, signal) => {
+      clearTimeout(timer);
+      if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
+      resolve({ status, signal, stdout, stderr, error });
+    });
+  });
+}
+
+async function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
   const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-ui-geometry-'));
   const fixturePath = path.join(temporaryDirectory, 'fixture.html');
   fs.writeFileSync(fixturePath, html, 'utf8');
 
   try {
-    const result = spawnSync(browser, [
+    const result = await collectGeometryDom(browser, [
       '--headless=new',
       '--disable-gpu',
       '--no-sandbox',
@@ -307,12 +373,10 @@ function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
       `--window-size=${width},${height}`,
       '--dump-dom',
       new URL(`file://${fixturePath}`).href,
-    ], {
-      encoding: 'utf8',
-      timeout: 30_000,
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    ]);
 
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, `browser terminated with ${result.signal}`);
     assert.equal(result.status, 0, result.stderr || `browser exited with ${result.status}`);
     const match = result.stdout.match(/<pre id="geometry-result">([^<]+)<\/pre>/);
     assert.ok(match, 'geometry probe must emit structured results');
@@ -322,13 +386,91 @@ function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
   }
 }
 
+// Exercise the real helper with successful DOM output even when the process failed.
+const probeResult = {
+  status: 0,
+  signal: null,
+  stdout: '<html><pre id="geometry-result">{&quot;results&quot;:[&quot;A&amp;B&quot;]}</pre></html>',
+  stderr: '',
+};
+
+function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeError = false } = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdio = [null, child.stdout, child.stderr, new PassThrough(), new PassThrough()];
+  const commands = [];
+  const finish = (status, signal) => queueMicrotask(() => child.emit('close', status, signal));
+  child.kill = signal => { finish(null, signal); return true; };
+  child.stdio[3].on('data', chunk => {
+    commands.push(chunk.toString());
+    if (pipeError) child.stdio[3].emit('error', new Error('close pipe failed'));
+    else if (!holdOpen) finish(result.status, result.signal);
+  });
+  const spawn = t.mock.method(childProcess, 'spawn', (_browser, args, options) => {
+    assert.ok(args.includes('--remote-debugging-pipe'));
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe', 'pipe', 'pipe']);
+    queueMicrotask(() => {
+      if (result.error) child.emit('error', result.error);
+      child.stdout.write(result.stdout);
+      child.stderr.write(result.stderr);
+      if (!holdOpen && !commands.length) finish(result.status, result.signal);
+    });
+    return child;
+  });
+  return { child, commands, spawn, finish };
+}
+
+for (const [label, failure, expected] of [
+  ['timeout with zero exit status', { error: Object.assign(new Error('spawn ETIMEDOUT'), { code: 'ETIMEDOUT' }) }, /ETIMEDOUT/],
+  ['spawn error', { error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) }, /ENOENT/],
+  ['signal with zero exit status', { signal: 'SIGTERM' }, /SIGTERM/],
+  ['nonzero exit status', { status: 1 }, /browser exited with 1/],
+  ['missing exit status', { status: null }, /browser exited with null/],
+]) {
+  test(`geometry probe rejects ${label} despite valid DOM`, async t => {
+    const { spawn } = mockGeometryBrowser(t, { ...probeResult, ...failure });
+    await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), expected);
+    assert.equal(spawn.mock.callCount(), 1);
+  });
+}
+
+test('geometry probe explicitly closes completed DOM and accepts only clean exit', async t => {
+  const { commands, spawn } = mockGeometryBrowser(t);
+  assert.deepEqual(await runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), { results: ['A&B'] });
+  assert.deepEqual(commands, [JSON.stringify({ id: 1, method: 'Browser.close' }) + '\0']);
+  assert.equal(spawn.mock.callCount(), 1);
+});
+
+test('geometry probe times out when completed DOM never gets a clean browser exit', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { commands } = mockGeometryBrowser(t, probeResult, { holdOpen: true });
+  const running = runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>');
+  const rejected = assert.rejects(running, /ETIMEDOUT/);
+  await new Promise(setImmediate);
+  assert.equal(commands.length, 1);
+  t.mock.timers.tick(30_000);
+  await rejected;
+});
+
+test('geometry probe rejects shutdown pipe errors despite completed DOM', async t => {
+  mockGeometryBrowser(t, probeResult, { pipeError: true });
+  await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /close pipe failed/);
+});
+
+test('geometry probe does not close or accept truncated DOM', async t => {
+  const { commands } = mockGeometryBrowser(t, { ...probeResult, stdout: probeResult.stdout.replace('</html>', '') });
+  await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /DOM was incomplete/);
+  assert.equal(commands.length, 0);
+});
+
 const browser = findBrowser();
 
 test('production renderer preserves Working Files grid spacing and Review Assets virtual geometry', {
   skip: browser ? false : 'Chrome or Chromium is not available in this environment',
   timeout: 35_000,
-}, () => {
-  const metrics = runGeometryProbe(browser, 1100, 760, productionWorkingFilesFixture());
+}, async () => {
+  const metrics = await runGeometryProbe(browser, 1100, 760, productionWorkingFilesFixture());
   assert.equal(metrics.error, undefined);
   assert.equal(metrics.results.length, 4);
   for (const result of metrics.results) {
@@ -358,9 +500,9 @@ test('production renderer preserves Working Files grid spacing and Review Assets
 test('real browser geometry keeps supported desktop Review Assets inside the Crate shell', {
   skip: browser ? false : 'Chrome or Chromium is not available in this environment',
   timeout: 120_000,
-}, () => {
+}, async () => {
   for (const [width, height] of viewports) {
-    const metrics = runGeometryProbe(browser, width, height);
+    const metrics = await runGeometryProbe(browser, width, height);
     const label = `${width}x${height}`;
 
     assert.ok(metrics.root.scrollWidth <= metrics.root.clientWidth + 1, `${label}: root must not overflow horizontally`);
@@ -388,4 +530,18 @@ test('real browser geometry keeps supported desktop Review Assets inside the Cra
     assert.equal(metrics.lastRowVisible, true, `${label}: final logical row must be visible at the end of the scroll range`);
     assert.equal(metrics.query, 'synthetic query', `${label}: search state must survive layout`);
   }
+});
+
+test('geometry probe rejects browser close protocol failure despite valid DOM', async t => {
+  const { child } = mockGeometryBrowser(t, probeResult, { holdOpen: true });
+  const running = runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>');
+  const rejected = assert.rejects(running, /rejected Browser.close/);
+  await new Promise(setImmediate);
+  child.stdio[4].write(JSON.stringify({ id: 1, error: { code: -1 } }) + '\0');
+  await rejected;
+});
+
+test('geometry probe keeps its output bound and rejects oversized DOM', async t => {
+  mockGeometryBrowser(t, { ...probeResult, stdout: 'x'.repeat(8 * 1024 * 1024 + 1) });
+  await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /exceeded output limit/);
 });

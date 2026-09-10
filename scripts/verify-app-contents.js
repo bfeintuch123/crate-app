@@ -28,6 +28,13 @@ const REQUIRED_ASAR_ENTRIES = Object.freeze([
   '/package.json',
   '/main.js',
   '/startup-phase-journal.js',
+  '/runtime-identity.json',
+  '/account-config.json',
+  '/account-config.js',
+  '/account-credential-store.js',
+  '/account-provider.js',
+  '/account-session.js',
+
   '/preload.js',
   '/provenance.js',
   '/diagnostic-summary.js',
@@ -61,6 +68,13 @@ function isAllowedAsarEntry(entry) {
     entry === '/package.json' ||
     entry === '/main.js' ||
     entry === '/startup-phase-journal.js' ||
+    entry === '/runtime-identity.json' ||
+    entry === '/account-config.json' ||
+    entry === '/account-config.js' ||
+    entry === '/account-credential-store.js' ||
+    entry === '/account-provider.js' ||
+    entry === '/account-session.js' ||
+
     entry === '/preload.js' ||
     entry === '/provenance.js' ||
     entry === '/diagnostic-summary.js'

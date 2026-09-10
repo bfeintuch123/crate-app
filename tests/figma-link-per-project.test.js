@@ -586,6 +586,21 @@ setStub('crypto', () => ({
 // canvas/keytar are pulled by parsers but absent from node_modules. The figma
 // parser already wraps them in try/catch, so leave them un-stubbed.
 
+// The existing workspace integration matrix runs with a synthetic verified account.
+// Account boundary cases explicitly invalidate this same real session below.
+const { AccountSession: RealAccountSession } = require('../account-session');
+let testAccountSession;
+function restoreTestAccount() {
+  testAccountSession.record = { identity: { id: 'test-account' } };
+  testAccountSession.accessToken = 'synthetic-access';
+  testAccountSession.accessExpiresAt = Date.now() + 3600000;
+  testAccountSession.publish('signed_in', '', { id: 'test-account' });
+}
+setStub('./account-session', () => ({ AccountSession: class extends RealAccountSession {
+  constructor(options) { super(options); testAccountSession = this; }
+  async restore() { restoreTestAccount(); return this.snapshot(); }
+} }));
+
 // ---------- Load main.js with stubs in place ----------
 const mainPath = path.resolve(__dirname, '..', 'main.js');
 let mainLoadError = null;
@@ -4134,5 +4149,62 @@ test('Package manifest includes Figma graph only for packaged scoped assets', as
     assert.equal(manifestText.includes('/usr/sbin/lsof'), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('account gate blocks all product IPC while preserving existing local data', async () => {
+  const project = await callIpc('projects:create', 'Account gate preserved project');
+  const before = JSON.stringify(fakeStoreInstance.data);
+  testAccountSession.invalidate();
+  testAccountSession.accessToken = null;
+  testAccountSession.publish('signed_out', '', null);
+  try {
+    for (const channel of ipcHandlers.keys()) {
+      if (!channel.startsWith('account:')) await assert.rejects(callIpcRaw(channel), /Sign in to Crate/, channel);
+    }
+    assert.equal(JSON.stringify(fakeStoreInstance.data), before);
+  } finally { restoreTestAccount(); }
+  assert.ok((await callIpc('projects:get-all')).some(item => item.id === project.id));
+});
+
+test('account switch fences a delayed project creation before persistence', async () => {
+  let finish;
+  nextFigmaLinkValidation = () => new Promise(resolve => { finish = resolve; });
+  const before = JSON.stringify(fakeStoreInstance.data.projects);
+  const operation = callIpc('projects:create', 'Must not persist after account switch', 'branding', 'current-page', 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1');
+  const rejected = assert.rejects(operation, /Sign in to Crate/);
+  await waitForCondition(() => typeof finish === 'function', 'preflight should start');
+  testAccountSession.invalidate();
+  testAccountSession.publish('signed_out', '', null);
+  restoreTestAccount();
+  finish({valid:true,scope:{scopeMode:'current-page',lockStatus:'locked',lockedPageId:'1:1',lockedPageName:'Verified Page',statusReason:null}});
+  await rejected;
+  assert.equal(JSON.stringify(fakeStoreInstance.data.projects), before);
+});
+
+test('account sign-out prevents a delayed Quick Package from publishing its staged files', async () => {
+  const previous = STUBS.get('./parsers/index.js');
+  const desktop = path.join(TEST_HOME, 'Desktop');
+  fs.mkdirSync(desktop, {recursive:true});
+  const before = fs.readdirSync(desktop).sort();
+  let finish;
+  setStub('./parsers/index.js', () => ({ packageMasterFile: async (source, directory) => {
+    const copied = path.join(directory, 'Synthetic.ai');
+    fs.writeFileSync(copied, 'synthetic-only');
+    await new Promise(resolve => { finish = resolve; });
+    return {masterFile:source,assetsFound:0,assetsCopied:0,assetsMissing:[],files:[{original:source,copied,source:'master'}]};
+  }}));
+  try {
+    const operation = callIpc('v2:package-file', path.join(TEST_HOME, 'Synthetic.ai'));
+    const rejected = assert.rejects(operation, /Sign in to Crate/);
+    await waitForCondition(() => typeof finish === 'function', 'Quick Package should enter private staging');
+    testAccountSession.invalidate(); testAccountSession.accessToken = null;
+    testAccountSession.publish('signed_out', '', null);
+    finish(); await rejected;
+    assert.deepEqual(fs.readdirSync(desktop).sort(), before);
+    assert.equal(fs.readdirSync(TEST_HOME).some(name => name.startsWith('.crate-package-staging-')), false);
+  } finally {
+    if (previous) STUBS.set('./parsers/index.js', previous); else STUBS.delete('./parsers/index.js');
+    restoreTestAccount();
   }
 });

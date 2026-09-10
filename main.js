@@ -9,6 +9,15 @@ const {
   Notification,
   utilityProcess,
 } = require('electron');
+const { AccountSession } = require('./account-session');
+const { AccountCredentialStore } = require('./account-credential-store');
+const { createAccountProvider } = require('./account-provider');
+const { loadAccountConfig, CALLBACK: ACCOUNT_CALLBACK } = require('./account-config');
+let accountSession = null;
+let accountCallbackWithoutAttempt = false;
+let accountWatchRecoveryReady = false;
+let accountWorkspaceAllowed = false;
+let accountWorkspaceId = null;
 const path = require('path');
 const fs = require('fs');
 const {
@@ -170,12 +179,98 @@ function assertTrustedRendererIpc(event) {
   }
 }
 
+function captureAccountAuthorization() {
+  const generation = accountSession?.generation;
+  const identity = accountSession?.snapshot().identity?.id;
+  return () => {
+    if (!accountSession?.canUseWorkspace() || accountSession.generation !== generation || accountSession.snapshot().identity?.id !== identity) {
+      throw new Error('Sign in to Crate to use your workspace.');
+    }
+  };
+}
+
 function registerTrustedIpcHandler(channel, handler) {
   ipcMain.handle(channel, (event, ...args) => {
     assertTrustedRendererIpc(event);
-    return handler(event, ...args);
+    if (!channel.startsWith('account:') && !accountSession?.canUseWorkspace()) {
+      throw new Error('Sign in to Crate to use your workspace.');
+    }
+    const assertCurrent = channel.startsWith('account:') ? null : captureAccountAuthorization();
+    const result = handler(event, ...args);
+    if (assertCurrent && result && typeof result.then === 'function') {
+      return result.then(value => { assertCurrent(); return value; });
+    }
+    return result;
   });
 }
+
+function initializeAccountSession() {
+  const config = loadAccountConfig();
+  accountSession = new AccountSession({
+    config,
+    provider: config ? createAccountProvider(config) : null,
+    credentials: config ? new AccountCredentialStore({
+      safeStorage: require('electron').safeStorage,
+      userDataPath: app.getPath('userData'),
+      binding: `${config.issuer}|${config.clientId}`,
+    }) : null,
+    openExternal: url => shell.openExternal(url),
+  });
+  accountSession.on('change', snapshot => {
+    const allowed = snapshot.canUseWorkspace;
+    const identityChanged = accountWorkspaceId !== snapshot.identity?.id;
+    if (accountWorkspaceAllowed && (!allowed || identityChanged)) {
+      // Invalidate the existing project-operation fences before any late scan/package result.
+      watchingActivationSequence++;
+      closeInactivityPrompts();
+      for (const project of getProjects()) stopWatching(project.id);
+    }
+    const resume = allowed && (!accountWorkspaceAllowed || identityChanged);
+    accountWorkspaceAllowed = allowed; accountWorkspaceId = snapshot.identity?.id;
+    if (resume && accountWatchRecoveryReady) {
+      const project = getProjects().find(project => project.status === 'watching');
+      if (project) {
+        lastFileActivity.set(project.id, Date.now());
+        void startWatching(project.id, { preserveWatchStartedAt: true }).catch(() => {});
+      }
+    }
+    if (trayWindow && !trayWindow.isDestroyed()) trayWindow.webContents.send('account:changed', snapshot);
+  });
+  for (const [channel, method] of Object.entries({
+    'account:get': 'snapshot', 'account:begin': 'begin', 'account:reopen': 'reopen',
+    'account:cancel': 'cancel', 'account:logout': 'logout', 'account:manage': 'manage', 'account:refresh': 'refresh',
+  })) registerTrustedIpcHandler(channel, (_event, ...args) => {
+    if (args.length) throw new Error('Invalid account request.');
+    return accountSession[method]();
+  });
+  // Packaged LaunchServices registration is declared in package.json. A source run
+  // never takes over the installed app's protocol handler.
+  void accountSession.restore().then(() => {
+    if (accountCallbackWithoutAttempt && !accountSession.pending && !accountSession.snapshot().identity) {
+      accountSession.publish(accountSession.snapshot().state, 'This browser sign-in has no active request. Start sign-in again in Crate.');
+    }
+    accountCallbackWithoutAttempt = false;
+  });
+}
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (typeof url !== 'string' || !url.startsWith(`${ACCOUNT_CALLBACK}?`)) return;
+  // No active in-memory PKCE attempt on cold launch: require a fresh sign-in.
+  if (accountSession) {
+    const session = accountSession, attempt = session.pending, generation = session.generation;
+    const revision = session.snapshot().revision;
+    void session.callback(url).then(result => {
+      // Only a consumed, current browser return may raise this candidate window.
+      // Replays, wrong state and a result overtaken by logout/retry stay inert.
+      if (attempt && session === accountSession && generation === session.generation &&
+          !session.pending && result.revision > revision && result.revision === session.snapshot().revision &&
+          ['signed_in', 'error'].includes(result.state)) {
+        showMainWindow({ reason: 'account-browser-return' });
+      }
+    }).catch(() => {});
+  } else accountCallbackWithoutAttempt = true;
+});
 
 function registerStartupDiagnosticIpc() {
   if (!ipcMain || typeof ipcMain.on !== 'function') return;
@@ -4402,7 +4497,36 @@ function getProjectAssetBaselineSourcePaths(project) {
   return [...pathsByKey.values()];
 }
 
-function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = null, { allowPaused = false } = {}) {
+// Required queue work is independent of retained proof and concurrent observers.
+function getAssetBaselineObserverCohort(state, sourceKey) {
+  state.observerCohorts ||= new Map();
+  let cohort = state.observerCohorts.get(sourceKey);
+  if (!cohort || (cohort.scans.size === 0 && cohort.reservations.size === 0)) {
+    cohort = { scans: new Set(), reservations: new Set(), dependable: false };
+    state.observerCohorts.set(sourceKey, cohort);
+  }
+  return cohort;
+}
+
+function refreshAssetBaselineQueuedKeys(state) {
+  state.queuedSourceKeys = new Set([...state.requiredReservations || []]
+    .filter(reservation => reservation.status === 'queued').map(reservation => reservation.sourceKey));
+}
+
+function settleAssetBaselineReservation(reservation) {
+  if (!reservation || !reservation.state.requiredReservations?.delete(reservation)) return;
+  reservation.status = 'settled';
+  reservation.cohort.reservations.delete(reservation);
+  reservation.state.revision = (reservation.state.revision || 0) + 1;
+  refreshAssetBaselineQueuedKeys(reservation.state);
+}
+
+function hasRequiredAssetBaselineWork(state) {
+  return !!(state.requiredReservations?.size || [...state.observerCohorts?.values() || []]
+    .some(cohort => !cohort.dependable && cohort.scans.size > 0));
+}
+
+function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = null, { allowPaused = false, baselineReservation = null } = {}) {
   const project = getProjects().find(item => item.id === projectId);
   if (!project || (project.status !== 'watching' && !(allowPaused && project.status === 'paused'))) return null;
   if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
@@ -4413,6 +4537,9 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   if (!sourceKey || !isProjectAssetBaselineSource(acceptedSource)) return null;
 
   let state = assetBaselineScans.get(projectId);
+  if (baselineReservation && (baselineReservation.state !== state ||
+      baselineReservation.sourceKey !== sourceKey || baselineReservation.status !== 'queued' ||
+      !state?.requiredReservations?.has(baselineReservation))) return null;
   if (!state) {
     const startedAt = Date.now();
     state = {
@@ -4428,11 +4555,17 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
   } else {
     state.queuedSourceKeys ||= new Set();
     state.requiredSourceKeys.add(sourceKey);
-    state.queuedSourceKeys?.delete(sourceKey);
   }
 
+  const cohort = baselineReservation?.cohort || getAssetBaselineObserverCohort(state, sourceKey);
+  if (baselineReservation) {
+    baselineReservation.status = 'active';
+    refreshAssetBaselineQueuedKeys(state);
+  }
   state.activeScans ||= new Set();
-  const scan = { projectId, sourceKey, startedAt: state.startedAt, activationToken, allowPaused };
+  state.revision = (state.revision || 0) + 1;
+  const scan = { projectId, sourceKey, state, cohort, baselineReservation, startedAt: state.startedAt, activationToken, allowPaused };
+  cohort.scans.add(scan);
   state.activeScans.add(scan);
   state.inFlightBySource.set(sourceKey, (state.inFlightBySource.get(sourceKey) || 0) + 1);
   return scan;
@@ -4440,31 +4573,40 @@ function beginProjectAssetBaselineScan(projectId, sourcePath, activationToken = 
 
 function releaseProjectAssetBaselineScan(scan) {
   if (!scan) return false;
-  const state = assetBaselineScans.get(scan.projectId);
+  const state = scan.state;
   if (!state || !state.activeScans?.has(scan)) return false;
   state.activeScans.delete(scan);
+  scan.cohort?.scans.delete(scan);
+  settleAssetBaselineReservation(scan.baselineReservation);
   const remaining = Math.max(0, (state.inFlightBySource.get(scan.sourceKey) || 0) - 1);
   if (remaining > 0) state.inFlightBySource.set(scan.sourceKey, remaining);
   else state.inFlightBySource.delete(scan.sourceKey);
   return true;
 }
 
-async function completeProjectAssetBaselineScan(scan, dependable) {
+async function completeProjectAssetBaselineScan(scan, dependable, isCurrent = () => true) {
   if (!scan) return;
-  const state = assetBaselineScans.get(scan.projectId);
-  if (!state) return;
-  if (scan.cancelled) {
-    releaseProjectAssetBaselineScan(scan);
-    return;
+  const state = scan.state;
+  // Release only the original ticket, even after its baseline owner retires.
+  if (!releaseProjectAssetBaselineScan(scan)) return;
+  const ownsBaseline = () => assetBaselineScans.get(scan.projectId) === state && !scan.cancelled && isCurrent();
+  if (!ownsBaseline()) return;
+  if (dependable) {
+    state.completedSourceKeys.add(scan.sourceKey);
+    scan.cohort.dependable = true;
   }
-  releaseProjectAssetBaselineScan(scan);
-  // A duplicate observer can start more than one scan for the same source.
-  // One dependable completion is sufficient; a later failed duplicate must not
-  // erase that proof and make the result depend on completion order.
-  if (dependable) state.completedSourceKeys.add(scan.sourceKey);
+  await finalizeProjectAssetBaselineScan(scan, isCurrent);
+}
 
-  if (state.inFlightBySource.size > 0 || state.queuedSourceKeys?.size > 0) return;
+async function finalizeProjectAssetBaselineScan(scan, isCurrent) {
+  const state = scan.state;
+  const ownsBaseline = () => assetBaselineScans.get(scan.projectId) === state && !scan.cancelled && isCurrent();
+  if (!ownsBaseline()) return;
+  state.revision = (state.revision || 0) + 1;
+  const completionRevision = state.revision;
   const complete = [...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key));
+  if (hasRequiredAssetBaselineWork(state)) return;
+  const canFinalize = () => ownsBaseline() && state.revision === completionRevision && !hasRequiredAssetBaselineWork(state);
   if (!complete) {
     const failedSourceKeys = new Set(
       [...state.requiredSourceKeys].filter(key => !state.completedSourceKeys.has(key))
@@ -4480,8 +4622,9 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
             .map(file => getAssetBaselineSourceRecoveryRecord(currentProject, file))
         )).filter(Boolean).sort((left, right) => left.sourceKeyHash.localeCompare(right.sourceKeyHash))
       : [];
+    if (!canFinalize()) return;
     const persisted = mutateProject(scan.projectId, project => {
-      if (project.assetBaseline?.status !== 'awaiting-first-scan') return false;
+      if (!canFinalize() || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
       const validRouteKeys = new Set(
         (project.files || [])
           .filter(isProjectAssetBaselineSource)
@@ -4497,7 +4640,7 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
       else delete project.assetBaseline.failedRequiredSources;
       return true;
     });
-    if (persisted) sendToRenderer('project:updated', { projectId: scan.projectId });
+    if (persisted && canFinalize()) sendToRenderer('project:updated', { projectId: scan.projectId });
     return;
   }
 
@@ -4506,10 +4649,10 @@ async function completeProjectAssetBaselineScan(scan, dependable) {
     null,
     scan.activationToken,
     state.startedAt,
-    { allowPaused: scan.allowPaused }
+    { allowPaused: scan.allowPaused, isCurrent: canFinalize }
   );
   const current = getProjects().find(item => item.id === scan.projectId);
-  if (result || !current || !current.assetBaseline || current.assetBaseline.status !== 'awaiting-first-scan') {
+  if (canFinalize() && (result || !current || !current.assetBaseline || current.assetBaseline.status !== 'awaiting-first-scan')) {
     assetBaselineScans.delete(scan.projectId);
   }
 }
@@ -4534,6 +4677,7 @@ function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
     assetBaselineScans.set(projectId, state);
   }
   state.queuedSourceKeys ||= new Set();
+  state.revision = (state.revision || 0) + 1;
 
   for (const sourcePath of sourcePaths) {
     const sourceKey = normalizeTrackedFilePath(sourcePath);
@@ -4549,31 +4693,38 @@ function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
       .filter(([sourceKey, sourcePath]) => sourceKey && typeof sourcePath === 'string' && sourcePath)
   ).values()];
   const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
-  if (state) {
-    for (const sourcePath of uniquePaths) {
-      const sourceKey = normalizeTrackedFilePath(sourcePath);
-      if (sourceKey) state.queuedSourceKeys.add(sourceKey);
-    }
-  }
+  const reservations = uniquePaths.map(sourcePath => {
+    if (!state) return null;
+    const sourceKey = normalizeTrackedFilePath(sourcePath);
+    const cohort = getAssetBaselineObserverCohort(state, sourceKey);
+    const reservation = { state, sourceKey, cohort, status: 'queued' };
+    state.requiredReservations ||= new Set();
+    state.requiredReservations.add(reservation);
+    cohort.reservations.add(reservation);
+    return reservation;
+  });
+  if (state) refreshAssetBaselineQueuedKeys(state);
+  // Keep the existing path-array interface; tokens are private to this queue.
+  Object.defineProperty(uniquePaths, 'baselineReservations', { value: reservations });
   return uniquePaths;
 }
 
-function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths) {
-  const state = assetBaselineScans.get(projectId);
+function cancelProjectAssetBaselineScanQueue(projectId, sourcePaths, state) {
   if (!state) return;
-  for (const sourcePath of Array.isArray(sourcePaths) ? sourcePaths : []) {
-    const sourceKey = normalizeTrackedFilePath(sourcePath);
-    if (!sourceKey || !state.queuedSourceKeys?.has(sourceKey)) continue;
-    state.queuedSourceKeys.delete(sourceKey);
-    state.requiredSourceKeys.delete(sourceKey);
-  }
-  if (state.inFlightBySource.size === 0 && state.requiredSourceKeys.size === 0) {
-    assetBaselineScans.delete(projectId);
+  for (const reservation of sourcePaths?.baselineReservations || []) {
+    if (reservation?.state !== state) continue;
+    for (const scan of [...state.activeScans || []]) {
+      if (scan.baselineReservation !== reservation) continue;
+      scan.cancelled = true;
+      releaseProjectAssetBaselineScan(scan);
+    }
+    settleAssetBaselineReservation(reservation);
   }
 }
 
 async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken, operation, options = {}) {
   const queuedPaths = reserveProjectAssetBaselineScanQueue(projectId, sourcePaths);
+  const baselineQueueState = assetBaselineScans.get(projectId);
   const outcomes = new Array(queuedPaths.length);
   let nextIndex = 0;
 
@@ -4582,13 +4733,15 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
       const index = nextIndex++;
       if (index >= queuedPaths.length) return;
       const sourcePath = queuedPaths[index];
+      const baselineReservation = queuedPaths.baselineReservations[index];
+      const scanOptions = { ...options, baselineReservation };
       if (!operation.current()) {
         outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
         continue;
       }
       try {
         if (options.addFilesScan !== true) {
-          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, options);
+          const result = await runScanOnOpen(projectId, sourcePath, activationToken, operation, scanOptions);
           if (!operation.current()) {
             outcomes[index] = { path: sourcePath, success: false, error: 'stale_project_operation' };
           } else if (result && result.success === false) {
@@ -4613,7 +4766,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
                   onCancel: scanLease.onCancel,
                   adoptScope: scope => operation.adoptScope(scope) && scanLease.current(),
                 },
-                { ...options, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
+                { ...scanOptions, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
               );
             } finally {
               releaseOnCancel();
@@ -4641,6 +4794,9 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
         }
       } catch (_) {
         outcomes[index] = { path: sourcePath, success: false, error: 'scan_on_open_failed' };
+      } finally {
+        // Includes a scan rejected before it could claim its reservation.
+        settleAssetBaselineReservation(baselineReservation);
       }
     }
   };
@@ -4648,8 +4804,14 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
   const workerCount = Math.min(MANUAL_ADD_SCAN_CONCURRENCY, queuedPaths.length);
   await Promise.all(Array.from({ length: workerCount }, () => runNext()));
   if (!operation.current()) {
-    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths);
+    cancelProjectAssetBaselineScanQueue(projectId, queuedPaths, baselineQueueState);
     return { cancelled: true, outcomes };
+  }
+  if (baselineQueueState) {
+    await finalizeProjectAssetBaselineScan({
+      projectId, state: baselineQueueState, activationToken,
+      allowPaused: options.allowPausedBaseline === true,
+    }, operation.current);
   }
   return { cancelled: false, outcomes };
 }
@@ -4663,15 +4825,25 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
     establishProjectAssetBaseline(projectId, null, null, Date.now(), { allowPaused });
     return;
   }
+  state.revision = (state.revision || 0) + 1;
   const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   for (const key of [...state.requiredSourceKeys]) {
     if (acceptedKeys.has(key)) continue;
     state.requiredSourceKeys.delete(key);
     state.completedSourceKeys.delete(key);
+    for (const scan of [...state.activeScans || []]) {
+      if (scan.sourceKey !== key) continue;
+      scan.cancelled = true;
+      releaseProjectAssetBaselineScan(scan);
+    }
+    for (const reservation of [...state.requiredReservations || []]) {
+      if (reservation.sourceKey === key) settleAssetBaselineReservation(reservation);
+    }
+    state.observerCohorts?.delete(key);
     state.inFlightBySource.delete(key);
     state.presentationMediaOccurrencesBySource?.delete(key);
   }
-  if (state.inFlightBySource.size > 0) return;
+  if (hasRequiredAssetBaselineWork(state)) return;
   if (![...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key))) return;
   const result = establishProjectAssetBaseline(projectId, null, null, state.startedAt, { allowPaused });
   const current = getProjects().find(item => item.id === projectId);
@@ -4680,15 +4852,17 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
   }
 }
 
-async function isFailedRequiredAssetBaselineSource(project, file) {
+async function isFailedRequiredAssetBaselineSource(project, file, { receipt = false } = {}) {
   if (!project || !file || project.assetBaseline?.status !== 'awaiting-first-scan') return false;
   const state = assetBaselineScans.get(project.id);
   const sourceKey = normalizeTrackedFilePath(file.path);
+  const revision = state?.revision;
   if (state && !(
       sourceKey &&
       state.requiredSourceKeys.has(sourceKey) &&
       !state.completedSourceKeys.has(sourceKey) &&
-      !state.inFlightBySource.has(sourceKey)
+      !state.inFlightBySource.has(sourceKey) &&
+      ![...state.requiredReservations || []].some(reservation => reservation.sourceKey === sourceKey)
   )) return false;
 
   // Live scan state identifies which source failed, but path identity alone is
@@ -4699,11 +4873,21 @@ async function isFailedRequiredAssetBaselineSource(project, file) {
     .find(candidate => candidate.sourceKeyHash === sourceKeyHash);
   if (!record) return false;
   const currentRecord = await getAssetBaselineSourceRecoveryRecord(project, file);
-  return !!(
-    currentRecord &&
-    currentRecord.sourceKeyHash === record.sourceKeyHash &&
-    currentRecord.physicalIdentityHash === record.physicalIdentityHash
+  const current = candidate => !!(
+    candidate && candidate.assetBaseline?.status === 'awaiting-first-scan' &&
+    candidate.files?.some(item => JSON.stringify(item) === JSON.stringify(file)) &&
+    assetBaselineScans.get(project.id) === state && state?.revision === revision &&
+    normalizeFailedRequiredAssetBaselineSources(candidate, candidate.assetBaseline)
+      .some(item => item.sourceKeyHash === record.sourceKeyHash && item.physicalIdentityHash === record.physicalIdentityHash) &&
+    currentRecord && currentRecord.sourceKeyHash === record.sourceKeyHash &&
+    currentRecord.physicalIdentityHash === record.physicalIdentityHash &&
+    (() => { try {
+      const stat = fs.lstatSync(file.path, { bigint: true });
+      return !stat.isSymbolicLink() && getAssetBaselineSourcePhysicalIdentityHash(candidate, stat) === record.physicalIdentityHash;
+    } catch (_) { return false; } })()
   );
+  if (!current(getProjects().find(item => item.id === project.id))) return false;
+  return receipt ? current : true;
 }
 
 function hasInFlightAssetBaselineScan(projectId) {
@@ -4727,8 +4911,9 @@ function establishProjectAssetBaseline(
   sourcePath,
   activationToken = null,
   scanStartedAt = Date.now(),
-  { allowPaused = false } = {}
+  { allowPaused = false, isCurrent = () => true } = {}
 ) {
+  if (!isCurrent()) return null;
   const baselineScanState = assetBaselineScans.get(projectId);
   const presentationMediaOccurrences = normalizePresentationMediaOccurrences(
     baselineScanState
@@ -4736,6 +4921,7 @@ function establishProjectAssetBaseline(
       : []
   );
   const result = mutateProject(projectId, (project) => {
+    if (!isCurrent()) return null;
     if (project.status !== 'watching' && !(allowPaused && project.status === 'paused')) return null;
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
     if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
@@ -4776,7 +4962,7 @@ function establishProjectAssetBaseline(
     };
   });
 
-  if (result && result.changed) {
+  if (result && result.changed && isCurrent()) {
     invalidatePackageReviewForProject(projectId);
     sendToRenderer('project:updated', { projectId });
   }
@@ -7881,8 +8067,67 @@ function isBoundWatchingActivationCurrent(projectId, activationToken) {
   return activationToken === null || isActiveWatchingProject(projectId, activationToken);
 }
 
-function captureProjectOperation(projectId) { const project = getProjects().find(item => item && item.id === projectId); if (!project) return null; const status = project.status, generation = watchingActivationSequence, activationToken = status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; let scopeRevision = illustratorActivationScopes.get(projectId)?.revision, open = true; const baseCurrent = () => { const latest = getProjects().find(item => item && item.id === projectId), currentToken = latest?.status === 'watching' ? watchingActivationTokens.get(projectId) ?? null : null; return !!latest && latest.status === status && open && watchingActivationSequence === generation && currentToken === activationToken; }; return { activationToken, close() { open = false; }, current() { return baseCurrent() && (activationToken === null || illustratorActivationScopes.get(projectId)?.revision === scopeRevision); },
-    adoptScope(scope) { if (activationToken === null) return baseCurrent(); if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope || ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false; scopeRevision = scope.revision; return true; } }; }
+// Generic change events historically follow fresh accepted-source state, not a
+// frozen Illustrator scope. Bind account and activation before metadata awaits;
+// parser children add their strict scope lease only after source revalidation.
+function captureWatchingScanEvent(projectId, activationToken) {
+  const assertAccountCurrent = captureAccountAuthorization();
+  const generation = watchingActivationSequence;
+  let open = true;
+  return {
+    close() { open = false; },
+    current() {
+      if (!open) return false;
+      try { assertAccountCurrent(); }
+      catch (_) { open = false; return false; }
+      return watchingActivationSequence === generation && isActiveWatchingProject(projectId, activationToken);
+    },
+  };
+}
+
+function captureProjectOperation(projectId) {
+  const project = getProjects().find(item => item && item.id === projectId);
+  if (!project) return null;
+  const assertAccountCurrent = captureAccountAuthorization();
+  const status = project.status;
+  const generation = watchingActivationSequence;
+  const activationToken = status === 'watching'
+    ? watchingActivationTokens.get(projectId) ?? null
+    : null;
+  let scopeRevision = illustratorActivationScopes.get(projectId)?.revision;
+  let open = true;
+  const baseCurrent = () => {
+    if (!open) return false;
+    try {
+      assertAccountCurrent();
+    } catch (_) {
+      // Retire this lease even if a later refresh permits new operations.
+      open = false;
+      return false;
+    }
+    const latest = getProjects().find(item => item && item.id === projectId);
+    const currentToken = latest?.status === 'watching'
+      ? watchingActivationTokens.get(projectId) ?? null
+      : null;
+    return !!latest && latest.status === status &&
+      watchingActivationSequence === generation && currentToken === activationToken;
+  };
+  return {
+    activationToken,
+    close() { open = false; },
+    current() {
+      return baseCurrent() && (activationToken === null ||
+        illustratorActivationScopes.get(projectId)?.revision === scopeRevision);
+    },
+    adoptScope(scope) {
+      if (activationToken === null) return baseCurrent();
+      if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope ||
+          ![scopeRevision, scopeRevision + 1].includes(scope?.revision)) return false;
+      scopeRevision = scope.revision;
+      return true;
+    },
+  };
+}
 
 function activateSingleWatchingProject(projectId, settings, { preserveWatchStartedAt = false } = {}) {
   const projects = getProjects();
@@ -7967,6 +8212,22 @@ function reserveUniqueName(name, usedNames) {
   }
   usedNames.add(candidate.toLowerCase());
   return candidate;
+}
+
+// Concurrent PSDs may reserve the same name while their bytes are staged.
+// Only an exclusive link claims the destination; never replace a sibling.
+function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndOwned) {
+  for (let attempt = 0; attempt < 1024; attempt++) {
+    assertCurrentAndOwned();
+    try {
+      fs.linkSync(stage.stagedPath, stage.extractPath);
+      return;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      stage.extractPath = path.join(extractDir, reserveUniqueName(stage.embeddedOriginalName, usedNames));
+    }
+  }
+  throw cacheSafetyError('psd-extract-file', 'name-collision-limit');
 }
 
 function getEmbeddedPsdDedupKey(file) {
@@ -11791,7 +12052,8 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         if (message.index !== (embedded ? embeddedCount : entryCount) || (!embedded && (sawEmbedded || message.byteLength !== 0))) invalid();
         sawEmbedded ||= embedded;
         record = { kind: message.kind, index: message.index, textUnits: message.textUnits,
-          byteLength: message.byteLength, text: '', written: 0, stage: null };
+          byteLength: message.byteLength, text: '', written: 0, stage: null,
+          hash: embedded ? crypto.createHash('sha256') : null };
       } else if (message.type === 'text') {
         if (!record || record.stage || typeof message.text !== 'string' || !message.text.length
           || message.text.length > 16384 || message.text.length > record.textUnits - record.text.length) invalid();
@@ -11814,6 +12076,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           offset += bytesWritten;
           record.written += bytesWritten;
         }
+        record.hash.update(message.bytes);
         assertCacheFileDescriptorIdentity(stage.handle.fd, stage.stagedPath, directoryIdentity, 'psd-extract-file');
       } else if (message.type === 'record-end') {
         if (!record || record.text.length !== record.textUnits || record.written !== record.byteLength) invalid();
@@ -11826,6 +12089,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           stage.handle = null;
           check();
           ownedPath(stage, stage.stagedPath);
+          stage.outputDigest = record.hash.digest('hex');
           embeddedCount++;
         } else {
           entries.push({ filePath: record.text, source: 'psd-linked' });
@@ -11854,15 +12118,17 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     promote() {
       check();
       for (const stage of stages) {
-        ownedPath(stage, stage.stagedPath);
-        fs.linkSync(stage.stagedPath, stage.extractPath);
+        promoteEmbeddedPsdStage(stage, extractDir, usedNames, () => {
+          check();
+          ownedPath(stage, stage.stagedPath);
+        });
         stage.promoted = true;
         ownedPath(stage, stage.extractPath);
         fs.unlinkSync(stage.stagedPath);
         if (ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
       }
       return stages.map(stage => ({ filePath: stage.extractPath, source: 'psd-embedded',
-        embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex, sourceDigest }));
+        embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex, sourceDigest, outputDigest: stage.outputDigest }));
     },
     assertReady() {
       check();
@@ -12095,6 +12361,11 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
   if (ext === '.psd') {
     const buffer = await fs.promises.readFile(filePath);
     readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
+    if (!isAddFilesSourceIdentityCurrent(await fs.promises.stat(filePath), getAddFilesSourceIdentity(stat))) {
+      throw new Error('asset_baseline_source_changed');
+    }
+    return { kind: 'psd-buffer-result', buffer, sourceIdentity: getAddFilesSourceIdentity(stat),
+      sourceDigest: crypto.createHash('sha256').update(buffer).digest('hex') };
   } else if (STRICT_ZIP_ASSET_BASELINE_EXTENSIONS.has(ext)) {
     await execFileAsync('/usr/bin/unzip', ['-tqq', filePath], {
       timeout: 10000,
@@ -12319,7 +12590,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       workerResult = await runAddFilesPsdWorker(psdFilePath, options.addFilesAttempt, options.psdTransaction);
       if (!isCurrent()) return [];
     } else {
-      const buf = await fs.promises.readFile(psdFilePath);
+      const buf = options.sourceBuffer || await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
       psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
     }
@@ -12365,7 +12636,10 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       await fs.promises.mkdir(extractDir, { recursive: true });
       if (!isCurrent()) return [];
+      const directoryIdentity = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory');
+      options.onOwnedPsdOutputs?.(invocationFiles);
       const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase()));
+      let baselineEmbeddedOrdinal = 0;
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
         if (!isCurrent()) return [];
         if (!lf.data) continue;
@@ -12377,14 +12651,33 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           stagedPath,
           extractPath,
           extractDir,
+          directoryIdentity,
           embeddedOriginalName: lf.name || '',
-          embeddedIndex,
+          // The streamed parser numbers embedded records only. Preserve the
+          // legacy index for other callers, but share its ordinal for receipts.
+          embeddedIndex: options.onOwnedPsdOutputs ? baselineEmbeddedOrdinal++ : embeddedIndex,
+          outputDigest: crypto.createHash('sha256').update(data).digest('hex'),
           identity: null,
           committed: false,
         };
         invocationFiles.push(staged);
-        await fs.promises.writeFile(stagedPath, data, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE });
+        if (options.onOwnedPsdOutputs) {
+          const handle = await fs.promises.open(stagedPath,
+            fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), OWNER_ONLY_FILE_MODE);
+          try {
+            const opened = fs.fstatSync(handle.fd);
+            staged.identity = { dev: opened.dev, ino: opened.ino };
+            if (!isCurrent()) throw new Error('stale_project_operation');
+            await handle.writeFile(data);
+            assertCacheFileDescriptorIdentity(handle.fd, stagedPath, directoryIdentity, 'psd-extract-file');
+          } finally { await handle.close(); }
+        } else {
+          await fs.promises.writeFile(stagedPath, data, { flag: 'wx', mode: OWNER_ONLY_FILE_MODE });
+        }
         const stagedStat = fs.lstatSync(stagedPath);
+        if (staged.identity && (stagedStat.dev !== staged.identity.dev || stagedStat.ino !== staged.identity.ino)) {
+          throw cacheSafetyError('psd-extract-file', 'changed');
+        }
         if (!isDirectCacheChild(extractDir, stagedPath) || stagedStat.isSymbolicLink() || !stagedStat.isFile() || stagedStat.nlink !== 1) {
           throw cacheSafetyError('psd-extract-file', 'unsafe');
         }
@@ -12393,7 +12686,15 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       for (const staged of invocationFiles) {
         if (!isCurrent()) return [];
-        fs.linkSync(staged.stagedPath, staged.extractPath);
+        promoteEmbeddedPsdStage(staged, extractDir, usedEmbeddedNames, () => {
+          if (!isCurrent()) throw new Error('add_files_parser_cancelled');
+          assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
+          const stat = fs.lstatSync(staged.stagedPath);
+          if (!isDirectCacheChild(extractDir, staged.stagedPath) || stat.isSymbolicLink() || !stat.isFile() ||
+              stat.dev !== staged.identity.dev || stat.ino !== staged.identity.ino) {
+            throw cacheSafetyError('psd-extract-file', 'changed');
+          }
+        });
         staged.committed = true;
         fs.unlinkSync(staged.stagedPath);
         const finalStat = fs.lstatSync(staged.extractPath);
@@ -12406,6 +12707,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           embeddedOriginalName: staged.embeddedOriginalName,
           embeddedIndex: staged.embeddedIndex,
           sourceDigest: workerResult?.sourceDigest || null,
+          outputDigest: staged.outputDigest,
         });
       }
     }
@@ -12416,7 +12718,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     if (options.strict === true) throw e;
     return [];
-  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = !staged.identity || (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino); if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
+  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = staged.identity ? (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino) : !options.onOwnedPsdOutputs; if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
 }
 
 /**
@@ -12738,6 +13040,8 @@ async function captureExistingPresentationMediaBaseline(
     const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
       source: 'scan-on-save-presentation',
       logicalPresentationPath: presentationPath,
+      onBeforeMaterialize: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
+      onBeforeWrite: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
       failClosed: true,
       rollbackOnFailure: true,
       onCandidate: candidate => {
@@ -12754,7 +13058,7 @@ async function captureExistingPresentationMediaBaseline(
     if (!isCurrent()) return;
 
     const scanState = assetBaselineScans.get(projectId);
-    if (scanState && scanState.startedAt === baselineScan.startedAt) {
+    if (scanState === baselineScan.state && isCurrent()) {
       scanState.presentationMediaOccurrencesBySource ||= new Map();
       scanState.presentationMediaOccurrencesBySource.set(
         baselineScan.sourceKey,
@@ -12829,22 +13133,170 @@ async function captureExistingPresentationMediaBaseline(
   }
 }
 
+// Baseline receipts are private to one owner. They prove an earlier accepted
+// asset, never authority for a new scan or ownership of its borrowed output.
+function psdBaselineFileIdentity(stat) {
+  return { ...getAddFilesSourceIdentity(stat), ctimeMs: stat.ctimeMs };
+}
+function assertPsdBaselineSnapshot(snapshot) {
+  if (snapshot.directory) assertCacheDirectoryIdentity(snapshot.directory, 'psd-extract-directory');
+  const stat = fs.lstatSync(snapshot.path);
+  if (stat.isSymbolicLink() || !isAddFilesSourceIdentityCurrent(stat, snapshot.identity) ||
+      stat.ctimeMs !== snapshot.identity.ctimeMs || fs.realpathSync(snapshot.path) !== snapshot.realPath) {
+    throw new Error('asset_baseline_psd_output_changed');
+  }
+}
+async function readPsdBaselineSnapshot(filePath, isCurrent, directory = null) {
+  const check = () => { if (!isCurrent()) throw new Error('stale_project_operation'); };
+  check();
+  const initial = fs.lstatSync(filePath);
+  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error('asset_baseline_psd_output_changed');
+  const snapshot = { path: filePath, realPath: fs.realpathSync(filePath),
+    identity: psdBaselineFileIdentity(initial), directory };
+  assertPsdBaselineSnapshot(snapshot);
+  const handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    check();
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (offset < initial.size) {
+      check();
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, initial.size - offset), offset);
+      check();
+      if (bytesRead <= 0) throw new Error('asset_baseline_psd_output_changed');
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    const final = await handle.stat();
+    check();
+    if (!isAddFilesSourceIdentityCurrent(final, snapshot.identity) || final.ctimeMs !== snapshot.identity.ctimeMs) {
+      throw new Error('asset_baseline_psd_output_changed');
+    }
+    snapshot.digest = hash.digest('hex');
+  } finally { await handle.close(); }
+  check();
+  assertPsdBaselineSnapshot(snapshot);
+  return snapshot;
+}
+function findPsdBaselineReceiptRow(project, receipt) {
+  return (project[receipt.collection] || []).find(row => JSON.stringify(row) === receipt.row);
+}
+function assertBaselinePsdOutputOwnership(outputs) {
+  for (const stage of outputs) {
+    assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+    const stat = fs.lstatSync(stage.extractPath);
+    if (!stage.committed || !stage.identity || !isDirectCacheChild(stage.extractDir, stage.extractPath) ||
+        stat.isSymbolicLink() || !stat.isFile() || stat.dev !== stage.identity.dev || stat.ino !== stage.identity.ino) {
+      throw new Error('asset_baseline_psd_output_changed');
+    }
+  }
+}
+async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, assets, isCurrent, ownedOutputs) {
+  const owner = baselineScan.state;
+  owner.psdOutputReceipts ||= new Map();
+  const receipts = owner.psdOutputReceipts;
+  const outputOwners = new Map(ownedOutputs.map(stage => [stage.extractPath, stage]));
+  const sourceRow = getProjects().find(project => project.id === projectId)?.files
+    .find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const sourceRowSnapshot = JSON.stringify(sourceRow);
+  const source = await readPsdBaselineSnapshot(filePath, isCurrent);
+  if (!isAddFilesSourceIdentityCurrent(fs.lstatSync(filePath), validatedSource.sourceIdentity) ||
+      source.digest !== validatedSource.sourceDigest) throw new Error('asset_baseline_source_changed');
+  const directory = captureCacheDirectoryIdentity(path.join(os.tmpdir(), 'crate-psd-extract-' + projectId), 'psd-extract-directory');
+  const items = [];
+  for (const asset of assets.filter(asset => asset.source === 'psd-embedded')) {
+    const key = JSON.stringify([normalizeTrackedFilePath(filePath), source.realPath, source.identity,
+      source.digest, asset.embeddedIndex, asset.embeddedOriginalName]);
+    const previous = receipts.get(key);
+    const ownedOutput = outputOwners.get(asset.filePath);
+    if (ownedOutput) assertBaselinePsdOutputOwnership([ownedOutput]);
+    const output = await readPsdBaselineSnapshot(asset.filePath, isCurrent, directory);
+    if (ownedOutput) assertBaselinePsdOutputOwnership([ownedOutput]);
+    if (output.digest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+    let borrowed = null;
+    if (previous) {
+      previous.assertAccountCurrent();
+      assertPsdBaselineSnapshot(previous.output);
+      borrowed = await readPsdBaselineSnapshot(previous.output.path, isCurrent, previous.output.directory);
+      if (borrowed.digest !== previous.output.digest || borrowed.digest !== output.digest) {
+        throw new Error('asset_baseline_psd_output_changed');
+      }
+    }
+    items.push({ asset, key, previous, output, borrowed });
+  }
+  const selectionCurrent = () => items.every(item => receipts.get(item.key) === item.previous);
+  const check = project => {
+    if (!isCurrent() || assetBaselineScans.get(projectId) !== owner || !selectionCurrent() ||
+        !project.files.some(row => JSON.stringify(row) === sourceRowSnapshot)) throw new Error('stale_project_operation');
+    assertPsdBaselineSnapshot(source);
+    // Watcher stages retain their original descriptor/directory identities.
+    // A freshly hashed identical-byte replacement never acquires ownership.
+    assertBaselinePsdOutputOwnership(ownedOutputs);
+    for (const item of items) {
+      assertPsdBaselineSnapshot(item.output);
+      if (item.previous) {
+        item.previous.assertAccountCurrent();
+        if (!findPsdBaselineReceiptRow(project, item.previous)) throw new Error('asset_baseline_psd_output_changed');
+        assertPsdBaselineSnapshot(item.previous.output);
+        assertPsdBaselineSnapshot(item.borrowed);
+      }
+    }
+  };
+  return { items, selectionCurrent, check, remember(project) {
+    check(project);
+    for (const item of items) {
+      if (item.previous) continue;
+      for (const collection of ['files', 'pendingFiles']) {
+        const row = (project[collection] || []).find(row => row.path === item.asset.filePath && row.source === 'psd-embedded');
+        if (row) receipts.set(item.key, { output: item.output, collection, row: JSON.stringify(row),
+          assertAccountCurrent: captureAccountAuthorization() });
+      }
+    }
+  } };
+}
+function finishBaselinePsdOutputs(outputs) {
+  for (const stage of outputs) {
+    if (!stage.committed || stage.accepted || !stage.identity) continue;
+    try {
+      assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+      const stat = fs.lstatSync(stage.extractPath);
+      if (isDirectCacheChild(stage.extractDir, stage.extractPath) && !stat.isSymbolicLink() && stat.isFile() &&
+          stat.dev === stage.identity.dev && stat.ino === stage.identity.ino) fs.unlinkSync(stage.extractPath);
+    } catch (_) { /* A replacement is never ours to remove. */ }
+  }
+}
+
 /**
  * Run scan-on-open for a design file: extract linked assets and merge into project.
  * Fire-and-forget — called outside mutateProject, then uses mutateProject for store writes.
  */
 async function runScanOnOpen(projectId, filePath, activationToken = null, operation = null, options = {}) {
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operation || operation.current());
+  // Compatibility callers without a parent lease bind authority at parser entry;
+  // this does not authorize or audit work done earlier by their polling roots.
+  const ownsOperation = !operation;
+  operation ||= captureProjectOperation(projectId);
+  let baselineScan = null;
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current() &&
+    (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
-  if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return;
+  if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) { if (ownsOperation) operation?.close(); return; }
   const currentProject = getProjects().find(p => p.id === projectId);
-  if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) return;
+  if (!currentProject || !isCurrent() || !isAcceptedProjectFilePath(currentProject, filePath)) {
+    if (ownsOperation) operation?.close();
+    return;
+  }
 
-  const baselineScan = options.establishBaseline === false
+  baselineScan = options.establishBaseline === false
     ? null
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
       allowPaused: options.allowPausedBaseline === true,
+      baselineReservation: options.baselineReservation,
     });
+  if (options.baselineReservation && !baselineScan) {
+    if (ownsOperation) operation?.close();
+    return { success: false, error: 'stale_project_operation' };
+  }
   if (options.addFilesScanLease) options.addFilesScanLease.baselineScan = baselineScan;
   if (baselineScan && options.addFilesScanLease) {
     options.addFilesScanLease.onCancel(() => {
@@ -12853,6 +13305,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
   let dependableScanCompleted = false;
   let psdTransaction = null;
+  let baselinePsdOutputs = [];
   try {
 
   if (ext === '.psd' && options.addFilesAttempt) {
@@ -12879,7 +13332,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   if (!isCurrent()) return;
   const recheckValidatedSource = async () => {
     if (!baselineScan || !validatedSource) return true;
-    if (validatedSource.kind === 'psd-worker-result') {
+    if (validatedSource.kind === 'psd-worker-result' || validatedSource.kind === 'psd-buffer-result') {
       return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
     }
     if (validatedSource.kind === 'regex-worker-result') {
@@ -12984,6 +13437,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
       strict: !!baselineScan,
       psdTransaction,
+      sourceBuffer: validatedSource?.kind === 'psd-buffer-result' ? validatedSource.buffer : undefined,
+      onOwnedPsdOutputs: baselineScan ? outputs => { baselinePsdOutputs = outputs; } : undefined,
       addFilesAttempt: options.addFilesAttempt,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
@@ -12992,6 +13447,15 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdTransaction && !await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdAssets.length > 0) {
+      let acceptance = null;
+      if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
+        // Another full scan may accept while hashing. Recompare its receipt;
+        // never publish based on a stale absence. No await follows this loop.
+        for (let attempt = 0; attempt < 4; attempt++) {
+          acceptance = await preparePsdBaselineAcceptance(projectId, filePath, baselineScan, validatedSource, psdAssets, isCurrent, baselinePsdOutputs);
+          if (acceptance.selectionCurrent()) break;
+        }
+      }
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -13005,10 +13469,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
             throw new Error('asset_baseline_source_changed');
           }
         }
-        // v2.4.0: normalize paths before comparing to prevent duplicates
+        // Validate every candidate before mutating any row; mutateProject does
+        // not roll back a partially modified project when its callback throws.
+        acceptance?.check(proj);
         const acceptedFiles = [];
         let changed = false;
         for (const asset of psdAssets) {
+          if (acceptance?.items.some(item => item.asset === asset && item.previous)) continue;
           const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
           let baselineMetadataChanged = false;
           if (baselineScan) {
@@ -13051,6 +13518,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         if (!psdRowsAccepted) throw new Error('add_files_parser_cancelled');
         psdTransaction.accept(getProjects().find(proj => proj.id === projectId));
       }
+      if (psdRowsAccepted) {
+        const acceptedProject = getProjects().find(proj => proj.id === projectId);
+        const acceptedPaths = new Set([...(acceptedProject.files || []), ...(acceptedProject.pendingFiles || [])].map(row => row.path));
+        for (const stage of baselinePsdOutputs) stage.accepted = acceptedPaths.has(stage.extractPath);
+        acceptance?.remember(acceptedProject);
+      }
       if (psdResult && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
@@ -13076,8 +13549,17 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       error: baselineScan ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed',
     };
   } finally {
-    if (psdTransaction) await psdTransaction.finish();
-    await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted && isCurrent());
+    try {
+      try {
+        if (psdTransaction) await psdTransaction.finish();
+        finishBaselinePsdOutputs(baselinePsdOutputs);
+      } catch (error) {
+        dependableScanCompleted = false;
+        throw error;
+      } finally {
+        await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
+      }
+    } finally { if (ownsOperation) operation?.close(); }
   }
 }
 
@@ -13089,33 +13571,51 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
  * For embedded smart objects: marks as embedded (source: 'scan-on-save-embedded', embedded: true).
  * Never breaks the session — all errors caught silently.
  */
-function scheduleScanOnSave(projectId, psdFilePath, activationToken = null) {
-  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
-  const key = `${projectId}:${psdFilePath}`;
-  if (scanOnSaveTimers.has(key)) {
-    clearTimeout(scanOnSaveTimers.get(key));
-  }
-  const timerId = setTimeout(() => {
-    if (scanOnSaveTimers.get(key) === timerId) {
-      scanOnSaveTimers.delete(key);
-    }
-    runScanOnSave(projectId, psdFilePath, activationToken).catch(() => {});
-  }, 2000);
-  scanOnSaveTimers.set(key, timerId);
+function scheduleOwnedSaveScan(timers, projectId, filePath, activationToken, operation, run) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
+  if (!isCurrent()) { if (!operation) ownedOperation?.close(); return Promise.resolve(); }
+  const key = `${projectId}:${filePath}`;
+  timers.get(key)?.cancel();
+  return new Promise(resolve => {
+    const settle = () => { if (!operation) ownedOperation.close(); resolve(); };
+    const pending = {
+      cancel() {
+        clearTimeout(pending.timer);
+        if (timers.get(key) === pending) timers.delete(key);
+        settle();
+      },
+      timer: null,
+    };
+    pending.timer = setTimeout(async () => {
+      if (timers.get(key) !== pending) return;
+      timers.delete(key);
+      try { if (isCurrent()) await run(projectId, filePath, activationToken, ownedOperation); }
+      catch (_) { /* Scan errors never break the watching session. */ }
+      finally { settle(); }
+    }, 2000);
+    timers.set(key, pending);
+  });
 }
 
-async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
+function scheduleScanOnSave(projectId, psdFilePath, activationToken = null, operation = null) {
+  return scheduleOwnedSaveScan(scanOnSaveTimers, projectId, psdFilePath, activationToken, operation, runScanOnSave);
+}
+
+async function runScanOnSave(projectId, psdFilePath, activationToken = null, operation = null) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
   try {
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, psdFilePath)) return;
 
     const stat = await fs.promises.stat(psdFilePath);
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     if (stat.size > MAX_PARSE_FILE_SIZE) return;
 
     const buf = await fs.promises.readFile(psdFilePath);
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
 
     const newEntries = [];
@@ -13162,10 +13662,10 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
       }
     }
 
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+      if (!isCurrent()) return null;
       const currentEmbeddedKeys = new Set(
         newEntries
           .filter(entry => entry.source === 'scan-on-save-embedded')
@@ -13201,7 +13701,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
     });
 
     if (result) {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+      if (!isCurrent()) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendProjectFileStateToRenderer(projectId, activationToken);
@@ -13209,6 +13709,8 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
   } catch (e) {
     // L2: Log so failures are debuggable — never break the session
     console.log('[scan-on-save] ag-psd parse failed:', e.message);
+  } finally {
+    if (!operation) ownedOperation?.close();
   }
 }
 
@@ -13217,24 +13719,17 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null) {
  * When a presentation is saved (Cmd+S), extract embedded media immediately
  * to a temp dir and add to project.files mid-session. Debounced 2s like PSD.
  */
-function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null) {
-  if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
-  const key = `${projectId}:${filePath}`;
-  if (scanOnSavePresentationTimers.has(key)) {
-    clearTimeout(scanOnSavePresentationTimers.get(key));
-  }
-  const timerId = setTimeout(() => {
-    if (scanOnSavePresentationTimers.get(key) === timerId) {
-      scanOnSavePresentationTimers.delete(key);
-    }
-    runScanOnSavePresentation(projectId, filePath, activationToken).catch(() => {});
-  }, 2000);
-  scanOnSavePresentationTimers.set(key, timerId);
+function scheduleScanOnSavePresentation(projectId, filePath, activationToken = null, operation = null) {
+  return scheduleOwnedSaveScan(scanOnSavePresentationTimers, projectId, filePath, activationToken, operation, runScanOnSavePresentation);
 }
 
-async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null) {
+async function runScanOnSavePresentation(projectId, presentationPath, activationToken = null, operation = null) {
+  const ownedOperation = operation || captureProjectOperation(projectId);
+  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!ownedOperation?.current();
+  const invocationFiles = [];
+  let keepInvocationFiles = false;
   try {
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
     const ext = path.extname(presentationPath).toLowerCase();
     if (ext !== '.pptx' && ext !== '.key') return;
     const base = path.basename(presentationPath, ext);
@@ -13247,7 +13742,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     // Build dedup sets from existing project files
     const currentProjects = getProjects();
     const project = currentProjects.find(p => p.id === projectId);
-    if (!project || !isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!project || !isCurrent()) return;
     const projectFiles = project.files || [];
 
     // Name-based dedup for .key files. Do not add prior scan-on-save media to
@@ -13328,7 +13823,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const { stdout: listing } = await execFileAsync('/usr/bin/unzip', ['-l', presentationPath], {
       timeout: 10000, encoding: 'utf8'
     });
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const newEntries = [];
 
@@ -13373,12 +13868,12 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       }
 
       try {
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', presentationPath, zipPath], {
           timeout: 10000, maxBuffer: 50 * 1024 * 1024,
           encoding: 'buffer'
         });
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         let extractedFingerprint = null;
 
         // Content-based dedup for presentation media.
@@ -13428,8 +13923,9 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
         }
         if (!destPath) continue;
 
-        if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+        if (!isCurrent()) return;
         writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
+        invocationFiles.push(captureOwnedDirectCacheFile(destPath, tempDir, 'presentation-cache-file'));
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
         newEntries.push({
@@ -13447,10 +13943,10 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     }
 
     if (newEntries.length === 0) return;
-    if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     const result = mutateProject(projectId, (proj) => {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return null;
+      if (!isCurrent()) return null;
       let changed = false;
 
       for (const entry of newEntries) {
@@ -13477,8 +13973,13 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
       return changed ? { files: proj.files, pendingFiles: proj.pendingFiles || [] } : null;
     });
 
+    const saved = getProjects().find(item => item.id === projectId);
+    // Preserve only files referenced by the accepted saved result, including pending rows.
+    const referenced = new Set([...(saved?.files || []), ...(saved?.pendingFiles || [])].map(file => file.path));
+    removeOwnedDirectCacheFiles(invocationFiles.filter(record => !referenced.has(record.filePath)));
+    keepInvocationFiles = true;
     if (result) {
-      if (!isBoundWatchingActivationCurrent(projectId, activationToken)) return;
+      if (!isCurrent()) return;
       lastFileActivity.set(projectId, Date.now());
       inactivityNotified.delete(projectId);
       sendProjectFileStateToRenderer(projectId, activationToken);
@@ -13486,6 +13987,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
   } catch (e) {
     console.log('[scan-on-save-presentation] extraction failed:', redactFigmaLogText(e.message));
   } finally {
+    if (!keepInvocationFiles) removeOwnedDirectCacheFiles(invocationFiles);
+    if (!operation) ownedOperation?.close();
     scheduleDeletedProjectCacheCleanup(projectId);
   }
 }
@@ -14359,13 +14862,18 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   // v2.2.2: Also triggers scan-on-open when a design file is modified
   watcher.on('change', async (filePath, suppliedStats = null) => {
     if (!isActiveWatchingProject(projectId, activationToken)) return;
+    const operation = captureWatchingScanEvent(projectId, activationToken);
+    const isCurrent = () => isActiveWatchingProject(projectId, activationToken) && !!operation?.current();
+    let childrenOwnOperation = false;
+    try {
+    if (!isCurrent()) return;
     const ext = path.extname(filePath).toLowerCase();
     const name = path.basename(filePath);
     if (name.startsWith('.') || name === 'Thumbs.db') return;
     if (name.startsWith('~$')) return;
 
     await new Promise(resolve => setTimeout(resolve, 500));
-    if (!isActiveWatchingProject(projectId, activationToken)) return;
+    if (!isCurrent()) return;
 
     // v2.2.6: Only re-scan PRIMARY design source files on change.
     // Same rationale as the 'add' handler — image/media changes are noise here.
@@ -14381,11 +14889,11 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         const latestProject = getFreshActiveWatchingProject(projectId, activationToken);
         if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
       }
-      if (!isActiveWatchingProject(projectId, activationToken)) return;
+      if (!isCurrent()) return;
 
       const fileEntry = { path: filePath, name, ext, addedAt: Date.now() };
       const result = mutateProject(projectId, (proj) => {
-        if (!isActiveWatchingProject(projectId, activationToken)) return null;
+        if (!isCurrent()) return null;
         const staged = stageLiveObservedFile(proj, fileEntry, {
           allowDirect: true,
           appFamily: 'generic',
@@ -14401,35 +14909,48 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         return { files: proj.files, pendingFiles: proj.pendingFiles || [] };
       });
 
-      if (result) {
+      if (result && isCurrent()) {
         lastFileActivity.set(projectId, Date.now());
         inactivityNotified.delete(projectId);
         sendProjectFileStateToRenderer(projectId, activationToken);
       }
 
+      if (!isCurrent()) return;
+      const children = [];
       const updatedProject = getProjects().find(p => p.id === projectId);
       const sourceIsAccepted = isAcceptedProjectFilePath(updatedProject, filePath);
+      if (!sourceIsAccepted || !isCurrent()) return;
+      const scopedChild = captureProjectOperation(projectId);
+      const childOperation = {
+        current: () => isCurrent() && !!scopedChild?.current(),
+        adoptScope: scope => isCurrent() && !!scopedChild?.adoptScope(scope),
+      };
 
       // v2.2.2: When a design file changes, re-scan for linked assets
       // (designer may have added new links). Fire-and-forget.
       // C3: Skip runScanOnOpen for .psd — scheduleScanOnSave handles it with debounce
       // to avoid double ag-psd parse on every .psd save event.
       if (sourceIsAccepted && SCAN_ON_OPEN_EXTENSIONS.has(ext) && ext !== '.psd') {
-        runScanOnOpen(projectId, filePath, activationToken).catch(() => {});
+        children.push(runScanOnOpen(projectId, filePath, activationToken, childOperation));
       }
 
       // v2.5.0: Scan-on-save for PSD files — debounced, completely isolated pipeline.
       if (sourceIsAccepted && ext === '.psd') {
-        scheduleScanOnSave(projectId, filePath, activationToken);
+        children.push(scheduleScanOnSave(projectId, filePath, activationToken, childOperation));
       }
 
       // v2.5.3: Scan-on-save for presentation files — extract embedded media live.
       if (sourceIsAccepted && (ext === '.pptx' || ext === '.key')) {
-        scheduleScanOnSavePresentation(projectId, filePath, activationToken);
+        children.push(scheduleScanOnSavePresentation(projectId, filePath, activationToken, childOperation));
       }
+      // Chokidar does not await child scans. Transfer lifetime ownership while
+      // preserving the callback's existing fire-and-forget return contract.
+      childrenOwnOperation = true;
+      Promise.allSettled(children).finally(() => { scopedChild?.close(); operation.close(); });
     }
 
     // v2.4.9: CHOKIDAR_IMAGE_EXTENSIONS block permanently removed from 'change' handler too.
+    } finally { if (!childrenOwnOperation) operation?.close(); }
   });
 
   watchers.set(projectId, watcher);
@@ -14462,16 +14983,16 @@ function stopWatching(projectId, { invalidateActivation = true } = {}) {
   designFilePids.delete(projectId);
   if (invalidateActivation) assetBaselineScans.delete(projectId);
   // v2.5.0: Clean up scan-on-save timers for this project
-  for (const [key, timerId] of scanOnSaveTimers) {
+  for (const [key, pending] of scanOnSaveTimers) {
     if (key.startsWith(projectId + ':')) {
-      clearTimeout(timerId);
+      pending.cancel();
       scanOnSaveTimers.delete(key);
     }
   }
   // v2.5.3: Clean up presentation scan-on-save timers
-  for (const [key, timerId] of scanOnSavePresentationTimers) {
+  for (const [key, pending] of scanOnSavePresentationTimers) {
     if (key.startsWith(projectId + ':')) {
-      clearTimeout(timerId);
+      pending.cancel();
       scanOnSavePresentationTimers.delete(key);
     }
   }
@@ -14481,9 +15002,15 @@ function stopWatching(projectId, { invalidateActivation = true } = {}) {
 
 let inactivityCheckerInterval = null; // C4: stored so it can be cleared on quit
 const activeNativeNotifications = new Set();
+const inactivityPromptCancellations = new Set();
+function closeInactivityPrompts() {
+  for (const cancel of inactivityPromptCancellations) { try { cancel(); } catch (_) {} }
+  inactivityPromptCancellations.clear();
+}
 
 function startInactivityChecker() {
   inactivityCheckerInterval = setInterval(() => {
+    if (!accountSession?.canUseWorkspace()) return;
     const projects = getProjects();
     const settings = store.get('settings');
 
@@ -14500,6 +15027,11 @@ function startInactivityChecker() {
           continue;
         }
 
+        const assertAccountCurrent = captureAccountAuthorization();
+        const operation = captureProjectOperation(project.id);
+        const isCurrent = () => {
+          try { assertAccountCurrent(); return !!operation?.current(); } catch (_) { return false; }
+        };
         // v2.4.2: Fallback — if the app window is not visible, show native Notification
         if (!trayWindow || trayWindow.isDestroyed() || !trayWindow.isVisible()) {
           inactivityNotified.add(project.id);
@@ -14509,7 +15041,11 @@ function startInactivityChecker() {
               body: `No new design files for "${project.name}" in 3 hours. Click to open Crate.`,
               silent: false,
             });
+            const close = () => notif.close();
+            inactivityPromptCancellations.add(close);
+            notif.on('close', () => inactivityPromptCancellations.delete(close));
             notif.on('click', () => {
+              if (!isCurrent()) return;
               lastFileActivity.set(project.id, Date.now());
               inactivityNotified.delete(project.id);
               showMainWindow();
@@ -14522,7 +15058,12 @@ function startInactivityChecker() {
         inactivityNotified.add(project.id);
 
         // Center-screen dialog alert (not corner notification)
-        dialog.showMessageBox({
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        inactivityPromptCancellations.add(cancel);
+        // A parent is required for AbortSignal cancellation on macOS.
+        dialog.showMessageBox(trayWindow, {
+          signal: controller.signal,
           type: 'question',
           title: 'Crate — Still working?',
           message: `⏸ Still working on "${project.name}"?`,
@@ -14531,6 +15072,7 @@ function startInactivityChecker() {
           defaultId: 0,
           cancelId: 0
         }).then(({ response }) => {
+          if (!isCurrent()) return;
           if (response === 0) {
             // Keep Watching — reset timer
             lastFileActivity.set(project.id, Date.now());
@@ -14550,7 +15092,7 @@ function startInactivityChecker() {
               trayWindow.webContents.send('package:trigger', { projectId: project.id });
             }
           }
-        });
+        }).catch(() => {}).finally(() => inactivityPromptCancellations.delete(cancel));
       }
     }
   }, 60 * 1000); // Check every minute
@@ -14572,6 +15114,7 @@ registerTrustedIpcHandler('projects:get-all', () => {
 });
 
 registerTrustedIpcHandler('projects:create', async (event, name, projectType = 'automatic', figmaScopeMode = FIGMA_SCOPE_CURRENT_PAGE, figmaUrl = null) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   if (projectCreationInFlight) return { error: 'project_creation_in_flight' };
 
   const creation = (async () => {
@@ -14614,6 +15157,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
       outputPath: null
     };
     safelyEnsureProjectProvenance(newProject);
+    assertAccountCurrent();
     projects.push(newProject);
     clearFileVisualProjectCache();
     store.set('projects', projects);
@@ -14632,6 +15176,7 @@ registerTrustedIpcHandler('projects:create', async (event, name, projectType = '
 // payload: { action: 'preserve'|'replace'|'remove', url?: string, scopeMode }
 // A blank replacement preserves the current link; removal must be explicit.
 registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, payload = {}) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const project = getProjects().find(p => p.id === projectId);
   if (!project) return { success: false, error: 'project_not_found' };
 
@@ -14659,6 +15204,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     if (!preflight.success) return { success: false, error: preflight.error };
   }
 
+  assertAccountCurrent();
   const settings = store.get('settings') || {};
   const updated = mutateProject(projectId, (proj) => {
     proj.figmaTrackedFiles = figmaTrackedFiles;
@@ -14718,16 +15264,18 @@ registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, proje
 });
 
 registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileIdOrPath) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const currentProject = getProjects().find(project => project.id === projectId);
   const currentFile = currentProject && currentProject.files.find(file => (
     matchesProjectFileIdentity(currentProject.id, file, fileIdOrPath)
   ));
-  const failedSourceRemovalAllowed = !!(
+  const failedSourceRemovalAllowed = (
     currentProject && currentFile && isProjectAssetBaselineSource(currentFile) &&
-    await isFailedRequiredAssetBaselineSource(currentProject, currentFile)
+    await isFailedRequiredAssetBaselineSource(currentProject, currentFile, { receipt: true })
   );
   let removed = false;
   let changed = false;
+  assertAccountCurrent();
   const result = mutateProject(projectId, (project) => {
     // C2: Use fileId for removal when available (embedded files share the parent PSD path).
     // Fall back to path match for non-embedded files.
@@ -14737,7 +15285,7 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
     if (
       removedFile &&
       isProjectAssetBaselineSource(removedFile) &&
-      !failedSourceRemovalAllowed
+      !(failedSourceRemovalAllowed && failedSourceRemovalAllowed(project))
     ) {
       return project.files;
     }
@@ -19134,6 +19682,7 @@ registerTrustedIpcHandler('v2:browse-file', async () => {
 });
 
 registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const { packageMasterFile } = require('./parsers/index.js');
 
   if (packageInFlight) return { error: 'package_in_flight' };
@@ -19152,10 +19701,18 @@ registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
     const baseName = path.basename(filePath, path.extname(filePath));
     const dateStr = new Date().toISOString().split('T')[0];
     const folderName = `${baseName}_${dateStr}`;
-    const destFolder = path.join(outputDir, folderName);
+    const destination = createPrivatePackageDestination(inspectPrivatePackageDestination(outputDir, folderName));
+    const destFolder = destination.destFolder;
+    let published = false;
 
     try {
-      const result = await packageMasterFile(filePath, destFolder);
+      const result = await packageMasterFile(filePath, destination.stagingFolder);
+      assertAccountCurrent();
+      const tree = capturePrivateStagedPackageTree(destination.stagingFolder, result.files.map(file => path.relative(destination.stagingFolder, file.copied)));
+      assertAccountCurrent();
+      publishPrivatePackageDestination(destination, tree);
+      published = true;
+      result.files = result.files.map(file => ({ ...file, copied: path.join(destFolder, path.relative(destination.stagingFolder, file.copied)) }));
       rememberGeneratedPackageOutputPath(destFolder);
       incrementPackageUsage();
       return {
@@ -19169,6 +19726,8 @@ registerTrustedIpcHandler('v2:package-file', async (event, filePath) => {
       };
     } catch (err) {
       return { error: err.message };
+    } finally {
+      if (!published) await cleanupPrivatePackageDestination(destination);
     }
   } finally {
     packageInFlight = false;
@@ -19208,6 +19767,7 @@ registerTrustedIpcHandler('figma:status', async () => {
 });
 
 registerTrustedIpcHandler('figma:connect', async (event, token) => {
+  const assertAccountCurrent = captureAccountAuthorization();
   const { FigmaParser } = require('./parsers/figma');
   const parser = new FigmaParser();
 
@@ -19219,6 +19779,7 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
     return { success: false, error };
   }
 
+  assertAccountCurrent();
   const stored = await parser.storeToken(token);
 
   if (!stored) {
@@ -19231,6 +19792,7 @@ registerTrustedIpcHandler('figma:connect', async (event, token) => {
   for (const project of projects) {
     if (!projectHasFigmaTrackedFiles(project)) continue;
     const preflight = await preflightProjectFigmaConnection(project);
+    assertAccountCurrent();
     if (!preflight.success) {
       const warningUpdate = markProjectFigmaConnectionUnavailable(project.id);
       if (warningUpdate) sendToRenderer('project:updated', { projectId: project.id });
@@ -19471,6 +20033,7 @@ app.whenReady().then(async () => {
     createMainWindow();
     showMainWindow({ reason: 'startup' });
     createTray();
+    initializeAccountSession();
     migrateFigmaCredentialStorageInBackground();
 
     const activeProjectCacheIds = safeStoredProjectCacheIds();
@@ -19485,8 +20048,9 @@ app.whenReady().then(async () => {
     startupPhaseJournal.mark('watch-recovery-start');
     const activeProject = repairPersistedWatchingProjects();
     startupPhaseJournal.mark('watch-state-repair-complete');
+    accountWatchRecoveryReady = true;
     let watchRecoveryPhase = 'watch-recovery-complete';
-    if (activeProject) {
+    if (activeProject && accountSession.canUseWorkspace()) {
       try {
         startupPhaseJournal.mark('watch-resume-start');
         const recoveredProject = await startWatching(activeProject.id, { preserveWatchStartedAt: true });
@@ -19518,6 +20082,7 @@ app.on('activate', () => {
 });
 
 app.on('did-become-active', () => {
+  if (accountSession?.snapshot().state === 'offline') void accountSession.refresh();
   if (isPackageAutoForegroundSuppressed()) return;
   showMainWindow({ reason: 'did-become-active' });
 });
@@ -19540,6 +20105,8 @@ app.on('window-all-closed', (e) => {
 });
 
 app.on('before-quit', () => {
+  closeInactivityPrompts();
+  accountSession?.shutdown();
   startupPhaseJournal.mark('before-quit');
   startupPhaseJournal.close();
   isQuitting = true;
@@ -19586,12 +20153,12 @@ app.on('before-quit', () => {
   }
   activeNativeNotifications.clear();
   // v2.5.0: Clean up scan-on-save timers
-  for (const [, timerId] of scanOnSaveTimers) {
-    clearTimeout(timerId);
+  for (const [, pending] of scanOnSaveTimers) {
+    pending.cancel();
   }
   scanOnSaveTimers.clear();
-  for (const [, timerId] of scanOnSavePresentationTimers) {
-    clearTimeout(timerId);
+  for (const [, pending] of scanOnSavePresentationTimers) {
+    pending.cancel();
   }
   scanOnSavePresentationTimers.clear();
   // Explicitly destroy tray + window so quit isn't blocked by live windows.

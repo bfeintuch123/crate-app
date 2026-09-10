@@ -34,6 +34,7 @@ function createElementStub(tagName = 'div') {
       },
       contains: (name) => classes.has(name),
     },
+    contains: node => !!node && (node === element || element.children.some(child => child === node || child.contains?.(node))),
     appendChild: child => {
       if (child?.parentNode && child.parentNode !== element && typeof child.parentNode.removeChild === 'function') {
         child.parentNode.removeChild(child);
@@ -131,6 +132,7 @@ function createElementStub(tagName = 'div') {
 
   let html = '';
   let text = '';
+  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument });
   Object.defineProperty(element, 'parentElement', { get: () => element.parentNode || null });
   const htmlEscape = value => String(value)
     .replace(/&/g, '&amp;')
@@ -200,6 +202,7 @@ function createDocumentStub(elements = {}, options = {}) {
   };
 
   document = {
+    getElementById,
     listeners,
     activeElement: body,
     addEventListener: (type, fn) => { listeners[type] = fn; },
@@ -352,6 +355,11 @@ function createPackageDetailsDom() {
 }
 
 function loadRendererHelpers(document = createDocumentStub(), windowOverrides = {}, contextOverrides = {}) {
+  // Existing workspace tests run as an authenticated account; gate tests supply their own snapshot.
+  if (windowOverrides.crate && !windowOverrides.crate.getAccount) {
+    windowOverrides.crate.getAccount = async () => ({ revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'test-account', email: 'pilot@example.test' }, message: '' });
+    windowOverrides.crate.onAccountChanged = () => {};
+  }
   const context = {
     console,
     document,
@@ -5289,7 +5297,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(css, /\.package-review-modal\s*\{(?=[^}]*position:\s*relative;)(?=[^}]*overflow-x:\s*hidden;)(?=[^}]*overflow-y:\s*auto;)[^}]*\}/);
   assert.match(css, /\.toggle input:focus-visible \+ \.toggle-slider\s*\{(?=[^}]*outline:\s*2px solid var\(--black\);)(?=[^}]*outline-offset:\s*3px;)[^}]*\}/);
   assert.match(html, /id="modal-upgrade"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-describedby="upgrade-subtitle"/);
-  assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Maybe later[\s\S]*<\/button>/);
+  assert.match(html, /<button[^>]*id="btn-dismiss-upgrade"[^>]*>Close[\s\S]*<\/button>/);
   assert.match(css, /\.dismiss-link:focus-visible[\s\S]*outline:/);
 });
 
@@ -6333,10 +6341,10 @@ test('renderer shows the authoritative package quota in Settings, sidebar, and l
   renderer.renderFooter();
   renderer.showPackageLimitModal({ daysLeft: 12, packageLimit: 25 });
 
-  assert.equal(elements['plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['plan-title'].textContent, 'Package usage');
   assert.equal(elements['plan-info'].textContent, '25 packages/month \u00B7 10/25 used');
   assert.equal(elements['plan-badge'].textContent, 'Beta tester');
-  assert.equal(elements['sidebar-plan-title'].textContent, 'Closed beta');
+  assert.equal(elements['sidebar-plan-title'].textContent, 'Package usage');
   assert.equal(elements['footer-usage'].textContent, '10 of 25 packages used this month');
   assert.equal(elements['upgrade-title'].textContent, "You've used all 25 packages");
   assert.equal(elements['upgrade-days-left'].textContent, '12');
@@ -6392,6 +6400,7 @@ test('Quick Package drop uses preload File handling while Browse keeps its exist
 
   loadRendererHelpers(document, { crate: crateBridge });
   document.listeners.DOMContentLoaded();
+  await new Promise(setImmediate); // Allow the authenticated startup check to reach the data requests.
   const startupUsageRequests = usageRequests;
 
   const dropHandlers = elements['v2-drop-zone'].listeners.drop;
@@ -6969,4 +6978,632 @@ test('renderer schedules visible preview work before lower-priority offscreen wo
   await Promise.all([offscreen, visible, nearby]);
 
   assert.deepEqual(calls.map(call => call[1]), ['visible', 'nearby', 'offscreen']);
+});
+
+test('full-window welcome requires an account even with existing projects or a remembered identity', () => {
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document);
+  const welcome = document.querySelector('#account-welcome');
+  welcome.classList.add('hidden');
+  for (const stateName of ['unconfigured', 'checking', 'signed_out', 'waiting', 'verifying', 'expired', 'error', 'offline']) {
+    renderer.stateName = stateName;
+    vm.runInContext(`state.projects = [{id:'existing',name:'Existing',files:[]}]; accountStatus = { revision: 1, state: stateName, identity: {email:'pilot@example.test'}, canUseWorkspace: false, message: '' }; renderAccount();`, renderer);
+    assert.equal(elements.app.classList.contains('account-onboarding'), true, stateName);
+    assert.equal(elements['app-sidebar'].inert, true);
+    assert.equal(elements['app-main'].inert, true);
+  }
+  vm.runInContext(`accountStatus = {revision:2,state:'signed_in',canUseWorkspace:true,identity:{email:'pilot@example.test'},message:''}; renderAccount();`, renderer);
+  assert.equal(elements.app.classList.contains('account-onboarding'), false);
+  assert.equal(elements['app-main'].inert, false);
+  vm.runInContext(`accountStatus = {revision:3,state:'signed_out',canUseWorkspace:false,identity:null,message:''}; renderAccount();`, renderer);
+  assert.equal(elements.app.classList.contains('account-onboarding'), true);
+});
+test('welcome has no anonymous bypass and remains the default before script initialization', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  assert.doesNotMatch(html, /welcome-local|Continue using local|sign-in is optional/i);
+  assert.match(html, /id="app" class="account-onboarding"/);
+  assert.match(html, /class="account-welcome"/);
+});
+test('signed-out startup does not request workspace data; sign-in loads it and logout rejects late startup data', async () => {
+  const { document, elements } = createInteractiveRendererDom();
+  let changed, reads = 0;
+  const pending = createDeferred();
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAccount: async () => ({revision:1,state:'signed_out',canUseWorkspace:false,identity:null,message:''}),
+    onAccountChanged: callback => { changed = callback; },
+    getProjects: () => { reads++; return pending.promise; },
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({connected:false}),
+    onFilesUpdated: () => {}, onProjectUpdated: () => {}, onPendingFilesUpdated: () => {}, onPackageTrigger: () => {}, onFigmaAuthError: () => {}, onFigmaScanStarted: () => {}, onFigmaScanComplete: () => {}, onFigmaScanError: () => {},
+  }});
+  await document.listeners.DOMContentLoaded();
+  assert.equal(reads, 0);
+  changed({revision:2,state:'signed_in',canUseWorkspace:true,identity:{id:'a',email:'pilot@example.test'},message:''});
+  assert.equal(reads, 1);
+  changed({revision:3,state:'signed_out',canUseWorkspace:false,identity:null,message:''});
+  pending.resolve([{id:'late-project',files:[]}]);
+  await new Promise(setImmediate);
+  assert.equal(vm.runInContext('state.projects.length',renderer),0);
+  assert.equal(elements.app.classList.contains('account-onboarding'),true);
+});
+
+test('Settings vertical tabs keep one pane visible and support arrows, Home, End and activation', () => {
+  const keys = ['general', 'packaging', 'integrations', 'privacy', 'account', 'billing'];
+  const panels = Object.fromEntries(keys.map(key => ['settings-panel-' + key, createElementStub('section')]));
+  const tabs = keys.map(key => {
+    const tab = createElementStub('button');
+    tab.setAttribute('aria-controls', 'settings-panel-' + key);
+    return tab;
+  });
+  const document = createDocumentStub(panels, { tabs });
+  const originalQuery = document.querySelectorAll.bind(document);
+  document.querySelectorAll = selector => selector === '[data-settings-tab]' ? tabs : originalQuery(selector);
+  const renderer = loadRendererHelpers(document);
+  renderer.initializeSettingsNavigation();
+  const selected = index => {
+    for (let i = 0; i < keys.length; i++) {
+      assert.equal(tabs[i].getAttribute('aria-selected'), String(i === index));
+      assert.equal(tabs[i].tabIndex, i === index ? 0 : -1);
+      assert.equal(panels['settings-panel-' + keys[i]].hidden, i !== index);
+    }
+  };
+  tabs[4].click(); selected(4);
+  const press = (index, key) => {
+    let prevented = false;
+    tabs[index].dispatchEvent({ type: 'keydown', key, preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+  };
+  press(4, 'ArrowDown'); selected(5); assert.equal(document.activeElement, tabs[5]);
+  press(5, 'ArrowDown'); selected(0);
+  press(0, 'ArrowUp'); selected(5);
+  press(5, 'Home'); selected(0);
+  press(0, 'End'); selected(5);
+  tabs[2].click(); selected(2);
+});
+
+// Deferred startup and welcome focus regressions from independent review.
+const signed = revision => ({revision, state:'signed_in', canUseWorkspace:true, identity:{id:'synthetic-a',email:'review@example.test'},message:''});
+const out = revision => ({revision,state:'signed_out',canUseWorkspace:false,identity:null,message:''});
+function fixture(defer) {
+ const {document,elements} = createInteractiveRendererDom();
+ let changed, reads=0, resolve;
+ const pending = new Promise(r => {resolve=r;});
+ const renderer = loadRendererHelpers(document,{crate:{
+  getAccount:async()=>signed(1),onAccountChanged:callback=>{changed=callback;},
+  getProjects:()=>{reads++;return defer&&reads===1?pending:Promise.resolve([{id:'fresh-project',files:[]}]);},
+  getSettings:async()=>({}),getUsage:async()=>({}),getFigmaStatus:async()=>({connected:false}),
+  onFilesUpdated:()=>{},onProjectUpdated:()=>{},onPendingFilesUpdated:()=>{},onPackageTrigger:()=>{},onFigmaAuthError:()=>{},onFigmaScanStarted:()=>{},onFigmaScanComplete:()=>{},onFigmaScanError:()=>{},
+ }});
+ return {document,elements,renderer,resolve,changed:s=>changed(s),reads:()=>reads};
+}
+test('control: initial signed-in startup reads and renders existing local projects',async()=>{
+ const f=fixture(false);await f.document.listeners.DOMContentLoaded();
+ assert.equal(f.reads(),1);assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'fresh-project');
+});
+test('repro: sign-out/sign-in during initial workspace load loses replacement load',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();
+ await new Promise(setImmediate);assert.equal(f.reads(),1);
+ f.changed(out(2));f.changed(signed(3));
+ f.resolve([{id:'stale-project',files:[]}]);await initializing;await new Promise(setImmediate);
+ const actual={reads:f.reads(),projectCount:vm.runInContext('state.projects.length',f.renderer),startupComplete:vm.runInContext('accountStartupLoaded',f.renderer),welcomeHidden:f.elements.app.classList.contains('account-onboarding')===false};
+ console.log('STARTUP_RACE_RECEIPT',JSON.stringify(actual));
+ assert.equal(actual.reads,2,'current authorized session must schedule a replacement workspace load');
+ assert.equal(actual.projectCount,1);
+});
+test('control: sign-out/sign-in after completed startup reloads local projects',async()=>{
+ const f=fixture(false);await f.document.listeners.DOMContentLoaded();
+ f.changed(out(2));f.changed(signed(3));await new Promise(setImmediate);
+ assert.equal(f.reads(),2);assert.equal(vm.runInContext('state.projects.length',f.renderer),1);
+});
+test('repro: waiting transition must move focus from hidden Sign in to visible Reopen',()=>{
+ const {document,elements}=createInteractiveRendererDom();
+ const renderer=loadRendererHelpers(document);
+ const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ vm.runInContext("accountStatus={revision:1,state:'signed_out',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ document.querySelector('#welcome-signin').focus();
+ vm.runInContext("accountStatus={revision:2,state:'waiting',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ const signin=document.querySelector('#welcome-signin'),reopen=document.querySelector('#welcome-reopen');
+ console.log('WAITING_FOCUS_RECEIPT',JSON.stringify({signinHidden:signin.classList.contains('hidden'),reopenHidden:reopen.classList.contains('hidden'),activeIsSignin:document.activeElement===signin,activeIsReopen:document.activeElement===reopen}));
+ assert.equal(document.activeElement===reopen,true,'pending welcome must focus its visible Reopen action');
+});
+test('repro: verifying transition must move focus from hidden Reopen to visible Cancel',()=>{
+ const {document}=createInteractiveRendererDom();
+ const renderer=loadRendererHelpers(document);
+ const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ vm.runInContext("accountStatus={revision:1,state:'waiting',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ document.querySelector('#welcome-reopen').focus();
+ vm.runInContext("accountStatus={revision:2,state:'verifying',canUseWorkspace:false,identity:null,message:''};renderAccount();",renderer);
+ const reopen=document.querySelector('#welcome-reopen'),cancel=document.querySelector('#welcome-cancel');
+ console.log('VERIFYING_FOCUS_RECEIPT',JSON.stringify({reopenHidden:reopen.classList.contains('hidden'),cancelHidden:cancel.classList.contains('hidden'),activeIsReopen:document.activeElement===reopen,activeIsCancel:document.activeElement===cancel}));
+ assert.equal(document.activeElement===cancel,true,'verification welcome must focus its visible Cancel action');
+});
+
+test('startup sign-out without reentry stays locked and never reloads stale local data',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();await new Promise(setImmediate);
+ f.changed(out(2));f.resolve([{id:'stale-project',files:[]}]);await initializing;
+ assert.equal(f.reads(),1);assert.equal(vm.runInContext('state.projects.length',f.renderer),0);assert.equal(f.elements.app.classList.contains('account-onboarding'),true);
+});
+test('repeated startup account transitions load the latest allowed epoch once',async()=>{
+ const f=fixture(true);const initializing=f.document.listeners.DOMContentLoaded();await new Promise(setImmediate);
+ f.changed(out(2));f.changed(signed(3));f.changed(out(4));f.changed(signed(5));f.changed(signed(6));
+ f.resolve([{id:'stale-project',files:[]}]);await initializing;
+ assert.equal(f.reads(),2);assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'fresh-project');
+});
+test('welcome cancel/error retargets hidden focus and repeated states preserve usable focus',()=>{
+ const {document}=createInteractiveRendererDom();const renderer=loadRendererHelpers(document);const welcome=document.querySelector('#account-welcome');
+ for(const id of ['welcome-signin','welcome-reopen','welcome-cancel','welcome-retry','welcome-signout']) welcome.appendChild(document.querySelector('#'+id));
+ const status=state=>vm.runInContext(`accountStatus={revision:1,state:'${state}',canUseWorkspace:false,identity:null,message:''};renderAccount();`,renderer);
+ status('waiting');document.querySelector('#welcome-cancel').focus();status('waiting');assert.equal(document.activeElement,document.querySelector('#welcome-cancel'));
+ status('signed_out');assert.equal(document.activeElement,document.querySelector('#welcome-signin'));
+ status('verifying');status('error');assert.equal(document.activeElement,document.querySelector('#welcome-signin'));
+});
+test('successful welcome return rejects a hidden Settings opener and returns to Projects',()=>{
+ const {document}=createInteractiveRendererDom();const renderer=loadRendererHelpers(document);const welcome=document.querySelector('#account-welcome');
+ welcome.appendChild(document.querySelector('#welcome-signin'));
+ const projects=document.querySelector('.app-tab[data-tab="projects"]');
+ vm.runInContext("accountWelcomeOpener=document.querySelector('#account-signin');accountStatus={state:'signed_out',canUseWorkspace:false,identity:null};renderAccount();",renderer);
+ document.querySelector('#welcome-signin').focus();
+ vm.runInContext("accountStatus={state:'signed_in',canUseWorkspace:true,identity:{id:'A',email:'a@example.test'}};renderAccount();",renderer);
+ assert.equal(document.activeElement,projects);
+});
+
+function accountModalFixture(crate = {}) {
+  const { document, elements } = createInteractiveRendererDom();
+  const project = { id: 'account-modal-project', files: [{ name: 'Asset.png', path: '/synthetic/Asset.png', assetOrigin: 'existing', projectRole: 'asset' }], pendingFiles: [], excludedAssetKeys: [], assetBaseline: { status: 'decision-required', decision: null } };
+  const renderer = loadRendererHelpers(document, { crate });
+  renderer.testProject = project;
+  vm.runInContext("state.projects=[testProject];state.selectedProjectId=testProject.id;accountStatus={revision:1,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}};", renderer);
+  const transition = () => vm.runInContext("acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}});", renderer);
+  return { document, elements, project, renderer, transition };
+}
+
+test('account expiry retires Existing Assets choices before same-account sign-in', async () => {
+  const decisions = [];
+  const f = accountModalFixture({ setExistingAssetsDecision: async (...args) => { decisions.push(args); return { success: true }; } });
+  await f.renderer.showExistingAssetsDecisionModal(f.project);
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), false);
+  f.transition();
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(await f.renderer.submitExistingAssetsDecision('skip'), false);
+  assert.deepEqual(decisions, []);
+  assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+});
+
+test('deferred Existing Assets preparation cannot reopen after account expiry and reentry', async () => {
+  const held = createDeferred();
+  const f = accountModalFixture({ getAssetWorkspace: () => held.promise });
+  const opening = f.renderer.showExistingAssetsDecisionModal(f.project);
+  await new Promise(setImmediate);
+  f.transition();
+  held.resolve({ projectId: f.project.id, files: f.project.files, pendingFiles: [] });
+  assert.equal(await opening, false);
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), null);
+});
+
+test('allowed account refresh preserves modal inert and aria-hidden background', async () => {
+  const f = accountModalFixture();
+  await f.renderer.showExistingAssetsDecisionModal(f.project);
+  vm.runInContext("acceptAccountSnapshot({revision:2,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}})", f.renderer);
+  for (const id of ['app-main', 'app-sidebar']) {
+    assert.equal(f.elements[id].inert, true);
+    assert.equal(f.elements[id].getAttribute('aria-hidden'), 'true');
+  }
+  assert.equal(f.elements['modal-existing-assets'].inert, false);
+});
+
+test('deferred project reads and watcher refresh cannot overwrite workspace after account transition', async () => {
+  const held = createDeferred();
+  const f = accountModalFixture({ getProjects: () => held.promise });
+  const read = vm.runInContext('(async()=>{state.projects=await getAccountCurrentProjects()})()', f.renderer);
+  const rejected = assert.rejects(read, /account_workspace_changed/);
+  const refresh = f.renderer.refreshProjectState(f.project.id);
+  f.transition();
+  held.resolve([{ id: 'stale-read', files: [] }]);
+  await rejected; await refresh;
+  assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+});
+
+for (const decision of ['include', 'skip']) for (const rejected of [false, true]) for (const identity of ['A', 'B']) {
+  test(`pending asset batch retires after account transition (decision=${decision}, reject=${rejected}, identity=${identity})`, async () => {
+    let resolve, reject;
+    const held = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const calls = [];
+    const completed = decision === 'include' ? { pendingFiles: [] } : [];
+    const method = decision === 'include' ? 'acceptPending' : 'rejectPending';
+    const f = accountModalFixture({ [method]: async (_projectId, target) => {
+      calls.push(target);
+      return calls.length === 1 ? held : completed;
+    } });
+    const batch = f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'first' }, { target: 'second' }]);
+    assert.deepEqual(calls, ['first']);
+    vm.runInContext(`acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'${identity}'}});`, f.renderer);
+    if (rejected) reject(new Error('Sign in to Crate to use your workspace.'));
+    else resolve(completed);
+    assert.equal(await batch, false);
+    assert.deepEqual(calls, ['first']);
+    assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+  });
+}
+
+function accountCreationFixture(overrides = {}) {
+  const f = accountModalFixture({
+    getProjects: async () => [{ id: 'account-modal-project', files: [] }],
+    getSettings: async () => ({}), getUsage: async () => ({}),
+    getFigmaStatus: async () => ({ connected: false }), ...overrides,
+  });
+  f.renderer.setupEventListeners();
+  f.elements['input-project-name'].value = 'Synthetic new project';
+  return f;
+}
+for (const outcome of ['authorization-rejection', 'authorization-rejection-persisted', 'success']) {
+  test(`settled project creation after account transition reconciles without old selection (${outcome})`, async () => {
+    const held = createDeferred(), read = createDeferred();
+    const f = accountCreationFixture({ createProject: () => held.promise, getProjects: () => read.promise });
+    const creating = f.renderer.createProject(); f.transition();
+    if (outcome.startsWith('authorization-rejection')) held.reject(new Error('Sign in to Crate to use your workspace.'));
+    else held.resolve({ id: 'created-old-account', files: [] });
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'reconciling');
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    read.resolve([{ id: 'account-modal-project', files: [] }, ...(outcome !== 'authorization-rejection' ? [{ id: 'created-old-account', files: [] }] : [])]);
+    await creating;
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'account-modal-project');
+    assert.equal(vm.runInContext('state.projects.length', f.renderer), outcome !== 'authorization-rejection' ? 2 : 1);
+    assert.doesNotMatch(f.elements['project-creation-status'].textContent, /Restart/);
+  });
+}
+test('account transition during creation refresh cannot merge or select the stale result', async () => {
+  const held = createDeferred();let reads = 0;
+  const f = accountCreationFixture({ createProject: async () => ({ id: 'old-created', files: [] }), getProjects: () => ++reads === 1 ? held.promise : Promise.resolve([{ id: 'new-selection', files: [] }]) });
+  const creating = f.renderer.createProject();await new Promise(setImmediate);f.transition();
+  vm.runInContext("state.projects=[{id:'new-selection',files:[]}];state.selectedProjectId='new-selection';", f.renderer);
+  held.resolve([{ id: 'old-created', files: [] }]);await creating;
+  assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'new-selection');
+  assert.equal(vm.runInContext('state.projects.map(p=>p.id).join()', f.renderer), 'new-selection');
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+});
+test('settled account rejection while signed out stays locked until current account projects reconcile', async () => {
+  const held=createDeferred(),read=createDeferred();
+  const f=accountCreationFixture({createProject:()=>held.promise,getProjects:()=>read.promise});
+  const creating=f.renderer.createProject();
+  vm.runInContext("accountStartupLoaded=true;acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});",f.renderer);
+  held.reject(new Error('Sign in to Crate to use your workspace.'));await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'reconciling');
+  vm.runInContext("acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'B'}});",f.renderer);
+  read.resolve([{id:'account-modal-project',files:[]}]);await new Promise(setImmediate);
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'idle');
+});
+test('unclassified creation rejection after account transition remains unresolved', async () => {
+  const held=createDeferred();const f=accountCreationFixture({createProject:()=>held.promise});
+  const creating=f.renderer.createProject();f.transition();held.reject(new Error('IPC transport disappeared'));await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'unresolved');
+});
+
+test('workspace read begun before retired creation settles cannot unlock reconciliation', async () => {
+  const created=createDeferred(),oldRead=createDeferred(),currentRead=createDeferred();let reads=0;
+  const f=accountCreationFixture({createProject:()=>created.promise,getProjects:()=>++reads===1?oldRead.promise:currentRead.promise});
+  const creating=f.renderer.createProject();vm.runInContext('accountStartupLoaded=true',f.renderer);f.transition();
+  created.resolve({id:'saved-project',files:[]});await new Promise(setImmediate);
+  oldRead.resolve([{id:'stale-list',files:[]}]);await new Promise(setImmediate);
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'reconciling');
+  assert.equal(vm.runInContext('state.projects[0].id',f.renderer),'account-modal-project');
+  currentRead.resolve([{id:'account-modal-project',files:[]},{id:'saved-project',files:[]}]);await creating;
+  assert.equal(vm.runInContext('projectCreationPhase',f.renderer),'idle');
+  assert.equal(vm.runInContext('state.projects.length',f.renderer),2);
+});
+
+for (const identity of ['A', 'B']) {
+  test(`clock expiry before account notification reconciles creation after sign-in (${identity})`, async t => {
+    const { AccountSession } = require('../account-session');
+    let now = 1000;
+    const session = new AccountSession({ config: {}, now: () => now });
+    t.after(() => session.shutdown());
+    session.record = { identity: { id: 'A' } };
+    session.accessToken = 'synthetic-access';
+    session.authorizeUntil(now + 60_000);
+    session.publish('signed_in', '', { id: 'A' });
+    // Use main's production authorization closure, including its direct clock
+    // check, without launching Electron or touching credentials.
+    const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+    const authorizationSource = mainSource.slice(mainSource.indexOf('function captureAccountAuthorization()'),
+      mainSource.indexOf('function registerTrustedIpcHandler'));
+    const authorize = vm.runInNewContext(`${authorizationSource}; captureAccountAuthorization()`, { accountSession: session });
+    let createCalls = 0, mutations = 0, reads = 0;
+    const currentRead = createDeferred();
+    const f = accountCreationFixture({
+      createProject: async () => {
+        createCalls++;
+        authorize();
+        mutations++;
+        return { id: 'unexpected-project', files: [] };
+      },
+      getProjects: () => {
+        reads++;
+        if (!session.canUseWorkspace()) return Promise.reject(new Error('Sign in to Crate to use your workspace.'));
+        return currentRead.promise;
+      },
+    });
+    vm.runInContext('accountStartupLoaded=true', f.renderer);
+    const epoch = vm.runInContext('accountWorkspaceEpoch', f.renderer);
+    session.on('change', snapshot => {
+      f.renderer.nextSnapshot = snapshot;
+      vm.runInContext('acceptAccountSnapshot(nextSnapshot)', f.renderer);
+    });
+    // Advance the actual session clock without firing its notification timer.
+    now = session.accessExpiresAt;
+    assert.equal(session.canUseWorkspace(), false);
+    assert.equal(vm.runInContext('accountStatus.canUseWorkspace', f.renderer), true);
+    await f.renderer.createProject();
+    assert.equal(vm.runInContext('accountWorkspaceEpoch', f.renderer), epoch);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'reconciling');
+    assert.equal(reads, 1, 'the known settled rejection attempts an authoritative read immediately');
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    await f.renderer.createProject();
+    assert.equal(createCalls, 1, 'denied reconciliation must not permit duplicate creation');
+    assert.equal(mutations, 0);
+
+    session.publish('expired');
+    session.record = { identity: { id: identity } };
+    session.accessToken = 'synthetic-reauthenticated-access';
+    session.authorizeUntil(now + 60_000);
+    session.publish('signed_in', '', { id: identity });
+    assert.equal(reads, 2);
+    assert.equal(f.elements['btn-create-project'].disabled, true);
+    await f.renderer.createProject();
+    assert.equal(createCalls, 1, 'sign-in alone must not unlock creation before the list settles');
+    currentRead.resolve([{ id: 'account-modal-project', files: [] }, { id: 'already-saved', files: [] }]);
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'idle');
+    assert.equal(f.elements['btn-create-project'].disabled, false);
+    assert.equal(vm.runInContext('state.projects.map(p=>p.id).join()', f.renderer), 'account-modal-project,already-saved');
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'account-modal-project');
+    assert.equal(createCalls, 1);
+    assert.equal(mutations, 0);
+    assert.doesNotMatch(f.elements['project-creation-status'].textContent, /Restart/);
+  });
+}
+
+test('ambiguous creation rejection stays unresolved after reauthentication and an authoritative list', async () => {
+  let createCalls = 0, reads = 0;
+  const f = accountCreationFixture({
+    createProject: async () => { createCalls++; throw new Error('IPC transport disappeared'); },
+    getProjects: async () => { reads++; return [{ id: 'account-modal-project', files: [] }]; },
+  });
+  vm.runInContext('accountStartupLoaded=true', f.renderer);
+  await f.renderer.createProject();
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'unresolved');
+  assert.equal(reads, 0);
+  f.transition();
+  await new Promise(setImmediate);
+  assert.equal(reads, 1);
+  assert.equal(vm.runInContext('projectCreationPhase', f.renderer), 'unresolved');
+  assert.equal(f.elements['btn-create-project'].disabled, true);
+  await f.renderer.createProject();
+  assert.equal(createCalls, 1);
+});
+
+// Settled creation recovery matrix: real session clock + production main IPC
+// authorization wrapper; only provider, persistence and IPC delivery are synthetic.
+function settledRecoveryFixture(t) {
+  const { AccountSession } = require('../account-session');
+  const identity = suffix => ({ id: `11111111-1111-4111-8111-11111111111${suffix}`, email: 'synthetic@example.test', verified: true, methods: ['email'] });
+  let now = 1000, creates = 0, mutations = 0;
+  const refreshGate = createDeferred(), createGate = createDeferred(), reads = [], timers = [], snapshots = [];
+  const session = new AccountSession({ config: {}, now: () => now,
+    provider: { refresh: () => refreshGate.promise, validate: async () => ({ subject: identity(1).id, expiresAt: now + 60000 }), me: async () => identity(1), revoke: async () => {} },
+    credentials: { write() {}, clear() {} } });
+  t.after(() => session.shutdown());
+  const allow = (id = 1) => { session.record = { identity: identity(id), refreshToken: 'synthetic-refresh' }; session.accessToken = 'synthetic-access'; session.authorizeUntil(now + 60000); session.publish('signed_in', '', identity(id)); };
+  allow();
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handlers = {};
+  const main = vm.createContext({ accountSession: session, ipcMain: { handle: (name, fn) => { handlers[name] = fn; } }, assertTrustedRendererIpc() {} });
+  vm.runInContext(source.slice(source.indexOf('function captureAccountAuthorization()'), source.indexOf('function initializeAccountSession()')), main);
+  main.create = () => createGate.promise;
+  vm.runInContext("registerTrustedIpcHandler('projects:create', () => create())", main);
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {
+    createProject: () => { creates++; return handlers['projects:create']({}); },
+    getProjects: () => { const read = createDeferred(); read.authorized = session.canUseWorkspace(); reads.push(read); return read.promise; },
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({ connected: false }),
+  } }, { setTimeout: (callback, delay) => { const timer = { callback, delay, cleared: false }; timers.push(timer); return timer; }, clearTimeout: timer => { if (timer) timer.cleared = true; } });
+  const evaluate = code => vm.runInContext(code, renderer);
+  renderer.initial = session.snapshot();
+  evaluate("state.projects=[{id:'selected',files:[]}];state.selectedProjectId='selected';accountStatus=initial;accountStartupLoaded=true;");
+  renderer.setupEventListeners(); elements['input-project-name'].value = 'Synthetic project';
+  session.on('change', snapshot => { snapshots.push(snapshot); renderer.incoming = snapshot; evaluate('acceptAccountSnapshot(incoming)'); });
+  const list = (count = 2) => Array.from({ length: count }, (_, i) => ({ id: i === 0 ? 'selected' : `saved-${i}`, files: [] }));
+  const expire = (notify = false) => { now = session.accessExpiresAt; if (notify) session.publish('expired'); };
+  const rejectRead = index => reads[index].reject(new Error('Sign in to Crate to use your workspace.'));
+  const assertLocked = phase => { assert.equal(evaluate('projectCreationPhase'), phase); assert.equal(elements['btn-create-project'].disabled, true); assert.equal(creates, 1); assert.equal(evaluate('state.selectedProjectId'), 'selected'); };
+  const assertRecovered = (count = 2) => {
+    assert.equal(evaluate('projectCreationPhase'), 'idle');
+    assert.deepEqual(JSON.parse(evaluate('JSON.stringify(state.projects)')), list(count));
+    assert.equal(evaluate('state.selectedProjectId'), 'selected');
+    assert.equal(elements['btn-create-project'].disabled, count >= evaluate('MAX_PROJECTS'));
+    assert.equal(evaluate('projectCreationRecoveryRead'), null);
+    assert.equal(creates, 1);
+  };
+  return { renderer, document, elements, evaluate, session, reads, timers, snapshots, allow, expire, list, rejectRead, assertLocked, assertRecovered, creates: () => creates, mutations: () => mutations,
+    start: () => renderer.createProject(),
+    settle: value => createGate.resolve(value), reject: error => createGate.reject(error),
+    persist: () => { mutations++; createGate.resolve({ id: 'saved-1', files: [] }); },
+    renew: async () => { refreshGate.resolve({ access_token: 'new-synthetic', refresh_token: 'new-synthetic-refresh' }); await session.refreshing; },
+    fire: delay => { const timer = timers.find(item => !item.cleared && item.delay === delay); assert.ok(timer, `active ${delay}ms deadline`); timer.callback(); },
+  };
+}
+const recoveryTurn = () => new Promise(setImmediate);
+
+for (const id of [1, 2]) test(`recovery matrix 01: pending create remains exclusive across identity ${id}`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  f.expire(true); f.allow(id); f.reads[0].resolve(f.list()); await recoveryTurn();
+  f.assertLocked('creating'); await f.start(); assert.equal(f.creates(), 1);
+  f.settle({ error: 'max_projects_reached' }); await recoveryTurn();
+  f.assertLocked('reconciling'); f.reads[1].resolve(f.list()); await creating; f.assertRecovered();
+});
+
+test('recovery matrix 02,04,11,12: same identity refresh demand survives pending denied read and coalesces', async t => {
+  const f = settledRecoveryFixture(t); const refreshing = f.session.refresh();
+  f.expire(); const creating = f.start(); await recoveryTurn(); f.assertLocked('reconciling');
+  assert.equal(f.reads.length, 1); assert.equal(f.reads[0].authorized, false);
+  await f.renew(); await refreshing;
+  for (let i = 0; i < 5; i++) f.session.publish('signed_in');
+  assert.equal(f.reads.length, 1, 'authorized demand coalesces behind denied pending read');
+  f.rejectRead(0); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'failed owner must honor newer authorization demand');
+  assert.equal(f.reads[1].authorized, true); f.assertLocked('reconciling');
+  const owner = f.evaluate('projectCreationRecoveryRead'); assert.ok(owner);
+  for (let i = 0; i < 5; i++) f.session.publish('signed_in');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), owner); assert.equal(f.reads.length, 2);
+  f.reads[1].resolve(f.list()); await creating; await recoveryTurn();
+  f.assertRecovered(); assert.equal(f.reads.length, 2); assert.equal(f.mutations(), 0);
+  assert.ok(f.snapshots.every(snapshot => snapshot.canUseWorkspace && snapshot.state === 'signed_in'));
+});
+
+test('recovery matrix 04: sole allowed snapshot after denied read has already settled recovers', async t => {
+  const f = settledRecoveryFixture(t); const refreshing = f.session.refresh(); f.expire();
+  const creating = f.start(); await recoveryTurn(); f.rejectRead(0); await creating;
+  f.assertLocked('reconciling'); await f.renew(); await refreshing;
+  assert.equal(f.reads.length, 2); f.assertLocked('reconciling');
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+  assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].canUseWorkspace, true);
+});
+
+for (const timing of ['before-result', 'between-result-and-read', 'during-read']) {
+  test(`recovery matrix 03,05: expiry ${timing} retires reads and recovers`, async t => {
+    const f = settledRecoveryFixture(t); const creating = f.start();
+    if (timing === 'before-result') f.expire(true);
+    f.reject(new Error('Sign in to Crate to use your workspace.'));
+    if (timing === 'between-result-and-read') f.expire(true);
+    await recoveryTurn();
+    if (timing === 'during-read') f.expire(true);
+    f.assertLocked('reconciling'); const retired = [...f.reads];
+    f.allow(); await recoveryTurn();
+    assert.equal(f.reads.length, retired.length + 1);
+    for (const read of retired) read.resolve([{ id: 'retired', files: [] }]);
+    await recoveryTurn(); f.assertLocked('reconciling');
+    assert.equal(f.evaluate('state.projects[0].id'), 'selected');
+    f.reads.at(-1).resolve(f.list()); await creating; await recoveryTurn(); f.assertRecovered();
+  });
+}
+
+for (const id of [1, 2]) test(`recovery matrix 06: logout then identity ${id} requires a current read`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  f.rejectRead(0); await creating; await f.session.logout(); f.allow(id);
+  f.assertLocked('reconciling'); assert.equal(f.reads.length, 2);
+  await f.start(); assert.equal(f.creates(), 1);
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+});
+
+test('recovery matrix 07: production main post-persistence authorization rejection requires saved list', async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.expire(); f.persist();
+  await recoveryTurn(); f.assertLocked('reconciling'); assert.equal(f.mutations(), 1);
+  f.rejectRead(0); await creating; f.allow(); f.reads[1].resolve(f.list()); await recoveryTurn();
+  f.assertRecovered(); assert.equal(f.mutations(), 1);
+});
+
+for (const outcome of ['success', 'known-error']) test(`recovery matrix 08: stale ${outcome} preserves selection and cap`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  // Renderer observes expiry then a renewal while main's operation remains in
+  // the same session generation, permitting the settled success/error through.
+  f.expire(true); f.allow();
+  f.settle(outcome === 'success' ? { id: 'old-created', files: [] } : { error: 'max_projects_reached' });
+  await recoveryTurn(); f.assertLocked('reconciling');
+  f.reads[0].resolve([{ id: 'stale-pre-settlement', files: [] }]); await recoveryTurn();
+  f.assertLocked('reconciling'); const count = f.evaluate('MAX_PROJECTS');
+  f.reads[1].resolve(f.list(count)); await creating; f.assertRecovered(count);
+  assert.equal(f.evaluate("state.projects.some(p=>p.id==='old-created')"), false);
+});
+
+test('recovery matrix 09: transition during successful create follow-up read fences selection', async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.settle({ id: 'old-created', files: [] });
+  await recoveryTurn(); f.expire(true); f.allow(2);
+  f.reads[0].resolve([{ id: 'old-created', files: [] }]); await recoveryTurn();
+  f.assertLocked('reconciling'); f.reads[1].resolve([{ id: 'pre-settlement', files: [] }]);
+  await recoveryTurn(); f.assertLocked('reconciling');
+  f.reads[2].resolve(f.list()); await creating; f.assertRecovered();
+});
+
+for (const settleOld of ['resolve', 'reject']) test(`recovery matrix 10,13,16: retired ${settleOld}/finally cannot block or clear new owner or attempt`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  const old = f.reads[0]; f.allow(2); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'never-settling retired request cannot block new identity');
+  const owner = f.evaluate('projectCreationRecoveryRead'); assert.ok(owner);
+  // Keep the old promise pending through recovery and start another create.
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+  const pending = createDeferred(); f.renderer.window.crate.createProject = () => pending.promise;
+  const second = f.start(); assert.equal(f.evaluate('projectCreationPhase'), 'creating');
+  if (settleOld === 'resolve') old.resolve([{ id: 'retired', files: [] }]); else old.reject(new Error('late denied'));
+  await creating; await recoveryTurn();
+  assert.equal(f.evaluate('projectCreationPhase'), 'creating');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), null);
+  assert.equal(f.evaluate('state.projects.map(p=>p.id).join()'), 'selected,saved-1');
+  pending.resolve({ error: 'max_projects_reached' }); await second;
+});
+
+for (const failure of ['error', 'deadline', 'invalid-list']) test(`recovery matrix 14: ${failure} exposes bounded saved-project retry without account events`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.reject(new Error('Sign in to Crate to use your workspace.'));
+  await recoveryTurn();
+  if (failure === 'error') f.reads[0].reject(new Error('read failed'));
+  else if (failure === 'deadline') f.fire(10000);
+  else f.reads[0].resolve(null);
+  await recoveryTurn(); f.assertLocked('reconciling');
+  const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
+  assert.ok(retry); assert.equal(retry.disabled, false); assert.equal(retry.classList.contains('hidden'), false);
+  assert.equal(retry.textContent, 'Check saved projects again');
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  retry.click(); retry.click(); await recoveryTurn();
+  assert.equal(f.reads.length, 2, 'double retry coalesces'); f.assertLocked('reconciling');
+  f.reads[1].resolve(f.list()); await creating; await recoveryTurn(); f.assertRecovered();
+  if (failure === 'deadline') { f.reads[0].resolve([{ id: 'late', files: [] }]); await recoveryTurn(); f.assertRecovered(); }
+  assert.equal(f.snapshots.length, 0);
+});
+
+for (const outcome of ['transport', 'unknown-typed', 'deadline']) test(`recovery matrix 15: ${outcome} remains unresolved after account/list/late result`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  if (outcome === 'transport') f.reject(new Error('transport disappeared'));
+  else if (outcome === 'unknown-typed') f.settle({ error: 'unknown_persistence' });
+  else f.fire(30000);
+  await creating; f.assertLocked('unresolved'); f.expire(true); f.allow(2);
+  f.reads[0].resolve(f.list()); if (outcome === 'deadline') f.persist();
+  await recoveryTurn(); f.assertLocked('unresolved'); await f.start(); assert.equal(f.creates(), 1);
+  const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
+  assert.ok(!retry?.listeners.click?.length || retry.classList.contains('hidden'));
+});
+
+for (const outcome of ['resolve', 'reject']) test(`recovery matrix 13: retired ${outcome}/finally leaves replacement read owned and locked`, async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  const retired = f.reads[0]; f.allow(2); const current = f.evaluate('projectCreationRecoveryRead');
+  assert.ok(current); assert.equal(f.reads.length, 2);
+  if (outcome === 'resolve') retired.resolve([{ id: 'retired', files: [] }]); else retired.reject(new Error('denied'));
+  await creating; await recoveryTurn(); f.assertLocked('reconciling');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), current);
+  assert.equal(f.evaluate('state.projects[0].id'), 'selected');
+  f.reads[1].resolve(f.list()); await recoveryTurn(); f.assertRecovered();
+});
+
+for (const outcome of ['resolve', 'reject']) test(`recovery matrix 09,10: never-settling success follow-up detaches; pre-settlement ${outcome} is fenced`, async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.settle({ id: 'old-created', files: [] });
+  await recoveryTurn(); const retiredFollowUp = f.reads[0]; f.expire(true); f.allow(2);
+  const preSettlement = f.reads[1]; await recoveryTurn();
+  assert.equal(f.reads.length, 3, 'settled creation must recover without retired follow-up settling');
+  f.assertLocked('reconciling'); const owner = f.evaluate('projectCreationRecoveryRead');
+  if (outcome === 'resolve') preSettlement.resolve([{ id: 'old-list', files: [] }]); else preSettlement.reject(new Error('old-read-failed'));
+  await recoveryTurn(); f.assertLocked('reconciling'); assert.equal(f.evaluate('projectCreationRecoveryRead'), owner);
+  f.reads[2].resolve(f.list()); await creating; f.assertRecovered();
+  retiredFollowUp.reject(new Error('late follow-up denial')); await recoveryTurn(); f.assertRecovered();
+});
+
+test('recovery matrix 11: replayed snapshot cannot generate an error retry loop', async t => {
+  const f = settledRecoveryFixture(t); f.expire(); const creating = f.start(); await recoveryTurn();
+  // Repeated delivery of the same revision is not a new authorization demand.
+  f.renderer.replay = f.evaluate('accountStatus');
+  assert.equal(f.renderer.replay.canUseWorkspace, true, 'replay the original allowed snapshot');
+  for (let i = 0; i < 8; i++) f.evaluate('acceptAccountSnapshot(replay)');
+  f.rejectRead(0); await creating; await recoveryTurn();
+  assert.equal(f.reads.length, 1); f.assertLocked('reconciling');
+  assert.equal(f.evaluate('projectCreationRecoveryRead'), null);
 });

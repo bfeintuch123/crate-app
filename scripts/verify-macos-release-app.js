@@ -84,6 +84,7 @@ const EXPECTED_MAIN_INFO_KEYS = Object.freeze([
   'CFBundleName',
   'CFBundlePackageType',
   'CFBundleShortVersionString',
+  'CFBundleURLTypes',
   'CFBundleVersion',
   'DTCompiler',
   'DTSDKBuild',
@@ -167,6 +168,12 @@ const EXPECTED_APP_UPDATE_METADATA = Buffer.from(
 const SOURCE_BOUND_ENTRIES = Object.freeze([
   'main.js',
   'startup-phase-journal.js',
+  'runtime-identity.json',
+  'account-config.json',
+  'account-config.js',
+  'account-credential-store.js',
+  'account-provider.js',
+  'account-session.js',
   'preload.js',
   'provenance.js',
   'diagnostic-summary.js',
@@ -367,6 +374,7 @@ function hasApprovedMainInfoPlist(infoPlist, options = {}) {
     infoPlist.CFBundleName === executableName &&
     infoPlist.CFBundleIdentifier === appId &&
     infoPlist.CFBundleInfoDictionaryVersion === '6.0' &&
+    isDeepStrictEqual(infoPlist.CFBundleURLTypes, [{ CFBundleURLName: 'Crate account sign-in', CFBundleTypeRole: 'Editor', CFBundleURLSchemes: ['com.get-crate.app'] }]) &&
     infoPlist.CFBundlePackageType === 'APPL' &&
     infoPlist.CFBundleShortVersionString === version &&
     infoPlist.CFBundleVersion === version &&

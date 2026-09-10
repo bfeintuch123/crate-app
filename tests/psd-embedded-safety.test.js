@@ -264,6 +264,15 @@ setStub('crypto', () => ({
   randomUUID: () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, '0')}`,
 }));
 
+// These PSD/package tests operate in an authenticated synthetic workspace.
+const { AccountSession: RealAccountSession } = require('../account-session');
+setStub('./account-session', () => ({ AccountSession: class extends RealAccountSession {
+  async restore() {
+    this.record = { identity: { id: 'test-account' } };
+    this.accessToken = 'synthetic-access'; this.accessExpiresAt = Date.now() + 3600000;
+    return this.publish('signed_in', '', { id: 'test-account' });
+  }
+} }));
 require(path.resolve(__dirname, '..', 'main.js'));
 
 test.beforeEach(() => {

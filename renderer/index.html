@@ -592,7 +592,27 @@
   </style>
 </head>
 <body>
-  <div id="app">
+  <div id="app" class="account-onboarding">
+    <section class="account-welcome" id="account-welcome" aria-labelledby="welcome-account-title" tabindex="-1">
+      <div class="account-welcome-content">
+        <div class="account-welcome-brand">CRATE</div>
+        <h1 id="welcome-account-title">Welcome to Crate</h1>
+        <p class="account-welcome-description">Your design projects, packaged.</p>
+        <div class="account-welcome-status">
+          <p id="welcome-account-state" role="status" aria-live="polite"></p>
+          <p id="welcome-account-message"></p>
+        </div>
+        <div class="account-actions">
+          <button class="modal-btn-primary" id="welcome-signin">Sign in via browser <span aria-hidden="true">↗</span></button>
+          <button class="modal-btn-primary hidden" id="welcome-reopen">Open browser again <span aria-hidden="true">↗</span></button>
+          <button class="modal-btn-secondary hidden" id="welcome-cancel">Cancel sign-in</button>
+          <button class="modal-btn-secondary hidden" id="welcome-retry">Check connection</button>
+          <button class="modal-btn-secondary hidden" id="welcome-signout">Sign out of Crate</button>
+        </div>
+        <p class="account-local-note">Sign in to access your Crate workspace.</p>
+      </div>
+    </section>
+
     <aside class="app-sidebar" id="app-sidebar" aria-label="Crate navigation">
       <div class="sidebar-brand">
         <span class="app-logo">CRATE</span>
@@ -611,11 +631,7 @@
         <button class="app-tab" data-tab="help">Help</button>
       </nav>
 
-      <div class="sidebar-plan-card">
-        <div class="sidebar-plan-title" id="sidebar-plan-title">Current plan</div>
-        <div class="app-usage" id="footer-usage">Loading package usage...</div>
-        <a class="app-upgrade" href="#">Upgrade</a>
-      </div>
+
     </aside>
 
     <main class="app-main" id="app-main">
@@ -623,6 +639,7 @@
       <div class="app-content">
       <!-- Projects Tab -->
       <div class="tab-content active" id="tab-projects">
+
         <!-- Empty State -->
         <div id="projects-empty" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
@@ -834,19 +851,7 @@
       </div>
 
       <!-- Settings Tab -->
-      <div class="tab-content" id="tab-settings">
-        <div class="settings-section">
-          <div class="settings-section-title">Naming Template</div>
-          <div class="settings-row">
-            <label class="settings-label" for="input-naming-template">Template</label>
-          </div>
-          <input class="settings-input" id="input-naming-template" value="{Project}_{Date}">
-          <div class="settings-preview-text">Preview: <span id="settings-naming-preview">Nike_BrandRefresh_2026-02-20</span></div>
-        </div>
-
-        <div class="settings-section">
-          <div class="settings-section-title">Preferences</div>
-          <div class="settings-row">
+      <div class="tab-content" id="tab-settings"><div class="settings-layout"><nav class="settings-navigation" aria-label="Settings"><h1 class="settings-nav-title">Settings</h1><div role="tablist" aria-label="Settings sections" aria-orientation="vertical"><p class="settings-nav-group">SETTINGS</p><button type="button" role="tab" class="settings-tab" id="settings-tab-general" data-settings-tab="general" aria-controls="settings-panel-general" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg><span>General</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-packaging" data-settings-tab="packaging" aria-controls="settings-panel-packaging" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5v9l-9 5-9-5V8Zm0 9 9-4M12 12 3 8m9 4v10M7 5.8l9 5"/></svg><span>Packaging</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-integrations" data-settings-tab="integrations" aria-controls="settings-panel-integrations" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0Zm6 10v4"/></svg><span>Integrations</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-privacy" data-settings-tab="privacy" aria-controls="settings-panel-privacy" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/></svg><span>Data and Privacy</span></button><p class="settings-nav-group">ACCOUNT</p><button type="button" role="tab" class="settings-tab" id="settings-tab-account" data-settings-tab="account" aria-controls="settings-panel-account" aria-selected="true" tabindex="0"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="9" r="3"/><path d="M6 19c0-6 12-6 12 0"/></svg><span>Account</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-billing" data-settings-tab="billing" aria-controls="settings-panel-billing" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></svg><span>Plans and Billing</span></button></div></nav><div class="settings-panels"><section class="settings-panel" role="tabpanel" id="settings-panel-general" aria-labelledby="settings-tab-general" tabindex="0" hidden><h2 class="settings-panel-title">General</h2><div class="settings-section"><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-notifications-label">Package alerts</div>
               <div class="settings-desc" id="setting-notifications-desc">Get alerts when Crate notices a watched project has been idle.</div>
@@ -855,19 +860,7 @@
               <input type="checkbox" id="toggle-notifications" aria-labelledby="setting-notifications-label" aria-describedby="setting-notifications-desc">
               <span class="toggle-slider"></span>
             </label>
-          </div>
-          <div class="settings-row">
-            <div class="settings-label-wrap">
-              <div class="settings-label" id="setting-diagnostics-label">Include diagnostic report in packages</div>
-              <div class="settings-desc" id="setting-diagnostics-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" id="toggle-diagnostic-report" aria-labelledby="setting-diagnostics-label" aria-describedby="setting-diagnostics-desc setting-diagnostics-hint">
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="diagnostics-hint" id="setting-diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div>
-          <div class="settings-row">
+          </div><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-package-details-label">Show Package Details after packaging</div>
               <div class="settings-desc" id="setting-package-details-desc">Shows a simple package summary after Crate gathers your files.</div>
@@ -876,8 +869,14 @@
               <input type="checkbox" id="toggle-package-details" aria-labelledby="setting-package-details-label" aria-describedby="setting-package-details-desc">
               <span class="toggle-slider"></span>
             </label>
-          </div>
+          </div></div></section><section class="settings-panel" role="tabpanel" id="settings-panel-packaging" aria-labelledby="settings-tab-packaging" tabindex="0" hidden><h2 class="settings-panel-title">Packaging</h2><div class="settings-section">
+          <div class="settings-section-title">Naming Template</div>
           <div class="settings-row">
+            <label class="settings-label" for="input-naming-template">Template</label>
+          </div>
+          <input class="settings-input" id="input-naming-template" value="{Project}_{Date}">
+          <div class="settings-preview-text">Preview: <span id="settings-naming-preview">Nike_BrandRefresh_2026-02-20</span></div>
+        </div><div class="settings-section"><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-package-folders-label">Organize packages by file type</div>
               <div class="settings-desc" id="setting-package-folders-desc">Creates folders such as AI, PNG, and PDF. Turn this off to keep all files together.</div>
@@ -886,10 +885,26 @@
               <input type="checkbox" id="toggle-package-folders" aria-labelledby="setting-package-folders-label" aria-describedby="setting-package-folders-desc">
               <span class="toggle-slider"></span>
             </label>
+          </div></div><div class="settings-section">
+          <div class="settings-section-title">Package Usage</div>
+          <div class="settings-desc quota-section-desc">Existing local package allowance. This is separate from account billing.</div>
+          <div class="quota-state-list">
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title" id="plan-title">Package usage</div>
+                <div class="quota-state-copy" id="plan-info">Loading package usage...</div>
+              </div>
+              <span class="quota-state-badge upgrade" id="plan-badge">Package usage</span>
+            </div>
+            <div class="quota-state-row">
+              <div>
+                <div class="quota-state-title">Limit reached</div>
+                <div class="quota-state-copy">No output written when blocked</div>
+              </div>
+              <span class="quota-state-badge available" id="quota-limit-state">Available</span>
+            </div>
           </div>
-        </div>
-
-        <div class="settings-section">
+        </div><p class="settings-local-usage" id="footer-usage"></p></section><section class="settings-panel" role="tabpanel" id="settings-panel-integrations" aria-labelledby="settings-tab-integrations" tabindex="0" hidden><h2 class="settings-panel-title">Integrations</h2><div class="settings-section">
           <div class="settings-section-title">Figma Integration</div>
           <div class="settings-desc" style="margin-bottom:12px;">Connect Figma, then add a Figma link inside a project.</div>
           <div id="figma-status">
@@ -938,41 +953,40 @@
           <div class="privacy-hint" style="margin-top:12px;">
             &#x1F512; Saved Figma connections are protected by macOS Keychain and stay on this Mac. Crate uses them only to request the Figma files and assets you link.
           </div>
-        </div>
-
-        <div class="settings-section">
-          <div class="settings-section-title">Quota / Plan</div>
-          <div class="settings-desc quota-section-desc">Plan limits and upgrade state.</div>
-          <div class="quota-state-list">
-            <div class="quota-state-row">
-              <div>
-                <div class="quota-state-title" id="plan-title">Current plan</div>
-                <div class="quota-state-copy" id="plan-info">Loading package usage...</div>
-              </div>
-              <span class="quota-state-badge upgrade" id="plan-badge">Current plan</span>
+        </div></section><section class="settings-panel" role="tabpanel" id="settings-panel-privacy" aria-labelledby="settings-tab-privacy" tabindex="0" hidden><h2 class="settings-panel-title">Data and Privacy</h2><div class="settings-section"><div class="settings-row">
+            <div class="settings-label-wrap">
+              <div class="settings-label" id="setting-diagnostics-label">Include diagnostic report in packages</div>
+              <div class="settings-desc" id="setting-diagnostics-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
             </div>
-            <div class="quota-state-row">
-              <div>
-                <div class="quota-state-title">Premium</div>
-                <div class="quota-state-copy">Future paid state</div>
-              </div>
-              <span class="quota-state-badge premium">Upgrade state</span>
-            </div>
-            <div class="quota-state-row">
-              <div>
-                <div class="quota-state-title">Limit reached</div>
-                <div class="quota-state-copy">No output written when blocked</div>
-              </div>
-              <span class="quota-state-badge available" id="quota-limit-state">Available</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="settings-section">
+            <label class="toggle">
+              <input type="checkbox" id="toggle-diagnostic-report" aria-labelledby="setting-diagnostics-label" aria-describedby="setting-diagnostics-desc setting-diagnostics-hint">
+              <span class="toggle-slider"></span>
+            </label>
+          </div><div class="diagnostics-hint" id="setting-diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div></div><div class="settings-section">
           <div class="settings-section-title">Data</div>
           <button class="btn-danger-outline" id="btn-clear-all">Clear All Projects</button>
-        </div>
-      </div>
+        </div></section><section class="settings-panel" role="tabpanel" id="settings-panel-account" aria-labelledby="settings-tab-account" tabindex="0" ><h2 class="settings-panel-title">Account</h2><section class="settings-section account-panel" aria-labelledby="account-title">
+          <span class="sr-only" id="account-title">Sign-in details</span>
+          <p id="account-state" role="status" aria-live="polite">Checking account…</p>
+          <dl class="account-details" id="account-details">
+            <div class="account-detail-row"><dt>Name</dt><dd id="account-name"></dd></div>
+            <div class="account-detail-row"><dt>Email</dt><dd id="account-identity"></dd></div>
+            <div class="account-detail-row"><dt>Sign-in methods</dt><dd id="account-methods"></dd></div>
+          </dl>
+          <p id="account-message"></p>
+          <div class="account-actions">
+            <button class="modal-btn-primary" id="account-signin">Sign in via browser</button>
+            <button class="modal-btn-secondary hidden" id="account-reopen">Open browser again</button>
+            <button class="modal-btn-secondary hidden" id="account-cancel">Cancel sign-in</button>
+            <button class="modal-btn-secondary hidden" id="account-retry">Check connection</button>
+            <button class="modal-btn-secondary hidden" id="account-manage">Manage account ↗</button>
+            <button class="modal-btn-secondary hidden" id="account-signout">Sign out of Crate</button>
+          </div>
+          <p class="account-local-note">Your projects stay on this Mac when you sign out.</p>
+        </section></section><section class="settings-panel" role="tabpanel" id="settings-panel-billing" aria-labelledby="settings-tab-billing" tabindex="0" hidden><h2 class="settings-panel-title">Plans and Billing</h2><section class="settings-section" aria-labelledby="billing-title">
+          <h2 class="settings-section-title" id="billing-title">Coming later</h2>
+          <p>Plans and billing are coming later.</p>
+        </section></section></div></div></div>
 
       <!-- Help Tab -->
       <div class="tab-content" id="tab-help">
@@ -1124,17 +1138,10 @@
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title" id="upgrade-title">You've reached your package limit</div>
-          <div class="modal-subtitle" id="upgrade-subtitle">Upgrade to Crate Pro for higher package limits.</div>
+          <div class="modal-subtitle" id="upgrade-subtitle">The package allowance for this Mac has been used. Plans and billing are coming later.</div>
         </div>
         <div class="modal-body">
-          <ul class="feature-list">
-            <li>Higher package limits</li>
-            <li>Beta and paid plan options</li>
-            <li>Custom naming templates</li>
-            <li>Priority support</li>
-          </ul>
-          <button class="app-btn" disabled>Upgrade to Pro &rarr;</button>
-          <button type="button" class="dismiss-link" id="btn-dismiss-upgrade">Maybe later &middot; resets in <span id="upgrade-days-left">30</span> days</button>
+          <button type="button" class="dismiss-link" id="btn-dismiss-upgrade">Close &middot; resets in <span id="upgrade-days-left">30</span> days</button>
         </div>
       </div>
     </div>
