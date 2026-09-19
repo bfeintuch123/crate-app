@@ -182,6 +182,59 @@ class StubFigmaParser extends FigmaParser {
   }
 }
 
+class FilteredScopeFigmaParser extends StubFigmaParser {
+  async _fetchAPI(endpoint) {
+    this.requestedEndpoints = [...(this.requestedEndpoints || []), endpoint];
+    const parsed = new URL(endpoint, 'https://figma.example');
+    if (parsed.pathname === `/files/${FILE_KEY}` && parsed.searchParams.has('ids')) {
+      const requestedId = parsed.searchParams.get('ids');
+      const selectedLayer = {
+        id: '4:1',
+        type: 'RECTANGLE',
+        name: 'Selected Layer',
+        fills: [{ type: 'IMAGE', imageRef: 'img-ref-selected-layer' }],
+      };
+      const group = {
+        id: '3:3',
+        type: 'GROUP',
+        name: 'Nested Group',
+        children: [selectedLayer],
+      };
+      const nestedFrame = {
+        id: '2:10',
+        type: 'FRAME',
+        name: 'Nested Frame',
+        children: [group],
+      };
+      const unrelatedPageOneLayer = {
+        id: '2:11',
+        type: 'RECTANGLE',
+        name: 'Unrelated Page One Layer',
+        fills: [{ type: 'IMAGE', imageRef: 'img-ref-unrelated-page-one' }],
+      };
+      const pageOne = {
+        id: '1:1',
+        type: 'CANVAS',
+        name: 'Page One',
+        children: requestedId === '1:1' ? [nestedFrame, unrelatedPageOneLayer] : [nestedFrame],
+      };
+      const pageTwo = { id: '1:2', type: 'CANVAS', name: 'Page Two' };
+      const children = requestedId === '9:9'
+        ? [{ id: '1:1', type: 'CANVAS', name: 'Page One' }, pageTwo]
+        : [pageOne, pageTwo];
+      return {
+        document: {
+          id: '0:0',
+          type: 'DOCUMENT',
+          name: 'Filtered fixture',
+          children,
+        },
+      };
+    }
+    return super._fetchAPI(endpoint);
+  }
+}
+
 class SensitiveUrlFigmaParser extends StubFigmaParser {
   async _fetchAPI(endpoint) {
     if (endpoint === `/files/${FILE_KEY}/images`) {
@@ -311,7 +364,7 @@ test('tracked-link preflight verifies file access and locks Current Page without
     lockedPageName: 'Page One',
     statusReason: null,
   });
-  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=1%3A1&depth=1`]);
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=1%3A1`]);
 });
 
 test('tracked-link preflight resolves a selected node to its enclosing page', async () => {
@@ -325,7 +378,51 @@ test('tracked-link preflight resolves a selected node to its enclosing page', as
   assert.equal(result.valid, true);
   assert.equal(result.scope.lockedPageId, '1:1');
   assert.equal(result.scope.lockedPageName, 'Page One');
-  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=2%3A1&depth=1`]);
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=2%3A1`]);
+});
+
+test('tracked-link preflight resolves a page from the filtered ids response without depth truncation', async () => {
+  const parser = new FilteredScopeFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: '1:1',
+    requestedNodeId: null,
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.scope.lockStatus, 'locked');
+  assert.equal(result.scope.lockedPageId, '1:1');
+  assert.equal(result.scope.lockedPageName, 'Page One');
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=1%3A1`]);
+});
+
+test('tracked-link preflight resolves a nested layer through its returned ancestor chain', async () => {
+  const parser = new FilteredScopeFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: null,
+    requestedNodeId: '4:1',
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.scope.lockStatus, 'locked');
+  assert.equal(result.scope.lockedPageId, '1:1');
+  assert.equal(result.scope.lockedPageName, 'Page One');
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=4%3A1`]);
+});
+
+test('tracked-link preflight still rejects a missing node in a filtered ids response', async () => {
+  const parser = new FilteredScopeFigmaParser();
+  const result = await parser.validateTrackedFileScope(FILE_KEY, {
+    scopeMode: 'current-page',
+    requestedPageId: null,
+    requestedNodeId: '9:9',
+  });
+
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, 'figma-current-page-requested-node-not-found');
+  assert.equal(result.scope.lockStatus, 'unresolved');
+  assert.deepEqual(parser.requestedEndpoints, [`/files/${FILE_KEY}?ids=9%3A9`]);
 });
 
 test('tracked-link preflight reports an unresolved requested page without fetching assets', async () => {

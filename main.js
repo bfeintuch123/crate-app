@@ -9660,9 +9660,64 @@ async function downloadFigmaAsset(
   }
 }
 
+function hasEstablishedFigmaAssetBaseline(project) {
+  return Number.isSafeInteger(project && project.figmaAssetBaselineEstablishedAt) &&
+    project.figmaAssetBaselineEstablishedAt > 0;
+}
+
+function beginFigmaAssetBaselineScan(projectId, scanStartedAt = Date.now()) {
+  return mutateProject(projectId, (project) => {
+    if (hasEstablishedFigmaAssetBaseline(project)) {
+      return { status: 'established' };
+    }
+    if (Number.isSafeInteger(project.figmaAssetBaselinePendingAt) && project.figmaAssetBaselinePendingAt > 0) {
+      return { status: 'pending' };
+    }
+
+    const existingFigmaAssetTimes = [...(project.files || []), ...(project.pendingFiles || [])]
+      .filter(file => file && file.source === 'figma-auto')
+      .map(file => file.addedAt)
+      .filter(Number.isSafeInteger);
+    if (existingFigmaAssetTimes.length > 0) {
+      project.figmaAssetBaselineEstablishedAt = Math.min(...existingFigmaAssetTimes);
+      return { changed: true, status: 'established' };
+    }
+
+    project.figmaAssetBaselinePendingAt = Number.isSafeInteger(scanStartedAt) && scanStartedAt > 0
+      ? scanStartedAt
+      : Date.now();
+    return { changed: true, status: 'pending' };
+  }, { persistIfChanged: true, trustResultChanged: true });
+}
+
+function completeFigmaAssetBaselineScan(projectId, scanStartedAt = Date.now(), isCurrent = () => true) {
+  if (!isCurrent()) return null;
+  return mutateProject(projectId, (project) => {
+    if (hasEstablishedFigmaAssetBaseline(project)) {
+      if (!Number.isSafeInteger(project.figmaAssetBaselinePendingAt)) return null;
+      delete project.figmaAssetBaselinePendingAt;
+      return { changed: true, status: 'established' };
+    }
+    if (!Number.isSafeInteger(project.figmaAssetBaselinePendingAt)) return null;
+
+    project.figmaAssetBaselineEstablishedAt = Number.isSafeInteger(scanStartedAt) && scanStartedAt > 0
+      ? scanStartedAt
+      : Date.now();
+    delete project.figmaAssetBaselinePendingAt;
+    return { changed: true, status: 'established' };
+  }, { persistIfChanged: true, trustResultChanged: true });
+}
+
+function isCompleteFigmaAssetBaselineSnapshot(scanResult, trackedFiles) {
+  const errors = Array.isArray(scanResult && scanResult.errors) ? scanResult.errors : [];
+  return Array.isArray(scanResult && scanResult.assets) &&
+    errors.length === 0 &&
+    didFigmaPrePackageScanSucceed(scanResult, trackedFiles);
+}
+
 /**
  * Download Figma scan assets and insert them into project state.
- * @returns {Promise<number>} count of inserted assets
+ * @returns {Promise<{addedCount: number, complete: boolean}>}
  */
 async function ingestFigmaAssetsIntoProject(
   projectId,
@@ -9673,8 +9728,9 @@ async function ingestFigmaAssetsIntoProject(
   operationGuard = null
 ) {
   const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && (!operationGuard || operationGuard());
-  if (!assets || assets.length === 0) return 0;
-  if (!isCurrent()) return 0;
+  if (!Array.isArray(assets)) return { addedCount: 0, complete: false };
+  if (assets.length === 0) return { addedCount: 0, complete: isCurrent() };
+  if (!isCurrent()) return { addedCount: 0, complete: false };
 
   const existingPaths = new Set((project.files || []).map(f => normalizeTrackedFilePath(f.path)));
   const existingFigmaAssetKeys = new Set((project.files || []).map(getFigmaAssetDedupKey).filter(Boolean));
@@ -9683,9 +9739,10 @@ async function ingestFigmaAssetsIntoProject(
     FIGMA_NETWORK_LIMITS.assetOperationTimeoutMs
   );
   let addedCount = 0;
+  let complete = true;
 
   for (const asset of assets) {
-    if (!isCurrent()) return addedCount;
+    if (!isCurrent()) return { addedCount, complete: false };
     const figmaFileKey = typeof asset.figmaFileKey === 'string' && asset.figmaFileKey.trim()
       ? asset.figmaFileKey.trim()
       : (typeof asset.fileKey === 'string' && asset.fileKey.trim() ? asset.fileKey.trim() : null);
@@ -9703,6 +9760,7 @@ async function ingestFigmaAssetsIntoProject(
       url: asset.url
     });
     if (!figmaFileKey || !figmaAssetIdentity || !figmaAssetDedupKey) {
+      complete = false;
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `assetKeyPresent=${!!figmaAssetIdentity} reason=identity_unavailable`
@@ -9730,8 +9788,9 @@ async function ingestFigmaAssetsIntoProject(
       figmaAssetDedupKey
     );
 
-    if (!isCurrent()) return addedCount;
+    if (!isCurrent()) return { addedCount, complete: false };
     if (!localPath) {
+      complete = false;
       console.log(
         `[crate][figma] asset skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `name=${formatFigmaLogScalar(asset.name)} reason=download_failed`
@@ -9745,6 +9804,12 @@ async function ingestFigmaAssetsIntoProject(
     }
     const normalizedLocalPath = normalizeTrackedFilePath(localPath);
     if (existingPaths.has(normalizedLocalPath)) {
+      const existingPathRecord = (project.files || []).find(file => (
+        normalizeTrackedFilePath(file && file.path) === normalizedLocalPath &&
+        file.source === 'figma-auto' &&
+        getFigmaAssetDedupKey(file) === figmaAssetDedupKey
+      ));
+      if (!existingPathRecord) complete = false;
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `localName=${formatFigmaLocalNameForLog(localPath)} reason=existing_path`
@@ -9774,6 +9839,7 @@ async function ingestFigmaAssetsIntoProject(
         figmaAssetIdentity,
         figmaAssetKey: figmaAssetIdentity,
         figmaAssetDedupKey,
+        assetOrigin: hasEstablishedFigmaAssetBaseline(proj) ? 'added' : 'existing',
       };
       const staged = stageLiveObservedFile(proj, fileRecord, {
         allowDirect: true,
@@ -9789,7 +9855,7 @@ async function ingestFigmaAssetsIntoProject(
     });
 
     if (result) {
-      if (!isCurrent()) return addedCount;
+      if (!isCurrent()) return { addedCount, complete: false };
       const projectHasLocalPath = (project.files || []).some(f => normalizeTrackedFilePath(f.path) === normalizedLocalPath);
       const projectHasFigmaKey = figmaAssetDedupKey && (project.files || []).some(f => getFigmaAssetDedupKey(f) === figmaAssetDedupKey);
       if (!projectHasLocalPath && !projectHasFigmaKey) {
@@ -9810,6 +9876,11 @@ async function ingestFigmaAssetsIntoProject(
       existingPaths.add(normalizedLocalPath);
       if (figmaAssetDedupKey) existingFigmaAssetKeys.add(figmaAssetDedupKey);
     } else {
+      const currentProject = getProjects().find(item => item.id === projectId);
+      const currentProjectHasAsset = (currentProject && currentProject.files || []).some(file => (
+        getFigmaAssetDedupKey(file) === figmaAssetDedupKey
+      ));
+      if (!currentProjectHasAsset) complete = false;
       console.log(
         `[crate][figma] asset duplicate skip (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `assetKeyPresent=${!!figmaAssetIdentity} localName=${formatFigmaLocalNameForLog(localPath)} reason=already_in_project`
@@ -9817,7 +9888,7 @@ async function ingestFigmaAssetsIntoProject(
     }
   }
 
-  return addedCount;
+  return { addedCount, complete };
 }
 
 /**
@@ -9888,6 +9959,10 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
       fileKeys.filter(key => typeof key === 'string' && key.trim())
     ).size;
 
+    if (teamIds.length > 0 || fileKeys.length > 0) {
+      beginFigmaAssetBaselineScan(projectId, scanStartedAt);
+    }
+
     // Determine time window for scanning
     const lastScanMs = figmaScanTimestamps.get(projectId) || project.watchStartedAt || scanStartedAt;
     const watchStartMs = project.watchStartedAt || 0;
@@ -9933,6 +10008,8 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
     const isRateLimited = scanResult.rateLimited === true ||
       hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
       retryAfterMs !== null;
+    const canEstablishFigmaBaseline = !isRateLimited &&
+      isCompleteFigmaAssetBaselineSnapshot(scanResult, rawTrackedFiles);
     let rateLimitRetryAt = 0;
     if (isRateLimited) {
       scanResult.assets = [];
@@ -9969,6 +10046,12 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
     }
 
     if (scanResult.assets.length === 0) {
+      if (canEstablishFigmaBaseline) {
+        completeFigmaAssetBaselineScan(projectId, scanStartedAt, () => (
+          isActiveWatchingProject(projectId, activationToken) &&
+          (watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+        ));
+      }
       // Notify renderer even when no assets found
       const scanErrors = sanitizeFigmaRendererIssues(scanResult.errors);
       const sessionWarning = sanitizeFigmaRendererIssue(
@@ -10018,7 +10101,7 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
       ...asset,
       figmaScopeMode: getProjectFigmaScopeMode(latestProject)
     }));
-    const addedCount = await ingestFigmaAssetsIntoProject(
+    const ingestion = await ingestFigmaAssetsIntoProject(
       projectId,
       project,
       scopedAssets,
@@ -10031,6 +10114,14 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
     ) {
       return { skipped: true, reason: 'watch-session-superseded' };
     }
+
+    if (canEstablishFigmaBaseline && ingestion.complete) {
+      completeFigmaAssetBaselineScan(projectId, scanStartedAt, () => (
+        isActiveWatchingProject(projectId, activationToken) &&
+        (watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
+      ));
+    }
+    const addedCount = ingestion.addedCount;
 
     if (addedCount > 0) {
       // Update activity timestamp
@@ -16271,6 +16362,8 @@ end tell`;
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
       if (!operationCurrent()) return null;
+      const figmaBaselineScanStartedAt = Date.now();
+      beginFigmaAssetBaselineScan(projectId, figmaBaselineScanStartedAt);
       figmaPackageTransferBlocks.set(projectId, FIGMA_PACKAGE_TRANSFER_ERROR);
       const activeRetryAt = getFigmaRateLimitRetryAt(projectId, latestProject);
       if (activeRetryAt > Date.now()) {
@@ -16304,6 +16397,8 @@ end tell`;
         const isRateLimited = figmaScanResult.rateLimited === true ||
           hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
           retryAfterMs !== null;
+        const canEstablishFigmaBaseline = !isRateLimited &&
+          isCompleteFigmaAssetBaselineSnapshot(figmaScanResult, rawTrackedFiles);
 
         if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {
           console.warn('[crate][figma] pre-package scan errors:', summarizeFigmaErrorsForLog(figmaScanResult.errors));
@@ -16329,11 +16424,16 @@ end tell`;
             ...asset,
             figmaScopeMode: getProjectFigmaScopeMode(latestProject)
           }));
-          const figmaAdded = await ingestFigmaAssetsIntoProject(
+          const ingestion = await ingestFigmaAssetsIntoProject(
             projectId, project, scopedAssets, 'pre-package', operation.activationToken, operationCurrent
           );
           if (!operationCurrent()) return null;
-          newCount += figmaAdded;
+          newCount += ingestion.addedCount;
+          if (canEstablishFigmaBaseline && ingestion.complete) {
+            completeFigmaAssetBaselineScan(projectId, figmaBaselineScanStartedAt, operationCurrent);
+          }
+        } else if (!isRateLimited && canEstablishFigmaBaseline) {
+          completeFigmaAssetBaselineScan(projectId, figmaBaselineScanStartedAt, operationCurrent);
         }
         if (!operationCurrent()) return null;
         if (didFigmaPrePackageScanSucceed(figmaScanResult, rawTrackedFiles)) {
