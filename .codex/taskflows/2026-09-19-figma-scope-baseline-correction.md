@@ -35,9 +35,9 @@ Forbidden:
 
 ## State
 
-- current phase: corrective review loop before final PR-head validation
-- last completed checkpoint: corrective source/test commits `7ee2e71` and `7881740` address findings from both exact-head review cycles; Figma link-per-project passes 93/93
-- next action: commit and push the sanitized proof-state update with corrective source commits `7ee2e71` and `7881740`, then bind PR #264's final head for protected CI and two fresh independent read-only reviews; keep the PR draft
+- current phase: final corrective review loop before PR-head validation
+- last completed checkpoint: exact-head reviewers on `faa036d4a00bfb589a6bd12f7491804fac710dc0` found a scan that began during replacement preflight could survive the successful link commit; correction `a1f1f39` advances the scope revision at commit, and the focused Figma link suite passes 94/94
+- next action: commit the sanitized proof-state update, push `a1f1f39` with the already-pushed corrective commits, then bind PR #264's new head for protected CI and two fresh independent read-only reviews; keep the PR draft
 - blocker: none
 - approval state: Bryant authorized the two focused corrections, repository-required checks, exact-head corrections, commit, push, and draft PR; later release and merge gates remain unauthorized
 - preferences applied: one repository writer; reviewers read-only; no private link or token in fixtures
@@ -50,10 +50,10 @@ Forbidden:
 - [x] source and official Figma API contract review
 - [x] implementation and realistic synthetic tests
 - [x] targeted checks
-- [ ] protected exact-head CI
-- [ ] exact-head independent review/correction loop
+- [ ] protected exact-head CI for the final PR head
+- [ ] exact-head independent review/correction loop for the final PR head
 - [x] proof section and ledger/workstream update
-- [x] source commit, push, and draft PR
+- [ ] latest corrective source and proof-state commits pushed to the existing draft PR
 - [ ] handoff at the authorized stop gate
 
 ## Evidence
@@ -72,12 +72,15 @@ Forbidden:
 | 2026-09-19 | Second exact-head review loop | PR head `af8982825be2ae126b1213198fdb1e0e13cd57b0`; two fresh Luna/high reviewers found a delayed preflight request-order race; its in-flight CI was canceled after correction | Added request-order fencing and replace/remove plus replace/replace regressions |
 | 2026-09-19 | Corrective local validation | `figma-link-per-project` 93/93; syntax and whitespace checks | PASS; full exact-head protected CI and two fresh reviews remain pending after push |
 | 2026-09-19 | Corrective source commits | `7ee2e71`, `7881740` | Local commits; proof-state update remains to be committed before pushing the new draft PR head |
+| 2026-09-19 | Third exact-head review loop | PR head `faa036d4a00bfb589a6bd12f7491804fac710dc0`; two fresh Luna/high reviewers found a poll could begin during replacement preflight and survive the successful link commit; stale CI run `35460465743` was canceled | Added commit-time scope revision advance and a delayed-scan regression |
+| 2026-09-19 | Latest corrective local validation | `figma-link-per-project` 94/94; pinned Node 22 syntax checks and `git diff --check` | PASS; source commit `a1f1f39` is local; final-head CI and two fresh reviews remain pending |
 
 ## Proof Notes
 
 - The Current Page Only preflight now uses the documented `ids` response without truncating depth; missing selected nodes remain rejected.
 - A project-scoped marker holds the Figma asset origin baseline open until the complete first scan and all asset ingestions succeed. Retries retain Existing origins, empty successful snapshots close the baseline, and later unseen assets are Added.
 - Legacy Figma rows are not reclassified by migration; existing origin and exclusion decisions are preserved.
+- A link replacement advances the per-project scope revision both when the request begins and when its preflight successfully commits, fencing polls that started during preflight from ingesting the previous link's snapshot.
 - `crate_doctor.py` was attempted in the isolated clone and could not run because its configured Projects root is absent in this environment. This is an environment limitation, not a product finding.
 
 ## Risks
@@ -92,5 +95,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Commit and push the sanitized proof-state update with corrective source commits `7ee2e71` and `7881740`, then rerun exact-head protected CI and complete two fresh, distinct Luna/high read-only reviews against PR #264's final head. Keep the PR draft and apply no merge or ready transition.
+Commit and push the sanitized proof-state update with correction `a1f1f39` and earlier corrective commits, then rerun exact-head protected CI and complete two fresh, distinct Luna/high read-only reviews against PR #264's final head. Keep the PR draft and apply no merge or ready transition.
 ```
