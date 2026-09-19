@@ -1600,6 +1600,101 @@ test('a Figma scan for a removed link cannot ingest the old assets or establish 
   assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
 });
 
+test('a scan started during replacement preflight is fenced when the new link commits', async () => {
+  const project = await createLinkedFigmaProject('Figma Scan During Link Preflight');
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => new Promise(resolve => {
+    releasePreflight = resolve;
+  });
+  const replacementPromise = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG33/Second-Cloud?page-id=2%3A2',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the replacement preflight should start'
+  );
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/preflight-window-old-link.png',
+    nodeId: 'node-preflight-window-old',
+    imageRef: 'img-preflight-window-old',
+    name: 'Preflight Window Old Link',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  figmaScanDelayMs = 80;
+  const scanInvocationsBefore = figmaScanInvocationCount;
+  const oldLinkScan = callIpc('figma:scan-project', project.id);
+  await waitForCondition(
+    () => figmaScanInvocationCount > scanInvocationsBefore,
+    'the old-link scan should start during replacement preflight'
+  );
+
+  storedFigmaToken = null;
+  releasePreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+  } });
+  const replacement = await replacementPromise;
+  assert.equal(replacement.success, true);
+  await oldLinkScan;
+
+  let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG33');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === 'img-preflight-window-old'), false);
+  assert.equal(fresh.figmaAssetBaselineEstablishedAt, undefined);
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
+
+  storedFigmaToken = 'test-token';
+  figmaScanDelayMs = 0;
+  const newLinkAsset = {
+    url: 'https://cdn.figma.example/new-link-first-asset.png',
+    nodeId: 'node-new-link-first',
+    imageRef: 'img-new-link-first',
+    name: 'New Link First Asset',
+    format: 'png',
+    figmaFileKey: 'FIG33',
+    figmaFileName: 'Second Cloud',
+    figmaPageId: '2:2',
+    figmaPageName: 'Second Page',
+  };
+  nextFigmaScanResult = figmaScanResult([newLinkAsset], [{
+    fileKey: 'FIG33',
+    primaryKey: 'FIG33',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  setFigmaDownloadResponse('new link first asset');
+  const newLinkScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(newLinkScan.success, true);
+  fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.find(file => file.figmaAssetIdentity === newLinkAsset.imageRef).assetOrigin, 'existing');
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselineEstablishedAt), true);
+});
+
 test('delete-all during an in-flight Figma download removes the late cache write', async () => {
   const project = await createLinkedFigmaProject('Delete all in-flight Figma cache');
   const downloadGate = setGatedFigmaDownloadResponse('late delete-all figma cache');

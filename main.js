@@ -15324,6 +15324,7 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
   if (getFigmaScopeRevision(projectId) !== linkUpdateRevision) {
     return { success: false, error: 'figma_link_update_superseded' };
   }
+  advanceFigmaScopeRevision(projectId);
   const settings = store.get('settings') || {};
   const updated = mutateProject(projectId, (proj) => {
     proj.figmaTrackedFiles = figmaTrackedFiles;
