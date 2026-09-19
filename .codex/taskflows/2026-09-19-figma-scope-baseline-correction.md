@@ -12,7 +12,7 @@
 - branch: codex/figma-scope-baseline-correction-20260919
 - base: e390d3bce48d83abf8955fc131a74038a27fa06a
 - draft PR: https://github.com/bfeintuch123/crate-app/pull/264
-- mode: focused source correction, targeted regression checks, protected exact-head CI, independent Luna/high review
+- mode: one Bryant-authorized additional source correction cycle, targeted regression checks, protected exact-head CI, two independent Astra/high reviews
 - status: active
 
 ## Goal
@@ -35,11 +35,11 @@ Forbidden:
 
 ## State
 
-- current phase: final corrective review loop before PR-head validation
-- last completed checkpoint: exact-head reviewers on `faa036d4a00bfb589a6bd12f7491804fac710dc0` found a scan that began during replacement preflight could survive the successful link commit; correction `a1f1f39` advances the scope revision at commit, and the focused Figma link suite passes 94/94
-- next action: commit the sanitized proof-state update, push `a1f1f39` with the already-pushed corrective commits, then bind PR #264's new head for protected CI and two fresh independent read-only reviews; keep the PR draft
+- current phase: final writer correction prepared; bind and review the next PR head
+- last completed checkpoint: fresh Astra/high reviewers on `faa036d4a00bfb589a6bd12f7491804fac710dc0` found that a scan could finish during replacement preflight before the commit-time revision fence. The current working-tree correction keeps per-project scans and pre-package recovery fenced for the full preflight, then resumes watching scans after all overlapping updates settle. Current-code `figma-link-per-project` passes 96/96 and combined `provenance.test.js` plus `provenance-dual-write.test.js` passes 585/585.
+- next action: recheck syntax and whitespace after the final race-test edit, make one normal correction commit with sanitized proof-state updates, push the authorized update to PR #264, bind its exact head, then run protected CI and two fresh distinct read-only Astra/high reviews. Keep the PR draft. If this one additional correction cycle receives another actionable finding, stop and escalate to Bryant.
 - blocker: none
-- approval state: Bryant authorized the two focused corrections, repository-required checks, exact-head corrections, commit, push, and draft PR; later release and merge gates remain unauthorized
+- approval state: Bryant authorized exactly one additional writer correction cycle, repository-required checks, final-head CI and two reviews, commit, push, factual PR-description update, and draft status; later release, ready-for-review, and merge gates remain unauthorized
 - preferences applied: one repository writer; reviewers read-only; no private link or token in fixtures
 - routing decision: SO-002 failure loop with Clawpatch, Deep Autoreview, regression, security, provenance, runner, PR, and handoff review
 - outcome receipt: pending
@@ -49,7 +49,7 @@ Forbidden:
 - [x] preflight and exact canonical base
 - [x] source and official Figma API contract review
 - [x] implementation and realistic synthetic tests
-- [x] targeted checks
+- [x] current-code `figma-link-per-project` (96/96) and provenance helper/dual-write checks (585/585 combined)
 - [ ] protected exact-head CI for the final PR head
 - [ ] exact-head independent review/correction loop for the final PR head
 - [x] proof section and ledger/workstream update
@@ -74,6 +74,7 @@ Forbidden:
 | 2026-09-19 | Corrective source commits | `7ee2e71`, `7881740` | Local commits; proof-state update remains to be committed before pushing the new draft PR head |
 | 2026-09-19 | Third exact-head review loop | PR head `faa036d4a00bfb589a6bd12f7491804fac710dc0`; two fresh Luna/high reviewers found a poll could begin during replacement preflight and survive the successful link commit; stale CI run `35460465743` was canceled | Added commit-time scope revision advance and a delayed-scan regression |
 | 2026-09-19 | Latest corrective local validation | `figma-link-per-project` 94/94; pinned Node 22 syntax checks and `git diff --check` | PASS; source commit `a1f1f39` is local; final-head CI and two fresh reviews remain pending |
+| 2026-09-19 | Additional correction cycle | A fresh review found scans could complete before replacement commit during preflight; added a project-scoped pending-update fence for watcher scans and pre-package recovery, plus post-preflight watcher resume and three retry/race regressions | Current-code `figma-link-per-project` 96/96 and combined provenance helpers/dual-write 585/585; commit, push, exact-head CI, and two Astra/high reviews pending |
 
 ## Proof Notes
 
@@ -81,6 +82,7 @@ Forbidden:
 - A project-scoped marker holds the Figma asset origin baseline open until the complete first scan and all asset ingestions succeed. Retries retain Existing origins, empty successful snapshots close the baseline, and later unseen assets are Added.
 - Legacy Figma rows are not reclassified by migration; existing origin and exclusion decisions are preserved.
 - A link replacement advances the per-project scope revision both when the request begins and when its preflight successfully commits, fencing polls that started during preflight from ingesting the previous link's snapshot.
+- Every pending link preflight now fences per-project watcher scans before parser invocation and again after token retrieval; pre-package recovery fails closed while the preflight is pending. A successful watching-project link update resumes its initial scan after all overlapping updates settle, while a failed preflight leaves the existing link available for a later retry.
 - `crate_doctor.py` was attempted in the isolated clone and could not run because its configured Projects root is absent in this environment. This is an environment limitation, not a product finding.
 
 ## Risks
@@ -95,5 +97,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Commit and push the sanitized proof-state update with correction `a1f1f39` and earlier corrective commits, then rerun exact-head protected CI and complete two fresh, distinct Luna/high read-only reviews against PR #264's final head. Keep the PR draft and apply no merge or ready transition.
+Complete current-code affected checks, commit this single authorized writer correction cycle with the sanitized proof-state update, push to PR #264, and bind its exact new head. Run protected CI and two fresh, distinct Astra/high read-only reviews against that exact head; update the PR description to match completed evidence, keep it draft, and stop before ready-for-review or merge. If the final review reports another actionable finding, stop and escalate rather than starting another correction cycle.
 ```

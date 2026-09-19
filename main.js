@@ -7374,6 +7374,8 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
 const FIGMA_PACKAGE_TRANSFER_ERROR = 'Crate could not securely retrieve all Figma assets. No package was written. Try again.';
 const figmaPackageTransferBlocks = new Map();
 const figmaScopeRevisions = new Map();
+const pendingFigmaScopeUpdates = new Map();
+const figmaPollingRestartAfterScopeUpdate = new Set();
 function getFigmaScopeRevision(projectId) {
   return figmaScopeRevisions.get(projectId) || 0;
 }
@@ -7381,6 +7383,27 @@ function advanceFigmaScopeRevision(projectId) {
   const revision = getFigmaScopeRevision(projectId) + 1;
   figmaScopeRevisions.set(projectId, revision);
   return revision;
+}
+function isFigmaScopeUpdatePending(projectId) {
+  return (pendingFigmaScopeUpdates.get(projectId)?.size || 0) > 0;
+}
+function beginFigmaScopeUpdate(projectId) {
+  const revision = advanceFigmaScopeRevision(projectId);
+  let pendingUpdates = pendingFigmaScopeUpdates.get(projectId);
+  if (!pendingUpdates) {
+    pendingUpdates = new Set();
+    pendingFigmaScopeUpdates.set(projectId, pendingUpdates);
+  }
+  pendingUpdates.add(revision);
+  return revision;
+}
+function finishFigmaScopeUpdate(projectId, revision) {
+  const pendingUpdates = pendingFigmaScopeUpdates.get(projectId);
+  if (!pendingUpdates) return false;
+  pendingUpdates.delete(revision);
+  if (pendingUpdates.size > 0) return false;
+  pendingFigmaScopeUpdates.delete(projectId);
+  return true;
 }
 function restoreFigmaPackageTransferBlock(projectId, previousBlock) {
   if (previousBlock === undefined) figmaPackageTransferBlocks.delete(projectId);
@@ -9907,6 +9930,9 @@ async function ingestFigmaAssetsIntoProject(
  * Runs on watch session start and every 60 seconds.
  */
 async function pollFigmaForProjectCore(projectId, isInitialScan = false, activationToken = null, watcherGeneration = null) {
+  if (isFigmaScopeUpdatePending(projectId)) {
+    return { skipped: true, reason: 'figma-link-update-pending' };
+  }
   if (figmaInProgress.has(projectId)) return { skipped: true, reason: 'in-progress' }; // Prevent overlapping polls
 
   const currentProjects = getProjects();
@@ -9946,6 +9972,9 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
   const token = await parser.getStoredToken();
   if (!isActiveWatchingProject(projectId, activationToken)) {
     return { skipped: true, reason: 'watch-session-superseded' };
+  }
+  if (isFigmaScopeUpdatePending(projectId)) {
+    return { skipped: true, reason: 'figma-link-update-pending' };
   }
   if (!token) {
     stopFigmaPolling(projectId);
@@ -15302,52 +15331,61 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     : (payload.action === 'replace' || rawUrl ? 'replace' : 'preserve');
 
   assertAccountCurrent();
-  const linkUpdateRevision = advanceFigmaScopeRevision(projectId);
-
-  let figmaTrackedFiles = normalizeTrackedFigmaFiles(project.figmaTrackedFiles || []);
-  if (action === 'remove') {
-    figmaTrackedFiles = [];
-  } else if (action === 'replace') {
-    const locator = createTrackedFigmaLocator(rawUrl);
-    if (!locator) {
-      return { success: false, error: 'invalid_figma_url' };
+  const linkUpdateRevision = beginFigmaScopeUpdate(projectId);
+  try {
+    let figmaTrackedFiles = normalizeTrackedFigmaFiles(project.figmaTrackedFiles || []);
+    if (action === 'remove') {
+      figmaTrackedFiles = [];
+    } else if (action === 'replace') {
+      const locator = createTrackedFigmaLocator(rawUrl);
+      if (!locator) {
+        return { success: false, error: 'invalid_figma_url' };
+      }
+      figmaTrackedFiles = [locator];
     }
-    figmaTrackedFiles = [locator];
-  }
 
-  if (action !== 'remove' && figmaTrackedFiles.length > 0) {
-    const preflight = await preflightTrackedFigmaLocator(figmaTrackedFiles[0], scopeMode);
-    if (!preflight.success) return { success: false, error: preflight.error };
-  }
+    if (action !== 'remove' && figmaTrackedFiles.length > 0) {
+      const preflight = await preflightTrackedFigmaLocator(figmaTrackedFiles[0], scopeMode);
+      if (!preflight.success) return { success: false, error: preflight.error };
+    }
 
-  assertAccountCurrent();
-  if (getFigmaScopeRevision(projectId) !== linkUpdateRevision) {
-    return { success: false, error: 'figma_link_update_superseded' };
-  }
-  advanceFigmaScopeRevision(projectId);
-  const settings = store.get('settings') || {};
-  const updated = mutateProject(projectId, (proj) => {
-    proj.figmaTrackedFiles = figmaTrackedFiles;
-    proj.figmaScopeMode = scopeMode;
-    proj.figmaSession = buildFigmaSessionSnapshot(proj, settings);
-    return proj;
-  });
-  figmaPackageTransferBlocks.delete(projectId);
+    assertAccountCurrent();
+    if (getFigmaScopeRevision(projectId) !== linkUpdateRevision) {
+      return { success: false, error: 'figma_link_update_superseded' };
+    }
+    advanceFigmaScopeRevision(projectId);
+    const settings = store.get('settings') || {};
+    const updated = mutateProject(projectId, (proj) => {
+      proj.figmaTrackedFiles = figmaTrackedFiles;
+      proj.figmaScopeMode = scopeMode;
+      proj.figmaSession = buildFigmaSessionSnapshot(proj, settings);
+      return proj;
+    });
+    figmaPackageTransferBlocks.delete(projectId);
 
-  if (updated && trayWindow && !trayWindow.isDestroyed()) {
-    trayWindow.webContents.send('project:updated', { projectId });
-  }
+    if (updated && trayWindow && !trayWindow.isDestroyed()) {
+      trayWindow.webContents.send('project:updated', { projectId });
+    }
 
-  if (updated && updated.status === 'watching') {
-    if (projectHasFigmaTrackedFiles(updated)) {
-      const activationToken = getActiveWatchingActivationToken(projectId);
-      if (activationToken !== null) startFigmaPolling(projectId, activationToken);
-    } else {
-      stopFigmaPolling(projectId);
+    if (updated && updated.status === 'watching') {
+      if (projectHasFigmaTrackedFiles(updated)) {
+        figmaPollingRestartAfterScopeUpdate.add(projectId);
+      } else {
+        stopFigmaPolling(projectId);
+      }
+    }
+
+    return { success: true, project: getIllustratorScopedProjectView(updated) };
+  } finally {
+    const allUpdatesFinished = finishFigmaScopeUpdate(projectId, linkUpdateRevision);
+    if (allUpdatesFinished && figmaPollingRestartAfterScopeUpdate.delete(projectId)) {
+      const latestProject = getProjects().find((candidate) => candidate.id === projectId);
+      if (latestProject?.status === 'watching' && projectHasFigmaTrackedFiles(latestProject)) {
+        const activationToken = getActiveWatchingActivationToken(projectId);
+        if (activationToken !== null) startFigmaPolling(projectId, activationToken);
+      }
     }
   }
-
-  return { success: true, project: getIllustratorScopedProjectView(updated) };
 });
 
 registerTrustedIpcHandler('projects:start-watching', async (event, id) => {
@@ -16391,6 +16429,18 @@ end tell`;
 
     if (teamIds.length > 0 || fileKeys.length > 0) {
       if (!operationCurrent()) return null;
+      if (isFigmaScopeUpdatePending(projectId)) {
+        figmaPackageError = FIGMA_PACKAGE_TRANSFER_ERROR;
+        figmaPackageTransferBlocks.set(projectId, figmaPackageError);
+        project.files = deduplicateFiles(project.files);
+        clearFileVisualProjectCache(projectId);
+        const currentProject = getProjects().find(item => item.id === projectId) || project;
+        return {
+          files: getIllustratorScopedProjectView(currentProject).files,
+          newCount,
+          error: figmaPackageError,
+        };
+      }
       const figmaBaselineScanStartedAt = Date.now();
       const figmaScopeRevision = getFigmaScopeRevision(projectId);
       const isFigmaScopeCurrent = () => getFigmaScopeRevision(projectId) === figmaScopeRevision;
@@ -19757,6 +19807,8 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
   stopWatching(id);
   illustratorActivationScopes.delete(id);
   figmaScopeRevisions.delete(id);
+  pendingFigmaScopeUpdates.delete(id);
+  figmaPollingRestartAfterScopeUpdate.delete(id);
   figmaPackageTransferBlocks.delete(id);
   let removed = false;
   const result = mutateProject(id, (project, projects) => {
@@ -19804,6 +19856,8 @@ registerTrustedIpcHandler('projects:delete-all', () => {
   figmaManualScanInFlight.clear();
   figmaPackageTransferBlocks.clear();
   figmaScopeRevisions.clear();
+  pendingFigmaScopeUpdates.clear();
+  figmaPollingRestartAfterScopeUpdate.clear();
   figmaScanTimestamps.clear();
   figmaRateLimitBackoffs.clear();
   // Clean up PS/InDesign pollers (v2.3.0)
