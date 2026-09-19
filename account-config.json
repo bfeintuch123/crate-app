@@ -1,6 +1,6 @@
 {
-  "providerUrl": "",
-  "webOrigin": "",
-  "clientId": "",
-  "publicKey": ""
+  "providerUrl": "https://khltfhqznktxogoxqpig.supabase.co",
+  "webOrigin": "https://accounts.get-crate.com",
+  "clientId": "3a12e701-b2ce-47f2-84dd-34f86568148f",
+  "publicKey": "sb_publishable_sW1mKWJ0BcnTa1JUiEHazw_0ZiNuIW1"
 }

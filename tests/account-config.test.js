@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -57,6 +58,18 @@ test('Finder-launched configuration comes only from the bundled public JSON when
   }
 });
 
+test('checked-in account configuration is bound to the approved public beta surface', () => {
+  const config = loadAccountConfig({}, path.join(__dirname, '..', 'account-config.json'));
+  assert.equal(config.provider, 'https://khltfhqznktxogoxqpig.supabase.co');
+  assert.equal(config.origin, 'https://accounts.get-crate.com');
+  assert.equal(config.clientId, '3a12e701-b2ce-47f2-84dd-34f86568148f');
+  assert.match(config.publicKey, /^sb_publishable_[A-Za-z0-9_-]{16,}$/);
+  assert.equal(
+    crypto.createHash('sha256').update(config.publicKey).digest('hex'),
+    'e41eca895468d48cde74585ef50f2557db26b7d256e7066cd27c9e47cdb51bac'
+  );
+});
+
 test('bundled configuration rejects unknown fields that could carry non-public material', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-account-config-'));
   const configPath = path.join(root, 'account-config.json');
@@ -69,6 +82,9 @@ test('bundled configuration rejects unknown fields that could carry non-public m
 });
 
 test('insecure, credential-bearing, arbitrary, and partial configuration fails closed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-account-config-'));
+  const blankConfigPath = path.join(root, 'blank-account-config.json');
+  fs.writeFileSync(blankConfigPath, JSON.stringify({ providerUrl: '', webOrigin: '', clientId: '', publicKey: '' }));
   for (const override of [
     { CRATE_ACCOUNT_PROVIDER_URL: 'http://project.supabase.co' },
     { CRATE_ACCOUNT_WEB_ORIGIN: 'https://user:pass@accounts.example.test' },
@@ -79,8 +95,12 @@ test('insecure, credential-bearing, arbitrary, and partial configuration fails c
   ]) {
     assert.equal(loadAccountConfig({ ...valid, ...override }), null);
   }
-  assert.equal(loadAccountConfig({}, path.join(__dirname, 'missing-account-config.json')), null);
-  assert.equal(loadAccountConfig({}, path.join(__dirname, '..', 'account-config.json')), null);
+  try {
+    assert.equal(loadAccountConfig({}, path.join(__dirname, 'missing-account-config.json')), null);
+    assert.equal(loadAccountConfig({}, blankConfigPath), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('general release refuses normalized loopback and unspecified endpoints in both origins', () => {
