@@ -36,8 +36,8 @@ Forbidden:
 ## State
 
 - current phase: corrective review loop before final PR-head validation
-- last completed checkpoint: corrective source/test commit `7ee2e71` is complete after both initial-head reviews; full relevant local suites pass
-- next action: commit and push the sanitized proof-state update with the corrective source commit, then bind PR #264's final head for protected CI and two fresh independent read-only reviews; keep the PR draft
+- last completed checkpoint: corrective source/test commits `7ee2e71` and `7881740` address findings from both exact-head review cycles; Figma link-per-project passes 93/93
+- next action: commit and push the sanitized proof-state update with corrective source commits `7ee2e71` and `7881740`, then bind PR #264's final head for protected CI and two fresh independent read-only reviews; keep the PR draft
 - blocker: none
 - approval state: Bryant authorized the two focused corrections, repository-required checks, exact-head corrections, commit, push, and draft PR; later release and merge gates remain unauthorized
 - preferences applied: one repository writer; reviewers read-only; no private link or token in fixtures
@@ -69,7 +69,9 @@ Forbidden:
 | 2026-09-19 | Draft PR | PR #264 targets `v2.4.x`; source commit `b9317ae` | Draft; source security and regression workflow was running before final proof-state commit |
 | 2026-09-19 | Initial exact-head review loop | PR head `22294d39e3d61dbe5ad164b9e81c4997ebf83cda`; protected source workflow passed; two distinct Luna/high reviewers requested changes | Corrected a scope-change race, incomplete pre-package ingestion block handling, and package-path baseline coverage; new head still required |
 | 2026-09-19 | Corrective local validation | `figma-link-per-project` 91 cases; Figma scope/privacy/renderer 292 cases; provenance helpers 7 cases; provenance dual-write 578 cases; syntax and whitespace checks | PASS; exact-head protected CI and fresh reviews remain pending after push |
-| 2026-09-19 | Corrective source commit | `7ee2e71` | Local commit; proof-state update remains to be committed before pushing the new draft PR head |
+| 2026-09-19 | Second exact-head review loop | PR head `af8982825be2ae126b1213198fdb1e0e13cd57b0`; two fresh Luna/high reviewers found a delayed preflight request-order race; its in-flight CI was canceled after correction | Added request-order fencing and replace/remove plus replace/replace regressions |
+| 2026-09-19 | Corrective local validation | `figma-link-per-project` 93/93; syntax and whitespace checks | PASS; full exact-head protected CI and two fresh reviews remain pending after push |
+| 2026-09-19 | Corrective source commits | `7ee2e71`, `7881740` | Local commits; proof-state update remains to be committed before pushing the new draft PR head |
 
 ## Proof Notes
 
@@ -90,5 +92,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Commit and push the sanitized proof-state update with corrective source commit `7ee2e71`, then rerun exact-head protected CI and complete two fresh, distinct Luna/high read-only reviews against PR #264's final head. Keep the PR draft and apply no merge or ready transition.
+Commit and push the sanitized proof-state update with corrective source commits `7ee2e71` and `7881740`, then rerun exact-head protected CI and complete two fresh, distinct Luna/high read-only reviews against PR #264's final head. Keep the PR draft and apply no merge or ready transition.
 ```
