@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -63,6 +64,10 @@ test('checked-in account configuration is bound to the approved public beta surf
   assert.equal(config.origin, 'https://accounts.get-crate.com');
   assert.equal(config.clientId, '3a12e701-b2ce-47f2-84dd-34f86568148f');
   assert.match(config.publicKey, /^sb_publishable_[A-Za-z0-9_-]{16,}$/);
+  assert.equal(
+    crypto.createHash('sha256').update(config.publicKey).digest('hex'),
+    'e41eca895468d48cde74585ef50f2557db26b7d256e7066cd27c9e47cdb51bac'
+  );
 });
 
 test('bundled configuration rejects unknown fields that could carry non-public material', () => {
