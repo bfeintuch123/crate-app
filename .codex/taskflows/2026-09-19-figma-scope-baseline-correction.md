@@ -11,6 +11,7 @@
 - repo: bfeintuch123/crate-app
 - branch: codex/figma-scope-baseline-correction-20260919
 - base: e390d3bce48d83abf8955fc131a74038a27fa06a
+- draft PR: https://github.com/bfeintuch123/crate-app/pull/264
 - mode: focused source correction, targeted regression checks, protected exact-head CI, independent Luna/high review
 - status: active
 
@@ -34,9 +35,9 @@ Forbidden:
 
 ## State
 
-- current phase: focused validation and exact-head review preparation
-- last completed checkpoint: both corrections and synthetic regressions implemented; focused suites and the full 578-case provenance dual-write suite pass
-- next action: rebind the current canonical base and working-tree boundary, then commit the exact source head for protected CI and independent reviews
+- current phase: draft PR exact-head CI and review
+- last completed checkpoint: source commit `b9317ae` pushed as draft PR #264 after focused Figma and full provenance validation
+- next action: publish the sanitized daily proof entry, then bind the resulting final PR head for protected CI and two independent read-only reviews
 - blocker: none
 - approval state: Bryant authorized the two focused corrections, repository-required checks, exact-head corrections, commit, push, and draft PR; later release and merge gates remain unauthorized
 - preferences applied: one repository writer; reviewers read-only; no private link or token in fixtures
@@ -48,10 +49,11 @@ Forbidden:
 - [x] preflight and exact canonical base
 - [x] source and official Figma API contract review
 - [x] implementation and realistic synthetic tests
-- [ ] targeted checks and required protected CI
+- [x] targeted checks
+- [ ] protected exact-head CI
 - [ ] exact-head independent review/correction loop
 - [ ] proof section and ledger/workstream update
-- [ ] commit, push, and draft PR
+- [x] source commit, push, and draft PR
 - [ ] handoff at the authorized stop gate
 
 ## Evidence
@@ -64,6 +66,7 @@ Forbidden:
 | 2026-09-19 | Focused Figma regressions | `figma-scope` 32 cases, `figma-link-per-project`, `figma-token-privacy` 9 cases, and `renderer-figma-scope` 251 cases | PASS |
 | 2026-09-19 | Provenance checks | `provenance.test.js` 7 cases and `provenance-dual-write.test.js` 578 cases | PASS |
 | 2026-09-19 | Syntax and hygiene | Pinned Node 22 syntax checks for changed JavaScript; `git diff --check`; private-link/token fixture search | PASS; search found no private URL or credential pattern |
+| 2026-09-19 | Draft PR | PR #264 targets `v2.4.x`; source commit `b9317ae` | Draft; source security and regression workflow was running before final proof-state commit |
 
 ## Proof Notes
 
@@ -84,5 +87,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Implement the two authorized corrections in the isolated checkout, run focused synthetic regressions, complete fresh exact-head reviews and protected CI, then stop with a draft PR before ready or merge.
+Update the sanitized daily proof entry, then rerun exact-head protected CI and complete two distinct Luna/high read-only reviews against PR #264's final head. Apply no merge or ready transition.
 ```
