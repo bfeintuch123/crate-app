@@ -1246,7 +1246,7 @@ class FigmaParser extends BaseParser {
       const requestedNodeId = FigmaParser.normalizeNodeId(scopeEntry && scopeEntry.requestedNodeId);
       const requestedScopeId = requestedPageId || requestedNodeId;
       const scopeQuery = requestedScopeId
-        ? `?ids=${encodeURIComponent(requestedScopeId)}&depth=1`
+        ? `?ids=${encodeURIComponent(requestedScopeId)}`
         : '?depth=1';
       const fileData = await this._fetchAPI(
         `/files/${fileKey}${scopeQuery}`,

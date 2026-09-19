@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
+const { Readable } = require('stream');
 const { spawn: realSpawn, spawnSync: realSpawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { promisify: nodePromisify } = require('util');
@@ -1127,6 +1128,9 @@ module.exports.__crateMetadataTestHooks = {
   getActiveWatchingActivationToken(projectId) {
     return getActiveWatchingActivationToken(projectId);
   },
+  runFigmaPoll(projectId, activationToken) {
+    return pollFigmaForProjectCore(projectId, true, activationToken, null);
+  },
   pollLsofForProject(projectId, activationToken) {
     return pollLsofForProject(projectId, activationToken);
   },
@@ -1281,6 +1285,101 @@ async function createVerifiedFigmaProject(name, scopeMode, url) {
   }
 }
 
+async function createSyntheticFigmaScanProject(name, scopeMode = 'current-page') {
+  const created = await createProject(name);
+  const project = storeInstance.data.projects.find(item => item.id === created.id);
+  assert.ok(project, 'expected synthetic Figma project to exist');
+  const fileKey = `synthetic-file-${project.id}`;
+  project.figmaScopeMode = scopeMode;
+  project.figmaTrackedFiles = [{
+    key: fileKey,
+    requestedPageId: scopeMode === 'current-page' ? '1:1' : null,
+    requestedNodeId: null,
+  }];
+  project.figmaSession = null;
+  roundTripFakeStore();
+  const activationToken = metadataTestHooks.getActiveWatchingActivationToken(project.id);
+  assert.ok(activationToken, 'expected active synthetic project watch session');
+  return { projectId: project.id, fileKey, activationToken };
+}
+
+function makeSyntheticFigmaAsset(fileKey, identity) {
+  return {
+    url: `https://assets.invalid/${identity}.png`,
+    fileKey,
+    figmaFileKey: fileKey,
+    figmaFileName: 'Synthetic Design',
+    figmaPageId: '1:1',
+    figmaPageName: 'Synthetic Page',
+    figmaScopeMode: 'current-page',
+    imageRef: `synthetic-image-${identity}`,
+    nodeId: `synthetic-node-${identity}`,
+    name: `Asset ${identity}`,
+    format: 'png',
+  };
+}
+
+function makeSyntheticFigmaScan(fileKey, assets, scopeMode = 'current-page') {
+  return {
+    files: [{ key: fileKey, name: 'Synthetic Design', isTracked: true, lastModifiedMs: Date.now() }],
+    assets,
+    errors: [],
+    warnings: [],
+    rateLimited: false,
+    scopeEntries: [{
+      fileKey,
+      primaryKey: fileKey,
+      scopeMode,
+      fileFetchStatus: 'success',
+      assetFetchStatus: 'success',
+      lockStatus: scopeMode === 'entire-file' ? 'entire-file' : 'locked',
+      lockedPageId: scopeMode === 'current-page' ? '1:1' : null,
+      lockedPageName: scopeMode === 'current-page' ? 'Synthetic Page' : null,
+      statusReason: null,
+      warning: null,
+    }],
+    candidateDiagnostics: null,
+  };
+}
+
+async function withSyntheticFigmaScans(scans, fetchHandler, work) {
+  const previousFigmaStub = STUBS.get('./parsers/figma');
+  const previousFetchHandler = testFetchHandler;
+  const { FigmaParser } = require('../parsers/figma');
+  let scanIndex = 0;
+  class SyntheticFigmaParser extends FigmaParser {
+    async getStoredToken() {
+      return 'synthetic-figma-token';
+    }
+
+    async autoTrackScan() {
+      const scan = scans[scanIndex++];
+      if (typeof scan === 'function') return scan();
+      if (!scan) throw new Error('Synthetic Figma scan fixture exhausted.');
+      return scan;
+    }
+  }
+  setStub('./parsers/figma', () => ({ FigmaParser: SyntheticFigmaParser }));
+  testFetchHandler = fetchHandler;
+  try {
+    return await work();
+  } finally {
+    if (previousFigmaStub) STUBS.set('./parsers/figma', previousFigmaStub);
+    else STUBS.delete('./parsers/figma');
+    testFetchHandler = previousFetchHandler;
+  }
+}
+
+function syntheticFigmaAssetResponse(ok = true) {
+  const bytes = Buffer.from('synthetic Figma image bytes');
+  return {
+    ok,
+    status: ok ? 200 : 503,
+    headers: { get: name => (name === 'content-length' ? String(bytes.length) : null) },
+    body: Readable.from([bytes]),
+  };
+}
+
 async function getProject(projectId) {
   const projects = await callIpc('projects:get-all');
   return projects.find(project => project.id === projectId);
@@ -1297,6 +1396,155 @@ async function waitForProject(projectId, predicate, timeoutMs = 3000) {
     project = await getProject(projectId);
   }
   return project;
+}
+
+async function runFigmaFirstSnapshotBaselineRegression() {
+  const syntheticProject = await createSyntheticFigmaScanProject('Synthetic Figma baseline retry');
+  const assetA = makeSyntheticFigmaAsset(syntheticProject.fileKey, 'baseline-a');
+  const assetB = makeSyntheticFigmaAsset(syntheticProject.fileKey, 'baseline-b-retry');
+  const assetC = makeSyntheticFigmaAsset(syntheticProject.fileKey, 'later-c');
+  const scans = [
+    makeSyntheticFigmaScan(syntheticProject.fileKey, [assetA, assetB]),
+    makeSyntheticFigmaScan(syntheticProject.fileKey, [assetA, assetB]),
+    makeSyntheticFigmaScan(syntheticProject.fileKey, [assetA, assetB, assetC], 'entire-file'),
+  ];
+  let failFirstRetryAssetDownload = true;
+
+  await withSyntheticFigmaScans(scans, async url => {
+    if (url.endsWith('/baseline-b-retry.png') && failFirstRetryAssetDownload) {
+      failFirstRetryAssetDownload = false;
+      return syntheticFigmaAssetResponse(false);
+    }
+    return syntheticFigmaAssetResponse(true);
+  }, async () => {
+    const stored = storeInstance.data.projects.find(item => item.id === syntheticProject.projectId);
+    stored.excludedAssetKeys = ['synthetic-excluded-asset-key'];
+    roundTripFakeStore();
+
+    const firstPoll = await metadataTestHooks.runFigmaPoll(syntheticProject.projectId, syntheticProject.activationToken);
+    assert.equal(firstPoll.skipped, undefined, `expected first synthetic scan to run: ${JSON.stringify(firstPoll)}`);
+    let current = storeInstance.data.projects.find(item => item.id === syntheticProject.projectId);
+    let imported = current.files.filter(file => file.source === 'figma-auto');
+    assert.equal(Number.isSafeInteger(current.figmaAssetBaselinePendingAt), true);
+    assert.equal(current.figmaAssetBaselineEstablishedAt, undefined);
+    assert.equal(imported.length, 1);
+    assert.equal(imported[0].figmaAssetIdentity, assetA.imageRef);
+    assert.equal(imported[0].assetOrigin, 'existing');
+    assert.deepEqual(current.excludedAssetKeys, ['synthetic-excluded-asset-key']);
+
+    const pendingAt = current.figmaAssetBaselinePendingAt;
+    roundTripFakeStore();
+    await metadataTestHooks.runFigmaPoll(syntheticProject.projectId, syntheticProject.activationToken);
+    current = storeInstance.data.projects.find(item => item.id === syntheticProject.projectId);
+    imported = current.files.filter(file => file.source === 'figma-auto');
+    assert.equal(Number.isSafeInteger(current.figmaAssetBaselineEstablishedAt), true);
+    assert.ok(current.figmaAssetBaselineEstablishedAt >= pendingAt);
+    assert.equal(current.figmaAssetBaselinePendingAt, undefined);
+    assert.equal(imported.length, 2, 'retry should add only the asset whose first download failed');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetA.imageRef).assetOrigin, 'existing');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetB.imageRef).assetOrigin, 'existing');
+
+    const establishedAt = current.figmaAssetBaselineEstablishedAt;
+    current.figmaScopeMode = 'entire-file';
+    current.figmaSession = null;
+    roundTripFakeStore();
+    await metadataTestHooks.runFigmaPoll(syntheticProject.projectId, syntheticProject.activationToken);
+    current = storeInstance.data.projects.find(item => item.id === syntheticProject.projectId);
+    imported = current.files.filter(file => file.source === 'figma-auto');
+    assert.equal(imported.length, 3);
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetA.imageRef).assetOrigin, 'existing');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetB.imageRef).assetOrigin, 'existing');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetC.imageRef).assetOrigin, 'added');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetA.imageRef).figmaScopeMode, 'current-page');
+    assert.equal(imported.find(file => file.figmaAssetIdentity === assetC.imageRef).figmaScopeMode, 'entire-file');
+    assert.equal(current.figmaAssetBaselineEstablishedAt, establishedAt);
+    assert.equal(current.figmaAssetBaselinePendingAt, undefined);
+    assert.deepEqual(current.excludedAssetKeys, ['synthetic-excluded-asset-key']);
+
+    roundTripFakeStore();
+    const persisted = await getProject(syntheticProject.projectId);
+    assert.equal(persisted.figmaAssetBaselineEstablishedAt, establishedAt);
+    assert.deepEqual(persisted.excludedAssetKeys, ['synthetic-excluded-asset-key']);
+    assert.deepEqual(
+      persisted.files.filter(file => file.source === 'figma-auto').map(file => file.assetOrigin).sort(),
+      ['added', 'existing', 'existing']
+    );
+  });
+}
+
+async function runSuccessfulEmptyFigmaBaselineRegression() {
+  const emptyBaselineProject = await createSyntheticFigmaScanProject('Synthetic empty Figma baseline');
+  const firstAsset = makeSyntheticFigmaAsset(emptyBaselineProject.fileKey, 'after-empty-baseline');
+  await withSyntheticFigmaScans([
+    makeSyntheticFigmaScan(emptyBaselineProject.fileKey, []),
+    makeSyntheticFigmaScan(emptyBaselineProject.fileKey, [firstAsset]),
+  ], async () => syntheticFigmaAssetResponse(true), async () => {
+    await metadataTestHooks.runFigmaPoll(emptyBaselineProject.projectId, emptyBaselineProject.activationToken);
+    let emptyStored = storeInstance.data.projects.find(item => item.id === emptyBaselineProject.projectId);
+    const emptyBaselineAt = emptyStored.figmaAssetBaselineEstablishedAt;
+    assert.equal(Number.isSafeInteger(emptyBaselineAt), true);
+    assert.equal(emptyStored.files.some(file => file.source === 'figma-auto'), false);
+
+    await metadataTestHooks.runFigmaPoll(emptyBaselineProject.projectId, emptyBaselineProject.activationToken);
+    emptyStored = storeInstance.data.projects.find(item => item.id === emptyBaselineProject.projectId);
+    assert.equal(
+      emptyStored.files.find(file => file.figmaAssetIdentity === firstAsset.imageRef).assetOrigin,
+      'added'
+    );
+  });
+
+  const independentProject = await createSyntheticFigmaScanProject('Synthetic independent Figma baseline');
+  const independentAsset = makeSyntheticFigmaAsset(independentProject.fileKey, 'independent-initial-asset');
+  assert.equal(
+    storeInstance.data.projects.find(item => item.id === independentProject.projectId).figmaAssetBaselineEstablishedAt,
+    undefined,
+    'establishing one project baseline must not affect another project'
+  );
+  await withSyntheticFigmaScans([
+    makeSyntheticFigmaScan(independentProject.fileKey, [independentAsset]),
+  ], async () => syntheticFigmaAssetResponse(true), async () => {
+    await metadataTestHooks.runFigmaPoll(independentProject.projectId, independentProject.activationToken);
+    const independentStored = storeInstance.data.projects.find(item => item.id === independentProject.projectId);
+    assert.equal(
+      independentStored.files.find(file => file.figmaAssetIdentity === independentAsset.imageRef).assetOrigin,
+      'existing'
+    );
+  });
+
+  const legacyProject = await createSyntheticFigmaScanProject('Synthetic legacy Figma baseline');
+  const legacyExistingAsset = makeSyntheticFigmaAsset(legacyProject.fileKey, 'legacy-existing');
+  const legacyAddedAsset = makeSyntheticFigmaAsset(legacyProject.fileKey, 'legacy-new');
+  const legacyStored = storeInstance.data.projects.find(item => item.id === legacyProject.projectId);
+  const legacyPath = path.join(TEST_HOME, 'Documents', 'synthetic-legacy-figma.png');
+  legacyStored.files.push({
+    path: legacyPath,
+    name: path.basename(legacyPath),
+    ext: '.png',
+    addedAt: Date.now() - 1000,
+    source: 'figma-auto',
+    figmaFileKey: legacyProject.fileKey,
+    figmaAssetIdentity: legacyExistingAsset.imageRef,
+    figmaAssetKey: legacyExistingAsset.imageRef,
+    figmaAssetDedupKey: metadataTestHooks.getFigmaAssetDedupKey(legacyExistingAsset),
+    assetOrigin: 'existing',
+  });
+  roundTripFakeStore();
+  await withSyntheticFigmaScans([
+    makeSyntheticFigmaScan(legacyProject.fileKey, [legacyExistingAsset, legacyAddedAsset]),
+  ], async () => syntheticFigmaAssetResponse(true), async () => {
+    await metadataTestHooks.runFigmaPoll(legacyProject.projectId, legacyProject.activationToken);
+    const legacyAfterScan = storeInstance.data.projects.find(item => item.id === legacyProject.projectId);
+    assert.equal(legacyAfterScan.figmaAssetBaselinePendingAt, undefined);
+    assert.equal(Number.isSafeInteger(legacyAfterScan.figmaAssetBaselineEstablishedAt), true);
+    assert.equal(
+      legacyAfterScan.files.find(file => file.figmaAssetIdentity === legacyExistingAsset.imageRef).assetOrigin,
+      'existing'
+    );
+    assert.equal(
+      legacyAfterScan.files.find(file => file.figmaAssetIdentity === legacyAddedAsset.imageRef).assetOrigin,
+      'added'
+    );
+  });
 }
 
 async function waitForCondition(predicate, message, timeoutMs = 3000) {
@@ -23555,7 +23803,7 @@ test('PSD reuse watcher stage replaced at write completion preserves foreign ino
 
 
 for (const watcher of [false, true]) for (const changedSource of [false, true]) for (const replacement of ['output', 'directory']) {
-  test(`PSD reuse original promotion ownership watcher ${watcher} changed source ${changedSource} replacement ${replacement}`, async () => {
+test(`PSD reuse original promotion ownership watcher ${watcher} changed source ${changedSource} replacement ${replacement}`, async () => {
     const f = await makePsdReuseFixture();
     let restore = () => {};
     try {
@@ -23590,3 +23838,6 @@ for (const watcher of [false, true]) for (const changedSource of [false, true]) 
     } finally { restore(); f.cleanup(); }
   });
 }
+
+test('Figma first snapshot stays Existing across a failed download, retry, scope replacement, and deduplication', runFigmaFirstSnapshotBaselineRegression);
+test('successful empty Figma baseline is project-scoped, while legacy Existing rows keep their origin', runSuccessfulEmptyFigmaBaselineRegression);

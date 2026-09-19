@@ -1491,6 +1491,372 @@ test('a delayed Figma download from an old A activation cannot mutate or cache a
   );
 });
 
+test('a Figma scan for a replaced link cannot ingest old assets or establish the new link baseline', async () => {
+  const project = await createLinkedFigmaProject('Replace Figma Link During Scan');
+  const staleAsset = {
+    url: 'https://cdn.figma.example/stale-link.png',
+    nodeId: 'node-stale-link',
+    imageRef: 'img-stale-link',
+    name: 'Stale Link Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  };
+  const scopeEntry = (fileKey, pageId) => ({
+    fileKey,
+    primaryKey: fileKey,
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: pageId,
+    lockedPageName: `Page ${pageId}`,
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  });
+  nextFigmaScanResult = figmaScanResult([staleAsset], [scopeEntry('FIG22', '1:1')]);
+  figmaScanDelayMs = 80;
+  const invocationsBefore = figmaScanInvocationCount;
+  const staleScan = callIpc('figma:scan-project', project.id);
+  await waitForCondition(
+    () => figmaScanInvocationCount > invocationsBefore,
+    'the old-link Figma scan should start'
+  );
+
+  storedFigmaToken = null;
+  const replacement = await callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG33/Second-Cloud?page-id=2%3A2',
+    scopeMode: 'current-page',
+  });
+  assert.equal(replacement.success, true);
+  await staleScan;
+
+  let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG33');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === staleAsset.imageRef), false);
+  assert.equal(fresh.figmaAssetBaselineEstablishedAt, undefined);
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
+
+  figmaScanDelayMs = 0;
+  storedFigmaToken = 'test-token';
+  const replacementAsset = { ...staleAsset, nodeId: 'node-new-link', imageRef: 'img-new-link', figmaFileKey: 'FIG33', figmaPageId: '2:2' };
+  nextFigmaScanResult = figmaScanResult([replacementAsset], [scopeEntry('FIG33', '2:2')]);
+  setFigmaDownloadResponse('replacement first asset');
+  const replacementScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(replacementScan.success, true);
+
+  fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.find(file => file.figmaAssetIdentity === replacementAsset.imageRef).assetOrigin, 'existing');
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselineEstablishedAt), true);
+  assert.equal(fresh.figmaAssetBaselinePendingAt, undefined);
+});
+
+test('a Figma scan for a removed link cannot ingest the old assets or establish a baseline', async () => {
+  const project = await createLinkedFigmaProject('Remove Figma Link During Scan');
+  const staleAsset = {
+    url: 'https://cdn.figma.example/removed-link.png',
+    nodeId: 'node-removed-link',
+    imageRef: 'img-removed-link',
+    name: 'Removed Link Asset',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  };
+  nextFigmaScanResult = figmaScanResult([staleAsset], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  figmaScanDelayMs = 80;
+  const invocationsBefore = figmaScanInvocationCount;
+  const staleScan = callIpc('figma:scan-project', project.id);
+  await waitForCondition(
+    () => figmaScanInvocationCount > invocationsBefore,
+    'the removed-link Figma scan should start'
+  );
+
+  storedFigmaToken = null;
+  const removed = await callIpc('projects:set-figma-link', project.id, { action: 'remove' });
+  assert.equal(removed.success, true);
+  await staleScan;
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(fresh.figmaTrackedFiles, []);
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === staleAsset.imageRef), false);
+  assert.equal(fresh.figmaAssetBaselineEstablishedAt, undefined);
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
+});
+
+test('a scan that completes during replacement preflight is fenced from the old link', async () => {
+  const project = await createLinkedFigmaProject('Figma Scan During Link Preflight');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/preflight-window-old-link.png',
+    nodeId: 'node-preflight-window-old',
+    imageRef: 'img-preflight-window-old',
+    name: 'Preflight Window Old Link',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  figmaScanDelayMs = 80;
+  const scanInvocationsBefore = figmaScanInvocationCount;
+  const oldLinkScan = callIpc('figma:scan-project', project.id);
+  await waitForCondition(
+    () => figmaScanInvocationCount > scanInvocationsBefore,
+    'the old-link scan should be in flight before replacement preflight'
+  );
+
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => new Promise(resolve => {
+    releasePreflight = resolve;
+  });
+  const replacementPromise = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG33/Second-Cloud?page-id=2%3A2',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the replacement preflight should start'
+  );
+  await oldLinkScan;
+  figmaScanDelayMs = 0;
+  assert.equal(figmaScanInvocationCount, scanInvocationsBefore + 1);
+  let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG22');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === 'img-preflight-window-old'), false);
+  assert.equal(fresh.figmaAssetBaselineEstablishedAt, undefined);
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
+
+  const newLinkAsset = {
+    url: 'https://cdn.figma.example/new-link-first-asset.png',
+    nodeId: 'node-new-link-first',
+    imageRef: 'img-new-link-first',
+    name: 'New Link First Asset',
+    format: 'png',
+    figmaFileKey: 'FIG33',
+    figmaFileName: 'Second Cloud',
+    figmaPageId: '2:2',
+    figmaPageName: 'Second Page',
+  };
+  nextFigmaScanResult = figmaScanResult([newLinkAsset], [{
+    fileKey: 'FIG33',
+    primaryKey: 'FIG33',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  setFigmaDownloadResponse('new link first asset');
+  releasePreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+  } });
+  const replacement = await replacementPromise;
+  assert.equal(replacement.success, true);
+
+  fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG33');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === 'img-preflight-window-old'), false);
+  const scanned = await waitForProject(
+    project.id,
+    item => item.files.some(file => file.figmaAssetIdentity === newLinkAsset.imageRef),
+    'the post-commit scan should use the replacement link'
+  );
+  fresh = scanned;
+  assert.equal(fresh.files.find(file => file.figmaAssetIdentity === newLinkAsset.imageRef).assetOrigin, 'existing');
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselineEstablishedAt), true);
+});
+
+test('a scan skipped during failed link preflight can retry the existing link', async () => {
+  const project = await createLinkedFigmaProject('Figma Retry After Failed Link Preflight');
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => new Promise(resolve => {
+    releasePreflight = resolve;
+  });
+  const replacementPromise = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG33/Second-Cloud?page-id=2%3A2',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the replacement preflight should start'
+  );
+
+  const existingLinkAsset = {
+    url: 'https://cdn.figma.example/existing-link-retry.png',
+    nodeId: 'node-existing-link-retry',
+    imageRef: 'img-existing-link-retry',
+    name: 'Existing Link Retry',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  };
+  nextFigmaScanResult = figmaScanResult([existingLinkAsset], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  const scanInvocationsBefore = figmaScanInvocationCount;
+  const pendingScan = await callIpc('figma:scan-project', project.id);
+  assert.equal(pendingScan.success, true);
+  assert.equal(figmaScanInvocationCount, scanInvocationsBefore);
+
+  releasePreflight({ valid: false, reason: 'invalid-token' });
+  assert.deepEqual(await replacementPromise, {
+    success: false,
+    error: 'figma_invalid_token',
+  });
+  let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG22');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === existingLinkAsset.imageRef), false);
+
+  setFigmaDownloadResponse('existing link retry');
+  const retry = await callIpc('figma:scan-project', project.id);
+  assert.equal(retry.success, true);
+  assert.equal(figmaScanInvocationCount, scanInvocationsBefore + 1);
+  fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG22');
+  assert.equal(fresh.files.find(file => file.figmaAssetIdentity === existingLinkAsset.imageRef).assetOrigin, 'existing');
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselineEstablishedAt), true);
+});
+
+test('pre-package Figma recovery blocks during link preflight and retries after commit', async () => {
+  const project = await createLinkedFigmaProject('Pre-package Scan During Figma Link Preflight');
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => new Promise(resolve => {
+    releasePreflight = resolve;
+  });
+  const replacementPromise = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/FIG33/Second-Cloud?page-id=2%3A2',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the replacement preflight should start'
+  );
+
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/pre-package-pending-link.png',
+    nodeId: 'node-pre-package-pending-link',
+    imageRef: 'img-pre-package-pending-link',
+    name: 'Pre Package Pending Link',
+    format: 'png',
+    figmaFileKey: 'FIG22',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  const scanInvocationsBefore = figmaScanInvocationCount;
+  const blockedScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.match(blockedScan.error, /could not securely retrieve all Figma assets/i);
+  assert.equal(figmaScanInvocationCount, scanInvocationsBefore);
+  let fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG22');
+  assert.equal(fresh.files.some(file => file.figmaAssetIdentity === 'img-pre-package-pending-link'), false);
+
+  const replacementAsset = {
+    url: 'https://cdn.figma.example/pre-package-new-link-retry.png',
+    nodeId: 'node-pre-package-new-link-retry',
+    imageRef: 'img-pre-package-new-link-retry',
+    name: 'Pre Package New Link Retry',
+    format: 'png',
+    figmaFileKey: 'FIG33',
+    figmaFileName: 'Second Cloud',
+    figmaPageId: '2:2',
+    figmaPageName: 'Second Page',
+  };
+  nextFigmaScanResult = figmaScanResult([replacementAsset], [{
+    fileKey: 'FIG33',
+    primaryKey: 'FIG33',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+  setFigmaDownloadResponse('pre-package new link retry');
+  releasePreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '2:2',
+    lockedPageName: 'Second Page',
+  } });
+  const replacement = await replacementPromise;
+  assert.equal(replacement.success, true);
+
+  const replacementScan = await waitForProject(
+    project.id,
+    item => item.files.some(file => file.figmaAssetIdentity === replacementAsset.imageRef),
+    'the post-commit scan should use the replacement link before package recovery'
+  );
+  assert.equal(replacementScan.files.find(file => file.figmaAssetIdentity === replacementAsset.imageRef).assetOrigin, 'existing');
+  const retryScan = await callIpc('projects:pre-package-scan', project.id);
+  assert.equal(retryScan.error, undefined);
+  assert.equal(figmaScanInvocationCount, scanInvocationsBefore + 2);
+  fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'FIG33');
+  assert.equal(fresh.files.find(file => file.figmaAssetIdentity === replacementAsset.imageRef).assetOrigin, 'existing');
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselineEstablishedAt), true);
+});
+
 test('delete-all during an in-flight Figma download removes the late cache write', async () => {
   const project = await createLinkedFigmaProject('Delete all in-flight Figma cache');
   const downloadGate = setGatedFigmaDownloadResponse('late delete-all figma cache');
@@ -1981,6 +2347,88 @@ test('projects:set-figma-link rejects a failed preflight without replacing proje
   const after = (await callIpc('projects:get-all')).find(item => item.id === project.id);
   assert.deepEqual(after.figmaTrackedFiles, before.figmaTrackedFiles);
   assert.deepEqual(after.figmaSession, before.figmaSession);
+});
+
+test('a delayed Figma replacement preflight cannot restore a link after a later removal', async () => {
+  const project = await createLinkedFigmaProject('Figma Stale Replace After Remove');
+  storedFigmaToken = null;
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => {
+    const result = await new Promise(resolve => { releasePreflight = resolve; });
+    return result;
+  };
+
+  const staleReplacement = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/OLDLINK/Old-File?page-id=1%3A1',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the older link preflight should start'
+  );
+
+  const removed = await callIpc('projects:set-figma-link', project.id, { action: 'remove' });
+  assert.equal(removed.success, true);
+  releasePreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Old Page',
+  } });
+  assert.deepEqual(await staleReplacement, { success: false, error: 'figma_link_update_superseded' });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(fresh.figmaTrackedFiles, []);
+  assert.equal(fresh.figmaSession.trackedFiles.length, 0);
+});
+
+test('a delayed Figma replacement preflight cannot overwrite a later replacement', async () => {
+  const project = await createLinkedFigmaProject('Figma Stale Replace After Replace');
+  storedFigmaToken = null;
+  let validationCalls = 0;
+  let releaseFirstPreflight;
+  let firstPreflightResolve;
+  const firstPreflightStarted = new Promise(resolve => { firstPreflightResolve = resolve; });
+  nextFigmaLinkValidation = async (fileKey, scopeEntry) => {
+    validationCalls += 1;
+    if (validationCalls === 1) {
+      firstPreflightResolve();
+      return await new Promise(resolve => { releaseFirstPreflight = resolve; });
+    }
+    return { valid: true, scope: {
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: scopeEntry.requestedPageId,
+      lockedPageName: 'New Page',
+    } };
+  };
+
+  const staleReplacement = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/OLDLINK/Old-File?page-id=1%3A1',
+    scopeMode: 'current-page',
+  });
+  await firstPreflightStarted;
+  const latestReplacement = await callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/NEWLINK/New-File?page-id=3%3A3',
+    scopeMode: 'current-page',
+  });
+  assert.equal(latestReplacement.success, true);
+  releaseFirstPreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Old Page',
+  } });
+  assert.deepEqual(await staleReplacement, { success: false, error: 'figma_link_update_superseded' });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'NEWLINK');
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '3:3');
+  assert.equal(fresh.figmaSession.trackedFiles[0].key, 'NEWLINK');
 });
 
 test('projects:set-figma-link removes the link only through an explicit action', async () => {
@@ -3100,6 +3548,8 @@ test('package-time Current Page scope blocks when the Figma file fetch succeeds 
     assert.match(scan.error, /could not securely retrieve all Figma assets/i);
     const categorized = (await callIpc('projects:get-all')).find(item => item.id === project.id);
     assert.equal(categorized.figmaSession.trackedFiles[0].failureCategory, 'scope');
+    assert.equal(Number.isSafeInteger(categorized.figmaAssetBaselinePendingAt), true);
+    assert.equal(categorized.figmaAssetBaselineEstablishedAt, undefined);
 
     const outputDir = path.join(tmpRoot, 'out');
     const packaged = await callIpc('projects:package', project.id, outputDir);
@@ -3471,6 +3921,9 @@ test('pre-package Figma download failure blocks output until a clean retry succe
 
     const scan = await callIpc('projects:pre-package-scan', project.id);
     assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+    const failedProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(Number.isSafeInteger(failedProject.figmaAssetBaselinePendingAt), true);
+    assert.equal(failedProject.figmaAssetBaselineEstablishedAt, undefined);
 
     const outputDir = path.join(tmpRoot, 'blocked-output');
     const blocked = await callIpc('projects:package', project.id, outputDir);
@@ -3524,6 +3977,12 @@ test('pre-package Figma download failure blocks output until a clean retry succe
     const recoveredProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
     assert.equal(recoveredProject.figmaSession.rateLimitRetryAt, undefined);
     assert.equal(recoveredProject.figmaSession.warnings.some(warning => /rate limiting/i.test(warning)), false);
+    assert.equal(Number.isSafeInteger(recoveredProject.figmaAssetBaselineEstablishedAt), true);
+    assert.equal(recoveredProject.figmaAssetBaselinePendingAt, undefined);
+    assert.equal(
+      recoveredProject.files.find(file => file.figmaAssetIdentity === asset.imageRef).assetOrigin,
+      'existing'
+    );
 
     const packaged = await callIpc('projects:package', project.id, outputDir);
     assert.equal(packaged.success, true);
@@ -3532,6 +3991,15 @@ test('pre-package Figma download failure blocks output until a clean retry succe
       fs.readFileSync(path.join(packageFolder(outputDir, 'Figma Download Block'), 'PNG', 'Brand_Cloud_Oversized.png'), 'utf8'),
       'recovered asset'
     );
+
+    const laterAsset = { ...asset, nodeId: 'node-later', imageRef: 'img-later', name: 'Later Asset' };
+    nextFigmaScanResult = figmaScanResult([asset, laterAsset], successfulScopeEntries);
+    setFigmaDownloadResponse('later asset');
+    const laterScan = await callIpc('projects:pre-package-scan', project.id);
+    assert.equal(laterScan.error, undefined);
+    const afterLaterScan = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(afterLaterScan.files.find(file => file.figmaAssetIdentity === asset.imageRef).assetOrigin, 'existing');
+    assert.equal(afterLaterScan.files.find(file => file.figmaAssetIdentity === laterAsset.imageRef).assetOrigin, 'added');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -3595,6 +4063,9 @@ test('pre-package recovery requires one successful candidate for every tracked F
   nextFigmaScanResult = figmaScanResult([], [successfulScope('FIG22', '1:1')]);
   const incompleteScan = await callIpc('projects:pre-package-scan', project.id);
   assert.match(incompleteScan.error, /could not securely retrieve all Figma assets/i);
+  const incompleteProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(Number.isSafeInteger(incompleteProject.figmaAssetBaselinePendingAt), true);
+  assert.equal(incompleteProject.figmaAssetBaselineEstablishedAt, undefined);
 
   nextFigmaScanResult = figmaScanResult([], [
     successfulScope('FIG22', '1:1'),
@@ -3602,6 +4073,45 @@ test('pre-package recovery requires one successful candidate for every tracked F
   ]);
   const completeScan = await callIpc('projects:pre-package-scan', project.id);
   assert.equal(completeScan.error, undefined);
+  const completeProject = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(Number.isSafeInteger(completeProject.figmaAssetBaselineEstablishedAt), true);
+  assert.equal(completeProject.figmaAssetBaselinePendingAt, undefined);
+});
+
+test('pre-package scan keeps the Figma transfer block when asset ingestion is incomplete', async () => {
+  const project = await createLinkedFigmaProject('Figma Incomplete Package Ingestion');
+  nextFigmaScanResult = figmaScanResult([{
+    url: 'https://cdn.figma.example/asset-without-file-key.png',
+    name: 'Missing File Key',
+    format: 'png',
+    figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1',
+    figmaPageName: 'Page One',
+  }], [{
+    fileKey: 'FIG22',
+    primaryKey: 'FIG22',
+    fileName: 'Brand Cloud',
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Page One',
+    warning: null,
+    fileFetchStatus: 'success',
+    fileFetchFailureReason: null,
+    assetFetchStatus: 'success',
+  }]);
+
+  const scan = await callIpc('projects:pre-package-scan', project.id);
+  assert.match(scan.error, /could not securely retrieve all Figma assets/i);
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-figma-incomplete-ingestion-'));
+  fs.rmSync(outputDir, { recursive: true, force: true });
+  const packaged = await callIpc('projects:package', project.id, outputDir);
+  assert.match(packaged.error, /could not securely retrieve all Figma assets/i);
+  assert.equal(fs.existsSync(outputDir), false);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.length, 0);
+  assert.equal(Number.isSafeInteger(fresh.figmaAssetBaselinePendingAt), true);
+  assert.equal(fresh.figmaAssetBaselineEstablishedAt, undefined);
 });
 
 test('Figma asset cache directories and downloaded files are owner-only where supported', async () => {
