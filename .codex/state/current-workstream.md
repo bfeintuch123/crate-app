@@ -1,14 +1,14 @@
 # Crate Current Workstream
 
-Last updated: 2026-07-17
+Last updated: 2026-09-19 (Figma closeout section; older workstream history retained)
 
 ## Active Figma PR Correction (2026-09-19)
 
 - PR #264 remains a draft against `v2.4.x`, branch `codex/figma-scope-baseline-correction-20260919`, in native task `01a0ba98-fede-7c91-85ab-caf5da7d880a` on the local host.
-- The previously pushed head `4db79b1e646e63c0e62ade268a71d42db9d85d03` has a passing protected source workflow, but that evidence is stale once the authorized additional correction is committed.
-- Working-tree correction fences watcher scans and pre-package Figma recovery through the complete pending link preflight, then resumes the initial scan after overlapping updates settle. Current-code `figma-link-per-project` passes 96/96 and combined `provenance.test.js` plus `provenance-dual-write.test.js` passes 585/585.
-- Bryant authorized one additional writer correction cycle, commit and push, exact-head CI, two fresh distinct `gpt-6-astra` / high read-only reviews, and a factual PR-description update. Keep the PR draft. If another actionable finding appears in that cycle, stop and escalate; do not enter another writer cycle. No merge, ready transition, build, installed-app QA, release, or deployment is authorized.
-- Next action: finish current-code affected checks and durable proof updates, commit and push the correction, bind the new PR head, and wait for protected CI plus both exact-head reviews.
+- Reviewed product head: `dc0304880a00c9204beadcb6d00a4887e1cd0088`, committed and pushed. Protected CI run `35468009454` passed on that head; two distinct reviews found no remaining runtime defects, with one low finding about stale committed status notes.
+- That product head fences scans and pre-package Figma recovery during link preflight and resumes watching scans after overlapping updates settle. Its local Figma-link tests passed 96/96; combined provenance helper/dual-write tests passed 585/585; syntax and whitespace checks passed.
+- Bryant separately authorized documentation-only correction of these status notes, a normal commit/push, and required CI/reviews on the resulting PR head. Product files must remain identical to `dc0304880a00c9204beadcb6d00a4887e1cd0088`. Keep the PR draft; report any product finding without another product correction cycle.
+- Documentation-commit validation and stop point: consult PR #264 and native task `01a0ba98-fede-7c91-85ab-caf5da7d880a` on host `local` for the exact new head, protected CI, independent review verdicts, and product-tree identity comparison. These results are recorded externally after commit, so no extra commit is needed to record its own results. Ready/merge/build/release gates remain separate and unauthorized.
 
 ## Current Status
 

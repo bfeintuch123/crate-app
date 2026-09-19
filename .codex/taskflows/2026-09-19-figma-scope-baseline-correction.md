@@ -12,7 +12,7 @@
 - branch: codex/figma-scope-baseline-correction-20260919
 - base: e390d3bce48d83abf8955fc131a74038a27fa06a
 - draft PR: https://github.com/bfeintuch123/crate-app/pull/264
-- mode: one Bryant-authorized additional source correction cycle, targeted regression checks, protected exact-head CI, two independent Astra/high reviews
+- mode: Bryant-authorized documentation-only closeout; protected CI and independent review of the resulting PR head
 - status: active
 
 ## Goal
@@ -21,11 +21,13 @@ Correct the Beta 2.22 Figma Current Page Only preflight for page and nested-laye
 
 ## Scope
 
-Allowed:
+Historical product scope (completed at `dc030488`; not renewed by this closeout):
 
 - Narrow Figma preflight and asset-origin changes in `parsers/figma.js` and `main.js`.
 - Focused synthetic regressions for filtered Figma responses, failed-node rejection, initial snapshots, retries, deduplication, and project isolation.
 - Repository-required playbooks, exact-head review/correction, focused checks, commit, branch push, draft PR, and sanitized taskflow/proof notes.
+
+Current authorization is limited to this taskflow, the relevant current-workstream status, and the daily ledger for consistency, plus normal commit/push and required validation. Product code, tests, dependencies, and versions must remain unchanged.
 
 Forbidden:
 
@@ -35,14 +37,14 @@ Forbidden:
 
 ## State
 
-- current phase: final writer correction prepared; bind and review the next PR head
-- last completed checkpoint: fresh Astra/high reviewers on `faa036d4a00bfb589a6bd12f7491804fac710dc0` found that a scan could finish during replacement preflight before the commit-time revision fence. The current working-tree correction keeps per-project scans and pre-package recovery fenced for the full preflight, then resumes watching scans after all overlapping updates settle. Current-code `figma-link-per-project` passes 96/96 and combined `provenance.test.js` plus `provenance-dual-write.test.js` passes 585/585.
-- next action: recheck syntax and whitespace after the final race-test edit, make one normal correction commit with sanitized proof-state updates, push the authorized update to PR #264, bind its exact head, then run protected CI and two fresh distinct read-only Astra/high reviews. Keep the PR draft. If this one additional correction cycle receives another actionable finding, stop and escalate to Bryant.
-- blocker: none
-- approval state: Bryant authorized exactly one additional writer correction cycle, repository-required checks, final-head CI and two reviews, commit, push, factual PR-description update, and draft status; later release, ready-for-review, and merge gates remain unauthorized
-- preferences applied: one repository writer; reviewers read-only; no private link or token in fixtures
-- routing decision: SO-002 failure loop with Clawpatch, Deep Autoreview, regression, security, provenance, runner, PR, and handoff review
-- outcome receipt: pending
+- current phase: documentation-only closeout of the low stale-status finding
+- last completed checkpoint: product correction `dc0304880a00c9204beadcb6d00a4887e1cd0088` was committed and pushed. Protected CI run `35468009454` passed on that exact head. Two distinct read-only reviews found no remaining runtime defect; one returned PASS and the other identified stale taskflow/workstream status. Local product validation passed Figma link tests 96/96 and combined provenance tests 585/585, plus syntax and whitespace checks.
+- next action: consult PR #264 and the native task receipt first. Complete any outstanding commit/push and protected CI/independent review gates for this documentation-only correction, recording the new head and results externally. Do not repeat completed gates or create another commit merely to record its own hash or results.
+- blocker: the low documentation finding is addressed by this closeout; validation of the resulting documentation commit is recorded externally after it exists
+- approval state: Bryant separately authorized documentation-only cleanup of taskflow/current-workstream and the ledger where needed, a normal commit/push to PR #264, PR-body updates, and required exact-head validation/review. No product correction cycle, ready transition, merge, build, release, or provider action is authorized.
+- preferences applied: sole native repository writer; independent reviewers read-only; Astra/high for difficult review under Bryant's current model preference
+- routing decision: existing major-PR exact-head review requirements remain in force; product-tree identity must match reviewed product head `dc0304880a00c9204beadcb6d00a4887e1cd0088`
+- outcome receipt: final documentation-head results belong in PR #264 and native task `01a0ba98-fede-7c91-85ab-caf5da7d880a` on host `local`
 
 ## Checkpoints
 
@@ -50,13 +52,15 @@ Forbidden:
 - [x] source and official Figma API contract review
 - [x] implementation and realistic synthetic tests
 - [x] current-code `figma-link-per-project` (96/96) and provenance helper/dual-write checks (585/585 combined)
-- [ ] protected exact-head CI for the final PR head
-- [ ] exact-head independent review/correction loop for the final PR head
-- [x] proof section and ledger/workstream update
-- [ ] latest corrective source and proof-state commits pushed to the existing draft PR
-- [ ] handoff at the authorized stop gate
+- [x] protected CI for product head `dc0304880a00c9204beadcb6d00a4887e1cd0088`: run `35468009454` PASS
+- [x] two independent reviews of that product head completed: no runtime findings; one low stale-documentation finding
+- [x] corrective product commit pushed to the existing draft PR
+- [x] documentation-only cleanup separately authorized
+- Documentation-commit CI, reviews, product-tree identity comparison, and final handoff: recorded externally in PR #264 and the native task receipt after commit; this snapshot does not preclaim their results.
 
 ## Evidence
+
+Earlier rows are historical checkpoints, not current pending actions. The bound product-head result below supersedes their pending status.
 
 | Time | Action | Evidence | Result |
 | --- | --- | --- | --- |
@@ -74,7 +78,7 @@ Forbidden:
 | 2026-09-19 | Corrective source commits | `7ee2e71`, `7881740` | Local commits; proof-state update remains to be committed before pushing the new draft PR head |
 | 2026-09-19 | Third exact-head review loop | PR head `faa036d4a00bfb589a6bd12f7491804fac710dc0`; two fresh Luna/high reviewers found a poll could begin during replacement preflight and survive the successful link commit; stale CI run `35460465743` was canceled | Added commit-time scope revision advance and a delayed-scan regression |
 | 2026-09-19 | Latest corrective local validation | `figma-link-per-project` 94/94; pinned Node 22 syntax checks and `git diff --check` | PASS; source commit `a1f1f39` is local; final-head CI and two fresh reviews remain pending |
-| 2026-09-19 | Additional correction cycle | A fresh review found scans could complete before replacement commit during preflight; added a project-scoped pending-update fence for watcher scans and pre-package recovery, plus post-preflight watcher resume and three retry/race regressions | Current-code `figma-link-per-project` 96/96 and combined provenance helpers/dual-write 585/585; commit, push, exact-head CI, and two Astra/high reviews pending |
+| 2026-09-19 | Additional correction cycle | A fresh review found scans could complete before replacement commit during preflight; added a project-scoped pending-update fence for watcher scans and pre-package recovery, plus post-preflight watcher resume and three retry/race regressions | Product head `dc0304880a00c9204beadcb6d00a4887e1cd0088` committed/pushed; local checks 96/96 and 585/585; CI `35468009454` PASS; two distinct reviews found no runtime defects and one low stale-documentation finding |
 
 ## Proof Notes
 
@@ -97,5 +101,5 @@ Forbidden:
 Next exact action:
 
 ```text
-Complete current-code affected checks, commit this single authorized writer correction cycle with the sanitized proof-state update, push to PR #264, and bind its exact new head. Run protected CI and two fresh, distinct Astra/high read-only reviews against that exact head; update the PR description to match completed evidence, keep it draft, and stop before ready-for-review or merge. If the final review reports another actionable finding, stop and escalate rather than starting another correction cycle.
+Consult PR #264 and the native task receipt for the documentation commit's exact head and completed CI/review results. If not yet completed, push only the authorized documentation correction and complete the required gates on that head, verifying all non-documentation files match dc0304880a00c9204beadcb6d00a4887e1cd0088. Record results externally without another self-recording commit. Keep the PR draft and stop before ready or merge. Report any product finding without expanding this documentation-only scope.
 ```
