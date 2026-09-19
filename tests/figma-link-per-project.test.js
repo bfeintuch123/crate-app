@@ -2092,6 +2092,88 @@ test('projects:set-figma-link rejects a failed preflight without replacing proje
   assert.deepEqual(after.figmaSession, before.figmaSession);
 });
 
+test('a delayed Figma replacement preflight cannot restore a link after a later removal', async () => {
+  const project = await createLinkedFigmaProject('Figma Stale Replace After Remove');
+  storedFigmaToken = null;
+  let releasePreflight;
+  nextFigmaLinkValidation = async () => {
+    const result = await new Promise(resolve => { releasePreflight = resolve; });
+    return result;
+  };
+
+  const staleReplacement = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/OLDLINK/Old-File?page-id=1%3A1',
+    scopeMode: 'current-page',
+  });
+  await waitForCondition(
+    () => typeof releasePreflight === 'function',
+    'the older link preflight should start'
+  );
+
+  const removed = await callIpc('projects:set-figma-link', project.id, { action: 'remove' });
+  assert.equal(removed.success, true);
+  releasePreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Old Page',
+  } });
+  assert.deepEqual(await staleReplacement, { success: false, error: 'figma_link_update_superseded' });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(fresh.figmaTrackedFiles, []);
+  assert.equal(fresh.figmaSession.trackedFiles.length, 0);
+});
+
+test('a delayed Figma replacement preflight cannot overwrite a later replacement', async () => {
+  const project = await createLinkedFigmaProject('Figma Stale Replace After Replace');
+  storedFigmaToken = null;
+  let validationCalls = 0;
+  let releaseFirstPreflight;
+  let firstPreflightResolve;
+  const firstPreflightStarted = new Promise(resolve => { firstPreflightResolve = resolve; });
+  nextFigmaLinkValidation = async (fileKey, scopeEntry) => {
+    validationCalls += 1;
+    if (validationCalls === 1) {
+      firstPreflightResolve();
+      return await new Promise(resolve => { releaseFirstPreflight = resolve; });
+    }
+    return { valid: true, scope: {
+      scopeMode: 'current-page',
+      lockStatus: 'locked',
+      lockedPageId: scopeEntry.requestedPageId,
+      lockedPageName: 'New Page',
+    } };
+  };
+
+  const staleReplacement = callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/OLDLINK/Old-File?page-id=1%3A1',
+    scopeMode: 'current-page',
+  });
+  await firstPreflightStarted;
+  const latestReplacement = await callIpc('projects:set-figma-link', project.id, {
+    action: 'replace',
+    url: 'https://www.figma.com/file/NEWLINK/New-File?page-id=3%3A3',
+    scopeMode: 'current-page',
+  });
+  assert.equal(latestReplacement.success, true);
+  releaseFirstPreflight({ valid: true, scope: {
+    scopeMode: 'current-page',
+    lockStatus: 'locked',
+    lockedPageId: '1:1',
+    lockedPageName: 'Old Page',
+  } });
+  assert.deepEqual(await staleReplacement, { success: false, error: 'figma_link_update_superseded' });
+
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.figmaTrackedFiles.length, 1);
+  assert.equal(fresh.figmaTrackedFiles[0].key, 'NEWLINK');
+  assert.equal(fresh.figmaTrackedFiles[0].requestedPageId, '3:3');
+  assert.equal(fresh.figmaSession.trackedFiles[0].key, 'NEWLINK');
+});
+
 test('projects:set-figma-link removes the link only through an explicit action', async () => {
   const activePollersBefore = await getActiveFigmaPollerCount();
   const project = await callIpc(

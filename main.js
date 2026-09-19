@@ -15301,6 +15301,9 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
     ? 'remove'
     : (payload.action === 'replace' || rawUrl ? 'replace' : 'preserve');
 
+  assertAccountCurrent();
+  const linkUpdateRevision = advanceFigmaScopeRevision(projectId);
+
   let figmaTrackedFiles = normalizeTrackedFigmaFiles(project.figmaTrackedFiles || []);
   if (action === 'remove') {
     figmaTrackedFiles = [];
@@ -15318,8 +15321,10 @@ registerTrustedIpcHandler('projects:set-figma-link', async (event, projectId, pa
   }
 
   assertAccountCurrent();
+  if (getFigmaScopeRevision(projectId) !== linkUpdateRevision) {
+    return { success: false, error: 'figma_link_update_superseded' };
+  }
   const settings = store.get('settings') || {};
-  advanceFigmaScopeRevision(projectId);
   const updated = mutateProject(projectId, (proj) => {
     proj.figmaTrackedFiles = figmaTrackedFiles;
     proj.figmaScopeMode = scopeMode;
