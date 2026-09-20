@@ -351,7 +351,7 @@ function restoreRendererViewState(viewState) {
     if (list && Number.isFinite(scrollTop)) list.scrollTop = scrollTop;
   }
   const focusTarget = findRendererFocusTarget(viewState);
-  if (focusTarget && typeof focusTarget.focus === 'function') {
+  if (focusTarget && typeof focusTarget.focus === 'function' && !hasModalInteraction()) {
     focusTarget.focus({ preventScroll: true });
   }
 }
@@ -761,7 +761,7 @@ function reportVisibleRenderer() {
 }
 
 // ===== Tab Switching =====
-function switchTab(tabName) {
+function switchTab(tabName, { isCurrent = () => true } = {}) {
   const navigationEpoch = ++tabNavigationEpoch;
   const normalizedTab = tabName === 'files' ? 'current-project' : tabName;
 
@@ -771,7 +771,7 @@ function switchTab(tabName) {
   });
 
   if (normalizedTab === 'current-project') {
-    return renderFiles({ isCurrent: () => navigationEpoch === tabNavigationEpoch });
+    return renderFiles({ isCurrent: () => navigationEpoch === tabNavigationEpoch && isCurrent() });
   } else if (normalizedTab === 'settings') {
     renderSettings();
   } else if (normalizedTab === 'projects') {
@@ -4927,7 +4927,7 @@ function setupMainProcessListeners() {
     ));
     if (!canNavigate()) return;
     const read = captureProjectListRead();
-    const intent = projectSelectionIntentEpoch;
+    const intent = ++projectSelectionIntentEpoch;
     const tabIntent = tabNavigationEpoch;
     try {
       const projects = await getAccountCurrentProjects();
@@ -4938,7 +4938,8 @@ function setupMainProcessListeners() {
           project.assetBaseline.establishedAt !== data.establishedAt) return;
       state.projects = projects;
       setSelectedProject(project.id, { invalidate: true, restoreFocus: false });
-      await switchTab('current-project');
+      const selectionIntent = projectSelectionIntentEpoch;
+      await switchTab('current-project', { isCurrent: () => selectionIntent === projectSelectionIntentEpoch });
     } catch (_) {
       // Stale account/project navigation leaves the current interaction intact.
     }

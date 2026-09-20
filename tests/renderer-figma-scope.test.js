@@ -7831,3 +7831,44 @@ test('a later tab choice also cancels notification rendering while its asset wor
     assert.equal(f.packages(), 0);
   }
 });
+
+
+test('latest Existing Assets notice click wins in either project-read completion order', async () => {
+  for (const order of ['older-first', 'newer-first']) {
+    const first = createDeferred(), second = createDeferred();
+    let reads = 0;
+    const f = existingNotificationFixture(() => (++reads === 1 ? first.promise : second.promise));
+    const older = f.click('a');
+    const newer = f.click('b');
+    if (order === 'older-first') {
+      first.resolve(f.projects); await older;
+      assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+      second.resolve(f.projects); await newer;
+    } else {
+      second.resolve(f.projects); await newer;
+      first.resolve(f.projects); await older;
+    }
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b', order);
+    assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes('b.png'), true, order);
+    assert.equal(f.document.activeElement, f.elements['btn-include-existing-assets'], order);
+    assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+  }
+});
+
+test('a newer notice also cancels the older notice asset-workspace render while its own read waits', async () => {
+  const read = createDeferred(), workspace = createDeferred();
+  let reads = 0;
+  const f = existingNotificationFixture(() => (++reads === 1 ? Promise.resolve(f.projects) : read.promise));
+  const loadWorkspace = f.renderer.window.crate.getAssetWorkspace;
+  f.renderer.window.crate.getAssetWorkspace = projectId => projectId === 'a' ? workspace.promise : loadWorkspace(projectId);
+  const older = f.click('a');
+  await new Promise(setImmediate);
+  const newer = f.click('b');
+  workspace.resolve(await loadWorkspace('a'));
+  await older;
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  read.resolve(f.projects); await newer;
+  assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b');
+  assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes('b.png'), true);
+  assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+});

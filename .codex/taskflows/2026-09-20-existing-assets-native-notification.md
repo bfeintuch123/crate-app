@@ -43,3 +43,10 @@ Initial head `494f4875dbeb2fa3896257fea3bf6a7beebc65e3` passed protected CI `355
 A deferred-read regression reproduced the wrong-project selection on the initial head. The normal writer follow-up captures tab navigation intent alongside project/account guards, so a later tab choice wins. Focused tests cover both delayed project reads and delayed asset-workspace reads, Settings and Projects, selected project, visible tab, hidden decision modal, final focus and absence of decision/package mutation. Both delay cases failed before their guard was applied. Every prior CI/review result is invalid for the new head; fresh CI and both reviews are recorded externally. Correction-cycle count: 1 of 3.
 
 The reviewers also considered and rejected two candidates: a fresh explicit baseline decision on a paused project is actionable under the existing paused Add Files/accepted-source contract, and a newer notification click may supersede older queued navigation. Neither requires watcher or notification-policy changes. Notices created before a later pause still lose authority.
+
+
+## Correction cycle 2: latest notification click wins
+
+Before cycle 1's protected run completed, a parent read-only synthetic probe at `628a271be379e404d565c4c1ac2cb6af2a071655` reproduced a second ordering defect: after two valid notice clicks A then B, A's faster project response could select A and invalidate newer B. Cycle 1 reviews were held, not passed.
+
+This normal follow-up records each admitted click as a new selection intent before its asynchronous read and carries that intent through the existing render-current guard. Regressions cover both project-read completion orders and a superseded older asset-workspace render while the newer project read waits. The new keyboard-focus assertion also exposed workspace focus restoration overriding a newly opened modal; restoration now leaves active modal focus intact while still restoring scroll. No asset decision, exclusion, watcher or native delivery policy changes. Fresh protected CI and both independent reviews are required at the new head, recorded externally. Correction-cycle count: 2 of 3.
