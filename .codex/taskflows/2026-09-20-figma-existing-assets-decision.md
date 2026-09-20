@@ -25,6 +25,12 @@ No owner project data, live Figma/account/token access, live app or auth compute
 - Doctor preflight could not run because its fixed legacy repository path is absent on this Mac. Canonical identity, clean starting base, GitHub access, and protected CI were verified directly; doctor/tooling changes are outside this correction.
 - UI changes require exact-head running-candidate visual evidence under AGENTS.md. That evidence remains unperformed under the explicit no-live-app scope and is not waived by source tests.
 
+## Review correction cycle 1
+
+At initial head `a08a0190784e56189659cb600104d40ca7210403`, protected CI `35514873578` passed (1,431 passed, zero failed, one skipped). The state reviewer passed; the independent UI reviewer found that individually excluded Existing rows were hidden from the initial-choice dialog even though its actions affect them. With all rows excluded, the required choice could fail to appear.
+
+The normal writer follow-up includes every Existing row in the decision set, discloses the currently skipped count and all-assets effect, and adds partial/all-excluded regressions. The new regression fails against the unchanged initial head; updated Figma/renderer suites pass 352/352 locally. These are pre-commit results; the new exact head requires fresh protected CI and both independent Luna/high reviews, recorded externally below. Correction-cycle count: 1 of 3.
+
 ## Final-head evidence contract
 
 This file records scope and reproducible evidence without attempting to record its own commit SHA. Consult the draft PR and native task's persistent September 20 receipt for the latest exact head, focused-check results, protected CI, two distinct Luna/high reviews, and correction-cycle count before resuming. Results are recorded externally after each committed head; do not make a self-recording documentation commit merely to repeat those results.

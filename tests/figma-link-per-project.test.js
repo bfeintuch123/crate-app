@@ -3827,28 +3827,28 @@ test('complete initial Figma snapshot offers an existing-assets decision and bul
 });
 
 test('complete Figma refresh repairs an older Existing decision gap without guessing Added origin', async () => {
-  for (const baselineStatus of ['awaiting-first-scan', 'empty']) {
+  for (const [baselineStatus, existingCount] of [['awaiting-first-scan', 1], ['empty', 1], ['empty', 2]]) {
     storedFigmaToken = null;
     const project = await createLinkedFigmaProject(`Figma older ${baselineStatus}`);
     setFigmaDownloadResponse('synthetic');
-    nextFigmaScanResult = existingDecisionSnapshot(1);
+    nextFigmaScanResult = existingDecisionSnapshot(existingCount);
     await callIpc('figma:scan-project', project.id);
     const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
     const marker = stored.figmaAssetBaselineEstablishedAt;
     stored.assetBaseline = { schemaVersion: 1, status: baselineStatus, decision: null, establishedAt: null };
     stored.excludedAssetKeys = [stored.files[0].path];
     reloadDecisionTestStore();
-    nextFigmaScanResult = existingDecisionSnapshot(2);
+    nextFigmaScanResult = existingDecisionSnapshot(existingCount + 1);
     nextFigmaScanResult.errors = ['incomplete synthetic snapshot'];
     await callIpc('figma:scan-project', project.id);
     let current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
     assert.equal(current.assetBaseline.status, baselineStatus, 'a marker alone is not a complete snapshot');
-    nextFigmaScanResult = existingDecisionSnapshot(2);
+    nextFigmaScanResult = existingDecisionSnapshot(existingCount + 1);
     await callIpc('figma:scan-project', project.id);
     current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
     assert.equal(current.assetBaseline.status, 'decision-required');
     assert.equal(current.figmaAssetBaselineEstablishedAt, marker);
-    assert.equal(current.files.find(file => file.figmaAssetIdentity === 'initial-1').assetOrigin, 'added');
+    assert.equal(current.files.find(file => file.figmaAssetIdentity === `initial-${existingCount}`).assetOrigin, 'added');
     assert.deepEqual(current.excludedAssetKeys, [current.files[0].path]);
     assert.equal((await callIpc('projects:set-existing-assets-decision', project.id, 'include')).success, true);
   }

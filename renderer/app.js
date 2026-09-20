@@ -1752,7 +1752,7 @@ function getExistingAssetsForDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
   return [...(workspace?.files || []), ...(workspace?.pendingFiles || [])].filter(file => (
-    file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.excluded !== true
+    file && file.assetOrigin === 'existing' && file.protectedSource !== true
   ));
 }
 
@@ -1977,7 +1977,10 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
         : 'Working file';
     }
     $('#existing-assets-modal-title').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
-    $('#existing-assets-modal-count').textContent = 'Choose which existing assets to include in packages.';
+    const skippedCount = assets.filter(file => file.excluded === true).length;
+    $('#existing-assets-modal-count').textContent = skippedCount > 0
+      ? `${skippedCount} currently skipped. This choice applies to all ${assets.length} existing assets.`
+      : 'Choose which existing assets to include in packages.';
     const list = $('#existing-assets-modal-list');
     list.innerHTML = '';
     for (const file of assets.slice(0, 4)) {

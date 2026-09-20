@@ -1156,6 +1156,46 @@ test('Figma initial choice includes explicitly and explains the already-included
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 
+test('repaired Figma decision includes partial and fully skipped assets in its choice', async () => {
+  for (const skippedCount of [1, 2]) {
+    for (const decision of ['include', 'skip']) {
+      const { document, elements } = createInteractiveRendererDom();
+      const files = [0, 1].map(index => ({
+        name: `Existing ${index}.png`, path: `/synthetic/Existing ${index}.png`,
+        source: 'figma-auto', assetOrigin: 'existing', projectRole: 'asset',
+      }));
+      const project = {
+        id: `repaired-${skippedCount}-${decision}`, status: 'watching', files, pendingFiles: [],
+        excludedAssetKeys: files.slice(0, skippedCount).map(file => file.path),
+        assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+      };
+      const saved = {
+        ...project, excludedAssetKeys: decision === 'skip' ? files.map(file => file.path) : [],
+        assetBaseline: { ...project.assetBaseline, status: decision === 'skip' ? 'skipped' : 'included', decision },
+      };
+      const decisions = [];
+      const renderer = loadRendererHelpers(document, { crate: {
+        setExistingAssetsDecision: async (...args) => { decisions.push(args); return { success: true, project: saved }; },
+        getProjects: async () => [saved],
+      } });
+      renderer.testProject = project;
+      vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+      document.querySelector('#tab-current-project').classList.add('active');
+      await renderer.renderFiles();
+      renderer.setupEventListeners();
+      assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+      assert.equal(elements['existing-assets-modal-title'].textContent, '2 existing assets found');
+      assert.equal(elements['existing-assets-modal-list'].children.length, 2);
+      assert.equal(elements['existing-assets-modal-count'].textContent,
+        `${skippedCount} currently skipped. This choice applies to all 2 existing assets.`);
+      await elements[`btn-${decision}-existing-assets`].listeners.click[0]();
+      assert.deepEqual(decisions, [[project.id, decision]]);
+      assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+      assert.deepEqual(Array.from(vm.runInContext('state.projects[0].excludedAssetKeys', renderer)), saved.excludedAssetKeys);
+    }
+  }
+});
+
 test('renderer restores focus inside the Existing Assets modal when decision persistence fails', async () => {
   const { document, elements } = createInteractiveRendererDom();
   const project = {
