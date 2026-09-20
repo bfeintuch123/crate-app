@@ -1752,7 +1752,7 @@ function getExistingAssetsForDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
   return [...(workspace?.files || []), ...(workspace?.pendingFiles || [])].filter(file => (
-    file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.excluded !== true
+    file && file.assetOrigin === 'existing' && file.protectedSource !== true
   ));
 }
 
@@ -1836,8 +1836,10 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   }
 
   if (includeAll) {
-    includeAll.textContent = hasPendingReviewSurface ? 'Add All' : 'Include All Existing';
-    includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : 'Include all existing assets');
+    const allIncluded = existingAssets.length > 0 && includedExistingCount === existingAssets.length;
+    includeAll.textContent = hasPendingReviewSurface ? 'Add All' : (allIncluded ? 'All Existing Included' : 'Include All Existing');
+    includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : (allIncluded ? 'All existing assets are already included' : 'Include all existing assets'));
+    includeAll.title = !hasPendingReviewSurface && allIncluded ? 'All existing assets are already included.' : '';
     includeAll.disabled = hasPendingReviewSurface
       ? eligiblePendingCount === 0
       : existingAssets.length === 0 || includedExistingCount === existingAssets.length;
@@ -1863,13 +1865,13 @@ function restoreAssetReviewBatchControls(project) {
 }
 
 function getExistingAssetsDecisionFocusableElements() {
-  return ['btn-review-existing-assets-later', 'btn-include-existing-assets']
+  return ['btn-skip-existing-assets', 'btn-include-existing-assets']
     .map(id => $(`#${id}`))
     .filter(element => element && !element.disabled);
 }
 
 function setExistingAssetsDecisionButtonsDisabled(disabled) {
-  for (const id of ['btn-review-existing-assets-later', 'btn-include-existing-assets']) {
+  for (const id of ['btn-skip-existing-assets', 'btn-include-existing-assets']) {
     const button = $(`#${id}`);
     if (button) button.disabled = disabled;
   }
@@ -1974,8 +1976,11 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
         ? `${sourceAppLabel ? `${sourceAppLabel} · ` : ''}${sourceFile.name}`
         : 'Working file';
     }
-    $('#existing-assets-modal-title').textContent = `${assets.length} asset${assets.length === 1 ? ' was' : 's were'} already in this file`;
-    $('#existing-assets-modal-count').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} included by default`;
+    $('#existing-assets-modal-title').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
+    const skippedCount = assets.filter(file => file.excluded === true).length;
+    $('#existing-assets-modal-count').textContent = skippedCount > 0
+      ? `${skippedCount} of these assets currently skipped. This choice applies to all existing assets in the project.`
+      : 'Include or skip all existing assets in this project.';
     const list = $('#existing-assets-modal-list');
     list.innerHTML = '';
     for (const file of assets.slice(0, 4)) {
@@ -2080,10 +2085,13 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
     return false;
   } finally {
     if (existingAssetsDecisionRequest === request) {
+      const restoreAttemptedChoice = isCurrentDecision();
       existingAssetsDecisionRequest = null;
       if (existingAssetsModalProjectId === projectId) {
         setExistingAssetsDecisionButtonsDisabled(false);
-        ($('#btn-include-existing-assets') || $('#modal-existing-assets'))?.focus();
+        if (restoreAttemptedChoice) {
+          ($(`#btn-${decision}-existing-assets`) || $('#modal-existing-assets'))?.focus();
+        }
       }
     }
   }
@@ -4473,8 +4481,8 @@ function setupEventListeners() {
 
   $('#btn-confirm-package').addEventListener('click', confirmPackage);
 
-  $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include', { openReview: true }));
-  $('#btn-review-existing-assets-later').addEventListener('click', () => submitExistingAssetsDecision('include'));
+  $('#btn-include-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('include'));
+  $('#btn-skip-existing-assets').addEventListener('click', () => submitExistingAssetsDecision('skip'));
   $('#btn-include-all-existing').addEventListener('click', () => submitAssetReviewBatchDecision('include'));
   $('#btn-skip-all-existing').addEventListener('click', () => submitAssetReviewBatchDecision('skip'));
 
