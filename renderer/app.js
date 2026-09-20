@@ -769,7 +769,7 @@ function switchTab(tabName) {
   });
 
   if (normalizedTab === 'current-project') {
-    renderFiles();
+    return renderFiles();
   } else if (normalizedTab === 'settings') {
     renderSettings();
   } else if (normalizedTab === 'projects') {
@@ -3362,6 +3362,7 @@ function initializeSettingsNavigation() {
 function renderSettingsControls() {
   $('#input-naming-template').value = state.settings.namingTemplate || DEFAULT_NAMING_TEMPLATE;
   $('#toggle-notifications').checked = state.settings.notifications || false;
+  $('#toggle-existing-assets-notifications').checked = state.settings.existingAssetsNotifications !== false;
   $('#toggle-diagnostic-report').checked = state.settings.includeDiagnosticReport === true;
   $('#toggle-package-details').checked = state.settings.showPackageDetails !== false;
   $('#toggle-package-folders').checked = getPackageOutputLayoutMode() === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
@@ -4539,6 +4540,12 @@ function setupEventListeners() {
     window.crate.updateSetting('notifications', checked);
   });
 
+  $('#toggle-existing-assets-notifications').addEventListener('change', async () => {
+    const checked = $('#toggle-existing-assets-notifications').checked;
+    const settings = await window.crate.updateSetting('existingAssetsNotifications', checked);
+    state.settings = settings || { ...state.settings, existingAssetsNotifications: checked };
+  });
+
   $('#toggle-diagnostic-report').addEventListener('change', () => {
     const checked = $('#toggle-diagnostic-report').checked;
     window.crate.updateSetting('includeDiagnosticReport', checked);
@@ -4908,6 +4915,30 @@ function refreshProjectState(projectId) {
 
 // ===== Main Process Listeners =====
 function setupMainProcessListeners() {
+  window.crate.onExistingAssetsReview?.(async (data) => {
+    if (!data || typeof data.projectId !== 'string' || !accountStatus.canUseWorkspace) return;
+    // Preserve unrelated work and an in-flight decision; an idle Existing Assets
+    // dialog may be replaced through the common same/cross-project cleanup path.
+    const canNavigate = () => !activeAddFilesOperation && (!hasModalInteraction() || (
+      activeModalLease?.id === 'modal-existing-assets' && !existingAssetsDecisionRequest &&
+      getVisibleBlockingModalIds().every(id => id === 'modal-existing-assets')
+    ));
+    if (!canNavigate()) return;
+    const read = captureProjectListRead();
+    const intent = projectSelectionIntentEpoch;
+    try {
+      const projects = await getAccountCurrentProjects();
+      if (!projectListReadIsCurrent(read) || intent !== projectSelectionIntentEpoch || !canNavigate()) return;
+      const project = projects.find(item => item.id === data.projectId);
+      if (!project || project.assetBaseline?.status !== 'decision-required' ||
+          project.assetBaseline.establishedAt !== data.establishedAt) return;
+      state.projects = projects;
+      setSelectedProject(project.id, { invalidate: true, restoreFocus: false });
+      await switchTab('current-project');
+    } catch (_) {
+      // Stale account/project navigation leaves the current interaction intact.
+    }
+  });
   if (mainProcessListenersBound) return;
   if (!window.crate) {
     logRendererError('preload bridge unavailable for main-process listeners', 'window.crate missing');

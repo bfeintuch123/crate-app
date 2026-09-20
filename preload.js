@@ -114,6 +114,11 @@ contextBridge.exposeInMainWorld('crate', {
   onProjectUpdated: (callback) => {
     ipcRenderer.on('project:updated', (event, data) => callback(data));
   },
+  onExistingAssetsReview: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('existing-assets:review', listener);
+    return () => ipcRenderer.removeListener('existing-assets:review', listener);
+  },
   onPackageTrigger: (callback) => {
     ipcRenderer.on('package:trigger', (event, data) => callback(data));
   },

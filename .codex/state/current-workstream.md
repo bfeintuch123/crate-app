@@ -1,5 +1,9 @@
 # Crate Current Workstream
 
+## September 20 Existing Assets native notification
+
+Active taskflow: `.codex/taskflows/2026-09-20-existing-assets-native-notification.md`; branch `codex/existing-assets-native-notification-20260920`, fresh canonical Beta 2.24 source `72a06a0191b883c2d98aa4b122408d5a881c32e1`. Bryant authorized a background native notice and independent default-on Settings toggle through a reviewed draft PR. Watching remains active while Include/Skip waits; packaging remains gated. One writer and two Luna/high read-only reviewers; exact-head protected CI/review receipts live externally in the PR/native task. Synthetic running-candidate visual evidence and real OS delivery remain separate unperformed gates. No ready/merge/build/release/install/provider/tester authority. Older sections below describe historical work, not the current gate.
+
 ## September 20 Figma Existing Assets correction
 
 The active source correction is `.codex/taskflows/2026-09-20-figma-existing-assets-decision.md`, branch `codex/figma-existing-assets-decision-20260920`, starting from Beta 2.23 source `fca609db4373f26ab31d981f63d69b5f2ee3a1f8`. Bryant authorized the initial include/skip choice and bulk-action lifecycle repair through a reviewed draft PR. One native writer owns the branch; two independent Luna/high reviewers are required for this state-integrity change. Use the PR/native September 20 receipt for final-head CI/reviews and the next gate. Running-candidate visual evidence remains unperformed under the no-live-app scope. No ready/merge/build/release/install/provider/tester action is authorized here.

@@ -223,6 +223,7 @@ function initializeAccountSession() {
       // Invalidate the existing project-operation fences before any late scan/package result.
       watchingActivationSequence++;
       closeInactivityPrompts();
+      closeExistingAssetsNotifications();
       for (const project of getProjects()) stopWatching(project.id);
     }
     const resume = allowed && (!accountWorkspaceAllowed || identityChanged);
@@ -283,6 +284,10 @@ function registerStartupDiagnosticIpc() {
         return;
       }
       markFirstOccurrenceStartupPhase(phase);
+      if (phase === 'renderer-startup-data-complete') {
+        existingAssetsNotificationReadyContents.add(event.sender);
+        deliverExistingAssetsNotificationReview();
+      }
     });
   }
 }
@@ -4970,6 +4975,7 @@ function establishProjectAssetBaseline(
   if (result && result.changed && isCurrent()) {
     invalidatePackageReviewForProject(projectId);
     sendToRenderer('project:updated', { projectId });
+    if (result.status === 'decision-required') notifyExistingAssetsDecision(projectId);
   }
   return result;
 }
@@ -5039,6 +5045,7 @@ function setProjectExistingAssetsDecision(projectId, decision) {
   });
 
   if (!result || !result.success) return result || { success: false, error: 'project_not_found' };
+  closeExistingAssetsNotifications(projectId);
   invalidatePackageReviewForProject(projectId);
   sendToRenderer('project:updated', { projectId });
   const project = getProjects().find(item => item.id === projectId);
@@ -5690,6 +5697,7 @@ try {
       settings: {
         namingTemplate: DEFAULT_NAMING_TEMPLATE,
         notifications: true,
+        existingAssetsNotifications: true,
         includeDiagnosticReport: false,
         showPackageDetails: true,
         packageOutputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION
@@ -9778,6 +9786,7 @@ function reconcileFigmaExistingAssetsDecision(projectId, isCurrent) {
   if (changed && isCurrent()) {
     invalidatePackageReviewForProject(projectId);
     sendToRenderer('project:updated', { projectId });
+    notifyExistingAssetsDecision(projectId);
   }
 }
 
@@ -14342,6 +14351,8 @@ function createMainWindow() {
   }
 
   if (trayWindow.webContents && typeof trayWindow.webContents.on === 'function') {
+    const notificationContents = trayWindow.webContents;
+    notificationContents.on('did-start-loading', () => existingAssetsNotificationReadyContents.delete(notificationContents));
     let rendererWasUnresponsive = false;
     trayWindow.webContents.on('unresponsive', () => {
       if (rendererWasUnresponsive) return;
@@ -14489,6 +14500,90 @@ function isMainWindowForegroundVisible() {
 function getNotificationIconPath() {
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
   return fs.existsSync(iconPath) ? iconPath : null;
+}
+
+// Entries survive dismissal to deduplicate one actionable decision, and are
+// invalidated when its project, account, watching activation, or preference ends.
+const existingAssetsNotifications = new Map();
+const existingAssetsNotificationReadyContents = new WeakSet();
+let pendingExistingAssetsNotificationReview = null;
+
+function existingAssetsNotificationsEnabled() {
+  const settings = store.get('settings') || {};
+  return settings.notifications === true && settings.existingAssetsNotifications !== false;
+}
+
+function closeExistingAssetsNotifications(projectId = null) {
+  for (const [id, entry] of existingAssetsNotifications) {
+    if (projectId !== null && id !== projectId) continue;
+    existingAssetsNotifications.delete(id);
+    activeNativeNotifications.delete(entry.notification);
+    try { entry.notification.close(); } catch (_) {}
+  }
+  if (projectId === null || pendingExistingAssetsNotificationReview?.entry.projectId === projectId) {
+    pendingExistingAssetsNotificationReview = null;
+  }
+}
+
+function deliverExistingAssetsNotificationReview() {
+  const pending = pendingExistingAssetsNotificationReview;
+  if (!pending) return;
+  if (!pending.entry.isCurrent() || pending.window !== trayWindow || pending.window.isDestroyed()) {
+    pendingExistingAssetsNotificationReview = null;
+    return;
+  }
+  if (!existingAssetsNotificationReadyContents.has(pending.window.webContents)) return;
+  pendingExistingAssetsNotificationReview = null;
+  sendToRenderer('existing-assets:review', {
+    projectId: pending.entry.projectId,
+    establishedAt: pending.entry.establishedAt,
+  });
+}
+
+function notifyExistingAssetsDecision(projectId) {
+  try {
+    const project = getProjects().find(item => item.id === projectId);
+    if (!project || project.assetBaseline?.status !== 'decision-required' ||
+        !getExistingAssetReviewFiles(project).length || !accountSession?.canUseWorkspace() ||
+        !existingAssetsNotificationsEnabled() || isMainWindowForegroundVisible() ||
+        !Notification.isSupported() || existingAssetsNotifications.has(projectId)) return false;
+    const operation = captureProjectOperation(projectId);
+    const establishedAt = project.assetBaseline.establishedAt;
+    const entry = { projectId, establishedAt, notification: null, clicked: false, isCurrent: () => {
+      const current = getProjects().find(item => item.id === projectId);
+      return existingAssetsNotifications.get(projectId) === entry && operation?.current() &&
+        existingAssetsNotificationsEnabled() && current?.assetBaseline?.status === 'decision-required' &&
+        current.assetBaseline.establishedAt === establishedAt && getExistingAssetReviewFiles(current).length > 0;
+    } };
+    const icon = getNotificationIconPath();
+    const notification = new Notification({
+      title: 'Crate — Existing assets found',
+      body: 'Choose whether to include or skip existing assets. Click to review in Crate.',
+      silent: false,
+      ...(icon ? { icon } : {}),
+    });
+    entry.notification = notification;
+    existingAssetsNotifications.set(projectId, entry);
+    activeNativeNotifications.add(notification);
+    const release = () => activeNativeNotifications.delete(notification);
+    notification.on('close', release);
+    notification.on('failed', release);
+    notification.on('click', () => {
+      try {
+        if (entry.clicked || !entry.isCurrent()) return;
+        entry.clicked = true;
+        showMainWindow({ reason: 'existing-assets-notification-click' });
+        pendingExistingAssetsNotificationReview = { entry, window: trayWindow };
+        deliverExistingAssetsNotificationReview();
+      } catch (_) {
+        // Notification delivery must never change the persisted asset decision.
+      }
+    });
+    try { notification.show(); } catch (_) { release(); }
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function showPackageCompleteNotification(projectName, fileCount, options = {}) {
@@ -15151,6 +15246,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 }
 
 function stopWatching(projectId, { invalidateActivation = true } = {}) {
+  closeExistingAssetsNotifications(projectId);
   if (invalidateActivation) watchingActivationTokens.delete(projectId);
   cancelWatcherCoordinator(projectId);
   const watcher = watchers.get(projectId);
@@ -19875,6 +19971,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
 });
 
 registerTrustedIpcHandler('projects:delete-all', () => {
+  closeExistingAssetsNotifications();
   packageReviewSnapshots.clear();
   currentPackageReviewTokenByProject.clear();
   consumedPackageReviewTokens.clear();
@@ -20223,12 +20320,12 @@ registerTrustedIpcHandler('figma:scan-now', async (event) => {
 });
 
 registerTrustedIpcHandler('settings:get', () => {
-  return store.get('settings');
+  return { existingAssetsNotifications: true, ...store.get('settings') };
 });
 
 registerTrustedIpcHandler('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "existingAssetsNotifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   if (key === 'namingTemplate') {
     store.set(`settings.${key}`, sanitizeNamingTemplate(value));
@@ -20241,7 +20338,11 @@ registerTrustedIpcHandler('settings:update', (event, key, value) => {
     if (previousMode !== nextMode) invalidateAllPackageReviews();
     return store.get('settings');
   }
+  if (key === 'existingAssetsNotifications' && typeof value !== 'boolean') return store.get('settings');
   store.set(`settings.${key}`, value);
+  if ((key === 'notifications' || key === 'existingAssetsNotifications') && !existingAssetsNotificationsEnabled()) {
+    closeExistingAssetsNotifications();
+  }
   return store.get('settings');
 });
 
@@ -20380,6 +20481,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   closeInactivityPrompts();
+  closeExistingAssetsNotifications();
   accountSession?.shutdown();
   startupPhaseJournal.mark('before-quit');
   startupPhaseJournal.close();
