@@ -7706,6 +7706,7 @@ function existingNotificationFixture(getProjectsOverride) {
   const noOp = () => {};
   const renderer = loadRendererHelpers(document, {crate:{
     getProjects: getProjectsOverride || (async () => projects),
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({connected:false}),
     setExistingAssetsDecision: async () => {decisions++;}, preparePackageReview: async () => {packages++;},
     onExistingAssetsReview: callback => {handler=callback;},
     onFilesUpdated:noOp,onProjectUpdated:noOp,onPendingFilesUpdated:noOp,onPackageTrigger:noOp,
@@ -7785,4 +7786,48 @@ test('Existing Assets notification preserves active Add Files work', async () =>
   await f.click();
   assert.equal(vm.runInContext('state.selectedProjectId',f.renderer),'a');
   assert.equal(vm.runInContext('activeAddFilesOperation.requestId',f.renderer),1);
+});
+
+test('a later Settings or Projects tab choice supersedes delayed Existing Assets notification navigation', async () => {
+  for (const tab of ['settings', 'projects']) {
+    const pending = createDeferred();
+    const f = existingNotificationFixture(() => pending.promise);
+    f.renderer.setupEventListeners();
+    const clicking = f.click('b');
+    const chosen = [...f.document.querySelectorAll('.app-tab')].find(element => element.dataset.tab === tab);
+    chosen.click();
+    chosen.focus();
+    pending.resolve(f.projects);
+    await clicking;
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'a', tab);
+    assert.equal(f.elements[`tab-${tab}`].classList.contains('active'), true, tab);
+    assert.equal(f.elements['tab-current-project'].classList.contains('active'), false, tab);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true, tab);
+    assert.equal(f.document.activeElement, chosen, tab);
+    assert.equal(f.decisions(), 0);
+    assert.equal(f.packages(), 0);
+  }
+});
+
+test('a later tab choice also cancels notification rendering while its asset workspace is loading', async () => {
+  for (const tab of ['settings', 'projects']) {
+    const pending = createDeferred();
+    const f = existingNotificationFixture();
+    const loadWorkspace = f.renderer.window.crate.getAssetWorkspace;
+    f.renderer.window.crate.getAssetWorkspace = () => pending.promise;
+    f.renderer.setupEventListeners();
+    const clicking = f.click('b');
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b');
+    const chosen = [...f.document.querySelectorAll('.app-tab')].find(element => element.dataset.tab === tab);
+    chosen.click();
+    chosen.focus();
+    pending.resolve(await loadWorkspace('b'));
+    await clicking;
+    assert.equal(f.elements[`tab-${tab}`].classList.contains('active'), true, tab);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true, tab);
+    assert.equal(f.document.activeElement, chosen, tab);
+    assert.equal(f.decisions(), 0);
+    assert.equal(f.packages(), 0);
+  }
 });

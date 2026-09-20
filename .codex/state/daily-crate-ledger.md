@@ -2,7 +2,7 @@
 
 ## 2026-09-20 — Existing Assets native notification
 
-Fresh source task from canonical Beta 2.24 `72a06a0`, after Bryant reported the installed Existing Assets dialog worked. Adds one background native notice for a newly actionable decision and an independent default-on Settings toggle that respects global notification disable. Clicks are account/project/activation guarded and never decide or change exclusions. Watching/polling continues; packaging waits for Include/Skip. Taskflow: `.codex/taskflows/2026-09-20-existing-assets-native-notification.md`. Exact-head checks/reviews/draft identity are recorded externally; no live app, OS permission, owner data, build, ready/merge or delivery action.
+Fresh source task from canonical Beta 2.24 `72a06a0`, after Bryant reported the installed Existing Assets dialog worked. Adds one background native notice for a newly actionable decision and an independent default-on Settings toggle that respects global notification disable. Clicks are account/project/activation guarded and never decide or change exclusions. Watching/polling continues; packaging waits for Include/Skip. Taskflow: `.codex/taskflows/2026-09-20-existing-assets-native-notification.md`. Initial exact-head CI passed; lifecycle review found a delayed-notification tab-navigation race, addressed in normal correction cycle 1 with a failure-first regression. Fresh exact-head checks/reviews/draft identity are recorded externally; no live app, OS permission, owner data, build, ready/merge or delivery action.
 
 ## 2026-09-20 — Figma existing-assets decision correction
 

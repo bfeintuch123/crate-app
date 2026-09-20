@@ -34,3 +34,12 @@ Under a separately authorized running-candidate gate, bind the exact PR head and
 5. Leave the dialog waiting, ingest a later synthetic Added asset, then explicitly decide and inspect the packaging gate.
 
 Source mocks do not establish macOS permission, banner style, Notification Center retention, delivery, installed-app behavior, or exact-head visual acceptance. Capture and inspect only approved synthetic Crate/notification surfaces with unrelated notifications and desktop content excluded. No permission toggles or capture are authorized by this source task. Keep the PR draft pending that gate and separate owner authorization for ready/merge.
+
+
+## Correction cycle 1: preserve newer tab navigation
+
+Initial head `494f4875dbeb2fa3896257fea3bf6a7beebc65e3` passed protected CI `35533188084` (1,441 passed, zero failed, one skipped) and local suites (954 passed). UI review passed. The independent lifecycle reviewer found a P2 delayed-notification navigation race: a newer Settings/Projects tab choice did not invalidate the pending project read, which could later reopen Current Project and its decision dialog.
+
+A deferred-read regression reproduced the wrong-project selection on the initial head. The normal writer follow-up captures tab navigation intent alongside project/account guards, so a later tab choice wins. Focused tests cover both delayed project reads and delayed asset-workspace reads, Settings and Projects, selected project, visible tab, hidden decision modal, final focus and absence of decision/package mutation. Both delay cases failed before their guard was applied. Every prior CI/review result is invalid for the new head; fresh CI and both reviews are recorded externally. Correction-cycle count: 1 of 3.
+
+The reviewers also considered and rejected two candidates: a fresh explicit baseline decision on a paused project is actionable under the existing paused Add Files/accepted-source contract, and a newer notification click may supersede older queued navigation. Neither requires watcher or notification-policy changes. Notices created before a later pause still lose authority.

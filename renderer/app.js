@@ -75,6 +75,7 @@ let packageReviewModalRequestId = null;
 let packageReviewModalSessionId = null;
 let projectSelectionEpoch = 0;
 let projectSelectionIntentEpoch = 0;
+let tabNavigationEpoch = 0;
 let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
@@ -761,6 +762,7 @@ function reportVisibleRenderer() {
 
 // ===== Tab Switching =====
 function switchTab(tabName) {
+  const navigationEpoch = ++tabNavigationEpoch;
   const normalizedTab = tabName === 'files' ? 'current-project' : tabName;
 
   $$('.app-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === normalizedTab));
@@ -769,7 +771,7 @@ function switchTab(tabName) {
   });
 
   if (normalizedTab === 'current-project') {
-    return renderFiles();
+    return renderFiles({ isCurrent: () => navigationEpoch === tabNavigationEpoch });
   } else if (normalizedTab === 'settings') {
     renderSettings();
   } else if (normalizedTab === 'projects') {
@@ -4926,9 +4928,11 @@ function setupMainProcessListeners() {
     if (!canNavigate()) return;
     const read = captureProjectListRead();
     const intent = projectSelectionIntentEpoch;
+    const tabIntent = tabNavigationEpoch;
     try {
       const projects = await getAccountCurrentProjects();
-      if (!projectListReadIsCurrent(read) || intent !== projectSelectionIntentEpoch || !canNavigate()) return;
+      if (!projectListReadIsCurrent(read) || intent !== projectSelectionIntentEpoch ||
+          tabIntent !== tabNavigationEpoch || !canNavigate()) return;
       const project = projects.find(item => item.id === data.projectId);
       if (!project || project.assetBaseline?.status !== 'decision-required' ||
           project.assetBaseline.establishedAt !== data.establishedAt) return;
