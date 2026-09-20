@@ -1070,7 +1070,7 @@ test('renderer presents the required Existing Assets decision with source-safe c
   await renderer.renderFiles();
 
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.equal(elements['existing-assets-modal-count'].textContent, 'Choose which existing assets to include in packages.');
+  assert.equal(elements['existing-assets-modal-count'].textContent, 'Include or skip all existing assets in this project.');
   assert.equal(elements['existing-assets-modal-title'].textContent, '1 existing asset found');
   assert.equal(elements['existing-assets-modal-source'].textContent, 'Illustrator · Existing Project.ai');
   assert.equal(elements['existing-assets-modal-list'].children.length, 1);
@@ -1187,7 +1187,7 @@ test('repaired Figma decision includes partial and fully skipped assets in its c
       assert.equal(elements['existing-assets-modal-title'].textContent, '2 existing assets found');
       assert.equal(elements['existing-assets-modal-list'].children.length, 2);
       assert.equal(elements['existing-assets-modal-count'].textContent,
-        `${skippedCount} currently skipped. This choice applies to all 2 existing assets.`);
+        `${skippedCount} of these assets currently skipped. This choice applies to all existing assets in the project.`);
       await elements[`btn-${decision}-existing-assets`].listeners.click[0]();
       assert.deepEqual(decisions, [[project.id, decision]]);
       assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
@@ -1196,31 +1196,48 @@ test('repaired Figma decision includes partial and fully skipped assets in its c
   }
 });
 
-test('renderer restores focus inside the Existing Assets modal when decision persistence fails', async () => {
-  const { document, elements } = createInteractiveRendererDom();
-  const project = {
-    id: 'existing-assets-decision-failure',
-    files: [{ name: 'Existing.png', path: '/synthetic/Existing.png', assetOrigin: 'existing', projectRole: 'asset' }],
-    pendingFiles: [],
-    excludedAssetKeys: [],
-    assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
-  };
-  const renderer = loadRendererHelpers(document, { crate: {
-    setExistingAssetsDecision: async () => ({ success: false, error: 'write_failed' }),
-  } });
-  renderer.testProject = project;
-  vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
-
-  await renderer.showExistingAssetsDecisionModal(project);
-  elements['btn-skip-existing-assets'].focus();
-  await renderer.submitExistingAssetsDecision('skip');
-
-  assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
-  assert.equal(elements['btn-skip-existing-assets'].disabled, false);
-  assert.equal(elements['btn-include-existing-assets'].disabled, false);
-  assert.equal(document.activeElement, elements['btn-include-existing-assets']);
-  assert.equal(elements['app-sidebar'].inert, true);
-  assert.equal(elements['app-main'].inert, true);
+test('renderer restores the attempted Existing Assets choice after either save failure and retries it', async () => {
+  for (const decision of ['skip', 'include']) {
+    for (const failure of ['result', 'throw']) {
+      const { document, elements } = createInteractiveRendererDom();
+      const project = {
+        id: `decision-failure-${decision}-${failure}`, status: 'watching',
+        files: [{ name: 'Existing.png', path: '/synthetic/Existing.png', assetOrigin: 'existing', projectRole: 'asset' }],
+        pendingFiles: [], excludedAssetKeys: [],
+        assetBaseline: { status: 'decision-required', decision: null, establishedAt: 1 },
+      };
+      const saved = { ...project, assetBaseline: { ...project.assetBaseline, status: decision === 'skip' ? 'skipped' : 'included', decision } };
+      const decisions = [];
+      const renderer = loadRendererHelpers(document, { crate: {
+        setExistingAssetsDecision: async (id, attempted) => {
+          decisions.push([id, attempted]);
+          if (decisions.length === 1) {
+            if (failure === 'throw') throw new Error('synthetic save failure');
+            return { success: false, error: 'write_failed' };
+          }
+          return { success: true, project: saved };
+        },
+        getProjects: async () => [saved],
+      } });
+      renderer.testProject = project;
+      vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
+      await renderer.showExistingAssetsDecisionModal(project);
+      renderer.setupEventListeners();
+      const attemptedButton = elements[`btn-${decision}-existing-assets`];
+      attemptedButton.focus();
+      await attemptedButton.listeners.click[0]();
+      assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), false);
+      assert.equal(elements['btn-skip-existing-assets'].disabled, false);
+      assert.equal(elements['btn-include-existing-assets'].disabled, false);
+      assert.equal(document.activeElement, attemptedButton);
+      assert.equal(elements['app-sidebar'].inert, true);
+      assert.equal(elements['app-main'].inert, true);
+      // Activate the focused control again, as a keyboard retry would.
+      await document.activeElement.listeners.click[0]();
+      assert.deepEqual(decisions, [[project.id, decision], [project.id, decision]]);
+      assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
+    }
+  }
 });
 
 test('renderer closes a stale Existing Assets decision when the selected project no longer requires it', async () => {
@@ -5349,6 +5366,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
 
   assert.match(html, /id="modal-existing-assets"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.match(html, /all existing assets in the project, including any not shown here/);
   assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Skip existing assets<\/button>/);
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Include existing assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);

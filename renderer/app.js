@@ -1979,8 +1979,8 @@ async function showExistingAssetsDecisionModal(project, packageRequestId = null)
     $('#existing-assets-modal-title').textContent = `${assets.length} existing asset${assets.length === 1 ? '' : 's'} found`;
     const skippedCount = assets.filter(file => file.excluded === true).length;
     $('#existing-assets-modal-count').textContent = skippedCount > 0
-      ? `${skippedCount} currently skipped. This choice applies to all ${assets.length} existing assets.`
-      : 'Choose which existing assets to include in packages.';
+      ? `${skippedCount} of these assets currently skipped. This choice applies to all existing assets in the project.`
+      : 'Include or skip all existing assets in this project.';
     const list = $('#existing-assets-modal-list');
     list.innerHTML = '';
     for (const file of assets.slice(0, 4)) {
@@ -2085,10 +2085,13 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
     return false;
   } finally {
     if (existingAssetsDecisionRequest === request) {
+      const restoreAttemptedChoice = isCurrentDecision();
       existingAssetsDecisionRequest = null;
       if (existingAssetsModalProjectId === projectId) {
         setExistingAssetsDecisionButtonsDisabled(false);
-        ($('#btn-include-existing-assets') || $('#modal-existing-assets'))?.focus();
+        if (restoreAttemptedChoice) {
+          ($(`#btn-${decision}-existing-assets`) || $('#modal-existing-assets'))?.focus();
+        }
       }
     }
   }

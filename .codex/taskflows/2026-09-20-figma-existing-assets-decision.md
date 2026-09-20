@@ -31,6 +31,12 @@ At initial head `a08a0190784e56189659cb600104d40ca7210403`, protected CI `355148
 
 The normal writer follow-up includes every Existing row in the decision set, discloses the currently skipped count and all-assets effect, and adds partial/all-excluded regressions. The new regression fails against the unchanged initial head; updated Figma/renderer suites pass 352/352 locally. These are pre-commit results; the new exact head requires fresh protected CI and both independent Luna/high reviews, recorded externally below. Correction-cycle count: 1 of 3.
 
+## Review correction cycle 2
+
+At head `60f36ccbb4b93276c425c53b6b3cfed07d583c08`, protected CI `35515669256` passed (1,432 passed, zero failed, one skipped), and local serial checks passed 938/938. The excluded-assets finding was closed. Review found a remaining keyboard retry problem: failed Skip saved no decision but moved focus to Include.
+
+The second normal writer follow-up restores the attempted choice only while its modal session is current. Copy explicitly discloses the existing project-wide action, including assets not shown, without treating the scoped preview count as the total affected set; backend scope behavior is unchanged. A failure-first regression demonstrates the old focus error and covers failed Include/Skip, unsuccessful results/thrown errors, and activation of the focused retry control. Current Figma/renderer checks pass 352/352 before commit. Fresh final-head CI and both independent Luna/high reviews are required and recorded externally. Correction-cycle count: 2 of 3. Current correction tests do not substitute for historical Olivia/Jenna acceptance; Chief coordinates a separate read-only historical audit.
+
 ## Final-head evidence contract
 
 This file records scope and reproducible evidence without attempting to record its own commit SHA. Consult the draft PR and native task's persistent September 20 receipt for the latest exact head, focused-check results, protected CI, two distinct Luna/high reviews, and correction-cycle count before resuming. Results are recorded externally after each committed head; do not make a self-recording documentation commit merely to repeat those results.
