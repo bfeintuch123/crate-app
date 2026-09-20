@@ -4926,6 +4926,11 @@ function establishProjectAssetBaseline(
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
     if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
     if (sourcePath && !isAcceptedProjectFilePath(project, sourcePath)) return null;
+    // A partial first cloud snapshot cannot become a completed mixed-source
+    // decision merely because the local parser finished first.
+    if (!hasEstablishedFigmaAssetBaseline(project) &&
+        Number.isSafeInteger(project.figmaAssetBaselinePendingAt) &&
+        ((project.figmaTrackedFiles || []).length > 0 || (project.figmaSession?.teamIds || []).length > 0)) return null;
 
     const establishedAt = Number.isFinite(scanStartedAt) ? scanStartedAt : Date.now();
     const baseline = {
@@ -9724,15 +9729,16 @@ function beginFigmaAssetBaselineScan(projectId, scanStartedAt = Date.now()) {
 
 function completeFigmaAssetBaselineScan(projectId, scanStartedAt = Date.now(), isCurrent = () => true, expectedPendingAt = null) {
   if (!isCurrent()) return null;
-  return mutateProject(projectId, (project) => {
-    if (
-      !Number.isSafeInteger(expectedPendingAt) ||
-      project.figmaAssetBaselinePendingAt !== expectedPendingAt
-    ) return null;
+  const result = mutateProject(projectId, (project) => {
+    if (!isCurrent()) return null;
     if (hasEstablishedFigmaAssetBaseline(project)) {
-      delete project.figmaAssetBaselinePendingAt;
-      return { changed: true, status: 'established' };
+      // Older releases established the Figma origin boundary without the
+      // shared decision. Repair only after another complete, current scan.
+      if (expectedPendingAt !== null) return null;
+      return { changed: false, status: 'established' };
     }
+    if (!Number.isSafeInteger(expectedPendingAt) ||
+        project.figmaAssetBaselinePendingAt !== expectedPendingAt) return null;
 
     project.figmaAssetBaselineEstablishedAt = Number.isSafeInteger(scanStartedAt) && scanStartedAt > 0
       ? scanStartedAt
@@ -9740,6 +9746,39 @@ function completeFigmaAssetBaselineScan(projectId, scanStartedAt = Date.now(), i
     delete project.figmaAssetBaselinePendingAt;
     return { changed: true, status: 'established' };
   }, { persistIfChanged: true, trustResultChanged: true });
+  if (result && isCurrent()) reconcileFigmaExistingAssetsDecision(projectId, isCurrent);
+  return result;
+}
+
+function reconcileFigmaExistingAssetsDecision(projectId, isCurrent) {
+  if (!isCurrent()) return;
+  const project = getProjects().find(item => item.id === projectId);
+  if (!project || !hasEstablishedFigmaAssetBaseline(project)) return;
+  if (project.assetBaseline?.status === 'awaiting-first-scan') {
+    const state = assetBaselineScans.get(projectId);
+    // A Figma receipt cannot stand in for missing/failed local source proof.
+    if (normalizeFailedRequiredAssetBaselineSources(project, project.assetBaseline).length > 0) return;
+    if (state) {
+      if (hasRequiredAssetBaselineWork(state) ||
+          ![...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key))) return;
+      reconcileProjectAssetBaselineScanSources(projectId);
+    } else if (getProjectAssetBaselineSourcePaths(project).length === 0) {
+      establishProjectAssetBaseline(projectId, null, null, project.figmaAssetBaselineEstablishedAt, {
+        allowPaused: true, isCurrent,
+      });
+    }
+    return;
+  }
+  const changed = mutateProject(projectId, current => {
+    if (!isCurrent() || current.assetBaseline?.status !== 'empty' ||
+        !getExistingAssetReviewFiles(current).some(file => file.source === 'figma-auto')) return false;
+    current.assetBaseline.status = 'decision-required';
+    return true;
+  }, { persistIfChanged: true });
+  if (changed && isCurrent()) {
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
 }
 
 function isCompleteFigmaAssetBaselineSnapshot(scanResult, trackedFiles) {
@@ -9881,6 +9920,12 @@ async function ingestFigmaAssetsIntoProject(
         reason: 'figma-project-tracked-cloud',
       });
       if (!staged.changed || staged.decision !== LIVE_CAPTURE_DECISIONS.DIRECT_ADD) return null;
+      // Honor a choice made before this first cloud snapshot finished, without
+      // reapplying it to duplicates or overriding later individual choices.
+      if (fileRecord.assetOrigin === 'existing' && proj.assetBaseline?.decision === 'skip') {
+        const key = getAssetReviewExclusionKey(fileRecord);
+        if (key) proj.excludedAssetKeys = [...new Set([...(proj.excludedAssetKeys || []), key])];
+      }
       console.log(
         `[crate][figma] asset inserted (${contextLabel}): fileKeyPresent=${!!figmaFileKey} ` +
         `name=${formatFigmaLocalNameForLog(fileRecord.name)} localName=${formatFigmaLocalNameForLog(localPath)}`
@@ -10053,7 +10098,7 @@ async function pollFigmaForProjectCore(projectId, isInitialScan = false, activat
       hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
       retryAfterMs !== null;
     const canEstablishFigmaBaseline = !isRateLimited &&
-      baselineScan?.status === 'pending' &&
+      !!baselineScan &&
       isCompleteFigmaAssetBaselineSnapshot(scanResult, rawTrackedFiles);
     let rateLimitRetryAt = 0;
     if (isRateLimited) {
@@ -16489,7 +16534,7 @@ end tell`;
           hasFigmaRateLimitDiagnostic(candidateDiagnostics) ||
           retryAfterMs !== null;
         const canEstablishFigmaBaseline = !isRateLimited &&
-          baselineScan?.status === 'pending' &&
+          !!baselineScan &&
           isCompleteFigmaAssetBaselineSnapshot(figmaScanResult, rawTrackedFiles);
 
         if (figmaScanResult.errors && figmaScanResult.errors.length > 0) {

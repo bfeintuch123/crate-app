@@ -1427,6 +1427,7 @@ async function runFigmaFirstSnapshotBaselineRegression() {
     let imported = current.files.filter(file => file.source === 'figma-auto');
     assert.equal(Number.isSafeInteger(current.figmaAssetBaselinePendingAt), true);
     assert.equal(current.figmaAssetBaselineEstablishedAt, undefined);
+    assert.equal(current.assetBaseline.status, 'awaiting-first-scan');
     assert.equal(imported.length, 1);
     assert.equal(imported[0].figmaAssetIdentity, assetA.imageRef);
     assert.equal(imported[0].assetOrigin, 'existing');
@@ -1440,6 +1441,7 @@ async function runFigmaFirstSnapshotBaselineRegression() {
     assert.equal(Number.isSafeInteger(current.figmaAssetBaselineEstablishedAt), true);
     assert.ok(current.figmaAssetBaselineEstablishedAt >= pendingAt);
     assert.equal(current.figmaAssetBaselinePendingAt, undefined);
+    assert.equal(current.assetBaseline.status, 'decision-required');
     assert.equal(imported.length, 2, 'retry should add only the asset whose first download failed');
     assert.equal(imported.find(file => file.figmaAssetIdentity === assetA.imageRef).assetOrigin, 'existing');
     assert.equal(imported.find(file => file.figmaAssetIdentity === assetB.imageRef).assetOrigin, 'existing');
@@ -1484,6 +1486,7 @@ async function runSuccessfulEmptyFigmaBaselineRegression() {
     const emptyBaselineAt = emptyStored.figmaAssetBaselineEstablishedAt;
     assert.equal(Number.isSafeInteger(emptyBaselineAt), true);
     assert.equal(emptyStored.files.some(file => file.source === 'figma-auto'), false);
+    assert.equal(emptyStored.assetBaseline.status, 'empty');
 
     await metadataTestHooks.runFigmaPoll(emptyBaselineProject.projectId, emptyBaselineProject.activationToken);
     emptyStored = storeInstance.data.projects.find(item => item.id === emptyBaselineProject.projectId);
@@ -23841,3 +23844,57 @@ test(`PSD reuse original promotion ownership watcher ${watcher} changed source $
 
 test('Figma first snapshot stays Existing across a failed download, retry, scope replacement, and deduplication', runFigmaFirstSnapshotBaselineRegression);
 test('successful empty Figma baseline is project-scoped, while legacy Existing rows keep their origin', runSuccessfulEmptyFigmaBaselineRegression);
+
+test('mixed Figma and native baseline waits for both complete sources and preserves Working Files', async () => {
+  for (const nativeFirst of [false, true]) {
+    const fixture = await createSyntheticFigmaScanProject(`Mixed baseline ${nativeFirst}`);
+    const sourcePath = path.join(TEST_HOME, `mixed-${fixture.projectId}.ai`);
+    const localPath = path.join(TEST_HOME, `mixed-${fixture.projectId}.png`);
+    fs.writeFileSync(sourcePath, 'synthetic working file');
+    fs.writeFileSync(localPath, 'synthetic local asset');
+    const stored = storeInstance.data.projects.find(item => item.id === fixture.projectId);
+    stored.files.push(
+      { path: sourcePath, name: 'Working.ai', ext: '.ai', source: 'manual-browse', projectRole: 'source', assetOrigin: 'added', addedAt: 1 },
+      { path: localPath, name: 'Linked.png', ext: '.png', source: 'scan-on-open', projectRole: 'asset', assetOrigin: 'existing', addedAt: 1 },
+    );
+    const ticket = metadataTestHooks.beginProjectAssetBaselineScan(fixture.projectId, sourcePath, fixture.activationToken);
+    assert.ok(ticket);
+    const asset = makeSyntheticFigmaAsset(fixture.fileKey, 'mixed');
+    const partial = makeSyntheticFigmaScan(fixture.fileKey, [asset]);
+    partial.errors = ['synthetic incomplete snapshot'];
+    await withSyntheticFigmaScans([partial, makeSyntheticFigmaScan(fixture.fileKey, [asset])],
+      async () => syntheticFigmaAssetResponse(true), async () => {
+        await metadataTestHooks.runFigmaPoll(fixture.projectId, fixture.activationToken);
+        if (nativeFirst) await metadataTestHooks.completeProjectAssetBaselineScan(ticket, true);
+        let current = await getProject(fixture.projectId);
+        assert.equal(current.assetBaseline.status, 'awaiting-first-scan');
+        assert.equal(current.figmaAssetBaselineEstablishedAt, undefined);
+        assert.equal((await callIpcRaw('projects:set-existing-assets-decision', fixture.projectId, 'skip')).success, false);
+        await metadataTestHooks.runFigmaPoll(fixture.projectId, fixture.activationToken);
+        if (!nativeFirst) {
+          current = await getProject(fixture.projectId);
+          assert.equal(current.assetBaseline.status, 'awaiting-first-scan');
+          await metadataTestHooks.completeProjectAssetBaselineScan(ticket, false);
+          current = await getProject(fixture.projectId);
+          assert.equal(current.assetBaseline.status, 'awaiting-first-scan');
+          const retry = metadataTestHooks.beginProjectAssetBaselineScan(fixture.projectId, sourcePath, fixture.activationToken);
+          await metadataTestHooks.completeProjectAssetBaselineScan(retry, true);
+        }
+        current = await getProject(fixture.projectId);
+        assert.equal(current.assetBaseline.status, 'decision-required');
+        const skipped = await callIpcRaw('projects:set-existing-assets-decision', fixture.projectId, 'skip');
+        assert.equal(skipped.success, true);
+        assert.equal(skipped.project.excludedAssetKeys.length, 2);
+        assert.equal(skipped.project.excludedAssetKeys.includes(sourcePath), false);
+        const keys = [...skipped.project.excludedAssetKeys];
+        roundTripFakeStore();
+        await metadataTestHooks.runFigmaPoll(fixture.projectId, fixture.activationToken);
+        current = await getProject(fixture.projectId);
+        assert.deepEqual(current.excludedAssetKeys, keys);
+        assert.ok(current.files.some(file => file.path === sourcePath));
+        const included = await callIpcRaw('projects:set-existing-assets-decision', fixture.projectId, 'include');
+        assert.equal(included.success, true);
+        assert.deepEqual(included.project.excludedAssetKeys, []);
+      });
+  }
+});

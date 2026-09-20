@@ -1,5 +1,10 @@
 # Daily Crate Ledger
 
+## 2026-09-20 — Figma existing-assets decision correction
+
+Fresh correction from canonical `v2.4.x@fca609d` under Bryant's September 20 authorization. Complete synthetic first import reproduces bulk `asset_baseline_decision_unavailable`; scoped lifecycle and explicit include/skip UI correction is tracked in `.codex/taskflows/2026-09-20-figma-existing-assets-decision.md`. Final-head checks, two Luna/high review receipts, draft PR, and remaining visual gate live externally in the PR/native persistent September 20 receipt. No owner data, live app/auth, build, version, release, ready, or merge actions.
+
+
 Purpose: durable, privacy-safe source of truth for daily Crate progress. This file exists so the 11 PM vault automation can update the Crate vault without asking Bryant to paste a daily summary.
 
 ## Operating Contract

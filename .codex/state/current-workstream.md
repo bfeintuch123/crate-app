@@ -1,5 +1,12 @@
 # Crate Current Workstream
 
+## September 20 Figma Existing Assets correction
+
+The active source correction is `.codex/taskflows/2026-09-20-figma-existing-assets-decision.md`, branch `codex/figma-existing-assets-decision-20260920`, starting from Beta 2.23 source `fca609db4373f26ab31d981f63d69b5f2ee3a1f8`. Bryant authorized the initial include/skip choice and bulk-action lifecycle repair through a reviewed draft PR. One native writer owns the branch; two independent Luna/high reviewers are required for this state-integrity change. Use the PR/native September 20 receipt for final-head CI/reviews and the next gate. Running-candidate visual evidence remains unperformed under the no-live-app scope. No ready/merge/build/release/install/provider/tester action is authorized here.
+
+Earlier entries below retain historical context and are not current authority for this correction.
+
+
 Last updated: 2026-09-19 (Figma closeout section; older workstream history retained)
 
 ## Active Figma PR Correction (2026-09-19)

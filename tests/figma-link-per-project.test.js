@@ -3775,6 +3775,109 @@ test('package waits for in-flight Figma scan downloads before selecting package 
   }
 });
 
+function existingDecisionSnapshot(count = 20) {
+  return figmaScanResult(Array.from({ length: count }, (_, index) => ({
+    url: `https://cdn.figma.example/initial-${index}.png`, imageRef: `initial-${index}`,
+    name: `Initial ${index}`, format: 'png', figmaFileKey: 'FIG22', figmaFileName: 'Brand Cloud',
+    figmaPageId: '1:1', figmaPageName: 'Page One',
+  })), [{
+    fileKey: 'FIG22', scopeMode: 'current-page', lockStatus: 'locked',
+    fileFetchStatus: 'success', assetFetchStatus: 'success',
+    lockedPageId: '1:1', lockedPageName: 'Page One', warning: null,
+  }]);
+}
+
+function reloadDecisionTestStore() {
+  fs.mkdirSync(path.dirname(fakeStoreInstance.path), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(fakeStoreInstance.path, JSON.stringify(fakeStoreInstance.data), { mode: 0o600 });
+  fakeStoreInstance.data = JSON.parse(fs.readFileSync(fakeStoreInstance.path, 'utf8'));
+}
+
+test('complete initial Figma snapshot offers an existing-assets decision and bulk skip/include', async () => {
+  const project = await createLinkedFigmaProject('Figma Initial Decision');
+  setFigmaDownloadResponse('synthetic existing asset');
+  nextFigmaScanResult = existingDecisionSnapshot();
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  const fresh = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(fresh.files.filter(file => file.assetOrigin === 'existing').length, 20);
+  const initialStatus = fresh.assetBaseline.status;
+  const initialReview = await callIpcRaw('projects:prepare-package-review', project.id);
+  const skipped = await callIpc('projects:set-existing-assets-decision', project.id, 'skip');
+  assert.equal(skipped.success, true, `bulk skip failed: ${skipped.error}`);
+  assert.equal(initialStatus, 'decision-required');
+  assert.equal(initialReview.error, 'asset_baseline_decision_required');
+  assert.equal(skipped.project.excludedAssetKeys.length, 20);
+  const skippedKeys = [...skipped.project.excludedAssetKeys];
+  reloadDecisionTestStore();
+  nextFigmaScanResult = existingDecisionSnapshot(21);
+  await callIpc('figma:scan-project', project.id);
+  const reloaded = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(reloaded.excludedAssetKeys, skippedKeys);
+  assert.equal(reloaded.files.find(file => file.figmaAssetIdentity === 'initial-20').assetOrigin, 'added');
+  const included = await callIpc('projects:set-existing-assets-decision', project.id, 'include');
+  assert.equal(included.success, true);
+  assert.equal(included.project.excludedAssetKeys.length, 0);
+  const firstPath = included.project.files[0].path;
+  await callIpc('projects:remove-file', project.id, firstPath);
+  reloadDecisionTestStore();
+  await callIpc('figma:scan-project', project.id);
+  const individual = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(individual.excludedAssetKeys, [firstPath]);
+  assert.equal((await callIpc('projects:set-existing-assets-decision', project.id, 'include')).project.excludedAssetKeys.length, 0);
+});
+
+test('complete Figma refresh repairs an older Existing decision gap without guessing Added origin', async () => {
+  for (const baselineStatus of ['awaiting-first-scan', 'empty']) {
+    storedFigmaToken = null;
+    const project = await createLinkedFigmaProject(`Figma older ${baselineStatus}`);
+    setFigmaDownloadResponse('synthetic');
+    nextFigmaScanResult = existingDecisionSnapshot(1);
+    await callIpc('figma:scan-project', project.id);
+    const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
+    const marker = stored.figmaAssetBaselineEstablishedAt;
+    stored.assetBaseline = { schemaVersion: 1, status: baselineStatus, decision: null, establishedAt: null };
+    stored.excludedAssetKeys = [stored.files[0].path];
+    reloadDecisionTestStore();
+    nextFigmaScanResult = existingDecisionSnapshot(2);
+    nextFigmaScanResult.errors = ['incomplete synthetic snapshot'];
+    await callIpc('figma:scan-project', project.id);
+    let current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(current.assetBaseline.status, baselineStatus, 'a marker alone is not a complete snapshot');
+    nextFigmaScanResult = existingDecisionSnapshot(2);
+    await callIpc('figma:scan-project', project.id);
+    current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(current.assetBaseline.status, 'decision-required');
+    assert.equal(current.figmaAssetBaselineEstablishedAt, marker);
+    assert.equal(current.files.find(file => file.figmaAssetIdentity === 'initial-1').assetOrigin, 'added');
+    assert.deepEqual(current.excludedAssetKeys, [current.files[0].path]);
+    assert.equal((await callIpc('projects:set-existing-assets-decision', project.id, 'include')).success, true);
+  }
+});
+
+test('delayed first Figma assets honor prior decisions without overriding individual choices', async () => {
+  for (const status of ['included', 'skipped', 'legacy-included']) {
+    storedFigmaToken = null;
+    const project = await createLinkedFigmaProject(`Prior ${status}`);
+    const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
+    stored.assetBaseline = { schemaVersion: 1, status, decision: status === 'skipped' ? 'skip' : 'include', establishedAt: 1 };
+    setFigmaDownloadResponse('synthetic');
+    nextFigmaScanResult = existingDecisionSnapshot(2);
+    await callIpc('figma:scan-project', project.id);
+    let current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(current.assetBaseline.status, status);
+    assert.equal(current.excludedAssetKeys.length, status === 'skipped' ? 2 : 0);
+    await callIpc('projects:remove-file', project.id, current.files[0].path);
+    const exclusions = [...(await callIpc('projects:get-all')).find(item => item.id === project.id).excludedAssetKeys];
+    reloadDecisionTestStore();
+    nextFigmaScanResult = existingDecisionSnapshot(3);
+    await callIpc('figma:scan-project', project.id);
+    current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+    assert.equal(current.assetBaseline.status, status);
+    assert.deepEqual(current.excludedAssetKeys, exclusions);
+    assert.equal(current.files.find(file => file.figmaAssetIdentity === 'initial-2').assetOrigin, 'added');
+  }
+});
+
 test('Figma asset scan records cloud resource materialization provenance after ledger add', async () => {
   const project = await createLinkedFigmaProject('Figma Provenance Materialized');
   setFigmaDownloadResponse('hero image bytes');
@@ -3984,6 +4087,9 @@ test('pre-package Figma download failure blocks output until a clean retry succe
       'existing'
     );
 
+    assert.equal(recoveredProject.assetBaseline.status, 'decision-required');
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'asset_baseline_decision_required');
+    assert.equal((await callIpc('projects:set-existing-assets-decision', project.id, 'include')).success, true);
     const packaged = await callIpc('projects:package', project.id, outputDir);
     assert.equal(packaged.success, true);
     assert.equal(packaged.copiedCount, 1);
