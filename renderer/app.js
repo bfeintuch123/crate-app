@@ -3339,6 +3339,7 @@ async function initializeAccountUI() {
 function initializeSettingsNavigation() {
   const tabs = [...document.querySelectorAll('[data-settings-tab]')];
   const select = (tab, focus = false) => {
+    tabNavigationEpoch += 1;
     for (const candidate of tabs) {
       const active = candidate === tab;
       candidate.setAttribute('aria-selected', String(active));

@@ -50,3 +50,10 @@ The reviewers also considered and rejected two candidates: a fresh explicit base
 Before cycle 1's protected run completed, a parent read-only synthetic probe at `628a271be379e404d565c4c1ac2cb6af2a071655` reproduced a second ordering defect: after two valid notice clicks A then B, A's faster project response could select A and invalidate newer B. Cycle 1 reviews were held, not passed.
 
 This normal follow-up records each admitted click as a new selection intent before its asynchronous read and carries that intent through the existing render-current guard. Regressions cover both project-read completion orders and a superseded older asset-workspace render while the newer project read waits. The new keyboard-focus assertion also exposed workspace focus restoration overriding a newly opened modal; restoration now leaves active modal focus intact while still restoring scroll. No asset decision, exclusion, watcher or native delivery policy changes. Fresh protected CI and both independent reviews are required at the new head, recorded externally. Correction-cycle count: 2 of 3.
+
+
+## Correction cycle 3: preserve nested Settings navigation
+
+Head `0eacf213616c094b452ff46860634a6b5823f007` passed protected CI `35534550479` (1,445 passed, zero failed, one skipped; the integration passed separately) and local focused 365/365. Fresh reviews confirmed prior corrections and found a distinct remaining P2: selecting a nested Settings section did not advance the navigation epoch, allowing a delayed notice to route away from an already-open Settings tab.
+
+Both click and ArrowDown regressions failed against that head. The one-line production correction advances the existing epoch in the shared Settings section-selection helper, covering click and keyboard navigation. No settings redesign or other notification policy change. Correction-cycle count: 3 of 3, final permitted writer follow-up. Fresh exact-head CI and both reviews are required and recorded externally; any remaining actionable finding must be escalated rather than starting a fourth cycle.

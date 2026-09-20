@@ -7872,3 +7872,34 @@ test('a newer notice also cancels the older notice asset-workspace render while 
   assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes('b.png'), true);
   assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
 });
+
+for (const input of ['click', 'keyboard']) {
+  test(`a later Settings section ${input} supersedes delayed Existing Assets notice navigation`, async () => {
+    const pending = createDeferred();
+    const f = existingNotificationFixture(() => pending.promise);
+    const tabs = ['general', 'privacy'].map((name, index) => {
+      const tab = f.document.createElement('button');
+      tab.setAttribute('aria-controls', `settings-panel-${name}`);
+      tab.setAttribute('aria-selected', String(index === 0));
+      f.document.getElementById(`settings-panel-${name}`).hidden = index !== 0;
+      return tab;
+    });
+    const queryAll = f.document.querySelectorAll.bind(f.document);
+    f.document.querySelectorAll = selector => selector === '[data-settings-tab]' ? tabs : queryAll(selector);
+    f.renderer.initializeSettingsNavigation();
+    f.renderer.switchTab('settings');
+    await new Promise(setImmediate);
+    const clicking = f.click('b');
+    if (input === 'click') { tabs[1].click(); tabs[1].focus(); }
+    else tabs[0].dispatchEvent({type:'keydown', key:'ArrowDown', preventDefault() {}});
+    pending.resolve(f.projects);
+    await clicking;
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'a');
+    assert.equal(f.elements['tab-settings'].classList.contains('active'), true);
+    assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
+    assert.equal(f.elements['settings-panel-privacy'].hidden, false);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+    assert.equal(f.document.activeElement, tabs[1]);
+    assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+  });
+}
