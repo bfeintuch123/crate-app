@@ -150,6 +150,11 @@ Module._load = function patchedLoad(request, parent, ...rest) {
 
 // ---------- IPC + Store + Electron stubs ----------
 const ipcHandlers = new Map();
+const ipcEventHandlers = new Map();
+const nativeNotifications = [];
+let nativeNotificationsSupported = false;
+let mainWindowVisible = true;
+let mainWindowShowCount = 0;
 const electronAppHandlers = new Map();
 const rendererMessages = [];
 const storageErrorMessages = [];
@@ -160,10 +165,10 @@ const trustedRendererMainFrame = {
 const existingRendererWindow = {
   handlers: new Map(),
   isDestroyed: () => false,
-  isVisible: () => true,
+  isVisible: () => mainWindowVisible,
   isMinimized: () => false,
   restore: () => {},
-  show: () => {},
+  show: () => { mainWindowShowCount++; },
   focus: () => {},
   moveTop: () => {},
   setFocusable: () => {},
@@ -331,6 +336,7 @@ const electronStub = {
   Tray: class { constructor() {} on() {} setToolTip() {} isDestroyed() { return true; } destroy() {} },
   ipcMain: {
     handle(channel, fn) { ipcHandlers.set(channel, fn); },
+    on(channel, fn) { ipcEventHandlers.set(channel, fn); },
   },
   dialog: {
     showOpenDialog: async () => ({ canceled: true }),
@@ -339,7 +345,12 @@ const electronStub = {
   },
   shell: { openPath: () => {} },
   nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
-  Notification: class { static isSupported() { return false; } constructor() {} show() {} },
+  Notification: class extends EventEmitter {
+    static isSupported() { return nativeNotificationsSupported; }
+    constructor(options) { super(); this.options = options; this.shown = 0; this.closed = false; nativeNotifications.push(this); }
+    show() { this.shown++; }
+    close() { this.closed = true; this.emit('close'); }
+  },
   Menu: { buildFromTemplate: () => ({}) },
 };
 setStub('electron', () => electronStub);
@@ -4822,5 +4833,130 @@ test('account sign-out prevents a delayed Quick Package from publishing its stag
   } finally {
     if (previous) STUBS.set('./parsers/index.js', previous); else STUBS.delete('./parsers/index.js');
     restoreTestAccount();
+  }
+});
+
+
+test('Existing Assets native notice is once-only, private, background-only and click never decides', async () => {
+  const prior = { ...fakeStoreInstance.data.settings };
+  nativeNotificationsSupported = true;
+  mainWindowVisible = false;
+  fakeStoreInstance.data.settings.notifications = true;
+  delete fakeStoreInstance.data.settings.existingAssetsNotifications;
+  const before = nativeNotifications.length;
+  const shows = mainWindowShowCount;
+  try {
+    assert.equal((await callIpc('settings:get')).existingAssetsNotifications, true);
+    storedFigmaToken = null;
+    const project = await createLinkedFigmaProject('Private project label');
+    setFigmaDownloadResponse('synthetic notification asset');
+    nextFigmaScanResult = existingDecisionSnapshot(2);
+    await callIpc('figma:scan-project', project.id);
+    assert.equal(nativeNotifications.length, before + 1);
+    assert.equal(mainWindowShowCount, shows, 'arrival cannot foreground Crate');
+    const notification = nativeNotifications.at(-1);
+    assert.equal(notification.shown, 1);
+    assert.equal(notification.options.title, 'Crate — Existing assets found');
+    assert.doesNotMatch(JSON.stringify(notification.options), /Private project|FIG22|Initial 0|https:/);
+    nextFigmaScanResult = existingDecisionSnapshot(3);
+    await callIpc('figma:scan-project', project.id);
+    assert.equal(nativeNotifications.length, before + 1, 'polling and later assets cannot repeat the notice');
+    const current = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+    const decision = JSON.stringify([current.assetBaseline, current.excludedAssetKeys]);
+    const clicksBefore = rendererMessages.filter(m => m.channel === 'existing-assets:review').length;
+    notification.emit('click');
+    ipcEventHandlers.get('startup:renderer-startup-data-complete')({sender:existingRendererWindow.webContents,senderFrame:trustedRendererMainFrame});
+    assert.equal(rendererMessages.filter(m => m.channel === 'existing-assets:review').length, clicksBefore + 1);
+    assert.deepEqual(rendererMessages.filter(m => m.channel === 'existing-assets:review').at(-1).data,
+      {projectId:project.id, establishedAt:current.assetBaseline.establishedAt});
+    notification.emit('click');
+    assert.equal(rendererMessages.filter(m => m.channel === 'existing-assets:review').length, clicksBefore + 1);
+    const after = (await callIpc('projects:get-all')).find(p => p.id === project.id);
+    assert.equal(JSON.stringify([after.assetBaseline, after.excludedAssetKeys]), decision);
+    assert.equal(after.files.find(f => f.figmaAssetIdentity === 'initial-2').assetOrigin, 'added');
+    assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).error, 'asset_baseline_decision_required');
+    await callIpc('projects:set-existing-assets-decision', project.id, 'skip');
+    assert.equal(notification.closed, true);
+  } finally { fakeStoreInstance.data.settings = prior; nativeNotificationsSupported = false; mainWindowVisible = true; }
+});
+
+test('Existing Assets notification settings default on, persist off, and obey global and OS gates', async () => {
+  const prior = { ...fakeStoreInstance.data.settings };
+  try {
+    assert.equal(fakeStoreOptions.defaults.settings.existingAssetsNotifications, true);
+    delete fakeStoreInstance.data.settings.existingAssetsNotifications;
+    assert.equal((await callIpc('settings:get')).existingAssetsNotifications, true);
+    await callIpc('settings:update', 'existingAssetsNotifications', false);
+    reloadDecisionTestStore();
+    assert.equal((await callIpc('settings:get')).existingAssetsNotifications, false);
+    await callIpc('settings:update', 'existingAssetsNotifications', 'invalid');
+    assert.equal((await callIpc('settings:get')).existingAssetsNotifications, false);
+    for (const gate of ['type-off', 'global-off', 'unsupported', 'foreground']) {
+      fakeStoreInstance.data.settings.notifications = gate !== 'global-off';
+      fakeStoreInstance.data.settings.existingAssetsNotifications = gate !== 'type-off';
+      nativeNotificationsSupported = gate !== 'unsupported';
+      mainWindowVisible = gate === 'foreground';
+      storedFigmaToken = null;
+      const project = await createLinkedFigmaProject(`Suppressed ${gate}`);
+      const before = nativeNotifications.length;
+      setFigmaDownloadResponse('synthetic'); nextFigmaScanResult = existingDecisionSnapshot(1);
+      await callIpc('figma:scan-project', project.id);
+      assert.equal(nativeNotifications.length, before, gate);
+      assert.equal((await callIpc('projects:get-all')).find(p => p.id === project.id).assetBaseline.status, 'decision-required');
+      await callIpc('projects:delete', project.id);
+    }
+  } finally { fakeStoreInstance.data.settings = prior; nativeNotificationsSupported = false; mainWindowVisible = true; }
+});
+
+test('Existing Assets stale notice clicks are rejected after resolution, deletion, preference off or account change', async () => {
+  const prior = { ...fakeStoreInstance.data.settings };
+  try {
+    for (const boundary of ['resolved', 'deleted', 'paused', 'type-off', 'global-off', 'account']) {
+      nativeNotificationsSupported = true; mainWindowVisible = false;
+      fakeStoreInstance.data.settings.notifications = true;
+      fakeStoreInstance.data.settings.existingAssetsNotifications = true;
+      storedFigmaToken = null;
+      const project = await createLinkedFigmaProject(`Stale ${boundary}`);
+      setFigmaDownloadResponse('synthetic'); nextFigmaScanResult = existingDecisionSnapshot(1);
+      const count = nativeNotifications.length;
+      await callIpc('figma:scan-project', project.id);
+      assert.equal(nativeNotifications.length, count + 1);
+      const notification = nativeNotifications.at(-1);
+      if (boundary === 'resolved') await callIpc('projects:set-existing-assets-decision', project.id, 'include');
+      if (boundary === 'deleted') await callIpc('projects:delete', project.id);
+      if (boundary === 'paused') await callIpc('projects:pause', project.id);
+      if (boundary === 'type-off') await callIpc('settings:update', 'existingAssetsNotifications', false);
+      if (boundary === 'global-off') await callIpc('settings:update', 'notifications', false);
+      if (boundary === 'account') { testAccountSession.invalidate(); testAccountSession.publish('signed_out', '', null); }
+      const before = rendererMessages.length, shows = mainWindowShowCount;
+      notification.emit('click');
+      assert.equal(rendererMessages.length, before, boundary);
+      assert.equal(mainWindowShowCount, shows, boundary);
+      if (boundary === 'account') restoreTestAccount();
+      if (boundary !== 'deleted') await callIpc('projects:delete', project.id);
+    }
+  } finally { restoreTestAccount(); fakeStoreInstance.data.settings = prior; nativeNotificationsSupported = false; mainWindowVisible = true; }
+});
+
+test('turning off Existing Assets notices leaves package completion notifications enabled', async () => {
+  const prior = { ...fakeStoreInstance.data.settings };
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-notification-independence-'));
+  try {
+    nativeNotificationsSupported = true; mainWindowVisible = false;
+    await callIpc('settings:update', 'notifications', true);
+    await callIpc('settings:update', 'existingAssetsNotifications', false);
+    storedFigmaToken = null;
+    const project = await createLinkedFigmaProject('Synthetic Notice Independence');
+    setFigmaDownloadResponse('synthetic'); nextFigmaScanResult = existingDecisionSnapshot(1);
+    await callIpc('figma:scan-project', project.id);
+    await callIpc('projects:set-existing-assets-decision', project.id, 'include');
+    const before = nativeNotifications.length;
+    const result = await callIpc('projects:package', project.id, path.join(tmpRoot, 'out'));
+    assert.equal(result.success, true);
+    assert.equal(nativeNotifications.length, before + 1);
+    assert.equal(nativeNotifications.at(-1).options.title, 'Project Packaged!');
+  } finally {
+    fakeStoreInstance.data.settings = prior; nativeNotificationsSupported = false; mainWindowVisible = true;
+    fs.rmSync(tmpRoot, {recursive:true,force:true});
   }
 });

@@ -7695,3 +7695,211 @@ test('recovery matrix 11: replayed snapshot cannot generate an error retry loop'
   assert.equal(f.reads.length, 1); f.assertLocked('reconciling');
   assert.equal(f.evaluate('projectCreationRecoveryRead'), null);
 });
+
+
+function existingNotificationFixture(getProjectsOverride) {
+  const {document, elements} = createInteractiveRendererDom();
+  const projects = ['a', 'b'].map(id => ({id, name: `Synthetic ${id}`, type:'branding', status:'watching',
+    files:[{name:`${id}.png`,path:`/synthetic/${id}.png`,source:'figma-auto',assetOrigin:'existing',projectRole:'asset'}],
+    pendingFiles:[],excludedAssetKeys:[],assetBaseline:{status:'decision-required',establishedAt:1,decision:null}}));
+  let handler, decisions = 0, packages = 0;
+  const noOp = () => {};
+  const renderer = loadRendererHelpers(document, {crate:{
+    getProjects: getProjectsOverride || (async () => projects),
+    getSettings: async () => ({}), getUsage: async () => ({}), getFigmaStatus: async () => ({connected:false}),
+    setExistingAssetsDecision: async () => {decisions++;}, preparePackageReview: async () => {packages++;},
+    onExistingAssetsReview: callback => {handler=callback;},
+    onFilesUpdated:noOp,onProjectUpdated:noOp,onPendingFilesUpdated:noOp,onPackageTrigger:noOp,
+    onFigmaAuthError:noOp,onFigmaScanStarted:noOp,onFigmaScanComplete:noOp,onFigmaScanError:noOp,
+  }});
+  renderer.testProjects = projects;
+  vm.runInContext("state.projects=testProjects;state.selectedProjectId='a';accountStatus={canUseWorkspace:true,identity:{id:'synthetic'}};",renderer);
+  document.querySelector('#tab-current-project').classList.add('active');
+  renderer.setupMainProcessListeners();
+  return {document,elements,projects,renderer,click:(id='b',establishedAt=1)=>handler({projectId:id,establishedAt}),decisions:()=>decisions,packages:()=>packages};
+}
+
+test('Existing Assets notification opens the sole current same/cross-project dialog without deciding or packaging', async () => {
+  for (const target of ['a','b']) {
+    const f=existingNotificationFixture();
+    await f.renderer.renderFiles();
+    const previous=vm.runInContext('existingAssetsModalSessionId',f.renderer);
+    await f.click(target);
+    assert.equal(vm.runInContext('state.selectedProjectId',f.renderer),target);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'),false);
+    assert.deepEqual(Array.from(f.renderer.getVisibleBlockingModalIds()),['modal-existing-assets']);
+    assert.ok(vm.runInContext('existingAssetsModalSessionId',f.renderer)>previous);
+    assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes(`${target}.png`),true);
+    assert.equal(f.document.activeElement,f.elements['btn-include-existing-assets']);
+    assert.equal(f.decisions(),0);assert.equal(f.packages(),0);
+  }
+});
+
+test('Existing Assets notification preserves unrelated dialogs and in-flight decisions', async () => {
+  for(const modal of ['modal-success','modal-package','modal-upgrade','modal-existing-assets']) {
+    const f=existingNotificationFixture();
+    if(modal==='modal-existing-assets') {
+      await f.renderer.renderFiles();
+      vm.runInContext('existingAssetsDecisionRequest={projectId:"a"};',f.renderer);
+    } else { f.elements[modal].classList.remove('hidden'); f.renderer.claimModalLease(modal); }
+    await f.click();
+    assert.equal(vm.runInContext('state.selectedProjectId',f.renderer),'a',modal);
+    assert.equal(f.elements[modal].classList.contains('hidden'),false,modal);
+    assert.equal(f.decisions(),0);assert.equal(f.packages(),0);
+  }
+});
+
+test('Existing Assets notification ignores resolved, missing, wrong-generation and stale selection/account reads', async () => {
+  for(const boundary of ['resolved','missing','generation','selection','account']) {
+    const pending=createDeferred();
+    const f=existingNotificationFixture(()=>pending.promise);
+    const clicking=f.click('b',boundary==='generation'?2:1);
+    if(boundary==='resolved') f.projects[1].assetBaseline.status='included';
+    if(boundary==='missing') f.projects.pop();
+    if(boundary==='selection') f.renderer.setSelectedProject('a',{invalidate:true});
+    if(boundary==='account') vm.runInContext('accountWorkspaceEpoch++;accountStatus.canUseWorkspace=false;',f.renderer);
+    pending.resolve(f.projects);await clicking;
+    assert.equal(vm.runInContext('state.selectedProjectId',f.renderer),'a',boundary);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'),true,boundary);
+  }
+});
+
+test('Existing Assets Settings toggle renders absent as on and saves independent explicit false', async () => {
+  const {document,elements}=createInteractiveRendererDom();const updates=[];
+  const renderer=loadRendererHelpers(document,{crate:{updateSetting:async(key,value)=>{updates.push([key,value]);return {notifications:true,[key]:value};}}});
+  vm.runInContext('state.settings={notifications:true};',renderer);
+  renderer.renderSettingsControls();
+  assert.equal(elements['toggle-existing-assets-notifications'].checked,true);
+  renderer.setupEventListeners();
+  elements['toggle-existing-assets-notifications'].checked=false;
+  await elements['toggle-existing-assets-notifications'].listeners.change[0]();
+  assert.deepEqual(updates,[['existingAssetsNotifications',false]]);
+  renderer.renderSettingsControls();
+  assert.equal(elements['toggle-existing-assets-notifications'].checked,false);
+  assert.equal(elements['toggle-notifications'].checked,true);
+});
+
+
+test('Existing Assets notification preserves active Add Files work', async () => {
+  const f=existingNotificationFixture();
+  vm.runInContext('activeAddFilesOperation={projectId:"a",requestId:1};',f.renderer);
+  await f.click();
+  assert.equal(vm.runInContext('state.selectedProjectId',f.renderer),'a');
+  assert.equal(vm.runInContext('activeAddFilesOperation.requestId',f.renderer),1);
+});
+
+test('a later Settings or Projects tab choice supersedes delayed Existing Assets notification navigation', async () => {
+  for (const tab of ['settings', 'projects']) {
+    const pending = createDeferred();
+    const f = existingNotificationFixture(() => pending.promise);
+    f.renderer.setupEventListeners();
+    const clicking = f.click('b');
+    const chosen = [...f.document.querySelectorAll('.app-tab')].find(element => element.dataset.tab === tab);
+    chosen.click();
+    chosen.focus();
+    pending.resolve(f.projects);
+    await clicking;
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'a', tab);
+    assert.equal(f.elements[`tab-${tab}`].classList.contains('active'), true, tab);
+    assert.equal(f.elements['tab-current-project'].classList.contains('active'), false, tab);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true, tab);
+    assert.equal(f.document.activeElement, chosen, tab);
+    assert.equal(f.decisions(), 0);
+    assert.equal(f.packages(), 0);
+  }
+});
+
+test('a later tab choice also cancels notification rendering while its asset workspace is loading', async () => {
+  for (const tab of ['settings', 'projects']) {
+    const pending = createDeferred();
+    const f = existingNotificationFixture();
+    const loadWorkspace = f.renderer.window.crate.getAssetWorkspace;
+    f.renderer.window.crate.getAssetWorkspace = () => pending.promise;
+    f.renderer.setupEventListeners();
+    const clicking = f.click('b');
+    await new Promise(setImmediate);
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b');
+    const chosen = [...f.document.querySelectorAll('.app-tab')].find(element => element.dataset.tab === tab);
+    chosen.click();
+    chosen.focus();
+    pending.resolve(await loadWorkspace('b'));
+    await clicking;
+    assert.equal(f.elements[`tab-${tab}`].classList.contains('active'), true, tab);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true, tab);
+    assert.equal(f.document.activeElement, chosen, tab);
+    assert.equal(f.decisions(), 0);
+    assert.equal(f.packages(), 0);
+  }
+});
+
+
+test('latest Existing Assets notice click wins in either project-read completion order', async () => {
+  for (const order of ['older-first', 'newer-first']) {
+    const first = createDeferred(), second = createDeferred();
+    let reads = 0;
+    const f = existingNotificationFixture(() => (++reads === 1 ? first.promise : second.promise));
+    const older = f.click('a');
+    const newer = f.click('b');
+    if (order === 'older-first') {
+      first.resolve(f.projects); await older;
+      assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+      second.resolve(f.projects); await newer;
+    } else {
+      second.resolve(f.projects); await newer;
+      first.resolve(f.projects); await older;
+    }
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b', order);
+    assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes('b.png'), true, order);
+    assert.equal(f.document.activeElement, f.elements['btn-include-existing-assets'], order);
+    assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+  }
+});
+
+test('a newer notice also cancels the older notice asset-workspace render while its own read waits', async () => {
+  const read = createDeferred(), workspace = createDeferred();
+  let reads = 0;
+  const f = existingNotificationFixture(() => (++reads === 1 ? Promise.resolve(f.projects) : read.promise));
+  const loadWorkspace = f.renderer.window.crate.getAssetWorkspace;
+  f.renderer.window.crate.getAssetWorkspace = projectId => projectId === 'a' ? workspace.promise : loadWorkspace(projectId);
+  const older = f.click('a');
+  await new Promise(setImmediate);
+  const newer = f.click('b');
+  workspace.resolve(await loadWorkspace('a'));
+  await older;
+  assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+  read.resolve(f.projects); await newer;
+  assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'b');
+  assert.equal(getElementTreeText(f.elements['existing-assets-modal-list']).includes('b.png'), true);
+  assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+});
+
+for (const input of ['click', 'keyboard']) {
+  test(`a later Settings section ${input} supersedes delayed Existing Assets notice navigation`, async () => {
+    const pending = createDeferred();
+    const f = existingNotificationFixture(() => pending.promise);
+    const tabs = ['general', 'privacy'].map((name, index) => {
+      const tab = f.document.createElement('button');
+      tab.setAttribute('aria-controls', `settings-panel-${name}`);
+      tab.setAttribute('aria-selected', String(index === 0));
+      f.document.getElementById(`settings-panel-${name}`).hidden = index !== 0;
+      return tab;
+    });
+    const queryAll = f.document.querySelectorAll.bind(f.document);
+    f.document.querySelectorAll = selector => selector === '[data-settings-tab]' ? tabs : queryAll(selector);
+    f.renderer.initializeSettingsNavigation();
+    f.renderer.switchTab('settings');
+    await new Promise(setImmediate);
+    const clicking = f.click('b');
+    if (input === 'click') { tabs[1].click(); tabs[1].focus(); }
+    else tabs[0].dispatchEvent({type:'keydown', key:'ArrowDown', preventDefault() {}});
+    pending.resolve(f.projects);
+    await clicking;
+    assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'a');
+    assert.equal(f.elements['tab-settings'].classList.contains('active'), true);
+    assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
+    assert.equal(f.elements['settings-panel-privacy'].hidden, false);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+    assert.equal(f.document.activeElement, tabs[1]);
+    assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+  });
+}
