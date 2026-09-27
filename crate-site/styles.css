@@ -1358,7 +1358,7 @@ button {
 }
 /* Keep the approved folder cap while the accordion body grows with its text. */
 .faq .folder-top { height:230px }
-.faq::before { top:200px; border:1px solid rgba(255,255,255,.24); border-top:0; border-radius:0 0 26px 26px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light }
+.faq::before { top:180px; border:1px solid rgba(255,255,255,.24); border-top:0; border-radius:0 0 26px 26px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light }
 @media(max-width:700px) {
   .faq .folder-top { height:170px }
   .faq::before { top:120px }
@@ -1370,3 +1370,70 @@ button {
   .demo-window { align-items:flex-start; padding-top:59px }
   .quick-workflow { padding-top:5px }
 }
+
+/* Full-page review: restore the hero and footer to the approved frame geometry. */
+.site-header { height:140px; position:relative }
+.wordmark { position:absolute; left:72px; top:51px }
+.site-nav { position:absolute; right:332px; top:59px; width:188px; justify-content:space-between; gap:0; margin:0 }
+.site-nav a { line-height:16px }
+.header-download { position:absolute; right:72px; top:43px }
+.hero-folder { width:313.6px; height:254.8px; object-fit:fill; margin-top:42px }
+.hero h1 { margin-top:38.2px; margin-bottom:32px }
+.hero-note { margin-top:32px; font-size:12px; line-height:16px; letter-spacing:0 }
+.supports h2 { line-height:53px }
+.apps-viewport { margin-top:71px; height:64px }
+.apps-track,.apps-set { height:100% }
+.app-item { margin-left:0; padding-right:72px; font-weight:400; line-height:24px }
+.apps-set { padding-left:64px }
+.app-item:first-child { margin-left:0 }
+.supports-note { margin-top:18px; line-height:13px }
+.how::before,.pricing::before { bottom:-160px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light; background-size:auto,721.3px 721.3px }
+.faq::before { background-size:auto,721.3px 721.3px }
+.footer { padding-top:96px }
+.footer h2 { font-size:44px; line-height:59px; margin-bottom:26px }
+.footer>p { margin-top:26px; font-size:11px; line-height:13px; letter-spacing:0 }
+.footer-bottom { margin-top:26px; padding-top:41px; justify-content:center; font-size:12px; line-height:20px }
+@media(min-width:701px) and (max-width:1050px) {
+  .wordmark { left:40px }
+  .header-download { right:40px }
+  .site-nav { right:290px }
+  .demo-card { width:min(100%,660px) }
+}
+@media(max-width:700px) {
+  .site-header { height:85px }
+  .wordmark { left:24px; top:31px; line-height:22px }
+  .site-nav { top:34px; right:24px; width:172px; gap:0; margin:0 }
+  .site-nav a { font-size:10px; line-height:16px }
+  .hero-folder { width:180px; height:146.25px; margin-top:61px }
+  .hero h1 { margin-top:49.75px; margin-bottom:46px }
+  .hero-note { margin-top:30px; font-size:10px }
+  .supports h2 { line-height:40px }
+  .apps-viewport { height:48px; margin-top:61px }
+  .apps-set { padding-left:24px }
+  .app-item { font-size:15px; line-height:18px; gap:10.5px; margin-left:0; padding-right:54px }
+  .app-item:first-child { margin-left:0 }
+  .app-item img { width:33px; height:33px }
+  .supports-note { margin-top:29px }
+  .workflow-steps { height:auto; min-height:110px }
+  .step-number { line-height:14px }
+  .step { gap:8px }
+  .workflow>.demo-control { align-self:flex-end; flex:none }
+  .footer { padding-top:56px }
+  .footer h2 { font-size:30px; line-height:40px; margin-bottom:22px }
+  .footer>p { margin-top:22px; font-size:10px; line-height:16px }
+  .footer-bottom { margin-top:22px; padding-top:37px; gap:4px; font-size:10px; line-height:16px }
+  .footer-bottom a { font-size:12px; line-height:20px }
+}
+@media(max-width:360px) {
+  .site-nav { width:150px }
+  .site-nav a { font-size:9px }
+}
+.supports h2 { padding-top:58px }
+.apps-viewport { margin-top:70px }
+@media(max-width:700px) {
+  .supports h2 { padding-top:24px }
+  .apps-viewport { margin-top:56px }
+  .supports-note { margin-top:20px; line-height:14px }
+}
+.hero h1 { letter-spacing:0; color:#292929 }
+.hero-folder { object-fit:cover }

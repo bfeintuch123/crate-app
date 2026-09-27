@@ -65,6 +65,10 @@ faqItems.forEach((item, index) => item.querySelector('button').addEventListener(
     // mobile answer can also move the newly selected question above the viewport.
     if (bounds.top < 24 || bounds.top > window.innerHeight - 100) {
       target.scrollIntoView({ block: 'start', behavior: 'instant' });
+      if (!mobile.matches) {
+        target.setAttribute('tabindex', '-1');
+        target.focus({ preventScroll: true });
+      }
     }
   }
 }));
