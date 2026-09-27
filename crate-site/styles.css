@@ -226,7 +226,7 @@ button {
 
 .supports .folder-top {
   height:450px;
-  background-image:url('assets/design/supports-desktop.png')
+  background-image:url('assets/design/supports-desktop.png?v=e1d6214d1d22ffe9')
 }
 
 .supports::before {
@@ -304,7 +304,7 @@ button {
   width:calc(100% + 72px);
   left:-36px;
   height:1470px;
-  background-image:url('assets/design/how-desktop.png')
+  background-image:url('assets/design/how-desktop.png?v=1a236593f98e3090')
 }
 
 .how::before {
@@ -532,7 +532,7 @@ button {
   width:calc(100% + 72px);
   left:-36px;
   height:822px;
-  background-image:url('assets/design/pricing-desktop.png')
+  background-image:url('assets/design/pricing-desktop.png?v=43f3863aa08797b9')
 }
 
 .pricing::before {
@@ -606,7 +606,7 @@ button {
   width:calc(100% + 72px);
   left:-36px;
   height:1390px;
-  background-image:url('assets/design/faq-desktop.png')
+  background-image:url('assets/design/faq-desktop.png?v=80cabd8a882c886d')
 }
 
 .faq::before {
@@ -814,7 +814,7 @@ button {
   }
   .supports .folder-top {
     height:340px;
-    background-image:url('assets/design/supports-mobile.png')
+    background-image:url('assets/design/supports-mobile.png?v=2364647ca0951209')
   }
   .supports::before {
     top:110px
@@ -849,7 +849,7 @@ button {
     width:calc(100% + 72px);
     left:-36px;
     height:1452px;
-    background-image:url('assets/design/how-mobile.png')
+    background-image:url('assets/design/how-mobile.png?v=9ee579ef658adbea')
   }
   .how::before {
     top:115px
@@ -984,7 +984,7 @@ button {
     width:calc(100% + 72px);
     left:-36px;
     height:880px;
-    background-image:url('assets/design/pricing-mobile.png')
+    background-image:url('assets/design/pricing-mobile.png?v=16f983d743e58c10')
   }
   .pricing::before {
     top:120px
@@ -1295,7 +1295,7 @@ button {
   .price-card.enterprise p { margin-top:19px; line-height:20px }
   .price-card.enterprise .price-email { font-size:11px; line-height:20px; margin-top:2px }
   .price-amount { line-height:78px }
-  .faq .folder-top { display:block; height:1253px; background-image:url('assets/design/faq-mobile.png') }
+  .faq .folder-top { display:block; height:1253px; background-image:url('assets/design/faq-mobile.png?v=434a1a210c04fd87') }
   .faq::before { top:110px; border-radius:0 0 26px 26px }
   .faq h2 { padding-top:24px; line-height:40px }
   .faq-list { margin-top:44px; min-height:0; padding-bottom:52px }
@@ -1358,7 +1358,7 @@ button {
 }
 /* Keep the approved folder cap while the accordion body grows with its text. */
 .faq .folder-top { height:230px }
-.faq::before { top:180px; border:1px solid rgba(255,255,255,.24); border-top:0; border-radius:0 0 26px 26px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light }
+.faq::before { top:180px; border:1px solid rgba(255,255,255,.24); border-top:0; border-radius:0 0 26px 26px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c'); background-blend-mode:normal,soft-light }
 @media(max-width:700px) {
   .faq .folder-top { height:170px }
   .faq::before { top:120px }
@@ -1387,7 +1387,7 @@ button {
 .apps-set { padding-left:64px }
 .app-item:first-child { margin-left:0 }
 .supports-note { margin-top:18px; line-height:13px }
-.how::before,.pricing::before { bottom:-160px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light; background-size:auto,721.3px 721.3px }
+.how::before,.pricing::before { bottom:-160px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c'); background-blend-mode:normal,soft-light; background-size:auto,721.3px 721.3px }
 .faq::before { background-size:auto,721.3px 721.3px }
 .footer { padding-top:96px }
 .footer h2 { font-size:44px; line-height:59px; margin-bottom:26px }
@@ -1443,10 +1443,10 @@ button {
 .folder-stack::before,.folder-section::before { display:none }
 .folder-section .folder-top { display:block; inset:0 0 auto; width:100%; height:calc(100% + 180px); background:none; filter:drop-shadow(0 -14px 18px rgba(0,0,0,.45)); --cap-height:180px; --folder-color:#131313 }
 .folder-top::before,.folder-top::after { content:''; position:absolute; inset:0; pointer-events:none }
-.folder-top::before { background-color:var(--folder-color); background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light; background-size:auto,721.3135px 721.3135px; mask-image:var(--cap-mask),linear-gradient(#fff,#fff); mask-position:top,bottom; mask-size:100% var(--cap-height),100% calc(100% - var(--cap-height) + 1px); mask-repeat:no-repeat }
+.folder-top::before { background-color:var(--folder-color); background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c'); background-blend-mode:normal,soft-light; background-size:auto,721.3135px 721.3135px; mask-image:var(--cap-mask),linear-gradient(#fff,#fff); mask-position:top,bottom; mask-size:100% var(--cap-height),100% calc(100% - var(--cap-height) + 1px); mask-repeat:no-repeat }
 .folder-top::after { background:var(--cap-stroke) top / 100% var(--cap-height) no-repeat }
 .supports .folder-top { filter:none; --folder-color:#181817 }
-.supports .folder-top::before { background-image:linear-gradient(rgba(24,24,23,.85),rgba(24,24,23,.85)),url('assets/design/folder-texture.png') }
+.supports .folder-top::before { background-image:linear-gradient(rgba(24,24,23,.85),rgba(24,24,23,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c') }
 .supports .folder-top::after { display:none }
 .faq .folder-top { height:100% }
 .faq .folder-top::before { border-radius:0 0 40px 40px }
