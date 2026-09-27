@@ -1505,16 +1505,17 @@ button {
 @media(max-width:700px) {
   .folder-stack {
     --gutter:24px;
-    --tab-end:calc(var(--content-x) + 28.717949cqw - var(--gutter));
+    --tab-end:max(calc(var(--content-x) + 88px),28.717949cqw);
     --cap-height:120px;
     --shelf-y:64px;
-    --corner-x:6.153846cqw;
+    --corner-x:max(6.153846cqw,24px);
     --corner-y:24px;
     --left-corner-y:24px;
-    --slope-width:28.205128cqw;
+    --slope-width:max(28.205128cqw,110px);
     --cap-slope:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2065%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%20V65%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
     --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2064%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
   }
+  .pricing { --shelf-y:64px; --corner-y:24px; --left-corner-y:24px }
   .faq { --shelf-y:75.584px; --corner-y:28.344px; --left-corner-y:28.344px }
   .faq .folder-top::before,.faq .folder-top::after { border-bottom-left-radius:24px; border-bottom-right-radius:24px }
 }
