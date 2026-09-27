@@ -72,4 +72,24 @@ faqItems.forEach((item, index) => item.querySelector('button').addEventListener(
     }
   }
 }));
-mobile.addEventListener?.('change', () => { if (!faqInteracted) setFaq(mobile.matches ? -1 : 0); });
+// Remember the reading context before a resize changes the FAQ's layout.
+const faqSection = document.querySelector('.faq');
+const footer = document.querySelector('.footer');
+let readingFaq = false;
+window.addEventListener('scroll', () => {
+  const bounds = faqSection.getBoundingClientRect();
+  const footerFullyVisible = footer.getBoundingClientRect().bottom <= window.innerHeight + 1;
+  readingFaq = bounds.top < window.innerHeight && bounds.bottom > 0 && !footerFullyVisible;
+}, { passive: true });
+mobile.addEventListener?.('change', () => {
+  if (!faqInteracted) { setFaq(mobile.matches ? -1 : 0); return; }
+  const selected = faqItems.find(item => item.classList.contains('is-active'));
+  if (!selected || !readingFaq) return;
+  requestAnimationFrame(() => {
+    const target = selected.querySelector(mobile.matches ? 'button' : '.faq-answer');
+    const bounds = target.getBoundingClientRect();
+    if (bounds.top < 24 || bounds.top > window.innerHeight - 100) {
+      target.scrollIntoView({ block: 'start', behavior: 'instant' });
+    }
+  });
+});
