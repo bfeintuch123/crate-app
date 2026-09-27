@@ -738,7 +738,7 @@ button {
 }
 
 @media(max-width:1050px) and (min-width:701px) {
-  .site-header,.section-inner {
+  .site-header {
     padding-left:40px;
     padding-right:40px
   }
@@ -801,9 +801,6 @@ button {
   .hero-note {
     font-size:9px;
     margin-top:18px
-  }
-  .section-inner {
-    padding:0 24px
   }
   .folder-section h2 {
     font-size:30px;
@@ -1438,33 +1435,89 @@ button {
 .hero h1 { letter-spacing:0; color:#292929 }
 .hero-folder { object-fit:cover }
 
-/* Verified Figma contours: the cap is independent of the expandable body.
-   A single texture spans both; no exported raster bottom can enter content. */
+/* The content frame and folder tab share one section-width coordinate system.
+   At wide sizes the approved curves hold their size while straight runs extend.
+   The body remains full bleed and independent of the FAQ accordion height. */
 .folder-stack::before,.folder-section::before { display:none }
-.folder-section .folder-top { display:block; inset:0 0 auto; width:100%; height:calc(100% + 180px); background:none; filter:drop-shadow(0 -14px 18px rgba(0,0,0,.45)); --cap-height:180px; --folder-color:#131313 }
-.folder-top::before,.folder-top::after { content:''; position:absolute; inset:0; pointer-events:none }
-.folder-top::before { background-color:var(--folder-color); background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c'); background-blend-mode:normal,soft-light; background-size:auto,721.3135px 721.3135px; mask-image:var(--cap-mask),linear-gradient(#fff,#fff); mask-position:top,bottom; mask-size:100% var(--cap-height),100% calc(100% - var(--cap-height) + 1px); mask-repeat:no-repeat }
-.folder-top::after { background:var(--cap-stroke) top / 100% var(--cap-height) no-repeat }
+.folder-stack {
+  container-type:inline-size;
+  --frame-width:min(100cqw,1440px);
+  --frame-x:calc((100cqw - var(--frame-width))/2);
+  --gutter:72px;
+  --content-x:calc(var(--frame-x) + var(--gutter));
+  --tab-end:calc(var(--content-x) + min(calc(28.194444cqw - var(--gutter)),334px));
+  --cap-height:180px;
+  --shelf-y:122px;
+  --corner-x:min(2.777778cqw,40px);
+  --corner-y:40px;
+  --left-corner-y:40px;
+  --slope-width:min(14.583333cqw,210px);
+  --cap-slope:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20210%20123%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C20%200%2032%208%2045%2018%20L171%20110%20C183%20119%20193%20122%20210%20122%20V123%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
+  --cap-corner:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2040%2040%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C22%200%2040%2018%2040%2040%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
+  --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20210%20122%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C20%200%2032%208%2045%2018%20L171%20110%20C183%20119%20193%20122%20210%20122%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E");
+  --corner-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2040%2040%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C22%200%2040%2018%2040%2040%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
+}
+.folder-section .section-inner { width:var(--frame-width); padding-inline:var(--gutter) }
+.folder-section .folder-top {
+  display:block;
+  inset:0 0 auto;
+  width:100%;
+  height:calc(100% + var(--cap-height));
+  background:none;
+  filter:drop-shadow(0 -14px 18px rgba(0,0,0,.45));
+  --folder-color:#131313
+}
+.folder-top::before,.folder-top::after {
+  content:'';
+  position:absolute;
+  inset:0;
+  pointer-events:none;
+  border-top-left-radius:var(--corner-x) var(--left-corner-y);
+  mask-image:linear-gradient(#fff,#fff),var(--cap-slope),linear-gradient(#fff,#fff),var(--cap-corner),linear-gradient(#fff,#fff);
+  mask-size:calc(var(--tab-end) + 1px) var(--cap-height),var(--slope-width) calc(var(--shelf-y) + 1px),calc(100% - var(--corner-x) + 1px) calc(var(--cap-height) - var(--shelf-y) + 1px),var(--corner-x) calc(var(--corner-y) + 1px),100% calc(100% - var(--shelf-y) - var(--corner-y) + 2px);
+  mask-position:left top,var(--tab-end) top,left var(--shelf-y),right var(--shelf-y),left bottom;
+  mask-repeat:no-repeat
+}
+.folder-top::before {
+  background-color:var(--folder-color);
+  background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c');
+  background-blend-mode:normal,soft-light;
+  background-size:auto,721.3135px 721.3135px
+}
+.folder-top::after {
+  border-top:1.25px solid rgba(255,255,255,.24);
+  border-left:1.25px solid rgba(255,255,255,.24);
+  border-right:1.25px solid rgba(255,255,255,.24);
+  background-image:var(--slope-stroke),linear-gradient(rgba(255,255,255,.24),rgba(255,255,255,.24)),var(--corner-stroke);
+  background-size:var(--slope-width) calc(var(--shelf-y) + 1px),calc(100% - var(--tab-end) - var(--slope-width) - var(--corner-x) + 4px) 1.25px,var(--corner-x) calc(var(--corner-y) + 1px);
+  background-position:var(--tab-end) top,calc(var(--tab-end) + var(--slope-width) - 2px) var(--shelf-y),right var(--shelf-y);
+  background-repeat:no-repeat
+}
 .supports .folder-top { filter:none; --folder-color:#181817 }
 .supports .folder-top::before { background-image:linear-gradient(rgba(24,24,23,.85),rgba(24,24,23,.85)),url('assets/design/folder-texture.png?v=7535ee414865eb0c') }
 .supports .folder-top::after { display:none }
+.pricing { --shelf-y:91.8588px; --corner-y:30.1176px; --left-corner-y:30.1176px }
 .faq .folder-top { height:100% }
-.faq .folder-top::before { border-radius:0 0 40px 40px }
+.faq .folder-top::before,.faq .folder-top::after { border-bottom-left-radius:40px; border-bottom-right-radius:40px }
+.faq .folder-top::after { border-bottom:1.25px solid rgba(255,255,255,.24) }
 .footer-bottom a { text-decoration:underline; text-underline-offset:3px }
- .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M40%200%20H406%20C426%200%20438%208%20451%2018%20L577%20110%20C589%20119%20599%20122%20616%20122%20H1400%20C1422%20122%201440%20140%201440%20162%20V180%20H0%20L0%2040%20C0%2018%2018%200%2040%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M40%200%20H406%20C426%200%20438%208%20451%2018%20L577%20110%20C589%20119%20599%20122%20616%20122%20H1400%20C1422%20122%201440%20140%201440%20162%20V180%20M0%20180%20L0%2040%20C0%2018%2018%200%2040%200%22/%3E%3C/svg%3E") }
-.pricing .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M40%200%20H406%20C426%200%20438%206.023530483%20451%2013.552940369%20L577%2082.823532104%20C589%2089.600002289%20599%2091.858833313%20616%2091.858833313%20H1400%20C1422%2091.858833313%201440%20105.41176033%201440%20121.976470947%20V180%20H0%20L0%2030.117649078%20C0%2013.552938461%2018%200%2040%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M40%200%20H406%20C426%200%20438%206.023530483%20451%2013.552940369%20L577%2082.823532104%20C589%2089.600002289%20599%2091.858833313%20616%2091.858833313%20H1400%20C1422%2091.858833313%201440%20105.41176033%201440%20121.976470947%20V180%20M0%20180%20L0%2030.117649078%20C0%2013.552938461%2018%200%2040%200%22/%3E%3C/svg%3E") }
-@media(min-width:701px) and (max-width:1050px) { .folder-section h2 { font-size:30px } }
+@media(min-width:701px) and (max-width:1050px) { .folder-stack { --gutter:40px } .folder-section h2 { font-size:30px } }
 @media(max-width:700px) {
- .folder-section .folder-top { --cap-height:120px; height:calc(100% + 120px) }
- .folder-section .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M24%200%20H112%20C124%200%20130%204%20140%2012%20L198%2056%20C205%2062%20211%2064%20222%2064%20H366%20C379%2064%20390%2075%20390%2088%20V120%20H0%20L0%2024%20C0%208%208%200%2024%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M24%200%20H112%20C124%200%20130%204%20140%2012%20L198%2056%20C205%2062%20211%2064%20222%2064%20H366%20C379%2064%20390%2075%20390%2088%20V120%20M0%20120%20L0%2024%20C0%208%208%200%2024%200%22/%3E%3C/svg%3E") }
- .faq .folder-top { height:100%; --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M24%200%20H112%20C124%200%20130%204.724%20140%2014.172%20L198%2066.136%20C205%2073.222%20211%2075.584%20222%2075.584%20H366%20C379%2075.584%20390%2088.575%20390%20103.928%20V120%20H0%20L0%2028.344%20C0%209.448%208%200%2024%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M24%200%20H112%20C124%200%20130%204.724%20140%2014.172%20L198%2066.136%20C205%2073.222%20211%2075.584%20222%2075.584%20H366%20C379%2075.584%20390%2088.575%20390%20103.928%20V120%20M0%20120%20L0%2028.344%20C0%209.448%208%200%2024%200%22/%3E%3C/svg%3E") }
- .faq .folder-top::before { border-radius:0 0 24px 24px }
+  .folder-stack {
+    --gutter:24px;
+    --tab-end:calc(var(--content-x) + 28.717949cqw - var(--gutter));
+    --cap-height:120px;
+    --shelf-y:64px;
+    --corner-x:6.153846cqw;
+    --corner-y:24px;
+    --left-corner-y:24px;
+    --slope-width:28.205128cqw;
+    --cap-slope:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2065%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%20V65%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
+    --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2064%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
+  }
+  .faq { --shelf-y:75.584px; --corner-y:28.344px; --left-corner-y:28.344px }
+  .faq .folder-top::before,.faq .folder-top::after { border-bottom-left-radius:24px; border-bottom-right-radius:24px }
 }
-.faq .folder-top::after { border-left:1px solid rgba(255,255,255,.24); border-right:1px solid rgba(255,255,255,.24); border-bottom:1px solid rgba(255,255,255,.24); border-radius:0 0 40px 40px; clip-path:polygon(0 180px,1px 180px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 180px,100% 180px,100% 100%,0 100%) }
-@media(max-width:700px) { .faq .folder-top::after { border-radius:0 0 24px 24px; clip-path:polygon(0 120px,1px 120px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 120px,100% 120px,100% 100%,0 100%) } }
-/* Continue the cap's two side outlines below its fixed-height viewport. */
-.how .folder-top::after,.pricing .folder-top::after { border-left:1px solid rgba(255,255,255,.24); border-right:1px solid rgba(255,255,255,.24); clip-path:polygon(0 180px,1px 180px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 180px,100% 180px,100% 100%,0 100%) }
-@media(max-width:700px) { .how .folder-top::after,.pricing .folder-top::after { clip-path:polygon(0 120px,1px 120px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 120px,100% 120px,100% 100%,0 100%) } }
 
 /* Quick Package's initial drop target follows the approved Figma content grid.
    SVG keeps the measured dash lengths and fractional mobile stroke at every width. */
