@@ -451,11 +451,10 @@ button {
   margin-top:5px
 }
 
-.ui-square {
-  width:70px;
-  height:70px;
-  background:linear-gradient(135deg,#8acbea,#2789c4);
-  border-radius:8px;
+.ui-project-folder {
+  width:80px;
+  height:80px;
+  object-fit:contain;
   flex:none
 }
 
@@ -472,31 +471,6 @@ button {
 
 .ui-row span:last-child {
   color:#777
-}
-
-.ui-folder {
-  width:95px;
-  height:65px;
-  margin:25px auto;
-  background:linear-gradient(#6bc7f1,#39a4da);
-  border-radius:8px;
-  box-shadow:0 8px 14px #aaa;
-  position:relative
-}
-
-.ui-folder::before {
-  content:'';
-  position:absolute;
-  left:0;
-  top:-9px;
-  width:42px;
-  height:13px;
-  border-radius:5px 5px 0 0;
-  background:#6bc7f1
-}
-
-.demo-card:has(.ui-folder) {
-  text-align:center
 }
 
 .drop-zone {
@@ -1251,4 +1225,266 @@ button {
   .price-card.enterprise .price-email {
     font-size:10px
   }
+}
+
+/* Figma FINAL frames: align artwork bounds, not exported shadow margins. */
+.how .folder-top,.pricing .folder-top,.faq .folder-top { top:-50px }
+.how { min-height:1330px }
+.how h2 { line-height:53px }
+.workflow { margin-top:100px }
+.step { padding:0; border:0; min-height:109px; gap:7px; position:relative }
+.step::before { content:''; position:absolute; left:-10px; top:0; bottom:0; width:2px; background:transparent }
+.step.is-active::before { background:#f5f5f5 }
+.step-number { line-height:12px }
+.step-title { line-height:33px }
+.demo-window { background:transparent; height:523px }
+.quick-workflow { margin:67px 0 0; padding-top:6px; grid-template-columns:290px minmax(0,1fr); gap:70px }
+.quick-copy { padding:58px 0 0 10px }
+.quick-copy .kicker { margin-bottom:12px; line-height:12px }
+.quick-copy h3 { margin-bottom:12px }
+.quick-window { height:523px }
+.pricing h2 { padding-top:51px; line-height:53px }
+.pricing-cards { margin-top:81px }
+.price-card { padding:39px 40px 33px }
+.price-card h3 { height:92px; display:flex; align-items:center; justify-content:center; flex:none; line-height:58px }
+.price-card.regular h3 { align-items:baseline; gap:14px; white-space:nowrap }
+.price-amount { line-height:92px }
+.price-period { line-height:30px }
+.price-card p { margin:20px 0 0 }
+.price-card.enterprise p { margin-top:21px }
+.price-card .price-email { margin:2px 0 0 }
+.price-card .pill { flex:none }
+.faq { overflow:visible }
+.faq h2 { padding-top:50px; line-height:54px }
+.faq-list { margin-top:112px; min-height:1100px; padding-bottom:72px; display:flow-root }
+.faq-list::before { content:''; position:absolute; left:39.506%; top:0; bottom:72px; width:1px; background:rgba(255,255,255,.2) }
+.faq-group { width:36.883%; line-height:16px; margin:0 0 8px; color:#fff }
+.faq-item { width:36.883%; border:0; margin-bottom:8px }
+.faq-item button { min-height:60px; padding:16px 18px; font:400 16px/24px var(--mono); border-radius:6px }
+.faq-sign { display:none }
+.faq-answer { left:42.284%; top:0; width:53.858%; max-height:none; overflow:visible; padding:0; scroll-margin-top:24px }
+.faq-answer .faq-category { font:400 10px/16px var(--mono); margin:0 0 24px }
+.faq-answer h3 { line-height:44px; margin-bottom:24px }
+@media(min-width:701px) and (max-width:1050px) {
+  .workflow { grid-template-columns:230px minmax(0,1fr); gap:30px }
+  .quick-workflow { grid-template-columns:240px minmax(0,1fr); gap:30px }
+  .demo-card { width:100%; padding:30px 24px }
+  .price-card { padding-left:20px; padding-right:20px }
+  .faq-item button { font-size:14px; padding-left:10px; padding-right:10px }
+  .faq-answer h3 { font-size:30px; line-height:39px }
+  .faq-answer { font-size:14px; line-height:24px }
+}
+@media(max-width:700px) {
+  .how h2 { line-height:40px }
+  .workflow { margin-top:36px; position:relative }
+  .step::before { display:none }
+  .demo-window { height:300px }
+  .workflow>.demo-control { margin:0; height:20px; z-index:1 }
+  .quick-workflow { margin:80px 0 0; padding-top:32px; gap:0 }
+  .quick-copy { padding:0 }
+  .quick-copy .kicker { margin-bottom:12px }
+  .quick-copy h3 { margin-bottom:12px }
+  .quick-window { height:300px }
+  .pricing h2 { padding-top:24px; line-height:40px }
+  .pricing-cards { margin-top:68px }
+  .price-card { padding:25px 24px; }
+  .price-card h3 { height:78px }
+  .price-card.enterprise { padding-top:29px; padding-bottom:29px }
+  .price-card.enterprise h3 { height:50px; font-size:30px; line-height:40px }
+  .price-card.regular p { margin-top:16px }
+  .price-card.enterprise p { margin-top:19px; line-height:20px }
+  .price-card.enterprise .price-email { font-size:11px; line-height:20px; margin-top:2px }
+  .price-amount { line-height:78px }
+  .faq .folder-top { display:block; height:1253px; background-image:url('assets/design/faq-mobile.png') }
+  .faq::before { top:110px; border-radius:0 0 26px 26px }
+  .faq h2 { padding-top:24px; line-height:40px }
+  .faq-list { margin-top:44px; min-height:0; padding-bottom:52px }
+  .faq-list::before { display:none }
+  .faq-group { width:100%; font-size:10px; margin:0 0 12px }
+  .faq-group:not(:first-child) { margin-top:16px }
+  .faq-item { width:100%; border-bottom:1px solid rgba(255,255,255,.14); margin-bottom:0 }
+  .faq-item button { font-size:14px; line-height:22px; padding:16px 0; border-radius:0 }
+  .faq-sign { display:block }
+  .faq-answer { width:100%; padding:4px 0 24px; scroll-margin-top:24px }
+  .faq-answer .faq-category { margin-bottom:18px }
+}
+
+/* Interface moments use the approved text, field sizes, and content grid. */
+.hero h1 { transform:translateY(-2px) }
+.how .folder-top,.pricing .folder-top { height:calc(100% + 50px) }
+.demo-card h3 { line-height:45px; margin:0 0 20px }
+.ui-input { background:none; padding:0; margin:0 0 20px; font:400 10px/12px var(--mono); color:#666 }
+.ui-input span { margin-top:8px; padding:12px 16px; min-height:46px; border-radius:10px; background:#ebebeb; color:#121212; font:400 18px/22px var(--ui) }
+.ui-action { margin-top:0; height:42px; padding:14px 12px; font:400 12px/14px var(--mono) }
+.ui-small { margin:20px 0 0; font:400 13px/15px var(--mono); color:#555 }
+.ui-workspace { height:103px; padding:12px 24px; gap:20px; margin:0 0 20px; border-radius:10px; background:#ebebeb }
+.ui-workspace strong { font:400 24px/29px var(--ui) }
+.ui-workspace span { font:400 15px/18px var(--ui); margin-top:12px }
+.ui-project-folder { width:80px; height:80px }
+.ui-row { height:64px; align-items:center; margin:0 0 13px; padding:0 18px; border-radius:10px; font:400 17px/21px var(--ui) }
+.ui-row span:last-child { font:400 9px/12px var(--mono); text-align:right }
+.drop-zone { height:202px; border-radius:10px; font:400 18px/22px var(--ui); gap:25px }
+.drop-zone span { font-size:36px; line-height:44px }
+.drop-zone p { margin:0 }
+@media(min-width:701px) {
+  .workflow .demo-window { transform:translateY(-3px) }
+}
+@media(max-width:1050px) and (min-width:701px) {
+  .demo-card h3 { font-size:28px; line-height:36px }
+  .ui-input span { font-size:14px }
+  .ui-row { font-size:13px; padding:0 12px; gap:8px }
+  .ui-row span:last-child { font-size:8px }
+  .ui-workspace { padding:12px; gap:10px }
+  .ui-project-folder { width:60px; height:60px }
+  .ui-workspace strong { font-size:20px }
+  .drop-zone { font-size:14px; text-align:center }
+}
+@media(max-width:700px) {
+  .faq .folder-top { width:100%; left:0; background-size:100% auto }
+  .demo-card { padding:20px; }
+  .demo-card h3 { font-size:25px; line-height:30px; margin-bottom:12px }
+  .ui-input { font-size:9px; line-height:12px; margin-bottom:12px }
+  .ui-input span { margin-top:10px; padding:9px 12px; min-height:36px; font-size:14px; line-height:18px }
+  .ui-action { font-size:11px; line-height:14px; padding:14px 8px; margin-top:0 }
+  .ui-small { font-size:10px; line-height:14px; margin-top:12px }
+  .ui-workspace { height:80px; padding:10px 14px; margin-bottom:12px; gap:14px }
+  .ui-project-folder { width:60px; height:60px }
+  .ui-workspace strong { font-size:20px; line-height:24px }
+  .ui-workspace span { font-size:13px; line-height:16px; margin-top:8px }
+  .ui-row { height:52px; padding:0 12px; margin-bottom:12px; font-size:14px; line-height:18px }
+  .ui-row span:last-child { font-size:8px }
+  .drop-zone { height:160px; font-size:13px; gap:20px }
+  .drop-zone span { font-size:30px; line-height:36px }
+}
+/* Keep the approved folder cap while the accordion body grows with its text. */
+.faq .folder-top { height:230px }
+.faq::before { top:180px; border:1px solid rgba(255,255,255,.24); border-top:0; border-radius:0 0 26px 26px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light }
+@media(max-width:700px) {
+  .faq .folder-top { height:170px }
+  .faq::before { top:120px }
+}
+@media(max-width:700px) {
+  .how { min-height:1276px }
+}
+@media(min-width:701px) {
+  .demo-window { align-items:flex-start; padding-top:59px }
+  .quick-workflow { padding-top:5px }
+}
+
+/* Full-page review: restore the hero and footer to the approved frame geometry. */
+.site-header { height:140px; position:relative }
+.wordmark { position:absolute; left:72px; top:51px }
+.site-nav { position:absolute; right:332px; top:59px; width:188px; justify-content:space-between; gap:0; margin:0 }
+.site-nav a { line-height:16px }
+.header-download { position:absolute; right:72px; top:43px }
+.hero-folder { width:313.6px; height:254.8px; object-fit:fill; margin-top:42px }
+.hero h1 { margin-top:38.2px; margin-bottom:32px }
+.hero-note { margin-top:32px; font-size:12px; line-height:16px; letter-spacing:0 }
+.supports h2 { line-height:53px }
+.apps-viewport { margin-top:71px; height:64px }
+.apps-track,.apps-set { height:100% }
+.app-item { margin-left:0; padding-right:72px; font-weight:400; line-height:24px }
+.apps-set { padding-left:64px }
+.app-item:first-child { margin-left:0 }
+.supports-note { margin-top:18px; line-height:13px }
+.how::before,.pricing::before { bottom:-160px; background-color:#131313; background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light; background-size:auto,721.3px 721.3px }
+.faq::before { background-size:auto,721.3px 721.3px }
+.footer { padding-top:96px }
+.footer h2 { font-size:44px; line-height:59px; margin-bottom:26px }
+.footer>p { margin-top:26px; font-size:11px; line-height:13px; letter-spacing:0 }
+.footer-bottom { margin-top:26px; padding-top:41px; justify-content:center; font-size:12px; line-height:20px }
+@media(min-width:701px) and (max-width:1050px) {
+  .wordmark { left:40px }
+  .header-download { right:40px }
+  .site-nav { right:290px }
+  .demo-card { width:min(100%,660px) }
+}
+@media(max-width:700px) {
+  .site-header { height:85px }
+  .wordmark { left:24px; top:31px; line-height:22px }
+  .site-nav { top:34px; right:24px; width:172px; gap:0; margin:0 }
+  .site-nav a { font-size:10px; line-height:16px }
+  .hero-folder { width:180px; height:146.25px; margin-top:61px }
+  .hero h1 { margin-top:49.75px; margin-bottom:46px }
+  .hero-note { margin-top:30px; font-size:10px }
+  .supports h2 { line-height:40px }
+  .apps-viewport { height:48px; margin-top:61px }
+  .apps-set { padding-left:24px }
+  .app-item { font-size:15px; line-height:18px; gap:10.5px; margin-left:0; padding-right:54px }
+  .app-item:first-child { margin-left:0 }
+  .app-item img { width:33px; height:33px }
+  .supports-note { margin-top:29px }
+  .workflow-steps { height:auto; min-height:110px }
+  .step-number { line-height:14px }
+  .step { gap:8px }
+  .workflow>.demo-control { align-self:flex-end; flex:none }
+  .footer { padding-top:56px }
+  .footer h2 { font-size:30px; line-height:40px; margin-bottom:22px }
+  .footer>p { margin-top:22px; font-size:10px; line-height:16px }
+  .footer-bottom { margin-top:22px; padding-top:37px; gap:4px; font-size:10px; line-height:16px }
+  .footer-bottom a { font-size:12px; line-height:20px }
+}
+@media(max-width:360px) {
+  .site-nav { width:150px }
+  .site-nav a { font-size:9px }
+}
+.supports h2 { padding-top:58px }
+.apps-viewport { margin-top:70px }
+@media(max-width:700px) {
+  .supports h2 { padding-top:24px }
+  .apps-viewport { margin-top:56px }
+  .supports-note { margin-top:20px; line-height:14px }
+}
+.hero h1 { letter-spacing:0; color:#292929 }
+.hero-folder { object-fit:cover }
+
+/* Verified Figma contours: the cap is independent of the expandable body.
+   A single texture spans both; no exported raster bottom can enter content. */
+.folder-stack::before,.folder-section::before { display:none }
+.folder-section .folder-top { display:block; inset:0 0 auto; width:100%; height:calc(100% + 180px); background:none; filter:drop-shadow(0 -14px 18px rgba(0,0,0,.45)); --cap-height:180px; --folder-color:#131313 }
+.folder-top::before,.folder-top::after { content:''; position:absolute; inset:0; pointer-events:none }
+.folder-top::before { background-color:var(--folder-color); background-image:linear-gradient(rgba(19,19,19,.85),rgba(19,19,19,.85)),url('assets/design/folder-texture.png'); background-blend-mode:normal,soft-light; background-size:auto,721.3135px 721.3135px; mask-image:var(--cap-mask),linear-gradient(#fff,#fff); mask-position:top,bottom; mask-size:100% var(--cap-height),100% calc(100% - var(--cap-height) + 1px); mask-repeat:no-repeat }
+.folder-top::after { background:var(--cap-stroke) top / 100% var(--cap-height) no-repeat }
+.supports .folder-top { filter:none; --folder-color:#181817 }
+.supports .folder-top::before { background-image:linear-gradient(rgba(24,24,23,.85),rgba(24,24,23,.85)),url('assets/design/folder-texture.png') }
+.supports .folder-top::after { display:none }
+.faq .folder-top { height:100% }
+.faq .folder-top::before { border-radius:0 0 40px 40px }
+.footer-bottom a { text-decoration:underline; text-underline-offset:3px }
+ .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M40%200%20H406%20C426%200%20438%208%20451%2018%20L577%20110%20C589%20119%20599%20122%20616%20122%20H1400%20C1422%20122%201440%20140%201440%20162%20V180%20H0%20L0%2040%20C0%2018%2018%200%2040%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M40%200%20H406%20C426%200%20438%208%20451%2018%20L577%20110%20C589%20119%20599%20122%20616%20122%20H1400%20C1422%20122%201440%20140%201440%20162%20V180%20M0%20180%20L0%2040%20C0%2018%2018%200%2040%200%22/%3E%3C/svg%3E") }
+.pricing .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M40%200%20H406%20C426%200%20438%206.023530483%20451%2013.552940369%20L577%2082.823532104%20C589%2089.600002289%20599%2091.858833313%20616%2091.858833313%20H1400%20C1422%2091.858833313%201440%20105.41176033%201440%20121.976470947%20V180%20H0%20L0%2030.117649078%20C0%2013.552938461%2018%200%2040%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%201440%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M40%200%20H406%20C426%200%20438%206.023530483%20451%2013.552940369%20L577%2082.823532104%20C589%2089.600002289%20599%2091.858833313%20616%2091.858833313%20H1400%20C1422%2091.858833313%201440%20105.41176033%201440%20121.976470947%20V180%20M0%20180%20L0%2030.117649078%20C0%2013.552938461%2018%200%2040%200%22/%3E%3C/svg%3E") }
+@media(min-width:701px) and (max-width:1050px) { .folder-section h2 { font-size:30px } }
+@media(max-width:700px) {
+ .folder-section .folder-top { --cap-height:120px; height:calc(100% + 120px) }
+ .folder-section .folder-top { --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M24%200%20H112%20C124%200%20130%204%20140%2012%20L198%2056%20C205%2062%20211%2064%20222%2064%20H366%20C379%2064%20390%2075%20390%2088%20V120%20H0%20L0%2024%20C0%208%208%200%2024%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M24%200%20H112%20C124%200%20130%204%20140%2012%20L198%2056%20C205%2062%20211%2064%20222%2064%20H366%20C379%2064%20390%2075%20390%2088%20V120%20M0%20120%20L0%2024%20C0%208%208%200%2024%200%22/%3E%3C/svg%3E") }
+ .faq .folder-top { height:100%; --cap-mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M24%200%20H112%20C124%200%20130%204.724%20140%2014.172%20L198%2066.136%20C205%2073.222%20211%2075.584%20222%2075.584%20H366%20C379%2075.584%20390%2088.575%20390%20103.928%20V120%20H0%20L0%2028.344%20C0%209.448%208%200%2024%200%20Z%22/%3E%3C/svg%3E"); --cap-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20390%20120%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22M24%200%20H112%20C124%200%20130%204.724%20140%2014.172%20L198%2066.136%20C205%2073.222%20211%2075.584%20222%2075.584%20H366%20C379%2075.584%20390%2088.575%20390%20103.928%20V120%20M0%20120%20L0%2028.344%20C0%209.448%208%200%2024%200%22/%3E%3C/svg%3E") }
+ .faq .folder-top::before { border-radius:0 0 24px 24px }
+}
+.faq .folder-top::after { border-left:1px solid rgba(255,255,255,.24); border-right:1px solid rgba(255,255,255,.24); border-bottom:1px solid rgba(255,255,255,.24); border-radius:0 0 40px 40px; clip-path:polygon(0 180px,1px 180px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 180px,100% 180px,100% 100%,0 100%) }
+@media(max-width:700px) { .faq .folder-top::after { border-radius:0 0 24px 24px; clip-path:polygon(0 120px,1px 120px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 120px,100% 120px,100% 100%,0 100%) } }
+/* Continue the cap's two side outlines below its fixed-height viewport. */
+.how .folder-top::after,.pricing .folder-top::after { border-left:1px solid rgba(255,255,255,.24); border-right:1px solid rgba(255,255,255,.24); clip-path:polygon(0 180px,1px 180px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 180px,100% 180px,100% 100%,0 100%) }
+@media(max-width:700px) { .how .folder-top::after,.pricing .folder-top::after { clip-path:polygon(0 120px,1px 120px,1px 0,calc(100% - 1px) 0,calc(100% - 1px) 120px,100% 120px,100% 100%,0 100%) } }
+
+/* Quick Package's initial drop target follows the approved Figma content grid.
+   SVG keeps the measured dash lengths and fractional mobile stroke at every width. */
+.quick-window [data-panel="0"] h3 { margin-bottom:18px }
+.quick-window .drop-zone {
+  display:block; height:164px; padding-top:24px; border:0; border-radius:14px;
+  background:#f0f0f0 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100%25' height='100%25'%3E%3Crect x='.5' y='.5' style='width:calc(100%25 - 1px);height:calc(100%25 - 1px)' rx='13.5' fill='none' stroke='%23bfbfbf' stroke-width='1' stroke-dasharray='5 5'/%3E%3C/svg%3E") no-repeat;
+  color:#121212; text-align:center;
+}
+.quick-window .drop-zone span { display:block; width:100px; height:44px; margin:0 auto; color:#737373; font:400 36px/44px var(--ui) }
+.quick-window .drop-zone p { width:calc(100% - 24px); max-width:460px; margin:36px auto 0; font:400 18px/22px var(--ui) }
+@media(min-width:701px) and (max-width:1050px) {
+  .quick-window .drop-zone p { font-size:14px }
+}
+@media(max-width:700px) {
+  .quick-window [data-panel="0"] h3 { font-size:24px; margin-bottom:12px }
+  .quick-window .drop-zone {
+    height:160px; padding-top:28px; border-radius:7.254545px;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100%25' height='100%25'%3E%3Crect x='.259091' y='.259091' style='width:calc(100%25 - .518182px);height:calc(100%25 - .518182px)' rx='6.995454' fill='none' stroke='%23bfbfbf' stroke-width='.518182' stroke-dasharray='2.590909 2.590909'/%3E%3C/svg%3E");
+  }
+  .quick-window .drop-zone span { height:40px; font-size:32px; line-height:30px }
+  .quick-window .drop-zone p { height:32px; margin-top:38px; font-size:12px; line-height:16px }
 }
