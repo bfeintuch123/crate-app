@@ -72,24 +72,132 @@ faqItems.forEach((item, index) => item.querySelector('button').addEventListener(
     }
   }
 }));
-// Remember the reading context before a resize changes the FAQ's layout.
-const faqSection = document.querySelector('.faq');
+// Keep a pre-breakpoint reading landmark. A footer peek is not by itself
+// evidence that the reader has left a visibly selected FAQ.
 const footer = document.querySelector('.footer');
-let readingFaq = false;
-window.addEventListener('scroll', () => {
-  const bounds = faqSection.getBoundingClientRect();
-  const footerEntered = footer.getBoundingClientRect().top < window.innerHeight;
-  readingFaq = bounds.top < window.innerHeight && bounds.bottom > 0 && !footerEntered;
-}, { passive: true });
-mobile.addEventListener?.('change', () => {
-  if (!faqInteracted) { setFaq(mobile.matches ? -1 : 0); return; }
-  const selected = faqItems.find(item => item.classList.contains('is-active'));
-  if (!selected || !readingFaq) return;
-  requestAnimationFrame(() => {
-    const target = selected.querySelector(mobile.matches ? 'button' : '.faq-answer');
-    const bounds = target.getBoundingClientRect();
-    if (bounds.top < 24 || bounds.top > window.innerHeight - 100) {
-      target.scrollIntoView({ block: 'start', behavior: 'instant' });
+let keyboardInput = false;
+let pointerControl = null;
+let settledLayout = mobile.matches;
+let readingSnapshot = null;
+let restoringReading = false;
+let snapshotFrame;
+let resizeGeneration = 0;
+
+const landmarkRect = landmark => landmark.range
+  ? landmark.range.getBoundingClientRect() : landmark.element.getBoundingClientRect();
+const visibleLandmark = landmark => {
+  if (!landmark) return false;
+  const rect = landmarkRect(landmark);
+  return rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.bottom <= innerHeight;
+};
+// Text ranges follow the same word when wrapping changes, including within a
+// long paragraph. Container intersection alone can mistake an answer tail for
+// its heading, or an offscreen focused answer for current keyboard intent.
+const textLandmark = (element, firstOnly = true) => {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    for (const match of node.textContent.matchAll(/\S+/g)) {
+      const range = document.createRange();
+      range.setStart(node, match.index);
+      range.setEnd(node, match.index + match[0].length);
+      const landmark = { element, range };
+      if (firstOnly || visibleLandmark(landmark)) return landmark;
     }
+  }
+  return firstOnly ? { element } : null;
+};
+const primaryLandmark = item => textLandmark(item.querySelector(mobile.matches ? 'button' : '.faq-answer h3'));
+const captureReading = () => {
+  const item = faqItems.find(item => item.classList.contains('is-active'));
+  if (!item) return null;
+  const focused = document.activeElement;
+  const focusLandmark = textLandmark(focused);
+  const visibleFocus = visibleLandmark(focusLandmark);
+  const ownsKeyboard = keyboardInput && visibleFocus && item.contains(focused);
+  if (visibleFocus && !item.contains(focused) &&
+      (keyboardInput || (pointerControl && pointerControl.contains(focused)))) return null;
+  let landmark;
+  let primary = false;
+  if (ownsKeyboard) {
+    primary = focused === item.querySelector('button') || focused === item.querySelector('.faq-answer h3');
+    landmark = primary ? primaryLandmark(item) : focusLandmark;
+  } else {
+    landmark = primaryLandmark(item);
+    primary = visibleLandmark(landmark);
+    if (!primary) {
+      // Deliberate tie-break: footer reading wins over an unfocused answer tail.
+      if (footer.getBoundingClientRect().top < innerHeight) return null;
+      landmark = [...item.querySelectorAll('.faq-answer p:not(.faq-category), .faq-answer li')]
+        .map(element => textLandmark(element, false)).find(Boolean);
+    }
+  }
+  if (!visibleLandmark(landmark)) return null;
+  return { item, landmark, primary, offset: landmarkRect(landmark).top,
+    keyboardOwner: ownsKeyboard ? focused : null, focusedAtCapture: focused, layout: mobile.matches };
+};
+const scheduleReadingSnapshot = () => {
+  // Capture the completed event synchronously too: a resize can arrive before
+  // the next frame after a click, focus move or scroll.
+  if (!restoringReading && mobile.matches === settledLayout) readingSnapshot = captureReading();
+  cancelAnimationFrame(snapshotFrame);
+  snapshotFrame = requestAnimationFrame(() => {
+    if (!restoringReading && mobile.matches === settledLayout) readingSnapshot = captureReading();
+  });
+};
+document.addEventListener('keydown', event => {
+  if (['Tab', 'Enter', ' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
+    keyboardInput = true;
+    pointerControl = null;
+    scheduleReadingSnapshot();
+  }
+}, true);
+document.addEventListener('pointerdown', event => {
+  keyboardInput = false;
+  pointerControl = event.target.closest('button, a, input, select, textarea');
+  scheduleReadingSnapshot();
+}, true);
+const pointerScroll = () => { keyboardInput = false; pointerControl = null; scheduleReadingSnapshot(); };
+window.addEventListener('wheel', pointerScroll, { passive: true });
+window.addEventListener('touchstart', pointerScroll, { passive: true });
+window.addEventListener('scroll', scheduleReadingSnapshot, { passive: true });
+document.addEventListener('focusin', scheduleReadingSnapshot);
+document.addEventListener('click', scheduleReadingSnapshot);
+window.addEventListener('resize', scheduleReadingSnapshot);
+scheduleReadingSnapshot();
+
+mobile.addEventListener?.('change', () => {
+  const snapshot = readingSnapshot;
+  const generation = ++resizeGeneration;
+  restoringReading = true;
+  if (!faqInteracted && !snapshot) setFaq(mobile.matches ? -1 : 0);
+  requestAnimationFrame(() => {
+    if (generation !== resizeGeneration) return;
+    const focused = document.activeElement;
+    // Browsers may blur a desktop heading when mobile CSS hides it. This is
+    // still the same keyboard context unless a new user input took ownership.
+    const keyboardFocusHidden = snapshot?.keyboardOwner && keyboardInput &&
+      (focused === snapshot.keyboardOwner || (focused === document.body &&
+        !visibleLandmark(textLandmark(snapshot.keyboardOwner))));
+    if (snapshot && snapshot.layout !== mobile.matches &&
+        snapshot.item.classList.contains('is-active') &&
+        (focused === snapshot.focusedAtCapture || snapshot.item.contains(focused) || keyboardFocusHidden)) {
+      const landmark = snapshot.primary ? primaryLandmark(snapshot.item) : snapshot.landmark;
+      if (!visibleLandmark(landmark)) {
+        const rect = landmarkRect(landmark);
+        const offset = Math.max(24, Math.min(snapshot.offset, innerHeight - rect.height - 24));
+        window.scrollBy({ top: rect.top - offset, behavior: 'instant' });
+      }
+      // Only genuine keyboard ownership permits a same-FAQ focus transfer.
+      // Pointer readers and focus outside this selected FAQ are never moved.
+      if (keyboardFocusHidden &&
+          !visibleLandmark(textLandmark(snapshot.keyboardOwner))) {
+        const target = landmark.element;
+        if (!target.hasAttribute('tabindex') && target.tagName !== 'BUTTON') target.setAttribute('tabindex', '-1');
+        target.focus({ preventScroll: true });
+      }
+    }
+    settledLayout = mobile.matches;
+    restoringReading = false;
+    scheduleReadingSnapshot();
   });
 });
