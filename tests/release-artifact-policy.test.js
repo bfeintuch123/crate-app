@@ -4100,6 +4100,8 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          node --check scripts/verify-install-scripts.js',
     '          node --check scripts/verify-macos-release-app.js',
     '          node --check scripts/run-macos-release-proof.js',
+    '          node --check scripts/version-crate-site-assets.js',
+    '          node scripts/version-crate-site-assets.js --check',
     '',
   ].join('\n'));
   assert.equal(workflowStepBlock(workflow, 'Authenticate installed release verifier toolchain'), [
