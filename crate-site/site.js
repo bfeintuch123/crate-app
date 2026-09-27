@@ -56,6 +56,16 @@ const setFaq = selected => faqItems.forEach((item, index) => {
 if (mobile.matches) setFaq(-1);
 faqItems.forEach((item, index) => item.querySelector('button').addEventListener('click', () => {
   faqInteracted = true;
-  setFaq(mobile.matches && item.classList.contains('is-active') ? -1 : index);
+  const selected = mobile.matches && item.classList.contains('is-active') ? -1 : index;
+  setFaq(selected);
+  if (selected !== -1) {
+    const target = mobile.matches ? item.querySelector('button') : item.querySelector('.faq-answer');
+    const bounds = target.getBoundingClientRect();
+    // Lower questions must reveal the selected answer; collapsing an earlier
+    // mobile answer can also move the newly selected question above the viewport.
+    if (bounds.top < 24 || bounds.top > window.innerHeight - 100) {
+      target.scrollIntoView({ block: 'start', behavior: 'instant' });
+    }
+  }
 }));
 mobile.addEventListener?.('change', () => { if (!faqInteracted) setFaq(mobile.matches ? -1 : 0); });
