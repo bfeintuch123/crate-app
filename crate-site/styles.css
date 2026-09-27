@@ -1170,6 +1170,9 @@ button {
 }
 
 @media(min-width:701px) {
+  .quick-workflow {
+    grid-template-rows:auto 1fr
+  }
   .quick-copy {
     grid-column:1;
     grid-row:1
@@ -1181,7 +1184,8 @@ button {
     align-items:center;
     gap:13px;
     justify-content:flex-start;
-    margin-top:-170px;
+    margin-top:20px;
+    align-self:start;
     font:400 10px/1 var(--mono)
   }
   .quick-control button {
