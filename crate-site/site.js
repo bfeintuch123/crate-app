@@ -78,8 +78,8 @@ const footer = document.querySelector('.footer');
 let readingFaq = false;
 window.addEventListener('scroll', () => {
   const bounds = faqSection.getBoundingClientRect();
-  const footerFullyVisible = footer.getBoundingClientRect().bottom <= window.innerHeight + 1;
-  readingFaq = bounds.top < window.innerHeight && bounds.bottom > 0 && !footerFullyVisible;
+  const footerEntered = footer.getBoundingClientRect().top < window.innerHeight;
+  readingFaq = bounds.top < window.innerHeight && bounds.bottom > 0 && !footerEntered;
 }, { passive: true });
 mobile.addEventListener?.('change', () => {
   if (!faqInteracted) { setFaq(mobile.matches ? -1 : 0); return; }
