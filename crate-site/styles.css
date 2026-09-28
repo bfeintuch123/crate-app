@@ -53,6 +53,8 @@ button {
 }
 
 .site-shell {
+  --page-gutter:clamp(24px,5vw,160px);
+  --page-width:min(calc(100% - 2 * var(--page-gutter)),2800px);
   overflow:hidden;
   background:linear-gradient(180deg,rgba(243,239,236,0) 0%,rgba(243,239,236,.55) 100%),linear-gradient(90deg,#f1e8e7 0%,#f3edea 46%,#eaf0ec 100%)
 }
@@ -1441,23 +1443,21 @@ button {
 .folder-stack::before,.folder-section::before { display:none }
 .folder-stack {
   container-type:inline-size;
-  --frame-width:min(100cqw,1440px);
-  --frame-x:calc((100cqw - var(--frame-width))/2);
-  --gutter:72px;
-  --content-x:calc(var(--frame-x) + var(--gutter));
-  --tab-end:calc(var(--content-x) + min(calc(28.194444cqw - var(--gutter)),334px));
+  --content-width:min(calc(100cqw - 2 * var(--page-gutter)),2800px);
+  --content-x:calc((100cqw - var(--content-width))/2);
+  --tab-end:calc(var(--content-x) + clamp(220px,23.194444cqw,650px));
   --cap-height:180px;
   --shelf-y:122px;
   --corner-x:min(2.777778cqw,40px);
   --corner-y:40px;
   --left-corner-y:40px;
-  --slope-width:min(14.583333cqw,210px);
+  --slope-width:clamp(110px,14.583333cqw,320px);
   --cap-slope:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20210%20123%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C20%200%2032%208%2045%2018%20L171%20110%20C183%20119%20193%20122%20210%20122%20V123%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
   --cap-corner:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2040%2040%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C22%200%2040%2018%2040%2040%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
-  --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20210%20122%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C20%200%2032%208%2045%2018%20L171%20110%20C183%20119%20193%20122%20210%20122%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E");
-  --corner-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2040%2040%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C22%200%2040%2018%2040%2040%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
+  --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20210%20123%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C20%200%2032%208%2045%2018%20L171%20110%20C183%20119%20193%20122%20210%20122%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%222.5%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E");
+  --corner-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2040%2040%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C22%200%2040%2018%2040%2040%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%222.5%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
 }
-.folder-section .section-inner { width:var(--frame-width); padding-inline:var(--gutter) }
+.folder-section .section-inner { width:var(--content-width); padding-inline:0 }
 .folder-section .folder-top {
   display:block;
   inset:0 0 auto;
@@ -1485,6 +1485,7 @@ button {
   background-size:auto,721.3135px 721.3135px
 }
 .folder-top::after {
+  background-origin:border-box;
   border-top:1.25px solid rgba(255,255,255,.24);
   border-left:1.25px solid rgba(255,255,255,.24);
   border-right:1.25px solid rgba(255,255,255,.24);
@@ -1501,10 +1502,9 @@ button {
 .faq .folder-top::before,.faq .folder-top::after { border-bottom-left-radius:40px; border-bottom-right-radius:40px }
 .faq .folder-top::after { border-bottom:1.25px solid rgba(255,255,255,.24) }
 .footer-bottom a { text-decoration:underline; text-underline-offset:3px }
-@media(min-width:701px) and (max-width:1050px) { .folder-stack { --gutter:40px } .folder-section h2 { font-size:30px } }
+@media(min-width:701px) and (max-width:1050px) { .folder-section h2 { font-size:30px } }
 @media(max-width:700px) {
   .folder-stack {
-    --gutter:24px;
     --tab-end:max(calc(var(--content-x) + 88px),28.717949cqw);
     --cap-height:120px;
     --shelf-y:64px;
@@ -1513,7 +1513,7 @@ button {
     --left-corner-y:24px;
     --slope-width:max(28.205128cqw,110px);
     --cap-slope:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2065%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%20V65%20H0%20Z%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E");
-    --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2064%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%221.25%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
+    --slope-stroke:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20110%2065%22%20preserveAspectRatio%3D%22none%22%3E%3Cpath%20d%3D%22M0%200%20C12%200%2018%204%2028%2012%20L86%2056%20C93%2062%2099%2064%20110%2064%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-opacity%3D%22.24%22%20stroke-width%3D%222.5%22%20vector-effect%3D%22non-scaling-stroke%22%2F%3E%3C%2Fsvg%3E")
   }
   .pricing { --shelf-y:64px; --corner-y:24px; --left-corner-y:24px }
   .faq { --shelf-y:75.584px; --corner-y:28.344px; --left-corner-y:28.344px }
@@ -1541,4 +1541,94 @@ button {
   }
   .quick-window .drop-zone span { height:40px; font-size:32px; line-height:30px }
   .quick-window .drop-zone p { height:32px; margin-top:38px; font-size:12px; line-height:16px }
+}
+
+/* One content grid serves the header, folder sections, and footer. The approved
+   1440 and 390 layouts retain 72 and 24 px gutters; wide views gain room. */
+.site-header { width:var(--page-width); max-width:none; padding-inline:0 }
+.wordmark { left:0 }
+.site-nav { right:260px }
+.header-download { right:0 }
+.footer { padding-inline:var(--page-gutter) }
+.footer-bottom { width:100%; max-width:2800px }
+@media(max-width:700px) {
+  .site-nav { right:0 }
+  .wordmark { left:0 }
+}
+@media(min-width:701px) and (max-width:1440px) {
+  .workflow,.quick-workflow { gap:clamp(30px,calc(-8px + 5.42vw),70px) }
+  .workflow { grid-template-columns:clamp(230px,calc(182.6px + 6.77vw),280px) minmax(0,1fr) }
+  .quick-workflow { grid-template-columns:clamp(240px,calc(192.6px + 6.77vw),290px) minmax(0,1fr) }
+}
+
+/* Larger desktops grow as a composition rather than leaving 1440 px artwork
+   and controls adrift inside a full-width folder background. */
+@media(min-width:1441px) {
+  .pill { width:clamp(220px,calc(91.4px + 8.93vw),330px); min-height:clamp(54px,calc(41.1px + .893vw),76px); font-size:clamp(12px,calc(8.4px + .25vw),18px) }
+  .hero { min-height:clamp(810px,calc(566px + 16.94vw),1215px) }
+  .site-header { height:clamp(140px,calc(101px + 2.708vw),205px); display:grid; grid-template-columns:1fr auto auto; align-items:center; gap:clamp(32px,3vw,100px) }
+  .wordmark,.site-nav,.header-download { position:static }
+  .wordmark { justify-self:start; font-size:clamp(24px,calc(14px + .694vw),40px) }
+  .site-nav { width:auto; gap:clamp(25px,2.1vw,70px); margin:0 }
+  .site-nav a { font-size:clamp(12px,calc(7px + .347vw),20px); line-height:1.4 }
+  .hero-folder { width:clamp(313.6px,calc(202px + 7.75vw),500px); height:auto; aspect-ratio:313.6 / 254.8; margin-top:clamp(42px,3vw,115px) }
+  .hero h1 { font-size:clamp(62px,calc(33.2px + 2vw),110px); line-height:1.1; max-width:min(90vw,1800px); margin-top:clamp(38.2px,3.3vw,110px); margin-bottom:clamp(32px,2.5vw,80px) }
+  .hero-actions { gap:clamp(14px,1.2vw,42px) }
+  .hero-note { margin-top:clamp(32px,2.5vw,80px); font-size:clamp(12px,calc(7px + .347vw),20px); line-height:1.4 }
+  .folder-section h2 { font-size:clamp(40px,calc(16px + 1.667vw),76px); line-height:1.2 }
+  .supports { height:auto; min-height:270px; padding-bottom:clamp(0px,calc(-38.6px + 2.68vw),64px) }
+  .supports h2 { padding-top:clamp(58px,4vw,125px); line-height:1.2 }
+  .apps-viewport { margin-top:clamp(70px,5vw,150px); height:clamp(64px,5vw,105px) }
+  .apps-set { padding-left:var(--page-gutter) }
+  .app-item { gap:clamp(14px,1vw,28px); padding-right:clamp(72px,5vw,150px); font-size:clamp(20px,calc(12px + .556vw),34px); line-height:1.3 }
+  .app-item img { width:clamp(44px,3.5vw,75px); height:clamp(44px,3.5vw,75px) }
+  .supports-note { margin-top:clamp(18px,1.6vw,42px); font-size:clamp(11px,calc(6px + .347vw),18px); line-height:1.5 }
+  .how { min-height:clamp(1330px,calc(1066px + 18.33vw),1770px); padding-bottom:clamp(72px,5vw,170px) }
+  .how h2 { padding-top:clamp(57px,4vw,125px); line-height:1.2 }
+  .workflow,.quick-workflow { grid-template-columns:clamp(290px,calc(-41.2px + 23vw),650px) minmax(0,1fr); gap:clamp(70px,5vw,140px) }
+  .workflow { grid-template-columns:clamp(280px,calc(-51.2px + 23vw),650px) minmax(0,1fr); margin-top:clamp(100px,7vw,210px) }
+  .quick-workflow { margin-top:clamp(67px,5.5vw,150px) }
+  .quick-copy { padding-top:clamp(58px,4vw,110px) }
+  .step { min-height:clamp(109px,8.5vw,180px) }
+  .workflow-steps { gap:clamp(24px,2vw,55px) }
+  .step-number,.quick-copy .kicker { font-size:clamp(10px,calc(5.5px + .313vw),17px); line-height:1.4 }
+  .step-title,.quick-copy h3 { font-size:clamp(25px,calc(11px + .972vw),48px); line-height:1.28 }
+  .step-copy,.quick-copy>p:last-child { font-size:clamp(16px,calc(10.7px + .368vw),25px); line-height:1.55; max-width:34ch }
+  .demo-window,.quick-window { height:clamp(523px,calc(126px + 27.57vw),1050px); padding-top:clamp(59px,4.4vw,120px) }
+  .demo-card { width:min(100%,clamp(660px,calc(228px + 30vw),1150px)); height:clamp(408px,calc(100px + 21.4vw),820px); padding:clamp(36px,3vw,75px) clamp(48px,4vw,100px) }
+  .demo-card h3 { font-size:clamp(34px,calc(21px + .903vw),56px); line-height:1.2; margin-bottom:clamp(20px,2vw,55px) }
+  .demo-card .ui-input { font-size:clamp(10px,.7vw,16px); line-height:1.3; margin-bottom:clamp(20px,1.5vw,40px) }
+  .demo-card .ui-input span { font-size:clamp(18px,1.3vw,29px); line-height:1.3; min-height:clamp(46px,3.5vw,80px); padding:clamp(12px,1vw,25px) clamp(16px,1.2vw,32px) }
+  .demo-card .ui-action { height:auto; min-height:clamp(42px,3vw,70px); font-size:clamp(12px,.85vw,20px); line-height:1.4 }
+  .demo-card .ui-small { font-size:clamp(13px,.9vw,20px); line-height:1.4 }
+  .demo-card .ui-workspace { height:auto; min-height:clamp(103px,7vw,175px); gap:clamp(20px,2vw,48px) }
+  .demo-card .ui-project-folder { width:clamp(80px,5vw,130px); height:clamp(80px,5vw,130px) }
+  .demo-card .ui-row { height:clamp(64px,4.8vw,100px); font-size:clamp(17px,1.1vw,27px); line-height:1.3 }
+  .demo-card .ui-row span:last-child { font-size:clamp(9px,.65vw,16px) }
+  .quick-window .drop-zone { height:clamp(164px,12vw,300px); padding-top:clamp(24px,2vw,55px) }
+  .quick-window .drop-zone p { font-size:clamp(18px,1.2vw,30px); line-height:1.4; max-width:28ch; margin-top:clamp(36px,3vw,75px) }
+  .quick-control { font-size:clamp(10px,.75vw,18px) }
+  .quick-control button { width:clamp(30px,2vw,48px); height:clamp(30px,2vw,48px) }
+  .pricing { min-height:clamp(542px,calc(330px + 14.72vw),900px); padding-bottom:clamp(72px,5vw,170px) }
+  .pricing h2 { padding-top:clamp(51px,4vw,125px); line-height:1.2 }
+  .pricing-cards { gap:clamp(32px,2.5vw,80px); margin-top:clamp(81px,6vw,180px) }
+  .price-card { width:calc((100% - clamp(32px,2.5vw,80px))/2); height:clamp(306px,calc(180px + 8.75vw),520px); padding:clamp(39px,3vw,85px) clamp(40px,3vw,85px) clamp(33px,2.5vw,75px) }
+  .price-card h3 { height:clamp(92px,7vw,155px); font-size:clamp(44px,calc(21px + 1.6vw),83px); line-height:1.2 }
+  .price-amount { font-size:clamp(76px,calc(34px + 2.92vw),145px); line-height:1.1 }
+  .price-period,.price-card.regular .price-period { font-size:clamp(23px,1.65vw,40px); line-height:1.3 }
+  .price-card.regular p { font-size:clamp(23px,1.6vw,38px); line-height:1.4 }
+  .price-card.enterprise p { font-size:clamp(14px,1vw,24px); line-height:1.5 }
+  .price-card .price-email { font-size:clamp(13px,.95vw,23px); line-height:1.5 }
+  .faq { min-height:clamp(1316px,calc(968px + 24.17vw),1900px) }
+  .faq h2 { padding-top:clamp(50px,4vw,125px); line-height:1.2 }
+  .faq-list { margin-top:clamp(112px,8vw,230px); min-height:clamp(1100px,80vw,1550px) }
+  .faq-list::before { left:clamp(514px,39.506%,1050px) }
+  .faq-group,.faq-item { width:min(36.883%,980px) }
+  .faq-item button { min-height:clamp(60px,4.7vw,100px); font-size:clamp(16px,calc(9px + .486vw),27px); line-height:1.45; padding:clamp(16px,1.2vw,30px) clamp(18px,1.5vw,40px) }
+  .faq-answer { left:clamp(548px,42.284%,1150px); width:min(53.858%,1000px); font-size:clamp(16px,calc(10px + .417vw),26px); line-height:1.65; max-width:72ch }
+  .faq-answer h3 { font-size:clamp(34px,calc(17px + 1.181vw),62px); line-height:1.25 }
+  .footer { min-height:clamp(416px,32vw,700px); padding-top:clamp(96px,8vw,230px) }
+  .footer h2 { font-size:clamp(44px,calc(20px + 1.667vw),84px); line-height:1.2 }
+  .footer>p { font-size:clamp(11px,.8vw,18px); line-height:1.5 }
+  .footer-bottom { margin-top:clamp(26px,3vw,90px); padding-top:clamp(41px,3vw,95px); font-size:clamp(12px,.85vw,20px); line-height:1.5 }
 }
