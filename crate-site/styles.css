@@ -1560,6 +1560,11 @@ button {
   .workflow { grid-template-columns:clamp(230px,calc(182.6px + 6.77vw),280px) minmax(0,1fr) }
   .quick-workflow { grid-template-columns:clamp(240px,calc(192.6px + 6.77vw),290px) minmax(0,1fr) }
 }
+/* The tablet qualifier crosses the following folder's raised tab. Let the
+   heading, carousel and any wrapped note set its height, with clear space. */
+@media(min-width:701px) and (max-width:1050px) {
+  .supports { height:auto; min-height:270px; padding-bottom:24px }
+}
 
 /* Larger desktops grow as a composition rather than leaving 1440 px artwork
    and controls adrift inside a full-width folder background. */
@@ -1594,8 +1599,11 @@ button {
   .step-number,.quick-copy .kicker { font-size:clamp(10px,calc(5.5px + .313vw),17px); line-height:1.4 }
   .step-title,.quick-copy h3 { font-size:clamp(25px,calc(11px + .972vw),48px); line-height:1.28 }
   .step-copy,.quick-copy>p:last-child { font-size:clamp(16px,calc(10.7px + .368vw),25px); line-height:1.55; max-width:34ch }
-  .demo-window,.quick-window { height:clamp(523px,calc(126px + 27.57vw),1050px); padding-top:clamp(59px,4.4vw,120px) }
-  .demo-card { width:min(100%,clamp(660px,calc(228px + 30vw),1150px)); height:clamp(408px,calc(100px + 21.4vw),820px); padding:clamp(36px,3vw,75px) clamp(48px,4vw,100px) }
+  /* All states share a content-sized grid cell. Invisible states reserve their
+     space so completion padding survives wrapping without a step-change jump. */
+  .demo-window,.quick-window { display:grid; grid-template-columns:minmax(0,1fr); align-items:stretch; justify-items:center; height:auto; min-height:clamp(523px,calc(126px + 27.57vw),1050px); padding-top:clamp(59px,4.4vw,120px); padding-bottom:clamp(56px,4vw,110px) }
+  .demo-card { grid-area:1 / 1; width:min(100%,clamp(660px,calc(228px + 30vw),1150px)); height:auto; min-height:clamp(408px,calc(100px + 21.4vw),820px); padding:clamp(36px,3vw,75px) clamp(48px,4vw,100px) }
+  .demo-card[hidden] { display:block; visibility:hidden; pointer-events:none }
   .demo-card h3 { font-size:clamp(34px,calc(21px + .903vw),56px); line-height:1.2; margin-bottom:clamp(20px,2vw,55px) }
   .demo-card .ui-input { font-size:clamp(10px,.7vw,16px); line-height:1.3; margin-bottom:clamp(20px,1.5vw,40px) }
   .demo-card .ui-input span { font-size:clamp(18px,1.3vw,29px); line-height:1.3; min-height:clamp(46px,3.5vw,80px); padding:clamp(12px,1vw,25px) clamp(16px,1.2vw,32px) }
