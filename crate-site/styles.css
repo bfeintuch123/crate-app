@@ -1599,7 +1599,7 @@ button {
   .demo-card h3 { font-size:clamp(34px,calc(21px + .903vw),56px); line-height:1.2; margin-bottom:clamp(20px,2vw,55px) }
   .demo-card .ui-input { font-size:clamp(10px,.7vw,16px); line-height:1.3; margin-bottom:clamp(20px,1.5vw,40px) }
   .demo-card .ui-input span { font-size:clamp(18px,1.3vw,29px); line-height:1.3; min-height:clamp(46px,3.5vw,80px); padding:clamp(12px,1vw,25px) clamp(16px,1.2vw,32px) }
-  .demo-card .ui-action { height:auto; min-height:clamp(42px,3vw,70px); font-size:clamp(12px,.85vw,20px); line-height:1.4 }
+  .demo-card .ui-action { display:flex; align-items:center; justify-content:center; height:auto; min-height:clamp(42px,3vw,70px); font-size:clamp(12px,.85vw,20px); line-height:1.4 }
   .demo-card .ui-small { font-size:clamp(13px,.9vw,20px); line-height:1.4 }
   .demo-card .ui-workspace { height:auto; min-height:clamp(103px,7vw,175px); gap:clamp(20px,2vw,48px) }
   .demo-card .ui-project-folder { width:clamp(80px,5vw,130px); height:clamp(80px,5vw,130px) }
@@ -1612,13 +1612,16 @@ button {
   .pricing { min-height:clamp(542px,calc(330px + 14.72vw),900px); padding-bottom:clamp(72px,5vw,170px) }
   .pricing h2 { padding-top:clamp(51px,4vw,125px); line-height:1.2 }
   .pricing-cards { gap:clamp(32px,2.5vw,80px); margin-top:clamp(81px,6vw,180px) }
-  .price-card { width:calc((100% - clamp(32px,2.5vw,80px))/2); height:clamp(306px,calc(180px + 8.75vw),520px); padding:clamp(39px,3vw,85px) clamp(40px,3vw,85px) clamp(33px,2.5vw,75px) }
+  .price-card { width:calc((100% - clamp(32px,2.5vw,80px))/2); height:auto; min-height:clamp(306px,calc(180px + 8.75vw),520px); padding:clamp(39px,3vw,85px) clamp(40px,3vw,85px) clamp(33px,2.5vw,75px) }
   .price-card h3 { height:clamp(92px,7vw,155px); font-size:clamp(44px,calc(21px + 1.6vw),83px); line-height:1.2 }
   .price-amount { font-size:clamp(76px,calc(34px + 2.92vw),145px); line-height:1.1 }
   .price-period,.price-card.regular .price-period { font-size:clamp(23px,1.65vw,40px); line-height:1.3 }
   .price-card.regular p { font-size:clamp(23px,1.6vw,38px); line-height:1.4 }
   .price-card.enterprise p { font-size:clamp(14px,1vw,24px); line-height:1.5 }
-  .price-card .price-email { font-size:clamp(13px,.95vw,23px); line-height:1.5 }
+  .price-card.enterprise .price-email { font-size:clamp(13px,.95vw,23px); line-height:1.5 }
+  /* Content sets the shared card height; reserve room before the bottom-aligned actions. */
+  .price-card p,.price-card .price-email { flex-shrink:0 }
+  .price-card.regular p,.price-card.enterprise .price-email { margin-bottom:clamp(21px,1.5vw,40px) }
   .faq { min-height:clamp(1316px,calc(968px + 24.17vw),1900px) }
   .faq h2 { padding-top:clamp(50px,4vw,125px); line-height:1.2 }
   .faq-list { margin-top:clamp(112px,8vw,230px); min-height:clamp(1100px,80vw,1550px) }
