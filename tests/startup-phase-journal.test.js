@@ -3,13 +3,69 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const Module = require('node:module');
+const originalLoad = Module._load;
+const journalPath = require.resolve('../startup-phase-journal');
+const previousJournalCache = require.cache[journalPath];
+const electronModulePath = /[/\\]node_modules[/\\]electron(?:[/\\]|$)/u;
+const previousElectronCache = Object.keys(require.cache).filter(id => electronModulePath.test(id));
+const bootstrapListeners = [];
+const electronStub = {
+  app: {
+    on(eventName, listener) {
+      bootstrapListeners.push([eventName, listener]);
+    },
+  },
+};
+let stubbedElectronLoads = 0;
+let rejectedElectronModuleLoads = 0;
+let startupJournal;
+
+// The journal imports Electron during evaluation. Fence that import before
+// loading it: Electron's package entry can invoke its installer even when npm
+// lifecycle scripts were disabled. Keep this stub local to the synchronous load.
+delete require.cache[journalPath];
+try {
+  Module._load = function loadWithElectronStub(request, parent, isMain) {
+    if (request === 'electron') {
+      stubbedElectronLoads += 1;
+      return electronStub;
+    }
+    if (electronModulePath.test(request)) {
+      rejectedElectronModuleLoads += 1;
+      throw new Error('Desktop minimum tests must not load Electron package files');
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  startupJournal = require('../startup-phase-journal');
+} finally {
+  Module._load = originalLoad;
+  if (previousJournalCache) require.cache[journalPath] = previousJournalCache;
+  else delete require.cache[journalPath];
+}
+
+
 const {
   STARTUP_PHASE_JOURNAL_FILE,
   STARTUP_PHASE_JOURNAL_MAX_BYTES,
   STARTUP_PHASE_JOURNAL_MODE,
   createStartupPhaseJournal,
   getWatchRecoveryPhase,
-} = require('../startup-phase-journal');
+} = startupJournal;
+
+test('startup journal bootstrap uses the stub without loading Electron or its installer', () => {
+  assert.equal(stubbedElectronLoads, 1);
+  assert.equal(rejectedElectronModuleLoads, 0);
+  assert.equal(bootstrapListeners.length, 1);
+  assert.equal(bootstrapListeners[0][0], 'browser-window-created');
+  assert.equal(typeof bootstrapListeners[0][1], 'function');
+  assert.equal(Module._load, originalLoad);
+  assert.equal(require.cache[journalPath], previousJournalCache);
+  assert.deepEqual(
+    Object.keys(require.cache).filter(id => electronModulePath.test(id)),
+    previousElectronCache,
+  );
+});
 
 function modeOf(filePath) {
   return fs.statSync(filePath).mode & 0o777;
