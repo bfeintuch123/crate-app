@@ -1041,6 +1041,9 @@
     <!-- Package Confirmation Modal -->
     <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" aria-describedby="package-review-subtitle" tabindex="-1">
       <div class="modal package-review-modal">
+        <div class="package-review-navigation">
+          <button type="button" id="btn-back-package" class="package-review-back">← Back to selection</button>
+        </div>
         <div class="modal-header-area">
           <div class="modal-title" id="package-review-title">Package Review</div>
           <div class="modal-subtitle" id="package-review-subtitle">Confirm the visual summary before Crate creates the folder.</div>
@@ -1063,7 +1066,10 @@
               <div class="modal-row-label" id="package-review-assets-heading">What Will Be Packaged</div>
               <div class="package-review-total" id="package-review-total">0 visual assets</div>
               <div class="package-review-apps" id="package-review-apps"></div>
-              <div class="modal-file-list" id="modal-file-list" role="region" aria-label="Files in Package Review" tabindex="-1"></div>
+              <div class="package-review-contents" id="package-review-contents" role="region" aria-label="Files in Package Review" tabindex="0">
+                <div class="modal-file-list" id="modal-file-list" role="list" aria-label="Package files"></div>
+              </div>
+              <button type="button" id="btn-toggle-package-contents" class="package-review-contents-toggle hidden" aria-expanded="false" aria-controls="modal-file-list">Show all files</button>
             </section>
             <aside class="package-review-summary" aria-labelledby="package-review-summary-heading">
               <div class="modal-row-label" id="package-review-summary-heading">Package Summary</div>
@@ -1093,7 +1099,7 @@
             </aside>
           </div>
           <div class="modal-actions">
-            <button class="modal-btn-secondary" id="btn-cancel-package">Change Selection</button>
+            <button class="modal-btn-secondary" id="btn-cancel-package">Back to selection</button>
             <button class="modal-btn-primary" id="btn-confirm-package">Package Project</button>
           </div>
         </div>
