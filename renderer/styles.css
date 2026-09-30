@@ -2112,6 +2112,10 @@ body {
   cursor: pointer;
 }
 
+#package-destination-label {
+  color: var(--gray-700);
+}
+
 .modal-folder-change:disabled {
   opacity: 0.55;
   cursor: wait;
