@@ -58,6 +58,7 @@ let rendererEventListenersBound = false;
 let mainProcessListenersBound = false;
 let packageReviewOpener = null;
 let packageReviewConfirmationInFlight = false;
+let packageDestinationPicker = null;
 let packageReviewConfirmationId = 0;
 let upgradeModalOpener = null;
 let existingAssetsDecisionRequest = null;
@@ -3557,6 +3558,7 @@ function syncPackageReviewReturnControls() {
     const button = $(`#${id}`);
     if (button) button.disabled = packageReviewConfirmationInFlight;
   }
+  syncPackageDestinationControls();
 }
 
 function getPackageReviewFocusableElements() {
@@ -3760,7 +3762,60 @@ function handlePackageReviewKeydown(event) {
 }
 
 function getPackageDestinationLabel(outputPath) {
-  return typeof outputPath === 'string' && outputPath ? 'Selected output folder' : '~/Desktop/';
+  return typeof outputPath === 'string' && outputPath ? 'Selected output folder' : 'Choose a folder before packaging';
+}
+
+function syncPackageDestinationControls() {
+  const button = $('#btn-change-dest');
+  if (button) {
+    button.textContent = packageDestinationPicker ? 'Choosing…' : state.packageOutputPath ? 'Change Folder' : 'Choose Folder';
+    button.disabled = Boolean(packageDestinationPicker) || packageReviewConfirmationInFlight;
+    button.setAttribute('aria-busy', String(Boolean(packageDestinationPicker)));
+  }
+  const confirmButton = $('#btn-confirm-package');
+  if (confirmButton) confirmButton.disabled = Boolean(packageDestinationPicker) || packageReviewConfirmationInFlight || !state.packageReviewToken;
+}
+
+async function choosePackageDestination() {
+  const modal = $('#modal-package');
+  if (packageDestinationPicker || packageReviewConfirmationInFlight || accountStatus.canUseWorkspace !== true ||
+      !packageReviewModalSessionId || !packageReviewModalProjectId || modal?.classList.contains('hidden') ||
+      packageReviewModalProjectId !== state.selectedProjectId || packageReviewModalSelectionEpoch !== projectSelectionEpoch ||
+      packageReviewModalRequestId !== packageReviewRequestId || !isCurrentModalLease('modal-package', packageReviewModalSessionId)) return;
+  const operation = {
+    accountEpoch: accountWorkspaceEpoch,
+    projectId: state.selectedProjectId,
+    selectionEpoch: projectSelectionEpoch,
+    requestId: packageReviewRequestId,
+    sessionId: packageReviewModalSessionId,
+  };
+  const isCurrent = () => accountWorkspaceEpoch === operation.accountEpoch && accountStatus.canUseWorkspace === true &&
+    state.selectedProjectId === operation.projectId && projectSelectionEpoch === operation.selectionEpoch &&
+    packageReviewModalProjectId === operation.projectId && packageReviewRequestId === operation.requestId &&
+    packageReviewModalRequestId === operation.requestId && packageReviewModalSessionId === operation.sessionId &&
+    isCurrentModalLease('modal-package', operation.sessionId) && !modal.classList.contains('hidden');
+  const button = $('#btn-change-dest');
+  const focusAnchor = $('#btn-back-package');
+  const restoreButtonFocus = document.activeElement === button;
+  if (restoreButtonFocus) focusAnchor?.focus?.({ preventScroll: true });
+  packageDestinationPicker = operation;
+  syncPackageDestinationControls();
+  try {
+    const folder = await window.crate.selectOutputFolder();
+    if (packageDestinationPicker !== operation || !isCurrent()) return;
+    if (typeof folder === 'string' && folder) {
+      state.packageOutputPath = folder;
+      $('#modal-dest-path').textContent = getPackageDestinationLabel(folder);
+    }
+  } catch (error) {
+    if (packageDestinationPicker === operation && isCurrent()) showToast('The folder picker could not open. Try again.');
+  } finally {
+    if (packageDestinationPicker === operation) {
+      packageDestinationPicker = null;
+      syncPackageDestinationControls();
+      if (restoreButtonFocus && isCurrent() && document.activeElement === focusAnchor) button?.focus?.({ preventScroll: true });
+    }
+  }
 }
 
 function getPackageOutputLayoutMode(settings = state.settings) {
@@ -4290,6 +4345,7 @@ async function confirmPackage() {
   const confirmButton = $('#btn-confirm-package');
   if (
     !project ||
+    packageDestinationPicker ||
     !state.packageReviewToken ||
     confirmButton?.disabled ||
     packageReviewModalProjectId !== project.id ||
@@ -4576,13 +4632,7 @@ function setupEventListeners() {
     applyAssetReviewFilter();
   });
 
-  $('#btn-change-dest').addEventListener('click', async () => {
-    const folder = await window.crate.selectOutputFolder();
-    if (folder) {
-      state.packageOutputPath = folder;
-      $('#modal-dest-path').textContent = getPackageDestinationLabel(folder);
-    }
-  });
+  $('#btn-change-dest').addEventListener('click', choosePackageDestination);
 
   // Success modal
   $('#btn-success-done').addEventListener('click', hidePackageSuccessModal);

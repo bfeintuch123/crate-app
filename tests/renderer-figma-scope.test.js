@@ -4555,7 +4555,7 @@ test('Package Review minimizes custom destination paths in renderer labels', () 
 
   assert.equal(elements['modal-dest-path'].textContent, 'Selected output folder');
   assert.equal(elements['modal-dest-path'].textContent.includes('/Users/'), false);
-  assert.equal(renderer.getPackageDestinationLabel(null), '~/Desktop/');
+  assert.equal(renderer.getPackageDestinationLabel(null), 'Choose a folder before packaging');
 });
 
 test('Package Review binds duplicate display names to distinct authoritative visual identities', async () => {
@@ -5376,7 +5376,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Skip existing assets<\/button>/);
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Include existing assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
-  assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change Folder<\/button>/);
+  assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Choose Folder<\/button>/);
   assert.match(html, /<div(?=[^>]*id="modal-package-review-message")(?=[^>]*role="status")(?=[^>]*aria-live="polite")(?=[^>]*tabindex="-1")[^>]*>/);
   assert.match(html, /id="package-review-contents"[^>]*role="region"[^>]*tabindex="0"/);
   assert.match(html, /id="modal-file-list"[^>]*role="list"/);

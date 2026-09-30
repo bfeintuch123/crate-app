@@ -407,3 +407,92 @@ for (const guard of ['settings', 'hidden', 'other-modal', 'confirmation']) test(
   gate.resolve({ packageOutputLayoutMode: 'flat' });
   await pending;
 });
+
+
+for (const outcome of ['selected', 'cancelled', 'error']) test(`destination picker ${outcome} preserves ownership, privacy and keyboard focus`, async () => {
+  const { renderer, elements, document, project, review } = setup();
+  vm.runInContext("accountStatus = { canUseWorkspace: true }; state.packageOutputPath = null;", renderer);
+  renderer.renderPackageReview(project, review, '', renderer.claimModalLease('modal-package', { replaceVisible: true }));
+  assert.equal(elements['btn-change-dest'].textContent, 'Choose Folder');
+  assert.equal(elements['modal-dest-path'].textContent, 'Choose a folder before packaging');
+  let settle;
+  let reject;
+  let calls = 0;
+  renderer.window.crate.selectOutputFolder = () => { calls++; return new Promise((resolve, fail) => { settle = resolve; reject = fail; }); };
+  const button = elements['btn-change-dest'];
+  button.focus();
+  const operation = renderer.choosePackageDestination();
+  assert.equal(document.activeElement, elements['btn-back-package'], 'move focus before disabling picker action');
+  assert.equal(button.disabled, true);
+  assert.equal(button.getAttribute('aria-busy'), 'true');
+  assert.equal(elements['btn-confirm-package'].disabled, true);
+  await renderer.choosePackageDestination();
+  await renderer.confirmPackage();
+  assert.equal(calls, 1, 'one owned picker, including confirmation path');
+  if (outcome === 'error') reject(new Error('/private/path must not be exposed'));
+  else settle(outcome === 'selected' ? '/private/synthetic/output' : null);
+  await operation;
+  assert.equal(vm.runInContext('state.packageOutputPath', renderer), outcome === 'selected' ? '/private/synthetic/output' : null);
+  assert.equal(elements['modal-dest-path'].textContent, outcome === 'selected' ? 'Selected output folder' : 'Choose a folder before packaging');
+  assert.equal(button.textContent, outcome === 'selected' ? 'Change Folder' : 'Choose Folder');
+  assert.equal(button.disabled, false);
+  assert.equal(button.getAttribute('aria-busy'), 'false');
+  assert.equal(elements['btn-confirm-package'].disabled, false);
+  assert.equal(document.activeElement, button);
+  assert.equal(elements['modal-dest-path'].textContent.includes('/private/'), false);
+  assert.equal(vm.runInContext('state.packageReviewToken', renderer), 'review-token', 'backend destination confirmation still owns plan acceptance');
+});
+
+for (const boundary of ['close', 'project', 'same-project-reset', 'account', 'request', 'replacement-dialog']) {
+  test(`destination picker ignores completion after ${boundary} without stealing focus`, async () => {
+    const { renderer, elements, document, project, review } = setup();
+    vm.runInContext('accountStatus = { canUseWorkspace: true };', renderer);
+    let settle;
+    renderer.window.crate.selectOutputFolder = () => new Promise(resolve => { settle = resolve; });
+    elements['btn-change-dest'].focus();
+    const operation = renderer.choosePackageDestination();
+    if (boundary === 'close') renderer.hidePackageReviewDialog();
+    if (boundary === 'project') renderer.setSelectedProject('new-project');
+    if (boundary === 'same-project-reset') renderer.setSelectedProject(project.id, { invalidate: true });
+    if (boundary === 'account') vm.runInContext('accountWorkspaceEpoch++; accountStatus.canUseWorkspace = false;', renderer);
+    if (boundary === 'request') vm.runInContext('packageReviewRequestId++;', renderer);
+    if (boundary === 'replacement-dialog') {
+      renderer.hidePackageReviewDialog();
+      renderer.renderPackageReview(project, review);
+      assert.equal(elements['btn-change-dest'].disabled, true, 'native picker is still outstanding');
+    }
+    elements['btn-package'].focus();
+    const currentLabel = elements['modal-dest-path'].textContent;
+    settle('/private/stale/choice');
+    await operation;
+    assert.equal(vm.runInContext('state.packageOutputPath', renderer), '/synthetic/output');
+    assert.equal(elements['modal-dest-path'].textContent, currentLabel);
+    assert.equal(document.activeElement, elements['btn-package']);
+    assert.equal(vm.runInContext('packageDestinationPicker', renderer), null);
+  });
+}
+
+test('destination picker does not steal focus after another owned control receives it', async () => {
+  const { renderer, elements, document } = setup();
+  vm.runInContext('accountStatus = { canUseWorkspace: true };', renderer);
+  let settle;
+  renderer.window.crate.selectOutputFolder = () => new Promise(resolve => { settle = resolve; });
+  elements['btn-change-dest'].focus();
+  const operation = renderer.choosePackageDestination();
+  elements['toggle-package-review-folders'].focus();
+  settle(null);
+  await operation;
+  assert.equal(document.activeElement, elements['toggle-package-review-folders']);
+  assert.equal(vm.runInContext('state.packageOutputPath', renderer), '/synthetic/output', 'cancel preserves existing choice');
+});
+
+test('destination is a single labeled button at the top of Package Summary', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../renderer/index.html'), 'utf8');
+  const summary = html.slice(html.indexOf('<aside class="package-review-summary"'), html.indexOf('</aside>', html.indexOf('<aside class="package-review-summary"')));
+  assert.equal((html.match(/id="btn-change-dest"/g) || []).length, 1);
+  assert.ok(summary.indexOf('id="btn-change-dest"') < summary.indexOf('id="package-review-summary-list"'));
+  assert.match(summary, /id="package-destination-label">Save package to/);
+  assert.match(summary, /<button[^>]*id="btn-change-dest"[^>]*aria-describedby="package-destination-label modal-dest-path"/);
+  assert.match(summary, /id="modal-dest-path"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.doesNotMatch(summary, /~\/Desktop\//);
+});

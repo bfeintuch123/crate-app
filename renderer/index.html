@@ -1073,6 +1073,11 @@
             </section>
             <aside class="package-review-summary" aria-labelledby="package-review-summary-heading">
               <div class="modal-row-label" id="package-review-summary-heading">Package Summary</div>
+              <div class="modal-folder-row">
+                <div class="modal-naming-label" id="package-destination-label">Save package to</div>
+                <span class="modal-folder-path" id="modal-dest-path" role="status" aria-live="polite">Choose a folder before packaging</span>
+                <button type="button" class="modal-folder-change" id="btn-change-dest" aria-describedby="package-destination-label modal-dest-path">Choose Folder</button>
+              </div>
               <dl id="package-review-summary-list"></dl>
               <div class="modal-info-row hidden" id="modal-figma-scope-row">
                 <div class="modal-row-label">Figma Scope</div>
@@ -1091,10 +1096,6 @@
               <div class="modal-naming-box">
                 <div class="modal-naming-label">Output Folder Name</div>
                 <div class="modal-naming-preview" id="modal-folder-name"></div>
-              </div>
-              <div class="modal-folder-row">
-                <span class="modal-folder-path" id="modal-dest-path">~/Desktop/</span>
-                <button type="button" class="modal-folder-change" id="btn-change-dest">Change Folder</button>
               </div>
             </aside>
           </div>

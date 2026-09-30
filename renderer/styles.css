@@ -2098,14 +2098,23 @@ body {
 
 .modal-folder-change {
   appearance: none;
-  border: 0;
-  padding: 0;
-  background: transparent;
+  border: 1px solid var(--gray-400);
+  border-radius: 6px;
+  min-height: 36px;
+  padding: 8px 12px;
+  background: var(--white);
   font-size: 12px;
   font-weight: 600;
   font-family: inherit;
   color: var(--black);
+  white-space: normal;
+  overflow-wrap: anywhere;
   cursor: pointer;
+}
+
+.modal-folder-change:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 
 .modal-folder-change:focus-visible {
