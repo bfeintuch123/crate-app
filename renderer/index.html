@@ -187,7 +187,7 @@
 
     .project-dashboard-action-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr);
       align-items: end;
       gap: 16px 20px;
     }
@@ -358,8 +358,7 @@
         grid-template-columns: minmax(0, 1fr);
       }
 
-      .project-dashboard-alert,
-      .review-assets-button {
+      .project-dashboard-alert {
         width: 100%;
       }
 
@@ -744,7 +743,10 @@
             <div class="asset-metric-grid" aria-label="Asset summary">
               <div class="asset-metric existing"><strong id="metric-existing-count">0</strong><span>Existing</span></div>
               <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added while working</span></div>
-              <div class="asset-metric missing"><strong id="metric-missing-count">0</strong><span>Needs Review</span></div>
+              <div class="asset-metric missing">
+                <div class="asset-metric-copy"><strong id="metric-missing-count">0</strong><span id="metric-missing-label">Needs Review</span></div>
+                <button type="button" class="app-btn review-assets-button" id="btn-review-assets" aria-describedby="metric-missing-count metric-missing-label">Review Assets</button>
+              </div>
               <div class="asset-metric excluded"><strong id="metric-excluded-count">0</strong><span>Excluded</span></div>
             </div>
 
@@ -753,7 +755,6 @@
                 <h2 id="recent-assets-heading">Recently Found</h2>
                 <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
               </section>
-              <button type="button" class="app-btn review-assets-button" id="btn-review-assets">Review Assets</button>
             </div>
 
             <div class="project-dashboard-grid">
