@@ -11080,7 +11080,7 @@ async function queryIllustratorActiveState(projectId, activationToken) {
 async function initializeIllustratorActivationScope(projectId, activationToken) {
   const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
   const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
-  applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken); return updated;
+  await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken); return updated;
 }
 function admitIllustratorSourcesForProject(projectId, filePaths) {
   const activationToken = getActiveWatchingActivationToken(projectId), scope = getIllustratorActivationScope(projectId, activationToken); if (!scope || !getFreshActiveWatchingProject(projectId, activationToken)) return;
@@ -11174,7 +11174,7 @@ function getLiveAppEvidenceCandidates(liveEvidenceRecords = []) {
   return collectLiveAppEvidenceCandidates(liveEvidenceRecords).candidates;
 }
 
-function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null) {
+async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null) {
   if (!isBoundWatchingActivationCurrent(projectId, activationToken)) {
     return { changed: false, stagedCount: 0, skipped: {} };
   }
@@ -11192,6 +11192,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
     let stagedCount = 0;
     const stagedStates = new Map();
     const stagedByApp = new Map();
+    const baselineSourcePaths = [];
 
     for (const { evidence, ext } of candidates) {
       const fileEntry = buildAutoCaptureFileEntry(evidence.filePath, evidence.source, { ext });
@@ -11223,6 +11224,10 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
       if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
         const storedFile = proj.files.find(f => f.path === fileEntry.path && f.source === fileEntry.source);
         if (storedFile) {
+          if (
+            proj.assetBaseline?.status === 'awaiting-first-scan' &&
+            isProjectAssetBaselineSource(storedFile) && SCAN_ON_OPEN_EXTENSIONS.has(ext)
+          ) baselineSourcePaths.push(storedFile.path);
           recordSessionObservedFile(proj, storedFile, {
             kind: OBSERVER_KINDS.APP_SCRIPT,
             method: evidence.source,
@@ -11242,6 +11247,7 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
       stagedCount,
       stagedStates: Array.from(stagedStates.entries()),
       stagedByApp: Array.from(stagedByApp.entries()),
+      baselineSourcePaths,
       files: proj.files,
       pendingFiles: proj.pendingFiles || [],
     };
@@ -11257,6 +11263,21 @@ function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activa
   }
 
   if (result.stagedCount > 0) sendProjectFileStateToRenderer(projectId, activationToken);
+
+  // Reserve the newly admitted cohort before yielding so review waits on it.
+  // Existing/failed sources are not re-queued by later observer snapshots.
+  if (result.baselineSourcePaths.length > 0 &&
+      getFreshActiveWatchingProject(projectId, activationToken)?.assetBaseline?.status === 'awaiting-first-scan') {
+    const operation = parentOperation || captureProjectOperation(projectId);
+    if (operation) {
+      try {
+        const scanReport = await runBoundedScanOnOpenQueue(projectId, result.baselineSourcePaths, activationToken, operation);
+        if (scanReport.cancelled || !operation.current()) return { ...result, cancelled: true };
+      } finally {
+        if (!parentOperation) operation.close();
+      }
+    }
+  }
 
   return result;
 }
@@ -11637,6 +11658,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
 
   psInProgress.add(projectId);
   logLiveAppDiagnostic(projectId, 'poll-fired', `live app evidence refresh fired for project ${projectId}`);
+  let refreshOperation = null;
 
   try {
     const liveEvidenceRecords = [];
@@ -11884,7 +11906,18 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
     ) return;
 
-    const refreshResult = applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken);
+    const capturedOperation = captureProjectOperation(projectId);
+    if (!capturedOperation) return;
+    const coordinatorCurrent = () => watcherGeneration === null ||
+      getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration);
+    refreshOperation = {
+      ...capturedOperation,
+      current: () => capturedOperation.current() && coordinatorCurrent(),
+      adoptScope: scope => coordinatorCurrent() && capturedOperation.adoptScope(scope) && coordinatorCurrent(),
+    };
+    if (!refreshOperation.current()) return;
+    const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation);
+    if (refreshResult.cancelled || !refreshOperation.current()) return;
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -11902,9 +11935,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       console.log(`[crate][live-app] Staged ${refreshResult.stagedCount} active-session evidence candidates for project ${projectId}${stateSummary ? ` (${stateSummary})` : ''}`);
     }
   } catch (e) {
+    if (refreshOperation && !refreshOperation.current()) return;
     if (activationToken !== null && !getFreshActiveWatchingProject(projectId, activationToken)) return;
     console.error('[crate][live-app] pollPsForProject error:', redactFigmaLogText(e && e.message));
   } finally {
+    refreshOperation?.close();
     if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) psInProgress.delete(projectId);
   }
 }
@@ -16228,7 +16263,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     if (!illustratorQuery.stale && getFreshActiveWatchingProject(projectId, illustratorActivationToken)) {
       const scopeResult = updateIllustratorActivationScope(projectId, illustratorActivationToken, illustratorQuery, false); if (!scopeResult || !operation.adoptScope(scopeResult.scope) || !operationCurrent()) return;
       if (scopeResult && scopeResult.ready) {
-        const records = createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }), refreshed = applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken); newCount += refreshed.stagedCount || 0;
+        const records = createIllustratorLiveEvidenceRecords(projectId, illustratorQuery.activeState, scopeResult.project, { skipped: {} }), refreshed = await applyLiveAppEvidenceRefresh(projectId, records, illustratorActivationToken, operation); newCount += refreshed.stagedCount || 0;
         project = getFreshActiveWatchingProject(projectId, illustratorActivationToken) || project;
         for (const file of project.files || []) existingPaths.add(normalizeTrackedFilePath(file.path));
         for (const file of project.pendingFiles || []) pendingPaths.add(normalizeTrackedFilePath(file.path));
