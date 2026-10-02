@@ -3308,3 +3308,69 @@ body {
 #settings-panel-billing .settings-section { padding:25px; background:rgba(245,244,240,.9); border-radius:10px; }
 #settings-panel-billing .settings-section-title { font:400 21px Georgia,serif; letter-spacing:normal; text-transform:none; color:var(--black); }
 #settings-panel-billing p { font-size:13px; color:var(--gray-500); }
+
+/* Package Review navigation stays visible when the dialog body scrolls. */
+.package-review-navigation {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 12px 28px;
+  background: var(--white);
+  border-bottom: 1px solid var(--gray-200);
+}
+
+.package-review-back,
+.package-review-contents-toggle {
+  min-height: 40px;
+  border: 1px solid var(--gray-200);
+  border-radius: 7px;
+  background: var(--white);
+  color: var(--gray-700);
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.package-review-back:hover,
+.package-review-contents-toggle:hover { background: var(--gray-50); }
+.package-review-back:disabled { opacity: 0.55; cursor: not-allowed; }
+.package-review-back:focus-visible,
+.package-review-contents-toggle:focus-visible,
+.package-review-contents:focus-visible {
+  outline: 2px solid var(--black);
+  outline-offset: 3px;
+}
+
+.package-review-modal .package-review-ready { top: 90px; }
+.package-review-contents { max-height: 310px; overflow-y: auto; border-radius: 4px; }
+.package-review-assets .modal-file-list { max-height: none; overflow: visible; margin-bottom: 0; }
+.package-review-contents-toggle { margin-top: 12px; }
+.package-review-assets .modal-file-list.is-expanded { display: block; }
+.package-review-assets .modal-file-list.is-expanded .package-review-file-card {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-rows: auto auto auto;
+  column-gap: 10px;
+  row-gap: 4px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--gray-200);
+}
+.modal-file-list.is-expanded .file-visual { grid-row: 1 / 4; width: 36px; height: 36px; }
+.modal-file-list.is-expanded .modal-file-name,
+.modal-file-list.is-expanded .file-origin,
+.modal-file-list.is-expanded .package-review-file-destination {
+  grid-column: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: visible;
+}
+.modal-file-list.is-expanded .modal-file-name { font-size: 12px; }
+
+.modal-file-list.is-expanded .file-origin-label {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: visible;
+  text-overflow: clip;
+}

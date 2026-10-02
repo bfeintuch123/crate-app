@@ -73,6 +73,7 @@ let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
 let packageReviewModalRequestId = null;
 let packageReviewModalSessionId = null;
+let packageReviewContents = null;
 let projectSelectionEpoch = 0;
 let projectSelectionIntentEpoch = 0;
 let tabNavigationEpoch = 0;
@@ -3551,14 +3552,21 @@ function setModalBackgroundState(blocked) {
   }
 }
 
+function syncPackageReviewReturnControls() {
+  for (const id of ['btn-back-package', 'btn-cancel-package']) {
+    const button = $(`#${id}`);
+    if (button) button.disabled = packageReviewConfirmationInFlight;
+  }
+}
+
 function getPackageReviewFocusableElements() {
   const modal = $('#modal-package');
   if (!modal) return [];
   if (typeof modal.querySelectorAll === 'function') {
     return [...modal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
-      .filter(element => !element.disabled && element.getAttribute?.('aria-hidden') !== 'true');
+      .filter(element => !element.disabled && element.getAttribute?.('aria-hidden') !== 'true' && !element.closest?.('.hidden'));
   }
-  return ['btn-change-dest', 'btn-cancel-package', 'btn-confirm-package']
+  return ['btn-back-package', 'btn-change-dest', 'btn-cancel-package', 'btn-confirm-package']
     .map(id => $(`#${id}`))
     .filter(element => element && !element.disabled);
 }
@@ -3571,7 +3579,7 @@ function focusPackageReviewDialog() {
     reviewMessage.focus({ preventScroll: true });
     return;
   }
-  const cancelButton = $('#btn-cancel-package');
+  const cancelButton = $('#btn-back-package') || $('#btn-cancel-package');
   const focusTarget = cancelButton && !cancelButton.disabled
     ? cancelButton
     : getPackageReviewFocusableElements()[0] || $('#modal-package');
@@ -3592,6 +3600,8 @@ function openPackageReviewDialog(suppliedLease = null) {
     packageReviewModalSessionId = lease.sessionId;
   }
   packageReviewModalSessionId = lease.sessionId;
+  if (packageReviewContents) packageReviewContents.lease = lease;
+  syncPackageReviewReturnControls();
   setModalBackgroundState(true);
   modal.classList.remove('hidden');
   focusPackageReviewDialog();
@@ -3599,6 +3609,11 @@ function openPackageReviewDialog(suppliedLease = null) {
 }
 
 function hidePackageReviewDialog({ restoreFocus = false, preserveOpener = false } = {}) {
+  if (packageReviewContents?.expanded) {
+    packageReviewContents.expanded = false;
+    renderPackageReviewContents();
+  }
+  if (!preserveOpener) packageReviewContents = null;
   $('#modal-package')?.classList.add('hidden');
   releaseModalLease('modal-package', packageReviewModalSessionId);
   packageReviewModalSessionId = null;
@@ -3700,14 +3715,21 @@ function showPackageSuccessModal() {
 function cancelPackageReview() {
   if (packageReviewConfirmationInFlight) return;
   state.packageReviewToken = null;
+  // A refresh may own a newer lease than the still-visible review.
+  packageReviewRequestId += 1;
   hidePackageReviewDialog({ restoreFocus: true });
+  releaseModalLease('modal-package');
 }
 
 function changePackageReviewSelection() {
-  if (packageReviewConfirmationInFlight) return;
+  if (packageReviewConfirmationInFlight || !packageReviewModalProjectId ||
+      packageReviewModalProjectId !== state.selectedProjectId ||
+      packageReviewModalSelectionEpoch !== projectSelectionEpoch) return;
   state.packageReviewToken = null;
   state.assetReviewOpen = true;
+  packageReviewRequestId += 1;
   hidePackageReviewDialog();
+  releaseModalLease('modal-package');
   switchTab('current-project');
   openAssetReviewWorkspace();
 }
@@ -3753,21 +3775,39 @@ function getPackageOutputLayoutMode(settings = state.settings) {
   return PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
 }
 
-function syncPackageOutputLayoutControls(layoutMode = getPackageOutputLayoutMode()) {
+function syncPackageOutputLayoutControls(layoutMode = getPackageOutputLayoutMode(), { updateReview = true } = {}) {
   const organized = layoutMode === PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION;
   const settingsToggle = $('#toggle-package-folders');
   const reviewToggle = $('#toggle-package-review-folders');
   const reviewStatus = $('#package-review-organization-status');
   if (settingsToggle) settingsToggle.checked = organized;
-  if (reviewToggle) reviewToggle.checked = organized;
-  if (reviewStatus) reviewStatus.textContent = organized ? 'Folders by file type' : 'Keep files together';
+  if (updateReview && reviewToggle) reviewToggle.checked = organized;
+  if (updateReview && reviewStatus) reviewStatus.textContent = organized ? 'Folders by file type' : 'Keep files together';
 }
 
 async function updatePackageOutputLayoutMode(organized, { refreshReview = false } = {}) {
+  const reviewSessionId = packageReviewModalSessionId;
+  const reviewProjectId = state.selectedProjectId;
+  const reviewSelectionEpoch = projectSelectionEpoch;
+  const canRefreshReview = () => refreshReview &&
+    reviewSessionId === packageReviewModalSessionId &&
+    reviewProjectId === state.selectedProjectId &&
+    reviewSelectionEpoch === projectSelectionEpoch &&
+    (!reviewSessionId || isCurrentModalLease('modal-package', reviewSessionId));
   const previousMode = getPackageOutputLayoutMode();
   const nextMode = organized ? PACKAGE_OUTPUT_LAYOUT_MODES.BY_EXTENSION : PACKAGE_OUTPUT_LAYOUT_MODES.FLAT;
   const controls = [$('#toggle-package-folders'), $('#toggle-package-review-folders')].filter(Boolean);
   const confirmButton = $('#btn-confirm-package');
+  const modal = $('#modal-package');
+  const focusedControl = document.activeElement;
+  if (reviewSessionId && canRefreshReview() && !packageReviewConfirmationInFlight &&
+      modal && !modal.classList.contains('hidden') &&
+      (focusedControl === $('#toggle-package-review-folders') || focusedControl === confirmButton)) {
+    // Disabling Chromium's focused input blurs to BODY, outside the dialog's
+    // key handler. Keep pending-refresh Escape reachable without scrolling.
+    const returnControl = $('#btn-back-package');
+    if (returnControl && !returnControl.disabled) returnControl.focus({ preventScroll: true });
+  }
   controls.forEach(control => { control.disabled = true; });
   if (refreshReview) {
     state.packageReviewToken = null;
@@ -3779,9 +3819,10 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
       ? updatedSettings
       : { ...state.settings, packageOutputLayoutMode: nextMode };
     const savedMode = getPackageOutputLayoutMode();
-    syncPackageOutputLayoutControls(savedMode);
+    // Do not relabel the authoritative plan of a review opened after this save began.
+    syncPackageOutputLayoutControls(savedMode, { updateReview: !refreshReview || canRefreshReview() });
     if (savedMode !== nextMode) throw new Error('Package organization preference was not saved');
-    if (refreshReview) {
+    if (canRefreshReview()) {
       await showPackageModal({
         successMessage: PACKAGE_LAYOUT_CHANGED_MESSAGE,
         runPreScan: false,
@@ -3791,13 +3832,64 @@ async function updatePackageOutputLayoutMode(organized, { refreshReview = false 
   } catch (error) {
     logRendererError('Package organization update failed', error);
     state.settings.packageOutputLayoutMode = previousMode;
-    syncPackageOutputLayoutControls(previousMode);
-    if (refreshReview) {
+    syncPackageOutputLayoutControls(previousMode, { updateReview: !refreshReview || canRefreshReview() });
+    if (canRefreshReview()) {
       await showPackageModal({ message: PACKAGE_REVIEW_RECOVERY_MESSAGE, runPreScan: false });
     }
   } finally {
     controls.forEach(control => { control.disabled = false; });
   }
+}
+
+function renderPackageReviewContents() {
+  const contents = packageReviewContents;
+  const fileList = $('#modal-file-list');
+  const region = $('#package-review-contents');
+  if (!contents || !fileList) return;
+  fileList.innerHTML = '';
+  fileList.classList.toggle('is-expanded', contents.expanded);
+  const visibleFiles = contents.expanded ? contents.files : contents.files.slice(0, 8);
+  visibleFiles.forEach((file, index) => {
+    const item = document.createElement('div');
+    item.className = 'modal-file-item package-review-file-card';
+    item.setAttribute('role', 'listitem');
+    item.appendChild(createFileVisual(contents.project.id, file, { loadVisual: index < 8 }));
+    const name = document.createElement('div');
+    name.className = 'modal-file-name';
+    name.textContent = file.name || 'Unavailable file';
+    name.title = name.textContent;
+    item.appendChild(name);
+    appendAppOriginLabel(item, file, contents.project);
+    if (typeof file.packageFolder === 'string' && file.packageFolder) {
+      const destination = document.createElement('div');
+      destination.className = 'package-review-file-destination';
+      destination.textContent = file.packageFolder === 'Package root'
+        ? 'Package root' : `${file.packageFolder} folder`;
+      item.appendChild(destination);
+    }
+    fileList.appendChild(item);
+  });
+  const toggle = $('#btn-toggle-package-contents');
+  if (toggle) {
+    toggle.classList.toggle('hidden', contents.files.length <= 8);
+    toggle.textContent = contents.expanded ? 'Show fewer' : `+${contents.files.length - 8} more — Show all files`;
+    toggle.setAttribute('aria-expanded', String(contents.expanded));
+  }
+  if (region) region.scrollTop = 0;
+}
+
+function togglePackageReviewContents() {
+  const contents = packageReviewContents;
+  if (!contents || packageReviewConfirmationInFlight ||
+      contents.project.id !== state.selectedProjectId ||
+      packageReviewModalSelectionEpoch !== projectSelectionEpoch ||
+      !isCurrentModalLease('modal-package', contents.lease.sessionId) ||
+      $('#modal-package')?.classList.contains('hidden')) return;
+  contents.expanded = !contents.expanded;
+  renderPackageReviewContents();
+  // One focusable scroll region exposes the semantic list without hundreds of tab stops.
+  const focusTarget = contents.expanded ? $('#package-review-contents') : $('#btn-toggle-package-contents');
+  focusTarget?.focus?.({ preventScroll: true });
 }
 
 function renderPackageReview(project, review, message = '', suppliedLease = null) {
@@ -3853,39 +3945,10 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
     ready.classList.toggle('is-blocked', !canPackage);
   }
 
-  // File list
-  const fileListEl = $('#modal-file-list');
-  fileListEl.innerHTML = '';
-
   const reviewFiles = Array.isArray(review.files) ? review.files : [];
   const presentedReviewFiles = reviewFiles;
-  const visibleFiles = presentedReviewFiles.slice(0, 8);
-  for (const file of visibleFiles) {
-    const item = document.createElement('div');
-    item.className = 'modal-file-item package-review-file-card';
-    item.appendChild(createFileVisual(project.id, file));
-    const name = document.createElement('div');
-    name.className = 'modal-file-name';
-    name.textContent = file.name || 'Unavailable file';
-    item.appendChild(name);
-    appendAppOriginLabel(item, file, project);
-    if (typeof file.packageFolder === 'string' && file.packageFolder) {
-      const destination = document.createElement('div');
-      destination.className = 'package-review-file-destination';
-      destination.textContent = file.packageFolder === 'Package root'
-        ? 'Package root'
-        : `${file.packageFolder} folder`;
-      item.appendChild(destination);
-    }
-    fileListEl.appendChild(item);
-  }
-
-  if (reviewFiles.length > visibleFiles.length) {
-    const more = document.createElement('div');
-    more.className = 'modal-file-item package-review-more';
-    more.textContent = `+${Math.max(0, reviewFiles.length - visibleFiles.length)} more`;
-    fileListEl.appendChild(more);
-  }
+  packageReviewContents = { project, files: reviewFiles, expanded: false, lease };
+  renderPackageReviewContents();
 
   const total = $('#package-review-total');
   if (total) total.textContent = `${reviewFiles.length} visual asset${reviewFiles.length === 1 ? '' : 's'}`;
@@ -4055,6 +4118,7 @@ function getPackageReviewRecoveryMessage(error, diagnostics = null, project = nu
 }
 
 async function showPackageModal({
+  opener = null,
   message = '',
   successMessage = '',
   runPreScan = true,
@@ -4084,7 +4148,7 @@ async function showPackageModal({
     isCurrentModalLease('modal-package', modalSessionId)
   );
   if (!packageReviewOpener && !packageReviewConfirmationInFlight) {
-    packageReviewOpener = document.activeElement || null;
+    packageReviewOpener = opener || document.activeElement || null;
   }
   state.packageReviewToken = null;
   let project = state.projects.find(item => item.id === projectId) || null;
@@ -4106,8 +4170,9 @@ async function showPackageModal({
   if (!isCurrentRequest()) return false;
   if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
-        state.projects = await getAccountCurrentProjects();
+        const refreshedProjects = await getAccountCurrentProjects();
         if (!isCurrentRequest()) return false;
+        state.projects = refreshedProjects;
         project = state.projects.find(item => item.id === projectId) || project;
         hidePackageReviewDialog({ restoreFocus: false, preserveOpener: true });
         if (project?.assetBaseline?.status === 'decision-required') {
@@ -4116,8 +4181,9 @@ async function showPackageModal({
         }
       }
       try {
-        state.projects = await getAccountCurrentProjects();
+        const refreshedProjects = await getAccountCurrentProjects();
         if (!isCurrentRequest()) return false;
+        state.projects = refreshedProjects;
         project = state.projects.find(item => item.id === projectId) || project;
       } catch (_) {
         // Keep the last safe project snapshot when refresh is unavailable.
@@ -4135,8 +4201,9 @@ async function showPackageModal({
 
     if (review.projectId !== projectId) return false;
 
-    state.projects = await getAccountCurrentProjects();
+    const refreshedProjects = await getAccountCurrentProjects();
     if (!isCurrentRequest()) return false;
+    state.projects = refreshedProjects;
     project = state.projects.find(item => item.id === projectId) || project;
     if (!project) return false;
     renderPackageReview(project, review, successMessage || message, lease);
@@ -4247,6 +4314,7 @@ async function confirmPackage() {
   );
   if (confirmButton) confirmButton.disabled = true;
   packageReviewConfirmationInFlight = true;
+  syncPackageReviewReturnControls();
   try {
     hidePackageReviewDialog({ preserveOpener: true });
     packageReviewModalProjectId = reviewProjectId;
@@ -4334,6 +4402,7 @@ async function confirmPackage() {
   } finally {
     if (packageReviewConfirmationId !== confirmationId) return;
     packageReviewConfirmationInFlight = false;
+    syncPackageReviewReturnControls();
     hidePackageProgressModal();
     if (confirmButton) confirmButton.disabled = !state.packageReviewToken;
   }
@@ -4472,7 +4541,7 @@ function setupEventListeners() {
       if (!ok) return;
     }
     try {
-      await runRendererAction(`package-review:${projectId}`, button, 'Preparing…', () => showPackageModal(), 'Package Project');
+      await runRendererAction(`package-review:${projectId}`, button, 'Preparing…', () => showPackageModal({ opener: button }), 'Package Project');
     } catch (error) {
       logRendererError('Package Review preparation failed', error);
       showToast('Package Review could not open. Try again.');
@@ -4481,6 +4550,8 @@ function setupEventListeners() {
 
   // Package modal
   $('#btn-cancel-package').addEventListener('click', changePackageReviewSelection);
+  $('#btn-back-package')?.addEventListener('click', changePackageReviewSelection);
+  $('#btn-toggle-package-contents')?.addEventListener('click', togglePackageReviewContents);
   $('#modal-package').addEventListener('keydown', handlePackageReviewKeydown);
 
   $('#btn-confirm-package').addEventListener('click', confirmPackage);

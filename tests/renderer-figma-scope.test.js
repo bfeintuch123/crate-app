@@ -249,6 +249,9 @@ function createInteractiveRendererDom() {
     'btn-package': createElementStub('button'),
     'btn-change-dest': createElementStub('button'),
     'btn-cancel-package': createElementStub('button'),
+    'btn-back-package': createElementStub('button'),
+    'btn-toggle-package-contents': createElementStub('button'),
+    'package-review-contents': createElementStub(),
     'btn-confirm-package': createElementStub('button'),
     'toggle-package-folders': createElementStub('input'),
     'toggle-package-review-folders': createElementStub('input'),
@@ -286,6 +289,9 @@ function createInteractiveRendererDom() {
     elements[id].classList.add('hidden');
   }
   elements['modal-package'].focusableElements = [
+    elements['btn-back-package'],
+    elements['package-review-contents'],
+    elements['btn-toggle-package-contents'],
     elements['btn-change-dest'],
     elements['toggle-package-review-folders'],
     elements['btn-cancel-package'],
@@ -5372,7 +5378,8 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
   assert.match(html, /<button[^>]*id="btn-change-dest"[^>]*>Change Folder<\/button>/);
   assert.match(html, /<div(?=[^>]*id="modal-package-review-message")(?=[^>]*role="status")(?=[^>]*aria-live="polite")(?=[^>]*tabindex="-1")[^>]*>/);
-  assert.match(html, /id="modal-file-list"[^>]*role="region"[^>]*tabindex="-1"/);
+  assert.match(html, /id="package-review-contents"[^>]*role="region"[^>]*tabindex="0"/);
+  assert.match(html, /id="modal-file-list"[^>]*role="list"/);
   assert.match(html, /id="asset-review-heading"[^>]*tabindex="-1"/);
   assert.match(html, /data-asset-filter="all"[^>]*aria-pressed="true"/);
   assert.match(html, /data-asset-filter="existing"[^>]*aria-pressed="false"/);
@@ -6008,7 +6015,7 @@ test('Package Review traps keyboard focus, cancels with Escape, and restores its
 
   elements['btn-package'].focus();
   assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
-  assert.equal(document.activeElement, elements['btn-cancel-package']);
+  assert.equal(document.activeElement, elements['btn-back-package']);
   assert.equal(elements['app-sidebar'].inert, true);
   assert.equal(elements['app-main'].inert, true);
   assert.equal(elements['app-sidebar'].getAttribute('aria-hidden'), 'true');
@@ -6024,7 +6031,7 @@ test('Package Review traps keyboard focus, cancels with Escape, and restores its
   };
   elements['modal-package'].dispatchEvent(forwardTab);
   assert.equal(forwardTab.defaultPrevented, true);
-  assert.equal(document.activeElement, elements['btn-change-dest']);
+  assert.equal(document.activeElement, elements['btn-back-package']);
 
   const reverseTab = {
     type: 'keydown',
@@ -6054,7 +6061,7 @@ test('Package Review traps keyboard focus, cancels with Escape, and restores its
   assert.equal(document.activeElement, elements['btn-package']);
 
   assert.equal(await renderer.showPackageModal({ runPreScan: false }), true);
-  assert.equal(document.activeElement, elements['btn-cancel-package']);
+  assert.equal(document.activeElement, elements['btn-back-package']);
 });
 
 test('notification Package Review Change Selection activates Current Project and opens Review Assets', async () => {
