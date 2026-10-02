@@ -1779,6 +1779,27 @@ test('Review Assets switches from the dashboard without changing inclusion state
   assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
 });
 
+test('Review Assets has one action inside Needs Review and stays usable with zero pending assets', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../renderer/index.html'), 'utf8');
+  const metric = html.slice(html.indexOf('<div class="asset-metric missing">'), html.indexOf('<div class="asset-metric excluded">'));
+  assert.equal((html.match(/id="btn-review-assets"/g) || []).length, 1);
+  assert.match(metric, /<button[^>]*id="btn-review-assets"[^>]*aria-describedby="metric-missing-count metric-missing-label"[^>]*>Review Assets<\/button>/);
+  assert.doesNotMatch(metric, /disabled|role="button"|tabindex="[1-9]/);
+  const { document, elements, assetFilters } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {} });
+  document.querySelector('#metric-missing-count').textContent = '0';
+  vm.runInContext("state.assetReviewFilter = 'excluded'; state.assetReviewQuery = 'logo'; setupEventListeners();", renderer);
+  const opener = document.querySelector('#btn-review-assets');
+  opener.click();
+  assert.equal(document.activeElement, elements['asset-review-heading']);
+  assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'excluded');
+  assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'logo');
+  assert.equal(assetFilters[4].getAttribute('aria-pressed'), 'true');
+  document.querySelector('#btn-review-assets-back').click();
+  assert.equal(document.activeElement, opener);
+  assert.equal(elements['project-dashboard'].classList.contains('hidden'), false);
+});
+
 test('Review Assets search filters Needs Review rows and hides an empty pending section', () => {
   const { document, elements } = createInteractiveRendererDom();
   const renderer = loadRendererHelpers(document, { crate: {} });
@@ -2139,7 +2160,7 @@ test('Needs Review batch recovery copy names list-level retry actions', () => {
 
 test('Review Before Packaging uses the approved terminology and retains keyboard and accessibility semantics', async () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
-  assert.match(html, /<span>Needs Review<\/span>/);
+  assert.match(html, /<span[^>]*>Needs Review<\/span>/);
   assert.match(html, /data-asset-filter="missing"[^>]*aria-pressed="false">Needs Review/);
   assert.match(html, /<p>Crate automatically includes files it can confidently connect to this project\. Review anything it could not verify\.<\/p>/);
   assert.match(html, /<h2 class="asset-panel-title" id="pending-header">Review Before Packaging<\/h2>/);
