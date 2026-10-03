@@ -4382,6 +4382,7 @@ async function confirmPackage() {
     let outputPath = state.packageOutputPath;
     if (!outputPath) {
       outputPath = await window.crate.selectOutputFolder();
+      if (!isCurrentConfirmation()) return;
       if (!outputPath) {
         if (isCurrentConfirmation()) openPackageReviewDialog();
         return;
