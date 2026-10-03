@@ -60,15 +60,6 @@ const APPROVED_INSTALL_SCRIPTS = Object.freeze([
     scripts: Object.freeze({ install: 'node ./script/select-7z-arch.js' }),
     implicitInstall: null,
   }),
-  Object.freeze({
-    lockPath: 'node_modules/fsevents',
-    name: 'fsevents',
-    version: '2.3.3',
-    resolved: 'https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz',
-    integrity: 'sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==',
-    scripts: Object.freeze({}),
-    implicitInstall: null,
-  }),
 ]);
 
 function lifecycleScripts(manifest, names = DEPENDENCY_LIFECYCLE_NAMES) {
