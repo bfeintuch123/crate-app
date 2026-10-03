@@ -150,6 +150,63 @@ test('cancelled output picker reopens a collapsed interactive review', async () 
   assert.equal(elements['modal-file-list'].children.length, 13);
 });
 
+for (const boundary of ['project-switch', 'project-round-trip', 'same-project-reset', 'reopened-review']) {
+  for (const outcome of ['selected', 'cancelled']) test(`confirmation picker ${outcome} after ${boundary} preserves the current destination and review`, async () => {
+    const { renderer, elements, project, review } = setup();
+    const picker = deferred();
+    let pickerCalls = 0;
+    let scanCalls = 0;
+    let packageCalls = 0;
+    renderer.window.crate.selectOutputFolder = () => { pickerCalls++; return picker.promise; };
+    renderer.window.crate.preScanSession = async () => { scanCalls++; return null; };
+    renderer.window.crate.packageProject = async () => { packageCalls++; };
+    vm.runInContext('state.packageOutputPath = null;', renderer);
+    const pending = renderer.confirmPackage();
+    assert.equal(pickerCalls, 1, 'exercise the confirmation fallback picker');
+    if (boundary === 'project-switch' || boundary === 'project-round-trip') renderer.setSelectedProject('other-project');
+    if (boundary === 'project-round-trip') renderer.setSelectedProject(project.id);
+    if (boundary === 'same-project-reset') renderer.setSelectedProject(project.id, { invalidate: true });
+    if (boundary === 'reopened-review') {
+      renderer.hidePackageReviewDialog();
+      assert.equal(await renderer.showPackageModal({ runPreScan: false, review: { ...review, token: 'replacement-token' } }), true);
+    }
+    vm.runInContext("state.packageOutputPath = '/synthetic/current-output';", renderer);
+    const currentToken = vm.runInContext('state.packageReviewToken', renderer);
+    const currentSession = vm.runInContext('packageReviewModalSessionId', renderer);
+    const reviewHidden = elements['modal-package'].classList.contains('hidden');
+    picker.resolve(outcome === 'selected' ? '/synthetic/stale-output' : null);
+    await pending;
+    assert.equal(vm.runInContext('state.packageOutputPath', renderer), '/synthetic/current-output');
+    assert.equal(vm.runInContext('state.packageReviewToken', renderer), currentToken);
+    assert.equal(vm.runInContext('packageReviewModalSessionId', renderer), currentSession);
+    assert.equal(elements['modal-package'].classList.contains('hidden'), reviewHidden);
+    assert.equal(elements['modal-progress'].classList.contains('hidden'), true);
+    assert.equal(scanCalls, 0);
+    assert.equal(packageCalls, 0, 'the existing guard must still block stale packaging');
+  });
+}
+
+test('confirmation picker cancellation permits a fresh selection and packages with that destination', async () => {
+  const { renderer, elements, project, review } = setup();
+  const picker = deferred();
+  const packageCalls = [];
+  renderer.window.crate.selectOutputFolder = async () => null;
+  vm.runInContext('state.packageOutputPath = null;', renderer);
+  await renderer.confirmPackage();
+  assert.equal(elements['modal-package'].classList.contains('hidden'), false);
+  assert.equal(vm.runInContext('state.packageOutputPath', renderer), null);
+  renderer.window.crate.selectOutputFolder = () => picker.promise;
+  renderer.window.crate.packageProject = async (...args) => {
+    packageCalls.push(args);
+    return { error: 'package_review_changed', review };
+  };
+  const pending = renderer.confirmPackage();
+  picker.resolve('/synthetic/selected-output');
+  await pending;
+  assert.equal(vm.runInContext('state.packageOutputPath', renderer), '/synthetic/selected-output');
+  assert.deepEqual(packageCalls, [[project.id, '/synthetic/selected-output', review.token]]);
+});
+
 test('markup supplies one keyboard scroll region, a semantic list, native buttons and retained return ID', () => {
   const html = fs.readFileSync(path.join(__dirname, '../renderer/index.html'), 'utf8');
   assert.match(html, /id="package-review-contents"[^>]*role="region"[^>]*tabindex="0"/);
