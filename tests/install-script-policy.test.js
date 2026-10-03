@@ -12,6 +12,7 @@ const {
   APPROVED_INSTALL_SCRIPTS,
   FORBIDDEN_ROOT_PACKAGE_MANAGER_FILES,
   ROOT_LIFECYCLE_NAMES,
+  implicitInstallBehavior,
   inspectInstallScriptPolicy,
   run: runInstallScriptPolicy,
 } = require('../scripts/verify-install-scripts');
@@ -43,15 +44,6 @@ const EXPECTED_INSTALL_SCRIPTS = Object.freeze([
     resolved: 'https://registry.npmjs.org/electron-winstaller/-/electron-winstaller-5.4.0.tgz',
     integrity: 'sha512-bO3y10YikuUwUuDUQRM4KfwNkKhnpVO7IPdbsrejwN9/AABJzzTQ4GeHwyzNSrVO+tEH3/Np255a3sVZpZDjvg==',
     scripts: Object.freeze({ install: 'node ./script/select-7z-arch.js' }),
-    implicitInstall: null,
-  }),
-  Object.freeze({
-    lockPath: 'node_modules/fsevents',
-    name: 'fsevents',
-    version: '2.3.3',
-    resolved: 'https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz',
-    integrity: 'sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==',
-    scripts: Object.freeze({}),
     implicitInstall: null,
   }),
 ]);
@@ -303,14 +295,39 @@ test('package-tree symlinks and implicit install drift fail closed', () => {
     fs.unlinkSync(nodeModulesPath);
     fs.renameSync(movedNodeModulesPath, nodeModulesPath);
 
-    const approval = EXPECTED_INSTALL_SCRIPTS.find(item => item.name === 'fsevents');
-    fs.writeFileSync(path.join(root, approval.lockPath, 'binding.gyp'), '{}');
+    const approval = EXPECTED_INSTALL_SCRIPTS.find(item => item.name === 'electron-winstaller');
+    const packageRoot = path.join(root, approval.lockPath);
+    const manifestPath = path.join(packageRoot, 'package.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    // Removing the explicit approved installer must not enable npm's implicit rebuild.
+    delete manifest.scripts.install;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    fs.writeFileSync(path.join(packageRoot, 'binding.gyp'), '{}');
+    assert.equal(implicitInstallBehavior(packageRoot, manifest), 'node-gyp rebuild');
     const result = inspectInstallScriptPolicy(root);
     assert.equal(result.ok, false);
     assert.equal(
       result.failures.includes('Approved installed lifecycle script changed.'),
       true
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('binding.gyp introduces an unapproved implicit install even without declared scripts', () => {
+  const root = createFixture();
+  try {
+    const packageRoot = path.join(root, 'node_modules', 'inert-fixture');
+    fs.mkdirSync(packageRoot);
+    fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({
+      name: 'inert-fixture', version: '1.0.0',
+    }));
+    assert.equal(inspectInstallScriptPolicy(root).ok, true);
+    fs.writeFileSync(path.join(packageRoot, 'binding.gyp'), '{}');
+    const result = inspectInstallScriptPolicy(root);
+    assert.equal(result.ok, false);
+    assert.equal(result.failures.includes('Unapproved installed lifecycle script.'), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
