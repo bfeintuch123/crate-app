@@ -1306,6 +1306,14 @@ function baselineCases() {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
     const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
     const f = await correctionProject('.psd', write(linkedFiles, children));
+    // Conf10.2/electron-store8.2 deserialize fresh JSON on every get. Scope
+    // that persistence behavior to these PSD cases rather than sharing rows
+    // between the asynchronous preparation and canonical writer reads.
+    const originalStoreGet = storeInstance.get;
+    storeInstance.get = function clonedStoreGet(...args) {
+      const value = originalStoreGet.apply(this, args);
+      return value === undefined ? value : JSON.parse(JSON.stringify(value));
+    };
     const originalTmpdir = os.tmpdir;
     const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'cycle2-owned-psd-'));
     os.tmpdir = () => privateTmp;
@@ -1323,6 +1331,7 @@ function baselineCases() {
         assert.equal(result.success, true); return result;
       },
       cleanup() { currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+        storeInstance.get = originalStoreGet;
         fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); },
     };
   }
@@ -1417,6 +1426,86 @@ function baselineCases() {
     } finally { f.cleanup(); }
   });
 
+  baselineTest('cycle3: cloned persisted pending rows retain/reorder, replace and retire exact membership', async () => {
+    const a = { id: psdId, name: 'Same.bin', data: Buffer.from('original pending bytes') };
+    const b = { id: '33333333-3333-4333-8333-333333333333', name: 'Same.bin', data: Buffer.from('other bytes') };
+    const f = await workingPsdFixture([a, b]);
+    try {
+      const original = JSON.parse(JSON.stringify(f.rows().find(row => row.psdResource.producerId === psdId)));
+      const project = f.current();
+      project.files = project.files.filter(row => row.fileId !== original.fileId);
+      project.pendingFiles = [...(project.pendingFiles || []), original];
+      project.excludedAssetKeys.push(original.fileId);
+      await f.save([b, a]);
+      let pending = f.current().pendingFiles.find(row => row.fileId === original.fileId);
+      const parsed = f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
+      assert.equal(pending.psdResource.linkedIndex, parsed.linkedFiles.findIndex(item => item.id === psdId));
+      assert.equal(pending.path, original.path);
+      const replacement = { ...a, data: Buffer.from('new pending bytes') };
+      await f.save([replacement, b]);
+      pending = f.current().pendingFiles.find(row => row.fileId === original.fileId);
+      assert.equal(f.current().pendingFiles.filter(row => row.fileId === original.fileId).length, 1);
+      assert.equal(f.current().files.some(row => row.fileId === original.fileId), false);
+      assert.notEqual(pending.path, original.path);
+      assert.deepEqual(fs.readFileSync(pending.path), replacement.data);
+      assert.ok(f.current().excludedAssetKeys.includes(original.fileId));
+      const replacementPath = pending.path;
+      await f.save([], [], 2);
+      assert.equal(f.rows().length, 0); assert.ok(fs.existsSync(original.path)); assert.ok(fs.existsSync(replacementPath));
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(review.totalFiles, 1);
+      assert.equal(review.files.some(row => row.path === original.path || row.path === replacementPath), false);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle3: verified clean PSD retires only its resolved current-flow domain hold', async () => {
+    const object = { id: psdId, name: 'Embedded.png', data: embeddedPng };
+    const f = await workingPsdFixture([object]);
+    try {
+      const original = JSON.parse(JSON.stringify(f.rows()[0]));
+      f.current().excludedAssetKeys.push(original.fileId);
+      await f.save([], [{ name: 'layer', linkedFiles: [object] }]);
+      assert.ok(f.current().workingSourceRelationshipHolds.some(hold => hold.reason === 'psd-resource-domain-changed'));
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      assert.equal(f.rows().length, 1); assert.equal(f.rows()[0].fileId, original.fileId);
+      await f.save([object]);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(workspace.workingSourceSelectionBlocked, false);
+      assert.deepEqual(workspace.semanticCounts, review.semanticCounts);
+      assert.equal(f.rows()[0].path, original.path); assert.ok(f.current().excludedAssetKeys.includes(original.fileId));
+      assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
+      const protectedHolds = [{ reason: 'legacy-psd-object-association-unverified', sourcePath: f.filePath },
+        { reason: 'psd-resource-domain-changed', sourcePath: path.join(TEST_HOME, 'Desktop', 'Other.psd') },
+        { signal: 'unknown-manual-hold', sourcePath: f.filePath }];
+      f.current().workingSourceRelationshipHolds.push(...protectedHolds);
+      await f.save([], [{ name: 'layer', linkedFiles: [object] }]); await f.save([object]);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, protectedHolds);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      f.current().workingSourceRelationshipHolds = { reason: 'malformed-container' };
+      await f.save([object]);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, { reason: 'malformed-container' });
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle3: unique verified PSD clears a temporary duplicate-ID hold', async () => {
+    const object = { id: psdId, name: 'Embedded.png', data: embeddedPng };
+    const f = await workingPsdFixture([object]);
+    try {
+      const original = JSON.parse(JSON.stringify(f.rows()[0]));
+      await f.save([object, { ...object, name: 'Other.png' }]);
+      assert.ok(f.current().workingSourceRelationshipHolds.some(hold => hold.reason === 'psd-resource-identity-ambiguous'));
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      await f.save([object]);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+      assert.equal(f.rows().length, 1); assert.equal(f.rows()[0].fileId, original.fileId);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+      assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
+    } finally { f.cleanup(); }
+  });
+
   baselineTest('cycle2: concrete legacy association conflict preserves rows/bytes/exclusions and gives a specific hold', async () => {
     const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }]);
     try {
@@ -1427,7 +1516,8 @@ function baselineCases() {
       f.current().files.push(old); f.current().excludedAssetKeys.push(old.fileId);
       const exclusions = [...f.current().excludedAssetKeys];
       await f.save([], [], 2);
-      assert.ok(f.current().files.includes(old)); assert.ok(f.current().files.includes(current));
+      assert.ok(f.current().files.some(row => row.path === old.path && row.fileId === old.fileId));
+      assert.ok(f.current().files.some(row => row.path === current.path && row.fileId === current.fileId));
       assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.equal(fs.readFileSync(oldPath, 'utf8'), 'old preserved bytes');
       const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
       assert.equal(review.materializable, false); assert.ok(review.semanticCounts.relationshipHolds > 0);

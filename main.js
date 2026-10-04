@@ -14181,6 +14181,15 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, isCu
   const resourceKey = resource => resource?.producerId && resource.producerId.length <= 512
     ? JSON.stringify([resource.layerPath === null ? 'root' : 'layer', resource.producerId])
     : JSON.stringify(['saved-bytes', resource?.sourceDigest, resource?.layerPath, resource?.linkedIndex, resource?.originalName]);
+  // Preparation reads and canonical writer reads are distinct deserialized
+  // objects in electron-store. Bind each owned row to its immutable serialized
+  // collection/index receipt; the complete array fence below protects indexes.
+  const rowReceipts = new Map();
+  for (const collection of ['files', 'pendingFiles']) {
+    for (const [index, row] of (project[collection] || []).entries()) {
+      rowReceipts.set(row, { collection, index, row: JSON.stringify(row) });
+    }
+  }
   const associated = [...project.files, ...(project.pendingFiles || [])].filter(row =>
     row.source === 'psd-embedded' && row.psdResource?.version === 1 && row.psdResource.current !== false &&
     normalizeTrackedFilePath(row.psdResource.parentPath) === parent);
@@ -14250,13 +14259,36 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, isCu
   };
   return { items, check, detached, blocked: holds.length > 0, apply(latest) {
     check(latest);
-    reconcilePsdEmbeddedMembership(latest, row => retire.has(row));
-    for (const row of detached) row.psdResource = { ...row.psdResource, current: false };
-    if (!holds.length) for (const item of items) if (item.retained) item.previous.psdResource = item.resource;
-    if (holds.length) {
-      const previous = Array.isArray(latest.workingSourceRelationshipHolds) ? latest.workingSourceRelationshipHolds : [];
-      latest.workingSourceRelationshipHolds = [...previous, ...holds].filter((hold, index, all) =>
-        all.findIndex(other => JSON.stringify(other) === JSON.stringify(hold)) === index);
+    // Resolve all receipts before any mutation. References are safe only after
+    // rebinding to this one canonical writer read, never across store.get calls.
+    const rebound = new Map();
+    for (const row of associated) {
+      const receipt = rowReceipts.get(row);
+      const canonical = latest[receipt.collection]?.[receipt.index];
+      if (!canonical || JSON.stringify(canonical) !== receipt.row) throw new Error('stale_project_operation');
+      rebound.set(row, canonical);
+    }
+    const canonicalRetire = new Set([...retire].map(row => rebound.get(row)));
+    reconcilePsdEmbeddedMembership(latest, row => canonicalRetire.has(row));
+    for (const row of detached) {
+      const canonical = rebound.get(row);
+      canonical.psdResource = { ...canonical.psdResource, current: false };
+    }
+    if (!holds.length) for (const item of items) if (item.retained) rebound.get(item.previous).psdResource = item.resource;
+    const previous = latest.workingSourceRelationshipHolds;
+    // A completed, source/output-validated reconciliation may retire only this
+    // PSD's proven-resolved current-flow guards. Legacy, unknown, other-source
+    // and malformed hold state remains preserved and fails closed.
+    if (previous === undefined || Array.isArray(previous)) {
+      const transientReasons = new Set(['psd-resource-identity-ambiguous', 'psd-resource-domain-changed',
+        'psd-resource-continuity-unverified']);
+      const preserved = (previous || []).filter(hold => holds.length || !hold ||
+        !transientReasons.has(hold.reason) || typeof hold.sourcePath !== 'string' ||
+        Object.keys(hold).some(key => key !== 'reason' && key !== 'sourcePath') ||
+        normalizeTrackedFilePath(hold.sourcePath) !== parent);
+      if (holds.length || previous !== undefined) latest.workingSourceRelationshipHolds = [...preserved,
+        ...holds.filter((hold, index) => !preserved.some(other => JSON.stringify(other) === JSON.stringify(hold)) &&
+          holds.findIndex(other => JSON.stringify(other) === JSON.stringify(hold)) === index)];
     }
   } };
 }
