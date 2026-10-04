@@ -14698,7 +14698,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const reconcileWorkingPsd = verificationScan && !!psdTransaction;
     const workingReconciliation = reconcileWorkingPsd
       ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, inventory, isCurrent) : null;
-    if (psdAssets.length > 0 || workingReconciliation) {
+    if (psdAssets.length > 0 || workingReconciliation || (workingScan && psdTransaction)) {
       let acceptance = null;
       if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
         // Another full scan may accept while hashing. Recompare its receipt;
@@ -14709,7 +14709,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
       }
       const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
-      if (workingScan && psdTransaction && verificationScan) {
+      if (workingScan && psdTransaction) {
+        // Persist validated obligations even while selection is dormant, so
+        // engagement through another root cannot lose output byte/Reject proof.
         // Bind requirements to this validated source and exact reconciled
         // output paths, including retained outputs whose fresh stage is cleaned.
         // Keep embedded output receipts separate from external references.
@@ -18896,7 +18898,7 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
     workingSourceVerification: reviewedSemantics && !hasWorkingSourceSelectionState(project)
       ? Object.fromEntries(Object.entries(project.workingSourceVerification || {}).map(([key, record]) =>
         [key, getDormantWorkingSourceReviewFacts(record)]).filter(([, facts]) =>
-          facts.status || facts.requiredReferences.length || facts.unresolved.length).sort(([a], [b]) => a.localeCompare(b)))
+          facts.status || facts.requiredReferences.length || facts.requiredEmbeddedOutputs.length || facts.unresolved.length).sort(([a], [b]) => a.localeCompare(b)))
       : project.workingSourceVerification ?? null,
     workingSourceRelationshipHolds: project.workingSourceRelationshipHolds ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],

@@ -1304,7 +1304,7 @@ function baselineCases() {
 
   const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
   const psdId = '22222222-2222-4222-8222-222222222222';
-  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false) {
+  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false, engageProducer = true) {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
     const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
     const f = viaAddFiles ? await (async () => {
@@ -1330,16 +1330,18 @@ function baselineCases() {
     const restoreAdmission = forcePending ? metadataTestHooks.forceWorkingPsdPendingAdmission() : () => {};
     if (viaAddFiles) {
       manualDialogFor([f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
-      if (f.current().assetBaseline.status === 'decision-required') {
+      if (f.current().assetBaseline.status === 'decision-required' && !(forcePending && !engageProducer)) {
         await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
       }
     }
     const rows = () => [...f.current().files, ...(f.current().pendingFiles || [])].filter(file => file.source === 'psd-embedded');
     const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
     const source = workspace.files.find(file => file.name === path.basename(f.filePath));
-    await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
-    assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
-      { action: 'restore', expectedRevision: 1 })).verificationStatus, 'scanned');
+    if (engageProducer) {
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
+        { action: 'restore', expectedRevision: 1 })).verificationStatus, 'scanned');
+    }
     return { ...f, rows, write, source, privateTmp, actual,
       async save(linkedFiles, children = [], width = 1) {
         fs.writeFileSync(f.filePath, write(linkedFiles, children, width));
@@ -1837,6 +1839,60 @@ function baselineCases() {
         fs.writeFileSync(output.path, embeddedPng);
         const recovered = await callIpcRaw('projects:prepare-package-review', f.project.id);
         assert.equal(recovered.materializable, true); assert.equal(recovered.totalFiles, 2);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const pending of [false, true]) {
+    baselineTest(`dormant output: ${domain} ${pending ? 'rejection' : 'bytes'} remains bound when another source engages selection`, async () => {
+      const object = { id: psdId, name: 'Dormant.png', data: embeddedPng };
+      const f = await workingPsdFixture(domain === 'root' ? [object] : [],
+        domain === 'layer' ? [{ name: 'dormant layer', linkedFiles: [object] }] : [], true, pending, false);
+      try {
+        const output = JSON.parse(JSON.stringify(f.rows()[0]));
+        const sourceBytes = fs.readFileSync(f.filePath);
+        const producer = f.current().files.find(row => row.path === f.filePath);
+        const producerKey = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), producer);
+        assert.equal(Object.keys(f.current().workingSourceSelections || {}).length, 0);
+        assert.equal(Boolean((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable), !pending,
+          'dormant admission retains its existing accepted/pending decision behavior');
+        if (pending) {
+          assert.ok(f.current().pendingFiles.some(row => row.fileId === output.fileId));
+          await callIpcRaw('projects:reject-pending', f.project.id, output.path);
+          assert.equal(f.rows().length, 0); assert.ok(f.current().excludedAssetKeys.includes(output.fileId));
+          await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+        }
+        const otherPath = path.join(TEST_HOME, 'Desktop', 'Engage-other.ai');
+        fs.writeFileSync(otherPath, '%PDF-1.7\n%%EOF\n');
+        manualDialogFor([otherPath]); await callIpcRaw('projects:add-files', f.project.id);
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const other = workspace.files.find(row => row.name === path.basename(otherPath));
+        assert.ok(other);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity,
+          { action: 'exclude', expectedRevision: 0 });
+        assert.equal(f.current().workingSourceSelections?.[producerKey], undefined, 'producer is never Excluded/Restored');
+        if (!pending) {
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+          const stat = fs.statSync(output.path), altered = Buffer.from(embeddedPng); altered[altered.length - 1] ^= 1;
+          fs.writeFileSync(output.path, altered); fs.utimesSync(output.path, stat.atimeMs / 1000, stat.mtimeMs / 1000);
+        }
+        const assertBlocked = async () => {
+          const changed = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(changed.materializable, false, 'dormant worker obligation survives unrelated-source engagement');
+          assert.equal(changed.token, undefined);
+          if (pending) assert.equal(changed.semanticCounts.missingRequiredReferences, 1);
+        };
+        await assertBlocked();
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        await assertBlocked();
+        assert.deepEqual(fs.readFileSync(f.filePath), sourceBytes);
+        const receipt = f.current().workingSourceVerification[producerKey].requiredEmbeddedOutputs;
+        assert.equal(receipt.length, 1); assert.equal(receipt[0].path, output.path);
+        if (!pending) {
+          fs.writeFileSync(output.path, embeddedPng);
+          const recovered = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(recovered.materializable, true); assert.equal(recovered.totalFiles, 2);
+        }
       } finally { f.cleanup(); }
     });
   }
