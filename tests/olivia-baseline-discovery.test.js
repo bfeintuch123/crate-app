@@ -21,6 +21,7 @@ replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership,\n' +
+  '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
@@ -1696,6 +1697,134 @@ function baselineCases() {
         assert.equal(recovery.success, true); assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'scanned');
         assert.equal((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.path === linked), false);
       } finally { fs.promises.access = originalAccess; clearTrackedTimers(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const collection of ['files', 'pendingFiles']) {
+    baselineTest(`final graph: ${domain} ${collection} replacement preserves proven producer edge`, async () => {
+      const originalObject = { id: psdId, name: 'Resource.bin', data: Buffer.from('old resource') };
+      const children = domain === 'layer' ? [{ name: 'resource layer', linkedFiles: [originalObject] }] : [];
+      const f = await workingPsdFixture(domain === 'root' ? [originalObject] : [], children, true);
+      try {
+        const original = JSON.parse(JSON.stringify(f.rows()[0]));
+        assert.equal(original.assetBaselineSourcePath, f.filePath);
+        f.current().excludedAssetKeys.push(original.fileId);
+        if (collection === 'pendingFiles') {
+          f.current().files = f.current().files.filter(row => row.fileId !== original.fileId);
+          f.current().pendingFiles = [...(f.current().pendingFiles || []), original];
+        }
+        const replacement = { ...originalObject, data: Buffer.from('changed resource') };
+        await f.save(domain === 'root' ? [replacement] : [], domain === 'layer' ? [{ name: 'resource layer', linkedFiles: [replacement] }] : []);
+        const current = f.current()[collection].find(row => row.fileId === original.fileId);
+        assert.equal(current.assetBaselineSourcePath, f.filePath, 'same proved producer relationship must survive replacement');
+        assert.notEqual(current.path, original.path); assert.deepEqual(fs.readFileSync(current.path), replacement.data);
+        assert.ok(f.current().excludedAssetKeys.includes(current.fileId));
+        if (collection === 'pendingFiles') {
+          const accepted = await callIpcRaw('projects:accept-pending', f.project.id, current.path);
+          assert.equal(accepted.files.some(row => row.fileId === current.fileId), true);
+          // Retain the user's exclusion to exercise the dependency override,
+          // independently of the explicit accept command's inclusion intent.
+          if (!f.current().excludedAssetKeys.includes(current.fileId)) f.current().excludedAssetKeys.push(current.fileId);
+        }
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const row = workspace.files.find(row => row.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, current));
+        assert.equal(row.includedAsDependency, true); assert.deepEqual(row.requiredBy, [path.basename(f.filePath)]);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(review.materializable, true); assert.equal(review.totalFiles, 2); assert.equal(review.semanticCounts.includedAssets, 1);
+        assert.equal(review.files.some(file => file.visualIdentity === row.visualIdentity), true);
+        await f.save([], [], 2); assert.equal(f.rows().length, 0); assert.ok(fs.existsSync(current.path));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).totalFiles, 1);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const mutation of ['restore', 'scan']) {
+    baselineTest(`final graph: ${mutation} of another root during source hash refuses stale retirement`, async () => {
+      const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }], [], true);
+      let restorePause, saving;
+      const gate = deferred();
+      try {
+        const output = JSON.parse(JSON.stringify(f.rows()[0]));
+        const otherPath = path.join(TEST_HOME, 'Desktop', 'Concurrent.ai');
+        const linkedBytes = `%PDF-1.7\n${output.path}\n%%EOF\n`;
+        fs.writeFileSync(otherPath, mutation === 'restore' ? linkedBytes : '%PDF-1.7\n%%EOF\n');
+        f.current().files.push({ path: otherPath, name: 'Concurrent.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+        const scanOther = () => metadataTestHooks.runScanOnOpen(f.project.id, otherPath, null, null,
+          { establishBaseline: false, allowPausedBaseline: true });
+        assert.equal((await scanOther()).success, true);
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const other = workspace.files.find(row => row.name === 'Concurrent.ai');
+        if (mutation === 'restore') await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        f.current().excludedAssetKeys.push(output.fileId);
+        const guards = [{ reason: 'psd-resource-domain-changed', sourcePath: f.filePath }]; f.current().workingSourceRelationshipHolds = guards;
+        const before = JSON.parse(JSON.stringify([f.current().files, f.current().pendingFiles || []]));
+        const exclusions = [...f.current().excludedAssetKeys];
+        let entered = false;
+        restorePause = metadataTestHooks.pauseWorkingPsdPublicationSource(async () => { entered = true; await gate.promise; });
+        fs.writeFileSync(f.filePath, f.write([], [], 2));
+        saving = metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+        await waitForCondition(() => entered, 'PSD final source hash did not pause');
+        if (mutation === 'restore') {
+          const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'restore', expectedRevision: 1 });
+          assert.equal(restored.verificationStatus, 'scanned');
+        } else { fs.writeFileSync(otherPath, linkedBytes); assert.equal((await scanOther()).success, true); }
+        assert.deepEqual([f.current().files, f.current().pendingFiles || []], before, 'other-root graph changes need not change row arrays');
+        gate.release(); const result = await saving; saving = null;
+        assert.equal(result.success, false, 'old prospective graph cannot authorize retirement');
+        assert.deepEqual([f.current().files, f.current().pendingFiles || []], before);
+        assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.deepEqual(f.current().workingSourceRelationshipHolds, guards);
+        assert.deepEqual(fs.readFileSync(output.path), embeddedPng);
+        restorePause(); restorePause = null;
+        assert.equal((await metadataTestHooks.runScanOnSave(f.project.id, f.filePath)).success, true);
+        const retained = f.rows().find(row => row.fileId === output.fileId); assert.ok(retained); assert.equal(retained.psdResource.current, false);
+        const currentWorkspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.deepEqual(currentWorkspace.files.find(row => row.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, retained)).requiredBy, ['Concurrent.ai']);
+      } finally { gate.release(); if (saving) await saving; restorePause?.(); f.cleanup(); }
+    });
+  }
+
+  for (const mutation of ['exclude', 'scan', 'newer-review', 'unavailable-exclude', 'dormant-scan']) {
+    baselineTest(`final response: ${mutation} during presentation cannot return a ready stale token`, async () => {
+      const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+      const outputPath = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'response-package-'));
+      const originalGet = storeInstance.get;
+      storeInstance.get = function(...args) { const value = originalGet.apply(this, args); return value === undefined ? value : JSON.parse(JSON.stringify(value)); };
+      const gate = deferred(); let restorePause, review;
+      try {
+        const assetPath = path.join(TEST_HOME, 'Desktop', 'Presentation.png'); fs.writeFileSync(assetPath, embeddedPng);
+        f.current().files.push({ path: assetPath, name: 'Presentation.png', ext: '.png', source: 'user-added', projectRole: 'asset' });
+        if (mutation !== 'dormant-scan') f.current().workingSourceSelections = {};
+        const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null,
+          { allowPausedBaseline: true, ...(mutation === 'dormant-scan' ? { establishBaseline: false } : {}) });
+        assert.equal((await scan()).success, true);
+        const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const source = initial.files.find(row => row.name === path.basename(f.filePath));
+        if (mutation === 'unavailable-exclude') f.current().workingSourceRelationshipHolds = [{ reason: 'manual-guard', sourcePath: f.filePath }];
+        let entered = false;
+        restorePause = metadataTestHooks.pauseRecoveryEligibility(async () => { if (!entered) { entered = true; await gate.promise; } });
+        review = callIpcRaw('projects:prepare-package-review', f.project.id, outputPath);
+        await waitForCondition(() => entered, 'package review presentation did not pause');
+        let newer;
+        if (mutation === 'exclude' || mutation === 'unavailable-exclude') await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        else if (mutation === 'scan') { fs.writeFileSync(f.filePath, '%PDF-1.7\ninvalid incomplete source'); assert.equal((await scan()).success, false); }
+        else if (mutation === 'dormant-scan') assert.equal((await scan()).success, true);
+        else { newer = await callIpcRaw('projects:prepare-package-review', f.project.id, outputPath); assert.equal(newer.materializable, true); }
+        gate.release(); const result = await review; review = null;
+        if (mutation === 'dormant-scan') {
+          assert.equal(result.materializable, true, 'identical dormant attempt bookkeeping does not stale review semantics');
+          restorePause(); restorePause = null;
+          assert.equal((await callIpcRaw('projects:package', f.project.id, outputPath, result.token)).success, true);
+          return;
+        }
+        assert.equal(result.error, 'package_review_changed'); assert.equal(result.token, undefined); assert.notEqual(result.materializable, true);
+        restorePause(); restorePause = null;
+        if (newer) assert.equal((await callIpcRaw('projects:package', f.project.id, outputPath, newer.token)).success, true, 'older refusal cannot invalidate newer token');
+        else {
+          const current = await callIpcRaw('projects:prepare-package-review', f.project.id, outputPath);
+          if (mutation === 'exclude' || mutation === 'unavailable-exclude') assert.equal(current.semanticCounts.selectedWorkingSources, 0);
+          else assert.equal(current.materializable, false);
+        }
+      } finally { gate.release(); if (review) await review; restorePause?.(); storeInstance.get = originalGet; clearTrackedTimers(); }
     });
   }
 

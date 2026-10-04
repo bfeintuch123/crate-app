@@ -14178,6 +14178,8 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   const project = getProjects().find(item => item.id === projectId);
   const parent = normalizeTrackedFilePath(filePath);
   const before = JSON.stringify([project.files, project.pendingFiles || []]);
+  const graphInput = getPackageSelectionInputSignature(project);
+  if (!graphInput) throw new Error('stale_project_operation');
   const currentAssets = assets.filter(asset => asset.source === 'psd-embedded');
   // This is the complete metadata inventory of the same validated saved
   // bytes, including external and alias records that produce no output stage.
@@ -14277,7 +14279,8 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
     .some(key => key !== sourceKey));
   for (const row of detached) retire.delete(row);
   const check = latest => {
-    if (!isCurrent() || JSON.stringify([latest.files, latest.pendingFiles || []]) !== before) {
+    if (!isCurrent() || JSON.stringify([latest.files, latest.pendingFiles || []]) !== before ||
+        getPackageSelectionInputSignature(latest) !== graphInput) {
       throw new Error('stale_project_operation');
     }
     for (const snapshot of snapshots) assertPsdBaselineSnapshot(snapshot);
@@ -14701,6 +14704,14 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           if (reconciled?.previous) {
             fileEntry.assetOrigin = reconciled.previous.assetOrigin;
             fileEntry.projectRole = reconciled.previous.projectRole;
+            // Carry only the proven current producer edge. Other roots keep
+            // their obligations on the detached old path and old bytes.
+            const priorEvidence = reconciled.previous.captureEvidence || {};
+            const priorProducer = priorEvidence.relationshipSourcePath || priorEvidence.sourceDocumentPath ||
+              reconciled.previous.assetBaselineSourcePath;
+            if (normalizeTrackedFilePath(priorProducer) === normalizeTrackedFilePath(filePath)) {
+              fileEntry.assetBaselineSourcePath = filePath;
+            }
             proj[reconciled.collection].push(fileEntry);
             if (reconciled.collection === 'files') acceptedFiles.push(fileEntry);
             changed = true;
@@ -18992,10 +19003,21 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
+  const inputSignature = getPackageSelectionInputSignature(manifest.project, true);
+  const settingsKey = JSON.stringify(manifest.plan?.packageSettings || getRelevantPackageReviewSettings());
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
+  if (!inputSignature || inputSignature !== getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId), true) ||
+      settingsKey !== JSON.stringify(getRelevantPackageReviewSettings()) ||
+      packageReviewSnapshots.get(token) !== snapshot || currentPackageReviewTokenByProject.get(projectId) !== token ||
+      snapshot.expiresAt <= Date.now()) {
+    // Retire only this response's token. A newer review may already own one.
+    packageReviewSnapshots.delete(token);
+    if (currentPackageReviewTokenByProject.get(projectId) === token) currentPackageReviewTokenByProject.delete(projectId);
+    return { error: 'package_review_changed' };
+  }
   return {
     token,
     projectId,
@@ -19025,10 +19047,14 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
 
 async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
+  const inputSignature = getPackageSelectionInputSignature(manifest.project, true);
+  const settingsKey = JSON.stringify(manifest.plan?.packageSettings || getRelevantPackageReviewSettings());
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
+  if (!inputSignature || inputSignature !== getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId), true) ||
+      settingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) return { error: 'package_review_changed' };
   return {
     projectId,
     files: manifest.entries.map((entry, index) => ({
