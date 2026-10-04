@@ -1,0 +1,20 @@
+{
+  "name": "crate-http-cache-semantics-backport",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Crate maintained private security backport derived from http-cache-semantics 4.2.0; independent fork version",
+  "main": "index.js",
+  "types": "index.js",
+  "license": "BSD-2-Clause",
+  "author": "Kornel Lesi\u0144ski <npms2@geekhood.net> (https://kornel.ski/)",
+  "crateBackport": {
+    "upstreamName": "http-cache-semantics",
+    "upstreamVersion": "4.2.0",
+    "upstreamRepository": "git+https://github.com/kornelski/http-cache-semantics.git",
+    "upstreamArchiveIntegrity": "sha512-dTxcvPXqPvXBQpq5dUr6mEMJX4oIEFv6bwom3FDwKRDsuIjjJGANqhBuoAn9c1RQJIdAKav33ED65E2ys+87QQ==",
+    "upstreamSourceSha256": "01b7d66c854b2fe53ac05c98feb6e0d64722ab8898a778e2d2426a8b468d178f",
+    "sourceSha256": "91395fae0cfe22fb18f5c905f484856ac7ee39f737a9aa6c351c63bc3ca8abcf",
+    "trackedAdvisory": "GHSA-ch52-4w7c-c8xp",
+    "sourceReceiptSha256": "19327135c9dd3f47800d08421a190dba760166470255676ca957f25e5b836759"
+  }
+}
