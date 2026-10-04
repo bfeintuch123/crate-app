@@ -3704,6 +3704,20 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
 }
 
+// Fence disk-dependent presentation facts after the earlier byte hashes.
+function captureWorkingSourcePresentationDiskInput(files, membership) {
+  const paths = new Set();
+  for (const file of files) {
+    const sourcePath = isScanOnSaveEmbeddedPsdFile(file) ? file.parentPsd || file.path : file.path;
+    if (typeof sourcePath === 'string' && path.isAbsolute(sourcePath)) paths.add(sourcePath);
+  }
+  for (const required of membership.requiredByPath.values()) paths.add(required.path);
+  return crypto.createHash('sha256').update(JSON.stringify({
+    disk: [...paths].sort().map(sourcePath => [sourcePath, getPackageReviewSourceFingerprint(sourcePath)]),
+    facts: [...membership.facts], counts: membership.counts, blocked: membership.blocked,
+  })).digest('hex');
+}
+
 const workingSourceScanLeases = new Map();
 
 function getDormantWorkingSourceReviewFacts(record) {
@@ -4349,6 +4363,8 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const selectionSignature = getPackageSelectionInputSignature(project);
   const packageFiles = await selectProjectFilesForPackaging(project);
   const membership = getWorkingSourceMembership(project, packageFiles);
+  const presentedFiles = [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])];
+  const diskInput = captureWorkingSourcePresentationDiskInput(presentedFiles, membership);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
   const cacheGeneration = fileVisualProjectCacheGeneration;
@@ -4379,13 +4395,16 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   // in-flight workspace build from publishing or returning stale records
   // after a concurrent project update. Retry once so the renderer receives a
   // current snapshot; repeated churn fails closed instead of returning stale data.
+  const currentProject = getProjects().find(item => item.id === projectId);
   const workspaceIsFresh = (
     getFileVisualProjectCacheEpoch(projectId) === cacheEpoch &&
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
-    selectionSignature === getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId)) &&
-    getIllustratorActivationScope(projectId) === illustratorScope
+    selectionSignature === getPackageSelectionInputSignature(currentProject) &&
+    getIllustratorActivationScope(projectId) === illustratorScope &&
+    currentProject && diskInput === captureWorkingSourcePresentationDiskInput(presentedFiles,
+      getWorkingSourceMembership(currentProject, packageFiles))
   );
   if (!workspaceIsFresh) {
     return retryCount < 2 ? getProjectAssetWorkspace(projectId, retryCount + 1) : null;
@@ -18861,6 +18880,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       return { error: 'asset_baseline_decision_required' };
     }
     const inputSignature = getPackageSelectionInputSignature(project);
+    const reviewedInputSignature = getPackageSelectionInputSignature(project, true);
     const packageSettings = getRelevantPackageReviewSettings();
     const packageSettingsKey = JSON.stringify(packageSettings);
     if (!inputSignature) return { error: 'package_review_unavailable' };
@@ -18881,6 +18901,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         files,
         entries,
         entryStatuses: membership.blocked ? entryStatuses.map(() => 'unavailable') : entryStatuses,
+        reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
         materializable: false,
       };
     }
@@ -18900,6 +18921,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
           files,
           entries,
           entryStatuses: entries.map(entry => PACKAGE_PRESENTATION_EXTENSIONS.has(entry.ext) ? 'unavailable' : 'ready'),
+          reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
           materializable: false,
         };
       }
@@ -18921,6 +18943,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       entries,
       plan,
       manifestKey,
+      reviewedInputSignature, reviewedSettingsKey: packageSettingsKey,
       materializable: true,
     };
   }
@@ -19003,13 +19026,18 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
-  const inputSignature = getPackageSelectionInputSignature(manifest.project, true);
-  const settingsKey = JSON.stringify(manifest.plan?.packageSettings || getRelevantPackageReviewSettings());
+  const inputSignature = manifest.reviewedInputSignature;
+  const settingsKey = manifest.reviewedSettingsKey;
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
+  const diskInput = captureWorkingSourcePresentationDiskInput(manifest.files, membership);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
-  if (!inputSignature || inputSignature !== getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId), true) ||
+  const currentProject = getProjects().find(item => item.id === projectId);
+  const diskCurrent = currentProject && diskInput === captureWorkingSourcePresentationDiskInput(manifest.files,
+    getWorkingSourceMembership(currentProject, manifest.files)) && manifest.entries.every((entry, index) =>
+      packageReviewFingerprintsMatch(entry.sourceFingerprint, getPackageReviewManifestEntry(manifest.files[index]).sourceFingerprint));
+  if (membership.blocked || !diskCurrent || !inputSignature || inputSignature !== getPackageSelectionInputSignature(currentProject, true) ||
       settingsKey !== JSON.stringify(getRelevantPackageReviewSettings()) ||
       packageReviewSnapshots.get(token) !== snapshot || currentPackageReviewTokenByProject.get(projectId) !== token ||
       snapshot.expiresAt <= Date.now()) {
@@ -19047,13 +19075,18 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
 
 async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
-  const inputSignature = getPackageSelectionInputSignature(manifest.project, true);
-  const settingsKey = JSON.stringify(manifest.plan?.packageSettings || getRelevantPackageReviewSettings());
+  const inputSignature = manifest.reviewedInputSignature;
+  const settingsKey = manifest.reviewedSettingsKey;
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
+  const diskInput = captureWorkingSourcePresentationDiskInput(manifest.files, membership);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
-  if (!inputSignature || inputSignature !== getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId), true) ||
+  const currentProject = getProjects().find(item => item.id === projectId);
+  const diskCurrent = currentProject && diskInput === captureWorkingSourcePresentationDiskInput(manifest.files,
+    getWorkingSourceMembership(currentProject, manifest.files)) && manifest.entries.every((entry, index) =>
+      packageReviewFingerprintsMatch(entry.sourceFingerprint, getPackageReviewManifestEntry(manifest.files[index]).sourceFingerprint));
+  if (!diskCurrent || !inputSignature || inputSignature !== getPackageSelectionInputSignature(currentProject, true) ||
       settingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) return { error: 'package_review_changed' };
   return {
     projectId,

@@ -1828,6 +1828,52 @@ function baselineCases() {
     });
   }
 
+  for (const surface of ['ready', 'unavailable', 'workspace']) for (const mutation of ['source-bytes', 'required-file']) {
+    baselineTest(`disk response: ${surface} rechecks ${mutation} after presentation`, async () => {
+      const f = await correctionProject('.ai');
+      const assetPath = path.join(TEST_HOME, 'Desktop', 'Required-presentation.png'); fs.writeFileSync(assetPath, embeddedPng);
+      fs.writeFileSync(f.filePath, `%PDF-1.7\n${assetPath}\n%%EOF\n`); fs.utimesSync(f.filePath, 1791100800, 1791100800);
+      f.current().workingSourceSelections = {};
+      const originalGet = storeInstance.get;
+      storeInstance.get = function(...args) { const value = originalGet.apply(this, args); return value === undefined ? value : JSON.parse(JSON.stringify(value)); };
+      const gate = deferred(); let restorePause, response;
+      try {
+        assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true })).success, true);
+        const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(initial.semanticCounts.missingRequiredReferences, 0); assert.equal(initial.semanticCounts.unresolvedVerification, 0);
+        if (surface === 'unavailable') f.current().workingSourceRelationshipHolds = [{ reason: 'manual-guard', sourcePath: f.filePath }];
+        const storedBefore = JSON.stringify(f.current());
+        let entered = false;
+        restorePause = metadataTestHooks.pauseRecoveryEligibility(async () => { if (!entered) { entered = true; await gate.promise; } });
+        response = callIpcRaw(surface === 'workspace' ? 'projects:get-asset-workspace' : 'projects:prepare-package-review', f.project.id);
+        await waitForCondition(() => entered, 'presentation did not pause');
+        if (mutation === 'source-bytes') {
+          const before = fs.statSync(f.filePath);
+          fs.writeFileSync(f.filePath, fs.readFileSync(f.filePath, 'utf8').replace(assetPath, ' '.repeat(assetPath.length)));
+          fs.utimesSync(f.filePath, before.atimeMs / 1000, before.mtimeMs / 1000);
+          const after = fs.statSync(f.filePath);
+          assert.equal(after.size, before.size); assert.equal(after.mtimeMs, before.mtimeMs);
+          assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino); assert.notEqual(after.ctimeMs, before.ctimeMs);
+        } else fs.unlinkSync(assetPath);
+        assert.equal(JSON.stringify(f.current()), storedBefore, 'only filesystem changes, no scan/store publication');
+        gate.release(); const result = await response; response = null;
+        if (surface === 'workspace') {
+          assert.ok(result); assert.equal(result.workingSourceSelectionBlocked, true);
+          if (mutation === 'source-bytes') {
+            assert.equal(result.files.find(row => row.name === path.basename(f.filePath)).verificationStatus, 'stale');
+            assert.ok(result.semanticCounts.unresolvedVerification > 0);
+          } else assert.equal(result.semanticCounts.missingRequiredReferences, 1);
+        } else {
+          assert.equal(result.error, 'package_review_changed'); assert.equal(result.token, undefined); assert.notEqual(result.materializable, true);
+        }
+        restorePause(); restorePause = null;
+        const current = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(current.workingSourceSelectionBlocked, true);
+        assert.ok(mutation === 'source-bytes' ? current.semanticCounts.unresolvedVerification > 0 : current.semanticCounts.missingRequiredReferences === 1);
+      } finally { gate.release(); if (response) await response; restorePause?.(); storeInstance.get = originalGet; clearTrackedTimers(); }
+    });
+  }
+
   baselineTest('reconciliation completion: indirect parent reference cannot retain removed PSD output', async () => {
     const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }], [], true);
     try {
