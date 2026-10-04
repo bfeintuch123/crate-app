@@ -22,6 +22,7 @@ replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership,\n' +
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
+  '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
@@ -1303,7 +1304,7 @@ function baselineCases() {
 
   const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
   const psdId = '22222222-2222-4222-8222-222222222222';
-  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false) {
+  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false) {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
     const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
     const f = viaAddFiles ? await (async () => {
@@ -1326,6 +1327,7 @@ function baselineCases() {
     const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'cycle2-owned-psd-'));
     os.tmpdir = () => privateTmp;
     currentPsdFixture = 'actual-source-buffer';
+    const restoreAdmission = forcePending ? metadataTestHooks.forceWorkingPsdPendingAdmission() : () => {};
     if (viaAddFiles) {
       manualDialogFor([f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
       if (f.current().assetBaseline.status === 'decision-required') {
@@ -1344,7 +1346,7 @@ function baselineCases() {
         const result = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
         assert.equal(result.success, true); return result;
       },
-      cleanup() { currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+      cleanup() { restoreAdmission(); currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
         storeInstance.get = originalStoreGet;
         fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); },
     };
@@ -1697,6 +1699,66 @@ function baselineCases() {
         assert.equal(recovery.success, true); assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'scanned');
         assert.equal((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.path === linked), false);
       } finally { fs.promises.access = originalAccess; clearTrackedTimers(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const route of ['restore', 'save']) for (const admission of ['direct', 'pending']) {
+    baselineTest(`producer closure: non-Add-Files ${route} ${domain} ${admission} survives acceptance exclusion reload and saves`, async () => {
+      const original = { id: psdId, name: 'Ordinary.bin', data: Buffer.from('ordinary original output') };
+      const linked = value => domain === 'root' ? [value] : [];
+      const children = value => domain === 'layer' ? [{ name: 'ordinary layer', linkedFiles: [value] }] : [];
+      const f = await workingPsdFixture(route === 'restore' ? linked(original) : [],
+        route === 'restore' ? children(original) : [], false, admission === 'pending');
+      try {
+        assert.equal(f.current().assetBaseline.status, 'legacy-included');
+        if (route === 'save') await f.save(linked(original), children(original), 2);
+        assert.equal(f.rows().length, 1);
+        let output = f.rows()[0];
+        assert.equal(output.assetBaselineSourcePath, undefined, 'ordinary admission has no paused baseline stamp');
+        assert.equal(output.psdResource.parentPath, f.filePath);
+        assert.equal(output.psdResource.version, 1);
+        assert.equal(Object.values(f.current().workingSourceVerification)[0].requiredReferences.length, 0,
+          'embedded producer obligations must not be invented as external references');
+        if (admission === 'pending') {
+          assert.equal(f.current().files.some(row => row.path === output.path), false);
+          assert.equal(f.current().pendingFiles.some(row => row.path === output.path), true);
+          const pendingReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(pendingReview.materializable, false);
+          assert.equal(pendingReview.semanticCounts.missingRequiredReferences, 1, 'pending current output is a known required obligation');
+          const accepted = await callIpcRaw('projects:accept-pending', f.project.id, output.path);
+          assert.equal(accepted.files.some(row => row.fileId === output.fileId), true);
+        } else assert.equal(f.current().files.some(row => row.path === output.path), true);
+        output = f.current().files.find(row => row.fileId === output.fileId);
+        assert.equal(output.captureEvidence, undefined, 'production direct/accept paths strip transient evidence');
+        f.current().excludedAssetKeys.push(output.fileId);
+        const assertClosure = async currentOutput => {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          const identity = metadataTestHooks.createProjectFileVisualIdentity(f.project.id, currentOutput);
+          const row = workspace.files.find(row => row.visualIdentity === identity);
+          assert.equal(row.includedAsDependency, true, 'validated current producer relationship must survive transient admission metadata');
+          assert.deepEqual(row.requiredBy, [path.basename(f.filePath)]);
+          const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(review.materializable, true); assert.equal(review.totalFiles, 2);
+          assert.equal(review.semanticCounts.includedAssets, 1); assert.equal(review.semanticCounts.missingRequiredReferences, 0);
+          assert.equal(review.files.some(row => row.visualIdentity === identity), true, 'exclusion cannot drop a required current output');
+        };
+        await assertClosure(output);
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        await assertClosure(output);
+        await f.save(linked(original), children(original), route === 'save' ? 2 : 1);
+        assert.equal(f.rows()[0].path, output.path); await assertClosure(f.rows()[0]);
+        const replacement = { ...original, data: Buffer.from('ordinary replacement output') };
+        await f.save(linked(replacement), children(replacement), 3);
+        const replaced = f.rows()[0];
+        assert.equal(replaced.fileId, output.fileId); assert.notEqual(replaced.path, output.path);
+        assert.equal(replaced.assetBaselineSourcePath, undefined);
+        assert.ok(f.current().excludedAssetKeys.includes(replaced.fileId));
+        await assertClosure(replaced);
+        await f.save([], [], 4); assert.equal(f.rows().length, 0);
+        assert.ok(fs.existsSync(replaced.path), 'retirement preserves old physical bytes');
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(review.materializable, true); assert.equal(review.totalFiles, 1);
+      } finally { f.cleanup(); }
     });
   }
 

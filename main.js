@@ -3605,7 +3605,8 @@ function getWorkingSourceVerification(project, file) {
 }
 
 function getWorkingSourceMembership(project, packageFiles = null) {
-  const files = deduplicateFiles(getIllustratorScopedProjectView(project)?.files || []);
+  const scopedProject = getIllustratorScopedProjectView(project);
+  const files = deduplicateFiles(scopedProject?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
   const sources = files.filter(isWorkingSourceFile);
   // A logical embedded resource reads its parent's bytes; it is not that file.
@@ -3631,6 +3632,17 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       file.psdResource.current === false && normalizeTrackedFilePath(file.psdResource.parentPath) &&
       normalizeTrackedFilePath(relationshipSource) === normalizeTrackedFilePath(file.psdResource.parentPath);
     if (!detachedFromParent) edge(relationshipSource, file.path);
+  }
+  // Worker-bound current resource metadata survives direct admission and
+  // pending acceptance stripping transient live-capture evidence. A pending
+  // required output blocks closure until accepted; retired edges stay absent.
+  if (engaged) for (const file of [...files, ...(scopedProject?.pendingFiles || [])]) {
+    const resource = file.psdResource;
+    if (file.source === 'psd-embedded' && resource?.version === 1 && resource.current !== false &&
+        typeof resource.parentPath === 'string' && path.isAbsolute(resource.parentPath) &&
+        /^[a-f0-9]{64}$/.test(resource.sourceDigest || '') && /^[a-f0-9]{64}$/.test(resource.outputDigest || '')) {
+      edge(resource.parentPath, file.path);
+    }
   }
   // Traverse from selected working roots, retaining source-as-asset roles and
   // all known transitive obligations. Cycles do not resurrect excluded roots.
