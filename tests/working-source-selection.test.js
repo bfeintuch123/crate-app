@@ -43,6 +43,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     isProjectAssetBaselineSource: file => file?.projectRole === 'source',
     getIllustratorScopedProjectView: project => project,
     deduplicateFiles: files => [...new Map(files.map(file => [file.path.toLowerCase(), file])).values()],
+    isScanOnSaveEmbeddedPsdFile: file => !!(file?.embedded && file.source === 'scan-on-save-embedded'),
     isAssetReviewFileExcluded: (project, file) => (project.excludedAssetKeys || []).includes(file.path),
     sanitizeRendererSourceName: name => String(name).replace(/[\r\n]/g, '').slice(0, 256),
     captureProjectOperation: id => {

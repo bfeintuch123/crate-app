@@ -1213,6 +1213,228 @@ function baselineCases() {
     clearTrackedTimers();
   });
 
+
+  baselineTest('cycle2: untouched vetoed root keeps legacy readiness and final counts', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try {
+      const project = f.current();
+      project.files[0].source = 'lsof'; project.files[0].acceptedPending = true;
+      project.watchStartedAt = Date.now() + 60000;
+      const sibling = path.join(TEST_HOME, 'Desktop', 'Excluded.ai'); fs.writeFileSync(sibling, '%PDF-1.7\n%%EOF\n');
+      const asset = path.join(TEST_HOME, 'Desktop', 'Kept.png'); fs.writeFileSync(asset, 'kept asset');
+      project.files.push({ path: sibling, name: 'Excluded.ai', ext: '.ai', source: 'user-added', projectRole: 'source', acceptedPending: true },
+        { path: asset, name: 'Kept.png', ext: '.png', source: 'user-added', projectRole: 'asset', acceptedPending: true });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      const row = workspace.files.find(file => file.name === 'Excluded.ai');
+      await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.materializable, true); assert.deepEqual(review.files.map(file => file.name), ['Kept.png']);
+      assert.equal(review.semanticCounts.selectedWorkingSources, 0);
+      assert.equal(review.semanticCounts.includedAssets, 1);
+      const latest = await callIpcRaw('projects:get-asset-workspace', project.id);
+      assert.deepEqual(latest.semanticCounts, review.semanticCounts); assert.equal(latest.workingSourceSelectionBlocked, false);
+      const source = f.current().files.find(file => file.path === f.filePath);
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), source);
+      f.current().workingSourceVerification[key] = { status: 'failed', selectionRevision: 0, attempt: 'known-failure',
+        reason: 'scan-failed', requiredReferences: [], unresolved: [{ reason: 'scan-failed' }] };
+      assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).materializable, false,
+        'revision zero does not waive concrete persisted failure');
+    } finally { clearTrackedTimers(); }
+  });
+
+  baselineTest('cycle2: logical embedded alias cannot satisfy a missing required physical PSD', async () => {
+    const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    const data = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try {
+      const required = path.join(TEST_HOME, 'Desktop', 'Required.psd');
+      fs.writeFileSync(required, actual.writePsdBuffer({ width: 1, height: 1, linkedFiles: [{
+        id: '22222222-2222-4222-8222-222222222222', name: 'Embedded.png', data,
+      }] }));
+      currentPsdFixture = actual.readPsd(fs.readFileSync(required), { skipLayerImageData: true, skipCompositeImageData: true });
+      fs.writeFileSync(f.filePath, `%PDF-1.7\n${required}\n%%EOF\n`);
+      const project = f.current();
+      project.files.push({ path: required, name: 'Required.psd', ext: '.psd', source: 'lsof', acceptedPending: true, projectRole: 'source' },
+        { path: required, parentPsd: required, embeddedIndex: 0, embeddedOriginalName: 'Embedded.png', name: 'Embedded.png', ext: '.png',
+          source: 'scan-on-save-embedded', embedded: true, fileId: crypto.randomUUID(), assetOrigin: 'existing', projectRole: 'asset' });
+      project.watchStartedAt = Date.now() + 60000;
+      let workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      const root = workspace.files.find(file => file.name === path.basename(f.filePath));
+      await callIpcRaw('projects:set-working-source-selection', project.id, root.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', project.id, root.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      const parent = workspace.files.find(file => file.name === 'Required.psd');
+      await callIpcRaw('projects:set-working-source-selection', project.id, parent.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const stored = f.current();
+      const physical = stored.files.find(file => file.path === required && !file.embedded);
+      physical.source = 'lsof'; physical.acceptedPending = true;
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(stored, physical);
+      stored.workingSourceVerification[key] = { ...stored.workingSourceVerification[key], status: 'unavailable', reason: 'not-scanned',
+        sourceFingerprint: null, sourceIdentity: null, requiredReferences: [], unresolved: [] };
+      const selected = await metadataTestHooks.selectProjectFilesForPackaging(stored);
+      assert.ok(selected.some(file => file.embedded)); assert.equal(selected.some(file => file.path === required && !file.embedded), false);
+      const review = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(review.materializable, false); assert.ok(review.semanticCounts.missingRequiredReferences > 0);
+      assert.equal(review.files.find(file => file.embedded)?.includedAsDependency, false);
+      stored.files = stored.files.filter(file => file !== physical);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).materializable, false,
+        'an accepted logical alias alone cannot satisfy physical inventory presence');
+      stored.files.push({ ...physical, source: 'user-added' });
+      assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).materializable, true,
+        'the actual direct PSD still satisfies the required role');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  baselineTest('cycle2: unchanged dormant scan preserves token while source change rejects it', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try {
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true);
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { establishBaseline: false })).success, true);
+      const packaged = await callIpcRaw('projects:package', f.project.id, TEST_HOME, review.token);
+      assert.equal(packaged.success, true);
+      f.current().status = 'watching';
+      const second = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      fs.appendFileSync(f.filePath, '\nchanged bytes');
+      const rejected = await callIpcRaw('projects:package', f.project.id, TEST_HOME, second.token);
+      assert.ok(['package_review_changed', 'package_review_stale'].includes(rejected.error));
+    } finally { clearTrackedTimers(); }
+  });
+
+  const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
+  const psdId = '22222222-2222-4222-8222-222222222222';
+  async function workingPsdFixture(linkedFiles, children = []) {
+    const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
+    const f = await correctionProject('.psd', write(linkedFiles, children));
+    const originalTmpdir = os.tmpdir;
+    const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'cycle2-owned-psd-'));
+    os.tmpdir = () => privateTmp;
+    currentPsdFixture = 'actual-source-buffer';
+    const rows = () => [...f.current().files, ...(f.current().pendingFiles || [])].filter(file => file.source === 'psd-embedded');
+    const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+    const source = workspace.files.find(file => file.name === path.basename(f.filePath));
+    await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+    assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
+      { action: 'restore', expectedRevision: 1 })).verificationStatus, 'scanned');
+    return { ...f, rows, write, source, privateTmp, actual,
+      async save(linkedFiles, children = [], width = 1) {
+        fs.writeFileSync(f.filePath, write(linkedFiles, children, width));
+        const result = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+        assert.equal(result.success, true); return result;
+      },
+      cleanup() { currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+        fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); },
+    };
+  }
+
+  baselineTest('cycle2: PSD identical saves reuse one output and removal/empty retire exact membership', async () => {
+    const objects = [{ id: psdId, name: 'Embedded.png', data: embeddedPng }];
+    const f = await workingPsdFixture(objects);
+    try {
+      assert.equal(f.rows().length, 1);
+      const original = { ...f.rows()[0] };
+      await f.save(objects); await f.save(objects);
+      assert.equal(f.rows().length, 1);
+      assert.equal(original.psdResource.parentPath, f.filePath); assert.equal(original.psdResource.linkedIndex, 0); assert.equal(f.rows()[0].path, original.path); assert.equal(f.rows()[0].fileId, original.fileId);
+      assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
+      assert.equal(fs.readdirSync(path.dirname(original.path)).filter(name => !name.startsWith('.')).length, 1,
+        'transaction retires its own unused new snapshots');
+      await f.save([], [], 2);
+      assert.equal(f.rows().length, 0); assert.ok(fs.existsSync(original.path), 'prior output bytes are preserved');
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(review.totalFiles, 1);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle2: PSD replacement and reordered same-name objects preserve exclusions and index domains', async () => {
+    const linked = { id: '11111111-1111-4111-8111-111111111111', name: 'Linked.png', childDocumentID: '',
+      linkedFile: { fileSize: 1, name: 'Linked.png', fullPath: path.join(TEST_HOME, 'Desktop', 'Linked.png'), originalPath: '', relativePath: '' } };
+    const a = { id: psdId, name: 'Same.png', data: embeddedPng };
+    const b = { id: '33333333-3333-4333-8333-333333333333', name: 'Same.png', data: Buffer.from('other bytes') };
+    const f = await workingPsdFixture([a, b]);
+    try {
+      const original = f.rows().find(row => row.psdResource.producerId === psdId);
+      const oldPath = original.path;
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, original));
+      await callIpcRaw('projects:remove-file', f.project.id, row.visualIdentity);
+      assert.ok(f.current().excludedAssetKeys.includes(original.fileId));
+      fs.writeFileSync(linked.linkedFile.fullPath, 'linked byte');
+      const replacement = { ...a, data: Buffer.from('replacement bytes') };
+      await f.save([linked, b, replacement]);
+      const current = f.rows().find(row => row.psdResource.producerId === psdId);
+      assert.equal(f.rows().length, 2); assert.equal(current.fileId, original.fileId);
+      const saved = f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
+      assert.equal(current.psdResource.linkedIndex, saved.linkedFiles.findIndex(item => item.id === psdId),
+        'locator uses the actual saved root record index, never assumes serialization order');
+      assert.equal(current.psdResource.layerPath, null); assert.notEqual(current.path, oldPath);
+      assert.ok(f.current().excludedAssetKeys.includes(current.fileId)); assert.ok(fs.existsSync(oldPath));
+      assert.deepEqual(fs.readFileSync(current.path), replacement.data);
+      await f.save([linked, replacement]);
+      assert.equal(f.rows().length, 1); assert.equal(f.rows()[0].fileId, original.fileId);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle2: PSD layer outputs retain their own locator and two parent sources do not reconcile each other', async () => {
+    const root = { id: psdId, name: 'Root.bin', data: Buffer.from('root') };
+    const layerObject = { id: '33333333-3333-4333-8333-333333333333', name: 'Layer.bin', data: Buffer.from('layer') };
+    const children = [{ name: 'layer', linkedFiles: [layerObject] }];
+    const f = await workingPsdFixture([root], children);
+    try {
+      assert.equal(f.rows().length, 2);
+      const layer = f.rows().find(row => row.psdResource.producerId === layerObject.id);
+      assert.deepEqual(layer.psdResource.layerPath, [0]); assert.equal(layer.psdResource.linkedIndex, 0);
+      const otherPath = path.join(TEST_HOME, 'Desktop', 'Other.psd'); fs.writeFileSync(otherPath, f.write([root]));
+      f.current().files.push({ path: otherPath, name: 'Other.psd', ext: '.psd', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const other = workspace.files.find(file => file.name === 'Other.psd');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      const otherOutput = f.rows().find(row => row.psdResource.parentPath === otherPath);
+      assert.ok(otherOutput);
+      await f.save([], []);
+      assert.deepEqual(f.rows().map(row => row.psdResource.parentPath), [otherPath]); assert.ok(fs.existsSync(otherOutput.path));
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle2: PSD removal retains a physical asset still required by another selected root', async () => {
+    const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }]);
+    try {
+      const output = f.rows()[0];
+      const otherPath = path.join(TEST_HOME, 'Desktop', 'Other.ai'); fs.writeFileSync(otherPath, `%PDF-1.7\n${output.path}\n%%EOF\n`);
+      f.current().files.push({ path: otherPath, name: 'Other.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const other = workspace.files.find(file => file.name === 'Other.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      await f.save([], [], 2);
+      assert.ok(f.current().files.some(row => row.path === output.path));
+      assert.equal(f.current().files.find(row => row.path === output.path).psdResource.current, false);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true);
+      assert.ok(review.files.some(row => row.ext === '.png' && row.includedAsDependency));
+      assert.deepEqual(fs.readFileSync(output.path), embeddedPng);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('cycle2: concrete legacy association conflict preserves rows/bytes/exclusions and gives a specific hold', async () => {
+    const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }]);
+    try {
+      const current = f.rows()[0];
+      const oldPath = path.join(f.privateTmp, 'old-output.png'); fs.writeFileSync(oldPath, 'old preserved bytes');
+      const old = { path: oldPath, name: 'old-output.png', ext: '.png', source: 'psd-embedded', assetBaselineSourcePath: f.filePath,
+        fileId: crypto.randomUUID(), projectRole: 'asset', assetOrigin: 'existing' };
+      f.current().files.push(old); f.current().excludedAssetKeys.push(old.fileId);
+      const exclusions = [...f.current().excludedAssetKeys];
+      await f.save([], [], 2);
+      assert.ok(f.current().files.includes(old)); assert.ok(f.current().files.includes(current));
+      assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.equal(fs.readFileSync(oldPath, 'utf8'), 'old preserved bytes');
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, false); assert.ok(review.semanticCounts.relationshipHolds > 0);
+      assert.match(review.message, /Photoshop asset association/);
+    } finally { f.cleanup(); }
+  });
+
   for (const mode of ['ready', 'missing', 'excluded']) {
     baselineTest(`confirmed correction 6: PSD save refreshes current bytes and preserves ${mode} state`, async () => {
       const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);

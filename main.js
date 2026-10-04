@@ -3608,8 +3608,12 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   const files = deduplicateFiles(getIllustratorScopedProjectView(project)?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
   const sources = files.filter(isWorkingSourceFile);
-  const byPath = new Map(files.map(file => [normalizeTrackedFilePath(file.path), file]));
-  const packagePaths = packageFiles && new Set(packageFiles.map(file => normalizeTrackedFilePath(file.path)));
+  // A logical embedded resource reads its parent's bytes; it is not that file.
+  const physicalFiles = files.filter(file => !isScanOnSaveEmbeddedPsdFile(file));
+  const byPath = new Map(physicalFiles.map(file => [normalizeTrackedFilePath(file.path), file]));
+  const packageKeys = packageFiles && new Set(packageFiles.map(getTrackedFileDedupKey));
+  const packagePaths = packageFiles && new Set(packageFiles.filter(file => !isScanOnSaveEmbeddedPsdFile(file))
+    .map(file => normalizeTrackedFilePath(file.path)));
   const requiredByPath = new Map();
   const edges = new Map();
   function edge(sourcePath, resourcePath) {
@@ -3641,10 +3645,12 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
   for (const file of files) {
     const source = isWorkingSourceFile(file), selection = source ? getWorkingSourceSelection(project, file) : null;
-    const requiredBy = [...(requiredByPath.get(normalizeTrackedFilePath(file.path))?.sources.values() || [])];
+    const requiredBy = isScanOnSaveEmbeddedPsdFile(file) ? [] :
+      [...(requiredByPath.get(normalizeTrackedFilePath(file.path))?.sources.values() || [])];
     const selectedSource = source && selection.state === 'selected';
     const includedAsDependency = engaged && requiredBy.length > 0;
-    const included = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
+    const eligible = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
+    const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = project.workingSourceVerification?.[getAssetBaselineSourceRecoveryRouteKey(project, file)];
     // An untouched root with no concrete scan obligation keeps legacy readiness.
@@ -3652,13 +3658,13 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     // never an invented demand for exhaustive inventory certification.
     const unscannedExcludedRole = verification?.status === 'unavailable' && verification.reason === 'not-scanned' &&
       !verification.sourceFingerprint && verification.requiredReferences.length === 0 && verification.unresolved.length === 0;
-    const verificationRequired = engaged && included && ((selectedSource && (selection.revision > 0 ||
+    const verificationRequired = engaged && eligible && ((selectedSource && (selection.revision > 0 ||
       (!!persistedVerification && !unscannedExcludedRole))) ||
       (includedAsDependency && !!persistedVerification && !unscannedExcludedRole));
     // The final package selector still enforces observer and Figma scope vetoes.
     // A veto cannot silently remove an engaged root or known required role.
-    const packageSelectionOmitted = engaged && packagePaths && included &&
-      (selectedSource || includedAsDependency) && !packagePaths.has(normalizeTrackedFilePath(file.path));
+    const packageSelectionOmitted = engaged && packageKeys && eligible &&
+      (includedAsDependency || (selectedSource && verificationRequired)) && !packageKeys.has(getTrackedFileDedupKey(file));
     let verificationStatus = selection?.state === 'invalid' ? 'invalid' : verification?.status || 'unavailable';
     if (verificationRequired && ['scanned', 'no-extractor'].includes(verification?.status) && !isWorkingSourceDiskIdentityCurrent(file, verification)) verificationStatus = 'stale';
     const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
@@ -3669,8 +3675,8 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       requiredBy: requiredBy.map(item => sanitizeRendererSourceName(item.name || path.basename(item.path)) || 'Working file') });
     if (source) {
       if (selection.state === 'excluded') counts.excludedWorkingSources++;
-      else if (selection.state === 'selected') counts.selectedWorkingSources++;
-      else counts.invalidWorkingSources++;
+      else if (selection.state === 'selected' && included) counts.selectedWorkingSources++;
+      else if (selection.state === 'invalid') counts.invalidWorkingSources++;
     }
     if (unresolved) counts.unresolvedVerification++;
     if (!selectedSource) {
@@ -3688,11 +3694,20 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
     !/^[a-f0-9]{64}$/.test(key) || !record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
     !((record.state === 'excluded' && record.reason === 'user-excluded') || (record.state === 'selected' && record.reason === null))));
-  return { facts, counts, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
+  return { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
 }
 
 const workingSourceScanLeases = new Map();
+
+function getDormantWorkingSourceReviewFacts(record) {
+  if (record?.status === 'pending' && record.pendingReviewFacts) return record.pendingReviewFacts;
+  const status = record?.status;
+  const failed = ['failed', 'limited', 'incomplete', 'stale'].includes(status) ||
+    (status === 'unavailable' && record.reason !== 'not-scanned');
+  return { status: failed ? status : null, reason: failed ? record.reason || null : null,
+    requiredReferences: record?.requiredReferences || [], unresolved: record?.unresolved || [] };
+}
 
 function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null) {
   const project = getProjects().find(item => item.id === projectId);
@@ -3715,14 +3730,16 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
     if (!parentCurrent()) return false;
     latest.workingSourceVerification = { ...(latest.workingSourceVerification || {}), [key]: {
       ...previous, status: 'pending', selectionRevision: selection.revision, attempt,
+      pendingReviewFacts: getDormantWorkingSourceReviewFacts(previous),
       provider: 'ordinary-scan', coverage: 'ordinary-route', version: 1, reason: 'scan-pending', inventoryStatus: 'unverified',
       requiredReferences: previous?.requiredReferences || [], unresolved: previous?.unresolved || [],
       sourceFingerprint: previous?.sourceFingerprint || null, sourceIdentity: previous?.sourceIdentity || null,
     } };
     return true;
   });
-  invalidatePackageReviewForProject(projectId);
-  return { projectId, key, attempt, selectionRevision: selection.revision, file, current };
+  if (hasWorkingSourceSelectionState(project)) invalidatePackageReviewForProject(projectId);
+  return { projectId, key, attempt, selectionRevision: selection.revision, file, current,
+    previousReviewFacts: getDormantWorkingSourceReviewFacts(previous) };
 }
 
 function collectWorkingSourceScanEvidence(paths, inventory = null) {
@@ -3756,9 +3773,17 @@ function publishWorkingSourceScan(scan, result) {
     if (!scan.current()) return false;
     project.workingSourceVerification[scan.key] = { ...project.workingSourceVerification[scan.key], ...result,
       attempt: scan.attempt, selectionRevision: scan.selectionRevision };
+    delete project.workingSourceVerification[scan.key].pendingReviewFacts;
     return true;
   });
-  if (written) { invalidatePackageReviewForProject(scan.projectId); sendToRenderer('project:updated', { projectId: scan.projectId }); }
+  if (written) {
+    const project = getProjects().find(item => item.id === scan.projectId);
+    if (hasWorkingSourceSelectionState(project) || JSON.stringify(scan.previousReviewFacts) !==
+        JSON.stringify(getDormantWorkingSourceReviewFacts(project?.workingSourceVerification?.[scan.key]))) {
+      invalidatePackageReviewForProject(scan.projectId);
+    }
+    sendToRenderer('project:updated', { projectId: scan.projectId });
+  }
   return !!written;
 }
 
@@ -4316,7 +4341,8 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
   const selectionSignature = getPackageSelectionInputSignature(project);
-  const membership = getWorkingSourceMembership(project);
+  const packageFiles = await selectProjectFilesForPackaging(project);
+  const membership = getWorkingSourceMembership(project, packageFiles);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
   const cacheGeneration = fileVisualProjectCacheGeneration;
@@ -12948,8 +12974,20 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
         fs.unlinkSync(stage.stagedPath);
         if (ownedPath(stage, stage.extractPath).size !== stage.byteLength) invalid();
       }
-      return stages.map(stage => ({ filePath: stage.extractPath, source: 'psd-embedded',
-        embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex, sourceDigest, outputDigest: stage.outputDigest }));
+      const embeddedRecords = linkedMetadata.filter(item => item.origin === 'linked-file' && item.dataPresent);
+      return stages.map((stage, ordinal) => {
+        const item = embeddedRecords[ordinal];
+        // Transfer ordinal, concatenated record index and per-layer locator are
+        // separate domains. Only metadata already bound to this output is used.
+        const localIndex = linkedMetadata.filter(candidate => candidate.origin === 'linked-file' &&
+          candidate.index < item.index && JSON.stringify(candidate.layerPath) === JSON.stringify(item.layerPath)).length;
+        return { filePath: stage.extractPath, source: 'psd-embedded',
+          embeddedOriginalName: stage.embeddedOriginalName, embeddedIndex: stage.embeddedIndex,
+          sourceDigest, outputDigest: stage.outputDigest,
+          psdResource: { version: 1, producerId: typeof item.metadata.id === 'string' && item.metadata.id.length <= 512
+            ? item.metadata.id : null, layerPath: item.layerPath, linkedIndex: localIndex,
+            originalName: stage.embeddedOriginalName, sourceDigest, outputDigest: stage.outputDigest } };
+      });
     },
     assertReady() {
       check();
@@ -14120,6 +14158,109 @@ async function preparePsdBaselineAcceptance(projectId, filePath, baselineScan, v
     }
   } };
 }
+// Preserve the legacy save reconciler's exact retain/replace/remove model,
+// using worker-bound physical outputs for root and layer resources alike.
+function reconcilePsdEmbeddedMembership(project, isStaleEntry) {
+  const filesBefore = project.files.length;
+  const pendingBefore = (project.pendingFiles || []).length;
+  project.files = project.files.filter(entry => !isStaleEntry(entry));
+  project.pendingFiles = (project.pendingFiles || []).filter(entry => !isStaleEntry(entry));
+  return project.files.length !== filesBefore || project.pendingFiles.length !== pendingBefore;
+}
+
+async function prepareWorkingPsdReconciliation(projectId, filePath, assets, isCurrent) {
+  const project = getProjects().find(item => item.id === projectId);
+  const parent = normalizeTrackedFilePath(filePath);
+  const before = JSON.stringify([project.files, project.pendingFiles || []]);
+  const currentAssets = assets.filter(asset => asset.source === 'psd-embedded');
+  const counts = new Map();
+  for (const asset of currentAssets) {
+    const id = asset.psdResource?.producerId;
+    if (id) counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  const resourceKey = resource => resource?.producerId && resource.producerId.length <= 512
+    ? JSON.stringify([resource.layerPath === null ? 'root' : 'layer', resource.producerId])
+    : JSON.stringify(['saved-bytes', resource?.sourceDigest, resource?.layerPath, resource?.linkedIndex, resource?.originalName]);
+  const associated = [...project.files, ...(project.pendingFiles || [])].filter(row =>
+    row.source === 'psd-embedded' && row.psdResource?.version === 1 && row.psdResource.current !== false &&
+    normalizeTrackedFilePath(row.psdResource.parentPath) === parent);
+  const priorByKey = new Map();
+  const holds = [];
+  for (const row of associated) {
+    const key = resourceKey(row.psdResource);
+    if (priorByKey.has(key)) holds.push({ reason: 'psd-resource-identity-ambiguous', sourcePath: filePath });
+    priorByKey.set(key, row);
+  }
+  // No generic old-row migration: hold only concrete source-associated rows
+  // whose object correspondence is unavailable in this reconciliation.
+  if ([...project.files, ...(project.pendingFiles || [])].some(row =>
+      (row.source === 'psd-embedded' && !row.psdResource &&
+        normalizeTrackedFilePath(row.assetBaselineSourcePath) === parent) ||
+      (isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parent))) {
+    holds.push({ reason: 'legacy-psd-object-association-unverified', sourcePath: filePath });
+  }
+  const items = [];
+  const retainedKeys = new Set();
+  const snapshots = [];
+  for (const old of associated) if (old.psdResource.producerId && currentAssets.some(asset =>
+      asset.psdResource?.producerId === old.psdResource.producerId &&
+      (asset.psdResource.layerPath === null) !== (old.psdResource.layerPath === null))) {
+    holds.push({ reason: 'psd-resource-domain-changed', sourcePath: filePath });
+  }
+  for (const asset of currentAssets) {
+    if (!asset.psdResource || asset.psdResource.sourceDigest !== asset.sourceDigest ||
+        asset.psdResource.outputDigest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+    const resource = { ...asset.psdResource, parentPath: filePath };
+    const key = resourceKey(resource);
+    if (resource.producerId && counts.get(resource.producerId) !== 1) {
+      holds.push({ reason: 'psd-resource-identity-ambiguous', sourcePath: filePath });
+    }
+    retainedKeys.add(key);
+    const previous = priorByKey.get(key);
+    let retained = false;
+    if (previous && previous.psdResource.outputDigest === asset.outputDigest) {
+      const snapshot = await readPsdBaselineSnapshot(previous.path, isCurrent);
+      if (snapshot.digest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+      snapshots.push(snapshot);
+      retained = true;
+    }
+    items.push({ asset, resource, previous, retained, collection: previous && project.files.includes(previous) ? 'files' : 'pendingFiles' });
+  }
+  for (const row of associated) {
+    if (!retainedKeys.has(resourceKey(row.psdResource)) && !row.psdResource.producerId &&
+        currentAssets.some(asset => asset.sourceDigest !== row.psdResource.sourceDigest)) {
+      holds.push({ reason: 'psd-resource-continuity-unverified', sourcePath: filePath });
+    }
+  }
+  // An authoritative empty result removes attributed resources, including
+  // missing-ID rows, without claiming correspondence to a replacement object.
+  const retire = holds.length ? new Set() : new Set(associated.filter(row =>
+    !items.some(item => item.previous === row && item.retained)));
+  const membership = getWorkingSourceMembership(project);
+  const sourceRow = project.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === parent);
+  const sourceKey = getAssetBaselineSourceRecoveryRouteKey(project, sourceRow);
+  const detached = [...retire].filter(row => [...(membership.requiredByPath.get(normalizeTrackedFilePath(row.path))?.sources.keys() || [])]
+    .some(key => key !== sourceKey));
+  for (const row of detached) retire.delete(row);
+  const check = latest => {
+    if (!isCurrent() || JSON.stringify([latest.files, latest.pendingFiles || []]) !== before) {
+      throw new Error('stale_project_operation');
+    }
+    for (const snapshot of snapshots) assertPsdBaselineSnapshot(snapshot);
+  };
+  return { items, check, detached, blocked: holds.length > 0, apply(latest) {
+    check(latest);
+    reconcilePsdEmbeddedMembership(latest, row => retire.has(row));
+    for (const row of detached) row.psdResource = { ...row.psdResource, current: false };
+    if (!holds.length) for (const item of items) if (item.retained) item.previous.psdResource = item.resource;
+    if (holds.length) {
+      const previous = Array.isArray(latest.workingSourceRelationshipHolds) ? latest.workingSourceRelationshipHolds : [];
+      latest.workingSourceRelationshipHolds = [...previous, ...holds].filter((hold, index, all) =>
+        all.findIndex(other => JSON.stringify(other) === JSON.stringify(hold)) === index);
+    }
+  } };
+}
+
 function finishBaselinePsdOutputs(outputs) {
   for (const stage of outputs) {
     if (!stage.committed || stage.accepted || !stage.identity) continue;
@@ -14419,7 +14560,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!isCurrent()) return;
     if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     if (psdTransaction && !await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
-    if (psdAssets.length > 0) {
+    const reconcileWorkingPsd = verificationScan && !!psdTransaction;
+    const workingReconciliation = reconcileWorkingPsd
+      ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, isCurrent) : null;
+    if (psdAssets.length > 0 || workingReconciliation) {
       let acceptance = null;
       if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
         // Another full scan may accept while hashing. Recompare its receipt;
@@ -14445,17 +14589,42 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         // Validate every candidate before mutating any row; mutateProject does
         // not roll back a partially modified project when its callback throws.
         acceptance?.check(proj);
+        workingReconciliation?.apply(proj);
         const acceptedFiles = [];
-        let changed = false;
+        let changed = !!workingReconciliation;
         for (const asset of psdAssets) {
-          if (acceptance?.items.some(item => item.asset === asset && item.previous)) continue;
+          const reconciled = workingReconciliation?.items.find(item => item.asset === asset);
+          if ((reconciled && workingReconciliation.blocked) || reconciled?.retained ||
+              acceptance?.items.some(item => item.asset === asset && item.previous)) continue;
           const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+          if (asset.psdResource) {
+            fileEntry.psdResource = reconciled?.resource || { ...asset.psdResource, parentPath: filePath };
+            // A stable fileId is also the existing asset-exclusion identity.
+            const detachedPrevious = workingReconciliation?.detached.includes(reconciled?.previous);
+            fileEntry.fileId = (!detachedPrevious && reconciled?.previous?.fileId) || crypto.randomUUID();
+            if (reconciled?.previous && (detachedPrevious || !reconciled.previous.fileId) &&
+                (proj.excludedAssetKeys || []).includes(getAssetReviewExclusionKey(reconciled.previous))) {
+              proj.excludedAssetKeys = [...new Set([...proj.excludedAssetKeys, fileEntry.fileId])];
+            }
+            if (reconciled?.previous?.assetOrigin) fileEntry.assetOrigin = reconciled.previous.assetOrigin;
+          }
           let baselineMetadataChanged = false;
           if (baselineScan) {
             fileEntry.assetOrigin = 'existing';
             fileEntry.projectRole = 'asset';
             if (baselineScan.allowPaused) fileEntry.assetBaselineSourcePath = filePath;
             baselineMetadataChanged = markExistingBaselineAssetMetadata(proj, fileEntry);
+          }
+          // A verified replacement inherits that exact accepted/pending row's
+          // authority and exclusion identity. Fresh admission would otherwise
+          // discard an excluded replacement after retiring the old membership.
+          if (reconciled?.previous) {
+            fileEntry.assetOrigin = reconciled.previous.assetOrigin;
+            fileEntry.projectRole = reconciled.previous.projectRole;
+            proj[reconciled.collection].push(fileEntry);
+            if (reconciled.collection === 'files') acceptedFiles.push(fileEntry);
+            changed = true;
+            continue;
           }
           const staged = stageLiveObservedFile(proj, fileEntry, {
             relationshipSourcePath: filePath,
@@ -14677,11 +14846,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
         normalizeTrackedFilePath(entry.parentPsd || entry.path) === normalizeTrackedFilePath(psdFilePath) &&
         !currentEmbeddedKeys.has(getEmbeddedPsdDedupKey(entry))
       );
-      const filesBefore = proj.files.length;
-      const pendingBefore = (proj.pendingFiles || []).length;
-      proj.files = proj.files.filter(entry => !isStaleEmbeddedEntry(entry));
-      proj.pendingFiles = (proj.pendingFiles || []).filter(entry => !isStaleEmbeddedEntry(entry));
-      let changed = proj.files.length !== filesBefore || proj.pendingFiles.length !== pendingBefore;
+      let changed = reconcilePsdEmbeddedMembership(proj, isStaleEmbeddedEntry);
 
       for (const entry of newEntries) {
         const staged = stageLiveObservedFile(proj, entry, {
@@ -18552,7 +18717,7 @@ function getReviewedPackageFolderName(project, packageSettings, now = new Date()
   );
 }
 
-function getPackageSelectionInputSignature(project) {
+function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   if (!project) return null;
   const scopedProject = getIllustratorScopedProjectView(project);
   if (!scopedProject) return null;
@@ -18566,7 +18731,11 @@ function getPackageSelectionInputSignature(project) {
     files: Array.isArray(scopedProject.files) ? scopedProject.files : [],
     assetBaseline: project.assetBaseline || null,
     workingSourceSelections: project.workingSourceSelections ?? null,
-    workingSourceVerification: project.workingSourceVerification ?? null,
+    workingSourceVerification: reviewedSemantics && !hasWorkingSourceSelectionState(project)
+      ? Object.fromEntries(Object.entries(project.workingSourceVerification || {}).map(([key, record]) =>
+        [key, getDormantWorkingSourceReviewFacts(record)]).filter(([, facts]) =>
+          facts.status || facts.requiredReferences.length || facts.unresolved.length).sort(([a], [b]) => a.localeCompare(b)))
+      : project.workingSourceVerification ?? null,
     workingSourceRelationshipHolds: project.workingSourceRelationshipHolds ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],
     watchStartedAt: project.watchStartedAt || null,
@@ -18651,7 +18820,10 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     const finalEntries = files.map(getPackageReviewManifestEntry);
     bindEmbeddedPsdPackageReviewResources(files, finalEntries);
     if (!packageReviewFingerprintsMatch(entries, finalEntries)) continue;
-    const manifestKey = crypto.createHash('sha256').update(JSON.stringify({ entries, plan, inputSignature })).digest('hex');
+    // The full signature above fences asynchronous construction. A settled
+    // dormant scan's private attempt is not a new reviewed package.
+    const reviewedSignature = getPackageSelectionInputSignature(finalProject, true);
+    const manifestKey = crypto.createHash('sha256').update(JSON.stringify({ entries, plan, reviewedSignature })).digest('hex');
     return {
       project: finalProject,
       files,
@@ -18792,7 +18964,8 @@ async function createUnavailablePackageReview(projectId, manifest) {
     semanticCounts: membership.counts,
     materializable: false,
     message: manifest.files.length === 0 ? 'No files are selected for packaging.' :
-      (membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
+      (membership.counts.relationshipHolds > 0 ? 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' :
+        membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
         'Some files are unavailable. Resolve them before packaging.'),
   };
 }
