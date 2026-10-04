@@ -1584,7 +1584,14 @@ function baselineCases() {
         assert.equal(current.assetOrigin, original.assetOrigin); assert.equal(current.projectRole, original.projectRole);
         assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.deepEqual(fs.readFileSync(current.path), replacement.data);
         assert.deepEqual(f.current().workingSourceRelationshipHolds, []); assert.ok(fs.existsSync(original.path));
-        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+        const reconciledReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(reconciledReview.materializable, collection === 'files');
+        if (collection === 'pendingFiles') {
+          assert.equal(reconciledReview.semanticCounts.missingRequiredReferences, 1);
+          await callIpcRaw('projects:accept-pending', f.project.id, current.path);
+          const acceptedReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(acceptedReview.materializable, true); assert.equal(acceptedReview.totalFiles, 2);
+        }
       } finally { f.cleanup(); }
     });
   }
