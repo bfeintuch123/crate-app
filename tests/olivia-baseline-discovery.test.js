@@ -1586,6 +1586,102 @@ function baselineCases() {
     });
   }
 
+  baselineTest('reconciliation completion: indirect parent reference cannot retain removed PSD output', async () => {
+    const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }], [], true);
+    try {
+      const output = JSON.parse(JSON.stringify(f.rows()[0]));
+      const otherPath = path.join(TEST_HOME, 'Desktop', 'Indirect.ai'); fs.writeFileSync(otherPath, `%PDF-1.7\n${f.filePath}\n%%EOF\n`);
+      f.current().files.push({ path: otherPath, name: 'Indirect.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const other = workspace.files.find(file => file.name === 'Indirect.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      await f.save([], [], 2);
+      assert.equal(f.rows().length, 0, 'retirement evaluates obligations after disproving the former PSD edge');
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(review.totalFiles, 2);
+      assert.equal(review.files.some(row => row.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, output)), false);
+      assert.ok(fs.existsSync(output.path)); assert.deepEqual(fs.readFileSync(output.path), embeddedPng);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('reconciliation completion: source rewrite during retained-output hash preserves rows and guards on refusal', async () => {
+    const a = { id: psdId, name: 'A.bin', data: Buffer.from('retained A') };
+    const b = { id: '33333333-3333-4333-8333-333333333333', name: 'B.bin', data: Buffer.from('preserved B') };
+    const f = await workingPsdFixture([a, b]);
+    const originalOpen = fs.promises.open;
+    try {
+      const rowsBefore = JSON.parse(JSON.stringify(f.rows()));
+      const kept = rowsBefore.find(row => row.psdResource.producerId === psdId);
+      const removed = rowsBefore.find(row => row.psdResource.producerId === b.id);
+      f.current().excludedAssetKeys.push(removed.fileId);
+      const exclusions = [...f.current().excludedAssetKeys];
+      const guards = [{ reason: 'psd-resource-domain-changed', sourcePath: f.filePath }];
+      f.current().workingSourceRelationshipHolds = guards;
+      fs.writeFileSync(f.filePath, f.write([a])); fs.utimesSync(f.filePath, 1791100800, 1791100800);
+      const beforeStat = fs.statSync(f.filePath);
+      let changed = false;
+      fs.promises.open = async function rewriteDuringRetainedHash(filePath, ...args) {
+        const handle = await originalOpen.call(fs.promises, filePath, ...args);
+        if (filePath === kept.path && !changed) {
+          const originalRead = handle.read.bind(handle);
+          handle.read = async (...readArgs) => {
+            const result = await originalRead(...readArgs);
+            if (!changed) {
+              changed = true;
+              const bytes = fs.readFileSync(f.filePath); bytes.writeUInt32BE(2, 18);
+              fs.writeFileSync(f.filePath, bytes); fs.utimesSync(f.filePath, beforeStat.atimeMs / 1000, beforeStat.mtimeMs / 1000);
+              const after = fs.statSync(f.filePath);
+              assert.equal(after.size, beforeStat.size); assert.equal(after.mtimeMs, beforeStat.mtimeMs);
+              assert.equal(after.dev, beforeStat.dev); assert.equal(after.ino, beforeStat.ino);
+            }
+            return result;
+          };
+        }
+        return handle;
+      };
+      const result = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+      assert.equal(changed, true, 'source changes after parsed proof while retained bytes are read');
+      assert.equal(result.success, false);
+      assert.deepEqual(f.rows(), rowsBefore, 'refused current bytes cannot retire or update existing membership');
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, guards, 'refusal cannot clear prior guards');
+      assert.deepEqual(f.current().excludedAssetKeys, exclusions);
+      assert.deepEqual(fs.readFileSync(removed.path), b.data);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+    } finally { fs.promises.open = originalOpen; f.cleanup(); }
+  });
+
+  baselineTest('reconciliation completion: detached output keeps a genuine alternate transitive obligation', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try {
+      const formerPath = path.join(TEST_HOME, 'Desktop', 'Former.psd'); fs.writeFileSync(formerPath, 'unused excluded source');
+      const bridgePath = path.join(TEST_HOME, 'Desktop', 'Bridge.ai'); fs.writeFileSync(bridgePath, '%PDF-1.7\n%%EOF\n');
+      const assetPath = path.join(TEST_HOME, 'Desktop', 'Retained.png'); fs.writeFileSync(assetPath, 'retained bytes');
+      const assetId = crypto.randomUUID();
+      f.current().files.push({ path: formerPath, name: 'Former.psd', ext: '.psd', source: 'user-added', projectRole: 'source' },
+        { path: bridgePath, name: 'Bridge.ai', ext: '.ai', source: 'user-added', projectRole: 'source', captureEvidence: { relationshipSourcePath: f.filePath } },
+        { path: assetPath, name: 'Retained.png', ext: '.png', source: 'psd-embedded', projectRole: 'asset', assetOrigin: 'existing', fileId: assetId,
+          assetBaselineSourcePath: formerPath, captureEvidence: { relationshipSourcePath: bridgePath },
+          psdResource: { version: 1, current: false, parentPath: formerPath } });
+      f.current().excludedAssetKeys.push(assetId);
+      const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      for (const name of ['Former.psd', 'Bridge.ai']) {
+        const row = initial.files.find(file => file.name === name);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      }
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const retained = workspace.files.find(file => file.name === 'Retained.png');
+      assert.equal(retained.includedAsDependency, true); assert.deepEqual(retained.requiredBy, [path.basename(f.filePath)]);
+      assert.equal(workspace.workingSourceSelectionBlocked, false); assert.ok(f.current().excludedAssetKeys.includes(assetId));
+      const root = workspace.files.find(file => file.name === path.basename(f.filePath));
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, root.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const excluded = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(excluded.files.find(file => file.name === 'Retained.png').includedAsDependency, false);
+      assert.equal((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(file => file.path === assetPath), false);
+      assert.ok(f.current().excludedAssetKeys.includes(assetId)); assert.equal(fs.readFileSync(assetPath, 'utf8'), 'retained bytes');
+    } finally { clearTrackedTimers(); }
+  });
+
   baselineTest('cycle2: concrete legacy association conflict preserves rows/bytes/exclusions and gives a specific hold', async () => {
     const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }]);
     try {

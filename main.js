@@ -14258,7 +14258,12 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   // missing-ID rows, without claiming correspondence to a replacement object.
   const retire = holds.length ? new Set() : new Set(associated.filter(row =>
     !items.some(item => item.previous === row && item.retained)));
-  const membership = getWorkingSourceMembership(project);
+  // Determine independent retention in the prospective graph, after the
+  // validated save disproves these old producer edges. Another root reaching
+  // the parent PSD must not keep its obsolete output through the old edge.
+  const prospectiveRow = row => retire.has(row) ? { ...row, psdResource: { ...row.psdResource, current: false } } : row;
+  const membership = getWorkingSourceMembership({ ...project,
+    files: project.files.map(prospectiveRow), pendingFiles: (project.pendingFiles || []).map(prospectiveRow) });
   const sourceRow = project.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === parent);
   const sourceKey = getAssetBaselineSourceRecoveryRouteKey(project, sourceRow);
   const detached = [...retire].filter(row => [...(membership.requiredByPath.get(normalizeTrackedFilePath(row.path))?.sources.keys() || [])]
@@ -14469,6 +14474,25 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       return true;
     }
   };
+  // Bind each PSD membership publication after its asynchronous preparation.
+  // Hash the saved bytes, then assert the complete receipt synchronously inside
+  // the writer, including ctime so a same-stat rewrite cannot publish first.
+  const preparePsdPublicationSource = async () => {
+    if (!psdTransaction) return null;
+    const receipt = getWorkingSourceDiskIdentity({ path: filePath });
+    if (!receipt || !sourceIdentity || Object.keys(sourceIdentity).some(key => receipt[key] !== sourceIdentity[key])) {
+      throw new Error('asset_baseline_source_changed');
+    }
+    if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
+    return receipt;
+  };
+  const assertPsdPublicationSource = receipt => {
+    if (!receipt) return;
+    const current = getWorkingSourceDiskIdentity({ path: filePath });
+    if (!current || Object.keys(receipt).some(key => current[key] !== receipt[key])) {
+      throw new Error('asset_baseline_source_changed');
+    }
+  };
   if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
   const inventory = validatedSource?.result?.linkedInventory;
   const scanEvidence = collectWorkingSourceScanEvidence(linkedPaths, { references: inventory?.references || [],
@@ -14507,6 +14531,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const revisedScope = admitIllustratorRelationshipPathsForProject(projectId, filePath, validPaths);
     if (operation && revisedScope && !operation.adoptScope(revisedScope)) return;
     if (!isCurrent()) return;
+    const linkedSourceReceipt = psdTransaction ? await preparePsdPublicationSource() : null;
 
     const result = mutateProject(projectId, (proj) => {
       if (
@@ -14514,6 +14539,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         !isCurrent() ||
         !isAcceptedProjectFilePath(proj, filePath)
       ) return null;
+      assertPsdPublicationSource(linkedSourceReceipt);
       // v2.4.0: normalize paths before comparing to prevent duplicates
       const acceptedFiles = [];
       let changed = false;
@@ -14618,6 +14644,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           if (acceptance.selectionCurrent()) break;
         }
       }
+      const psdSourceReceipt = psdTransaction ? await preparePsdPublicationSource() : null;
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -14633,6 +14660,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
         // Validate every candidate before mutating any row; mutateProject does
         // not roll back a partially modified project when its callback throws.
+        assertPsdPublicationSource(psdSourceReceipt);
         acceptance?.check(proj);
         workingReconciliation?.apply(proj);
         const acceptedFiles = [];
