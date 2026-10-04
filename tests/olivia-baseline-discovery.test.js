@@ -1304,7 +1304,7 @@ function baselineCases() {
 
   const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
   const psdId = '22222222-2222-4222-8222-222222222222';
-  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false, engageProducer = true) {
+  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false, engageProducer = true, retrySibling = false) {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
     const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
     const f = viaAddFiles ? await (async () => {
@@ -1328,8 +1328,10 @@ function baselineCases() {
     os.tmpdir = () => privateTmp;
     currentPsdFixture = 'actual-source-buffer';
     const restoreAdmission = forcePending ? metadataTestHooks.forceWorkingPsdPendingAdmission() : () => {};
+    const retrySiblingPath = retrySibling ? path.join(TEST_HOME, 'Desktop', 'Retry-sibling.psd') : null;
+    if (retrySiblingPath) fs.writeFileSync(retrySiblingPath, 'invalid PSD sibling');
     if (viaAddFiles) {
-      manualDialogFor([f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
+      manualDialogFor(retrySiblingPath ? [f.filePath, retrySiblingPath] : [f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
       if (f.current().assetBaseline.status === 'decision-required' && !(forcePending && !engageProducer)) {
         await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
       }
@@ -1342,7 +1344,7 @@ function baselineCases() {
       assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
         { action: 'restore', expectedRevision: 1 })).verificationStatus, 'scanned');
     }
-    return { ...f, rows, write, source, privateTmp, actual,
+    return { ...f, rows, write, source, privateTmp, actual, retrySiblingPath,
       async save(linkedFiles, children = [], width = 1) {
         fs.writeFileSync(f.filePath, write(linkedFiles, children, width));
         const result = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
@@ -1893,6 +1895,47 @@ function baselineCases() {
           const recovered = await callIpcRaw('projects:prepare-package-review', f.project.id);
           assert.equal(recovered.materializable, true); assert.equal(recovered.totalFiles, 2);
         }
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const pending of [false, true]) {
+    baselineTest(`baseline output reuse: ${domain} ${pending ? 'pending' : 'accepted'} partial scan retry keeps exact borrowed output obligation`, async () => {
+      const object = { id: psdId, name: 'Borrowed.png', data: embeddedPng };
+      const f = await workingPsdFixture(domain === 'root' ? [object] : [],
+        domain === 'layer' ? [{ name: 'borrowed layer', linkedFiles: [object] }] : [], true, pending, false, true);
+      try {
+        assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
+        const original = JSON.parse(JSON.stringify(f.rows()[0]));
+        assert.ok(original);
+        assert.equal((f.current().pendingFiles || []).some(row => row.fileId === original.fileId), pending);
+        fs.writeFileSync(f.retrySiblingPath, f.write([], []));
+        manualDialogFor([f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
+        assert.equal(f.current().assetBaseline.status, 'decision-required');
+        assert.equal(f.rows().length, 1, 'successful source retry borrows rather than readmits the output');
+        assert.equal(f.rows()[0].path, original.path); assert.equal(f.rows()[0].fileId, original.fileId);
+        assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
+        await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const other = workspace.files.find(row => row.name === path.basename(f.retrySiblingPath));
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity,
+          { action: 'exclude', expectedRevision: 0 });
+        const assertReady = async () => {
+          const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(review.materializable, true, 'retained physical output satisfies its validated receipt after retry');
+          assert.equal(review.totalFiles, 2); assert.equal(review.semanticCounts.missingRequiredReferences, 0);
+        };
+        await assertReady();
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        await assertReady();
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(),
+          f.current().files.find(row => row.path === f.filePath));
+        assert.equal(f.current().workingSourceVerification[key].requiredEmbeddedOutputs[0].path, original.path);
+        const altered = Buffer.from(embeddedPng); altered[altered.length - 1] ^= 1;
+        fs.writeFileSync(original.path, altered);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false,
+          'reused receipt still binds the retained output bytes');
+        fs.writeFileSync(original.path, embeddedPng); await assertReady();
       } finally { f.cleanup(); }
     });
   }

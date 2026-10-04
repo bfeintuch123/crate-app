@@ -14720,7 +14720,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         const outputs = psdAssets.filter(asset => asset.source === 'psd-embedded').map(asset => {
           const item = reconciliationByAsset.get(asset);
           const baseline = acceptanceByAsset.get(asset);
-          return { path: item?.retained ? item.previous.path : baseline?.previous?.path || asset.filePath,
+          return { path: item?.retained ? item.previous.path : baseline?.previous?.output.path || asset.filePath,
             sourceDigest: sourceFingerprint, outputDigest: asset.outputDigest };
         });
         const bounded = collectWorkingSourceScanEvidence(outputs.map(output => output.path));
