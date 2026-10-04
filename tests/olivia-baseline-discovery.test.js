@@ -1712,6 +1712,114 @@ function baselineCases() {
     });
   }
 
+  for (const state of ['excluded', 'invalid']) {
+    baselineTest(`independent root boundary: ${state} intent is handled without guessing a selected root`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const bytes = actual.writePsdBuffer({ width: 1, height: 1 });
+      const f = await workingPsdFixture([{ id: psdId, name: 'Boundary.psd', data: bytes }]);
+      try {
+        const child = JSON.parse(JSON.stringify(f.rows()[0]));
+        manualDialogFor([child.path]); await callIpcRaw('projects:add-files', f.project.id);
+        const identity = metadataTestHooks.createProjectFileVisualIdentity(f.project.id, child);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, identity, { action: 'exclude', expectedRevision: 0 });
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), child);
+        if (state === 'invalid') {
+          await callIpcRaw('projects:set-working-source-selection', f.project.id, identity, { action: 'restore', expectedRevision: 1 });
+          // Fault-injected persisted intent, not a valid IPC user action.
+          f.current().workingSourceSelections[key] = { state: 'malformed', reason: null, revision: 2 };
+        }
+        const selection = JSON.parse(JSON.stringify(f.current().workingSourceSelections[key]));
+        await f.save([], [], 2);
+        const kept = f.current().files.find(row => row.fileId === child.fileId);
+        assert.deepEqual(f.current().workingSourceSelections[key], selection); assert.deepEqual(fs.readFileSync(child.path), bytes);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        if (state === 'excluded') {
+          assert.equal(kept, undefined, 'a source excluded independently and not required elsewhere can retire');
+          assert.equal(review.materializable, true); assert.equal(review.totalFiles, 1);
+        } else {
+          assert.ok(kept, 'malformed durable intent is held and never silently erased');
+          assert.equal(kept.psdResource.current, false);
+          const row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.visualIdentity === identity);
+          assert.equal(row.sourceSelection, 'invalid'); assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+        }
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const change of ['remove', 'replace']) {
+    baselineTest(`independent root: ${domain} ${change} retains separately added restored child and its excluded required asset`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      // The linked asset path must be in the actual current synthetic home.
+      const f = await workingPsdFixture([]);
+      try {
+        const requiredPath = path.join(TEST_HOME, 'Desktop', 'Child-required.png'); fs.writeFileSync(requiredPath, embeddedPng);
+        const childBytes = width => actual.writePsdBuffer({ width, height: 1, linkedFiles: [{
+          id: '99999999-9999-4999-8999-999999999999', name: 'Child-required.png', childDocumentID: '',
+          linkedFile: { fileSize: embeddedPng.length, name: 'Child-required.png', fullPath: requiredPath,
+            originalPath: '', relativePath: '' },
+        }] });
+        const object = { id: psdId, name: 'Independent.psd', data: childBytes(1) };
+        const linked = value => domain === 'root' ? [value] : [];
+        const children = value => domain === 'layer' ? [{ name: 'independent layer', linkedFiles: [value] }] : [];
+        await f.save(linked(object), children(object), 2);
+        const child = JSON.parse(JSON.stringify(f.rows()[0]));
+        manualDialogFor([child.path]); await callIpcRaw('projects:add-files', f.project.id);
+        let workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        let childPresentation = workspace.files.find(row => row.visualIdentity ===
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, child));
+        assert.equal(childPresentation.sourceSelection, 'selected');
+        assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, childPresentation.visualIdentity,
+          { action: 'exclude', expectedRevision: 0 })).success, true);
+        assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, childPresentation.visualIdentity,
+          { action: 'restore', expectedRevision: 1 })).verificationStatus, 'scanned');
+        const required = f.current().files.find(row => row.path === requiredPath); assert.ok(required);
+        await callIpcRaw('projects:remove-file', f.project.id,
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, required));
+        assert.ok(f.current().excludedAssetKeys.includes(required.fileId || required.path));
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), child);
+        const selection = JSON.parse(JSON.stringify(f.current().workingSourceSelections[key]));
+        const verification = JSON.parse(JSON.stringify(f.current().workingSourceVerification[key]));
+        const authority = JSON.parse(JSON.stringify(f.current().files.find(row => row.fileId === child.fileId).explicitUserAuthority));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).totalFiles, 3);
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        const replacement = { ...object, data: childBytes(2) };
+        await f.save(change === 'remove' ? [] : linked(replacement), change === 'remove' ? [] : children(replacement), 3);
+        const kept = f.current().files.find(row => row.fileId === child.fileId);
+        assert.ok(kept, 'independently selected source must survive retirement of its former producer relationship');
+        assert.equal(kept.path, child.path); assert.equal(kept.psdResource.current, false);
+        assert.deepEqual(fs.readFileSync(kept.path), object.data); assert.deepEqual(kept.explicitUserAuthority, authority);
+        assert.deepEqual(f.current().workingSourceSelections[key], selection);
+        assert.deepEqual(f.current().workingSourceVerification[key], verification);
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        childPresentation = workspace.files.find(row => row.visualIdentity ===
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, kept));
+        assert.equal(childPresentation.sourceSelection, 'selected'); assert.equal(childPresentation.effectiveRole, 'source');
+        assert.equal(childPresentation.includedAsDependency, false); assert.deepEqual(childPresentation.requiredBy, []);
+        const asset = workspace.files.find(row => row.visualIdentity ===
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, required));
+        assert.equal(asset.includedAsDependency, true); assert.deepEqual(asset.requiredBy, [path.basename(child.path)]);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(review.materializable, true); assert.equal(review.semanticCounts.selectedWorkingSources, 2);
+        assert.equal(review.totalFiles, change === 'remove' ? 3 : 4);
+        assert.equal(review.files.some(row => row.visualIdentity === asset.visualIdentity), true);
+        if (change === 'replace') {
+          const current = f.rows().find(row => row.psdResource.current !== false && row.psdResource.parentPath === f.filePath);
+          assert.ok(current); assert.notEqual(current.path, kept.path); assert.notEqual(current.fileId, kept.fileId);
+          assert.deepEqual(fs.readFileSync(current.path), replacement.data);
+        }
+        fs.unlinkSync(requiredPath);
+        const missing = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(missing.materializable, false); assert.equal(missing.semanticCounts.missingRequiredReferences, 1);
+        fs.writeFileSync(requiredPath, embeddedPng);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, childPresentation.visualIdentity,
+          { action: 'exclude', expectedRevision: 2 });
+        const excluded = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(excluded.materializable, true); assert.equal(excluded.semanticCounts.selectedWorkingSources, 1);
+        assert.equal(excluded.totalFiles, change === 'remove' ? 1 : 2);
+      } finally { f.cleanup(); }
+    });
+  }
+
   for (const domain of ['root', 'layer']) {
     baselineTest(`output closure bytes: ${domain} source-bound receipt refuses altered physical output and recovers exact bytes`, async () => {
       const object = { id: psdId, name: 'Bound.png', data: embeddedPng };

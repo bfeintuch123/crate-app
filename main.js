@@ -14324,8 +14324,13 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   } } : project.workingSourceVerification;
   const membership = getWorkingSourceMembership({ ...project, workingSourceVerification: prospectiveVerification,
     files: project.files.map(prospectiveRow), pendingFiles: (project.pendingFiles || []).map(prospectiveRow) });
-  const detached = [...retire].filter(row => [...(membership.requiredByPath.get(normalizeTrackedFilePath(row.path))?.sources.keys() || [])]
-    .some(key => key !== sourceKey));
+  const detached = [...retire].filter(row =>
+    // Root self-membership is deliberately absent from requiredByPath. Keep
+    // accepted independent selected/invalid intent and its outgoing closure.
+    (rowReceipts.get(row)?.collection === 'files' && isWorkingSourceFile(row) &&
+      getWorkingSourceSelection(project, row).state !== 'excluded') ||
+    [...(membership.requiredByPath.get(normalizeTrackedFilePath(row.path))?.sources.keys() || [])]
+      .some(key => key !== sourceKey));
   for (const row of detached) retire.delete(row);
   const check = latest => {
     if (!isCurrent() || JSON.stringify([latest.files, latest.pendingFiles || []]) !== before ||
