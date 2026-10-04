@@ -1586,6 +1586,119 @@ function baselineCases() {
     });
   }
 
+  for (const kind of ['replacement-files', 'replacement-pending', 'fresh']) {
+    for (const timing of ['before-output-hash', 'after-output-hash']) {
+      baselineTest(`publication receipts: ${kind} rejects ${timing} byte rewrite`, async () => {
+        const old = { id: psdId, name: 'Owned.bin', data: Buffer.from('old output bytes') };
+        const replacement = { ...old, data: Buffer.from('new output bytes') };
+        const f = await workingPsdFixture(kind === 'fresh' ? [] : [old]);
+        const originalOpen = fs.promises.open;
+        try {
+          const original = f.rows()[0];
+          if (kind === 'replacement-pending') {
+            f.current().files = f.current().files.filter(row => row.fileId !== original.fileId);
+            f.current().pendingFiles = [...(f.current().pendingFiles || []), original];
+          }
+          if (original) f.current().excludedAssetKeys.push(original.fileId);
+          const rowsBefore = JSON.parse(JSON.stringify(f.rows()));
+          const exclusions = [...f.current().excludedAssetKeys];
+          const guards = [{ reason: 'psd-resource-domain-changed', sourcePath: f.filePath }];
+          f.current().workingSourceRelationshipHolds = guards;
+          const previousPaths = new Set(rowsBefore.map(row => row.path));
+          const directory = path.join(f.privateTmp, 'crate-psd-extract-' + f.project.id);
+          let hashed = false, changed = false, rewrittenPath = null;
+          fs.promises.open = async function rewritePromotedOutput(filePath, ...args) {
+            const handle = await originalOpen.call(fs.promises, filePath, ...args);
+            if (filePath !== f.filePath && path.dirname(filePath) === directory &&
+                !path.basename(filePath).startsWith('.') && !previousPaths.has(filePath)) {
+              const read = handle.read.bind(handle);
+              handle.read = async (...readArgs) => { const result = await read(...readArgs); hashed = true; return result; };
+            }
+            if (filePath === f.filePath && !changed && (timing === 'before-output-hash' || hashed) && fs.existsSync(directory)) {
+              const candidate = fs.readdirSync(directory).map(name => path.join(directory, name))
+                .find(candidate => !path.basename(candidate).startsWith('.') && !previousPaths.has(candidate));
+              if (candidate) {
+                const before = fs.statSync(candidate);
+                const bytes = fs.readFileSync(candidate); bytes[0] ^= 0xff;
+                fs.writeFileSync(candidate, bytes); fs.utimesSync(candidate, before.atimeMs / 1000, before.mtimeMs / 1000);
+                const after = fs.statSync(candidate);
+                assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino); assert.equal(after.size, before.size);
+                changed = true; rewrittenPath = candidate;
+              }
+            }
+            return handle;
+          };
+          fs.writeFileSync(f.filePath, f.write([replacement], [], 2));
+          const result = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+          assert.equal(changed, true, 'promoted output changes during later asynchronous source preparation');
+          assert.equal(result.success, false, 'unverified output cannot authorize reconciliation');
+          assert.deepEqual(f.rows(), rowsBefore);
+          assert.deepEqual(f.current().excludedAssetKeys, exclusions);
+          assert.deepEqual(f.current().workingSourceRelationshipHolds, guards);
+          if (original) assert.deepEqual(fs.readFileSync(original.path), old.data);
+          assert.equal(fs.existsSync(rewrittenPath), false, 'refused transaction cleans only its own unaccepted output');
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+        } finally { fs.promises.open = originalOpen; f.cleanup(); }
+      });
+    }
+  }
+
+
+  for (const kind of ['restore', 'baseline']) for (const movement of ['changed-size', 'same-size']) {
+    baselineTest(`publication receipts: ${kind} rejects ${movement} linked source rewrite after access`, async () => {
+      const f = await correctionProject('.ai');
+      const linked = path.join(TEST_HOME, 'Desktop', 'Late-linked.png'); fs.writeFileSync(linked, 'synthetic linked asset');
+      fs.writeFileSync(f.filePath, `%PDF-1.7\n${linked}\n%%EOF\n`); fs.utimesSync(f.filePath, 1791100800, 1791100800);
+      const keptPath = path.join(TEST_HOME, 'Desktop', 'Existing.png'); fs.writeFileSync(keptPath, 'preserved old asset');
+      const kept = { path: keptPath, name: 'Existing.png', ext: '.png', source: 'user-added', projectRole: 'asset', fileId: crypto.randomUUID() };
+      f.current().files.push(kept); f.current().excludedAssetKeys.push(kept.fileId);
+      let source;
+      if (kind === 'baseline') f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan' };
+      else {
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        source = workspace.files.find(row => row.name === path.basename(f.filePath));
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      }
+      const preserved = JSON.parse(JSON.stringify(f.current().files.find(row => row.path === keptPath)));
+      const exclusions = [...f.current().excludedAssetKeys];
+      const originalAccess = fs.promises.access;
+      let changed = false;
+      fs.promises.access = async function rewriteAfterLinkedAccess(filePath, ...args) {
+        const result = await originalAccess.call(fs.promises, filePath, ...args);
+        if (filePath === linked && !changed) {
+          changed = true;
+          const before = fs.statSync(f.filePath);
+          if (movement === 'same-size') {
+            fs.writeFileSync(f.filePath, fs.readFileSync(f.filePath, 'utf8').replace(linked, ' '.repeat(linked.length)));
+            fs.utimesSync(f.filePath, before.atimeMs / 1000, before.mtimeMs / 1000);
+            const after = fs.statSync(f.filePath);
+            assert.equal(after.size, before.size); assert.equal(after.mtimeMs, before.mtimeMs);
+            assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino);
+          } else fs.writeFileSync(f.filePath, '%PDF-1.7\n%%EOF\n');
+        }
+        return result;
+      };
+      try {
+        const result = kind === 'restore'
+          ? await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 })
+          : await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+        assert.equal(changed, true);
+        if (kind === 'restore') assert.equal(result.verificationStatus, 'failed');
+        else assert.equal(result.success, false);
+        assert.equal([...f.current().files, ...(f.current().pendingFiles || [])].some(row => row.path === linked), false,
+          'refused previous-byte links cannot persist as surplus package members');
+        assert.deepEqual(f.current().files.find(row => row.path === keptPath), preserved);
+        assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.equal(fs.readFileSync(keptPath, 'utf8'), 'preserved old asset');
+        assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+        if (kind === 'restore') assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+        fs.promises.access = originalAccess;
+        const recovery = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+        assert.equal(recovery.success, true); assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'scanned');
+        assert.equal((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.path === linked), false);
+      } finally { fs.promises.access = originalAccess; clearTrackedTimers(); }
+    });
+  }
+
   baselineTest('reconciliation completion: indirect parent reference cannot retain removed PSD output', async () => {
     const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }], [], true);
     try {

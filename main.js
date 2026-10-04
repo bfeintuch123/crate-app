@@ -14232,6 +14232,13 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   for (const asset of currentAssets) {
     if (!asset.psdResource || asset.psdResource.sourceDigest !== asset.sourceDigest ||
         asset.psdResource.outputDigest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+    // Every current output participates in authoritative reconciliation,
+    // including fresh and replacement rows on establishBaseline:false saves.
+    // Bind actual bytes now and assert the receipt in the canonical writer.
+    const directory = captureCacheDirectoryIdentity(path.dirname(asset.filePath), 'psd-extract-directory');
+    const output = await readPsdBaselineSnapshot(asset.filePath, isCurrent, directory);
+    if (output.digest !== asset.outputDigest) throw new Error('asset_baseline_psd_output_changed');
+    snapshots.push(output);
     const resource = { ...asset.psdResource, parentPath: filePath };
     const key = resourceKey(resource);
     if (resource.producerId && counts.get(resource.producerId) !== 1) {
@@ -14474,11 +14481,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       return true;
     }
   };
-  // Bind each PSD membership publication after its asynchronous preparation.
+  // Bind strict saved-byte membership publication after async preparation.
   // Hash the saved bytes, then assert the complete receipt synchronously inside
   // the writer, including ctime so a same-stat rewrite cannot publish first.
-  const preparePsdPublicationSource = async () => {
-    if (!psdTransaction) return null;
+  const prepareScanPublicationSource = async () => {
     const receipt = getWorkingSourceDiskIdentity({ path: filePath });
     if (!receipt || !sourceIdentity || Object.keys(sourceIdentity).some(key => receipt[key] !== sourceIdentity[key])) {
       throw new Error('asset_baseline_source_changed');
@@ -14486,7 +14492,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     return receipt;
   };
-  const assertPsdPublicationSource = receipt => {
+  const assertScanPublicationSource = receipt => {
     if (!receipt) return;
     const current = getWorkingSourceDiskIdentity({ path: filePath });
     if (!current || Object.keys(receipt).some(key => current[key] !== receipt[key])) {
@@ -14528,10 +14534,11 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   } else {
     console.log(`[crate] scan-on-open: found ${validPaths.length} linked assets in ${path.basename(filePath)}`);
 
+    const linkedSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
+    assertScanPublicationSource(linkedSourceReceipt);
     const revisedScope = admitIllustratorRelationshipPathsForProject(projectId, filePath, validPaths);
     if (operation && revisedScope && !operation.adoptScope(revisedScope)) return;
     if (!isCurrent()) return;
-    const linkedSourceReceipt = psdTransaction ? await preparePsdPublicationSource() : null;
 
     const result = mutateProject(projectId, (proj) => {
       if (
@@ -14539,7 +14546,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         !isCurrent() ||
         !isAcceptedProjectFilePath(proj, filePath)
       ) return null;
-      assertPsdPublicationSource(linkedSourceReceipt);
+      assertScanPublicationSource(linkedSourceReceipt);
       // v2.4.0: normalize paths before comparing to prevent duplicates
       const acceptedFiles = [];
       let changed = false;
@@ -14644,7 +14651,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           if (acceptance.selectionCurrent()) break;
         }
       }
-      const psdSourceReceipt = psdTransaction ? await preparePsdPublicationSource() : null;
+      const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -14660,7 +14667,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
         // Validate every candidate before mutating any row; mutateProject does
         // not roll back a partially modified project when its callback throws.
-        assertPsdPublicationSource(psdSourceReceipt);
+        assertScanPublicationSource(psdSourceReceipt);
         acceptance?.check(proj);
         workingReconciliation?.apply(proj);
         const acceptedFiles = [];
