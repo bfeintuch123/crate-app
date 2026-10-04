@@ -1590,7 +1590,10 @@ function baselineCases() {
           assert.equal(reconciledReview.semanticCounts.missingRequiredReferences, 1);
           await callIpcRaw('projects:accept-pending', f.project.id, current.path);
           const acceptedReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
-          assert.equal(acceptedReview.materializable, true); assert.equal(acceptedReview.totalFiles, 2);
+          assert.equal(acceptedReview.materializable, true);
+          assert.equal(acceptedReview.totalFiles, carrier === 'external' ? 3 : 2);
+          assert.equal(acceptedReview.files.some(row => row.visualIdentity ===
+            metadataTestHooks.createProjectFileVisualIdentity(f.project.id, current)), true);
         }
       } finally { f.cleanup(); }
     });
