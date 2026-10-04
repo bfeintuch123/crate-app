@@ -3540,6 +3540,369 @@ function getAssetBaselineSourceRecoveryRouteKey(project, file) {
     .digest('hex');
 }
 
+// Working-source intent is separate from asset selection and survives absent rows.
+// This slice does not infer document continuity from names, dates, or coexistence.
+function getWorkingSourceSelection(project, file) {
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  const records = project?.workingSourceSelections;
+  if (records === undefined) return { state: 'selected', reason: null, revision: 0 };
+  if (!records || typeof records !== 'object' || Array.isArray(records)) {
+    return { state: 'invalid', reason: null, revision: 0 };
+  }
+  if (!key || !Object.prototype.hasOwnProperty.call(records, key)) {
+    return { state: 'selected', reason: null, revision: 0 };
+  }
+  const record = records[key];
+  if (!record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
+      !((record.state === 'excluded' && record.reason === 'user-excluded') ||
+        (record.state === 'selected' && record.reason === null))) {
+    return { state: 'invalid', reason: null, revision: 0 };
+  }
+  return { state: record.state, reason: record.reason, revision: record.revision };
+}
+
+function hasWorkingSourceSelectionState(project) {
+  return Object.prototype.hasOwnProperty.call(project || {}, 'workingSourceSelections');
+}
+
+function isWorkingSourceFile(file) {
+  return isProjectAssetBaselineSource(file) || file?.projectRole === 'source';
+}
+
+function getWorkingSourceDiskIdentity(file) {
+  try {
+    const stat = fs.statSync(file.path);
+    if (!stat.isFile()) return null;
+    return { ...getAddFilesSourceIdentity(stat), ctimeMs: stat.ctimeMs };
+  } catch (_) { return null; }
+}
+
+function isWorkingSourceDiskIdentityCurrent(file, record) {
+  const identity = getWorkingSourceDiskIdentity(file);
+  return !!identity && !!record.sourceIdentity && Object.keys(identity)
+    .every(key => identity[key] === record.sourceIdentity[key]);
+}
+
+function getWorkingSourceVerification(project, file) {
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  const record = project?.workingSourceVerification?.[key];
+  const selection = getWorkingSourceSelection(project, file);
+  if (!record || record.selectionRevision !== selection.revision) return null;
+  if (!['scanned', 'pending', 'failed', 'limited', 'incomplete', 'unavailable', 'stale', 'no-extractor'].includes(record.status) ||
+      typeof record.attempt !== 'string' || record.attempt.length > 64 ||
+      !Array.isArray(record.requiredReferences) || record.requiredReferences.length > 8192 ||
+      !record.requiredReferences.every(ref => ref && typeof ref.path === 'string' &&
+        path.isAbsolute(ref.path) && ref.path.length <= 16384) ||
+      !Array.isArray(record.unresolved) || record.unresolved.length > 128 ||
+      !record.unresolved.every(item => item && typeof item.reason === 'string' && item.reason.length <= 128) ||
+      record.inventoryStatus === 'complete' ||
+      (['scanned', 'no-extractor'].includes(record.status) &&
+        (!/^[a-f0-9]{64}$/.test(record.sourceFingerprint || '') || !record.sourceIdentity ||
+          !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return null;
+  // "scanned" proves ordinary-route parity on these bytes, never exhaustive
+  // inventory certification. No provider can publish a "complete" verdict.
+  return record;
+}
+
+function getWorkingSourceMembership(project) {
+  const files = deduplicateFiles(getIllustratorScopedProjectView(project)?.files || []);
+  const engaged = hasWorkingSourceSelectionState(project);
+  const sources = files.filter(isWorkingSourceFile);
+  const byPath = new Map(files.map(file => [normalizeTrackedFilePath(file.path), file]));
+  const requiredByPath = new Map();
+  const edges = new Map();
+  function edge(sourcePath, resourcePath) {
+    const source = normalizeTrackedFilePath(sourcePath), target = normalizeTrackedFilePath(resourcePath);
+    if (!source || !target || source === target) return;
+    const links = edges.get(source) || new Map(); links.set(target, resourcePath); edges.set(source, links);
+  }
+  for (const file of files) {
+    for (const ref of getWorkingSourceVerification(project, file)?.requiredReferences || []) edge(file.path, ref.path);
+    const evidence = file.captureEvidence || {};
+    edge(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath, file.path);
+  }
+  // Traverse from selected working roots, retaining source-as-asset roles and
+  // all known transitive obligations. Cycles do not resurrect excluded roots.
+  for (const root of sources.filter(file => getWorkingSourceSelection(project, file).state !== 'excluded')) {
+    const rootKey = normalizeTrackedFilePath(root.path), visited = new Set([rootKey]), queue = [rootKey];
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target, rawPath] of edges.get(queue[index]) || []) {
+        if (target !== rootKey) {
+          const entry = requiredByPath.get(target) || { path: rawPath, sources: new Map() };
+          entry.sources.set(getAssetBaselineSourceRecoveryRouteKey(project, root), root); requiredByPath.set(target, entry);
+        }
+        if (!visited.has(target)) { visited.add(target); queue.push(target); }
+      }
+    }
+  }
+  const facts = new Map();
+  const counts = { selectedWorkingSources: 0, excludedWorkingSources: 0, invalidWorkingSources: 0, includedAssets: 0,
+    excludedAssets: 0, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 };
+  for (const file of files) {
+    const source = isWorkingSourceFile(file), selection = source ? getWorkingSourceSelection(project, file) : null;
+    const requiredBy = [...(requiredByPath.get(normalizeTrackedFilePath(file.path))?.sources.values() || [])];
+    const selectedSource = source && selection.state === 'selected';
+    const includedAsDependency = engaged && requiredBy.length > 0;
+    const included = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
+    const verification = getWorkingSourceVerification(project, file);
+    const persistedVerification = project.workingSourceVerification?.[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+    // An untouched root with no concrete scan obligation keeps legacy readiness.
+    // Known scan results and required roles consume their actual obligations,
+    // never an invented demand for exhaustive inventory certification.
+    const unscannedExcludedRole = verification?.status === 'unavailable' && verification.reason === 'not-scanned' &&
+      !verification.sourceFingerprint && verification.requiredReferences.length === 0 && verification.unresolved.length === 0;
+    const verificationRequired = engaged && included && ((selectedSource && (selection.revision > 0 ||
+      (!!persistedVerification && !unscannedExcludedRole))) ||
+      (includedAsDependency && !!persistedVerification && !unscannedExcludedRole));
+    let verificationStatus = selection?.state === 'invalid' ? 'invalid' : verification?.status || 'unavailable';
+    if (verificationRequired && ['scanned', 'no-extractor'].includes(verification?.status) && !isWorkingSourceDiskIdentityCurrent(file, verification)) verificationStatus = 'stale';
+    const unresolved = selection?.state === 'invalid' || (verificationRequired &&
+      (!verification || !['scanned', 'no-extractor'].includes(verificationStatus) || verification.unresolved.length > 0));
+    facts.set(getTrackedFileDedupKey(file), { sourceSelection: selection?.state || null, selectionReason: selection?.reason || null,
+      selectionRevision: selection?.revision ?? null, includedAsDependency, included,
+      effectiveRole: selectedSource ? 'source' : 'asset', verificationStatus, verificationRequired,
+      requiredBy: requiredBy.map(item => sanitizeRendererSourceName(item.name || path.basename(item.path)) || 'Working file') });
+    if (source) {
+      if (selection.state === 'excluded') counts.excludedWorkingSources++;
+      else if (selection.state === 'selected') counts.selectedWorkingSources++;
+      else counts.invalidWorkingSources++;
+    }
+    if (unresolved) counts.unresolvedVerification++;
+    if (!selectedSource) {
+      if (included) counts.includedAssets++;
+      else if (!source) counts.excludedAssets++;
+    }
+  }
+  for (const [key, obligation] of requiredByPath) {
+    if (!byPath.has(key) || !fs.existsSync(obligation.path)) counts.missingRequiredReferences++;
+  }
+  if (project?.workingSourceRelationshipHolds !== undefined) {
+    counts.relationshipHolds = Array.isArray(project.workingSourceRelationshipHolds) ? project.workingSourceRelationshipHolds.length : 1;
+  }
+  const records = project?.workingSourceSelections;
+  const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
+    !/^[a-f0-9]{64}$/.test(key) || !record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
+    !((record.state === 'excluded' && record.reason === 'user-excluded') || (record.state === 'selected' && record.reason === null))));
+  return { facts, counts, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
+    (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
+}
+
+const workingSourceScanLeases = new Map();
+
+function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null) {
+  const project = getProjects().find(item => item.id === projectId);
+  const file = project?.files?.find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  if (!file || !parentCurrent()) return null;
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file), selection = getWorkingSourceSelection(project, file);
+  const previous = getWorkingSourceVerification(project, file);
+  if (selection.state === 'invalid' || (selection.state === 'excluded' &&
+    !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency)) return null;
+  if (attempt && previous?.attempt !== attempt) return null;
+  attempt ||= crypto.randomUUID();
+  const current = () => {
+    if (!parentCurrent()) return false;
+    const latest = getProjects().find(item => item.id === projectId);
+    const row = latest?.files?.find(item => getAssetBaselineSourceRecoveryRouteKey(latest, item) === key);
+    return !!row && getWorkingSourceSelection(latest, row).revision === selection.revision &&
+      latest.workingSourceVerification?.[key]?.attempt === attempt;
+  };
+  mutateProject(projectId, latest => {
+    if (!parentCurrent()) return false;
+    latest.workingSourceVerification = { ...(latest.workingSourceVerification || {}), [key]: {
+      ...previous, status: 'pending', selectionRevision: selection.revision, attempt,
+      provider: 'ordinary-scan', coverage: 'ordinary-route', version: 1, reason: 'scan-pending', inventoryStatus: 'unverified',
+      requiredReferences: previous?.requiredReferences || [], unresolved: previous?.unresolved || [],
+      sourceFingerprint: previous?.sourceFingerprint || null, sourceIdentity: previous?.sourceIdentity || null,
+    } };
+    return true;
+  });
+  invalidatePackageReviewForProject(projectId);
+  return { projectId, key, attempt, selectionRevision: selection.revision, file, current };
+}
+
+function collectWorkingSourceScanEvidence(paths, inventory = null) {
+  const required = new Map(), unresolved = [], notes = ['required-reference-domain-unverified'];
+  let units = 0, limited = false;
+  const issue = reason => { if (unresolved.length < 128) unresolved.push({ reason }); else limited = true; };
+  const add = resourcePath => {
+    if (typeof resourcePath !== 'string' || !resourcePath || !path.isAbsolute(resourcePath)) { issue('unresolved-declared-reference'); return; }
+    if (resourcePath.length > 16384 || required.size >= 8192 || units + resourcePath.length > 4 * 1024 * 1024) { limited = true; return; }
+    const key = normalizeTrackedFilePath(resourcePath);
+    if (!required.has(key)) { required.set(key, { path: resourcePath }); units += resourcePath.length; }
+  };
+  for (const resourcePath of paths || []) add(resourcePath);
+  for (const ref of inventory?.references || []) {
+    const raw = ref.rawPaths;
+    // Preserve obligations even if the ordinary admission filter rejects them.
+    if (raw?.fullPath) add(raw.fullPath);
+    else issue('unresolved-declared-reference');
+  }
+  for (const item of inventory?.unresolved || []) issue(typeof item?.reason === 'string' ? item.reason : 'unsupported-dependency-form');
+  if (limited) {
+    if (unresolved.length === 128) unresolved.pop();
+    unresolved.push({ reason: 'reference-coverage-limit' });
+  }
+  return { requiredReferences: [...required.values()], unresolved, notes, limited };
+}
+
+function publishWorkingSourceScan(scan, result) {
+  if (!scan?.current()) return false;
+  const written = mutateProject(scan.projectId, project => {
+    if (!scan.current()) return false;
+    project.workingSourceVerification[scan.key] = { ...project.workingSourceVerification[scan.key], ...result,
+      attempt: scan.attempt, selectionRevision: scan.selectionRevision };
+    return true;
+  });
+  if (written) { invalidatePackageReviewForProject(scan.projectId); sendToRenderer('project:updated', { projectId: scan.projectId }); }
+  return !!written;
+}
+
+function failWorkingSourceScan(scan, operation, reason) {
+  if (!scan || !operation?.current()) return false;
+  const changed = mutateProject(scan.projectId, project => {
+    const record = project.workingSourceVerification?.[scan.key];
+    const row = project.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === scan.key);
+    if (!operation.current() || record?.attempt !== scan.attempt || !row ||
+      getWorkingSourceSelection(project, row).revision !== scan.selectionRevision) return false;
+    project.workingSourceVerification[scan.key] = { ...record, status: 'failed', reason, unresolved: [{ reason }] };
+    return true;
+  });
+  if (changed) { invalidatePackageReviewForProject(scan.projectId); sendToRenderer('project:updated', { projectId: scan.projectId }); }
+  return !!changed;
+}
+
+async function refreshWorkingSourceVerification(projectId) {
+  const operation = captureProjectOperation(projectId);
+  try {
+    const project = getProjects().find(item => item.id === projectId);
+    if (!project || !hasWorkingSourceSelectionState(project)) return;
+    const membership = getWorkingSourceMembership(project);
+    for (const file of project.files || []) {
+      const fact = membership.facts.get(getTrackedFileDedupKey(file));
+      const record = getWorkingSourceVerification(project, file);
+      if (!fact?.verificationRequired || !['scanned', 'no-extractor'].includes(record?.status)) continue;
+      let fresh = false;
+      try { fresh = isWorkingSourceDiskIdentityCurrent(file, record) &&
+        await getAddFilesCurrentSourceDigest(file.path, operation, record.sourceIdentity) === record.sourceFingerprint; } catch (_) {}
+      if (!operation?.current()) return;
+      if (fresh) continue;
+      const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+      mutateProject(projectId, latest => {
+        if (!operation.current() || latest.workingSourceVerification?.[key]?.attempt !== record.attempt) return false;
+        latest.workingSourceVerification[key] = { ...record, status: 'stale', reason: 'source-bytes-changed' };
+        return true;
+      });
+      invalidatePackageReviewForProject(projectId);
+    }
+  } finally { operation?.close(); }
+}
+
+async function verifyRestoredWorkingSource(projectId, file, attempt, operation) {
+  const key = getAssetBaselineSourceRecoveryRouteKey({ id: projectId }, file);
+  const current = () => !!operation?.current() && getProjects().find(item => item.id === projectId)
+    ?.workingSourceVerification?.[key]?.attempt === attempt;
+  if (!current()) return;
+  if (file.virtual === true || !SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())) {
+    const scan = beginWorkingSourceScan(projectId, file.path, current, attempt);
+    if (file.virtual === true) {
+      publishWorkingSourceScan(scan, { status: 'unavailable', reason: 'connected-provider-interface-required', provider: 'connected-provider',
+        requiredReferences: [], unresolved: [{ reason: 'connected-provider-interface-required' }], notes: ['required-reference-domain-unverified'] });
+      return;
+    }
+    const outcome = await runBoundedAddFilesScan(async lease => {
+      const leaseKey = projectId + ':' + key;
+      workingSourceScanLeases.set(leaseKey, lease);
+      try {
+        const identity = getWorkingSourceDiskIdentity(file);
+        const fingerprint = await getAddFilesCurrentSourceDigest(file.path, lease, identity);
+        if (fingerprint !== await getAddFilesCurrentSourceDigest(file.path, lease, identity)) throw new Error('source-bytes-changed');
+        if (!lease.current()) return;
+        publishWorkingSourceScan(scan, { status: 'no-extractor', reason: 'ordinary-route-has-no-extractor', provider: 'none',
+          coverage: 'ordinary-route', version: 1, requiredReferences: [], unresolved: [],
+          notes: ['required-reference-domain-unverified'], sourceFingerprint: fingerprint, sourceIdentity: identity });
+      } finally { if (workingSourceScanLeases.get(leaseKey) === lease) workingSourceScanLeases.delete(leaseKey); }
+    }, { parentCurrent: current, timeoutMs: ADD_FILES_SCAN_TIMEOUT_MS }).catch(() => ({ failed: true }));
+    if (outcome.failed || outcome.timedOut || outcome.cancelled) publishWorkingSourceScan(scan, {
+      status: 'failed', reason: outcome.timedOut ? 'scan-timeout' : 'source-unavailable', unresolved: [{ reason: 'source-unavailable' }] });
+    return;
+  }
+  const report = await runBoundedScanOnOpenQueue(projectId, [file.path], operation.activationToken ?? null,
+    { ...operation, current, adoptScope: scope => operation.adoptScope(scope) && current() },
+    { addFilesScan: true, allowPausedBaseline: true, workingSourceAttempt: attempt });
+  if (!current()) return;
+  const record = getProjects().find(item => item.id === projectId)?.workingSourceVerification?.[key];
+  if (report.cancelled || report.outcomes.some(item => !item.success)) {
+    mutateProject(projectId, project => {
+      if (!current()) return false;
+      project.workingSourceVerification[key] = { ...record, status: 'failed', reason: report.outcomes[0]?.error || 'scan-cancelled' };
+      return true;
+    });
+    invalidatePackageReviewForProject(projectId);
+  }
+}
+
+async function setWorkingSourceSelection(projectId, visualIdentity, request) {
+  if (!request || typeof request !== 'object' || Array.isArray(request) ||
+      Object.keys(request).some(key => !['action', 'expectedRevision'].includes(key)) ||
+      !['exclude', 'restore'].includes(request.action) ||
+      !Number.isSafeInteger(request.expectedRevision) || request.expectedRevision < 0) {
+    return { success: false, error: 'invalid_working_source_selection' };
+  }
+  const operation = captureProjectOperation(projectId);
+  try {
+    const result = mutateProject(projectId, project => {
+      const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
+      if (!operation?.current() || !file || !project.files.includes(file) ||
+          !isWorkingSourceFile(file)) {
+        return { success: false, error: 'working_source_not_found' };
+      }
+      const previous = getWorkingSourceSelection(project, file);
+      if (previous.state === 'invalid' || previous.revision !== request.expectedRevision ||
+          previous.revision >= Number.MAX_SAFE_INTEGER) {
+        return { success: false, error: 'working_source_selection_stale' };
+      }
+      if (request.action === 'exclude' && previous.state === 'excluded') {
+        return { success: true, selection: previous };
+      }
+      if (request.action === 'restore' && previous.state !== 'excluded') {
+        return { success: false, error: 'working_source_not_excluded' };
+      }
+      const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+      if (!key) return { success: false, error: 'working_source_identity_unavailable' };
+      const verification = getWorkingSourceVerification(project, file);
+      const selection = { state: request.action === 'exclude' ? 'excluded' : 'selected',
+        reason: request.action === 'exclude' ? 'user-excluded' : null, revision: previous.revision + 1 };
+      const attempt = crypto.randomUUID();
+      // Validate prospective values before writing: mutateProject has no rollback.
+      project.workingSourceSelections = { ...(project.workingSourceSelections || {}), [key]: selection };
+      project.workingSourceVerification = { ...(project.workingSourceVerification || {}), [key]: {
+        ...verification, status: request.action === 'exclude' ? verification?.status || 'unavailable' : 'pending',
+        selectionRevision: selection.revision, attempt,
+        sourceFingerprint: verification?.sourceFingerprint || null, sourceIdentity: verification?.sourceIdentity || null,
+        provider: verification?.provider || 'ordinary-scan', coverage: 'ordinary-route', version: 1,
+        reason: request.action === 'restore' ? 'verification-required' : verification?.reason || 'not-scanned',
+        requiredReferences: verification?.requiredReferences || [], unresolved: verification?.unresolved || [],
+      } };
+      workingSourceScanLeases.get(projectId + ':' + key)?.cancel('selection-changed');
+      return { success: true, selection, file, attempt };
+    });
+    if (!result) return { success: false, error: 'not_found' };
+    if (!result.success) return result;
+    invalidatePackageReviewForProject(projectId);
+    reconcileProjectAssetBaselineScanSources(projectId, { allowPaused: true });
+    sendToRenderer('project:updated', { projectId });
+    if (request.action === 'restore' && result.file) {
+      await verifyRestoredWorkingSource(projectId, result.file, result.attempt, operation);
+    }
+    const project = getProjects().find(item => item.id === projectId);
+    const currentFile = project && resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
+    if (!currentFile) return { success: false, error: 'working_source_not_found' };
+    return { success: true, selection: getWorkingSourceSelection(project, currentFile),
+      verificationStatus: getWorkingSourceVerification(project, currentFile)?.status || 'unavailable',
+      semanticCounts: getWorkingSourceMembership(project).counts };
+  } finally { operation?.close(); }
+}
+
 function getAssetBaselineSourcePhysicalIdentityHash(project, stat) {
   if (!project || typeof project.id !== 'string' || !project.id || !stat) return null;
   const kind = stat.isFile() ? 'file' : (stat.isDirectory() ? 'directory' : null);
@@ -3888,7 +4251,7 @@ async function createProjectFileVisualRevision(projectId, file) {
   }
 }
 
-async function createRendererFilePresentation(project, file) {
+async function createRendererFilePresentation(project, file, membership = getWorkingSourceMembership(project)) {
   const ext = (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase();
   const captureEvidence = file?.captureEvidence && typeof file.captureEvidence === 'object'
     ? file.captureEvidence
@@ -3926,6 +4289,7 @@ async function createRendererFilePresentation(project, file) {
     assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
     projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
     protectedSource: isProjectAssetBaselineSource(file),
+    ...(membership.facts.get(getTrackedFileDedupKey(file)) || {}),
     sourceRecoveryAllowed: await isFailedRequiredAssetBaselineSource(project, file),
     excluded: isAssetReviewFileExcluded(project, file),
     visualIdentity: createProjectFileVisualIdentity(project.id, file),
@@ -3935,20 +4299,23 @@ async function createRendererFilePresentation(project, file) {
 
 async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (typeof projectId !== 'string' || !projectId || projectId.length > 128) return null;
+  await refreshWorkingSourceVerification(projectId);
   const project = getProjects().find(item => item && item.id === projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
   if (!project || !scopedProject) return null;
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
+  const selectionSignature = getPackageSelectionInputSignature(project);
+  const membership = getWorkingSourceMembership(project);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
   const cacheGeneration = fileVisualProjectCacheGeneration;
   const files = await Promise.all((scopedProject.files || []).map(async (file, sourceIndex) => ({
-    ...(await createRendererFilePresentation(project, file)),
+    ...(await createRendererFilePresentation(project, file, membership)),
     sourceIndex,
   })));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
-    ...(await createRendererFilePresentation(project, file)),
+    ...(await createRendererFilePresentation(project, file, membership)),
     sourceIndex,
   })));
   const visualRecords = new Map();
@@ -3975,6 +4342,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     fileVisualProjectCacheGeneration === cacheGeneration &&
     project.files === projectFiles &&
     project.pendingFiles === projectPendingFiles &&
+    selectionSignature === getPackageSelectionInputSignature(getProjects().find(item => item.id === projectId)) &&
     getIllustratorActivationScope(projectId) === illustratorScope
   );
   if (!workspaceIsFresh) {
@@ -4007,6 +4375,8 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     files,
     pendingFiles,
     trackedFigmaFiles,
+    semanticCounts: membership.counts,
+    workingSourceSelectionBlocked: membership.blocked,
   };
 }
 
@@ -4482,8 +4852,11 @@ function isAssetReviewFileExcluded(project, file) {
 }
 
 function getProjectAssetBaselineSourceKeys(project, startedAt) {
+  const membership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
   const sourceKeys = new Set();
   for (const file of project && project.files || []) {
+    if (membership &&
+        !membership.facts.get(getTrackedFileDedupKey(file))?.included) continue;
     if (!isProjectAssetBaselineSource(file)) continue;
     if (Number.isFinite(file.addedAt) && file.addedAt > startedAt) continue;
     const key = normalizeTrackedFilePath(file.path);
@@ -4493,8 +4866,11 @@ function getProjectAssetBaselineSourceKeys(project, startedAt) {
 }
 
 function getProjectAssetBaselineSourcePaths(project) {
+  const membership = hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
   const pathsByKey = new Map();
   for (const file of project && project.files || []) {
+    if (membership &&
+        !membership.facts.get(getTrackedFileDedupKey(file))?.included) continue;
     if (!isProjectAssetBaselineSource(file) || typeof file.path !== 'string' || !file.path) continue;
     const key = getTrackedFileDedupKey(file);
     if (key && !pathsByKey.has(key)) pathsByKey.set(key, file.path);
@@ -4692,10 +5068,13 @@ function ensureProjectAssetBaselineScanState(projectId, sourcePaths = []) {
 }
 
 function reserveProjectAssetBaselineScanQueue(projectId, sourcePaths) {
+  const project = getProjects().find(item => item.id === projectId);
+  const membership = project && hasWorkingSourceSelectionState(project) ? getWorkingSourceMembership(project) : null;
   const uniquePaths = [...new Map(
     (Array.isArray(sourcePaths) ? sourcePaths : [])
       .map(sourcePath => [normalizeTrackedFilePath(sourcePath), sourcePath])
       .filter(([sourceKey, sourcePath]) => sourceKey && typeof sourcePath === 'string' && sourcePath)
+      .filter(([sourceKey]) => !membership || membership.facts.get(sourceKey)?.included !== false)
   ).values()];
   const state = ensureProjectAssetBaselineScanState(projectId, uniquePaths);
   const reservations = uniquePaths.map(sourcePath => {
@@ -4784,6 +5163,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
           }
         );
         if (scanOutcome.timedOut) {
+          failWorkingSourceScan(scanOutcome.lease.workingSourceScan, operation, 'scan-timeout');
           releaseProjectAssetBaselineScan(scanOutcome.lease.baselineScan);
           outcomes[index] = { path: sourcePath, success: false, error: 'add_files_scan_timeout' };
         } else if (scanOutcome.cancelled || !operation.current()) {
@@ -4850,6 +5230,9 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
   }
   if (hasRequiredAssetBaselineWork(state)) return;
   if (![...state.requiredSourceKeys].every(key => state.completedSourceKeys.has(key))) return;
+  // Excluding the last root retires its obligations without treating pending
+  // observations as a newly accepted Existing Assets baseline.
+  if (acceptedKeys.size === 0 && hasWorkingSourceSelectionState(project)) return;
   const result = establishProjectAssetBaseline(projectId, null, null, state.startedAt, { allowPaused });
   const current = getProjects().find(item => item.id === projectId);
   if (result || !current || current.assetBaseline?.status !== 'awaiting-first-scan') {
@@ -5544,11 +5927,15 @@ function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
 }
 
 async function selectProjectFilesForPackaging(project) {
+  await refreshWorkingSourceVerification(project.id);
   const dedupedFiles = deduplicateFiles(getIllustratorScopedProjectView(project).files || []);
   const packageFiles = [];
+  const membership = getWorkingSourceMembership(project);
 
   for (const file of dedupedFiles) {
-    if (isAssetReviewFileExcluded(project, file)) {
+    const fact = membership.facts.get(getTrackedFileDedupKey(file));
+    if (fact && !fact.included) continue;
+    if (isAssetReviewFileExcluded(project, file) && !fact?.includedAsDependency) {
       continue;
     }
 
@@ -5593,7 +5980,10 @@ async function selectProjectFilesForPackaging(project) {
     );
   }
 
-  return deduplicateFiles(deduplicatePackageSourceMastersForOutput(project, packageFiles));
+  // Selection preserves independent working roots. Untouched projects keep
+  // their established auto-captured source-master filtering.
+  return deduplicateFiles(hasWorkingSourceSelectionState(project)
+    ? packageFiles : deduplicatePackageSourceMastersForOutput(project, packageFiles));
 }
 
 // projectType remains accepted for compatibility with persisted and older callers,
@@ -12213,6 +12603,14 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
   const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
   const stages = [];
   const entries = [];
+  const linkedMetadata = [];
+  const layerPaths = new Set();
+  let metadataUnits = 0;
+  let linkedFileCount = 0;
+  let metadataEmbeddedCount = 0;
+  let sawContent = false;
+  let framingFacts = null;
+  let mediaReferenceCount = 0;
   let directoryIdentity = null;
   let usedNames = null;
   let record = null;
@@ -12234,6 +12632,167 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
   const validIdentity = value => value && ['dev', 'ino', 'size', 'mtimeMs'].every(key => Number.isFinite(value[key]))
     && validInteger(value.size) && value.size <= MAX_PARSE_FILE_SIZE;
   const sameIdentity = value => validIdentity(value) && ['dev', 'ino', 'size', 'mtimeMs'].every(key => value[key] === sourceIdentity[key]);
+  const object = value => !!value && typeof value === 'object' && !Array.isArray(value);
+  function validateMetadataValue(value, depth = 0) {
+    if (depth > 16) invalid();
+    if (value === null || typeof value === 'string' || typeof value === 'boolean'
+      || (typeof value === 'number' && Number.isFinite(value))) return;
+    if (!value || typeof value !== 'object' || Object.keys(value).length > 1024) invalid();
+    for (const item of Object.values(value)) validateMetadataValue(item, depth + 1);
+  }
+  function consumeLinkedMetadata(text) {
+    let item;
+    try { item = JSON.parse(text); } catch (_) { invalid(); }
+    validateMetadataValue(item);
+    if (!object(item)) invalid();
+    if (item.origin === 'framing') {
+      if (linkedMetadata.length || !object(item.facts)
+        || !['framed', 'incomplete', 'not-examined'].includes(item.facts.status)
+        || (item.facts.status !== 'not-examined' && (item.facts.version !== 2
+          || item.facts.domain !== 'psd-v1-8bit-link-and-media-descriptors'
+          || !Array.isArray(item.facts.records) || !Array.isArray(item.facts.issues) || !Array.isArray(item.facts.mediaCarriers)
+          || !item.facts.records.every(record => object(record) && typeof record.id === 'string' && record.id.length <= 255
+            && ['lnk2', 'lnkD', 'lnk3', 'lnkE'].includes(record.carrier)
+            && typeof record.type === 'string' && record.type.length === 4 && validInteger(record.version)
+            && (record.layerIndex === null || validInteger(record.layerIndex))
+            && (record.tailBytes === null || validInteger(record.tailBytes)))
+          || item.facts.mediaCarriers.length > 128 || !item.facts.mediaCarriers.every(carrier => object(carrier)
+            && ['1075', 'PxSc'].includes(carrier.carrier) && validInteger(carrier.carrierIndex)
+            && (carrier.layerIndex === null || validInteger(carrier.layerIndex))
+            && (carrier.layerId === null || validInteger(carrier.layerId))
+            && ['decoded', 'unresolved'].includes(carrier.status) && (carrier.version === null || validInteger(carrier.version))
+            && (carrier.pixelSourceType === null || Number.isSafeInteger(carrier.pixelSourceType))
+            && (carrier.tailBytes === null || validInteger(carrier.tailBytes)) && Array.isArray(carrier.references)
+            && carrier.references.length <= 128 && carrier.references.every(ref => object(ref)
+              && (ref.reason === null || (typeof ref.reason === 'string' && ref.reason.length <= 80))))
+          || item.facts.issues.length > 128 || !item.facts.issues.every(reason => typeof reason === 'string' && reason.length <= 80)))) invalid();
+      if (item.facts.status === 'framed' && (item.facts.issues.length
+        || item.facts.records.some(record => !['liFD', 'liFE', 'liFA'].includes(record.type)
+          || record.version < 1 || record.version > 7 || record.tailBytes !== 0)
+        || item.facts.mediaCarriers.some(carrier => carrier.status !== 'decoded' || carrier.version !== 1
+          || carrier.tailBytes !== 0 || carrier.references.some(ref => ref.reason !== null)))) invalid();
+      framingFacts = item.facts;
+    } else if (item.origin === 'layer') {
+      if (linkedFileCount || !Array.isArray(item.layerPath) || !item.layerPath.length || item.layerPath.length > 65
+        || !item.layerPath.every(validInteger) || (item.placedLayer !== null && !object(item.placedLayer))
+        || (item.linkedFile !== null && !object(item.linkedFile))) invalid();
+      const key = item.layerPath.join('/');
+      if (layerPaths.has(key)) invalid();
+      layerPaths.add(key);
+    } else if (item.origin === 'linked-file') {
+      if (item.index !== linkedFileCount || !object(item.metadata) || Object.hasOwn(item.metadata, 'data')
+        || (item.layerPath !== null && (!Array.isArray(item.layerPath) || !item.layerPath.length
+          || !item.layerPath.every(validInteger) || !layerPaths.has(item.layerPath.join('/'))))
+        || typeof item.dataPresent !== 'boolean' || !validInteger(item.byteLength)
+        || item.byteLength > MAX_PARSE_FILE_SIZE
+        || (item.dataPresent ? item.embeddedIndex !== metadataEmbeddedCount : (item.embeddedIndex !== null || item.byteLength !== 0))) invalid();
+      linkedFileCount++;
+      if (item.dataPresent) metadataEmbeddedCount++;
+    } else if (item.origin === 'media-reference') {
+      if (item.index !== mediaReferenceCount || !['1075', 'PxSc'].includes(item.carrier)
+        || (item.frameReader !== null && !object(item.frameReader))
+        || (item.carrier === '1075' ? (item.layerPath !== null || !validInteger(item.groupIndex) || !validInteger(item.clipIndex))
+          : (!Array.isArray(item.layerPath) || !item.layerPath.every(validInteger)
+            || !layerPaths.has(item.layerPath.join('/')) || (item.layerId !== null && !validInteger(item.layerId))))) invalid();
+      mediaReferenceCount++;
+    } else invalid();
+    linkedMetadata.push(item);
+  }
+  function getLinkedInventory() {
+    const ids = new Map();
+    const references = [];
+    const unresolved = [];
+    const records = linkedMetadata.filter(item => item.origin !== 'framing').map(item => {
+      if (item.origin !== 'linked-file') return item;
+      const fields = item.metadata;
+      if (typeof fields.id === 'string' && fields.id) ids.set(fields.id, (ids.get(fields.id) || 0) + 1);
+      const external = Object.hasOwn(fields, 'linkedFile');
+      const fullPath = external && object(fields.linkedFile) ? fields.linkedFile.fullPath : null;
+      const disposition = external
+        ? (typeof fullPath === 'string' && fullPath.length ? 'external-reference' : 'unresolved-external')
+        : (item.dataPresent ? 'parsed-embedded' : 'unresolved-linked-record');
+      if (disposition.startsWith('unresolved')) unresolved.push({ origin: item.origin, index: item.index, reason: disposition });
+      if (external) references.push({ origin: item.origin, index: item.index, id: fields.id ?? null,
+        rawPaths: fields.linkedFile ?? null, dataPresent: item.dataPresent, disposition });
+      return { ...item, disposition };
+    });
+    for (const [id, count] of ids) if (count > 1) unresolved.push({ id, reason: 'ambiguous-linked-id' });
+    const associations = [];
+    for (const item of linkedMetadata.filter(item => item.origin === 'layer')) {
+      if (item.linkedFile !== null) {
+        const fullPath = item.linkedFile.fullPath;
+        references.push({ origin: item.origin, layerPath: item.layerPath, rawPaths: item.linkedFile,
+          disposition: typeof fullPath === 'string' && fullPath.length ? 'external-reference' : 'unresolved-external' });
+        if (typeof fullPath !== 'string' || !fullPath.length) unresolved.push({ layerPath: item.layerPath, reason: 'unresolved-external' });
+      }
+      if (item.placedLayer !== null) {
+        const id = item.placedLayer.id;
+        const count = typeof id === 'string' ? (ids.get(id) || 0) : 0;
+        const disposition = count === 1 ? 'matched-parsed-id' : (count ? 'ambiguous-linked-id' : 'unresolved-placed-id');
+        associations.push({ layerPath: item.layerPath, id, disposition });
+        if (count !== 1) unresolved.push({ layerPath: item.layerPath, id, reason: disposition });
+      }
+    }
+    const wireIds = new Map();
+    for (const record of framingFacts?.records || []) {
+      if (typeof record.id === 'string') wireIds.set(record.id, (wireIds.get(record.id) || 0) + 1);
+    }
+    const parsedAgreement = !!framingFacts && framingFacts.status !== 'not-examined'
+      && wireIds.size === ids.size && [...ids].every(([id, count]) => wireIds.get(id) === count)
+      && (framingFacts.records || []).length === linkedFileCount;
+    if (framingFacts?.status !== 'not-examined' && !parsedAgreement) unresolved.push({ reason: 'wire-parsed-record-disagreement' });
+    for (const reason of framingFacts?.issues || []) unresolved.push({ reason });
+    function mediaSignature(carrier, ref, wire) {
+      // Agreement covers fields exposed by both decoders. Timeline original
+      // and alias tokens remain in the wire record; ag-psd omits those fields.
+      const frame = ref.frameReader;
+      const link = wire ? frame?.['Lnk '] : frame?.link;
+      const type = wire ? frame?.frameReaderType : (carrier === 'PxSc' && frame?.type === 'QTFR' ? 1364477522 : frame?.type);
+      return JSON.stringify([carrier, carrier === '1075' ? ref.groupId : ref.layerId,
+        carrier === '1075' ? ref.clipId : null,
+        carrier === '1075' ? ref.groupIndex : null, carrier === '1075' ? ref.clipIndex : null,
+        type, frame?.mediaDescriptor ?? null,
+        (wire ? link?.['Nm  '] : link?.name) ?? null, link?.fullPath ?? null,
+        (wire ? link?.relPath : link?.relativePath) ?? null,
+        carrier === 'PxSc' ? (link?.originalPath ?? null) : null,
+        carrier === 'PxSc' ? ((wire ? link?.alis : link?.alias) ?? null) : null]);
+    }
+    const wireMedia = [];
+    for (const carrier of framingFacts?.mediaCarriers || []) {
+      for (const ref of carrier.references) {
+        const rawPaths = ref.frameReader?.['Lnk '] ?? null;
+        const disposition = !ref.reason && typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length
+          ? 'external-reference' : 'unresolved-media-reference';
+        references.push({ source: 'wire-media', carrier: carrier.carrier, carrierIndex: carrier.carrierIndex,
+          layerIndex: carrier.layerIndex, layerId: carrier.layerId, ...ref, rawPaths, disposition });
+        if (disposition !== 'external-reference') unresolved.push({ carrier: carrier.carrier, reason: ref.reason || disposition });
+        wireMedia.push(mediaSignature(carrier.carrier, { ...ref, layerId: carrier.layerId }, true));
+      }
+      if (carrier.status !== 'decoded') unresolved.push({ carrier: carrier.carrier, reason: carrier.reason || 'media-descriptor-unresolved' });
+    }
+    const parsedMedia = linkedMetadata.filter(item => item.origin === 'media-reference');
+    for (const item of parsedMedia) {
+      const rawPaths = item.frameReader?.link ?? null;
+      const disposition = typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length ? 'external-reference' : 'unresolved-media-reference';
+      references.push({ source: 'parsed-media', ...item, rawPaths, disposition });
+      if (disposition !== 'external-reference') unresolved.push({ carrier: item.carrier, reason: disposition });
+    }
+    const parsedMediaSignatures = parsedMedia.map(item => mediaSignature(item.carrier, item, false)).sort();
+    wireMedia.sort();
+    const mediaParsedAgreement = framingFacts?.status !== 'not-examined'
+      && (framingFacts?.mediaCarriers || []).every(carrier => carrier.status === 'decoded')
+      && wireMedia.length === parsedMediaSignatures.length && wireMedia.every((value, index) => value === parsedMediaSignatures[index]);
+    if (!mediaParsedAgreement) unresolved.push({ reason: 'wire-parsed-media-disagreement' });
+    // Framing visibility is not sufficiency of the entire required-reference
+    // domain. Empty/embedded-only records cannot become complete by counting.
+    return { provider: 'psd-agpsd-worker', coverage: 'linked-and-media-metadata', version: 3,
+      status: 'incomplete', reason: framingFacts?.status === 'framed' && parsedAgreement && mediaParsedAgreement
+        ? 'required-reference-domain-unverified' : 'wire-coverage-unverified',
+      framing: { facts: framingFacts, parsedAgreement, mediaParsedAgreement }, records, references, associations, unresolved,
+      counts: { metadata: linkedMetadata.length, linkedFiles: linkedFileCount,
+        layers: layerPaths.size, embedded: metadataEmbeddedCount, mediaReferences: mediaReferenceCount,
+        wireMediaReferences: wireMedia.length, unresolved: unresolved.length } };
+  }
   const ownedPath = (stage, filePath) => {
     assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
     const stat = fs.lstatSync(filePath);
@@ -12271,16 +12830,24 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     check();
     if (finalReceived) invalid();
     if (message.type === 'begin') {
-      if (sourceIdentity || !validIdentity(message.sourceIdentity) || typeof message.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(message.sourceDigest)) invalid();
+      if (sourceIdentity || message.protocolVersion !== 3 || !validIdentity(message.sourceIdentity)
+        || typeof message.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/.test(message.sourceDigest)) invalid();
       sourceIdentity = { ...message.sourceIdentity };
       sourceDigest = message.sourceDigest;
     } else {
       if (!sourceIdentity) invalid();
       if (message.type === 'record') {
-        if (record || !['linked-path', 'embedded'].includes(message.kind) || !validInteger(message.index)
+        if (record || !['linked-metadata', 'linked-path', 'embedded'].includes(message.kind) || !validInteger(message.index)
           || !validInteger(message.textUnits) || !validInteger(message.byteLength)) invalid();
+        const metadata = message.kind === 'linked-metadata';
         const embedded = message.kind === 'embedded';
-        if (message.index !== (embedded ? embeddedCount : entryCount) || (!embedded && (sawEmbedded || message.byteLength !== 0))) invalid();
+        if (message.index !== (metadata ? linkedMetadata.length : (embedded ? embeddedCount : entryCount))
+          || (!embedded && (sawEmbedded || message.byteLength !== 0))) invalid();
+        if (metadata) {
+          if (sawContent || !message.textUnits || message.textUnits > 65536 || linkedMetadata.length >= 8192
+            || metadataUnits + message.textUnits > 4 * 1024 * 1024) invalid();
+          metadataUnits += message.textUnits;
+        } else sawContent = true;
         sawEmbedded ||= embedded;
         record = { kind: message.kind, index: message.index, textUnits: message.textUnits,
           byteLength: message.byteLength, text: '', written: 0, stage: null,
@@ -12322,16 +12889,29 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
           ownedPath(stage, stage.stagedPath);
           stage.outputDigest = record.hash.digest('hex');
           embeddedCount++;
+        } else if (record.kind === 'linked-metadata') {
+          consumeLinkedMetadata(record.text);
         } else {
           entries.push({ filePath: record.text, source: 'psd-linked' });
           entryCount++;
         }
         record = null;
       } else if (message.type === 'result') {
-        if (record || message.entryCount !== entryCount || message.embeddedCount !== embeddedCount
+        const expectedPaths = linkedMetadata.flatMap(item => {
+          const fields = item.origin === 'layer' ? item.linkedFile : (item.origin === 'linked-file' ? item.metadata.linkedFile
+            : (item.origin === 'media-reference' ? item.frameReader?.link : null));
+          return object(fields) && typeof fields.fullPath === 'string' ? [fields.fullPath] : [];
+        });
+        const embeddedMetadata = linkedMetadata.filter(item => item.origin === 'linked-file' && item.dataPresent);
+        if (record || !framingFacts || message.protocolVersion !== 3 || message.metadataCount !== linkedMetadata.length
+          || message.metadataUnits !== metadataUnits || message.entryCount !== entryCount || message.embeddedCount !== embeddedCount
+          || embeddedCount !== metadataEmbeddedCount || entries.length !== expectedPaths.length
+          || entries.some((entry, index) => entry.filePath !== expectedPaths[index])
+          || stages.some((stage, index) => stage.byteLength !== embeddedMetadata[index]?.byteLength
+            || stage.embeddedOriginalName !== (typeof embeddedMetadata[index]?.metadata.name === 'string' ? embeddedMetadata[index].metadata.name : ''))
           || !sameIdentity(message.sourceIdentity) || message.sourceDigest !== sourceDigest) invalid();
         finalReceived = true;
-        return { entries, sourceIdentity, sourceDigest, transaction };
+        return { entries, sourceIdentity, sourceDigest, linkedInventory: getLinkedInventory(), transaction };
       } else invalid();
     }
     check();
@@ -12614,7 +13194,7 @@ async function getAddFilesCurrentSourceDigest(filePath, scanLease, expectedIdent
   check();
   const identity = expectedIdentity || getAddFilesSourceIdentity(await fs.promises.stat(filePath));
   check();
-  if (identity.size > MAX_PARSE_FILE_SIZE) changed();
+  if (identity.size > MAX_PARSE_FILE_SIZE) throw new Error('asset_baseline_source_too_large');
   const handle = await fs.promises.open(filePath, 'r');
   try {
     check();
@@ -12660,35 +13240,51 @@ async function extractLinkedAssets(filePath, options = {}) {
       case '.xd':
         return await extractLinkedAssetsRegex(filePath, {
           strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           sourceBuffer: options.sourceBuffer,
           addFilesAttempt: options.addFilesAttempt,
           validatedRegexResult: options.validatedRegexResult,
         });
       case '.psd':
-        return await extractLinkedAssetsPhotoshop(filePath, { strict });
+        return await extractLinkedAssetsPhotoshop(filePath, { strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
       case '.indd':
       case '.idml':
-        return await extractLinkedAssetsInDesign(filePath, { strict });
+        return await extractLinkedAssetsInDesign(filePath, { ...options, strict });
       case '.sketch':
-        return await extractLinkedAssetsSketch(filePath, { strict });
+        return await extractLinkedAssetsSketch(filePath, { strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
       case '.afdesign':
       case '.afphoto':
       case '.afpub':
-        return await extractLinkedAssetsAffinity(filePath, { strict });
+        return await extractLinkedAssetsAffinity(filePath, { strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
       case '.key':
       case '.pptx':
-        return await extractLinkedAssetsZipMedia(filePath, { strict });
+        return await extractLinkedAssetsZipMedia(filePath, { strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
       case '.ppt':
         return await extractLinkedAssetsRegex(filePath, {
           strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           addFilesAttempt: options.addFilesAttempt,
           validatedRegexResult: options.validatedRegexResult,
         });
       case '.pxd':
-        return await extractLinkedAssetsPxd(filePath, { strict });
+        return await extractLinkedAssetsPxd(filePath, { strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit });
       case '.fig':
         return await extractLinkedAssetsRegex(filePath, {
           strict,
+          onOrdinaryScanFailure: options.onOrdinaryScanFailure,
+          onOrdinaryScanLimit: options.onOrdinaryScanLimit,
           addFilesAttempt: options.addFilesAttempt,
           validatedRegexResult: options.validatedRegexResult,
         });
@@ -12698,6 +13294,7 @@ async function extractLinkedAssets(filePath, options = {}) {
   } catch (e) {
     console.error(`[crate] scan-on-open: extractLinkedAssets error for ${path.basename(filePath)}:`, e.message);
     if (strict) throw e;
+    options.onOrdinaryScanFailure?.();
     return [];
   }
 }
@@ -12725,6 +13322,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
       if (stat.size > MAX_PARSE_FILE_SIZE) {
         if (strict) throw new Error('asset_baseline_source_too_large');
         console.warn(`[crate] extractLinkedAssetsRegex: skipping ${path.basename(filePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
+        options.onOrdinaryScanLimit?.('source-too-large');
         return results;
       }
     }
@@ -12738,6 +13336,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
     }
   } catch (e) {
     if (strict) throw e;
+    options.onOrdinaryScanFailure?.();
   }
   return results;
 }
@@ -12773,7 +13372,7 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
         }),
         'crate-ps-scan.applescript',
         { timeout: 10000, encoding: 'utf8' }
-      ).catch(() => ({ stdout: '' }));
+      ).catch(() => { options.onOrdinaryScanFailure?.(); return { stdout: '' }; });
 
       if (psPaths.trim()) {
         const results = [];
@@ -12787,6 +13386,7 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
       }
     }
   } catch (e) {
+    options.onOrdinaryScanFailure?.();
     // do javascript failed — fall through to regex
   }
   return extractLinkedAssetsRegex(filePath, options);
@@ -12807,6 +13407,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     if (stat.size > MAX_PARSE_FILE_SIZE) {
       if (options.strict === true) throw new Error('asset_baseline_source_too_large');
       console.warn(`[crate][psd-parser] Skipping ${path.basename(psdFilePath)} (${Math.round(stat.size / 1024 / 1024)}MB exceeds ${MAX_PARSE_FILE_SIZE / 1024 / 1024}MB limit)`);
+      options.onOrdinaryScanLimit?.('source-too-large');
       return [];
     }
     let psd = null;
@@ -12948,6 +13549,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     if (!isCurrent()) return [];
     console.error('[crate][psd-parser] Error parsing PSD:', e.message);
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
     return [];
   } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = staged.identity ? (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino) : !options.onOwnedPsdOutputs; if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
 }
@@ -12968,10 +13570,14 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
     const { stdout: psCheck } = await execAsync(
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
-    );
+    ).catch(error => {
+      if (options.ordinaryVerification) return { stdout: '' };
+      throw error;
+    });
 
     if (!psCheck.trim()) {
-      if (strict) throw new Error('asset_baseline_indesign_unavailable');
+      if (strict && !options.ordinaryVerification) throw new Error('asset_baseline_indesign_unavailable');
+      options.onProvider?.('saved-byte-regex-fallback');
       return extractLinkedAssetsRegex(filePath, options);
     }
 
@@ -12981,6 +13587,7 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       { timeout: 10000, encoding: 'utf8' }
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
+    options.onProvider?.('indesign-live-current-bytes-unbound');
     const activeState = strict
       ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath)
       : parseInDesignActiveSessionOutput(inddPaths);
@@ -12988,10 +13595,11 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
     const results = activeState.links
       .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
       .map(link => link.linkedPath)
-      .filter(linkedPath => linkedPath !== filePath && fs.existsSync(linkedPath));
+      .filter(linkedPath => linkedPath !== filePath && (strict || fs.existsSync(linkedPath)));
     if (strict || results.length > 0) return [...new Set(results)];
   } catch (e) {
     if (strict) throw e;
+    options.onOrdinaryScanFailure?.();
   }
   // Non-baseline live scans retain the legacy binary fallback.
   return extractLinkedAssetsRegex(filePath, options);
@@ -13022,16 +13630,23 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
           timeout: 8000, encoding: 'utf8'
         });
         // Look for LinkResourceURI attributes
-        const uriRegex = /LinkResourceURI="file:([^"]+)"/gi;
+        const uriRegex = /LinkResourceURI="([^"]+)"/gi;
         let match;
         while ((match = uriRegex.exec(data)) !== null) {
-          let uri = match[1];
+          if (match[1].slice(0, 5).toLowerCase() !== 'file:') {
+            options.onUnresolvedDependency?.('unsupported-declared-link-uri');
+            continue;
+          }
+          let uri = match[1].slice(5);
           // Decode URI-encoded paths
           try { uri = decodeURIComponent(uri); } catch (e) {}
           // Normalize: remove leading slashes from file: scheme
           if (uri.startsWith('//')) uri = uri.slice(1);
           if (uri.startsWith('/Users/') || uri.startsWith('/Volumes/')) {
             results.push(uri);
+          } else {
+            options.onUnresolvedDependency?.('unsupported-declared-link-uri');
+            if (options.ordinaryVerification && path.isAbsolute(uri)) results.push(uri);
           }
         }
         // Also try the regex approach for any raw absolute paths
@@ -13041,10 +13656,12 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
         }
       } catch (e) {
         if (options.strict === true) throw e;
+        options.onOrdinaryScanFailure?.();
       }
     }
   } catch (e) {
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
     // fallback: try regex on the raw zip
     return await extractLinkedAssetsRegex(filePath, options);
   }
@@ -13082,10 +13699,12 @@ async function extractLinkedAssetsSketch(filePath, options = {}) {
         }
       } catch (e) {
         if (options.strict === true) throw e;
+        options.onOrdinaryScanFailure?.();
       }
     }
   } catch (e) {
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
     // fallback: try regex on the raw zip
     return await extractLinkedAssetsRegex(filePath, options);
   }
@@ -13128,6 +13747,7 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
         }
       } catch (e) {
         if (options.strict === true) throw e;
+        options.onOrdinaryScanFailure?.();
       }
     }
 
@@ -13136,6 +13756,7 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
     results.push(...rawResults);
   } catch (e) {
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
     return await extractLinkedAssetsRegex(filePath, options);
   }
   return [...new Set(results)];
@@ -13165,6 +13786,7 @@ async function extractLinkedAssetsZipMedia(filePath, options = {}) {
     }
   } catch (e) {
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
   }
   return results;
 }
@@ -13204,10 +13826,12 @@ async function extractLinkedAssetsPxd(filePath, options = {}) {
         }
       } catch (e) {
         if (options.strict === true) throw e;
+        options.onOrdinaryScanFailure?.();
       }
     }
   } catch (e) {
     if (options.strict === true) throw e;
+    options.onOrdinaryScanFailure?.();
   }
   // Also try raw binary regex
   const rawResults = await extractLinkedAssetsRegex(filePath, options);
@@ -13507,8 +14131,26 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // this does not authorize or audit work done earlier by their polling roots.
   const ownsOperation = !operation;
   operation ||= captureProjectOperation(projectId);
+  // Every ordinary route publishes through the same bounded, cancellable scan.
+  // The child lease retains retiring PSD IO until its existing finish protocol drains.
+  if (!options.addFilesAttempt && !options.workingSourceLease) {
+    try {
+      const outcome = await runBoundedAddFilesScan(lease => runScanOnOpen(projectId, filePath, activationToken,
+        { activationToken, current: () => operation.current() && lease.current(), onCancel: lease.onCancel,
+          adoptScope: scope => operation.adoptScope(scope) && lease.current() },
+        { ...options, workingSourceLease: lease, addFilesAttempt: path.extname(filePath).toLowerCase() === '.psd' &&
+          hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId)) ? lease : undefined,
+          addFilesScanLease: lease }),
+        { parentCurrent: operation.current, timeoutMs: ADD_FILES_SCAN_TIMEOUT_MS });
+      if (outcome.timedOut) failWorkingSourceScan(outcome.lease.workingSourceScan, operation, 'scan-timeout');
+      return outcome.timedOut || outcome.cancelled ? { success: false, error: outcome.timedOut ? 'add_files_scan_timeout' : 'stale_project_operation' } : outcome.value;
+    } finally { if (ownsOperation) operation?.close(); }
+  }
+  const scanLease = options.addFilesAttempt || options.workingSourceLease;
   let baselineScan = null;
-  const isCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current() &&
+  let workingScan = null;
+  const parentCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current();
+  const isCurrent = () => parentCurrent() && (!workingScan || workingScan.current()) &&
     (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) { if (ownsOperation) operation?.close(); return; }
@@ -13518,6 +14160,23 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     return;
   }
 
+  const sourceRow = currentProject.files?.find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt;
+  const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
+  const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
+  if (hasWorkingSourceSelectionState(currentProject) && sourceFact && !sourceFact.included) {
+    if (ownsOperation) operation?.close();
+    return { success: true, skipped: 'source-excluded' };
+  }
+  workingScan = beginWorkingSourceScan(projectId, filePath, parentCurrent, options.workingSourceAttempt);
+  scanLease.workingSourceScan = workingScan;
+  if (options.workingSourceAttempt && !workingScan) return { success: false, error: 'stale_project_operation' };
+  const leaseKey = workingScan && projectId + ':' + workingScan.key;
+  if (leaseKey) {
+    const previousLease = workingSourceScanLeases.get(leaseKey);
+    if (previousLease !== scanLease) previousLease?.cancel('newer-source-scan');
+    workingSourceScanLeases.set(leaseKey, scanLease);
+  }
   baselineScan = options.establishBaseline === false
     ? null
     : beginProjectAssetBaselineScan(projectId, filePath, activationToken, {
@@ -13525,6 +14184,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       baselineReservation: options.baselineReservation,
     });
   if (options.baselineReservation && !baselineScan) {
+    if (leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease) workingSourceScanLeases.delete(leaseKey);
+    publishWorkingSourceScan(workingScan, { status: 'failed', reason: 'stale-baseline-reservation', unresolved: [{ reason: 'stale-baseline-reservation' }] });
     if (ownsOperation) operation?.close();
     return { success: false, error: 'stale_project_operation' };
   }
@@ -13545,15 +14206,43 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     catch (error) { releaseSlot(); throw error; }
   }
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
-  const validatedSource = baselineScan
+  const sourceIdentity = getWorkingSourceDiskIdentity({ path: filePath });
+  let sourceFingerprint = null;
+  let sideLedgerFailure = false;
+  let sideLedgerLimit = false;
+  let sourceChangedDuringScan = false;
+  try {
+    if (workingScan) sourceFingerprint = await getAddFilesCurrentSourceDigest(filePath, scanLease, sourceIdentity);
+  } catch (error) {
+    if (baselineScan || verificationScan || !isCurrent()) throw error;
+    // A side-ledger refusal must not tighten legacy capture admission.
+    sideLedgerFailure = true;
+    sideLedgerLimit = error?.message === 'asset_baseline_source_too_large';
+    sourceChangedDuringScan = error?.message === 'asset_baseline_source_changed';
+  }
+  const strictScan = !!baselineScan || verificationScan;
+  const validatedSource = strictScan
     ? await assertDependableAssetBaselineSource(filePath, {
       isCurrent,
       psdTransaction,
       addFilesAttempt: options.addFilesAttempt,
     })
     : null;
+  let providerNote = null;
+  const declaredIssues = [];
+  let declaredIssueLimit = false;
+  const onOrdinaryScanFailure = () => { sideLedgerFailure = true; };
+  const onOrdinaryScanLimit = () => { sideLedgerLimit = true; };
   const linkedPaths = await extractLinkedAssets(filePath, {
-    strict: !!baselineScan,
+    strict: strictScan,
+    ordinaryVerification: !!workingScan && !baselineScan,
+    onOrdinaryScanFailure,
+    onOrdinaryScanLimit,
+    onProvider: value => { providerNote = value; },
+    onUnresolvedDependency: reason => {
+      if (declaredIssues.length < 128) declaredIssues.push({ reason });
+      else declaredIssueLimit = true;
+    },
     sourceBuffer: Buffer.isBuffer(validatedSource) ? validatedSource : undefined,
     addFilesAttempt: options.addFilesAttempt,
     validatedRegexResult: validatedSource?.kind === 'regex-worker-result' ? validatedSource.result : undefined,
@@ -13562,16 +14251,39 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   });
   if (!isCurrent()) return;
   const recheckValidatedSource = async () => {
-    if (!baselineScan || !validatedSource) return true;
-    if (validatedSource.kind === 'psd-worker-result' || validatedSource.kind === 'psd-buffer-result') {
-      return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
+    try {
+      if (sourceFingerprint && sourceFingerprint !== await getAddFilesCurrentSourceDigest(filePath, scanLease, sourceIdentity)) {
+        throw new Error('asset_baseline_source_changed');
+      }
+      if (!validatedSource) return true;
+      if (validatedSource.kind === 'psd-worker-result' || validatedSource.kind === 'psd-buffer-result') {
+        return await getAddFilesCurrentSourceDigest(filePath, scanLease, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
+      }
+      if (validatedSource.kind === 'regex-worker-result') {
+        return await getAddFilesCurrentSourceDigest(filePath, scanLease, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
+      }
+      return true;
+    } catch (error) {
+      if (strictScan || !isCurrent()) throw error;
+      // Legacy capture stays lenient; only its saved-byte proof is refused.
+      sideLedgerFailure = true;
+      sideLedgerLimit ||= error?.message === 'asset_baseline_source_too_large';
+      sourceChangedDuringScan ||= error?.message === 'asset_baseline_source_changed';
+      sourceFingerprint = null;
+      return true;
     }
-    if (validatedSource.kind === 'regex-worker-result') {
-      return await getAddFilesCurrentSourceDigest(filePath, options.addFilesAttempt, validatedSource.sourceIdentity) === validatedSource.sourceDigest;
-    }
-    return true;
   };
   if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
+  const inventory = validatedSource?.result?.linkedInventory;
+  const scanEvidence = collectWorkingSourceScanEvidence(linkedPaths, { references: inventory?.references || [],
+    unresolved: [...(inventory?.unresolved || []), ...declaredIssues,
+      ...(declaredIssueLimit ? [{ reason: 'reference-coverage-limit' }] : [])] });
+  if (declaredIssueLimit) scanEvidence.limited = true;
+  if (providerNote === 'indesign-live-current-bytes-unbound') {
+    if (scanEvidence.unresolved.length === 128) { scanEvidence.unresolved.pop(); scanEvidence.limited = true; }
+    scanEvidence.unresolved.push({ reason: providerNote });
+  }
+  if (providerNote) scanEvidence.notes.push(providerNote);
   const latestProject = getProjects().find(item => item.id === projectId);
   if (!latestProject || !isAcceptedProjectFilePath(latestProject, filePath)) return;
 
@@ -13602,7 +14314,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
     const result = mutateProject(projectId, (proj) => {
       if (
-        (proj.status !== 'watching' && !(baselineScan?.allowPaused && proj.status === 'paused')) ||
+        (proj.status !== 'watching' && !((baselineScan?.allowPaused || options.allowPausedBaseline) && proj.status === 'paused')) ||
         !isCurrent() ||
         !isAcceptedProjectFilePath(proj, filePath)
       ) return null;
@@ -13662,11 +14374,31 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // Debounce: skip if same PSD was parsed less than 5 seconds ago.
   if (ext === '.psd') {
     const lastParsed = psdParseDebounce.get(filePath) || 0;
-    if (!baselineScan && Date.now() - lastParsed < 5000) return;
+    if (!strictScan && Date.now() - lastParsed < 5000) {
+      if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
+      const sameSavedBytes = !sideLedgerFailure && !sideLedgerLimit && previousVerification?.status === 'scanned' && sourceFingerprint &&
+        previousVerification.sourceFingerprint === sourceFingerprint;
+      if (sideLedgerFailure || sideLedgerLimit) {
+        const known = collectWorkingSourceScanEvidence([
+          ...(previousVerification?.requiredReferences || []).map(ref => ref.path),
+          ...scanEvidence.requiredReferences.map(ref => ref.path),
+        ]);
+        scanEvidence.requiredReferences = known.requiredReferences;
+        scanEvidence.limited ||= known.limited;
+      }
+      publishWorkingSourceScan(workingScan, sameSavedBytes ? { ...previousVerification, sourceIdentity } :
+        { ...scanEvidence, status: sourceChangedDuringScan ? 'stale' : sideLedgerLimit ? 'limited' : sideLedgerFailure ? 'failed' : 'incomplete',
+          reason: sourceChangedDuringScan ? 'source-bytes-changed' : sideLedgerLimit ? 'ordinary-extractor-source-too-large' : sideLedgerFailure ? 'source-verification-unavailable' : 'ordinary-scan-debounced',
+          sourceIdentity, sourceFingerprint, notes: [...scanEvidence.notes, 'ordinary-scan-debounced'] });
+      dependableScanCompleted = true;
+      return { success: true, skipped: 'ordinary-scan-debounced' };
+    }
     if (!isCurrent()) return;
     psdParseDebounce.set(filePath, Date.now()); // set BEFORE parse to prevent concurrent duplicates
     const psdAssets = await extractPsdAssets(filePath, projectId, isCurrent, {
-      strict: !!baselineScan,
+      strict: strictScan,
+      onOrdinaryScanFailure,
+      onOrdinaryScanLimit,
       psdTransaction,
       sourceBuffer: validatedSource?.kind === 'psd-buffer-result' ? validatedSource.buffer : undefined,
       onOwnedPsdOutputs: baselineScan ? outputs => { baselinePsdOutputs = outputs; } : undefined,
@@ -13690,7 +14422,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
-          (proj.status !== 'watching' && !(baselineScan?.allowPaused && proj.status === 'paused')) ||
+          (proj.status !== 'watching' && !((baselineScan?.allowPaused || options.allowPausedBaseline) && proj.status === 'paused')) ||
           !isCurrent() ||
           !isAcceptedProjectFilePath(proj, filePath)
         ) return null;
@@ -13771,9 +14503,26 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const acceptedProject = getProjects().find(proj => proj.id === projectId);
     if (!acceptedProject || !isAcceptedProjectFilePath(acceptedProject, filePath)) throw new Error('add_files_parser_cancelled');
   }
+  if (workingScan) {
+    if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
+    if (sideLedgerFailure || sideLedgerLimit) {
+      const known = collectWorkingSourceScanEvidence([
+        ...(previousVerification?.requiredReferences || []).map(ref => ref.path),
+        ...scanEvidence.requiredReferences.map(ref => ref.path),
+      ]);
+      scanEvidence.requiredReferences = known.requiredReferences;
+      scanEvidence.limited ||= known.limited;
+    }
+    publishWorkingSourceScan(workingScan, { ...scanEvidence, status: sourceChangedDuringScan ? 'stale' : sideLedgerLimit ? 'limited' : sideLedgerFailure ? 'failed' : scanEvidence.limited ? 'limited' : 'scanned',
+      reason: sourceChangedDuringScan ? 'source-bytes-changed' : sideLedgerLimit ? 'ordinary-extractor-source-too-large' : sideLedgerFailure ? 'source-verification-unavailable' : scanEvidence.unresolved.length ? 'declared-reference-unresolved' : 'ordinary-scan-finished',
+      provider: ext === '.psd' ? (options.addFilesAttempt ? 'psd-agpsd-worker' : 'psd-ordinary') : 'ordinary-' + ext.slice(1), coverage: 'ordinary-route', version: 1,
+      inventoryStatus: 'unverified', sourceIdentity, sourceFingerprint });
+  }
   dependableScanCompleted = true;
   return { success: true };
   } catch (error) {
+    publishWorkingSourceScan(workingScan, { status: 'failed', reason: error?.message === 'asset_baseline_source_changed' ? 'source-bytes-changed' : 'ordinary-scan-failed',
+      unresolved: [{ reason: 'ordinary-scan-failed' }] });
     console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
     return {
       success: false,
@@ -13790,7 +14539,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       } finally {
         await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
       }
-    } finally { if (ownsOperation) operation?.close(); }
+    } finally {
+      if (leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease) workingSourceScanLeases.delete(leaseKey);
+      if (workingScan?.current() && !dependableScanCompleted) publishWorkingSourceScan(workingScan, {
+        status: 'failed', reason: 'ordinary-scan-failed', unresolved: [{ reason: 'ordinary-scan-failed' }] });
+      if (ownsOperation) operation?.close();
+    }
   }
 }
 
@@ -13840,6 +14594,12 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
     if (!isCurrent()) return;
     const currentProject = getProjects().find(p => p.id === projectId);
     if (!currentProject || !isAcceptedProjectFilePath(currentProject, psdFilePath)) return;
+
+    // Engaged PSD saves refresh through the same fenced route as Restore.
+    // Untouched projects retain the separate legacy save pipeline.
+    if (hasWorkingSourceSelectionState(currentProject)) {
+      return await runScanOnOpen(projectId, psdFilePath, activationToken, ownedOperation, { establishBaseline: false });
+    }
 
     const stat = await fs.promises.stat(psdFilePath);
     if (!isCurrent()) return;
@@ -15595,6 +16355,10 @@ registerTrustedIpcHandler('projects:get-file-visual', async (event, projectId, v
 
 registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, projectId, decision) => {
   return setProjectExistingAssetsDecision(projectId, decision);
+});
+
+registerTrustedIpcHandler('projects:set-working-source-selection', async (event, projectId, visualIdentity, request) => {
+  return await setWorkingSourceSelection(projectId, visualIdentity, request);
 });
 
 registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileIdOrPath) => {
@@ -17791,6 +18555,9 @@ function getPackageSelectionInputSignature(project) {
   const input = {
     files: Array.isArray(scopedProject.files) ? scopedProject.files : [],
     assetBaseline: project.assetBaseline || null,
+    workingSourceSelections: project.workingSourceSelections ?? null,
+    workingSourceVerification: project.workingSourceVerification ?? null,
+    workingSourceRelationshipHolds: project.workingSourceRelationshipHolds ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],
     watchStartedAt: project.watchStartedAt || null,
     createdAt: project.createdAt || null,
@@ -17835,14 +18602,15 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
 
     const entries = files.map(getPackageReviewManifestEntry);
+    const membership = getWorkingSourceMembership(currentProject);
     bindEmbeddedPsdPackageReviewResources(files, entries);
     const entryStatuses = entries.map(getPackageReviewEntryStatus);
-    if (entryStatuses.some(status => status !== 'ready')) {
+    if (files.length === 0 || membership.blocked || entryStatuses.some(status => status !== 'ready')) {
       return {
         project: currentProject,
         files,
         entries,
-        entryStatuses,
+        entryStatuses: membership.blocked ? entryStatuses.map(() => 'unavailable') : entryStatuses,
         materializable: false,
       };
     }
@@ -17873,7 +18641,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     const finalEntries = files.map(getPackageReviewManifestEntry);
     bindEmbeddedPsdPackageReviewResources(files, finalEntries);
     if (!packageReviewFingerprintsMatch(entries, finalEntries)) continue;
-    const manifestKey = crypto.createHash('sha256').update(JSON.stringify({ entries, plan })).digest('hex');
+    const manifestKey = crypto.createHash('sha256').update(JSON.stringify({ entries, plan, inputSignature })).digest('hex');
     return {
       project: finalProject,
       files,
@@ -17962,8 +18730,9 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
+  const membership = getWorkingSourceMembership(manifest.project);
   const presentations = await Promise.all(
-    manifest.files.map(file => createRendererFilePresentation(manifest.project, file))
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
   return {
     token,
@@ -17977,6 +18746,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
       status: 'ready',
     })),
     totalFiles: manifest.entries.length,
+    semanticCounts: membership.counts,
     materializable: true,
     folderName: destinationBinding?.folderName || manifest.plan.destinationFolderName,
     planSummary: {
@@ -17991,8 +18761,9 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
 
 async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
+  const membership = getWorkingSourceMembership(manifest.project);
   const presentations = await Promise.all(
-    manifest.files.map(file => createRendererFilePresentation(manifest.project, file))
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
   return {
     projectId,
@@ -18004,8 +18775,11 @@ async function createUnavailablePackageReview(projectId, manifest) {
       status: manifest.entryStatuses[index] || 'unavailable',
     })),
     totalFiles: manifest.entries.length,
+    semanticCounts: membership.counts,
     materializable: false,
-    message: 'Some files are unavailable. Resolve them before packaging.',
+    message: manifest.files.length === 0 ? 'No files are selected for packaging.' :
+      (membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
+        'Some files are unavailable. Resolve them before packaging.'),
   };
 }
 

@@ -142,3 +142,23 @@ test('the Add Files regex worker preserves absolute-path matching and source ide
   assert.equal(message.result.sourceIdentity.size, fs.statSync(sourcePath).size);
   assert.equal(typeof message.result.sourceDigest, 'string');
 });
+
+test('A1: an empty regex worker result carries byte identity but no exhaustive dependency capability', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-a1-regex-capability-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  for (const [name, content] of [
+    ['empty.ai', '%PDF-1.7\n%%EOF\n'],
+    ['unsupported-reference.ai', '%PDF-1.7\nLinkResourceURI="file:/opt/crate-synthetic/Required.png"\n%%EOF\n'],
+  ]) {
+    const filePath = path.join(directory, name);
+    fs.writeFileSync(filePath, content);
+    const { code, message } = await runRegexWorker(filePath);
+    assert.equal(code, 0);
+    assert.equal(message.type, 'result');
+    assert.deepEqual(message.result.paths, []);
+    assert.equal(message.result.sourceIdentity.size, Buffer.byteLength(content));
+    assert.match(message.result.sourceDigest, /^[a-f0-9]{64}$/);
+    assert.equal(message.result.completeness, undefined);
+    assert.equal(message.result.capability, undefined);
+  }
+});

@@ -20,9 +20,18 @@ replaceExactlyOnce("const test = require('node:test');",
 replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
+  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml,\n' +
+  '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
   '  captureProjectOperation,\n  runScanOnOpen');
+// Exercise the actual retained parser and wire inspection in the complete main
+// IPC/store route; the utility-process transport and Electron remain modeled.
+replaceExactlyOnce('const fixture = structuredClone(currentPsdFixture);',
+  "const fixture = currentPsdFixture === 'actual-source-buffer' ? null : structuredClone(currentPsdFixture);");
+replaceExactlyOnce('                  psd: fixture,',
+  "                  psd: fixture || originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(fs.readFileSync(filePath), { skipLayerImageData: true, skipCompositeImageData: true }),\n" +
+  "                  framing: fixture ? undefined : require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(fs.readFileSync(filePath)),");
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath;
 compiled.paths = Module._nodeModulePaths(__dirname);
@@ -497,4 +506,713 @@ function baselineCases() {
       assert.equal(f.count(0), 1); assert.equal(f.count(1), 1);
     } finally { await f.cleanup(); }
   });
+
+
+  baselineTest('working selection: real IPC, reload and re-admission preserve exclusion; Restore clears concrete obligations', async () => {
+    const f = await fixture();
+    try {
+      f.state.opened = true; await f.live();
+      await assertComplete(f);
+      const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = initial.files.find(file => file.name === 'Design_0.ai');
+      assert.equal(row.sourceSelection, 'selected');
+      const previousReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      const sourceBytes = fs.readFileSync(f.paths[0].source);
+      const exclusion = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision });
+      assert.equal(exclusion.success, true);
+      assert.equal(exclusion.selection.reason, 'user-excluded');
+      assert.deepEqual(fs.readFileSync(f.paths[0].source), sourceBytes);
+      assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, previousReview.token)).error,
+        'package_review_stale');
+      const assetOnly = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(assetOnly.materializable, true);
+      assert.deepEqual(assetOnly.files.map(file => file.name), ['Link_0.png']);
+      assert.equal(assetOnly.semanticCounts.selectedWorkingSources, 0);
+      assert.equal(assetOnly.semanticCounts.excludedWorkingSources, 1);
+      assert.equal(assetOnly.semanticCounts.includedAssets, 1);
+      await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      roundTripFakeStore();
+      let current = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(current.files.find(file => file.name === 'Design_0.ai').selectionReason, 'user-excluded');
+      const stored = storeInstance.data.projects.find(p => p.id === f.project.id);
+      const source = stored.files.find(file => file.path === f.paths[0].source);
+      stored.files = stored.files.filter(file => file !== source);
+      stored.pendingFiles.push({ ...source, fileId: 'same-path-new-row', acceptedPending: false });
+      roundTripFakeStore();
+      await callIpcRaw('projects:accept-pending', f.project.id, f.paths[0].source);
+      current = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const readmitted = current.files.find(file => file.name === 'Design_0.ai');
+      assert.equal(readmitted.sourceSelection, 'excluded');
+      assert.equal(readmitted.selectionReason, 'user-excluded');
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).files.length, 1);
+      const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, readmitted.visualIdentity,
+        { action: 'restore', expectedRevision: readmitted.selectionRevision });
+      assert.equal(restored.success, true);
+      assert.equal(restored.selection.reason, null);
+      assert.equal(restored.verificationStatus, 'scanned');
+      const verified = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(verified.materializable, true);
+      assert.equal(typeof verified.token, 'string');
+      assert.equal(verified.totalFiles, 2);
+      assert.equal(verified.semanticCounts.unresolvedVerification, 0);
+      assert.equal(verified.semanticCounts.missingRequiredReferences, 0);
+      const freshWorkspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.deepEqual(freshWorkspace.semanticCounts, verified.semanticCounts);
+      const packaged = await callIpcRaw('projects:package', f.project.id, TEST_HOME, verified.token);
+      assert.equal(packaged.success, true);
+      assert.equal(packaged.totalFiles, verified.totalFiles);
+      const outputNames = fs.readdirSync(packaged.folderPath, { recursive: true }).map(name => path.basename(name));
+      assert.ok(outputNames.includes('Design_0.ai')); assert.ok(outputNames.includes('Link_0.png'));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('working selection: last failed source exclusion removes its baseline obligation and returns honest empty review', async () => {
+    const f = await fixture({ malformed: true });
+    try {
+      f.state.opened = true; await f.live();
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).error, 'asset_baseline_scan_incomplete');
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const source = workspace.files.find(file => file.name === 'Design_0.ai');
+      const selected = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
+        { action: 'exclude', expectedRevision: source.selectionRevision });
+      assert.equal(selected.success, true);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.error, undefined);
+      assert.equal(review.materializable, false);
+      assert.equal(review.token, undefined);
+      assert.equal(review.totalFiles, 0);
+      assert.equal(review.message, 'No files are selected for packaging.');
+      assert.equal(fs.existsSync(f.paths[0].source), true);
+      assert.equal((await f.current()).files.length, 1);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('working selection: current-byte changes block review and reject the earlier package token', async () => {
+    const f = await fixture();
+    try {
+      f.state.opened = true; await f.live(); await assertComplete(f);
+      await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.name === 'Design_0.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true);
+      fs.appendFileSync(f.paths[0].source, '\nchanged saved bytes');
+      const fresh = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(fresh.semanticCounts.unresolvedVerification, 1);
+      const result = await callIpcRaw('projects:package', f.project.id, TEST_HOME, review.token);
+      assert.equal(result.error, 'package_review_stale');
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('working selection: excluding one source preserves untouched sibling readiness in the real workspace and review', async () => {
+    const f = await fixture({ sources: 2 });
+    try {
+      f.state.opened = true; await f.live(); await assertComplete(f);
+      await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.name === 'Design_0.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(review.semanticCounts.unresolvedVerification, 0);
+      assert.equal(review.semanticCounts.selectedWorkingSources, 1); assert.equal(review.semanticCounts.excludedWorkingSources, 1);
+      assert.equal(review.files.some(file => file.name === 'Design_0.ai'), false);
+      assert.equal(review.files.some(file => file.name === 'Design_1.ai'), true);
+      assert.deepEqual((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts, review.semanticCounts);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('working selection: workspace publication rechecks an exclusion made during its async presentation', async () => {
+    const f = await fixture();
+    let restoreEligibility;
+    let workspace;
+    const gate = deferred();
+    try {
+      f.state.opened = true; await f.live();
+      await assertComplete(f);
+      const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const source = initial.files.find(file => file.name === 'Design_0.ai');
+      let entered = false;
+      restoreEligibility = metadataTestHooks.pauseRecoveryEligibility(async () => { entered = true; await gate.promise; });
+      workspace = callIpcRaw('projects:get-asset-workspace', f.project.id);
+      await waitForCondition(() => entered, 'workspace presentation did not pause');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity,
+        { action: 'exclude', expectedRevision: source.selectionRevision });
+      gate.release();
+      const current = await workspace;
+      assert.equal(current.files.find(file => file.name === 'Design_0.ai').sourceSelection, 'excluded');
+      assert.equal(current.semanticCounts.excludedWorkingSources, 1);
+    } finally {
+      gate.release(); if (workspace) await workspace;
+      restoreEligibility?.(); await f.cleanup();
+    }
+  });
+
+  for (const mode of ['zero', 'present', 'missing', 'pathless', 'audio']) {
+    baselineTest(`PSD Restore main IPC uses actual parser and preserves ${mode} obligations`, async () => {
+      resetTestHomeWorkspace();
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const filePath = path.join(TEST_HOME, 'Desktop', 'Restore.psd');
+      const linkPath = path.join(TEST_HOME, 'Desktop', 'Linked.png');
+      if (mode === 'present') fs.writeFileSync(linkPath, 'synthetic linked bytes');
+      const linkedFiles = ['present', 'missing', 'pathless'].includes(mode) ? [{
+        id: '11111111-1111-4111-8111-111111111111', name: 'Linked.png', childDocumentID: '',
+        linkedFile: { fileSize: 10, name: 'Linked.png', fullPath: mode === 'pathless' ? '' : linkPath,
+          originalPath: linkPath, relativePath: '../Linked.png' },
+      }] : [];
+      const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+      const imageResources = mode === 'audio' ? { timelineInformation: { enabled: true, frameStep: second, frameRate: 24,
+        time: zero, duration: second, workInTime: zero, workOutTime: second, repeats: 0, hasMotion: true, globalTracks: [],
+        audioClipGroups: [{ id: 'group', muted: false, audioClips: [{ id: 'clip', start: zero, duration: second,
+          inTime: zero, outTime: second, muted: false, audioLevel: 0, frameReader: { type: 1, mediaDescriptor: '',
+            link: { name: 'Audio.wav', fullPath: path.join(TEST_HOME, 'Desktop', 'Audio.wav'), relativePath: '../Audio.wav' } } }] }],
+      } } : {};
+      fs.writeFileSync(filePath, actual.writePsdBuffer({ width: 1, height: 1, linkedFiles, imageResources }));
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const created = await createProject('PSD Restore route'); clearTrackedTimers();
+        const project = storeInstance.data.projects.find(p => p.id === created.id);
+        project.assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+        project.files.push({ path: filePath, name: 'Restore.psd', ext: '.psd', source: 'user-added',
+          acceptedPending: true, projectRole: 'source', addedAt: Date.now() });
+        const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+        const row = workspace.files.find(file => file.name === 'Restore.psd');
+        await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity,
+          { action: 'exclude', expectedRevision: row.selectionRevision });
+        const result = await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity,
+          { action: 'restore', expectedRevision: row.selectionRevision + 1 });
+        assert.equal(result.success, true); assert.equal(result.verificationStatus, 'scanned');
+        const current = storeInstance.data.projects.find(p => p.id === project.id);
+        const verification = Object.values(current.workingSourceVerification)[0];
+        assert.equal(verification.provider, 'psd-agpsd-worker');
+        assert.equal(verification.inventoryStatus, 'unverified');
+        assert.equal(verification.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'));
+        const review = await callIpcRaw('projects:prepare-package-review', project.id);
+        const freshWorkspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+        assert.deepEqual(freshWorkspace.semanticCounts, review.semanticCounts);
+        if (['zero', 'present'].includes(mode)) {
+          assert.equal(review.materializable, true);
+          assert.equal(review.totalFiles, mode === 'present' ? 2 : 1);
+        } else {
+          assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+          if (mode === 'missing') assert.equal(review.semanticCounts.missingRequiredReferences, 1);
+          else assert.ok(review.semanticCounts.unresolvedVerification > 0);
+        }
+        if (mode === 'audio') assert.ok(verification.unresolved.some(item => item.reason === 'unverified-timeline-frame-reader-type'));
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
+  async function correctionProject(ext, content = 'synthetic source bytes') {
+    resetTestHomeWorkspace();
+    setChildProcessHandler(() => ({ stdout: '' }));
+    const created = await createProject('Confirmed correction ' + ext); clearTrackedTimers();
+    const project = storeInstance.data.projects.find(p => p.id === created.id);
+    project.assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+    const filePath = path.join(TEST_HOME, 'Desktop', 'Correction' + ext);
+    fs.writeFileSync(filePath, content);
+    project.files.push({ path: filePath, name: path.basename(filePath), ext, source: 'user-added',
+      acceptedPending: true, projectRole: 'source', addedAt: Date.now() });
+    return { project, filePath, current: () => storeInstance.data.projects.find(p => p.id === project.id) };
+  }
+
+  async function ordinaryFailureCase(ext, mode) {
+    const f = await correctionProject(ext);
+    const known = path.join(TEST_HOME, 'Desktop', 'PreviouslyKnown.png');
+    const fresh = path.join(TEST_HOME, 'Desktop', 'NewlyFound.png');
+    fs.writeFileSync(known, 'known fixture'); fs.writeFileSync(fresh, 'fresh fixture');
+    const container = ['.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd'].includes(ext);
+    const originalRead = fs.promises.readFile;
+    let phase = mode === 'zero' ? 'zero' : 'initial';
+    setChildProcessHandler(({ command, args }) => {
+      if (command !== '/usr/bin/unzip') return { stdout: '' };
+      if (args[0] === '-l') {
+        if (phase === 'listing-failure') return { error: new Error('F4 listing refusal') };
+        return { stdout: '     100  01-01-2026  00:00   good.json\n     100  01-01-2026  00:00   bad.json\n' };
+      }
+      if (args[0] === '-p') {
+        if (phase === 'partial-failure' && args[2] === 'bad.json') return { error: new Error('F4 entry refusal') };
+        return { stdout: phase === 'zero' ? '{}' : JSON.stringify({ link: phase === 'initial' ? known : fresh }) };
+      }
+      return { stdout: '' };
+    });
+    if (!container) fs.writeFileSync(f.filePath, phase === 'zero' ? 'empty source' : known);
+    fs.promises.readFile = async function controlledExtractorRead(file, ...args) {
+      if (phase === 'read-failure' && path.resolve(file) === f.filePath) throw new Error('F4 ordinary read refusal');
+      return originalRead.call(fs.promises, file, ...args);
+    };
+    const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    try {
+      assert.equal((await scan()).success, true);
+      const initial = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(initial.status, 'scanned');
+      if (mode === 'zero') {
+        assert.deepEqual(initial.requiredReferences, []);
+        assert.equal(initial.reason, 'ordinary-scan-finished');
+        return;
+      }
+      assert.ok(initial.requiredReferences.some(ref => ref.path === known));
+      phase = mode;
+      const result = await scan();
+      assert.equal(result.success, true, 'legacy capture remains lenient');
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'failed', 'extractor refusal must not certify empty success');
+      assert.equal(record.reason, 'source-verification-unavailable');
+      assert.ok(record.requiredReferences.some(ref => ref.path === known), 'prior declared reference survives');
+      assert.notEqual(record.inventoryStatus, 'complete');
+      assert.ok([...f.current().files, ...(f.current().pendingFiles || [])].some(row => row.path === known));
+      if (mode === 'partial-failure') {
+        assert.ok(record.requiredReferences.some(ref => ref.path === fresh));
+        assert.ok([...f.current().files, ...(f.current().pendingFiles || [])].some(row => row.path === fresh),
+          'successful legacy entries still admit beside a refused entry');
+      }
+      f.current().workingSourceSelections = {};
+      assert.equal((await scan()).success, false, 'engaged verification still rejects extraction refusal');
+      assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+    } finally { fs.promises.readFile = originalRead; clearTrackedTimers(); }
+  }
+
+  for (const ext of ['.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd']) {
+    for (const mode of ['zero', 'partial-failure', 'listing-failure']) {
+      baselineTest(`F4 ordinary ${ext} ${mode}: honest status and retained legacy roles`, () => ordinaryFailureCase(ext, mode));
+    }
+  }
+  for (const ext of ['.xd', '.ppt', '.fig', '.pptx', '.key']) {
+    for (const mode of ['zero', 'read-failure']) {
+      baselineTest(`F4 ordinary ${ext} ${mode}: honest status and retained legacy roles`, () => ordinaryFailureCase(ext, mode));
+    }
+  }
+
+  baselineTest('F4 InDesign query refusal retains prior references and lenient fallback capture', async () => {
+    const f = await correctionProject('.indd');
+    const known = path.join(TEST_HOME, 'Desktop', 'KnownInDesign.png');
+    const fresh = path.join(TEST_HOME, 'Desktop', 'FallbackInDesign.png');
+    fs.writeFileSync(known, 'known fixture'); fs.writeFileSync(fresh, 'fresh fixture');
+    let refused = false;
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (String(command).includes('Adobe InDesign')) return { stdout: 'synthetic running InDesign' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) {
+        return refused ? { error: new Error('F4 InDesign query refusal') } : { stdout:
+          `DOC\t${f.filePath}\tCorrection.indd\tfalse\ttrue\t1\nLINK\t${f.filePath}\tCorrection.indd\t${known}\tfalse\ttrue\nEND\t1\t1\t1\t0\n` };
+      }
+      return { stdout: '' };
+    });
+    const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    try {
+      assert.equal((await scan()).success, true);
+      assert.ok(Object.values(f.current().workingSourceVerification)[0].requiredReferences.some(ref => ref.path === known));
+      refused = true; fs.writeFileSync(f.filePath, fresh);
+      assert.equal((await scan()).success, true);
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'failed'); assert.equal(record.reason, 'source-verification-unavailable');
+      for (const linked of [known, fresh]) {
+        assert.ok(record.requiredReferences.some(ref => ref.path === linked));
+        assert.ok([...f.current().files, ...(f.current().pendingFiles || [])].some(row => row.path === linked));
+      }
+      f.current().workingSourceSelections = {};
+      assert.equal((await scan()).success, false, 'strict query refusal still rejects');
+    } finally { clearTrackedTimers(); }
+  });
+
+  baselineTest('F4 InDesign closed-app empty fallback remains an ordinary scan success', async () => {
+    const f = await correctionProject('.indd');
+    setChildProcessHandler(() => ({ stdout: '' }));
+    try {
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null,
+        { allowPausedBaseline: true })).success, true);
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'scanned'); assert.deepEqual(record.requiredReferences, []);
+      assert.equal(record.reason, 'ordinary-scan-finished');
+    } finally { clearTrackedTimers(); }
+  });
+
+  baselineTest('F4 ordinary extractor size limit is explicit and strict mode still rejects', async () => {
+    const f = await correctionProject('.xd');
+    const originalStat = fs.promises.stat;
+    fs.promises.stat = async function oversizedExtractorStat(file, ...args) {
+      const stat = await originalStat.call(fs.promises, file, ...args);
+      return path.resolve(file) === f.filePath ? new Proxy(stat, { get(target, key) {
+        return key === 'size' ? 2 ** 31 : Reflect.get(target, key);
+      } }) : stat;
+    };
+    try {
+      const limits = []; let failures = 0;
+      assert.deepEqual(await metadataTestHooks.extractLinkedAssets(f.filePath, {
+        onOrdinaryScanLimit: reason => limits.push(reason), onOrdinaryScanFailure: () => failures++,
+      }), []);
+      assert.deepEqual(limits, ['source-too-large']); assert.equal(failures, 0);
+      await assert.rejects(metadataTestHooks.extractLinkedAssets(f.filePath, { strict: true }), /asset_baseline_source_too_large/);
+    } finally { fs.promises.stat = originalStat; clearTrackedTimers(); }
+  });
+
+  baselineTest('F4 genuinely oversized sparse source is limited without false byte-change evidence', async () => {
+    const f = await correctionProject('.xd');
+    const originalSize = fs.statSync(f.filePath).size;
+    try {
+      // Owned sparse fixture: actual stat/digest/extractor views all see the
+      // same oversized source. No allocation or read of a multi-gigabyte buffer.
+      fs.truncateSync(f.filePath, 2 ** 31);
+      assert.equal(fs.statSync(f.filePath).size, 2 ** 31);
+      const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+      assert.equal(result.success, true, 'size refusal must not tighten legacy admission');
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'limited'); assert.equal(record.reason, 'ordinary-extractor-source-too-large');
+      assert.equal(record.sourceFingerprint, null); assert.notEqual(record.inventoryStatus, 'complete');
+      f.current().workingSourceSelections = {};
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null,
+        { allowPausedBaseline: true })).success, false, 'strict source size refusal still rejects');
+    } finally { fs.truncateSync(f.filePath, originalSize); clearTrackedTimers(); }
+  });
+
+  baselineTest('F7 mixed-case encoded IDML file schemes preserve lowercase decoding and path boundaries', async () => {
+    const f = await correctionProject('.idml');
+    const linked = path.join(TEST_HOME, 'Desktop', 'Encoded image#.png');
+    const outside = '/private/Encoded outside.png';
+    let scheme = 'file:';
+    setChildProcessHandler(({ command, args }) => command === '/usr/bin/unzip' ? { stdout: args[0] === '-l'
+      ? '     100  01-01-2026  00:00   document.xml\n'
+      : `<Link LinkResourceURI="${scheme}${encodeURI(linked).replace('#', '%23')}"/><Link LinkResourceURI="${scheme}${encodeURI(outside)}"/>` } : { stdout: '' });
+    const lower = await metadataTestHooks.extractLinkedAssetsIdml(f.filePath);
+    assert.ok(lower.includes(linked)); assert.ok(!lower.includes(outside));
+    for (scheme of ['FILE:', 'FiLe:']) {
+      const issues = [];
+      assert.deepEqual(await metadataTestHooks.extractLinkedAssetsIdml(f.filePath), lower);
+      const verified = await metadataTestHooks.extractLinkedAssetsIdml(f.filePath, {
+        strict: true, ordinaryVerification: true, onUnresolvedDependency: reason => issues.push(reason),
+      });
+      assert.ok(verified.includes(linked)); assert.ok(verified.includes(outside));
+      assert.deepEqual(issues, ['unsupported-declared-link-uri'], 'only the outside admission path is unresolved');
+    }
+    clearTrackedTimers();
+  });
+
+  baselineTest('F7 unsupported IDML schemes remain declared obligations without path admission', async () => {
+    const f = await correctionProject('.idml');
+    setChildProcessHandler(({ command, args }) => command === '/usr/bin/unzip' ? { stdout: args[0] === '-l'
+      ? '     100  01-01-2026  00:00   document.xml\n'
+      : '<Link LinkResourceURI="https://example.invalid/Required.png"/><Link LinkResourceURI="FiLeX:../Required.png"/>' } : { stdout: '' });
+    const issues = [];
+    assert.deepEqual(await metadataTestHooks.extractLinkedAssetsIdml(f.filePath, {
+      strict: true, ordinaryVerification: true, onUnresolvedDependency: reason => issues.push(reason),
+    }), []);
+    assert.deepEqual(issues, ['unsupported-declared-link-uri', 'unsupported-declared-link-uri']);
+    const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    assert.equal(result.success, true);
+    const record = Object.values(f.current().workingSourceVerification)[0];
+    assert.equal(record.unresolved.length, 2);
+    assert.ok(record.unresolved.every(item => item.reason === 'unsupported-declared-link-uri'));
+    clearTrackedTimers();
+  });
+
+  async function f1LinkedRecheck(mode, strictKind = null) {
+    const f = await correctionProject('.ai');
+    const linked = path.join(TEST_HOME, 'Desktop', 'F1-linked.png');
+    fs.writeFileSync(linked, 'synthetic linked asset');
+    fs.writeFileSync(f.filePath, `%PDF-1.7\n${linked}\n%%EOF\n`);
+    if (strictKind === 'baseline') f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan' };
+    if (strictKind === 'selection') f.current().workingSourceSelections = {};
+    const frozenStat = fs.statSync(f.filePath);
+    const originalRead = fs.promises.readFile, originalOpen = fs.promises.open, originalStat = fs.promises.stat;
+    let reached = false;
+    fs.promises.readFile = async function moveAfterOrdinaryRead(filePath, ...args) {
+      const data = await originalRead.call(fs.promises, filePath, ...args);
+      if (filePath === f.filePath && !reached) {
+        reached = true;
+        if (mode === 'same-identity') fs.writeFileSync(filePath, data.toString().replace('%PDF-1.7', '%PDF-1.6'));
+        else if (mode !== 'read-refusal') fs.appendFileSync(filePath, '\nsource moved during extraction');
+      }
+      return data;
+    };
+    fs.promises.stat = async function controlledStat(filePath, ...args) {
+      if (mode === 'same-identity' && filePath === f.filePath && !args[0]?.bigint) return frozenStat;
+      return originalStat.call(fs.promises, filePath, ...args);
+    };
+    fs.promises.open = async function controlledOpen(filePath, ...args) {
+      if (mode === 'read-refusal' && filePath === f.filePath && reached) throw new Error('synthetic recheck read refusal');
+      const handle = await originalOpen.call(fs.promises, filePath, ...args);
+      if (mode === 'same-identity' && filePath === f.filePath) {
+        const originalHandleStat = handle.stat.bind(handle);
+        handle.stat = options => options?.bigint ? originalHandleStat(options) : Promise.resolve(frozenStat);
+      }
+      return handle;
+    };
+    try {
+      const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+      assert.equal(reached, true, 'fixture moves/refuses after initial digest, during extraction');
+      const admitted = [...f.current().files, ...(f.current().pendingFiles || [])].filter(file => file.path === linked);
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      if (strictKind) {
+        assert.equal(result.success, false);
+        assert.equal(result.error, strictKind === 'baseline' ? 'asset_baseline_scan_incomplete' : 'scan_on_open_failed');
+        assert.equal(admitted.length, 0); assert.equal(record.status, 'failed');
+      } else {
+        assert.equal(result.success, true, 'legacy admission must survive a side-ledger recheck refusal');
+        assert.equal(admitted.length, 1);
+        assert.equal(record.status, mode === 'read-refusal' ? 'failed' : 'stale');
+        assert.equal(record.reason, mode === 'read-refusal' ? 'source-verification-unavailable' : 'source-bytes-changed');
+        assert.equal(record.sourceFingerprint, null);
+        assert.equal(record.requiredReferences[0].path, linked);
+        assert.notEqual(record.inventoryStatus, 'complete');
+      }
+    } finally {
+      fs.promises.readFile = originalRead; fs.promises.open = originalOpen; fs.promises.stat = originalStat;
+      clearTrackedTimers();
+    }
+  }
+
+  for (const mode of ['stat-change', 'same-identity', 'read-refusal']) {
+    baselineTest(`F1 recheck: untouched linked admission survives ${mode}`, () => f1LinkedRecheck(mode));
+  }
+  for (const strictKind of ['baseline', 'selection']) {
+    baselineTest(`F1 recheck: ${strictKind} still rejects moving source bytes`, () => f1LinkedRecheck('stat-change', strictKind));
+  }
+
+  baselineTest('F1 recheck: legacy PSD admits owned embedded output after source movement', async () => {
+    const f = await correctionProject('.psd');
+    const originalTmpdir = os.tmpdir;
+    const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'f1-owned-tmp-'));
+    os.tmpdir = () => privateTmp;
+    const data = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
+    let parsed = false;
+    currentPsdFixture = () => {
+      parsed = true; fs.appendFileSync(f.filePath, '\nchanged after ordinary linked-path extraction');
+      return { children: [], linkedFiles: [{ name: 'F1-embedded.png', data }] };
+    };
+    try {
+      const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+      assert.equal(parsed, true);
+      assert.equal(result.success, true, 'post-parser recheck must not abort legacy PSD admission');
+      const admitted = [...f.current().files, ...(f.current().pendingFiles || [])]
+        .filter(file => file.source === 'psd-embedded' && file.name === 'F1-embedded.png');
+      assert.equal(admitted.length, 1);
+      assert.ok(admitted[0].path.startsWith(privateTmp + path.sep));
+      assert.deepEqual(fs.readFileSync(admitted[0].path), data);
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'stale'); assert.equal(record.sourceFingerprint, null);
+      assert.notEqual(record.inventoryStatus, 'complete');
+    } finally {
+      currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+      metadataTestHooks.clearPsdParseDebounce(f.filePath);
+      fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers();
+    }
+  });
+
+  baselineTest('confirmed correction 1: legacy auto masters dedupe while explicit and selected roots remain independent', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    const second = path.join(TEST_HOME, 'Desktop', 'second', path.basename(f.filePath));
+    fs.mkdirSync(path.dirname(second)); fs.copyFileSync(f.filePath, second);
+    f.project.files[0].source = 'auto-captured'; delete f.project.files[0].acceptedPending;
+    f.project.files.push({ ...f.project.files[0], path: second });
+    assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).totalFiles, 1);
+    f.current().files.forEach(file => { file.source = 'manual'; file.acceptedPending = true; });
+    assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).totalFiles, 2);
+    f.current().files.forEach(file => { file.source = 'auto-captured'; delete file.acceptedPending; });
+    f.current().workingSourceSelections = {};
+    assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).totalFiles, 2);
+    clearTrackedTimers();
+  });
+
+  baselineTest('confirmed correction 2: IDML extra paths are verification evidence only', async () => {
+    const f = await correctionProject('.idml');
+    const supported = path.join(TEST_HOME, 'Desktop', 'Supported.png');
+    const extra = '/private/Required.png';
+    setChildProcessHandler(({ command, args }) => command === '/usr/bin/unzip' ? { stdout: args[0] === '-l'
+      ? '     100  01-01-2026  00:00   document.xml\n'
+      : `<Link LinkResourceURI="file:${supported}"/><Link LinkResourceURI="file:${extra}"/>` } : { stdout: '' });
+    const legacy = await metadataTestHooks.extractLinkedAssetsIdml(f.filePath);
+    assert.deepEqual(legacy, [supported]);
+    const issues = [];
+    const verified = await metadataTestHooks.extractLinkedAssetsIdml(f.filePath,
+      { strict: true, ordinaryVerification: true, onUnresolvedDependency: reason => issues.push(reason) });
+    assert.deepEqual(verified, [supported, extra]);
+    assert.deepEqual(issues, ['unsupported-declared-link-uri']);
+    clearTrackedTimers();
+  });
+
+  baselineTest('confirmed correction 3: malformed ordinary AI stays lenient while baseline and selection remain strict', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\nmissing EOF');
+    const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    assert.equal((await scan()).success, true);
+    assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'scanned');
+    f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan' };
+    assert.equal((await scan()).error, 'asset_baseline_scan_incomplete');
+    f.current().assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include' };
+    f.current().workingSourceSelections = {};
+    assert.equal((await scan()).error, 'scan_on_open_failed');
+    assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+    clearTrackedTimers();
+  });
+
+  baselineTest('confirmed correction 3: lenient IDML entry failure does not tighten untouched admission', async () => {
+    const f = await correctionProject('.idml');
+    const link = path.join(TEST_HOME, 'Desktop', 'Required.png'); fs.writeFileSync(link, 'synthetic asset');
+    setChildProcessHandler(({ command, args }) => {
+      if (command !== '/usr/bin/unzip') return { stdout: '' };
+      if (args[0] === '-l') return { stdout: '     100  01-01-2026  00:00   good.xml\n     100  01-01-2026  00:00   failed.xml\n' };
+      if (args[2] === 'failed.xml') return { error: new Error('synthetic unreadable entry') };
+      return { stdout: `<Link LinkResourceURI="file:${link}"/>` };
+    });
+    const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    assert.equal((await scan()).success, true);
+    assert.equal(Object.values(f.current().workingSourceVerification)[0].requiredReferences[0].path, link);
+    assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+    f.current().workingSourceSelections = {};
+    assert.equal((await scan()).success, false);
+    clearTrackedTimers();
+  });
+
+  baselineTest('confirmed correction 3: untouched PSD retains ordinary parser route and debounce', async () => {
+    const f = await correctionProject('.psd'); let parses = 0;
+    currentPsdFixture = () => { parses++; return { children: [], linkedFiles: [] }; };
+    try {
+      const scan = () => metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+      assert.equal((await scan()).success, true); assert.equal(parses, 1);
+      assert.equal(Object.values(f.current().workingSourceVerification)[0].provider, 'psd-ordinary');
+      assert.equal((await scan()).skipped, 'ordinary-scan-debounced'); assert.equal(parses, 1);
+      assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'scanned');
+      fs.appendFileSync(f.filePath, '\nchanged saved bytes');
+      assert.equal((await scan()).skipped, 'ordinary-scan-debounced'); assert.equal(parses, 1);
+      assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'incomplete');
+      assert.notEqual(Object.values(f.current().workingSourceVerification)[0].inventoryStatus, 'complete');
+      metadataTestHooks.clearPsdParseDebounce(f.filePath);
+      currentPsdFixture = new Error('synthetic ordinary parser failure');
+      assert.equal((await scan()).success, true);
+      assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+    } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  baselineTest('confirmed correction 3: side-ledger digest refusal does not block legacy capture', async () => {
+    const f = await correctionProject('.ai');
+    const originalOpen = fs.promises.open;
+    fs.promises.open = async function failLedgerOpen(filePath, ...args) {
+      if (filePath === f.filePath) throw new Error('synthetic digest open refusal');
+      return originalOpen.call(fs.promises, filePath, ...args);
+    };
+    try {
+      const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+      assert.equal(result.success, true);
+      const record = Object.values(f.current().workingSourceVerification)[0];
+      assert.equal(record.status, 'failed'); assert.equal(record.reason, 'source-verification-unavailable');
+      assert.equal(record.sourceFingerprint, null);
+    } finally { fs.promises.open = originalOpen; clearTrackedTimers(); }
+  });
+
+  baselineTest('confirmed correction 4: closed InDesign still fails first-scan baseline dependability', async () => {
+    const f = await correctionProject('.indd');
+    f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan' };
+    setChildProcessHandler(() => ({ error: new Error('synthetic process check failure') }));
+    const result = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+    assert.equal(result.error, 'asset_baseline_scan_incomplete');
+    assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
+    clearTrackedTimers();
+  });
+
+  for (const mode of ['ready', 'missing', 'excluded']) {
+    baselineTest(`confirmed correction 6: PSD save refreshes current bytes and preserves ${mode} state`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd', actual.writePsdBuffer({ width: 1, height: 1 }));
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const row = workspace.files.find(file => file.name === path.basename(f.filePath));
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const previous = Object.values(f.current().workingSourceVerification)[0];
+        assert.equal(previous.status, 'scanned');
+        if (mode === 'excluded') await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+        const beforeSave = JSON.stringify(f.current().workingSourceVerification);
+        const link = path.join(TEST_HOME, 'Desktop', 'Missing.png');
+        const linkedFiles = mode === 'missing' ? [{ id: '11111111-1111-4111-8111-111111111111', name: 'Missing.png', childDocumentID: '',
+          linkedFile: { fileSize: 10, name: 'Missing.png', fullPath: link, originalPath: link, relativePath: '../Missing.png' } }] : [];
+        fs.writeFileSync(f.filePath, actual.writePsdBuffer({ width: 2, height: 1, linkedFiles }));
+        if (mode !== 'excluded') assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.unresolvedVerification, 1);
+        const save = await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+        if (mode === 'excluded') {
+          assert.equal(save.skipped, 'source-excluded');
+          assert.equal(JSON.stringify(f.current().workingSourceVerification), beforeSave);
+        } else {
+          assert.equal(save.success, true);
+          const current = Object.values(f.current().workingSourceVerification)[0];
+          assert.equal(current.status, 'scanned'); assert.notEqual(current.attempt, previous.attempt);
+          assert.equal(current.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(f.filePath)).digest('hex'));
+          const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(review.materializable, mode === 'ready');
+          assert.equal(review.semanticCounts.missingRequiredReferences, mode === 'missing' ? 1 : 0);
+          assert.deepEqual((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts, review.semanticCounts);
+        }
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
+  async function restoreRoute(ext, mode, container = false) {
+    resetTestHomeWorkspace();
+    const filePath = path.join(TEST_HOME, 'Desktop', 'Route' + ext);
+    const linkPath = path.join(TEST_HOME, 'Desktop', 'Missing.png');
+    const content = mode === 'missing' || mode === 'native-missing' ? linkPath : (mode === 'unsupported' ? '../Required.png' : '');
+    fs.writeFileSync(filePath, ext === '.ai' || ext === '.pdf'
+      ? `%PDF-1.7\n${content}\n${mode === 'failed' ? '' : '%%EOF\n'}` : `synthetic saved route bytes\n${content}\n`);
+    const commands = [];
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (mode === 'native-missing') {
+        if (String(command).includes('Adobe InDesign')) return { stdout: 'synthetic running process' };
+        if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-query.applescript')) return { stdout:
+          `DOC\t${filePath}\tRoute.indd\tfalse\ttrue\t1\nLINK\t${filePath}\tRoute.indd\t${linkPath}\tfalse\ttrue\nEND\t1\t1\t1\t0\n` };
+      }
+      if (command !== '/usr/bin/unzip') return { stdout: '' };
+      commands.push([...args]);
+      if (mode === 'failed') return { error: new Error('synthetic container failure') };
+      if (args[0] === '-l') return { stdout: '     100  01-01-2026  00:00   document.json\n     100  01-01-2026  00:00   document.xml\n' };
+      if (args[0] === '-p') return { stdout: !content ? '<Document/>' :
+        (args[2].endsWith('.json') ? JSON.stringify({ externalLink: content }) : `<Link LinkResourceURI="file:${content}"/>`) };
+      return { stdout: '' };
+    });
+    const created = await createProject('Ordinary route ' + ext); clearTrackedTimers();
+    const project = storeInstance.data.projects.find(p => p.id === created.id);
+    project.assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
+    project.files.push({ path: filePath, name: 'Route' + ext, ext, source: 'user-added', acceptedPending: true,
+      projectRole: 'source', addedAt: Date.now() });
+    const initial = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const row = initial.files.find(file => file.name === 'Route' + ext);
+    await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+    const result = await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity,
+      { action: 'restore', expectedRevision: 1 });
+    const current = storeInstance.data.projects.find(p => p.id === project.id);
+    const verification = Object.values(current.workingSourceVerification)[0];
+    assert.equal(result.success, true);
+    assert.equal(verification.status, mode === 'failed' ? 'failed' : 'scanned');
+    assert.equal(verification.inventoryStatus, 'unverified');
+    if (container) assert.ok(commands.some(args => args[0] === '-tqq'), 'ordinary container admission was exercised');
+    if (mode === 'missing' || mode === 'native-missing') {
+      assert.equal(verification.requiredReferences[0].path, linkPath);
+      assert.equal(result.semanticCounts.missingRequiredReferences, 1);
+    }
+    if (mode === 'native-missing') {
+      assert.equal(result.semanticCounts.unresolvedVerification, 1);
+      assert.ok(verification.unresolved.some(item => item.reason === 'indesign-live-current-bytes-unbound'));
+    }
+    if (mode === 'unsupported') {
+      assert.equal(result.semanticCounts.unresolvedVerification, 1);
+      assert.ok(verification.unresolved.some(item => item.reason === 'unsupported-declared-link-uri'));
+    }
+    if (mode === 'failed') assert.equal(result.semanticCounts.unresolvedVerification, 1);
+    if (mode === 'zero') assert.equal(result.semanticCounts.unresolvedVerification, 0);
+    clearTrackedTimers();
+  }
+
+  for (const ext of ['.ai', '.pdf', '.xd', '.ppt', '.fig', '.indd']) {
+    for (const mode of ext === '.ai' || ext === '.pdf' ? ['zero', 'missing', 'failed'] : ['zero', 'missing']) {
+      baselineTest(`ordinary regex Restore ${ext} ${mode} main route`, () => restoreRoute(ext, mode));
+    }
+  }
+  for (const ext of ['.idml', '.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd', '.pptx', '.key']) {
+    for (const mode of ['zero', 'missing', 'failed']) {
+      baselineTest(`ordinary container Restore ${ext} ${mode} main route with modeled unzip`, () => restoreRoute(ext, mode, true));
+    }
+  }
+  baselineTest('InDesign live declared missing link survives existence filtering and holds unbound saved bytes',
+    () => restoreRoute('.indd', 'native-missing'));
+  baselineTest('IDML unsupported declared URI blocks without a complete-empty verdict', () => restoreRoute('.idml', 'unsupported', true));
 }
