@@ -1712,6 +1712,145 @@ function baselineCases() {
     });
   }
 
+  for (const domain of ['root', 'layer']) {
+    baselineTest(`output closure bytes: ${domain} source-bound receipt refuses altered physical output and recovers exact bytes`, async () => {
+      const object = { id: psdId, name: 'Bound.png', data: embeddedPng };
+      const f = await workingPsdFixture(domain === 'root' ? [object] : [],
+        domain === 'layer' ? [{ name: 'bound layer', linkedFiles: [object] }] : []);
+      try {
+        const output = f.rows()[0]; const sourceBytes = fs.readFileSync(f.filePath);
+        const stat = fs.statSync(output.path); const altered = Buffer.from(embeddedPng); altered[altered.length - 1] ^= 1;
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+        fs.writeFileSync(output.path, altered); fs.utimesSync(output.path, stat.atimeMs / 1000, stat.mtimeMs / 1000);
+        assert.deepEqual(fs.readFileSync(f.filePath), sourceBytes);
+        const changed = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(changed.materializable, false, 'actual derived bytes must satisfy the validated current source receipt');
+        assert.equal(changed.token, undefined);
+        fs.writeFileSync(output.path, embeddedPng);
+        const recovered = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(recovered.materializable, true); assert.equal(recovered.totalFiles, 2);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const fault of ['not-array', 'wrong-source', 'wrong-output', 'too-many', 'long-path', 'total-path-budget']) {
+    baselineTest(`rejected receipt: ${fault} blocks workspace and review conservatively`, async () => {
+      const f = await workingPsdFixture([{ id: psdId, name: 'Receipt.png', data: embeddedPng }], [], false, true);
+      try {
+        const output = f.rows()[0];
+        await callIpcRaw('projects:reject-pending', f.project.id, output.path);
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(),
+          f.current().files.find(row => row.path === f.filePath));
+        const record = f.current().workingSourceVerification[key];
+        assert.equal(record.requiredEmbeddedOutputs.length, 1, 'receipt comes from an actual validated worker result');
+        const receipt = { ...record.requiredEmbeddedOutputs[0] };
+        if (fault === 'not-array') record.requiredEmbeddedOutputs = {};
+        else if (fault === 'wrong-source') record.requiredEmbeddedOutputs = [{ ...receipt, sourceDigest: '0'.repeat(64) }];
+        else if (fault === 'wrong-output') record.requiredEmbeddedOutputs = [{ ...receipt, outputDigest: 'invalid' }];
+        else if (fault === 'too-many') record.requiredEmbeddedOutputs = Array(8193).fill(receipt);
+        else if (fault === 'long-path') record.requiredEmbeddedOutputs = [{ ...receipt, path: '/Users/' + 'x'.repeat(16384) }];
+        else record.requiredEmbeddedOutputs = Array(4096).fill({ ...receipt, path: '/Users/' + 'x'.repeat(1100) });
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.workingSourceSelectionBlocked, true); assert.ok(workspace.semanticCounts.unresolvedVerification > 0);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) for (const route of ['restore', 'save']) {
+    baselineTest(`rejected output: ${domain} ${route} retains source obligation through rejection reload exclusion and retirement`, async () => {
+      const object = { id: psdId, name: 'Rejected.png', data: embeddedPng };
+      const linked = domain === 'root' ? [object] : [];
+      const children = domain === 'layer' ? [{ name: 'rejected layer', linkedFiles: [object] }] : [];
+      const f = await workingPsdFixture(route === 'restore' ? linked : [], route === 'restore' ? children : [], false, true);
+      try {
+        if (route === 'save') await f.save(linked, children, 2);
+        const output = JSON.parse(JSON.stringify(f.rows()[0]));
+        const sourceBytes = fs.readFileSync(f.filePath);
+        assert.equal(f.current().pendingFiles.some(row => row.fileId === output.fileId), true);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+        await callIpcRaw('projects:reject-pending', f.project.id, output.path);
+        assert.equal(f.rows().length, 0, 'Reject keeps its normal row-removal behavior');
+        assert.ok(f.current().excludedAssetKeys.includes(output.fileId), 'Reject intent survives');
+        assert.deepEqual(fs.readFileSync(f.filePath), sourceBytes, 'rejection never changes the source proof');
+        assert.ok(fs.existsSync(output.path));
+        const assertBlocked = async () => {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          assert.equal(workspace.workingSourceSelectionBlocked, true, 'deleting the candidate cannot erase its source requirement');
+          assert.equal(workspace.semanticCounts.missingRequiredReferences, 1);
+          const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+          assert.equal(review.semanticCounts.missingRequiredReferences, 1);
+        };
+        await assertBlocked();
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        await assertBlocked();
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const source = workspace.files.find(row => row.name === path.basename(f.filePath));
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+        const excludedReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(excludedReview.semanticCounts.selectedWorkingSources, 0);
+        assert.equal(excludedReview.semanticCounts.missingRequiredReferences, 0);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, false,
+          'inactive root does not require its rejected output; an empty package is still unavailable');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 3 });
+        const restoredOutput = f.rows()[0];
+        assert.ok(restoredOutput, 'a fresh Restore reparses the current saved producer');
+        await callIpcRaw('projects:reject-pending', f.project.id, restoredOutput.path);
+        await assertBlocked();
+        await f.save([], [], 4);
+        const retired = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(retired.materializable, true); assert.equal(retired.totalFiles, 1);
+        assert.equal(retired.semanticCounts.missingRequiredReferences, 0);
+        assert.ok(f.current().excludedAssetKeys.includes(output.fileId)); assert.ok(fs.existsSync(output.path));
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const domain of ['root', 'layer']) {
+    baselineTest(`rejected output: ${domain} retirement preserves another real source obligation after rejection`, async () => {
+      const object = { id: psdId, name: 'Shared.png', data: embeddedPng };
+      const f = await workingPsdFixture(domain === 'root' ? [object] : [],
+        domain === 'layer' ? [{ name: 'shared layer', linkedFiles: [object] }] : [], false, true);
+      try {
+        const output = JSON.parse(JSON.stringify(f.rows()[0]));
+        await callIpcRaw('projects:reject-pending', f.project.id, output.path);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false,
+          'a later independent scanner must not be needed to notice the rejected obligation');
+        const otherPath = path.join(TEST_HOME, 'Desktop', 'Other-required.ai');
+        fs.writeFileSync(otherPath, `%PDF-1.7\n${output.path}\n%%EOF\n`);
+        f.current().files.push({ path: otherPath, name: path.basename(otherPath), ext: '.ai', source: 'user-added',
+          acceptedPending: true, projectRole: 'source' });
+        assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, otherPath, null, null,
+          { establishBaseline: false, allowPausedBaseline: true })).success, true);
+        let workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const physical = f.current().files.find(row => row.path === output.path);
+        assert.ok(physical, 'actual ordinary scanner satisfies the physical obligation');
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+        await callIpcRaw('projects:remove-file', f.project.id,
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, physical));
+        assert.equal(f.current().files.some(row => row.path === output.path), true, 'asset removal preserves the row and toggles exclusion');
+        assert.ok(f.current().excludedAssetKeys.includes(physical.fileId || physical.path));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true,
+          'a known required asset overrides its exclusion');
+        await f.save([], [], 2);
+        const stillRequired = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(stillRequired.materializable, true); assert.equal(stillRequired.totalFiles, 3);
+        const retained = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row =>
+          row.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, physical));
+        assert.equal(retained.includedAsDependency, true); assert.deepEqual(retained.requiredBy, [path.basename(otherPath)],
+          'retiring the PSD resource cannot erase another root external reference');
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const other = workspace.files.find(row => row.name === path.basename(otherPath));
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const released = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(released.materializable, true); assert.equal(released.totalFiles, 1);
+        assert.ok(f.current().excludedAssetKeys.includes(output.fileId)); assert.ok(fs.existsSync(output.path));
+      } finally { f.cleanup(); }
+    });
+  }
+
   for (const domain of ['root', 'layer']) for (const route of ['restore', 'save']) for (const admission of ['direct', 'pending']) {
     baselineTest(`producer closure: non-Add-Files ${route} ${domain} ${admission} survives acceptance exclusion reload and saves`, async () => {
       const original = { id: psdId, name: 'Ordinary.bin', data: Buffer.from('ordinary original output') };

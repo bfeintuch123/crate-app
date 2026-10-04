@@ -3601,6 +3601,15 @@ function getWorkingSourceVerification(project, file) {
           !['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(record.sourceIdentity[key]))))) return null;
   // "scanned" proves ordinary-route parity on these bytes, never exhaustive
   // inventory certification. No provider can publish a "complete" verdict.
+  // This optional domain is published only by a byte-validated PSD scan.
+  // It outlives candidate rows, so Reject cannot erase a producer obligation.
+  if (record.requiredEmbeddedOutputs !== undefined &&
+      (!Array.isArray(record.requiredEmbeddedOutputs) || record.requiredEmbeddedOutputs.length > 8192 ||
+        !record.requiredEmbeddedOutputs.every(output => output && typeof output.path === 'string' &&
+          path.isAbsolute(output.path) && output.path.length <= 16384 &&
+          /^[a-f0-9]{64}$/.test(output.sourceDigest || '') && output.sourceDigest === record.sourceFingerprint &&
+          /^[a-f0-9]{64}$/.test(output.outputDigest || '')) ||
+        record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return null;
   return record;
 }
 
@@ -3623,7 +3632,9 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const links = edges.get(source) || new Map(); links.set(target, resourcePath); edges.set(source, links);
   }
   for (const file of files) {
-    for (const ref of getWorkingSourceVerification(project, file)?.requiredReferences || []) edge(file.path, ref.path);
+    const verification = getWorkingSourceVerification(project, file);
+    for (const ref of verification?.requiredReferences || []) edge(file.path, ref.path);
+    if (engaged) for (const output of verification?.requiredEmbeddedOutputs || []) edge(file.path, output.path);
     const evidence = file.captureEvidence || {};
     const relationshipSource = evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath;
     // A source-validated reconciliation disproved only this resource's former
@@ -3738,7 +3749,8 @@ function getDormantWorkingSourceReviewFacts(record) {
   const failed = ['failed', 'limited', 'incomplete', 'stale'].includes(status) ||
     (status === 'unavailable' && record.reason !== 'not-scanned');
   return { status: failed ? status : null, reason: failed ? record.reason || null : null,
-    requiredReferences: record?.requiredReferences || [], unresolved: record?.unresolved || [] };
+    requiredReferences: record?.requiredReferences || [], requiredEmbeddedOutputs: record?.requiredEmbeddedOutputs || [],
+    unresolved: record?.unresolved || [] };
 }
 
 function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null) {
@@ -14302,10 +14314,16 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   // validated save disproves these old producer edges. Another root reaching
   // the parent PSD must not keep its obsolete output through the old edge.
   const prospectiveRow = row => retire.has(row) ? { ...row, psdResource: { ...row.psdResource, current: false } } : row;
-  const membership = getWorkingSourceMembership({ ...project,
-    files: project.files.map(prospectiveRow), pendingFiles: (project.pendingFiles || []).map(prospectiveRow) });
   const sourceRow = project.files.find(row => !isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.path) === parent);
   const sourceKey = getAssetBaselineSourceRecoveryRouteKey(project, sourceRow);
+  const sourceVerification = getWorkingSourceVerification(project, sourceRow);
+  const retiredPaths = new Set([...retire].map(row => normalizeTrackedFilePath(row.path)));
+  const prospectiveVerification = sourceVerification ? { ...project.workingSourceVerification, [sourceKey]: {
+    ...sourceVerification, requiredEmbeddedOutputs: (sourceVerification.requiredEmbeddedOutputs || [])
+      .filter(output => !retiredPaths.has(normalizeTrackedFilePath(output.path))),
+  } } : project.workingSourceVerification;
+  const membership = getWorkingSourceMembership({ ...project, workingSourceVerification: prospectiveVerification,
+    files: project.files.map(prospectiveRow), pendingFiles: (project.pendingFiles || []).map(prospectiveRow) });
   const detached = [...retire].filter(row => [...(membership.requiredByPath.get(normalizeTrackedFilePath(row.path))?.sources.keys() || [])]
     .some(key => key !== sourceKey));
   for (const row of detached) retire.delete(row);
@@ -14686,6 +14704,23 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         }
       }
       const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
+      if (workingScan && psdTransaction && verificationScan) {
+        // Bind requirements to this validated source and exact reconciled
+        // output paths, including retained outputs whose fresh stage is cleaned.
+        // Keep embedded output receipts separate from external references.
+        const reconciliationByAsset = new Map((workingReconciliation?.items || []).map(item => [item.asset, item]));
+        const acceptanceByAsset = new Map((acceptance?.items || []).map(item => [item.asset, item]));
+        const outputs = psdAssets.filter(asset => asset.source === 'psd-embedded').map(asset => {
+          const item = reconciliationByAsset.get(asset);
+          const baseline = acceptanceByAsset.get(asset);
+          return { path: item?.retained ? item.previous.path : baseline?.previous?.path || asset.filePath,
+            sourceDigest: sourceFingerprint, outputDigest: asset.outputDigest };
+        });
+        const bounded = collectWorkingSourceScanEvidence(outputs.map(output => output.path));
+        const outputByPath = new Map(outputs.map(output => [normalizeTrackedFilePath(output.path), output]));
+        scanEvidence.requiredEmbeddedOutputs = bounded.requiredReferences.map(ref => outputByPath.get(normalizeTrackedFilePath(ref.path)));
+        scanEvidence.limited ||= bounded.limited || bounded.unresolved.length > 0;
+      }
       let psdRowsAccepted = false;
       const psdResult = mutateProject(projectId, (proj) => {
         if (
@@ -18881,6 +18916,28 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   }
 }
 
+function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries) {
+  const unavailable = new Set(), digestByEntry = new Map();
+  if (!hasWorkingSourceSelectionState(project)) return unavailable;
+  const entryByPath = new Map(files.map((file, index) => [normalizeTrackedFilePath(file.path), index]));
+  for (const source of project.files || []) {
+    const fact = membership.facts.get(getTrackedFileDedupKey(source));
+    if (!fact || !((fact.sourceSelection === 'selected' && fact.included) || fact.includedAsDependency)) continue;
+    for (const output of getWorkingSourceVerification(project, source)?.requiredEmbeddedOutputs || []) {
+      const index = entryByPath.get(normalizeTrackedFilePath(output.path));
+      if (index === undefined) continue; // Missing membership is already blocked.
+      try {
+        if (!digestByEntry.has(index)) {
+          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path, entries[index].sourceFingerprint);
+          digestByEntry.set(index, fingerprint.slice(fingerprint.lastIndexOf(':') + 1));
+        }
+        if (digestByEntry.get(index) !== output.outputDigest) unavailable.add(index);
+      } catch (_) { unavailable.add(index); }
+    }
+  }
+  return unavailable;
+}
+
 async function buildCanonicalPackageReviewManifest(projectId) {
   for (let attempt = 0; attempt < 4; attempt++) {
     const project = getProjects().find(item => item && item.id === projectId);
@@ -18917,6 +18974,12 @@ async function buildCanonicalPackageReviewManifest(projectId) {
         materializable: false,
       };
     }
+    const unavailableOutputs = getUnsatisfiedWorkingPsdOutputEntries(currentProject, membership, files, entries);
+    if (unavailableOutputs.size > 0) return {
+      project: currentProject, files, entries,
+      entryStatuses: entryStatuses.map((status, index) => unavailableOutputs.has(index) ? 'unavailable' : status),
+      reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
+    };
     let plan;
     try {
       plan = await buildAuthoritativePackagePlan(
