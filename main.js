@@ -3604,11 +3604,12 @@ function getWorkingSourceVerification(project, file) {
   return record;
 }
 
-function getWorkingSourceMembership(project) {
+function getWorkingSourceMembership(project, packageFiles = null) {
   const files = deduplicateFiles(getIllustratorScopedProjectView(project)?.files || []);
   const engaged = hasWorkingSourceSelectionState(project);
   const sources = files.filter(isWorkingSourceFile);
   const byPath = new Map(files.map(file => [normalizeTrackedFilePath(file.path), file]));
+  const packagePaths = packageFiles && new Set(packageFiles.map(file => normalizeTrackedFilePath(file.path)));
   const requiredByPath = new Map();
   const edges = new Map();
   function edge(sourcePath, resourcePath) {
@@ -3654,9 +3655,13 @@ function getWorkingSourceMembership(project) {
     const verificationRequired = engaged && included && ((selectedSource && (selection.revision > 0 ||
       (!!persistedVerification && !unscannedExcludedRole))) ||
       (includedAsDependency && !!persistedVerification && !unscannedExcludedRole));
+    // The final package selector still enforces observer and Figma scope vetoes.
+    // A veto cannot silently remove an engaged root or known required role.
+    const packageSelectionOmitted = engaged && packagePaths && included &&
+      (selectedSource || includedAsDependency) && !packagePaths.has(normalizeTrackedFilePath(file.path));
     let verificationStatus = selection?.state === 'invalid' ? 'invalid' : verification?.status || 'unavailable';
     if (verificationRequired && ['scanned', 'no-extractor'].includes(verification?.status) && !isWorkingSourceDiskIdentityCurrent(file, verification)) verificationStatus = 'stale';
-    const unresolved = selection?.state === 'invalid' || (verificationRequired &&
+    const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
       (!verification || !['scanned', 'no-extractor'].includes(verificationStatus) || verification.unresolved.length > 0));
     facts.set(getTrackedFileDedupKey(file), { sourceSelection: selection?.state || null, selectionReason: selection?.reason || null,
       selectionRevision: selection?.revision ?? null, includedAsDependency, included,
@@ -3674,7 +3679,7 @@ function getWorkingSourceMembership(project) {
     }
   }
   for (const [key, obligation] of requiredByPath) {
-    if (!byPath.has(key) || !fs.existsSync(obligation.path)) counts.missingRequiredReferences++;
+    if (!byPath.has(key) || !fs.existsSync(obligation.path) || (packagePaths && !packagePaths.has(key))) counts.missingRequiredReferences++;
   }
   if (project?.workingSourceRelationshipHolds !== undefined) {
     counts.relationshipHolds = Array.isArray(project.workingSourceRelationshipHolds) ? project.workingSourceRelationshipHolds.length : 1;
@@ -3851,8 +3856,13 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
   const operation = captureProjectOperation(projectId);
   try {
     const result = mutateProject(projectId, project => {
-      const file = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
-      if (!operation?.current() || !file || !project.files.includes(file) ||
+      const visibleFile = resolveProjectOwnedFileVisualRecord(projectId, visualIdentity, project);
+      // Scoped projections may copy rows. Admit through that view, then bind
+      // the same opaque identity and tracked path to an accepted canonical row.
+      const file = visibleFile && project.files.find(candidate =>
+        createProjectFileVisualIdentity(projectId, candidate) === visualIdentity &&
+        getTrackedFileDedupKey(candidate) === getTrackedFileDedupKey(visibleFile));
+      if (!operation?.current() || !file ||
           !isWorkingSourceFile(file)) {
         return { success: false, error: 'working_source_not_found' };
       }
@@ -18602,7 +18612,7 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
 
     const entries = files.map(getPackageReviewManifestEntry);
-    const membership = getWorkingSourceMembership(currentProject);
+    const membership = getWorkingSourceMembership(currentProject, files);
     bindEmbeddedPsdPackageReviewResources(files, entries);
     const entryStatuses = entries.map(getPackageReviewEntryStatus);
     if (files.length === 0 || membership.blocked || entryStatuses.some(status => status !== 'ready')) {
@@ -18730,7 +18740,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   };
   packageReviewSnapshots.set(token, snapshot);
   currentPackageReviewTokenByProject.set(projectId, token);
-  const membership = getWorkingSourceMembership(manifest.project);
+  const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
@@ -18739,6 +18749,8 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
     projectId,
     files: manifest.entries.map((entry, index) => ({
       ...presentations[index],
+      projectRole: hasWorkingSourceSelectionState(manifest.project)
+        ? presentations[index].effectiveRole : presentations[index].projectRole,
       name: entry.displayName,
       ext: entry.ext,
       embedded: entry.embedded,
@@ -18761,7 +18773,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
 
 async function createUnavailablePackageReview(projectId, manifest) {
   invalidatePackageReviewForProject(projectId);
-  const membership = getWorkingSourceMembership(manifest.project);
+  const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const presentations = await Promise.all(
     manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
   );
@@ -18769,6 +18781,8 @@ async function createUnavailablePackageReview(projectId, manifest) {
     projectId,
     files: manifest.entries.map((entry, index) => ({
       ...presentations[index],
+      projectRole: hasWorkingSourceSelectionState(manifest.project)
+        ? presentations[index].effectiveRole : presentations[index].projectRole,
       name: entry.displayName,
       ext: entry.ext,
       embedded: entry.embedded,

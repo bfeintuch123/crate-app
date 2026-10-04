@@ -20,7 +20,7 @@ replaceExactlyOnce("const test = require('node:test');",
 replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
-  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml,\n' +
+  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership,\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
@@ -564,6 +564,109 @@ function baselineCases() {
       assert.equal(packaged.totalFiles, verified.totalFiles);
       const outputNames = fs.readdirSync(packaged.folderPath, { recursive: true }).map(name => path.basename(name));
       assert.ok(outputNames.includes('Design_0.ai')); assert.ok(outputNames.includes('Link_0.png'));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('publication correction: scoped copied rows preserve owned Exclude and Restore admission', async () => {
+    const f = await fixture();
+    try {
+      f.state.opened = true; await f.live();
+      await assertComplete(f);
+      const initial = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = initial.files.find(file => file.name === 'Design_0.ai');
+      // A different open-before-Watch document forces the production scoped
+      // projection to copy visible rows, including this accepted source.
+      const scope = metadataTestHooks.getProjectOperationScope(f.project.id);
+      scope.baselineDocumentPaths.add(path.join(TEST_HOME, 'Desktop', 'Hidden.ai').toLowerCase());
+      const exclusion = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision });
+      assert.equal(exclusion.success, true);
+      const restoration = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'restore', expectedRevision: exclusion.selection.revision });
+      assert.equal(restoration.success, true);
+      assert.equal(restoration.verificationStatus, 'scanned');
+      const stored = storeInstance.data.projects.find(project => project.id === f.project.id);
+      const before = JSON.stringify(stored.workingSourceSelections);
+      // Foreign and pending-only identities never become accepted source rows.
+      const foreign = await createProject('Foreign selection fixture');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', foreign.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: 0 })).error, 'working_source_not_found');
+      const pending = { ...stored.files.find(file => file.path === f.paths[0].source),
+        path: path.join(TEST_HOME, 'Desktop', 'Pending.ai'), name: 'Pending.ai', fileId: 'pending-only',
+        acceptedPending: false, captureState: 'needs-save' };
+      stored.pendingFiles.push(pending);
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
+        metadataTestHooks.createProjectFileVisualIdentity(f.project.id, pending),
+        { action: 'exclude', expectedRevision: 0 })).error, 'working_source_not_found');
+      assert.equal(JSON.stringify(stored.workingSourceSelections), before);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('publication correction: package rows count an excluded required source as an asset', async () => {
+    const f = await fixture({ sources: 2 });
+    try {
+      f.state.opened = true; await f.live();
+      await assertComplete(f);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      fs.writeFileSync(f.paths[0].source, fs.readFileSync(f.paths[0].source, 'utf8')
+        .replace('%%EOF', `${f.paths[1].source}\n%%EOF`));
+      const root = workspace.files.find(file => file.name === 'Design_0.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, root.visualIdentity,
+        { action: 'exclude', expectedRevision: root.selectionRevision })).success, true);
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, root.visualIdentity,
+        { action: 'restore', expectedRevision: 1 })).success, true);
+      const required = workspace.files.find(file => file.name === 'Design_1.ai');
+      const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, required.visualIdentity,
+        { action: 'exclude', expectedRevision: required.selectionRevision });
+      assert.equal(result.success, true);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      const asset = review.files.find(file => file.name === 'Design_1.ai');
+      assert.ok(asset);
+      assert.equal(asset.sourceSelection, 'excluded');
+      assert.equal(asset.includedAsDependency, true);
+      assert.equal(asset.effectiveRole, 'asset');
+      assert.equal(asset.projectRole, 'asset');
+      // These are the current renderer's existing count predicates.
+      assert.equal(review.files.filter(file => file.projectRole === 'source').length,
+        review.semanticCounts.selectedWorkingSources);
+      assert.equal(review.files.filter(file => file.projectRole !== 'source').length,
+        review.semanticCounts.includedAssets);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('publication correction: final package filters cannot silently omit a required source role', async () => {
+    const f = await fixture({ sources: 2 });
+    try {
+      f.state.opened = true; await f.live();
+      await assertComplete(f);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      fs.writeFileSync(f.paths[0].source, fs.readFileSync(f.paths[0].source, 'utf8')
+        .replace('%%EOF', `${f.paths[1].source}\n%%EOF`));
+      const root = workspace.files.find(file => file.name === 'Design_0.ai');
+      const required = workspace.files.find(file => file.name === 'Design_1.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, root.visualIdentity,
+        { action: 'exclude', expectedRevision: 0 })).success, true);
+      const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, root.visualIdentity,
+        { action: 'restore', expectedRevision: 1 });
+      assert.equal(restored.verificationStatus, 'scanned');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, required.visualIdentity,
+        { action: 'exclude', expectedRevision: 0 })).success, true);
+      const stored = storeInstance.data.projects.find(project => project.id === f.project.id);
+      const file = stored.files.find(file => file.path === f.paths[1].source);
+      file.source = 'lsof'; file.acceptedPending = true;
+      stored.watchStartedAt = Date.now() + 60000;
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(stored, file);
+      stored.workingSourceVerification[key] = { ...stored.workingSourceVerification[key],
+        status: 'unavailable', reason: 'not-scanned', sourceFingerprint: null, sourceIdentity: null,
+        requiredReferences: [], unresolved: [] };
+      assert.equal(metadataTestHooks.getWorkingSourceMembership(stored).blocked, false,
+        'the tracked dependency exists and the untouched excluded role has no invented scan obligation');
+      const selected = await metadataTestHooks.selectProjectFilesForPackaging(stored);
+      assert.equal(selected.some(row => row.path === file.path), false, 'existing stale-lsof veto stays enforced');
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, false);
+      assert.equal(review.token, undefined);
+      assert.ok(review.semanticCounts.missingRequiredReferences > 0);
     } finally { await f.cleanup(); }
   });
 

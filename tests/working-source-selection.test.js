@@ -20,7 +20,7 @@ function between(start, end) {
   return main.slice(first, last);
 }
 
-function fixture() {
+function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   let api;
   let projects = [];
   const disk = new Map();
@@ -57,6 +57,7 @@ function fixture() {
     },
     resolveProjectOwnedFileVisualRecord: (id, identity, project) =>
       (project?.files || []).find(file => identity === `${id}:${file.fileId}`),
+    createProjectFileVisualIdentity: (id, file) => `${id}:${file.fileId}`,
     invalidatePackageReviewForProject: id => invalidated.push(id),
     sendToRenderer: (event, payload) => events.push({ event, payload }),
     reconcileProjectAssetBaselineScanSources() {},
@@ -85,9 +86,11 @@ function fixture() {
       return { cancelled: !operation.current(), outcomes };
     },
     isBroadObserverOnlyAcceptedFile: () => false,
-    getProjectFigmaScopeMode: () => 'entire-file',
+    getProjectFigmaScopeMode: () => figmaScopeMode,
     FIGMA_SCOPE_CURRENT_PAGE: 'current-page',
     shouldIncludeFigmaAssetForPackaging: () => true,
+    formatFigmaLocalNameForLog: filePath => path.basename(filePath),
+    formatFigmaLogScalar: value => String(value),
     isObservedPrimarySourceFile: () => false,
     shouldKeepObservedSourceFileForPackaging: async () => true,
     deduplicatePackageSourceMastersForOutput: (project, files) => files,
@@ -228,6 +231,23 @@ test('an excluded working role required by several retained sources stays one as
   const next = f.api.getWorkingSourceMembership(f.project).facts.get(original.path.toLowerCase());
   assert.deepEqual(plain(next.requiredBy), ['Two.ai']);
   assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, false);
+});
+
+test('publication correction: denied Figma dependency blocks final membership without bypassing Current Page scope', async () => {
+  const f = fixture({ figmaScopeMode: 'current-page' });
+  const root = f.source('Root.ai');
+  const required = f.source('Required.fig');
+  f.project.files.push(root, required);
+  f.disk.set(root.path, Buffer.from(`%PDF-1.7\n${required.path}\n%%EOF\n`));
+  await f.command(root, 'exclude');
+  await f.command(root, 'restore');
+  await f.command(required, 'exclude');
+  assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, false);
+  const selected = await f.api.selectProjectFilesForPackaging(f.project);
+  assert.deepEqual(selected.map(file => file.name), ['Root.ai']);
+  const finalMembership = f.api.getWorkingSourceMembership(f.project, selected);
+  assert.equal(finalMembership.counts.missingRequiredReferences, 1);
+  assert.equal(finalMembership.blocked, true);
 });
 
 test('exclusion wins over an in-flight Restore and cannot finish a newer Restore attempt', async () => {
