@@ -1302,10 +1302,17 @@ function baselineCases() {
 
   const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
   const psdId = '22222222-2222-4222-8222-222222222222';
-  async function workingPsdFixture(linkedFiles, children = []) {
+  async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false) {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
     const write = (linkedFiles, children = [], width = 1) => actual.writePsdBuffer({ width, height: 1, linkedFiles, children });
-    const f = await correctionProject('.psd', write(linkedFiles, children));
+    const f = viaAddFiles ? await (async () => {
+      resetTestHomeWorkspace(); setChildProcessHandler(() => ({ stdout: '' }));
+      const created = await createProject('PSD paused Add Files'); clearTrackedTimers();
+      const filePath = path.join(TEST_HOME, 'Desktop', 'Correction.psd');
+      fs.writeFileSync(filePath, write(linkedFiles, children));
+      return { project: storeInstance.data.projects.find(p => p.id === created.id), filePath,
+        current: () => storeInstance.data.projects.find(p => p.id === created.id) };
+    })() : await correctionProject('.psd', write(linkedFiles, children));
     // Conf10.2/electron-store8.2 deserialize fresh JSON on every get. Scope
     // that persistence behavior to these PSD cases rather than sharing rows
     // between the asynchronous preparation and canonical writer reads.
@@ -1318,6 +1325,12 @@ function baselineCases() {
     const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'cycle2-owned-psd-'));
     os.tmpdir = () => privateTmp;
     currentPsdFixture = 'actual-source-buffer';
+    if (viaAddFiles) {
+      manualDialogFor([f.filePath]); await callIpcRaw('projects:add-files', f.project.id);
+      if (f.current().assetBaseline.status === 'decision-required') {
+        await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
+      }
+    }
     const rows = () => [...f.current().files, ...(f.current().pendingFiles || [])].filter(file => file.source === 'psd-embedded');
     const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
     const source = workspace.files.find(file => file.name === path.basename(f.filePath));
@@ -1505,6 +1518,73 @@ function baselineCases() {
       assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
     } finally { f.cleanup(); }
   });
+
+  baselineTest('extra round: paused Add Files detached output preserves other-root obligation then respects exclusion', async () => {
+    const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }], [], true);
+    try {
+      const output = JSON.parse(JSON.stringify(f.rows()[0]));
+      assert.equal(output.assetBaselineSourcePath, f.filePath, 'real paused Add Files baseline stamps the origin edge');
+      f.current().excludedAssetKeys.push(output.fileId);
+      const otherPath = path.join(TEST_HOME, 'Desktop', 'Other.ai'); fs.writeFileSync(otherPath, `%PDF-1.7\n${output.path}\n%%EOF\n`);
+      f.current().files.push({ path: otherPath, name: 'Other.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const other = workspace.files.find(file => file.name === 'Other.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      await f.save([], [], 2);
+      assert.equal(f.current().files.find(row => row.fileId === output.fileId).psdResource.current, false);
+      const requiredReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      const retained = requiredReview.files.find(row => row.visualIdentity === metadataTestHooks.createProjectFileVisualIdentity(f.project.id, output));
+      assert.ok(retained.includedAsDependency); assert.deepEqual(retained.requiredBy, ['Other.ai']);
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true);
+      assert.equal(review.files.some(row => row.visualIdentity === retained.visualIdentity), false);
+      const latest = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const excluded = latest.files.find(row => row.visualIdentity === retained.visualIdentity);
+      assert.equal(excluded.includedAsDependency, false); assert.deepEqual(excluded.requiredBy, []);
+      assert.ok(f.current().files.some(row => row.fileId === output.fileId));
+      assert.ok(f.current().excludedAssetKeys.includes(output.fileId)); assert.deepEqual(fs.readFileSync(output.path), embeddedPng);
+    } finally { f.cleanup(); }
+  });
+
+  for (const carrier of ['external', 'alias']) for (const collection of ['files', 'pendingFiles']) {
+    baselineTest(`extra round: mixed ${carrier} duplicate preserves ${collection} row until unique proof`, async () => {
+      const object = { id: psdId, name: 'Embedded.png', data: embeddedPng };
+      const f = await workingPsdFixture([object]);
+      try {
+        const original = JSON.parse(JSON.stringify(f.rows()[0]));
+        if (collection === 'pendingFiles') {
+          f.current().files = f.current().files.filter(row => row.fileId !== original.fileId);
+          f.current().pendingFiles = [...(f.current().pendingFiles || []), original];
+        }
+        f.current().excludedAssetKeys.push(original.fileId);
+        const exclusions = [...f.current().excludedAssetKeys];
+        const linkedPath = path.join(TEST_HOME, 'Desktop', 'External.png'); fs.writeFileSync(linkedPath, 'external');
+        const duplicate = carrier === 'external' ? { id: psdId, name: 'External.png', childDocumentID: '', linkedFile: {
+          fileSize: 8, name: 'External.png', fullPath: linkedPath, originalPath: '', relativePath: '' } }
+          : { id: psdId, name: 'Alias.png' };
+        await f.save([{ ...object, data: Buffer.from('replacement') }, duplicate]);
+        assert.ok(Object.values(f.current().workingSourceVerification).some(record => record.unresolved.some(item => item.reason === 'ambiguous-linked-id')));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+        assert.ok((f.current().workingSourceRelationshipHolds || []).some(hold => hold.reason === 'psd-resource-identity-ambiguous' && hold.sourcePath === f.filePath));
+        assert.equal(f.rows().length, 1); assert.deepEqual(f.current()[collection].find(row => row.fileId === original.fileId), original);
+        assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.deepEqual(fs.readFileSync(original.path), embeddedPng);
+        assert.equal(fs.readdirSync(path.dirname(original.path)).filter(name => !name.startsWith('.')).length, 1,
+          'ambiguous replacement output is owned by this transaction and cleaned');
+        const conflictedWorkspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(conflictedWorkspace.workingSourceSelectionBlocked, true);
+        const replacement = { ...object, data: Buffer.from('unique replacement') };
+        await f.save([replacement]);
+        const current = f.current()[collection].find(row => row.fileId === original.fileId);
+        assert.equal(f.rows().length, 1); assert.notEqual(current.path, original.path);
+        assert.equal(current.assetOrigin, original.assetOrigin); assert.equal(current.projectRole, original.projectRole);
+        assert.deepEqual(f.current().excludedAssetKeys, exclusions); assert.deepEqual(fs.readFileSync(current.path), replacement.data);
+        assert.deepEqual(f.current().workingSourceRelationshipHolds, []); assert.ok(fs.existsSync(original.path));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+      } finally { f.cleanup(); }
+    });
+  }
 
   baselineTest('cycle2: concrete legacy association conflict preserves rows/bytes/exclusions and gives a specific hold', async () => {
     const f = await workingPsdFixture([{ id: psdId, name: 'Embedded.png', data: embeddedPng }]);

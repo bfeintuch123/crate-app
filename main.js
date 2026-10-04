@@ -3624,7 +3624,13 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   for (const file of files) {
     for (const ref of getWorkingSourceVerification(project, file)?.requiredReferences || []) edge(file.path, ref.path);
     const evidence = file.captureEvidence || {};
-    edge(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath, file.path);
+    const relationshipSource = evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath;
+    // A source-validated reconciliation disproved only this resource's former
+    // PSD relationship. Keep its provenance and genuine other-root obligations.
+    const detachedFromParent = file.source === 'psd-embedded' && file.psdResource?.version === 1 &&
+      file.psdResource.current === false && normalizeTrackedFilePath(file.psdResource.parentPath) &&
+      normalizeTrackedFilePath(relationshipSource) === normalizeTrackedFilePath(file.psdResource.parentPath);
+    if (!detachedFromParent) edge(relationshipSource, file.path);
   }
   // Traverse from selected working roots, retaining source-as-asset roles and
   // all known transitive obligations. Cycles do not resurrect excluded roots.
@@ -14168,15 +14174,20 @@ function reconcilePsdEmbeddedMembership(project, isStaleEntry) {
   return project.files.length !== filesBefore || project.pendingFiles.length !== pendingBefore;
 }
 
-async function prepareWorkingPsdReconciliation(projectId, filePath, assets, isCurrent) {
+async function prepareWorkingPsdReconciliation(projectId, filePath, assets, linkedInventory, isCurrent) {
   const project = getProjects().find(item => item.id === projectId);
   const parent = normalizeTrackedFilePath(filePath);
   const before = JSON.stringify([project.files, project.pendingFiles || []]);
   const currentAssets = assets.filter(asset => asset.source === 'psd-embedded');
+  // This is the complete metadata inventory of the same validated saved
+  // bytes, including external and alias records that produce no output stage.
+  // Reduced embedded-output counts cannot authorize object correspondence.
+  if (!Array.isArray(linkedInventory?.records)) throw new Error('asset_baseline_psd_output_changed');
   const counts = new Map();
-  for (const asset of currentAssets) {
-    const id = asset.psdResource?.producerId;
-    if (id) counts.set(id, (counts.get(id) || 0) + 1);
+  for (const record of linkedInventory.records) {
+    if (record.origin !== 'linked-file') continue;
+    const id = record.metadata.id;
+    if (typeof id === 'string' && id) counts.set(id, (counts.get(id) || 0) + 1);
   }
   const resourceKey = resource => resource?.producerId && resource.producerId.length <= 512
     ? JSON.stringify([resource.layerPath === null ? 'root' : 'layer', resource.producerId])
@@ -14197,7 +14208,9 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, isCu
   const holds = [];
   for (const row of associated) {
     const key = resourceKey(row.psdResource);
-    if (priorByKey.has(key)) holds.push({ reason: 'psd-resource-identity-ambiguous', sourcePath: filePath });
+    if (priorByKey.has(key) || (row.psdResource.producerId && counts.get(row.psdResource.producerId) > 1)) {
+      holds.push({ reason: 'psd-resource-identity-ambiguous', sourcePath: filePath });
+    }
     priorByKey.set(key, row);
   }
   // No generic old-row migration: hold only concrete source-associated rows
@@ -14594,7 +14607,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     if (psdTransaction && !await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
     const reconcileWorkingPsd = verificationScan && !!psdTransaction;
     const workingReconciliation = reconcileWorkingPsd
-      ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, isCurrent) : null;
+      ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, inventory, isCurrent) : null;
     if (psdAssets.length > 0 || workingReconciliation) {
       let acceptance = null;
       if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
