@@ -1,0 +1,3 @@
+# Reproducing the private artifact
+
+The readable sibling directory contains exactly the four archive files. Pack them in lexical order under package/ using USTAR, mode 0444, uid/gid 0, empty uname/gname, mtime 0; gzip with empty filename, mtime 0 and compression level 9. Do not include reviewed-source.diff or this recipe in the archive. Two preparations are compared byte-for-byte. The validation prepare.py supplies the executable Python recipe; it is evidence tooling, not a lifecycle hook. Runtime source must remain the approved hash recorded in package.json and PROVENANCE.md. This sidecar and source are isolated candidates, not committed product files.
