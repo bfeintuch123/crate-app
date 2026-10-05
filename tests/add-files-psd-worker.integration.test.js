@@ -928,3 +928,21 @@ for (const fault of ['missing-notes', 'unknown-note', 'note-cap', 'framed-note',
     assert.equal(fs.existsSync(run.extractDir), false);
   });
 }
+
+for (const fault of ['type', 'version', 'tail', 'incomplete-tail', 'media-version', 'media-tail', 'media-incomplete-tail']) {
+  test(`incomplete receiver derives ${fault} refusal without redundant worker issue`, async t => {
+    const value = parsed([{ id: 'id', name: 'embedded.bin', data: new Uint8Array(8) }]);
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3, status: 'incomplete', issues: [],
+      notes: ['alternate-layer-carrier-domain-unverified'], mediaCarriers: [],
+      records: [{ carrier: 'lnk2', layerIndex: null, id: 'id', type: fault === 'type' ? 'liZZ' : 'liFD',
+        version: fault === 'version' ? 8 : 2, tailBytes: fault === 'tail' ? 4 : fault === 'incomplete-tail' ? null : 0 }] };
+    if (fault.startsWith('media-')) value.framing.mediaCarriers.push({ carrier: '1075', carrierIndex: 1, layerIndex: null, layerId: null,
+      status: 'decoded', version: fault === 'media-version' ? 2 : 1, pixelSourceType: null,
+      tailBytes: fault === 'media-tail' ? 4 : fault === 'media-incomplete-tail' ? null : 0, references: [] });
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const reason = { type: 'unsupported-link-form', version: 'unsupported-link-form', tail: 'unexplained-link-tail',
+      'incomplete-tail': 'unresolved-link-record-framing', 'media-version': 'unsupported-media-descriptor-version',
+      'media-tail': 'unexplained-media-tail', 'media-incomplete-tail': 'unresolved-media-descriptor-framing' }[fault];
+    assert.ok(result.linkedInventory.unresolved.some(item => item.reason === reason)); await run.finish();
+  });
+}

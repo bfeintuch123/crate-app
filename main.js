@@ -12848,8 +12848,17 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       }
     }
     const wireIds = new Map();
+    const framingIssues = new Set(framingFacts?.issues || []);
     for (const record of framingFacts?.records || []) {
       if (typeof record.id === 'string') wireIds.set(record.id, (wireIds.get(record.id) || 0) + 1);
+      // Received concrete observations are obligations in their own right.
+      // Partial coverage must not rely on a redundant worker issue to keep
+      // an unsupported record or unexplained declared tail blocking.
+      if (!['liFD', 'liFE', 'liFA'].includes(record.type) || record.version < 1 || record.version > 7) {
+        framingIssues.add('unsupported-link-form');
+      }
+      if (record.tailBytes === null) framingIssues.add('unresolved-link-record-framing');
+      else if (record.tailBytes > 0) framingIssues.add('unexplained-link-tail');
     }
     const parsedAgreement = !!framingFacts && framingFacts.status !== 'not-examined'
       && wireIds.size === ids.size && [...ids].every(([id, count]) => wireIds.get(id) === count)
@@ -12860,7 +12869,6 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     const wireCoverage = framingFacts?.status === 'framed';
     const observedRecordDisagreement = [...wireIds].some(([id, count]) => count > (ids.get(id) || 0));
     if ((wireCoverage && !parsedAgreement) || observedRecordDisagreement) unresolved.push({ reason: 'wire-parsed-record-disagreement' });
-    for (const reason of framingFacts?.issues || []) unresolved.push({ reason });
     function mediaSignature(carrier, ref, wire) {
       // Agreement covers fields exposed by both decoders. Timeline original
       // and alias tokens remain in the wire record; ag-psd omits those fields.
@@ -12878,6 +12886,9 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     }
     const wireMedia = [];
     for (const carrier of framingFacts?.mediaCarriers || []) {
+      if (carrier.version !== 1) framingIssues.add('unsupported-media-descriptor-version');
+      if (carrier.tailBytes === null) framingIssues.add('unresolved-media-descriptor-framing');
+      else if (carrier.tailBytes > 0) framingIssues.add('unexplained-media-tail');
       for (const ref of carrier.references) {
         const rawPaths = ref.frameReader?.['Lnk '] ?? null;
         const disposition = !ref.reason && typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length
@@ -12909,6 +12920,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       parsedMediaCounts.set(signature, count - 1); return false;
     });
     if ((wireCoverage && !mediaParsedAgreement) || observedMediaDisagreement) unresolved.push({ reason: 'wire-parsed-media-disagreement' });
+    for (const reason of framingIssues) unresolved.push({ reason });
     // Framing visibility is not sufficiency of the entire required-reference
     // domain. Empty/embedded-only records cannot become complete by counting.
     return { provider: 'psd-agpsd-worker', coverage: 'linked-and-media-metadata', version: 3,

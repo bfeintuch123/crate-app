@@ -2730,4 +2730,36 @@ function baselineCases() {
     } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
   });
 
+  for (const fault of ['type', 'version', 'tail', 'incomplete-tail', 'media-version', 'media-tail', 'media-incomplete-tail']) {
+    baselineTest(`Receiver correction: incomplete coverage cannot suppress received ${fault} without redundant issue`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd', higherDepthPsd(actual, 16, [{ id: psdId, name: 'Receiver.png', data: embeddedPng }]));
+      const worker = require('../parsers/add-files-psd-worker'), inspect = worker.inspectPsdLinkFraming;
+      worker.inspectPsdLinkFraming = bytes => {
+        const facts = inspect(bytes); facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified']; facts.issues = [];
+        if (fault === 'type') facts.records[0].type = 'liZZ';
+        if (fault === 'version') facts.records[0].version = 8;
+        if (fault === 'tail') facts.records[0].tailBytes = 4;
+        if (fault === 'incomplete-tail') facts.records[0].tailBytes = null;
+        if (fault.startsWith('media-')) facts.mediaCarriers = [{ carrier: '1075', carrierIndex: 1, layerIndex: null, layerId: null,
+          status: 'decoded', version: fault === 'media-version' ? 2 : 1, pixelSourceType: null,
+          tailBytes: fault === 'media-tail' ? 4 : fault === 'media-incomplete-tail' ? null : 0, references: [] }];
+        return facts;
+      };
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id), source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const record = Object.values(f.current().workingSourceVerification)[0]; assert.equal(record.status, 'scanned');
+        const reason = { type: 'unsupported-link-form', version: 'unsupported-link-form', tail: 'unexplained-link-tail',
+          'incomplete-tail': 'unresolved-link-record-framing', 'media-version': 'unsupported-media-descriptor-version',
+          'media-tail': 'unexplained-media-tail', 'media-incomplete-tail': 'unresolved-media-descriptor-framing' }[fault];
+        assert.ok(record.unresolved.some(item => item.reason === reason)); assert.ok(restored.semanticCounts.unresolvedVerification > 0);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, true);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id); assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+      } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
 }
