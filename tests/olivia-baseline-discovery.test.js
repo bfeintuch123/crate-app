@@ -20,7 +20,7 @@ replaceExactlyOnce("const test = require('node:test');",
 replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
-  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification,\n' +
+  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification, getStablePackageReviewSourceContentFingerprint, getPackageReviewSourceFingerprint,\n' +
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
@@ -1943,6 +1943,49 @@ function baselineCases() {
     });
   }
 
+  baselineTest('output obligation hash: shared producer receipts attempt a failed physical read once per projection', async () => {
+    const f = await workingPsdFixture([{ id: psdId, name: 'Shared-read.png', data: embeddedPng }]);
+    const open = fs.openSync;
+    try {
+      const output = f.rows()[0], project = f.current(), producer = project.files.find(row => row.path === f.filePath);
+      const secondPath = path.join(TEST_HOME, 'Desktop', 'Second-producer.psd'); fs.writeFileSync(secondPath, fs.readFileSync(f.filePath));
+      const second = { ...producer, path: secondPath, name: 'Second-producer.psd', fileId: 'second-producer' }; project.files.push(second);
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(project, second), stat = fs.statSync(secondPath);
+      // Modeled valid persisted receipt for another source with identical bytes;
+      // exercise shared obligation accounting, not native producer association.
+      project.workingSourceVerification[key] = { ...metadataTestHooks.getWorkingSourceVerification(project, producer),
+        selectionRevision: 0, attempt: 'second-producer-receipt', sourceIdentity: { dev: stat.dev, ino: stat.ino,
+          size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } };
+      let attempts = 0;
+      fs.openSync = function refusedSharedOutput(filePath, ...args) {
+        if (filePath === output.path) { attempts++; throw new Error('modeled output read refusal'); }
+        return open.call(fs, filePath, ...args);
+      };
+      const membership = metadataTestHooks.getWorkingSourceMembership(project, project.files);
+      assert.equal(attempts, 1); assert.equal(membership.blocked, true);
+      assert.equal(membership.counts.unresolvedVerification, 1, 'one failed output fact, not one per producer');
+    } finally { fs.openSync = open; f.cleanup(); }
+  });
+
+  baselineTest('output obligation hash: explicit byte bound retires a modeled growing read with fixed scratch', async () => {
+    const f = await correctionProject('.txt', '12345678');
+    const originalRead = fs.readSync;
+    try {
+      const expected = metadataTestHooks.getPackageReviewSourceFingerprint(f.filePath);
+      assert.match(metadataTestHooks.getStablePackageReviewSourceContentFingerprint(f.filePath, expected, 8), /^8:[a-f0-9]{64}$/);
+      let reads = 0;
+      fs.readSync = function modeledGrowingRead(fd, buffer, offset, length, position) {
+        reads++; assert.equal(buffer.length, 1024 * 1024);
+        if (reads === 1) return originalRead.call(fs, fd, buffer, offset, length, position);
+        if (reads > 3) throw new Error('byte bound did not stop growing read');
+        buffer.fill(1, 0, 8); return 8;
+      };
+      assert.throws(() => metadataTestHooks.getStablePackageReviewSourceContentFingerprint(f.filePath, expected, 8),
+        error => error.constructor.name === 'PackageReviewChangedError');
+      assert.equal(reads, 2); assert.equal(fs.readFileSync(f.filePath, 'utf8'), '12345678');
+    } finally { fs.readSync = originalRead; clearTrackedTimers(); }
+  });
+
   for (const domain of ['root', 'layer']) {
     baselineTest(`output closure bytes: ${domain} source-bound receipt refuses altered physical output and recovers exact bytes`, async () => {
       const object = { id: psdId, name: 'Bound.png', data: embeddedPng };
@@ -1957,9 +2000,50 @@ function baselineCases() {
         const changed = await callIpcRaw('projects:prepare-package-review', f.project.id);
         assert.equal(changed.materializable, false, 'actual derived bytes must satisfy the validated current source receipt');
         assert.equal(changed.token, undefined);
+        let workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.workingSourceSelectionBlocked, true);
+        assert.equal(workspace.semanticCounts.unresolvedVerification, 1);
+        assert.deepEqual(workspace.semanticCounts, changed.semanticCounts);
+        const broken = workspace.files.find(row => row.name === 'Bound.png');
+        assert.equal(broken.verificationStatus, 'incomplete'); assert.equal(broken.verificationRequired, true);
+        const producer = f.current().files.find(row => row.path === f.filePath);
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), producer).status, 'scanned', 'source bytes remain valid');
         fs.writeFileSync(output.path, embeddedPng);
         const recovered = await callIpcRaw('projects:prepare-package-review', f.project.id);
         assert.equal(recovered.materializable, true); assert.equal(recovered.totalFiles, 2);
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.workingSourceSelectionBlocked, false); assert.equal(workspace.semanticCounts.unresolvedVerification, 0);
+        assert.deepEqual(workspace.semanticCounts, recovered.semanticCounts);
+        // Only an inactive producer's obligation is released; a separate root
+        // requiring that producer keeps the same concrete output receipt active.
+        const safe = path.join(TEST_HOME, 'Desktop', 'Parity-safe.txt'); fs.writeFileSync(safe, 'safe independent asset');
+        f.current().files.push({ path: safe, name: 'Parity-safe.txt', ext: '.txt', source: 'user-added', acceptedPending: true, projectRole: 'asset' });
+        fs.writeFileSync(output.path, altered);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.workingSourceSelectionBlocked, false);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+        const consumer = path.join(TEST_HOME, 'Desktop', 'Parity-consumer.ai'); fs.writeFileSync(consumer, `%PDF-1.7\n${f.filePath}\n%%EOF\n`);
+        f.current().files.push({ path: consumer, name: 'Parity-consumer.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+        assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, consumer, null, null,
+          { establishBaseline: false, allowPausedBaseline: true })).success, true);
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.files.find(row => row.name === 'Correction.psd').includedAsDependency, true);
+        assert.equal(workspace.workingSourceSelectionBlocked, true); assert.equal(workspace.semanticCounts.unresolvedVerification, 1);
+        const requiredReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(requiredReview.materializable, false); assert.equal(requiredReview.token, undefined);
+        assert.deepEqual(workspace.semanticCounts, requiredReview.semanticCounts);
+        fs.writeFileSync(output.path, embeddedPng);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, false);
+        const consumerRow = f.current().files.find(row => row.path === consumer);
+        await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, consumerRow), { action: 'exclude', expectedRevision: 0 });
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'restore', expectedRevision: 3 });
+        await f.save([], [], 2);
+        assert.equal(f.rows().length, 0, 'source-validated retirement releases only its old output obligation');
+        workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.workingSourceSelectionBlocked, false); assert.equal(workspace.semanticCounts.unresolvedVerification, 0);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
       } finally { f.cleanup(); }
     });
   }

@@ -3757,8 +3757,27 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
     !/^[a-f0-9]{64}$/.test(key) || !record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
     !((record.state === 'excluded' && record.reason === 'user-excluded') || (record.state === 'selected' && record.reason === null))));
-  return { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
+  const membership = { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
+  // Only a concrete producer receipt creates an output-byte obligation. Keep
+  // source scan validity separate, and share the same assessment with workspace,
+  // package review and their final post-await disk/fact rechecks.
+  if (engaged && packageFiles && files.some(file =>
+      getWorkingSourceVerification(project, file)?.requiredEmbeddedOutputs?.length > 0)) {
+    const unavailable = getUnsatisfiedWorkingPsdOutputEntries(project, membership, packageFiles);
+    for (const index of unavailable) {
+      const file = packageFiles[index], fact = facts.get(getTrackedFileDedupKey(file));
+      if (!fact) continue;
+      const alreadyUnresolved = fact.sourceSelection === 'invalid' || (fact.verificationRequired &&
+        (!['scanned', 'no-extractor'].includes(fact.verificationStatus) ||
+          (getWorkingSourceVerification(project, file)?.unresolved.length || 0) > 0));
+      if (!alreadyUnresolved) counts.unresolvedVerification++;
+      fact.verificationRequired = true;
+      fact.verificationStatus = 'incomplete';
+    }
+    if (unavailable.size) membership.blocked = true;
+  }
+  return membership;
 }
 
 // Fence disk-dependent presentation facts after the earlier byte hashes.
@@ -18647,7 +18666,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
   return descriptor;
 }
 
-function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint) {
+function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint, maxBytes = Infinity) {
   const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
   if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
     throw new PackageReviewChangedError();
@@ -18665,12 +18684,14 @@ function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFing
       throw new PackageReviewChangedError();
     }
 
+    if (Number.isFinite(maxBytes) && beforeStat.size > BigInt(maxBytes)) throw new PackageReviewChangedError();
     const hash = crypto.createHash('sha256');
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let size = 0;
     while (true) {
       const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
+      if (size + bytesRead > maxBytes) throw new PackageReviewChangedError();
       hash.update(buffer.subarray(0, bytesRead));
       size += bytesRead;
     }
@@ -19025,10 +19046,11 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   }
 }
 
-function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries) {
+function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries = null) {
   const unavailable = new Set(), digestByEntry = new Map();
   if (!hasWorkingSourceSelectionState(project)) return unavailable;
-  const entryByPath = new Map(files.map((file, index) => [normalizeTrackedFilePath(file.path), index]));
+  const entryByPath = new Map(files.flatMap((file, index) => isScanOnSaveEmbeddedPsdFile(file)
+    ? [] : [[normalizeTrackedFilePath(file.path), index]]));
   for (const source of project.files || []) {
     const fact = membership.facts.get(getTrackedFileDedupKey(source));
     if (!fact || !((fact.sourceSelection === 'selected' && fact.included) || fact.includedAsDependency)) continue;
@@ -19037,7 +19059,11 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
       if (index === undefined) continue; // Missing membership is already blocked.
       try {
         if (!digestByEntry.has(index)) {
-          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path, entries[index].sourceFingerprint);
+          // Cache failures too: shared producer obligations cannot retry this
+          // same physical output within one fresh projection.
+          digestByEntry.set(index, null);
+          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path,
+            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path), MAX_PARSE_FILE_SIZE);
           digestByEntry.set(index, fingerprint.slice(fingerprint.lastIndexOf(':') + 1));
         }
         if (digestByEntry.get(index) !== output.outputDigest) unavailable.add(index);
