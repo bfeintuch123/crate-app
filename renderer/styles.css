@@ -3421,3 +3421,26 @@ body {
   overflow: visible;
   text-overflow: clip;
 }
+
+/* Working-source selection: explicit actions keep the original file intact. */
+.working-file-list .asset-file-row { min-height: 76px; height: auto; align-items: center; }
+.working-source-detail { margin-top: 4px; font-size: 12px; line-height: 1.4; color: var(--text-secondary, #666); overflow-wrap: anywhere; }
+.working-source-action { flex-shrink: 0; min-height: 32px; padding: 5px 10px; border: 1px solid var(--border, #d9d9d9); border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
+.working-source-action:hover:not(:disabled) { background: rgba(128, 128, 128, .1); }
+.working-source-action:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.working-source-action:disabled { opacity: .55; cursor: default; }
+
+.source-continuation-choices { margin: 16px 0; }
+.source-continuation-choices h3 { font-size: 14px; margin: 0 0 12px; }
+.continuation-pair { padding: 12px; margin-top: 8px; border: 1px solid var(--border, #d9d9d9); border-radius: 8px; overflow-wrap: anywhere; }
+.continuation-pair p { margin: 0 0 8px; }
+.continuation-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.asset-review-workspace .asset-card-grid .asset-file-row.has-required-dependency {
+  grid-template-columns: 36px minmax(0, 1fr) auto auto;
+}
+.asset-review-workspace .asset-card-grid .required-dependency-action {
+  grid-column: 4;
+  grid-row: 1;
+  white-space: nowrap;
+}

@@ -82,6 +82,8 @@ let projectRefreshInFlight = null;
 let projectRefreshGeneration = 0;
 let pendingProjectRefreshIds = new Set();
 const rendererActionsInFlight = new Set();
+// A1 selection contract: frozen 444e v1. Intent is not package readiness.
+const workingSourceActions = new Map();
 let activeAddFilesOperation = null;
 const BLOCKING_MODAL_IDS = [
   'modal-existing-assets',
@@ -399,6 +401,16 @@ function getRendererItemSignature(item) {
     protectedSource: item.protectedSource === true,
     sourceRecoveryAllowed: item.sourceRecoveryAllowed === true,
     excluded: item.excluded === true,
+    sourceSelection: item.sourceSelection,
+    selectionRevision: item.selectionRevision,
+    included: item.included,
+    includedAsDependency: item.includedAsDependency,
+    effectiveRole: item.effectiveRole,
+    verificationStatus: item.verificationStatus,
+    verificationRequired: item.verificationRequired,
+    requiredBy: item.requiredBy,
+    selectionBusy: isWorkingSourceActionPending(getFileVisualIdentity(item)),
+    selectionUnavailable: item.selectionUnavailable === true,
     embedded: item.embedded === true,
     linked: item.linked === true,
     captureState: item.captureState || '',
@@ -566,6 +578,8 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
+  workingSourceActions.clear();
+  continuationChoiceOwner = null;
   // A project switch invalidates every modal session.  The caller must not
   // allow an async callback from the previous project to reopen a modal.
   activeModalLease = null;
@@ -1700,6 +1714,7 @@ async function renderFiles(renderOptions = {}) {
         excluded: excludedAssetKeys.has(getAssetReviewExclusionKey(file)),
         visualIdentity: null,
         visualRevision: null,
+        selectionUnavailable: true,
       })),
       pendingFiles: (project.pendingFiles || []).map(file => ({
         name: file.name,
@@ -1710,6 +1725,7 @@ async function renderFiles(renderOptions = {}) {
         excluded: excludedAssetKeys.has(getAssetReviewExclusionKey(file)),
         visualIdentity: null,
         visualRevision: null,
+        selectionUnavailable: true,
       })),
     };
   }
@@ -1864,7 +1880,7 @@ function restoreAssetReviewBatchControls(project) {
   const existingAssets = files.filter(file => (
     file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.projectRole !== 'source'
   ));
-  const includedExistingCount = existingAssets.filter(file => file.excluded !== true).length;
+  const includedExistingCount = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
   updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
 }
 
@@ -2554,6 +2570,120 @@ function appendAssetFileRestorationAction(row, project, file) {
   row.appendChild(restoreButton);
 }
 
+function isWorkingSourcePresentation(file) {
+  return ['selected', 'excluded', 'invalid'].includes(file?.sourceSelection);
+}
+
+function isWorkingSourceActionPending(identity) {
+  const owner = workingSourceActions.get(identity);
+  return !!owner && owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch && owner.tab === tabNavigationEpoch;
+}
+
+function focusWorkingSourceControl(identity) {
+  const visible = element => element && !element.disabled && !element.closest?.('.hidden') && !element.closest?.('.filtered-out');
+  const actions = Array.from(document.querySelectorAll('.working-source-action')).filter(visible);
+  const target = actions.find(button => button.dataset.sourceIdentity === identity) || actions.find(button => button.dataset.sourceIdentity) ||
+    Array.from(document.querySelectorAll('.asset-filter')).find(button => button.getAttribute('aria-pressed') === 'true' && visible(button)) ||
+    [$('#asset-review-heading'), $('#project-file-heading')].find(visible);
+  if (target && target.tagName !== 'BUTTON') target.setAttribute('tabindex', '-1');
+  target?.focus?.({ preventScroll: true });
+}
+
+function getWorkingSourceStatus(file) {
+  if (file.sourceSelection === 'invalid') return { label: 'Needs attention', detail: 'This selection could not be verified. Refresh the project before changing it.' };
+  if (file.sourceSelection === 'excluded') {
+    if (!file.includedAsDependency) return { label: 'Excluded', detail: 'Excluded from this package. Your original file stays on disk.' };
+    const sources = Array.isArray(file.requiredBy) ? file.requiredBy.map(sanitizeRendererSourceName).filter(Boolean).join(', ') : '';
+    const required = `Excluded as a working file. Required by ${sources || 'another working file'}.`;
+    if (file.verificationRequired && file.verificationStatus === 'pending') return { label: 'Verifying…', detail: `${required} Checking this required asset before packaging.` };
+    if (file.included !== true) return { label: 'Needs attention', detail: `${required} This required asset is currently unavailable for packaging. Open Package Review to check the current result.` };
+    if (file.verificationRequired && !['scanned', 'no-extractor'].includes(file.verificationStatus)) return { label: 'Needs attention', detail: `${required} Verification of this required asset has not finished successfully. Check the saved file and its links before packaging.` };
+    return { label: 'Required asset', detail: `Excluded as a working file. Still included because ${sources || 'another working file'} uses it.` };
+  }
+  if (file.verificationRequired && file.verificationStatus === 'pending') return { label: 'Verifying…', detail: 'Checking the saved file and its links before packaging.' };
+  if (file.verificationRequired && !['scanned', 'no-extractor'].includes(file.verificationStatus)) return {
+    label: 'Needs attention', detail: file.verificationStatus === 'stale'
+      ? 'The saved file changed. Package Review will check whether it can be included.'
+      : 'Verification has not finished successfully. Check that the saved file and its links are available, then open Package Review for the current result.'
+  };
+  return { label: 'Selected', detail: file.verificationStatus === 'no-extractor'
+    ? 'Selected as a working file. Automatic link checking is unavailable for this file type.'
+    : 'Selected as a working file. Package Review checks the current package.' };
+}
+
+function getWorkingSourceActionError(error) {
+  if (error === 'working_source_selection_stale' || error === 'working_source_not_excluded') return 'This selection changed. Review the refreshed row before choosing again.';
+  if (error === 'working_source_not_found' || error === 'not_found') return 'This working file is no longer available in this project.';
+  if (error === 'working_source_identity_unavailable') return 'Crate cannot change this working file’s selection yet.';
+  return 'Crate could not confirm this selection change. Refresh the project before choosing again.';
+}
+
+async function changeWorkingSourceSelection(project, file, action) {
+  const identity = getFileVisualIdentity(file);
+  const currentRow = state.assetWorkspace?.projectId === project.id && state.assetWorkspace.files?.find(row => getFileVisualIdentity(row) === identity);
+  if (!identity || !currentRow || currentRow.selectionRevision !== file.selectionRevision ||
+      currentRow.sourceSelection !== file.sourceSelection || isWorkingSourceActionPending(identity) ||
+      !Number.isSafeInteger(file.selectionRevision) || file.selectionRevision < 0 ||
+      !['selected', 'excluded'].includes(file.sourceSelection) ||
+      action !== (file.sourceSelection === 'excluded' ? 'restore' : 'exclude') ||
+      typeof window.crate?.setWorkingSourceSelection !== 'function' ||
+      state.selectedProjectId !== project.id || !accountStatus.canUseWorkspace) return false;
+  const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, tab: tabNavigationEpoch };
+  const current = () => owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch &&
+    owner.tab === tabNavigationEpoch && state.selectedProjectId === project.id && accountStatus.canUseWorkspace;
+  workingSourceActions.set(identity, owner);
+  // Retire the old review before awaiting the mutation. Never apply response counts.
+  state.packageReviewToken = null;
+  packageReviewRequestId += 1;
+  const confirm = $('#btn-confirm-package');
+  if (confirm) confirm.disabled = true;
+  for (const button of document.querySelectorAll('.working-source-action')) {
+    if (button.dataset.sourceIdentity === identity) { button.disabled = true; button.textContent = action === 'restore' ? 'Verifying…' : 'Excluding…'; }
+  }
+  let result;
+  try {
+    result = await window.crate.setWorkingSourceSelection(project.id, identity, { action, expectedRevision: file.selectionRevision });
+    if (!current()) return false;
+    if (workingSourceActions.get(identity) === owner) workingSourceActions.delete(identity);
+    await renderFiles({ isCurrent: current });
+    if (!current()) return false;
+    const latest = state.assetWorkspace?.projectId === project.id && state.assetWorkspace.files?.find(row => getFileVisualIdentity(row) === identity);
+    if (!result?.success) showToast(getWorkingSourceActionError(result?.error));
+    else if (latest) showToast(getWorkingSourceStatus(latest).detail);
+    focusWorkingSourceControl(identity);
+    return result?.success === true;
+  } catch (_) {
+    if (current()) showToast(getWorkingSourceActionError(null));
+    return false;
+  } finally {
+    if (workingSourceActions.get(identity) === owner) workingSourceActions.delete(identity);
+    if (current() && !result) { try { await renderFiles({ isCurrent: current }); } catch (_) {} }
+  }
+}
+
+function appendWorkingSourceControls(row, copy, project, file) {
+  const status = getWorkingSourceStatus(file);
+  appendFileStatusBadge(row, status.label, file.sourceSelection === 'excluded' ? 'excluded' : 'protected', status.detail);
+  const detail = document.createElement('div');
+  detail.className = 'working-source-detail';
+  detail.textContent = status.detail;
+  copy.appendChild(detail);
+  const identity = getFileVisualIdentity(file);
+  if (!identity || !Number.isSafeInteger(file.selectionRevision) || file.selectionRevision < 0 ||
+      !['selected', 'excluded'].includes(file.sourceSelection) ||
+      typeof window.crate?.setWorkingSourceSelection !== 'function') return;
+  const action = file.sourceSelection === 'excluded' ? 'restore' : 'exclude';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'working-source-action';
+  button.dataset.sourceIdentity = identity;
+  button.disabled = isWorkingSourceActionPending(identity);
+  button.textContent = button.disabled ? (action === 'restore' ? 'Verifying…' : 'Updating…') : action === 'restore' ? 'Restore' : 'Exclude';
+  button.setAttribute('aria-label', `${action === 'restore' ? 'Restore' : 'Exclude'} ${file.name || 'working file'}`);
+  button.addEventListener('click', event => { event.stopPropagation(); void changeWorkingSourceSelection(project, file, action); });
+  row.appendChild(button);
+}
+
 function createAssetFileRow(
   project,
   file,
@@ -2590,6 +2720,7 @@ function createAssetFileRow(
       select();
     });
     row.addEventListener('keydown', event => {
+      if (event.target?.closest?.('button')) return;
       if (event.key !== 'Enter' && event.key !== ' ') return;
       event.preventDefault();
       select();
@@ -2618,11 +2749,27 @@ function createAssetFileRow(
     appendFileStatusBadge(row, 'LNK', 'linked', 'Linked file - confirmed path');
     hasStatusBadge = true;
   }
-  if (protectedSource && sourceRecoveryAllowed) {
+  if (isWorkingSourcePresentation(file)) {
+    appendWorkingSourceControls(row, copy, project, file);
+  } else if (protectedSource && sourceRecoveryAllowed) {
     appendFileStatusBadge(row, 'Scan failed', 'recovery', 'Remove this source to recover the project, then add a valid project file');
     appendAssetFileRemovalAction(row, project, file, { recovery: true });
   } else if (protectedSource) {
-    appendFileStatusBadge(row, 'Ready', 'protected', 'Working files are always included');
+    appendFileStatusBadge(row, file.selectionUnavailable ? 'Unavailable' : 'Ready', 'protected', file.selectionUnavailable ? 'Refresh the project to check this working file’s selection.' : 'Working files are always included');
+  } else if (file.includedAsDependency) {
+    // Existing/Added lists use fixed virtual rows. Keep the full explanation
+    // in an accessible disclosure action rather than adding a wrapping line.
+    const explanation = `Required by ${(file.requiredBy || []).map(sanitizeRendererSourceName).filter(Boolean).join(', ') || 'an included working file'}.` +
+      (file.included === false ? ' This required asset is currently unavailable for packaging.' : ' It stays included while that working file needs it.');
+    const required = document.createElement('button');
+    required.type = 'button';
+    row.classList.add('has-required-dependency');
+    required.className = 'working-source-action required-dependency-action';
+    required.textContent = file.included === false ? 'Unavailable' : 'Required asset';
+    required.title = explanation;
+    required.setAttribute('aria-label', `Why ${file.name || 'this asset'} is required: ${explanation}`);
+    required.addEventListener('click', event => { event.stopPropagation(); showToast(explanation); });
+    row.appendChild(required);
   } else if (excluded) {
     appendFileStatusBadge(row, 'Excluded', 'excluded', 'Excluded from this package');
     appendAssetFileRestorationAction(row, project, file);
@@ -2712,7 +2859,7 @@ function applyAssetReviewFilter() {
   const logicalItems = state.assetReviewLogicalItems || {};
   const filterItems = (items, category) => (Array.isArray(items) ? items : []).filter(file => {
     const matchesFilter = filter === 'all'
-      || (filter === 'excluded' && file.excluded === true)
+      || (filter === 'excluded' && (file.excluded === true || file.sourceSelection === 'excluded'))
       || (filter === category && file.excluded !== true);
     return matchesFilter && (!query || getAssetReviewSearchText(file).includes(query));
   });
@@ -2747,7 +2894,7 @@ function applyAssetReviewFilter() {
     if (section && typeof section.classList?.toggle === 'function') {
       const isWorking = category === 'working';
       section.classList.toggle('filtered-out', isWorking
-        ? filter !== 'all' || filterItems(items, category).length === 0
+        ? !['all', 'excluded'].includes(filter) || filterItems(items, category).length === 0
         : filter === 'missing' || filter === 'existing' && category !== 'existing' || filter === 'added' && category !== 'added' || filter === 'excluded' && filterItems(items, category).length === 0);
     }
   }
@@ -2776,26 +2923,42 @@ function applyAssetReviewFilter() {
   });
 }
 
-function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles) {
-  const includedExisting = existingAssets.filter(file => file.excluded !== true);
+function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles, figmaSourceCount = 0) {
+  const includedExisting = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true));
   const excluded = [...existingAssets, ...addedAssets].filter(file => file.excluded === true);
-  const includedAdded = addedAssets.filter(file => file.excluded !== true);
+  const includedAdded = addedAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true));
   setCountText('metric-existing-count', includedExisting.length);
   setCountText('metric-added-count', includedAdded.length);
   setCountText('metric-missing-count', pendingFiles.length);
-  setCountText('metric-excluded-count', excluded.length);
+  const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
+  const counts = workspace?.semanticCounts;
+  const workingSummary = $('#working-source-summary');
+  if (workingSummary) {
+    workingSummary.classList.toggle('hidden', !counts);
+    workingSummary.textContent = counts ? `${counts.selectedWorkingSources} selected local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
+      `${figmaSourceCount ? ` · ${figmaSourceCount} tracked Figma working file(s)` : ''} · ${counts.includedAssets} included asset(s)` : '';
+  }
+  const excludedCount = counts ? counts.excludedWorkingSources + counts.excludedAssets : excluded.length;
+  setCountText('metric-excluded-count', excludedCount);
   setCountText('filter-count-all', existingAssets.length + addedAssets.length + pendingFiles.length);
   setCountText('filter-count-existing', includedExisting.length);
   setCountText('filter-count-added', includedAdded.length);
   setCountText('filter-count-missing', pendingFiles.length);
-  setCountText('filter-count-excluded', excluded.length);
+  setCountText('filter-count-excluded', excludedCount);
 
   const alert = $('#project-linking-alert');
   if (alert) {
     alert.textContent = pendingFiles.length
       ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
       : '';
-    alert.classList.toggle('hidden', pendingFiles.length === 0);
+    if (workspace?.workingSourceSelectionBlocked) {
+      const facts = [];
+      if (counts?.unresolvedVerification) facts.push(`${counts.unresolvedVerification} working-file verification issue(s)`);
+      if (counts?.missingRequiredReferences) facts.push(`${counts.missingRequiredReferences} required link(s) unavailable`);
+      if (counts?.relationshipHolds) facts.push('unresolved file relationships');
+      alert.textContent = [alert.textContent, 'Package verification needs attention.', ...facts].filter(Boolean).join(' ');
+    }
+    alert.classList.toggle('hidden', pendingFiles.length === 0 && !workspace?.workingSourceSelectionBlocked);
   }
 
   const recentList = $('#recent-assets-list');
@@ -2836,9 +2999,10 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     if (pendingFiles.length) appendDefinitionRow(originList, 'Needs Review', pendingFiles.length, 'warning');
   }
 
-  const totalIncludedAssets = includedExisting.length + includedAdded.length;
-  const summary = `${totalIncludedAssets} asset${totalIncludedAssets === 1 ? '' : 's'} included` +
-    ` · ${sourceFiles.length} Working File${sourceFiles.length === 1 ? '' : 's'} ready` +
+  const summary = (counts ? `${counts.includedAssets} asset${counts.includedAssets === 1 ? '' : 's'} included` +
+    ` · ${counts.selectedWorkingSources} ${figmaSourceCount ? 'local ' : ''}Working File${counts.selectedWorkingSources === 1 ? '' : 's'} selected` +
+    `${figmaSourceCount ? ` · ${figmaSourceCount} Figma Working File${figmaSourceCount === 1 ? '' : 's'} tracked` : ''}` +
+    `${workspace?.workingSourceSelectionBlocked ? ' · Verification needs attention' : ''}` : 'Package selection and verification unavailable') +
     `${pendingFiles.length ? ` · ${pendingFiles.length} need attention` : ''}`;
   const reviewSummary = $('#asset-review-summary');
   const reviewFooter = $('#asset-review-footer-summary');
@@ -2947,7 +3111,10 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     previewPriority: state.assetReviewOpen ? 10 : 0,
     loadVisual: false,
   });
-  setAssetPanelCount($('#working-assets-count'), sourceFiles.length);
+  const semanticCounts = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace.semanticCounts : null;
+  const workingCount = semanticCounts ? semanticCounts.selectedWorkingSources + figmaSourceFiles.length : null;
+  const workingTotal = semanticCounts ? semanticCounts.selectedWorkingSources + semanticCounts.excludedWorkingSources + semanticCounts.invalidWorkingSources + figmaSourceFiles.length : sourceFiles.length;
+  setAssetPanelCount($('#working-assets-count'), Number.isSafeInteger(workingCount) ? workingCount : sourceFiles.length, workingTotal);
 
   renderAssetPanelList($('#project-file-list'), project, sourceFiles, {
     protectedSource: true,
@@ -2972,10 +3139,10 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     selectable: true,
   });
 
-  setAssetPanelCount($('#project-file-count'), sourceFiles.length);
-  const includedExistingCount = existingAssets.filter(file => file.excluded !== true).length;
+  setAssetPanelCount($('#project-file-count'), Number.isSafeInteger(workingCount) ? workingCount : sourceFiles.length, workingTotal);
+  const includedExistingCount = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
   setAssetPanelCount($('#existing-assets-count'), includedExistingCount, existingAssets.length);
-  const includedAddedCount = addedAssets.filter(file => file.excluded !== true).length;
+  const includedAddedCount = addedAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
   setAssetPanelCount($('#added-assets-count'), includedAddedCount, addedAssets.length);
 
   const pendingFiles = state.assetWorkspace?.projectId === project.id
@@ -2988,7 +3155,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     added: addedAssets,
     missing: pendingReviewFiles,
   };
-  renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles);
+  renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles, figmaSourceFiles.length);
   applyAssetReviewFilter();
 
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
@@ -3947,6 +4114,145 @@ function togglePackageReviewContents() {
   focusTarget?.focus?.({ preventScroll: true });
 }
 
+// Save As pair-choice-v1 with explicit backend admission/selection eligibility.
+// Never infer pairs or admission from names, paths, or missing projection fields.
+let continuationChoiceOwner = null;
+function isSourceContinuationCandidate(pair) {
+  return !!pair && typeof pair.pairIdentity === 'string' && !!pair.pairIdentity &&
+    typeof pair.evidenceIdentity === 'string' && !!pair.evidenceIdentity && Number.isSafeInteger(pair.revision) && pair.revision >= 0 &&
+    [pair.predecessor, pair.successor].every(source => source && typeof source.visualIdentity === 'string' && source.visualIdentity &&
+      Number.isSafeInteger(source.selectionRevision) && source.selectionRevision >= 0 &&
+      ['selected', 'excluded'].includes(source.selectionState)) &&
+    pair.predecessor.admissionState === 'accepted' &&
+    ((pair.successor.admissionState === 'accepted' && pair.replaceRequires === null) ||
+      (pair.successor.admissionState === 'pending' && pair.replaceRequires === 'successor-admission'));
+}
+
+function getContinuationCandidates(review) {
+  const contract = review?.sourceContinuation;
+  if (contract?.version !== 1 || contract.capability !== 'pair-choice-v1' || !Array.isArray(contract.candidates)) return [];
+  return contract.candidates.filter(isSourceContinuationCandidate);
+}
+
+function continuationErrorMessage(error) {
+  if (error === 'continuation_stale' || error === 'continuation_not_found') return 'These files changed. Review the current pair before choosing again.';
+  if (error === 'continuation_admission_required') return 'Review the later file in your project before choosing Replace. Close Package Review to return to your files; this choice cannot add it to the project.';
+  if (error === 'continuation_verification_required') return 'Crate needs to verify the saved files and their links before replacing a working file.';
+  return 'Crate could not confirm that choice. Review the current files before choosing again.';
+}
+
+async function chooseSourceContinuation(project, pair, choice, lease) {
+  if (!['replace', 'keep-both', 'not-related'].includes(choice) ||
+      !isSourceContinuationCandidate(pair) || (choice === 'replace' && pair.replaceRequires !== null) ||
+      typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || continuationChoiceOwner ||
+      state.selectedProjectId !== project.id || !isCurrentModalLease('modal-package', lease.sessionId) ||
+      $('#modal-package')?.classList.contains('hidden') || packageReviewConfirmationInFlight || !accountStatus.canUseWorkspace) return false;
+  const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, request: packageReviewRequestId, lease: lease.sessionId };
+  const current = () => owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch &&
+    owner.request === packageReviewRequestId && state.selectedProjectId === project.id && accountStatus.canUseWorkspace &&
+    isCurrentModalLease('modal-package', owner.lease) && !$('#modal-package')?.classList.contains('hidden');
+  continuationChoiceOwner = owner;
+  state.packageReviewToken = null;
+  $('#btn-confirm-package').disabled = true;
+  for (const button of document.querySelectorAll('.continuation-choice')) button.disabled = true;
+  const status = $('#source-continuation-status');
+  if (status) status.textContent = 'Applying your choice…';
+  try {
+    let result = null;
+    try {
+      result = await window.crate.resolveWorkingSourceContinuation(project.id, {
+        pairIdentity: pair.pairIdentity, evidenceIdentity: pair.evidenceIdentity, expectedRevision: pair.revision,
+        predecessorSelectionRevision: pair.predecessor.selectionRevision, successorSelectionRevision: pair.successor.selectionRevision, choice,
+      });
+    } catch (_) {
+      // A lost reply does not prove the decision failed to commit. Refresh the
+      // current workspace before preparing again, without replaying the choice.
+    }
+    if (!current()) return false;
+    // Contract v1 requires fresh workspace facts before preparing a new review.
+    // This response may omit semanticCounts even after a successful commit.
+    await renderFiles({ isCurrent: current });
+    if (!current()) return false;
+    continuationChoiceOwner = null;
+    const succeeded = result?.success === true && result.projectId === project.id;
+    const message = succeeded ? 'Choice saved. Review the updated package.' : continuationErrorMessage(result?.error);
+    await showPackageModal({ runPreScan: false, message });
+    return succeeded;
+  } catch (_) {
+    if (current()) {
+      continuationChoiceOwner = null;
+      if (status) status.textContent = 'Crate could not refresh the current files. Close Package Review and refresh the project before packaging.';
+    }
+    return false;
+  } finally {
+    if (continuationChoiceOwner === owner) continuationChoiceOwner = null;
+  }
+}
+
+function renderSourceContinuationChoices(project, review, lease) {
+  const region = $('#source-continuation-choices');
+  if (!region) return;
+  region.replaceChildren();
+  if (continuationChoiceOwner && (continuationChoiceOwner.lease !== lease.sessionId || continuationChoiceOwner.request !== packageReviewRequestId)) continuationChoiceOwner = null;
+  const candidates = getContinuationCandidates(review);
+  region.classList.toggle('hidden', candidates.length === 0);
+  if (!candidates.length) return;
+  const heading = document.createElement('h3');
+  heading.textContent = 'Choose which working files to include';
+  region.appendChild(heading);
+  for (const pair of candidates) {
+    const card = document.createElement('div');
+    card.className = 'continuation-pair';
+    const description = document.createElement('p');
+    const older = sanitizeRendererSourceName(pair.predecessor.name) || 'Earlier working file';
+    const newer = sanitizeRendererSourceName(pair.successor.name) || 'Later working file';
+    description.textContent = `Does “${newer}” replace “${older}”?`;
+    card.appendChild(description);
+    const help = document.createElement('p');
+    help.className = 'working-source-detail';
+    help.textContent = 'Replace selects the later working file after verification. Keep both leaves your file selections unchanged. Not related dismisses this relationship and also leaves selections unchanged. Original files stay on disk.';
+    card.appendChild(help);
+    if (pair.successor.admissionState === 'pending') {
+      const admission = document.createElement('p');
+      admission.className = 'working-source-detail';
+      admission.textContent = `“${newer}” has not been added to this project. Close Package Review and review it in your files before choosing Replace. Keep both and Not related will not add it.`;
+      card.appendChild(admission);
+    } else if (pair.successor.selectionState === 'excluded') {
+      const selection = document.createElement('p');
+      selection.className = 'working-source-detail';
+      selection.textContent = `“${newer}” is excluded as a working file. Replace will select it after verification; Keep both and Not related leave it excluded.`;
+      card.appendChild(selection);
+    }
+    if (pair.retainsPredecessorAsDependency) {
+      const dependency = document.createElement('p');
+      dependency.className = 'working-source-detail';
+      dependency.textContent = `“${older}” is still required as an asset and will remain included if you choose Replace.`;
+      card.appendChild(dependency);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'continuation-actions';
+    for (const [choice, label] of [['replace', 'Replace'], ['keep-both', 'Keep both'], ['not-related', 'Not related']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'working-source-action continuation-choice';
+      button.textContent = label;
+      button.disabled = typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || !!continuationChoiceOwner ||
+        (choice === 'replace' && pair.replaceRequires !== null);
+      button.setAttribute('aria-label', `${label}: ${older} and ${newer}`);
+      button.addEventListener('click', () => { void chooseSourceContinuation(project, pair, choice, lease); });
+      actions.appendChild(button);
+    }
+    card.appendChild(actions);
+    region.appendChild(card);
+  }
+  const status = document.createElement('p');
+  status.id = 'source-continuation-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.textContent = typeof window.crate?.resolveWorkingSourceContinuation === 'function' ? '' : 'These choices are currently unavailable. Return to your files and refresh the project.';
+  region.appendChild(status);
+}
+
 function renderPackageReview(project, review, message = '', suppliedLease = null) {
   if (!project?.id || review?.projectId !== project.id) return false;
   const lease = suppliedLease || claimModalLease('modal-package');
@@ -3956,7 +4262,11 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   packageReviewModalSelectionEpoch = projectSelectionEpoch;
   packageReviewModalRequestId = packageReviewRequestId;
   packageReviewModalSessionId = lease.sessionId;
-  const canPackage = review.materializable !== false && typeof review.token === 'string';
+  const hasContinuationChoices = getContinuationCandidates(review).length > 0;
+  const hasUnresolvedContinuation = review?.error === 'working_source_continuation_choice_required' ||
+    (Array.isArray(review?.sourceContinuation?.candidates) && review.sourceContinuation.candidates.length > 0);
+  const canPackage = !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
+  renderSourceContinuationChoices(project, review, lease);
   state.packageReviewToken = canPackage ? review.token : null;
 
   $('#modal-project-name').textContent = project.name;
@@ -4059,6 +4369,7 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   $('#modal-dest-path').textContent = getPackageDestinationLabel(state.packageOutputPath);
 
   openPackageReviewDialog(lease);
+  if (message && reviewMessage) reviewMessage.focus?.({ preventScroll: true });
   return true;
 }
 
@@ -4108,6 +4419,7 @@ async function createUnavailableRendererReview(project, message) {
         excluded: false,
         visualIdentity: null,
         visualRevision: null,
+        selectionUnavailable: true,
         status: 'unavailable',
       };
     }),
@@ -4223,6 +4535,11 @@ async function showPackageModal({
         : window.crate.preparePackageReview(projectId, reviewedOutputPath)
   );
   if (!isCurrentRequest()) return false;
+  if (review?.projectId && review.projectId !== projectId) return false;
+  if (review?.projectId === projectId && review?.error === 'working_source_continuation_choice_required' && getContinuationCandidates(review).length && project) {
+    renderPackageReview(project, { ...review, materializable: false }, message || review.message || '', lease);
+    return false;
+  }
   if (!review || review.error) {
       if (review?.error === 'asset_baseline_decision_required') {
         const refreshedProjects = await getAccountCurrentProjects();
