@@ -457,6 +457,125 @@ function baselineCases() {
     }
   });
 
+  function ld1InDesignFixture(f, scenario) {
+    const source = path.join(TEST_HOME, 'Desktop', 'Later.indd');
+    const savedLink = f.paths[1].link;
+    const liveLink = path.join(TEST_HOME, 'Desktop', 'Live-only.png');
+    const otherSource = path.join(TEST_HOME, 'Desktop', 'Other.indd');
+    const otherLink = path.join(TEST_HOME, 'Desktop', 'Other-only.png');
+    fs.writeFileSync(source, `synthetic saved InDesign bytes\n${savedLink}\n`);
+    fs.writeFileSync(liveLink, 'synthetic live linked bytes');
+    fs.writeFileSync(otherLink, 'synthetic unrelated linked bytes');
+    const selected = [
+      `DOC\t${source}\tLater.indd\tfalse\ttrue\t1`,
+      `LINK\t${source}\tLater.indd\t${liveLink}\tfalse\ttrue`,
+      'END\t1\t1\t1\t0',
+    ].join('\n');
+    const other = [
+      `DOC\t${otherSource}\tOther.indd\tfalse\ttrue\t1`,
+      `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
+      'END\t1\t1\t1\t0',
+    ].join('\n');
+    const counts = { processChecks: 0, queries: 0, observerScripts: [] };
+    setChildProcessHandler(request => {
+      if (request.kind === 'exec' && String(request.command).includes("grep -i 'Adobe InDesign'")) {
+        counts.processChecks++;
+        if (scenario === 'process-policy-denied') {
+          return { error: Object.assign(new Error('synthetic process policy denial'), { code: 'EPERM' }) };
+        }
+        return { stdout: scenario === 'closed' ? '' : '/Applications/Adobe InDesign/Adobe InDesign' };
+      }
+      if (isOsascriptInvocation(request, 'crate-indd-query.applescript')) {
+        counts.queries++;
+        if (scenario === 'script-automation-denied') return { error: Object.assign(
+          new Error('synthetic Not authorized to send Apple events (-1743)'), { code: -1743 }) };
+        if (scenario === 'script-query-failure') return { error: new Error('synthetic query execution failure') };
+        if (scenario === 'malformed') return { stdout: other.replace(/END.*$/, '') };
+        if (scenario === 'count-mismatch') return { stdout: other.replace('END\t1\t1\t1\t0', 'END\t2\t1\t1\t0') };
+        if (scenario === 'query-error-count') return { stdout: other.replace('END\t1\t1\t1\t0', 'END\t1\t1\t1\t1') };
+        if (scenario === 'snapshot-source-change') fs.appendFileSync(source, `changed bytes\n${otherLink}\n`);
+        return { stdout: scenario === 'selected-present' ? selected : scenario === 'running-no-documents' ? 'END\t0\t0\t0\t0' : other };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/osascript') counts.observerScripts.push(path.basename(request.args[0]));
+      return { stdout: '' };
+    });
+    return { source, savedLink, liveLink, otherLink, counts };
+  }
+
+  for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
+    'malformed', 'count-mismatch', 'query-error-count', 'script-query-failure', 'script-automation-denied', 'process-policy-denied',
+    'snapshot-source-change']) {
+    baselineTest(`LD-1 M1 InDesign: ${scenario}`, async () => {
+      const f = await ld1CompletedFixture();
+      const d = ld1InDesignFixture(f, scenario);
+      const originalBytes = fs.readFileSync(d.source);
+      try {
+        const result = await f.add(d.source);
+        const project = f.current();
+        const source = project.files.find(file => file.path === d.source);
+        const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+        const success = ['running-other-document', 'running-no-documents', 'selected-present', 'closed'].includes(scenario);
+        console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario, counters: d.counts, before: f.baseline, after: project, result }));
+        // Add Files also refreshes the live observer. Its modeled output is
+        // empty; only the selected-source query can produce these links.
+        assert.deepEqual(d.counts.observerScripts, ['closed', 'process-policy-denied'].includes(scenario)
+          ? [] : ['crate-indd-poll.applescript']);
+        assert.equal(d.counts.processChecks, 2);
+        assert.equal(d.counts.queries, ['closed', 'process-policy-denied'].includes(scenario) ? 0 : 1);
+        assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
+        if (success) {
+          assert.ok(Array.isArray(result), 'valid non-open saved source must not cause a partial failure');
+          assert.equal(record?.status, 'scanned');
+          assert.equal(record.provider, 'ordinary-indd');
+          assert.equal(record.inventoryStatus, 'unverified');
+          assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(originalBytes).digest('hex'));
+          const stat = fs.statSync(d.source);
+          for (const key of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(record.sourceIdentity[key], stat[key]);
+          const expectedLink = scenario === 'selected-present' ? d.liveLink : d.savedLink;
+          assert.equal(project.files.filter(file => file.path === expectedLink).length, 1);
+          assert.equal(project.files.find(file => file.path === expectedLink).assetOrigin, 'added');
+          assert.ok(record.requiredReferences.some(ref => ref.path === expectedLink));
+          if (scenario === 'selected-present') {
+            assert.ok(record.unresolved.some(item => item.reason === 'indesign-live-current-bytes-unbound'));
+            assert.equal(record.notes.includes('saved-byte-regex-fallback'), false);
+            assert.equal(project.files.some(file => file.path === d.savedLink), false);
+          } else {
+            assert.ok(record.notes.includes('saved-byte-regex-fallback'));
+            assert.equal(record.notes.includes('indesign-live-current-bytes-unbound'), false);
+            assert.deepEqual(record.unresolved, []);
+            assert.equal(project.files.some(file => file.path === d.liveLink), false);
+          }
+        } else {
+          assertAddFilesPartialScanFailure(result);
+          assert.equal(result.failedCount, 1);
+          assert.equal(record?.status, 'failed');
+          assert.equal([...project.files, ...project.pendingFiles].some(file => [d.savedLink, d.liveLink].includes(file.path)), false);
+          assert.equal(record?.notes?.includes('saved-byte-regex-fallback') || false, false);
+        }
+        assert.equal([...project.files, ...project.pendingFiles].some(file => file.path === d.otherLink), false);
+        assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+        assert.deepEqual(project.pendingFiles, []);
+        f.assertPrior();
+      } finally { await f.cleanup(); }
+    });
+  }
+
+  baselineTest('LD-1 M1 InDesign: strict first baseline still rejects a valid snapshot missing the selected document', async () => {
+    const f = await fixture({ sources: 2, structuredLinks: false });
+    const d = ld1InDesignFixture(f, 'running-other-document');
+    try {
+      manualDialogFor([d.source]);
+      const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      assertAddFilesPartialScanFailure(result);
+      const project = JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      assert.equal(project.assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(project.assetBaseline.establishedAt, null);
+      assert.equal(project.files.some(file => file.path === d.savedLink || file.path === d.otherLink), false);
+      assert.equal(d.counts.queries, 1);
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline', after: project, result }));
+    } finally { await f.cleanup(); }
+  });
+
   baselineTest('no descriptor: saved direct admission scans once and requires ordinary Existing decision', async () => {
     const f = await fixture();
     try {

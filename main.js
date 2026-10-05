@@ -12421,7 +12421,7 @@ function parseInDesignActiveSessionOutput(output) {
   return { documents, links, diagnostics };
 }
 
-function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
+function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath, { allowMissingSelectedSource = false } = {}) {
   const rows = String(output || '').split('\n').map(line => line.trim()).filter(Boolean);
   const documents = new Map();
   const linkCountsByDocument = new Map();
@@ -12493,7 +12493,7 @@ function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
     [...documents].every(([documentPath, expectedLinks]) => (
       (linkCountsByDocument.get(documentPath) || 0) === expectedLinks
     )) &&
-    documents.has(selectedSourcePath) &&
+    (allowMissingSelectedSource || documents.has(selectedSourcePath)) &&
     [...linkCountsByDocument.keys()].every(documentPath => documents.has(documentPath));
   if (!complete) throw new Error('asset_baseline_indesign_snapshot_incomplete');
 
@@ -14260,7 +14260,7 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
       { timeout: 3000, encoding: 'utf8' }
     ).catch(error => {
-      if (options.ordinaryVerification) return { stdout: '' };
+      if (options.ordinaryVerification && options.verifySelectedSource !== true) return { stdout: '' };
       throw error;
     });
 
@@ -14276,10 +14276,18 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       { timeout: 10000, encoding: 'utf8' }
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
-    options.onProvider?.('indesign-live-current-bytes-unbound');
+    const allowSavedFallback = options.ordinaryVerification === true && options.verifySelectedSource === true;
     const activeState = strict
-      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath)
+      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath, { allowMissingSelectedSource: allowSavedFallback })
       : parseInDesignActiveSessionOutput(inddPaths);
+    // Only a complete, error-free snapshot can establish that the saved file
+    // is not open. Query/access failures must not become a fallback route.
+    if (allowSavedFallback && !activeState.documents.some(document =>
+      normalizeTrackedFilePath(document.documentPath) === selectedSourcePath)) {
+      options.onProvider?.('saved-byte-regex-fallback');
+      return extractLinkedAssetsRegex(filePath, options);
+    }
+    options.onProvider?.('indesign-live-current-bytes-unbound');
 
     const results = activeState.links
       .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
@@ -15112,6 +15120,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: strictScan,
     ordinaryVerification: !!workingScan && !baselineScan,
+    verifySelectedSource: options.verifySelectedSource === true && !baselineScan,
     onOrdinaryScanFailure,
     onOrdinaryScanLimit,
     onProvider: value => { providerNote = value; },
