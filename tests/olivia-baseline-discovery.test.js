@@ -46,10 +46,10 @@ function baselineCases() {
     return { promise, release };
   }
 
-  async function fixture({ opened = false, modified = false, descriptor = false, sources = 1, malformed = false, structuredLinks = true } = {}) {
+  async function fixture({ opened = false, modified = false, descriptor = false, sources = 1, malformed = false, structuredLinks = true, sourceNames = null } = {}) {
     resetTestHomeWorkspace();
     const paths = Array.from({ length: sources }, (_, i) => ({
-      source: path.join(TEST_HOME, 'Desktop', `Design_${i}.ai`),
+      source: path.join(TEST_HOME, 'Desktop', sourceNames?.[i] || `Design_${i}.ai`),
       link: path.join(TEST_HOME, 'Desktop', `Link_${i}.png`),
     }));
     for (const p of paths) {
@@ -149,6 +149,313 @@ function baselineCases() {
     assert.equal(review.error, undefined);
     assert.equal(typeof review.token, 'string');
   }
+
+  // LD-1: only the trusted Add Files picker admits each saved source. The
+  // dependency is present solely in its real AI bytes, never an observer LINK.
+  for (const completedBaseline of [false, true]) {
+    baselineTest(`LD-1 manual Add Files: ${completedBaseline ? 'completed baseline retains B parser dependency' : 'awaiting baseline positive control'}`, async () => {
+      const f = await fixture({ sources: 2, sourceNames: ['A.ai', 'B.ai'], structuredLinks: false });
+      const scans = [];
+      const chronology = [];
+      const previousLog = console.log;
+      console.log = function trackLd1Scan(...args) {
+        const message = String(args[0]);
+        for (const entry of f.paths) {
+          if (message === `[crate] scan-on-open: scanning ${path.basename(entry.source)}`) scans.push(entry.source);
+        }
+        return previousLog.apply(console, args);
+      };
+      const snapshot = () => JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      const sourceBytes = f.paths.map(entry => fs.readFileSync(entry.source));
+      const linkBytes = f.paths.map(entry => fs.readFileSync(entry.link));
+      const add = async index => {
+        clearTrackedTimers();
+        manualDialogFor([f.paths[index].source]);
+        chronology.push({ action: `Add ${path.basename(f.paths[index].source)}`, at: Date.now() });
+        const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+        assert.ok(Array.isArray(result), 'trusted Add Files must finish without a partial failure');
+        await metadataTestHooks.waitForWatcherIdle(f.project.id);
+        clearTrackedTimers();
+        return snapshot();
+      };
+      const assertSourceAndLink = (project, index, origin) => {
+        const entry = f.paths[index];
+        const source = project.files.filter(file => file.path === entry.source);
+        const links = project.files.filter(file => file.path === entry.link);
+        assert.equal(source.length, 1, 'manual source must have one admitted row');
+        assert.equal(source[0].source, 'manual-browse');
+        assert.equal(source[0].assetOrigin, 'added');
+        assert.equal(source[0].projectRole, 'source');
+        assert.equal(links.length, 1, 'B parser-only dependency must be admitted after Add Files');
+        assert.equal(links[0].assetOrigin, origin);
+        assert.equal(links[0].projectRole, 'asset');
+        if (origin === 'existing') assert.equal(links[0].assetBaselineSourcePath, entry.source);
+        assert.equal(links[0].source, 'scan-on-open');
+        assert.equal(project.pendingFiles.some(file => file.path === entry.source || file.path === entry.link), false);
+        const verification = metadataTestHooks.getWorkingSourceVerification(project, source[0]);
+        assert.equal(verification?.status, 'scanned');
+        assert.ok(verification.requiredReferences.some(ref => ref.path === entry.link), 'current parser receipt must bind source to dependency');
+        assert.equal(verification.sourceFingerprint, crypto.createHash('sha256').update(sourceBytes[index]).digest('hex'));
+        const identity = fs.statSync(entry.source);
+        for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(verification.sourceIdentity[field], identity[field]);
+        assert.equal(scans.filter(sourcePath => sourcePath === entry.source).length, 1,
+          'one bounded parser scan; hashing/read counts are only supporting evidence');
+        assert.deepEqual(fs.readFileSync(entry.source), sourceBytes[index]);
+        assert.deepEqual(fs.readFileSync(entry.link), linkBytes[index]);
+      };
+      try {
+        const activation = snapshot();
+        assert.equal(activation.assetBaseline.status, 'awaiting-first-scan');
+        assert.deepEqual(activation.files, []);
+        assert.deepEqual(activation.pendingFiles, []);
+        let beforeB = activation;
+        if (completedBaseline) {
+          const afterA = await add(0);
+          assertSourceAndLink(afterA, 0, 'existing');
+          assert.equal(afterA.assetBaseline.status, 'decision-required');
+          assert.ok(Number.isFinite(afterA.assetBaseline.establishedAt));
+          assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+          beforeB = snapshot();
+          chronology.push({ action: 'Include Existing', at: Date.now(), baseline: beforeB.assetBaseline });
+          assert.equal(beforeB.assetBaseline.status, 'included');
+          assert.equal(beforeB.assetBaseline.decision, 'include');
+          // Wait for the real boundary to pass; never fabricate completed state.
+          await waitForCondition(() => Date.now() > beforeB.assetBaseline.establishedAt, 'baseline time did not advance');
+        }
+        const afterB = await add(1);
+        console.log('LD1_EVIDENCE ' + JSON.stringify({ arm: completedBaseline ? 'completed' : 'awaiting',
+          chronology, beforeB, afterB, scans, supportingAsyncSourceReads: f.paths.map((_, i) => f.count(i)),
+          producerControls: { opened: f.state.opened, descriptor: f.state.descriptor, timers: activeTimeouts.size + activeIntervals.size } }));
+        assert.equal(f.state.opened, false);
+        assert.equal(f.state.descriptor, false);
+        assert.equal(activeTimeouts.size + activeIntervals.size, 0);
+        assert.deepEqual(afterB.workingSourceSelections, beforeB.workingSourceSelections);
+        assert.deepEqual(afterB.excludedAssetKeys || [], beforeB.excludedAssetKeys || []);
+        if (completedBaseline) {
+          assert.deepEqual(afterB.assetBaseline, beforeB.assetBaseline, 'prior baseline and Include decision must stay intact');
+          for (const entry of f.paths.slice(0, 1)) {
+            for (const filePath of [entry.source, entry.link]) {
+              assert.deepEqual(afterB.files.find(file => file.path === filePath), beforeB.files.find(file => file.path === filePath));
+            }
+          }
+          assert.equal(scans.filter(sourcePath => sourcePath === f.paths[0].source).length, 1, 'A must not be requeued');
+          assert.ok(afterB.files.find(file => file.path === f.paths[1].source).addedAt > beforeB.assetBaseline.establishedAt);
+        } else {
+          assert.equal(afterB.assetBaseline.status, 'decision-required');
+          assert.ok(Number.isFinite(afterB.assetBaseline.establishedAt));
+        }
+        assertSourceAndLink(afterB, 1, completedBaseline ? 'added' : 'existing');
+      } finally {
+        console.log = previousLog;
+        await f.cleanup();
+      }
+    });
+  }
+
+  async function ld1CompletedFixture() {
+    const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'B.ai', 'C.ai'], structuredLinks: false });
+    const scans = [];
+    const originalLog = console.log;
+    console.log = function trackLd1ControlScan(...args) {
+      for (const entry of f.paths) {
+        if (String(args[0]) === `[crate] scan-on-open: scanning ${path.basename(entry.source)}`) scans.push(entry.source);
+      }
+      return originalLog.apply(console, args);
+    };
+    const current = () => JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+    const begin = (indices, id = crypto.randomUUID()) => {
+      clearTrackedTimers();
+      manualDialogFor(indices.map(index => typeof index === 'number' ? f.paths[index].source : index));
+      return callIpcRaw('projects:add-files', f.project.id, id);
+    };
+    const add = async (...indices) => {
+      const result = await begin(indices);
+      await metadataTestHooks.waitForWatcherIdle(f.project.id);
+      clearTrackedTimers();
+      return result;
+    };
+    try {
+      assert.ok(Array.isArray(await add(0)));
+      const initial = current();
+      assert.equal(initial.assetBaseline.status, 'decision-required');
+      assert.ok(Number.isFinite(initial.assetBaseline.establishedAt));
+      assert.equal(initial.files.find(file => file.path === f.paths[0].link)?.assetOrigin, 'existing');
+      assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+      const baseline = current();
+      await waitForCondition(() => Date.now() > baseline.assetBaseline.establishedAt, 'completed baseline clock did not advance');
+      return { ...f, current, begin, add, scans, baseline,
+        scanCount(index) { return scans.filter(filePath => filePath === f.paths[index].source).length; },
+        assertPrior() {
+          const project = current();
+          assert.deepEqual(project.assetBaseline, baseline.assetBaseline);
+          for (const filePath of [f.paths[0].source, f.paths[0].link]) {
+            assert.deepEqual(project.files.find(file => file.path === filePath), baseline.files.find(file => file.path === filePath));
+          }
+          assert.equal(scans.filter(filePath => filePath === f.paths[0].source).length, 1);
+        },
+        assertMissing(index) {
+          const project = current();
+          assert.equal([...project.files, ...project.pendingFiles].some(file => file.path === f.paths[index].link), false);
+          assert.equal(JSON.stringify(project.provenance).includes(f.paths[index].link), false);
+          const row = project.files.find(file => file.path === f.paths[index].source);
+          assert.notEqual(metadataTestHooks.getWorkingSourceVerification(project, row)?.status, 'scanned');
+        },
+        evidence(control) {
+          console.log('LD1_CONTROL_EVIDENCE ' + JSON.stringify({ control, baseline, after: current(), scans }));
+        },
+        async cleanup() { console.log = originalLog; await f.cleanup(); },
+      };
+    } catch (error) { console.log = originalLog; await f.cleanup(); throw error; }
+  }
+
+  baselineTest('LD-1 controls: completed baseline ignores re-add, unselected roots and images', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      assert.ok(Array.isArray(await f.add(1)));
+      const verified = f.current();
+      const b = verified.files.find(file => file.path === f.paths[1].source);
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(verified, b)?.status, 'scanned');
+      assert.equal(verified.files.find(file => file.path === f.paths[1].link)?.assetOrigin, 'added');
+      assert.deepEqual(verified.pendingFiles, []);
+      assert.ok(Array.isArray(await f.add(1, 1, f.paths[2].link)));
+      assert.equal(f.scanCount(1), 1);
+      assert.equal(f.scanCount(2), 0);
+      assert.equal(f.current().files.some(file => file.path === f.paths[2].source), false);
+      assert.equal(f.current().files.find(file => file.path === f.paths[2].link)?.projectRole, 'asset');
+      assert.deepEqual(f.current().workingSourceVerification, verified.workingSourceVerification);
+      f.assertPrior(); f.evidence('re-add/unselected/image');
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 controls: prior exclusion survives row absence and manual readmission', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      assert.ok(Array.isArray(await f.add(1)));
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.name === 'B.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision })).success, true);
+      const excluded = f.current();
+      // Model a persisted absent row, as the existing durable-intent control
+      // does. The exclusion itself and subsequent admission use real IPC.
+      const stored = storeInstance.data.projects.find(project => project.id === f.project.id);
+      stored.files = stored.files.filter(file => file.path !== f.paths[1].source);
+      roundTripFakeStore();
+      assert.ok(Array.isArray(await f.add(1)));
+      const after = f.current();
+      assert.equal(f.scanCount(1), 1, 'new row at an excluded route cannot trigger Restore');
+      assert.deepEqual(after.workingSourceSelections, excluded.workingSourceSelections);
+      assert.deepEqual(after.workingSourceVerification, excluded.workingSourceVerification);
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'B.ai').sourceSelection, 'excluded');
+      assert.deepEqual(after.files.find(file => file.path === f.paths[1].link), excluded.files.find(file => file.path === f.paths[1].link),
+        'genuine prior dependency must survive source exclusion and re-admission');
+      f.assertPrior(); f.evidence('durable exclusion/modeled row absence/manual readmission');
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 controls: malformed later source fails without baseline reset or re-add retry', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      fs.writeFileSync(f.paths[1].source, `%PDF-1.7\n${f.paths[1].link}\nmissing EOF`);
+      const result = await f.add(1);
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(result.failedCount, 1);
+      assert.equal(result.completedCount, 0);
+      assert.equal(f.scanCount(1), 1);
+      f.assertMissing(1);
+      const failed = f.current().workingSourceVerification;
+      assert.ok(Array.isArray(await f.add(1)));
+      assert.equal(f.scanCount(1), 1);
+      assert.deepEqual(f.current().workingSourceVerification, failed);
+      f.assertPrior(); f.evidence('malformed/no implicit retry');
+    } finally { await f.cleanup(); }
+  });
+
+  for (const interruption of ['source-bytes', 'cancel', 'generation', 'exclude']) {
+    baselineTest(`LD-1 controls: ${interruption} during later scan prevents dependency publication`, async () => {
+      const f = await ld1CompletedFixture();
+      const entered = deferred(), release = deferred();
+      const restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+        if (path.resolve(filePath) === f.paths[1].source) { entered.release(); await release.promise; }
+        return read();
+      });
+      let pending;
+      try {
+        const id = crypto.randomUUID();
+        pending = f.begin([1], id);
+        await entered.promise;
+        if (interruption === 'source-bytes') {
+          writeSyntheticAiFile(f.paths[1].source, `${f.paths[2].link}\nchanged saved bytes`);
+        } else if (interruption === 'cancel') {
+          assert.equal(await callIpcRaw('projects:cancel-add-files', f.project.id, id), true);
+        } else if (interruption === 'generation') {
+          await createProject('LD-1 generation replacement');
+          clearTrackedTimers();
+        } else {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          const row = workspace.files.find(file => file.name === 'B.ai');
+          const excluded = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+            { action: 'exclude', expectedRevision: row.selectionRevision });
+          assert.equal(excluded.success, true);
+        }
+        release.release();
+        const result = await pending;
+        if (['cancel', 'generation'].includes(interruption)) assert.equal(result, null);
+        else assertAddFilesPartialScanFailure(result);
+        f.assertMissing(1);
+        assert.equal(f.current().files.some(file => file.path === f.paths[2].link), false);
+        if (interruption === 'exclude') {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          assert.equal(workspace.files.find(file => file.name === 'B.ai').sourceSelection, 'excluded');
+          assert.ok(Array.isArray(await f.add(1)));
+          assert.equal(f.scanCount(1), 1, 'excluded re-add must not act as Restore');
+          f.assertMissing(1);
+        }
+        f.assertPrior(); f.evidence(interruption);
+      } finally {
+        release.release();
+        if (pending) await pending;
+        restoreReads();
+        await f.cleanup();
+      }
+    });
+  }
+
+  baselineTest('LD-1 controls: later timeout retains bounded sibling success without late publication', async () => {
+    const f = await ld1CompletedFixture();
+    const entered = deferred(), release = deferred();
+    const restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+      if (path.resolve(filePath) === f.paths[1].source) { entered.release(); await release.promise; }
+      return read();
+    });
+    const trackedTimer = global.setTimeout;
+    // The established test harness scales only the production scan deadline.
+    global.setTimeout = (callback, delay, ...args) => trackedTimer(callback, delay === 30000 ? 250 : delay, ...args);
+    let pending;
+    try {
+      pending = f.begin([1, 2]);
+      await entered.promise;
+      const result = await pending;
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(result.selectedCount, 2);
+      assert.equal(result.completedCount, 1);
+      assert.equal(result.failedCount, 1);
+      assert.equal(result.scanResults.find(item => item.path === f.paths[1].source).error, 'add_files_scan_timeout');
+      assert.equal(f.current().files.find(file => file.path === f.paths[2].link)?.assetOrigin, 'added');
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(file => file.path === f.paths[2].source))?.status, 'scanned');
+      f.assertMissing(1);
+      release.release();
+      await new Promise(resolve => originalSetTimeout(resolve, 25));
+      f.assertMissing(1);
+      assert.equal(f.scanCount(1), 1); assert.equal(f.scanCount(2), 1);
+      f.assertPrior(); f.evidence('timeout/sibling/late result');
+    } finally {
+      global.setTimeout = trackedTimer;
+      release.release();
+      if (pending) await pending;
+      restoreReads(); await f.cleanup();
+    }
+  });
 
   baselineTest('no descriptor: saved direct admission scans once and requires ordinary Existing decision', async () => {
     const f = await fixture();

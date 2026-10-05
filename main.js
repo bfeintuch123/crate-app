@@ -15021,7 +15021,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // Engagement or an explicit Restore still binds publication to its exact
   // verification attempt, including engagement that occurs during this scan.
   const isCurrent = () => parentCurrent() && (!workingScan ||
-    (!options.workingSourceAttempt && !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
+    (!options.workingSourceAttempt && options.verifySelectedSource !== true &&
+      !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
     workingScan.current()) &&
     (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
@@ -15034,7 +15035,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   const sourceRow = currentProject.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
     normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
-  const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt;
+  const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt || options.verifySelectedSource === true;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
   const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
   const excludedPreparation = typeof options.excludedWorkingSourcePreparation === 'function' ? options.excludedWorkingSourcePreparation : null;
@@ -15045,7 +15046,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
   workingScan = beginWorkingSourceScan(projectId, filePath, parentCurrent, options.workingSourceAttempt, excludedPreparation);
   scanLease.workingSourceScan = workingScan;
-  if (options.workingSourceAttempt && !workingScan) return { success: false, error: 'stale_project_operation' };
+  if ((options.workingSourceAttempt || options.verifySelectedSource === true) && !workingScan) return { success: false, error: 'stale_project_operation' };
   const leaseKey = workingScan && projectId + ':' + workingScan.key;
   if (leaseKey) {
     const previousLease = workingSourceScanLeases.get(leaseKey);
@@ -17541,6 +17542,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         .map(filePath => [normalizeTrackedFilePath(filePath), filePath])
         .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
     ).values()];
+    const newSourcePaths = [];
     const result = mutateProject(projectId, (project) => {
       if (!operation.current()) return null;
       const acceptedByKey = new Map();
@@ -17564,6 +17566,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         if (!existingFile) {
           project.files.push(authorizedFile);
           acceptedByKey.set(key, authorizedFile);
+          if (isProjectAssetBaselineSource(authorizedFile)) newSourcePaths.push(filePath);
         }
         project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
         for (const exclusionKey of [
@@ -17591,15 +17594,24 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     sendProjectFileStateToRenderer(projectId, operation.activationToken);
 
     const updatedProject = getProjects().find(project => project.id === projectId);
-    if (updatedProject?.assetBaseline?.status === 'awaiting-first-scan') {
-      const baselineSources = getProjectAssetBaselineSourcePaths(updatedProject);
+    const establishBaseline = updatedProject?.assetBaseline?.status === 'awaiting-first-scan';
+    const eligibleSources = getProjectAssetBaselineSourcePaths(updatedProject);
+    const newSourceKeys = new Set(newSourcePaths.map(normalizeTrackedFilePath));
+    // Later manual admission scans only new selected roots, retaining the first
+    // cohort and its Existing decision. Re-add is not a Restore/retry route.
+    const selectedSources = establishBaseline ? eligibleSources
+      : Number.isFinite(updatedProject?.assetBaseline?.establishedAt)
+        ? eligibleSources.filter(sourcePath => newSourceKeys.has(normalizeTrackedFilePath(sourcePath))) : [];
+    if (establishBaseline || selectedSources.length > 0) {
       const scanReport = await runBoundedScanOnOpenQueue(
         projectId,
-        baselineSources,
+        selectedSources,
         operation.activationToken,
         operation,
         {
           addFilesScan: true,
+          establishBaseline,
+          verifySelectedSource: !establishBaseline,
           allowPausedBaseline: true,
           scanTimeoutMs: ADD_FILES_SCAN_TIMEOUT_MS,
           onScanLease(scanLease) {
