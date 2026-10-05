@@ -12890,12 +12890,24 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
       if (carrier.tailBytes === null) framingIssues.add('unresolved-media-descriptor-framing');
       else if (carrier.tailBytes > 0) framingIssues.add('unexplained-media-tail');
       for (const ref of carrier.references) {
-        const rawPaths = ref.frameReader?.['Lnk '] ?? null;
-        const disposition = !ref.reason && typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length
+        const frameReader = ref.frameReader;
+        const rawPaths = frameReader?.['Lnk '] ?? null;
+        // Derive the existing reader policy from concrete fields as well as
+        // retaining worker refusals: issue/reason omission cannot erase it.
+        const shapeValid = frameReader && typeof frameReader === 'object' && !Array.isArray(frameReader)
+          && frameReader.descVersion === 1 && rawPaths && typeof rawPaths === 'object' && !Array.isArray(rawPaths)
+          && rawPaths.descVersion === (carrier.carrier === '1075' ? 1 : 2);
+        const derivedReason = !shapeValid ? 'unsupported-media-reference-shape'
+          : carrier.carrier === '1075' ? 'unverified-timeline-frame-reader-type'
+            : carrier.pixelSourceType === 1986285651 && frameReader.frameReaderType === 1364477522
+              ? null : 'unsupported-video-reader-type';
+        for (const reason of [derivedReason, ref.reason]) if (reason) framingIssues.add(reason);
+        const referenceReason = derivedReason || ref.reason;
+        const disposition = !referenceReason && typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length
           ? 'external-reference' : 'unresolved-media-reference';
         references.push({ source: 'wire-media', carrier: carrier.carrier, carrierIndex: carrier.carrierIndex,
-          layerIndex: carrier.layerIndex, layerId: carrier.layerId, ...ref, rawPaths, disposition });
-        if (disposition !== 'external-reference') unresolved.push({ carrier: carrier.carrier, reason: ref.reason || disposition });
+          layerIndex: carrier.layerIndex, layerId: carrier.layerId, ...ref, reason: referenceReason, rawPaths, disposition });
+        if (disposition !== 'external-reference' && !referenceReason) unresolved.push({ carrier: carrier.carrier, reason: disposition });
         wireMedia.push(mediaSignature(carrier.carrier, { ...ref, layerId: carrier.layerId }, true));
       }
       if (carrier.status !== 'decoded') unresolved.push({ carrier: carrier.carrier, reason: carrier.reason || 'media-descriptor-unresolved' });

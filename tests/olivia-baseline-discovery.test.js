@@ -2762,4 +2762,116 @@ function baselineCases() {
     });
   }
 
+  function videoBytes({ fullPath = '/Users/synthetic/missing.mov', pixelType = 1986285651,
+    readerType = 1364477522, readerVersion = 1, descriptorVersion = 1, tail = 0 } = {}) {
+    const agPsd = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    const w = originalLoad.call(Module, 'ag-psd/dist/psdWriter', module);
+    const writer = w.createWriter();
+    const id = value => {
+      w.writeUint32(writer, value.length === 4 ? 0 : value.length);
+      w.writeAsciiString(writer, value);
+    };
+    // Explicit test-only Action Descriptor types avoid ag-psd's disabled PxSc
+    // writer's unrelated key-type inference. No production encoder is added.
+    function typedDescriptor(classId, fields) {
+      w.writeUnicodeStringWithPadding(writer, ''); id(classId); w.writeUint32(writer, fields.length);
+      for (const [key, type, value] of fields) {
+        id(key); w.writeSignature(writer, type);
+        if (type === 'Objc') typedDescriptor(value[0], value[1]);
+        else if (type === 'long') w.writeInt32(writer, value);
+        else if (type === 'doub') w.writeFloat64(writer, value);
+        else if (type === 'TEXT') w.writeUnicodeString(writer, value);
+        else if (type === 'bool') w.writeUint8(writer, value ? 1 : 0);
+        else if (type === 'enum') { id(value[0]); id(value[1]); }
+        else if (type === 'tdta') { w.writeInt32(writer, value.length); w.writeBytes(writer, value); }
+        else if (type === 'alis') { w.writeInt32(writer, value.length); w.writeAsciiString(writer, value); }
+        else throw new Error('unsupported synthetic fixture type');
+      }
+    }
+    w.writeUint32(writer, 16);
+    typedDescriptor('PixelSource', [
+      ['pixelSourceType', 'long', pixelType], ['descVersion', 'long', descriptorVersion],
+      ['origin', 'Objc', ['null', [['Hrzn', 'doub', 0], ['Vrtc', 'doub', 0]]]],
+      ['interpretation', 'Objc', ['footageInterpretation', [
+        ['Vrsn', 'long', 1], ['interpretAlpha', 'enum', ['alphaInterpretation', 'straight']], ['profile', 'tdta', new Uint8Array()],
+      ]]],
+      ['frameReader', 'Objc', ['FrameReader', [
+        ['frameReaderType', 'long', readerType], ['descVersion', 'long', readerVersion],
+        ['Lnk ', 'Objc', ['ExternalFileLink', [
+          ['descVersion', 'long', 2], ['Nm  ', 'TEXT', 'movie.mov'], ['fullPath', 'TEXT', fullPath],
+          ['originalPath', 'TEXT', 'file:///raw/original.mov'], ['relPath', 'TEXT', '../raw.mov'], ['alis', 'alis', 'raw-alias\u0000token'],
+        ]]], ['mediaDescriptor', 'TEXT', ''],
+      ]]], ['showAlteredVideo', 'bool', false],
+    ]);
+    const descriptor = Buffer.from(w.getWriterBuffer(writer));
+    const payload = Buffer.concat([descriptor, Buffer.alloc(tail, 7)]);
+    const block = Buffer.alloc(12 + payload.length + payload.length % 2);
+    block.write('8BIM'); block.write('PxSc', 4); block.writeUInt32BE(payload.length, 8); payload.copy(block, 12);
+    const original = agPsd.writePsdBuffer({ width: 1, height: 1, children: [{ id: 42, name: 'video layer' }] });
+    const resourceLength = 30 + original.readUInt32BE(26);
+    const maskLength = resourceLength + 4 + original.readUInt32BE(resourceLength);
+    const layerLength = maskLength + 4;
+    let offset = layerLength + 4 + 2 + 16;
+    const channelCount = original.readUInt16BE(offset); offset += 2 + channelCount * 6 + 12;
+    const extraLength = offset;
+    const extraEnd = extraLength + 4 + original.readUInt32BE(extraLength);
+    const bytes = Buffer.concat([original.subarray(0, extraEnd), block, original.subarray(extraEnd)]);
+    for (const position of [extraLength, layerLength, maskLength]) {
+      bytes.writeUInt32BE(original.readUInt32BE(position) + block.length, position);
+    }
+    return bytes;
+  }
+
+  for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version', 'video-frame-version',
+    'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal']) {
+    baselineTest(`Media receiver correction: actual IPC preserves ${mode} policy without redundant reason`, async () => {
+      resetTestHomeWorkspace();
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const target = path.join(TEST_HOME, 'Desktop', mode.startsWith('timeline') ? 'Media.wav' : 'movie.mov');
+      const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+      const bytes = mode.startsWith('timeline') ? actual.writePsdBuffer({ width: 1, height: 1, imageResources: {
+        timelineInformation: { enabled: true, frameStep: second, frameRate: 24, time: zero, duration: second,
+          workInTime: zero, workOutTime: second, repeats: 0, hasMotion: true, globalTracks: [],
+          audioClipGroups: [{ id: 'group', muted: false, audioClips: [{ id: 'clip', start: zero, duration: second,
+            inTime: zero, outTime: second, muted: false, audioLevel: 0, frameReader: { type: 1, mediaDescriptor: '',
+              link: { name: 'Media.wav', fullPath: target, relativePath: '../Media.wav' } } }] }],
+        },
+      } }) : videoBytes({ fullPath: target });
+      const f = await correctionProject('.psd', bytes); fs.writeFileSync(target, 'synthetic accepted media');
+      f.current().files.push({ path: target, name: path.basename(target), ext: path.extname(target),
+        source: 'user-added', acceptedPending: true, projectRole: 'asset' });
+      const worker = require('../parsers/add-files-psd-worker'), inspect = worker.inspectPsdLinkFraming;
+      worker.inspectPsdLinkFraming = data => {
+        const facts = inspect(data); const carrier = facts.mediaCarriers[0], ref = carrier.references[0];
+        assert.equal(carrier.status, 'decoded'); assert.equal(carrier.version, 1); assert.equal(carrier.tailBytes, 0);
+        facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified']; facts.issues = []; ref.reason = null;
+        if (mode.endsWith('frame-version')) ref.frameReader.descVersion = 2;
+        if (mode.endsWith('link-version')) ref.frameReader['Lnk '].descVersion = 9;
+        if (mode === 'video-pixel') carrier.pixelSourceType = 1;
+        if (mode === 'video-reader') ref.frameReader.frameReaderType = 1;
+        if (mode === 'video-worker-refusal') ref.reason = 'unsupported-media-reference-shape';
+        return facts;
+      };
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id), source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const record = Object.values(f.current().workingSourceVerification)[0]; assert.equal(record.status, 'scanned');
+        assert.ok(record.requiredReferences.some(x => x.path === target));
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        if (mode === 'video-supported') {
+          assert.deepEqual(record.unresolved, []); assert.equal(review.materializable, true); assert.equal(typeof review.token, 'string');
+        } else {
+          const reason = mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
+            : ['video-pixel', 'video-reader'].includes(mode) ? 'unsupported-video-reader-type' : 'unsupported-media-reference-shape';
+          assert.ok(record.unresolved.some(x => x.reason === reason));
+          assert.equal(record.unresolved.filter(x => x.reason === reason).length, 1);
+          assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+          assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, true);
+        }
+      } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
 }

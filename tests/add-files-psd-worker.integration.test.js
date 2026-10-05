@@ -946,3 +946,34 @@ for (const fault of ['type', 'version', 'tail', 'incomplete-tail', 'media-versio
     assert.ok(result.linkedInventory.unresolved.some(item => item.reason === reason)); await run.finish();
   });
 }
+
+
+for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version', 'video-frame-version',
+  'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal']) {
+  test(`media receiver derives ${mode} policy without redundant worker reason`, async t => {
+    const bytes = mode.startsWith('timeline') ? audioBytes() : videoBytes();
+    const value = parsed();
+    value.psd = agPsd.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+    value.framing = inspectPsdLinkFraming(bytes);
+    const carrier = value.framing.mediaCarriers[0], ref = carrier.references[0];
+    value.framing.status = 'incomplete'; value.framing.notes = ['alternate-layer-carrier-domain-unverified'];
+    value.framing.issues = []; ref.reason = null;
+    if (mode.endsWith('frame-version')) ref.frameReader.descVersion = 2;
+    if (mode.endsWith('link-version')) ref.frameReader['Lnk '].descVersion = 9;
+    if (mode === 'video-pixel') carrier.pixelSourceType = 1;
+    if (mode === 'video-reader') ref.frameReader.frameReaderType = 1;
+    if (mode === 'video-worker-refusal') ref.reason = 'unsupported-media-reference-shape';
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const inventory = result.linkedInventory;
+    if (mode === 'video-supported') {
+      assert.deepEqual(Array.from(inventory.unresolved), []);
+      assert.ok(inventory.references.some(x => x.source === 'wire-media' && x.disposition === 'external-reference'));
+    } else {
+      const reason = mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
+        : ['video-pixel', 'video-reader'].includes(mode) ? 'unsupported-video-reader-type' : 'unsupported-media-reference-shape';
+      assert.equal(inventory.unresolved.filter(x => x.reason === reason).length, 1);
+      assert.ok(inventory.references.some(x => x.source === 'wire-media' && x.disposition === 'unresolved-media-reference'));
+    }
+    await run.finish();
+  });
+}
