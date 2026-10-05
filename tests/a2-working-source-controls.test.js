@@ -32,7 +32,7 @@ function setup(overrides = {}) {
   };
   const renderer = loadRendererHelpers(document, { crate });
   renderer.fixtureProject = project; renderer.fixtureWorkspace = workspace;
-  vm.runInContext('state.projects = [fixtureProject]; state.selectedProjectId = fixtureProject.id; state.assetWorkspace = fixtureWorkspace; accountStatus.canUseWorkspace = true;', renderer);
+  vm.runInContext('state.projects = [fixtureProject]; state.selectedProjectId = fixtureProject.id; state.assetWorkspace = fixtureWorkspace; assetWorkspaceProjectSnapshot = fixtureProject; accountStatus.canUseWorkspace = true;', renderer);
   const notices = [];
   renderer.showToast = message => notices.push(message);
   return { renderer, document, elements, project, workspace, row, calls, crate, notices };
@@ -111,6 +111,78 @@ test('project cards do not fetch per-project workspaces or borrow another projec
   assert.match(f.elements['project-rows'].children[0].innerHTML, /1 included file/);
   assert.doesNotMatch(f.elements['project-rows'].children[1].innerHTML, /included file/);
   assert.equal(requests, 0);
+});
+
+test('same-project refresh retires card counts without per-project scans and fences a pending workspace', async () => {
+  const f = setup(); f.project.status = 'paused';
+  await f.renderer.renderFiles();
+  assert.match(f.renderer.getStatusLabel(f.project), /1 included file/);
+  f.document.querySelector('#tab-projects').classList.add('active');
+  f.document.querySelector('#tab-current-project').classList.remove('active');
+  const gate = deferred(); let requests = 0;
+  f.crate.getAssetWorkspace = () => { requests++; return gate.promise; };
+  const pending = f.renderer.ensureProjectAssetWorkspace(f.project);
+  await pending; // This read is satisfied by the current cached workspace.
+  vm.runInContext('assetWorkspaceRequestId += 1', f.renderer);
+  const staleRead = f.renderer.ensureProjectAssetWorkspace(f.project);
+  const next = clone(f.project); next.files.push({ name: 'New.ai' });
+  f.renderer.freshProject = next;
+  assert.equal(vm.runInContext('applyProjectRefresh([freshProject], projectRefreshGeneration, new Set([freshProject.id]), projectListReadEpoch)', f.renderer), true);
+  assert.equal(f.renderer.getStatusLabel(next), 'Paused');
+  gate.resolve(clone(f.workspace)); assert.equal(await staleRead, null, 'the obsolete in-flight response is rejected');
+  assert.equal(f.renderer.getStatusLabel(next), 'Paused', 'old in-flight workspace cannot republish the count');
+  assert.equal(requests, 1, 'project cards do not fetch a replacement projection');
+  assert.doesNotMatch(f.elements['project-rows'].children[0].innerHTML, /included file/);
+  f.crate.getAssetWorkspace = async () => ({ ...clone(f.workspace), files: [...clone(f.workspace.files), { name: 'New.ai', included: true }] });
+  await f.renderer.renderFiles();
+  assert.match(f.renderer.getStatusLabel(next), /2 included files/);
+});
+
+test('replacing the project snapshot alone cannot reuse a previous inclusion count', async () => {
+  const f = setup(); f.project.status = 'paused'; await f.renderer.renderFiles();
+  f.renderer.freshProject = clone(f.project);
+  vm.runInContext('state.projects = [freshProject]', f.renderer);
+  assert.equal(f.renderer.getStatusLabel(f.renderer.freshProject), 'Paused');
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Paused', 'old render callers also lose count authority');
+});
+
+for (const origin of ['existing', 'added']) test(`${origin} required override agrees with filters and excluded styling`, () => {
+  const f = setup();
+  const asset = { name: 'Required.png', ext: '.png', visualIdentity: 'required', projectRole: 'asset', assetOrigin: origin,
+    excluded: true, included: true, includedAsDependency: true, requiredBy: ['Original.ai'] };
+  f.workspace.files.push(asset); f.workspace.semanticCounts.includedAssets = 1;
+  f.renderer.renderAssetWorkspace(f.project, {}, f.workspace.files);
+  const list = f.elements[`${origin}-assets-list`];
+  const filter = value => { f.renderer.selectedFilter = value; vm.runInContext('state.assetReviewFilter = selectedFilter', f.renderer); f.renderer.applyAssetReviewFilter(); };
+  filter(origin);
+  assert.equal(f.elements[`filter-count-${origin}`].textContent, '1');
+  assert.equal(list.__assetReviewVirtualState.items.length, 1);
+  const requiredRow = list.children.find(row => /Required.png/.test(getElementTreeText(row)));
+  assert.ok(requiredRow); assert.doesNotMatch(requiredRow.className, /is-excluded/);
+  assert.ok(buttonFor(requiredRow, 'Required asset'));
+  filter('excluded');
+  assert.equal(f.elements['filter-count-excluded'].textContent, '0');
+  assert.equal(list.__assetReviewVirtualState.items.length, 0);
+  Object.assign(asset, { included: false, includedAsDependency: false, requiredBy: [] });
+  Object.assign(f.workspace.semanticCounts, { includedAssets: 0, excludedAssets: 1 });
+  f.renderer.renderAssetWorkspace(f.project, {}, f.workspace.files);
+  filter(origin); assert.equal(list.__assetReviewVirtualState.items.length, 0);
+  filter('excluded'); assert.equal(list.__assetReviewVirtualState.items.length, 1);
+  assert.equal(f.elements['filter-count-excluded'].textContent, '1');
+  const excludedRow = list.children.find(row => /Required.png/.test(getElementTreeText(row)));
+  assert.match(excludedRow.className, /is-excluded/);
+});
+
+test('effective asset filters preserve excluded working-source intent and legacy fallback', () => {
+  const f = setup({ sourceSelection: 'excluded', included: true, includedAsDependency: true, effectiveRole: 'asset' });
+  const legacy = { name: 'Legacy.png', visualIdentity: 'legacy', assetOrigin: 'added', excluded: true };
+  f.workspace.files.push(legacy);
+  Object.assign(f.workspace.semanticCounts, { selectedWorkingSources: 0, excludedWorkingSources: 1, excludedAssets: 1 });
+  vm.runInContext("state.assetReviewFilter = 'excluded'", f.renderer);
+  f.renderer.renderAssetWorkspace(f.project, {}, f.workspace.files);
+  assert.equal(f.elements['working-assets-list'].children[0].classList.contains('filtered-out'), false);
+  assert.equal(f.elements['added-assets-list'].__assetReviewVirtualState.items.length, 1);
+  assert.equal(f.elements['filter-count-excluded'].textContent, '2');
 });
 
 for (const outcome of ['failure', 'close']) test(`pending continuation keeps keyboard focus before disabling choice: ${outcome}`, async () => {

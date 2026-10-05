@@ -69,6 +69,7 @@ let fileWorkspaceRenderRequestId = 0;
 let assetWorkspaceRequestGeneration = 0;
 let assetWorkspaceRequestId = 0;
 let assetWorkspaceLoadedRequestId = 0;
+let assetWorkspaceProjectSnapshot = null;
 let packageReviewRequestId = 0;
 let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
@@ -894,6 +895,7 @@ function getProjectIncludedFileCount(project) {
   // project cards must not trigger their own per-project scans.
   if (!accountStatus.canUseWorkspace || state.selectedProjectId !== project.id ||
       workspace?.projectId !== project.id || assetWorkspaceLoadedRequestId !== assetWorkspaceRequestId ||
+      assetWorkspaceProjectSnapshot !== project || state.projects.find(item => item.id === project.id) !== project ||
       !workspace.semanticCounts || !Array.isArray(workspace.files) ||
       !workspace.files.every(file => typeof file?.included === 'boolean')) return null;
   return workspace.files.filter(file => file.included).length;
@@ -1732,6 +1734,7 @@ async function renderFiles(renderOptions = {}) {
   }
   state.assetWorkspace = assetWorkspace;
   assetWorkspaceLoadedRequestId = workspaceRequestId;
+  assetWorkspaceProjectSnapshot = project;
   statusText.textContent = getStatusLabel(project);
   if (isTabActive('projects')) renderProjectRows();
 
@@ -1939,6 +1942,7 @@ async function ensureProjectAssetWorkspace(project) {
   const requestGeneration = assetWorkspaceRequestGeneration;
   if (
     state.assetWorkspace?.projectId === project.id &&
+    assetWorkspaceProjectSnapshot === project &&
     assetWorkspaceLoadedRequestId === assetWorkspaceRequestId
   ) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
@@ -1953,6 +1957,7 @@ async function ensureProjectAssetWorkspace(project) {
     if (!workspace || workspace.projectId !== project.id) return null;
     state.assetWorkspace = workspace;
     assetWorkspaceLoadedRequestId = requestId;
+    assetWorkspaceProjectSnapshot = project;
     return workspace;
   } catch (error) {
     logRendererError('asset workspace unavailable', error);
@@ -2687,6 +2692,10 @@ function appendWorkingSourceControls(row, copy, project, file) {
   row.appendChild(button);
 }
 
+function isPresentedAssetIncluded(file) {
+  return typeof file?.included === 'boolean' ? file.included : file?.excluded !== true;
+}
+
 function createAssetFileRow(
   project,
   file,
@@ -2699,6 +2708,9 @@ function createAssetFileRow(
     selectable = false,
   } = {}
 ) {
+  // Ordinary assets use effective membership: a required dependency can
+  // override saved exclusion intent. Working-source intent stays separate.
+  if (!isWorkingSourcePresentation(file) && typeof file?.included === 'boolean') excluded = !isPresentedAssetIncluded(file);
   const row = document.createElement('div');
   row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
   row.setAttribute('role', 'listitem');
@@ -2861,9 +2873,12 @@ function applyAssetReviewFilter() {
   const query = String(state.assetReviewQuery || '').trim().toLowerCase();
   const logicalItems = state.assetReviewLogicalItems || {};
   const filterItems = (items, category) => (Array.isArray(items) ? items : []).filter(file => {
+    const excluded = isWorkingSourcePresentation(file)
+      ? file.sourceSelection === 'excluded'
+      : !isPresentedAssetIncluded(file);
     const matchesFilter = filter === 'all'
-      || (filter === 'excluded' && (file.excluded === true || file.sourceSelection === 'excluded'))
-      || (filter === category && file.excluded !== true);
+      || (filter === 'excluded' && excluded)
+      || (filter === category && !excluded);
     return matchesFilter && (!query || getAssetReviewSearchText(file).includes(query));
   });
   const listDefinitions = [
@@ -2927,9 +2942,9 @@ function applyAssetReviewFilter() {
 }
 
 function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles, figmaSourceCount = 0) {
-  const includedExisting = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true));
-  const excluded = [...existingAssets, ...addedAssets].filter(file => file.excluded === true);
-  const includedAdded = addedAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true));
+  const includedExisting = existingAssets.filter(isPresentedAssetIncluded);
+  const excluded = [...existingAssets, ...addedAssets].filter(file => !isPresentedAssetIncluded(file));
+  const includedAdded = addedAssets.filter(isPresentedAssetIncluded);
   setCountText('metric-existing-count', includedExisting.length);
   setCountText('metric-added-count', includedAdded.length);
   setCountText('metric-missing-count', pendingFiles.length);
@@ -3143,9 +3158,9 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   });
 
   setAssetPanelCount($('#project-file-count'), Number.isSafeInteger(workingCount) ? workingCount : sourceFiles.length, workingTotal);
-  const includedExistingCount = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
+  const includedExistingCount = existingAssets.filter(isPresentedAssetIncluded).length;
   setAssetPanelCount($('#existing-assets-count'), includedExistingCount, existingAssets.length);
-  const includedAddedCount = addedAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
+  const includedAddedCount = addedAssets.filter(isPresentedAssetIncluded).length;
   setAssetPanelCount($('#added-assets-count'), includedAddedCount, addedAssets.length);
 
   const pendingFiles = state.assetWorkspace?.projectId === project.id
@@ -5327,6 +5342,12 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
     refreshGeneration !== projectRefreshGeneration ||
     !projectListReadIsCurrent(projectListRead)
   ) return false;
+  if (state.selectedProjectId && projectIds.has(state.selectedProjectId)) {
+    // Retire both cached and in-flight workspace facts before rendering new
+    // inventory. The next Current Project visit obtains a fresh projection.
+    assetWorkspaceRequestId += 1;
+    assetWorkspaceProjectSnapshot = null;
+  }
   state.projects = Array.isArray(projects) ? projects : [];
   if (isTabActive('projects')) renderProjects();
   if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
