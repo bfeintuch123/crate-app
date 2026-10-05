@@ -13850,7 +13850,7 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
           timeout: 8000, encoding: 'utf8'
         });
         // Look for LinkResourceURI attributes
-        const uriRegex = /LinkResourceURI="([^"]+)"/gi;
+        const uriRegex = /LinkResourceURI="([^"]*)"/gi;
         let match;
         while ((match = uriRegex.exec(data)) !== null) {
           if (match[1].slice(0, 5).toLowerCase() !== 'file:') {

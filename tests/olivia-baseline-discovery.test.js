@@ -2665,6 +2665,7 @@ function baselineCases() {
       commands.push([...args]);
       if (mode === 'failed') return { error: new Error('synthetic container failure') };
       if (args[0] === '-l') return { stdout: '     100  01-01-2026  00:00   document.json\n     100  01-01-2026  00:00   document.xml\n' };
+      if (args[0] === '-p' && mode === 'empty-uri') return { stdout: '<Link LinkResourceURI=""/>' };
       if (args[0] === '-p') return { stdout: !content ? '<Document/>' :
         (args[2].endsWith('.json') ? JSON.stringify({ externalLink: content }) : `<Link LinkResourceURI="file:${content}"/>`) };
       return { stdout: '' };
@@ -2674,6 +2675,14 @@ function baselineCases() {
     project.assetBaseline = { schemaVersion: 1, status: 'legacy-included', decision: 'include', establishedAt: Date.now() };
     project.files.push({ path: filePath, name: 'Route' + ext, ext, source: 'user-added', acceptedPending: true,
       projectRole: 'source', addedAt: Date.now() });
+    if (mode === 'empty-uri') {
+      const legacyScan = await metadataTestHooks.runScanOnOpen(project.id, filePath);
+      assert.equal(legacyScan.success, true, 'unresolved declarations do not reject ordinary legacy admission');
+      assert.equal(Object.keys(project.workingSourceSelections || {}).length, 0);
+      assert.equal((await getProject(project.id)).files.some(file => file.path === filePath), true);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).materializable, true,
+        'dormant legacy readiness remains unchanged before explicit selection intent');
+    }
     const initial = await callIpcRaw('projects:get-asset-workspace', project.id);
     const row = initial.files.find(file => file.name === 'Route' + ext);
     await callIpcRaw('projects:set-working-source-selection', project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
@@ -2693,12 +2702,36 @@ function baselineCases() {
       assert.equal(result.semanticCounts.unresolvedVerification, 1);
       assert.ok(verification.unresolved.some(item => item.reason === 'indesign-live-current-bytes-unbound'));
     }
-    if (mode === 'unsupported') {
+    if (mode === 'unsupported' || mode === 'empty-uri') {
       assert.equal(result.semanticCounts.unresolvedVerification, 1);
       assert.ok(verification.unresolved.some(item => item.reason === 'unsupported-declared-link-uri'));
     }
     if (mode === 'failed') assert.equal(result.semanticCounts.unresolvedVerification, 1);
-    if (mode === 'zero') assert.equal(result.semanticCounts.unresolvedVerification, 0);
+    if (mode === 'zero') {
+      assert.equal(result.semanticCounts.unresolvedVerification, 0);
+      if (ext === '.idml') {
+        const review = await callIpcRaw('projects:prepare-package-review', project.id);
+        assert.equal(review.materializable, true, 'a genuine zero-link document retains readiness');
+        assert.equal(typeof review.token, 'string');
+      }
+    }
+    if (mode === 'empty-uri') {
+      assert.equal(verification.requiredReferences.length, 0, 'an empty declaration cannot admit a path');
+      const assertBlocked = async () => {
+        const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+        const restored = workspace.files.find(file => file.name === 'Route.idml');
+        assert.equal(restored.sourceSelection, 'selected');
+        assert.equal(restored.selectionRevision, 2, 'Restore intent remains durable');
+        assert.equal(workspace.semanticCounts.unresolvedVerification, 1);
+        const review = await callIpcRaw('projects:prepare-package-review', project.id);
+        assert.equal(review.materializable, false, 'the declared unresolved link blocks engaged readiness');
+        assert.equal(review.token, undefined);
+        assert.deepEqual(workspace.semanticCounts, review.semanticCounts);
+      };
+      await assertBlocked();
+      storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      await assertBlocked();
+    }
     clearTrackedTimers();
   }
 
@@ -2715,6 +2748,8 @@ function baselineCases() {
   baselineTest('InDesign live declared missing link survives existence filtering and holds unbound saved bytes',
     () => restoreRoute('.indd', 'native-missing'));
   baselineTest('IDML unsupported declared URI blocks without a complete-empty verdict', () => restoreRoute('.idml', 'unsupported', true));
+  baselineTest('C1 correction: IDML empty declared URI stays unresolved through Restore and reload',
+    () => restoreRoute('.idml', 'empty-uri', true));
   baselineTest('Opus correction: legacy hold follows concrete physical and logical reads across Exclude Restore reload', async () => {
     const object = { id: psdId, name: 'Legacy.png', data: embeddedPng };
     const f = await workingPsdFixture([object], [], false, false, false);

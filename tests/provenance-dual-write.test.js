@@ -13148,7 +13148,9 @@ test('Illustrator baseline validation and extraction use one immutable source sn
 
 for (const mode of ['exclude-current', 'engage-with-superseded-scan']) {
   test(`CI27 dormant scan still loses publication authority after ${mode}`, async () => {
-    const root = makeTempDir(), gates = [], scans = [], operations = [], leases = [];
+    // Linked-path admission is scoped to /Users; use the same home-root
+    // fixture domain on CI and in the guarded local runner.
+    const root = fs.mkdtempSync(path.join(originalHomedir(), 'crate-ci27-engagement-')), gates = [], scans = [], operations = [], leases = [];
     let restoreReads = () => {};
     try {
       const source = path.join(root, 'Current.ai'), other = path.join(root, 'Other.ai');
