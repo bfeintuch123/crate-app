@@ -465,6 +465,20 @@ function makeEmbeddedPsdEntry(psdPath, name = 'Embedded.png') {
   };
 }
 
+function expectedDormantWorkingSourceFacts(role) {
+  return {
+    sourceSelection: role === 'source' ? 'selected' : null,
+    selectionReason: null,
+    selectionRevision: role === 'source' ? 0 : null,
+    includedAsDependency: false,
+    included: true,
+    effectiveRole: role,
+    verificationStatus: 'unavailable',
+    verificationRequired: false,
+    requiredBy: [],
+  };
+}
+
 test('corrupt or removed PSD resources withhold review tokens and recover safely', async () => {
   const tmpRoot = makeTempDir();
   try {
@@ -490,6 +504,7 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
         sourceName: null,
         assetOrigin: 'existing',
         projectRole: 'asset',
+        ...expectedDormantWorkingSourceFacts('asset'),
         protectedSource: false,
         sourceRecoveryAllowed: false,
         excluded: false,
@@ -527,6 +542,7 @@ test('corrupt or removed PSD resources withhold review tokens and recover safely
         sourceName: null,
         assetOrigin: 'existing',
         projectRole: 'asset',
+        ...expectedDormantWorkingSourceFacts('asset'),
         protectedSource: false,
         sourceRecoveryAllowed: false,
         excluded: false,
@@ -1264,6 +1280,7 @@ test('package copy fails closed on reviewed symlink sources without copying targ
         sourceName: null,
         assetOrigin: 'existing',
         projectRole: 'source',
+        ...expectedDormantWorkingSourceFacts('source'),
         protectedSource: true,
         sourceRecoveryAllowed: false,
         excluded: false,

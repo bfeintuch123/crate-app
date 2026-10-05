@@ -14319,7 +14319,7 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
           timeout: 8000, encoding: 'utf8'
         });
         // Look for LinkResourceURI attributes
-        const uriRegex = /LinkResourceURI="([^"]+)"/gi;
+        const uriRegex = /LinkResourceURI="([^"]*)"/gi;
         let match;
         while ((match = uriRegex.exec(data)) !== null) {
           if (match[1].slice(0, 5).toLowerCase() !== 'file:') {
@@ -15017,7 +15017,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   let baselineScan = null;
   let workingScan = null;
   const parentCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current();
-  const isCurrent = () => parentCurrent() && (!workingScan || workingScan.current()) &&
+  // A dormant side receipt must not retire a legitimate legacy baseline scan.
+  // Engagement or an explicit Restore still binds publication to its exact
+  // verification attempt, including engagement that occurs during this scan.
+  const isCurrent = () => parentCurrent() && (!workingScan ||
+    (!options.workingSourceAttempt && !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
+    workingScan.current()) &&
     (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) { if (ownsOperation) operation?.close(); return; }
@@ -15044,7 +15049,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const leaseKey = workingScan && projectId + ':' + workingScan.key;
   if (leaseKey) {
     const previousLease = workingSourceScanLeases.get(leaseKey);
-    if (previousLease !== scanLease) previousLease?.cancel('newer-source-scan');
+    if (verificationScan && previousLease !== scanLease) previousLease?.cancel('newer-source-scan');
     workingSourceScanLeases.set(leaseKey, scanLease);
   }
   baselineScan = options.establishBaseline === false
@@ -15304,6 +15309,9 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     const workingReconciliation = reconcileWorkingPsd
       ? await prepareWorkingPsdReconciliation(projectId, filePath, psdAssets, inventory, isCurrent) : null;
     if (psdAssets.length > 0 || workingReconciliation || (workingScan && psdTransaction)) {
+      // Complete saved-byte proof before comparing baseline receipt ownership.
+      // No async continuation may invalidate that final comparison before write.
+      const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
       let acceptance = null;
       if (baselineScan && psdAssets.some(asset => asset.source === 'psd-embedded')) {
         // Another full scan may accept while hashing. Recompare its receipt;
@@ -15313,7 +15321,6 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           if (acceptance.selectionCurrent()) break;
         }
       }
-      const psdSourceReceipt = (strictScan || psdTransaction) ? await prepareScanPublicationSource() : null;
       if (workingScan && psdTransaction) {
         // Persist validated obligations even while selection is dormant, so
         // engagement through another root cannot lose output byte/Reject proof.
@@ -19604,7 +19611,8 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     const membership = getWorkingSourceMembership(currentProject, files);
     bindEmbeddedPsdPackageReviewResources(files, entries);
     const entryStatuses = entries.map(getPackageReviewEntryStatus);
-    if (files.length === 0 || membership.blocked || entryStatuses.some(status => status !== 'ready')) {
+    if ((hasWorkingSourceSelectionState(currentProject) && files.length === 0) ||
+        membership.blocked || entryStatuses.some(status => status !== 'ready')) {
       return {
         project: currentProject,
         files,
