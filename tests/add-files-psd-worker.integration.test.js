@@ -339,7 +339,7 @@ for (const mode of ['missing', 'present', 'pathless', 'unknown-pixel', 'unknown-
   });
 }
 
-for (const fault of ['type', 'version', 'overflow', 'truncation', 'signature', 'alternate-layer', 'psb', 'bit-depth']) {
+for (const fault of ['type', 'version', 'overflow', 'truncation', 'signature', 'psb']) {
   test(`same-buffer framing ${fault} mutation stays incomplete and bounded`, () => {
     const bytes = Buffer.from(aliasBytes());
     const record = bytes.indexOf('liFA');
@@ -348,9 +348,7 @@ for (const fault of ['type', 'version', 'overflow', 'truncation', 'signature', '
     if (fault === 'version') bytes.writeUInt32BE(8, record + 4);
     if (fault === 'overflow') bytes.writeUInt32BE(1, record - 8);
     if (fault === 'signature') bytes.write('8B64', bytes.indexOf('lnk2') - 4, 'ascii');
-    if (fault === 'alternate-layer') bytes.write('Lr16', bytes.indexOf('lnk2'), 'ascii');
     if (fault === 'psb') bytes.writeUInt16BE(2, 4);
-    if (fault === 'bit-depth') bytes.writeUInt16BE(16, 22);
     const facts = inspectPsdLinkFraming(fault === 'truncation' ? bytes.subarray(0, record + 10) : bytes);
     assert.equal(facts.status, 'incomplete');
     assert.ok(facts.issues.length > 0);
@@ -471,7 +469,7 @@ test('oversized audio clip domain refuses coverage without publishing an empty p
 
 test('wire/parsed ID disagreement remains explicit even when the framing claims a supported shape', async t => {
   const value = parsed([{ id: 'parsed-id', name: 'embedded.bin', data: new Uint8Array(8) }]);
-  value.framing = { domain: 'psd-v1-8bit-link-and-media-descriptors', version: 2, status: 'framed', issues: [], mediaCarriers: [],
+  value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3, status: 'framed', issues: [], notes: [], mediaCarriers: [],
     records: [{ carrier: 'lnk2', layerIndex: null, id: 'other-id', type: 'liFD', version: 2, tailBytes: 0 }] };
   const h = harness(t, { parsed: value }); const run = await h.start(); const result = await run.promise;
   assert.equal(result.linkedInventory.framing.parsedAgreement, false);
@@ -482,8 +480,8 @@ test('wire/parsed ID disagreement remains explicit even when the framing claims 
 for (const fault of ['coverage-version', 'type', 'tail']) {
   test(`receiver rejects a forged framed claim with unsupported ${fault}`, async t => {
     const value = parsed([{ id: 'id', name: 'embedded.bin', data: new Uint8Array(8) }]);
-    value.framing = { domain: 'psd-v1-8bit-link-and-media-descriptors', version: fault === 'coverage-version' ? 3 : 2,
-      status: 'framed', issues: [], mediaCarriers: [], records: [{ carrier: 'lnk2', layerIndex: null, id: 'id',
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: fault === 'coverage-version' ? 2 : 3,
+      status: 'framed', issues: [], notes: [], mediaCarriers: [], records: [{ carrier: 'lnk2', layerIndex: null, id: 'id',
         type: fault === 'type' ? 'liZZ' : 'liFD', version: 2, tailBytes: fault === 'tail' ? 4 : 0 }] };
     const h = harness(t, { parsed: value }); const run = await h.start();
     await assert.rejects(run.promise, /invalid_result/); await run.finish();
@@ -893,3 +891,40 @@ test('legacy PSD extraction retries a destination claimed after both name snapsh
   assert.equal(fs.readFileSync(second[0].filePath, 'utf8'), 'legacy b');
   assert.equal(fs.readdirSync(path.dirname(first[0].filePath)).length, 2);
 });
+
+for (const form of ['bit-depth', 'alternate-layer']) {
+  test(`bounded framing recognized ${form} is supported or remains a coverage note`, () => {
+    const bytes = Buffer.from(aliasBytes());
+    if (form === 'bit-depth') bytes.writeUInt16BE(16, 22);
+    if (form === 'alternate-layer') {
+      const length = 30 + bytes.readUInt32BE(26); const mask = length + 4 + bytes.readUInt32BE(length);
+      const end = mask + 4 + bytes.readUInt32BE(mask); const block = Buffer.alloc(18);
+      block.write('8B64Lr16'); block.writeUInt32BE(2, 12);
+      const extended = Buffer.concat([bytes.subarray(0, end), block, bytes.subarray(end)]);
+      extended.writeUInt32BE(bytes.readUInt32BE(mask) + block.length, mask);
+      const facts = inspectPsdLinkFraming(extended);
+      assert.deepEqual(facts.issues, []); assert.equal(facts.status, 'incomplete');
+      assert.deepEqual(facts.notes, ['alternate-layer-carrier-domain-unverified']); return;
+    }
+    const facts = inspectPsdLinkFraming(bytes);
+    assert.deepEqual(facts.issues, []);
+    assert.equal(facts.status, form === 'alternate-layer' ? 'incomplete' : 'framed');
+    assert.deepEqual(facts.notes, form === 'alternate-layer' ? ['alternate-layer-carrier-domain-unverified'] : []);
+  });
+}
+
+for (const fault of ['missing-notes', 'unknown-note', 'note-cap', 'framed-note', 'old-domain']) {
+  test(`receiver rejects incompatible or malformed coverage notes ${fault}`, async t => {
+    const value = parsed();
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3,
+      status: 'incomplete', records: [], mediaCarriers: [], issues: [], notes: [] };
+    if (fault === 'missing-notes') delete value.framing.notes;
+    if (fault === 'unknown-note') value.framing.notes = ['ignore-declared-errors'];
+    if (fault === 'note-cap') value.framing.notes = Array(129).fill('alternate-layer-carrier-domain-unverified');
+    if (fault === 'framed-note') { value.framing.status = 'framed'; value.framing.notes = ['alternate-layer-carrier-domain-unverified']; }
+    if (fault === 'old-domain') { value.framing.domain = 'psd-v1-8bit-link-and-media-descriptors'; value.framing.version = 2; }
+    const h = harness(t, { parsed: value }); const run = await h.start();
+    await assert.rejects(run.promise, /invalid_result/); await run.finish();
+    assert.equal(fs.existsSync(run.extractDir), false);
+  });
+}

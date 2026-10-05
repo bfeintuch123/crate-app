@@ -3717,7 +3717,20 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     if (!byPath.has(key) || !fs.existsSync(obligation.path) || (packagePaths && !packagePaths.has(key))) counts.missingRequiredReferences++;
   }
   if (project?.workingSourceRelationshipHolds !== undefined) {
-    counts.relationshipHolds = Array.isArray(project.workingSourceRelationshipHolds) ? project.workingSourceRelationshipHolds.length : 1;
+    const knownReasons = new Set(['psd-resource-identity-ambiguous', 'psd-resource-domain-changed',
+      'psd-resource-continuity-unverified', 'legacy-psd-object-association-unverified']);
+    const includedSourcePaths = new Set(requiredByPath.keys());
+    for (const file of files) if (facts.get(getTrackedFileDedupKey(file))?.included) {
+      // Logical embedded assets still read the parent even if its physical
+      // working-source role is excluded. Keep that concrete ambiguity active.
+      const sourcePath = isScanOnSaveEmbeddedPsdFile(file) ? file.parentPsd || file.path : file.path;
+      includedSourcePaths.add(normalizeTrackedFilePath(sourcePath));
+    }
+    counts.relationshipHolds = Array.isArray(project.workingSourceRelationshipHolds)
+      ? project.workingSourceRelationshipHolds.filter(hold => !hold || typeof hold !== 'object' || Array.isArray(hold) ||
+        !knownReasons.has(hold.reason) || typeof hold.sourcePath !== 'string' || !path.isAbsolute(hold.sourcePath) ||
+        hold.sourcePath.length > 16384 || hold.sourcePath.includes('\0') ||
+        includedSourcePaths.has(normalizeTrackedFilePath(hold.sourcePath))).length : 1;
   }
   const records = project?.workingSourceSelections;
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
@@ -3788,6 +3801,7 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
 
 function collectWorkingSourceScanEvidence(paths, inventory = null) {
   const required = new Map(), unresolved = [], notes = ['required-reference-domain-unverified'];
+  for (const note of inventory?.notes || []) if (notes.length < 128 && typeof note === 'string' && note.length <= 128 && !notes.includes(note)) notes.push(note);
   let units = 0, limited = false;
   const issue = reason => { if (unresolved.length < 128) unresolved.push({ reason }); else limited = true; };
   const add = resourcePath => {
@@ -3815,7 +3829,19 @@ function publishWorkingSourceScan(scan, result) {
   if (!scan?.current()) return false;
   const written = mutateProject(scan.projectId, project => {
     if (!scan.current()) return false;
-    project.workingSourceVerification[scan.key] = { ...project.workingSourceVerification[scan.key], ...result,
+    const previous = project.workingSourceVerification[scan.key];
+    let published = result;
+    if (['scanned', 'no-extractor'].includes(result.status) && result.sourceFingerprint &&
+        result.sourceFingerprint !== previous.sourceFingerprint && result.requiredEmbeddedOutputs === undefined &&
+        previous.requiredEmbeddedOutputs?.length) {
+      // A different source cannot inherit another byte version's receipts.
+      // Keep a concrete refusal until a validated worker supplies new ones.
+      const unresolved = [...(result.unresolved || [])];
+      if (unresolved.length < 128) unresolved.push({ reason: 'embedded-output-receipt-stale' });
+      published = { ...result, requiredEmbeddedOutputs: [], status: 'incomplete',
+        reason: 'embedded-output-receipt-stale', unresolved };
+    }
+    project.workingSourceVerification[scan.key] = { ...previous, ...published,
       attempt: scan.attempt, selectionRevision: scan.selectionRevision };
     delete project.workingSourceVerification[scan.key].pendingReviewFacts;
     return true;
@@ -5290,13 +5316,14 @@ function reconcileProjectAssetBaselineScanSources(projectId, { allowPaused = tru
   const state = assetBaselineScans.get(projectId);
   const project = getProjects().find(item => item.id === projectId);
   if (!project || project.assetBaseline?.status !== 'awaiting-first-scan') return;
+  const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   if (!state) {
+    if (acceptedKeys.size === 0 && hasWorkingSourceSelectionState(project)) return;
     if (normalizeFailedRequiredAssetBaselineSources(project, project.assetBaseline).length > 0) return;
     establishProjectAssetBaseline(projectId, null, null, Date.now(), { allowPaused });
     return;
   }
   state.revision = (state.revision || 0) + 1;
-  const acceptedKeys = new Set(getProjectAssetBaselineSourcePaths(project).map(normalizeTrackedFilePath).filter(Boolean));
   for (const key of [...state.requiredSourceKeys]) {
     if (acceptedKeys.has(key)) continue;
     state.requiredSourceKeys.delete(key);
@@ -12733,8 +12760,8 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     if (item.origin === 'framing') {
       if (linkedMetadata.length || !object(item.facts)
         || !['framed', 'incomplete', 'not-examined'].includes(item.facts.status)
-        || (item.facts.status !== 'not-examined' && (item.facts.version !== 2
-          || item.facts.domain !== 'psd-v1-8bit-link-and-media-descriptors'
+        || (item.facts.status !== 'not-examined' && (item.facts.version !== 3
+          || item.facts.domain !== 'psd-v1-link-and-media-descriptors'
           || !Array.isArray(item.facts.records) || !Array.isArray(item.facts.issues) || !Array.isArray(item.facts.mediaCarriers)
           || !item.facts.records.every(record => object(record) && typeof record.id === 'string' && record.id.length <= 255
             && ['lnk2', 'lnkD', 'lnk3', 'lnkE'].includes(record.carrier)
@@ -12750,8 +12777,10 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
             && (carrier.tailBytes === null || validInteger(carrier.tailBytes)) && Array.isArray(carrier.references)
             && carrier.references.length <= 128 && carrier.references.every(ref => object(ref)
               && (ref.reason === null || (typeof ref.reason === 'string' && ref.reason.length <= 80))))
-          || item.facts.issues.length > 128 || !item.facts.issues.every(reason => typeof reason === 'string' && reason.length <= 80)))) invalid();
-      if (item.facts.status === 'framed' && (item.facts.issues.length
+          || item.facts.issues.length > 128 || !item.facts.issues.every(reason => typeof reason === 'string' && reason.length <= 80)
+          || !Array.isArray(item.facts.notes) || item.facts.notes.length > 128 ||
+            !item.facts.notes.every(reason => reason === 'alternate-layer-carrier-domain-unverified')))) invalid();
+      if (item.facts.status === 'framed' && (item.facts.issues.length || item.facts.notes.length
         || item.facts.records.some(record => !['liFD', 'liFE', 'liFA'].includes(record.type)
           || record.version < 1 || record.version > 7 || record.tailBytes !== 0)
         || item.facts.mediaCarriers.some(carrier => carrier.status !== 'decoded' || carrier.version !== 1
@@ -12825,7 +12854,12 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     const parsedAgreement = !!framingFacts && framingFacts.status !== 'not-examined'
       && wireIds.size === ids.size && [...ids].every(([id, count]) => wireIds.get(id) === count)
       && (framingFacts.records || []).length === linkedFileCount;
-    if (framingFacts?.status !== 'not-examined' && !parsedAgreement) unresolved.push({ reason: 'wire-parsed-record-disagreement' });
+    // Partial byte coverage cannot prove globally missing records. Observed
+    // wire IDs must still have matching parsed counterparts, even if another
+    // carrier is outside this section walk's coverage.
+    const wireCoverage = framingFacts?.status === 'framed';
+    const observedRecordDisagreement = [...wireIds].some(([id, count]) => count > (ids.get(id) || 0));
+    if ((wireCoverage && !parsedAgreement) || observedRecordDisagreement) unresolved.push({ reason: 'wire-parsed-record-disagreement' });
     for (const reason of framingFacts?.issues || []) unresolved.push({ reason });
     function mediaSignature(carrier, ref, wire) {
       // Agreement covers fields exposed by both decoders. Timeline original
@@ -12867,13 +12901,21 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     const mediaParsedAgreement = framingFacts?.status !== 'not-examined'
       && (framingFacts?.mediaCarriers || []).every(carrier => carrier.status === 'decoded')
       && wireMedia.length === parsedMediaSignatures.length && wireMedia.every((value, index) => value === parsedMediaSignatures[index]);
-    if (!mediaParsedAgreement) unresolved.push({ reason: 'wire-parsed-media-disagreement' });
+    const parsedMediaCounts = new Map();
+    for (const signature of parsedMediaSignatures) parsedMediaCounts.set(signature, (parsedMediaCounts.get(signature) || 0) + 1);
+    const observedMediaDisagreement = wireMedia.some(signature => {
+      const count = parsedMediaCounts.get(signature) || 0;
+      if (!count) return true;
+      parsedMediaCounts.set(signature, count - 1); return false;
+    });
+    if ((wireCoverage && !mediaParsedAgreement) || observedMediaDisagreement) unresolved.push({ reason: 'wire-parsed-media-disagreement' });
     // Framing visibility is not sufficiency of the entire required-reference
     // domain. Empty/embedded-only records cannot become complete by counting.
     return { provider: 'psd-agpsd-worker', coverage: 'linked-and-media-metadata', version: 3,
       status: 'incomplete', reason: framingFacts?.status === 'framed' && parsedAgreement && mediaParsedAgreement
         ? 'required-reference-domain-unverified' : 'wire-coverage-unverified',
-      framing: { facts: framingFacts, parsedAgreement, mediaParsedAgreement }, records, references, associations, unresolved,
+      framing: { facts: framingFacts, parsedAgreement, mediaParsedAgreement },
+      notes: framingFacts?.notes || [], records, references, associations, unresolved,
       counts: { metadata: linkedMetadata.length, linkedFiles: linkedFileCount,
         layers: layerPaths.size, embedded: metadataEmbeddedCount, mediaReferences: mediaReferenceCount,
         wireMediaReferences: wireMedia.length, unresolved: unresolved.length } };
@@ -14396,6 +14438,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // this does not authorize or audit work done earlier by their polling roots.
   const ownsOperation = !operation;
   operation ||= captureProjectOperation(projectId);
+  if (!operation?.current()) {
+    if (ownsOperation) operation?.close();
+    return { success: false, error: 'stale_project_operation' };
+  }
   // Every ordinary route publishes through the same bounded, cancellable scan.
   // The child lease retains retiring PSD IO until its existing finish protocol drains.
   if (!options.addFilesAttempt && !options.workingSourceLease) {
@@ -14558,7 +14604,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   };
   if (!await recheckValidatedSource()) throw new Error('asset_baseline_source_changed');
   const inventory = validatedSource?.result?.linkedInventory;
-  const scanEvidence = collectWorkingSourceScanEvidence(linkedPaths, { references: inventory?.references || [],
+  const scanEvidence = collectWorkingSourceScanEvidence(linkedPaths, { references: inventory?.references || [], notes: inventory?.notes || [],
     unresolved: [...(inventory?.unresolved || []), ...declaredIssues,
       ...(declaredIssueLimit ? [{ reason: 'reference-coverage-limit' }] : [])] });
   if (declaredIssueLimit) scanEvidence.limited = true;
