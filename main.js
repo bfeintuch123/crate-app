@@ -3625,6 +3625,15 @@ function getWorkingSourceVerification(project, file) {
           /^[a-f0-9]{64}$/.test(output.sourceDigest || '') && output.sourceDigest === record.sourceFingerprint &&
           /^[a-f0-9]{64}$/.test(output.outputDigest || '')) ||
         record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return null;
+  // A concrete legacy PSD scan proves capture on these bytes, but its ordinary
+  // extractor does not publish the PSD's declared dependency inventory. Once
+  // selection is engaged, retain that receipt and its known obligations while
+  // requiring the existing Restore worker route for declaration proof. Roots
+  // with no receipt keep their untouched legacy readiness.
+  if (hasWorkingSourceSelectionState(project) && record.status === 'scanned' &&
+      record.provider === 'psd-ordinary' && path.extname(file.path || '').toLowerCase() === '.psd') {
+    return { ...record, status: 'incomplete', reason: 'psd-declaration-proof-required' };
+  }
   return record;
 }
 
@@ -3769,8 +3778,27 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   const records = project?.workingSourceSelections;
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
     !/^[a-f0-9]{64}$/.test(key) || !isValidWorkingSourceSelectionRecord(project, key, record)));
-  return { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
+  const membership = { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
+  // Only a concrete producer receipt creates an output-byte obligation. Keep
+  // source scan validity separate, and share the same assessment with workspace,
+  // package review and their final post-await disk/fact rechecks.
+  if (engaged && packageFiles && files.some(file =>
+      getWorkingSourceVerification(project, file)?.requiredEmbeddedOutputs?.length > 0)) {
+    const unavailable = getUnsatisfiedWorkingPsdOutputEntries(project, membership, packageFiles);
+    for (const index of unavailable) {
+      const file = packageFiles[index], fact = facts.get(getTrackedFileDedupKey(file));
+      if (!fact) continue;
+      const alreadyUnresolved = fact.sourceSelection === 'invalid' || (fact.verificationRequired &&
+        (!['scanned', 'no-extractor'].includes(fact.verificationStatus) ||
+          (getWorkingSourceVerification(project, file)?.unresolved.length || 0) > 0));
+      if (!alreadyUnresolved) counts.unresolvedVerification++;
+      fact.verificationRequired = true;
+      fact.verificationStatus = 'incomplete';
+    }
+    if (unavailable.size) membership.blocked = true;
+  }
+  return membership;
 }
 
 // Fence disk-dependent presentation facts after the earlier byte hashes.
@@ -5896,6 +5924,10 @@ function establishProjectAssetBaseline(
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
     if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
     if (sourcePath && !isAcceptedProjectFilePath(project, sourcePath)) return null;
+    // All establishment callers share this guard, including empty Add Files
+    // queues and completed cloud snapshots after local scan state is gone.
+    if (hasWorkingSourceSelectionState(project) && (project.files || []).some(isProjectAssetBaselineSource) &&
+        getProjectAssetBaselineSourcePaths(project).length === 0) return null;
     // A partial first cloud snapshot cannot become a completed mixed-source
     // decision merely because the local parser finished first.
     if (!hasEstablishedFigmaAssetBaseline(project) &&
@@ -19132,7 +19164,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
   return descriptor;
 }
 
-function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint) {
+function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFingerprint, maxBytes = Infinity) {
   const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
   if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
     throw new PackageReviewChangedError();
@@ -19150,12 +19182,14 @@ function getStablePackageReviewSourceContentFingerprint(sourcePath, expectedFing
       throw new PackageReviewChangedError();
     }
 
+    if (Number.isFinite(maxBytes) && beforeStat.size > BigInt(maxBytes)) throw new PackageReviewChangedError();
     const hash = crypto.createHash('sha256');
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let size = 0;
     while (true) {
       const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
+      if (size + bytesRead > maxBytes) throw new PackageReviewChangedError();
       hash.update(buffer.subarray(0, bytesRead));
       size += bytesRead;
     }
@@ -19512,10 +19546,11 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
   }
 }
 
-function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries) {
+function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entries = null) {
   const unavailable = new Set(), digestByEntry = new Map();
   if (!hasWorkingSourceSelectionState(project)) return unavailable;
-  const entryByPath = new Map(files.map((file, index) => [normalizeTrackedFilePath(file.path), index]));
+  const entryByPath = new Map(files.flatMap((file, index) => isScanOnSaveEmbeddedPsdFile(file)
+    ? [] : [[normalizeTrackedFilePath(file.path), index]]));
   for (const source of project.files || []) {
     const fact = membership.facts.get(getTrackedFileDedupKey(source));
     if (!fact || !((fact.sourceSelection === 'selected' && fact.included) || fact.includedAsDependency)) continue;
@@ -19524,7 +19559,11 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
       if (index === undefined) continue; // Missing membership is already blocked.
       try {
         if (!digestByEntry.has(index)) {
-          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path, entries[index].sourceFingerprint);
+          // Cache failures too: shared producer obligations cannot retry this
+          // same physical output within one fresh projection.
+          digestByEntry.set(index, null);
+          const fingerprint = getStablePackageReviewSourceContentFingerprint(files[index].path,
+            entries ? entries[index].sourceFingerprint : getPackageReviewSourceFingerprint(files[index].path), MAX_PARSE_FILE_SIZE);
           digestByEntry.set(index, fingerprint.slice(fingerprint.lastIndexOf(':') + 1));
         }
         if (digestByEntry.get(index) !== output.outputDigest) unavailable.add(index);
