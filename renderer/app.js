@@ -2649,7 +2649,13 @@ async function changeWorkingSourceSelection(project, file, action) {
   const confirm = $('#btn-confirm-package');
   if (confirm) confirm.disabled = true;
   for (const button of document.querySelectorAll('.working-source-action')) {
-    if (button.dataset.sourceIdentity === identity) { button.disabled = true; button.textContent = action === 'restore' ? 'Verifying…' : 'Excluding…'; }
+    if (button.dataset.sourceIdentity === identity) {
+      button.disabled = true;
+      button.textContent = action === 'restore' ? 'Verifying…' : 'Excluding…';
+      // This direct pending-state mutation must not survive an unchanged-row refresh.
+      const row = button.closest?.('[data-render-key]');
+      if (row) delete row.dataset.renderSignature;
+    }
   }
   let result;
   try {
@@ -2668,7 +2674,12 @@ async function changeWorkingSourceSelection(project, file, action) {
     return false;
   } finally {
     if (workingSourceActions.get(identity) === owner) workingSourceActions.delete(identity);
-    if (current() && !result) { try { await renderFiles({ isCurrent: current }); } catch (_) {} }
+    if (current() && !result) {
+      try {
+        await renderFiles({ isCurrent: current });
+        if (current() && !isWorkingSourceActionPending(identity)) focusWorkingSourceControl(identity);
+      } catch (_) {}
+    }
   }
 }
 

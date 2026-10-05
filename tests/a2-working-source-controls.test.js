@@ -40,6 +40,117 @@ function setup(overrides = {}) {
 function descendants(node) { return [node, ...(node.children || []).flatMap(descendants)]; }
 function buttonFor(node, text) { return descendants(node).find(child => child.tagName === 'BUTTON' && child.textContent === text); }
 
+async function mountSelectionControls(f, visibleList = 'working-assets-list') {
+  const listIds = ['working-assets-list', 'project-file-list'];
+  const originalQuery = f.document.querySelectorAll.bind(f.document);
+  f.document.querySelectorAll = selector => selector === '.working-source-action'
+    ? listIds.flatMap(id => descendants(f.elements[id]).filter(node => node.tagName === 'BUTTON' && node.dataset.sourceIdentity))
+    : originalQuery(selector);
+  const create = f.document.createElement.bind(f.document);
+  f.document.createElement = tag => {
+    const element = create(tag);
+    // Model the native ancestor lookup missing from the shared synthetic DOM.
+    element.closest = selector => {
+      for (let node = element; node; node = node.parentNode) {
+        if (selector === '[data-render-key]' && node.dataset?.renderKey) return node;
+        if (selector.startsWith('.') && node.classList?.contains(selector.slice(1))) return node;
+      }
+      return null;
+    };
+    return element;
+  };
+  const completions = [];
+  const change = f.renderer.changeWorkingSourceSelection;
+  f.renderer.changeWorkingSourceSelection = (...args) => {
+    const completion = change(...args); completions.push(completion); return completion;
+  };
+  await f.renderer.renderFiles();
+  for (const id of listIds) f.elements[id].classList.toggle('hidden', id !== visibleList);
+  const buttons = () => listIds.map(id => descendants(f.elements[id]).find(node =>
+    node.tagName === 'BUTTON' && node.dataset.sourceIdentity === f.row.visualIdentity));
+  return { listIds, completions, buttons, button: () => buttons()[listIds.indexOf(visibleList)] };
+}
+
+for (const list of ['working-assets-list', 'project-file-list']) {
+  for (const action of ['exclude', 'restore']) {
+    for (const failure of ['rejected-ipc', 'unchanged-refusal']) {
+      test(`mounted selection retry: ${list}, ${action}, ${failure}`, async () => {
+        const f = setup({ sourceSelection: action === 'restore' ? 'excluded' : 'selected',
+          included: action !== 'restore', selectionRevision: 2 });
+        const mounted = await mountSelectionControls(f, list);
+        const first = deferred(); let attempts = 0;
+        f.crate.setWorkingSourceSelection = async (...args) => {
+          f.calls.push(args);
+          if (++attempts === 1) {
+            await first.promise;
+            if (failure === 'rejected-ipc') throw new Error('synthetic selection rejection');
+            return { success: false, error: 'working_source_selection_stale' };
+          }
+          Object.assign(f.row, { sourceSelection: action === 'exclude' ? 'excluded' : 'selected',
+            included: action === 'restore', selectionRevision: 3 });
+          return { success: true };
+        };
+        vm.runInContext("state.packageReviewToken = 'old-token'", f.renderer);
+        const clicked = mounted.button(); clicked.focus(); clicked.click();
+        assert.equal(f.calls.length, 1);
+        for (const button of mounted.buttons()) {
+          assert.equal(button.disabled, true, 'both mounted surfaces stay disabled in flight');
+          assert.equal(button.textContent, action === 'restore' ? 'Verifying…' : 'Excluding…');
+        }
+        assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
+        assert.equal(f.elements['btn-confirm-package'].disabled, true);
+        // The stub dispatches disabled clicks: the production owner guard must also refuse it.
+        clicked.click(); await mounted.completions[1];
+        assert.equal(f.calls.length, 1);
+        first.resolve(); await mounted.completions[0];
+        const label = action === 'restore' ? 'Restore' : 'Exclude';
+        for (const button of mounted.buttons()) {
+          assert.equal(button.disabled, false, 'unchanged authoritative rows must allow retry');
+          assert.equal(button.textContent, label);
+        }
+        assert.equal(f.document.activeElement, mounted.button(), 'focus returns to the visible enabled action');
+        const recovered = mounted.button();
+        await f.renderer.renderFiles();
+        assert.equal(mounted.button(), recovered, 'same-project refresh retains the repaired control');
+        recovered.click(); await mounted.completions[2];
+        assert.equal(f.calls.length, 2, 'one valid subsequent activation sends one request');
+        assert.deepEqual(clone(f.calls[1]), [f.project.id, f.row.visualIdentity, { action, expectedRevision: 2 }]);
+        for (const button of mounted.buttons()) {
+          assert.equal(button.disabled, false);
+          assert.equal(button.textContent, action === 'restore' ? 'Exclude' : 'Restore', 'new backend state determines the next action');
+        }
+        assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
+      });
+    }
+  }
+}
+
+test('mounted selection retry: an old completion cannot enable a newer action owner', async () => {
+  const f = setup(); const mounted = await mountSelectionControls(f);
+  const old = deferred(), newer = deferred(); let attempts = 0;
+  f.crate.setWorkingSourceSelection = () => (++attempts === 1 ? old.promise : newer.promise);
+  mounted.button().click();
+  vm.runInContext('tabNavigationEpoch += 2', f.renderer);
+  await f.renderer.renderFiles();
+  assert.equal(mounted.button().disabled, false);
+  mounted.button().click();
+  old.resolve({ success: false, error: 'working_source_selection_stale' }); await mounted.completions[0];
+  assert.equal(f.renderer.isWorkingSourceActionPending(f.row.visualIdentity), true);
+  for (const button of mounted.buttons()) assert.equal(button.disabled, true);
+  newer.resolve({ success: false, error: 'working_source_selection_stale' }); await mounted.completions[1];
+  for (const button of mounted.buttons()) assert.equal(button.disabled, false);
+});
+
+test('mounted selection retry: unavailable refreshed rows do not regain selection authority', async () => {
+  const f = setup(); const mounted = await mountSelectionControls(f);
+  f.crate.setWorkingSourceSelection = async () => { throw new Error('synthetic selection rejection'); };
+  f.crate.getAssetWorkspace = async () => { throw new Error('synthetic workspace unavailable'); };
+  mounted.button().click(); await mounted.completions[0];
+  assert.ok(mounted.buttons().every(button => !button));
+  assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
+  assert.equal(f.elements['btn-confirm-package'].disabled, true);
+});
+
 for (const failure of ['rejection', 'error-response-refresh-failure', 'error-response-same-snapshot']) {
   for (const recovery of ['still-unavailable', 'fresh-membership', 'legacy-backend']) {
     test(`cached display fallback cannot supply Package Review: ${failure}, ${recovery}`, async () => {
