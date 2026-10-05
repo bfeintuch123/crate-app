@@ -44,7 +44,8 @@ test('runtime UUID policy uses Node crypto without an external uuid dependency',
   assert.equal(Object.hasOwn(packageLock.packages[''].dependencies, 'uuid'), false);
   assert.equal(Object.hasOwn(packageLock.packages, 'node_modules/uuid'), false);
   assert.equal(mainSource.includes("require('uuid')"), false);
-  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 5);
+  // Existing project/file/review IDs plus working-source attempt, Restore, and scan IDs.
+  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 8);
 });
 
 function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {

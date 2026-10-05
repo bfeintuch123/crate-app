@@ -14,6 +14,7 @@ const MAIN_UNDER_TEST_ROOT = process.env.CRATE_MAIN_UNDER_TEST
   ? path.dirname(path.resolve(process.env.CRATE_MAIN_UNDER_TEST))
   : path.resolve(__dirname, '..');
 const { createAutomaticPackageReviewCaller } = require('./package-review-ipc-helper');
+const { createAddFilesScanLease } = require('../parsers/add-files-operation');
 const packageJson = require('../package.json');
 const helperPlistPatch = require('../scripts/patch-helper-info-plists');
 const {
@@ -4437,7 +4438,22 @@ test('normal project package still consumes package quota after success', async 
   }
 });
 
+function expectedDormantWorkingSourceFacts(role) {
+  return {
+    sourceSelection: role === 'source' ? 'selected' : null,
+    selectionReason: null,
+    selectionRevision: role === 'source' ? 0 : null,
+    includedAsDependency: false,
+    included: true,
+    effectiveRole: role,
+    verificationStatus: 'unavailable',
+    verificationRequired: false,
+    requiredBy: [],
+  };
+}
+
 test('unchanged reviewed manifest packages exactly the reviewed files', async () => {
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Reviewed Manifest Unchanged');
@@ -4467,6 +4483,7 @@ test('unchanged reviewed manifest packages exactly the reviewed files', async ()
         sourceName: null,
         assetOrigin: 'added',
         projectRole: 'source',
+        ...expectedDormantWorkingSourceFacts('source'),
         protectedSource: true,
         sourceRecoveryAllowed: false,
         excluded: false,
@@ -4515,6 +4532,7 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
         sourceName: null,
         assetOrigin: 'added',
         projectRole: 'source',
+        ...expectedDormantWorkingSourceFacts('source'),
         protectedSource: true,
         sourceRecoveryAllowed: false,
         excluded: false,
@@ -4547,6 +4565,7 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
         sourceName: null,
         assetOrigin: 'added',
         projectRole: 'source',
+        ...expectedDormantWorkingSourceFacts('source'),
         protectedSource: true,
         sourceRecoveryAllowed: false,
         excluded: false,
@@ -4585,6 +4604,7 @@ test('unsupported virtual entries are reviewable by safe name but cannot issue a
     sourceName: null,
     assetOrigin: 'added',
     projectRole: 'source',
+    ...expectedDormantWorkingSourceFacts('source'),
     protectedSource: true,
     sourceRecoveryAllowed: false,
     excluded: false,
@@ -11308,7 +11328,9 @@ test('project file visuals resolve only owned identities, bound output size, and
     } finally {
       fs.lstatSync = originalLstatSync;
     }
-    assert.equal(synchronousRasterRevisionStats, 0);
+    // Membership takes metadata identities before and after presentation.
+    // Content reads and native decoding remain forbidden below.
+    assert.equal(synchronousRasterRevisionStats, 2);
 
     testNativeFileVisualImage = createTestNativeImage(64);
     testNativeFileIconImage = createTestNativeImage(64);
@@ -12960,7 +12982,9 @@ test('duplicate first scans of one source remain dependable when a later duplica
       const gate = new Promise(resolve => { release = resolve; });
       const entry = { release, gate, attempt: gates.length };
       gates.push(entry);
-      await gate;
+      // Hold the two competing scan entries; subsequent byte/publication
+      // rechecks belong to the first scan and must be allowed to drain.
+      if (entry.attempt < 2) await gate;
       if (entry.attempt === 1) throw new Error('forced duplicate scan failure');
       return read();
     });
@@ -12974,12 +12998,11 @@ test('duplicate first scans of one source remain dependable when a later duplica
     // Add Files checks the worker snapshot digest before and after recording assets.
     // The watcher duplicate's validation read stays blocked at gate 1 until both finish.
     gates[0].release();
-    await waitForCondition(() => gates.length === 3, 'expected final Add Files digest check');
-    gates[2].release();
+    await waitForCondition(() => gates.length >= 3, 'expected final Add Files digest check');
     await waitForScan(firstScan, 'first source scan did not complete');
     gates[1].release();
     await waitForScan(duplicateScan, 'duplicate source scan did not complete');
-    assert.equal(gates.length, 3);
+    assert.ok(gates.length >= 3, 'both competing entries and final byte rechecks were exercised');
 
     const fresh = await waitForProject(
       project.id,
@@ -13123,6 +13146,58 @@ test('Illustrator baseline validation and extraction use one immutable source sn
   }
 });
 
+for (const mode of ['exclude-current', 'engage-with-superseded-scan']) {
+  test(`CI27 dormant scan still loses publication authority after ${mode}`, async () => {
+    const root = makeTempDir(), gates = [], scans = [], operations = [], leases = [];
+    let restoreReads = () => {};
+    try {
+      const source = path.join(root, 'Current.ai'), other = path.join(root, 'Other.ai');
+      const linked = path.join(root, 'Dependency.png');
+      writeSyntheticAiFile(source, `current source link ${linked}`);
+      writeSyntheticAiFile(other, 'unrelated source');
+      fs.writeFileSync(linked, 'dependency bytes');
+      const project = await createProject('CI27 engagement fences');
+      await setProjectFiles(project.id, { files: [source, other].map(file => ({
+        path: file, name: path.basename(file), ext: '.ai', source: 'manual-browse', addedAt: Date.now(),
+      })) });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+      restoreReads = interceptBaselineSourceReads(async (file, read) => {
+        if (path.resolve(file) !== source || gates.length >= (mode === 'exclude-current' ? 1 : 2)) return read();
+        const gate = deferredScanBoundary(); gates.push(gate); await gate.wait(); return read();
+      });
+      const startScan = () => {
+        const operation = metadataTestHooks.captureProjectOperation(project.id);
+        const lease = createAddFilesScanLease({ parentCurrent: operation.current });
+        operations.push(operation); leases.push(lease);
+        scans.push(metadataTestHooks.runScanOnOpen(project.id, source, operation.activationToken, operation,
+          { workingSourceLease: lease, establishBaseline: false }));
+      };
+      startScan();
+      await waitForCondition(() => gates.length === 1, 'first dormant scan reached its byte read');
+      if (mode === 'engage-with-superseded-scan') {
+        startScan();
+        await waitForCondition(() => gates.length === 2, 'newer dormant scan reached its byte read');
+      }
+      const target = workspace.files.find(row => row.name === (mode === 'exclude-current' ? 'Current.ai' : 'Other.ai'));
+      const excluded = await callIpcRaw('projects:set-working-source-selection', project.id, target.visualIdentity,
+        { action: 'exclude', expectedRevision: target.selectionRevision });
+      assert.equal(excluded.success, true);
+      gates[0].release();
+      assert.notEqual((await scans[0])?.success, true, 'older dormant attempt cannot publish after engagement');
+      assert.equal((await getProject(project.id)).files.some(row => row.path === linked), false);
+      if (mode === 'engage-with-superseded-scan') {
+        gates[1].release();
+        assert.equal((await scans[1]).success, true, 'current included source retains its own authority');
+        assert.equal((await getProject(project.id)).files.some(row => row.path === linked), true);
+      }
+    } finally {
+      gates.forEach(gate => gate.release()); restoreReads(); await Promise.allSettled(scans);
+      leases.forEach(lease => lease.dispose()); operations.forEach(operation => operation.close());
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test('stable Illustrator Add Files completes with one parser read and separate digest rechecks', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-immutable-ai-baseline-test-'));
   let restoreReads = () => {};
@@ -13134,6 +13209,7 @@ test('stable Illustrator Add Files completes with one parser read and separate d
     const linkedPath = path.join(fixtureRoot, 'Immutable Snapshot.png');
     fs.writeFileSync(linkedPath, 'immutable snapshot dependency');
     writeSyntheticAiFile(sourcePath, `synthetic illustrator link ${linkedPath}`);
+    const savedSourceBytes = originalReadFileSync.call(fs, sourcePath);
 
     fs.readFileSync = function countParserReads(filePath, ...args) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) parserReadCount++;
@@ -13143,6 +13219,8 @@ test('stable Illustrator Add Files completes with one parser read and separate d
       const result = await read();
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         digestReadCount++;
+        const checkedBytes = Buffer.isBuffer(result) ? result : result.buffer.subarray(0, result.bytesRead);
+        assert.deepEqual(checkedBytes, savedSourceBytes, 'each proof read binds the actual saved source snapshot');
       }
       return result;
     });
@@ -13158,7 +13236,9 @@ test('stable Illustrator Add Files completes with one parser read and separate d
     );
 
     assert.equal(parserReadCount, 1);
-    assert.equal(digestReadCount, 2);
+    // Saved-byte receipt capture and strict publication fences now accompany
+    // the original parser/baseline checks; the parser still reads exactly once.
+    assert.equal(digestReadCount, 9);
     assert.equal(fresh.files.some(file => file.path === linkedPath), true);
     assert.equal(fresh.files.find(file => file.path === linkedPath).assetOrigin, 'existing');
   } finally {
@@ -14267,6 +14347,8 @@ test('Add Files production PSD worker timeout kills the utility process and fenc
   let workerChild = null;
   let parseRequested = false;
   let lateResult = null;
+  const deadlines = [];
+  let deadlineFired = false;
   try {
     const sourcePath = path.join(fixtureRoot, 'production-timeout.psd');
     const linkedPath = path.join(fixtureRoot, 'production-timeout-linked.png');
@@ -14286,13 +14368,20 @@ test('Add Files production PSD worker timeout kills the utility process and fenc
         parseRequested = true;
       } else if (phase === 'response' && message.type === 'result') {
         lateResult = message;
+        // Withhold an actual terminal response, then advance the existing
+        // deadline. Metadata throughput must not decide whether this is late.
+        queueMicrotask(() => {
+          if (deadlineFired) return;
+          deadlineFired = true;
+          for (const expire of deadlines) expire();
+        });
       }
     });
-    global.setTimeout = (callback, delay, ...args) => originalTestSetTimeout(
-      callback,
-      delay === 30_000 ? 25 : delay,
-      ...args
-    );
+    global.setTimeout = (callback, delay, ...args) => {
+      const timer = originalTestSetTimeout(callback, delay, ...args);
+      if (delay === 30_000) deadlines.push(() => callback(...args));
+      return timer;
+    };
 
     const project = await createProject('Production PSD worker timeout');
     manualDialogFor([sourcePath]);
@@ -14304,6 +14393,8 @@ test('Add Files production PSD worker timeout kills the utility process and fenc
     assert.equal(workerChild.options.serviceName, 'Crate Add Files PSD Parser');
     assert.equal(workerChild.killed, true);
     assert.ok(lateResult);
+    assert.equal(deadlineFired, true);
+    assert.ok(deadlines.length > 0);
     const admitted = getAddFilesResultFiles(result);
     assert.equal(admitted.some(file => file.path === sourcePath), true);
     assert.equal(admitted.some(file => file.path === linkedPath), false);
@@ -19560,6 +19651,10 @@ test('strong project-session saved evidence may auto-include while broad app-ope
   try {
     const project = await createProject('Illustrator baseline watcher save');
     assert.equal(illustratorQueryCount >= 1, true);
+    // Complete the initial app poll before the saved-source event. A scope
+    // revision during the scan intentionally retires that older operation.
+    await waitForCondition(() => metadataTestHooks.getWatcherStartupTimer(project.id, 'live-app') === undefined, 'initial app poll started');
+    await metadataTestHooks.waitForWatcherIdle(project.id);
     let fresh = await getProject(project.id);
     // Broad app-open observation alone must not auto-include either the source or its link.
     assert.deepEqual(fresh.files, []);
@@ -23031,7 +23126,8 @@ for (const mode of ['clock', 'notified', 'generation', 'identity', 'valid']) {
       const observations = saved.provenance.observations.length - prior.provenance.observations.length;
       const events = testRendererEvents.filter(e => e.data?.projectId === project.id).length;
       assert.equal(admitted, mode === 'valid' ? 1 : 0); assert.equal(observations, mode === 'valid' ? 1 : 0);
-      assert.equal(events, mode === 'valid' ? 3 : 0);
+      // The dormant verification receipt adds a file-state publication.
+      assert.equal(events, mode === 'valid' ? 5 : 0);
       if (mode !== 'valid') assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
     } finally { fs.promises.stat = originalStat; gate.release(); testAccountSession.now = originalNow; await testAccountSession.restore(); }
   });
@@ -23553,7 +23649,10 @@ async function makePsdReuseFixture({ entries = [{ name: 'asset.bin', data: Buffe
     finally { operation.close(); }
   } else {
     manualDialogFor([source, bad]);
-    assertAddFilesPartialScanFailure(await callIpcRaw('projects:add-files', project.id));
+    const admitted = await callIpcRaw('projects:add-files', project.id);
+    assertAddFilesPartialScanFailure(admitted);
+    assert.equal(admitted.scanResults.find(result => result.path === source)?.success, true);
+    assert.equal(admitted.scanResults.find(result => result.path === bad)?.success, false);
   }
   const owner = metadataTestHooks.getBaselineState(project.id);
   const rows = (await getProject(project.id)).files.filter(file => file.source === 'psd-embedded');
@@ -23562,13 +23661,13 @@ async function makePsdReuseFixture({ entries = [{ name: 'asset.bin', data: Buffe
     async scan({ sourcePath = source, watcher = false, operation = null } = {}) {
       operation ||= metadataTestHooks.captureProjectOperation(project.id);
       const queue = watcher ? null : metadataTestHooks.reserveProjectAssetBaselineScanQueue(project.id, [sourcePath]);
-      const lease = { current: () => operation.current(), onCancel: () => () => {} };
+      const lease = watcher ? null : createAddFilesScanLease({ parentCurrent: operation.current });
       currentPsdFixture = { linkedFiles: entries };
       try {
         return await metadataTestHooks.runScanOnOpen(project.id, sourcePath, operation.activationToken, operation, {
           ...(watcher ? {} : { addFilesAttempt: lease, addFilesScanLease: lease, baselineReservation: queue.baselineReservations[0] }),
         });
-      } finally { operation.close(); }
+      } finally { lease?.dispose(); operation.close(); }
     },
     cleanup() { setUtilityProcessHandler(null); currentPsdFixture = previous; fs.rmSync(extractDir, { recursive: true, force: true }); fs.rmSync(root, { recursive: true, force: true }); },
   };
@@ -23683,25 +23782,27 @@ for (const watcher of [false, true]) {
   test(`PSD reuse concurrent required retry and watcher ${watcher} accept one output`, async () => {
     const f = await makePsdReuseFixture(), gate = deferredScanBoundary();
     let restore = () => {}, prepared = 0;
+    const scans = [];
     try {
       // A new source snapshot makes both preparations initially see no receipt.
       fs.writeFileSync(f.source, 'new concurrent source snapshot');
       restore = metadataTestHooks.pausePsdAcceptance(async () => { if (++prepared <= 2) await gate.wait(); });
-      const first = f.scan(), second = f.scan({ watcher });
+      scans.push(f.scan(), f.scan({ watcher }));
       await waitForCondition(() => prepared === 2, 'both scans prepared against the same receipt map');
       gate.release();
-      assert.deepEqual((await Promise.all([first, second])).map(result => result.success), [true, true]);
+      assert.deepEqual((await Promise.all(scans)).map(result => result.success), [true, true]);
       assertPsdOriginalsPreserved(f);
       assert.equal(fs.readdirSync(f.extractDir).length, 2);
       assert.equal((await getProject(f.project.id)).files.filter(file => file.source === 'psd-embedded').length, 2);
       assert.equal(f.owner.requiredReservations?.size || 0, 0);
       assert.equal(f.owner.activeScans.size, 0);
-    } finally { gate.release(); restore(); f.cleanup(); }
+    } finally { gate.release(); restore(); await Promise.allSettled(scans); f.cleanup(); }
   });
 }
 test('PSD reuse later corrupt entry causes no partial row acceptance', async () => {
   const f = await makePsdReuseFixture({ entries: ['first.bin', 'second.bin'].map(name => ({ name, data: Buffer.from(name) })) });
   try {
+    assert.equal(f.rows.length, 2, 'both fixture outputs were accepted before corruption');
     fs.writeFileSync(f.rows[1].path, 'corrupted second output');
     const saved = JSON.stringify((await getProject(f.project.id)).files);
     assert.equal((await f.scan()).success, false);
