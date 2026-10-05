@@ -10,7 +10,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { createAddFilesScanLease } = require('../parsers/add-files-operation');
-const { startAddFilesPsdWorker } = require('../parsers/add-files-psd-worker');
+const { startAddFilesPsdWorker, inspectPsdLinkFraming } = require('../parsers/add-files-psd-worker');
 
 let agPsd = null;
 try {
@@ -146,6 +146,10 @@ test('Node advanced IPC: actual PSD parser, coordinator, stage bytes, digest and
   const run = await h.start(source);
   const result = await run.promise;
   assert.equal(result.entries[0].filePath, '/Users/synthetic/external.png');
+  assert.equal(result.linkedInventory.references[0].rawPaths.fullPath, '/Users/synthetic/external.png');
+  assert.equal(result.linkedInventory.associations[0].disposition, 'matched-parsed-id');
+  assert.equal(result.linkedInventory.status, 'incomplete');
+  assert.equal(result.linkedInventory.framing.parsedAgreement, true);
   assert.equal(result.sourceDigest, crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex'));
   assert.equal(await h.context.getAddFilesCurrentSourceDigest(source, run.lease, result.sourceIdentity), result.sourceDigest);
   const assets = run.transaction.promote();
@@ -156,6 +160,365 @@ test('Node advanced IPC: actual PSD parser, coordinator, stage bytes, digest and
   assert.equal(h.children.size, 0);
   assert.equal(fs.existsSync(assets[0].filePath), true);
 });
+
+for (const mode of ['present', 'missing', 'pathless', 'alias', 'empty']) {
+  test(`actual PSD parser retains ${mode} linked inventory without inventing completeness`, async t => {
+    const h = harness(t);
+    const source = path.join(h.root, 'source.psd');
+    const target = path.join(h.root, 'external.png');
+    if (mode === 'present') fs.writeFileSync(target, 'external bytes');
+    const linkedFiles = mode === 'empty' ? [] : [{
+      id: '11111111-1111-4111-8111-111111111111', name: 'external.png', childDocumentID: '',
+      ...(mode === 'alias' ? {} : { linkedFile: { fileSize: 14, name: 'external.png',
+        fullPath: mode === 'pathless' ? '' : target, originalPath: 'file:///raw/original.png', relativePath: '../raw.png' } }),
+    }];
+    fs.writeFileSync(source, agPsd.writePsdBuffer({ width: 1, height: 1, channels: 3, bitsPerChannel: 8, colorMode: 3, linkedFiles }));
+    const run = await h.start(source);
+    const result = await run.promise;
+    const inventory = result.linkedInventory;
+    assert.equal(inventory.status, 'incomplete');
+    assert.equal(inventory.reason, 'required-reference-domain-unverified');
+    assert.equal(inventory.counts.linkedFiles, linkedFiles.length);
+    if (mode === 'empty') assert.equal(inventory.records.length, 0);
+    else if (mode === 'alias') assert.equal(inventory.records[0].disposition, 'unresolved-linked-record');
+    else {
+      assert.equal(inventory.references[0].rawPaths.originalPath, 'file:///raw/original.png');
+      assert.equal(inventory.references[0].rawPaths.relativePath, '../raw.png');
+      assert.equal(inventory.references[0].disposition, mode === 'pathless' ? 'unresolved-external' : 'external-reference');
+      assert.equal(result.entries[0].filePath, mode === 'pathless' ? '' : target);
+    }
+    fs.appendFileSync(source, 'changed saved bytes');
+    await assert.rejects(h.context.getAddFilesCurrentSourceDigest(source, run.lease, result.sourceIdentity), /source_changed/);
+    await run.finish();
+  });
+}
+
+test('parsed-field double retains external requirement alongside bytes, duplicate IDs and orphan associations', async t => {
+  const value = parsed([
+    { id: 'same-id', name: 'cached.bin', linkedFile: { fullPath: '/missing/external.bin', originalPath: 'raw token' }, data: new Uint8Array(8) },
+    { id: 'same-id', name: 'alias.bin' },
+  ]);
+  value.psd.children = [{ placedLayer: { id: 'same-id', type: 'raster' }, children: [{ placedLayer: { id: 'orphan-id', type: 'raster' } }] }];
+  const h = harness(t, { parsed: value });
+  const run = await h.start();
+  const result = await run.promise;
+  assert.equal(result.linkedInventory.references[0].dataPresent, true);
+  assert.equal(result.linkedInventory.references[0].disposition, 'external-reference');
+  assert.equal(result.linkedInventory.references[0].rawPaths.originalPath, 'raw token');
+  assert.deepEqual(Array.from(result.linkedInventory.associations, item => item.disposition), ['ambiguous-linked-id', 'unresolved-placed-id']);
+  assert.ok(result.linkedInventory.unresolved.some(item => item.reason === 'unresolved-linked-record'));
+  await run.finish();
+});
+
+test('actual parser layer-local carrier preserves raw links and embedded bytes independently of global records', async t => {
+  const h = harness(t);
+  const source = path.join(h.root, 'layer-carrier.psd');
+  const id = '11111111-1111-4111-8111-111111111111';
+  fs.writeFileSync(source, agPsd.writePsdBuffer({ width: 1, height: 1,
+    children: [{ name: 'layer carrier', linkedFiles: [
+      { id, name: 'external.png', childDocumentID: '', linkedFile: { fileSize: 10, name: 'external.png',
+        fullPath: '/Users/synthetic/missing.png', originalPath: 'raw original', relativePath: '../missing.png' } },
+      { id: '22222222-2222-4222-8222-222222222222', name: 'embedded.bin', data: Buffer.from('layer embedded bytes') },
+    ] }] }));
+  const run = await h.start(source);
+  const result = await run.promise;
+  assert.equal(result.entries[0].filePath, '/Users/synthetic/missing.png');
+  const records = result.linkedInventory.records.filter(item => item.origin === 'linked-file');
+  assert.deepEqual(Array.from(records, item => Array.from(item.layerPath)), [[0], [0]]);
+  assert.equal(result.linkedInventory.references[0].rawPaths.originalPath, 'raw original');
+  assert.equal(result.linkedInventory.counts.linkedFiles, 2);
+  assert.equal(result.linkedInventory.status, 'incomplete');
+  assert.equal(result.linkedInventory.framing.facts.status, 'framed');
+  assert.equal(result.linkedInventory.framing.parsedAgreement, true);
+  const assets = run.transaction.promote();
+  assert.equal(fs.readFileSync(assets[0].filePath, 'utf8'), 'layer embedded bytes');
+  await run.finish();
+});
+
+function aliasBytes() {
+  return agPsd.writePsdBuffer({ width: 1, height: 1, linkedFiles: [
+    { id: '11111111-1111-4111-8111-111111111111', name: 'alias.bin' },
+  ] });
+}
+
+// Spec/pinned-reader-grounded synthetic descriptor. ag-psd's PxSc writer is
+// disabled, so inject one declared additional-info block into a valid layer.
+function videoBytes({ fullPath = '/Users/synthetic/missing.mov', pixelType = 1986285651,
+  readerType = 1364477522, readerVersion = 1, descriptorVersion = 1, tail = 0 } = {}) {
+  const w = require('ag-psd/dist/psdWriter');
+  const writer = w.createWriter();
+  const id = value => {
+    w.writeUint32(writer, value.length === 4 ? 0 : value.length);
+    w.writeAsciiString(writer, value);
+  };
+  // Explicit test-only Action Descriptor types avoid ag-psd's disabled PxSc
+  // writer's unrelated key-type inference. No production encoder is added.
+  function typedDescriptor(classId, fields) {
+    w.writeUnicodeStringWithPadding(writer, ''); id(classId); w.writeUint32(writer, fields.length);
+    for (const [key, type, value] of fields) {
+      id(key); w.writeSignature(writer, type);
+      if (type === 'Objc') typedDescriptor(value[0], value[1]);
+      else if (type === 'long') w.writeInt32(writer, value);
+      else if (type === 'doub') w.writeFloat64(writer, value);
+      else if (type === 'TEXT') w.writeUnicodeString(writer, value);
+      else if (type === 'bool') w.writeUint8(writer, value ? 1 : 0);
+      else if (type === 'enum') { id(value[0]); id(value[1]); }
+      else if (type === 'tdta') { w.writeInt32(writer, value.length); w.writeBytes(writer, value); }
+      else if (type === 'alis') { w.writeInt32(writer, value.length); w.writeAsciiString(writer, value); }
+      else throw new Error('unsupported synthetic fixture type');
+    }
+  }
+  w.writeUint32(writer, 16);
+  typedDescriptor('PixelSource', [
+    ['pixelSourceType', 'long', pixelType], ['descVersion', 'long', descriptorVersion],
+    ['origin', 'Objc', ['null', [['Hrzn', 'doub', 0], ['Vrtc', 'doub', 0]]]],
+    ['interpretation', 'Objc', ['footageInterpretation', [
+      ['Vrsn', 'long', 1], ['interpretAlpha', 'enum', ['alphaInterpretation', 'straight']], ['profile', 'tdta', new Uint8Array()],
+    ]]],
+    ['frameReader', 'Objc', ['FrameReader', [
+      ['frameReaderType', 'long', readerType], ['descVersion', 'long', readerVersion],
+      ['Lnk ', 'Objc', ['ExternalFileLink', [
+        ['descVersion', 'long', 2], ['Nm  ', 'TEXT', 'movie.mov'], ['fullPath', 'TEXT', fullPath],
+        ['originalPath', 'TEXT', 'file:///raw/original.mov'], ['relPath', 'TEXT', '../raw.mov'], ['alis', 'alis', 'raw-alias\u0000token'],
+      ]]], ['mediaDescriptor', 'TEXT', ''],
+    ]]], ['showAlteredVideo', 'bool', false],
+  ]);
+  const descriptor = Buffer.from(w.getWriterBuffer(writer));
+  const payload = Buffer.concat([descriptor, Buffer.alloc(tail, 7)]);
+  const block = Buffer.alloc(12 + payload.length + payload.length % 2);
+  block.write('8BIM'); block.write('PxSc', 4); block.writeUInt32BE(payload.length, 8); payload.copy(block, 12);
+  const original = agPsd.writePsdBuffer({ width: 1, height: 1, children: [{ id: 42, name: 'video layer' }] });
+  const resourceLength = 30 + original.readUInt32BE(26);
+  const maskLength = resourceLength + 4 + original.readUInt32BE(resourceLength);
+  const layerLength = maskLength + 4;
+  let offset = layerLength + 4 + 2 + 16;
+  const channelCount = original.readUInt16BE(offset); offset += 2 + channelCount * 6 + 12;
+  const extraLength = offset;
+  const extraEnd = extraLength + 4 + original.readUInt32BE(extraLength);
+  const bytes = Buffer.concat([original.subarray(0, extraEnd), block, original.subarray(extraEnd)]);
+  for (const position of [extraLength, layerLength, maskLength]) {
+    bytes.writeUInt32BE(original.readUInt32BE(position) + block.length, position);
+  }
+  return bytes;
+}
+
+for (const mode of ['missing', 'present', 'pathless', 'unknown-pixel', 'unknown-reader', 'reader-version', 'descriptor-version', 'tail']) {
+  test(`actual parser PxSc ${mode} preserves wire tokens and explicit unsupported evidence`, async t => {
+    const h = harness(t);
+    const target = path.join(h.root, 'movie.mov');
+    if (mode === 'present') fs.writeFileSync(target, 'synthetic media');
+    const bytes = videoBytes({ fullPath: mode === 'pathless' ? '' : target,
+      pixelType: mode === 'unknown-pixel' ? 99 : 1986285651, readerType: mode === 'unknown-reader' ? 99 : 1364477522,
+      readerVersion: mode === 'reader-version' ? 2 : 1, descriptorVersion: mode === 'descriptor-version' ? 2 : 1,
+      tail: mode === 'tail' ? 4 : 0 });
+    const source = path.join(h.root, 'video.psd'); fs.writeFileSync(source, bytes);
+    const run = await h.start(source); const result = await run.promise;
+    const carrier = result.linkedInventory.framing.facts.mediaCarriers[0];
+    assert.equal(carrier.carrier, 'PxSc'); assert.equal(carrier.layerId, 42);
+    assert.equal(carrier.references[0].frameReader['Lnk '].alis, 'raw-alias\u0000token');
+    assert.equal(carrier.references[0].frameReader['Lnk '].originalPath, 'file:///raw/original.mov');
+    assert.equal(carrier.references[0].frameReader['Lnk '].relPath, '../raw.mov');
+    assert.equal(result.linkedInventory.status, 'incomplete');
+    assert.equal(result.sourceDigest, crypto.createHash('sha256').update(bytes).digest('hex'));
+    if (mode === 'unknown-pixel') {
+      assert.equal(result.linkedInventory.counts.mediaReferences, 0);
+      assert.equal(result.linkedInventory.counts.wireMediaReferences, 1);
+      assert.equal(result.linkedInventory.framing.mediaParsedAgreement, false);
+      assert.ok(result.linkedInventory.unresolved.some(item => item.reason === 'unsupported-video-reader-type'));
+    } else {
+      assert.equal(result.linkedInventory.counts.mediaReferences, 1);
+      assert.deepEqual(Array.from(result.linkedInventory.records.find(item => item.origin === 'media-reference').layerPath), [0]);
+      assert.equal(result.entries[0].filePath, mode === 'pathless' ? '' : target);
+      assert.equal(result.linkedInventory.framing.mediaParsedAgreement, mode !== 'unknown-reader');
+    }
+    if (['unknown-pixel', 'unknown-reader', 'reader-version', 'descriptor-version', 'tail'].includes(mode)) {
+      assert.equal(result.linkedInventory.framing.facts.status, 'incomplete');
+    }
+    if (mode === 'pathless') assert.ok(result.linkedInventory.unresolved.some(item => item.reason === 'unresolved-media-reference'));
+    await run.finish();
+  });
+}
+
+for (const fault of ['type', 'version', 'overflow', 'truncation', 'signature', 'psb']) {
+  test(`same-buffer framing ${fault} mutation stays incomplete and bounded`, () => {
+    const bytes = Buffer.from(aliasBytes());
+    const record = bytes.indexOf('liFA');
+    assert.ok(record > 0);
+    if (fault === 'type') bytes.write('liZZ', record, 'ascii');
+    if (fault === 'version') bytes.writeUInt32BE(8, record + 4);
+    if (fault === 'overflow') bytes.writeUInt32BE(1, record - 8);
+    if (fault === 'signature') bytes.write('8B64', bytes.indexOf('lnk2') - 4, 'ascii');
+    if (fault === 'psb') bytes.writeUInt16BE(2, 4);
+    const facts = inspectPsdLinkFraming(fault === 'truncation' ? bytes.subarray(0, record + 10) : bytes);
+    assert.equal(facts.status, 'incomplete');
+    assert.ok(facts.issues.length > 0);
+    if (fault === 'type') assert.equal(facts.records[0].type, 'liZZ');
+    if (fault === 'version') assert.equal(facts.records[0].version, 8);
+  });
+}
+
+test('actual parser ignores a link tail while the same-buffer framing retains refusal evidence', () => {
+  const original = aliasBytes();
+  const type = original.indexOf('liFA');
+  const size = original.readUInt32BE(type - 4);
+  const recordEnd = type + size;
+  const bytes = Buffer.concat([original.subarray(0, recordEnd), Buffer.alloc(4, 7), original.subarray(recordEnd)]);
+  bytes.writeUInt32BE(size + 4, type - 4);
+  const blockLength = original.indexOf('lnk2') + 4;
+  bytes.writeUInt32BE(original.readUInt32BE(blockLength) + 4, blockLength);
+  const resourcesLength = 30 + original.readUInt32BE(26);
+  const maskLength = resourcesLength + 4 + original.readUInt32BE(resourcesLength);
+  bytes.writeUInt32BE(original.readUInt32BE(maskLength) + 4, maskLength);
+  const parsedOriginal = agPsd.readPsd(original, { skipLayerImageData: true, skipCompositeImageData: true });
+  const parsedChanged = agPsd.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+  assert.deepEqual(parsedChanged.linkedFiles, parsedOriginal.linkedFiles);
+  const facts = inspectPsdLinkFraming(bytes);
+  assert.equal(facts.status, 'incomplete');
+  assert.equal(facts.records[0].tailBytes, 4);
+  assert.ok(facts.issues.includes('unexplained-link-tail'));
+});
+
+test('unrelated image-resource note does not become a dependency failure or a complete verdict', () => {
+  const original = aliasBytes();
+  const lengthOffset = 30 + original.readUInt32BE(26);
+  const start = lengthOffset + 4;
+  const resource = Buffer.alloc(12);
+  resource.write('8BIM'); resource.writeUInt16BE(65000, 4);
+  const bytes = Buffer.concat([original.subarray(0, start), resource, original.subarray(start)]);
+  bytes.writeUInt32BE(original.readUInt32BE(lengthOffset) + 12, lengthOffset);
+  const facts = inspectPsdLinkFraming(bytes);
+  assert.equal(facts.status, 'framed');
+  assert.ok(facts.resourceIds.includes(65000));
+  assert.equal(facts.records[0].id, inspectPsdLinkFraming(original).records[0].id);
+  // Framed means positioning of the declared carrier domain, not irrelevance
+  // of every possible resource or complete required-reference verification.
+});
+
+function audioBytes({ fullPath = '/Users/synthetic/missing.wav', readerType = 1, clips = 1 } = {}) {
+  const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+  return agPsd.writePsdBuffer({ width: 1, height: 1, imageResources: {
+    timelineInformation: { enabled: true, frameStep: second, frameRate: 24, time: zero, duration: second,
+      workInTime: zero, workOutTime: second, repeats: 0, hasMotion: true, globalTracks: [],
+      audioClipGroups: [{ id: 'synthetic-group', muted: false, audioClips: Array.from({ length: clips }, (_, index) => ({ id: `synthetic-clip-${index}`,
+        start: zero, duration: second, inTime: zero, outTime: second, muted: false, audioLevel: 0,
+        frameReader: { type: readerType, mediaDescriptor: '', link: {
+          name: 'missing.wav', fullPath, relativePath: '../missing.wav',
+        } } })) }],
+    },
+  } });
+}
+
+test('actual parser timeline audio proves zero smart-object records is not complete required-reference evidence', async t => {
+  const bytes = audioBytes();
+  const parsed = agPsd.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+  assert.equal(parsed.imageResources.timelineInformation.audioClipGroups[0].audioClips[0].frameReader.link.fullPath,
+    '/Users/synthetic/missing.wav');
+  const h = harness(t); const source = path.join(h.root, 'timeline.psd'); fs.writeFileSync(source, bytes);
+  const run = await h.start(source); const result = await run.promise;
+  assert.equal(result.linkedInventory.framing.facts.records.length, 0);
+  assert.ok(result.linkedInventory.framing.facts.resourceIds.includes(1075));
+  assert.equal(result.linkedInventory.status, 'incomplete');
+  assert.equal(result.linkedInventory.reason, 'wire-coverage-unverified');
+  assert.equal(result.linkedInventory.framing.mediaParsedAgreement, true);
+  assert.ok(result.linkedInventory.references.some(ref => ref.rawPaths.fullPath === '/Users/synthetic/missing.wav'));
+  await run.finish();
+});
+
+for (const mode of ['pathless', 'unknown-reader', 'multiple']) {
+  test(`actual parser timeline ${mode} retains clip association and unresolved evidence`, async t => {
+    const h = harness(t);
+    const bytes = audioBytes({ fullPath: mode === 'pathless' ? '' : '/Users/synthetic/missing.wav',
+      readerType: mode === 'unknown-reader' ? 99 : 1, clips: mode === 'multiple' ? 3 : 1 });
+    const source = path.join(h.root, 'audio.psd'); fs.writeFileSync(source, bytes);
+    const run = await h.start(source); const result = await run.promise;
+    const inventory = result.linkedInventory;
+    assert.equal(inventory.status, 'incomplete');
+    assert.equal(inventory.framing.mediaParsedAgreement, true);
+    const carrier = inventory.framing.facts.mediaCarriers[0];
+    assert.equal(carrier.references.length, mode === 'multiple' ? 3 : 1);
+    for (const [index, ref] of carrier.references.entries()) {
+      assert.equal(ref.clipIndex, index); assert.equal(ref.clipId, `synthetic-clip-${index}`);
+      assert.equal(ref.groupIndex, 0); assert.equal(ref.groupId, 'synthetic-group');
+      assert.equal(ref.frameReader.frameReaderType, mode === 'unknown-reader' ? 99 : 1);
+      assert.equal(ref.frameReader['Lnk '].relPath, '../missing.wav');
+      assert.equal(ref.reason, 'unverified-timeline-frame-reader-type');
+    }
+    assert.equal(inventory.counts.mediaReferences, carrier.references.length);
+    assert.ok(inventory.unresolved.some(item => item.reason === 'unverified-timeline-frame-reader-type'));
+    await run.finish();
+  });
+}
+
+test('media descriptor decode error retains carrier digest and explicit unresolved evidence', () => {
+  const bytes = videoBytes(); const body = bytes.indexOf('PxSc') + 8;
+  bytes.writeUInt32BE(15, body); // Descriptor wrapper requires version 16.
+  const facts = inspectPsdLinkFraming(bytes);
+  assert.equal(facts.status, 'incomplete');
+  assert.equal(facts.mediaCarriers[0].status, 'unresolved');
+  assert.equal(facts.mediaCarriers[0].reason, 'media-descriptor-decode-or-shape-error');
+  assert.match(facts.mediaCarriers[0].payloadDigest, /^[a-f0-9]{64}$/);
+});
+
+test('oversized audio clip domain refuses coverage without publishing an empty proof', () => {
+  const facts = inspectPsdLinkFraming(audioBytes({ clips: 129 }));
+  assert.equal(facts.status, 'incomplete');
+  assert.equal(facts.mediaCarriers.length, 1);
+  assert.equal(facts.mediaCarriers[0].status, 'unresolved');
+  assert.ok(facts.issues.includes('coverage-limit') || facts.issues.includes('media-descriptor-decode-or-shape-error'));
+});
+
+test('wire/parsed ID disagreement remains explicit even when the framing claims a supported shape', async t => {
+  const value = parsed([{ id: 'parsed-id', name: 'embedded.bin', data: new Uint8Array(8) }]);
+  value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3, status: 'framed', issues: [], notes: [], mediaCarriers: [],
+    records: [{ carrier: 'lnk2', layerIndex: null, id: 'other-id', type: 'liFD', version: 2, tailBytes: 0 }] };
+  const h = harness(t, { parsed: value }); const run = await h.start(); const result = await run.promise;
+  assert.equal(result.linkedInventory.framing.parsedAgreement, false);
+  assert.ok(result.linkedInventory.unresolved.some(item => item.reason === 'wire-parsed-record-disagreement'));
+  await run.finish();
+});
+
+for (const fault of ['coverage-version', 'type', 'tail']) {
+  test(`receiver rejects a forged framed claim with unsupported ${fault}`, async t => {
+    const value = parsed([{ id: 'id', name: 'embedded.bin', data: new Uint8Array(8) }]);
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: fault === 'coverage-version' ? 2 : 3,
+      status: 'framed', issues: [], notes: [], mediaCarriers: [], records: [{ carrier: 'lnk2', layerIndex: null, id: 'id',
+        type: fault === 'type' ? 'liZZ' : 'liFD', version: 2, tailBytes: fault === 'tail' ? 4 : 0 }] };
+    const h = harness(t, { parsed: value }); const run = await h.start();
+    await assert.rejects(run.promise, /invalid_result/); await run.finish();
+    assert.equal(fs.existsSync(run.extractDir), false);
+  });
+}
+
+test('cancellation during metadata credit retires without reaching embedded writes', async t => {
+  let lease;
+  const h = harness(t, { parsed: parsed([{ name: 'embedded.bin', data: new Uint8Array(8) }]), onMessage(message) {
+    if (message.type === 'record' && message.kind === 'linked-metadata') lease.cancel();
+  } });
+  const run = await h.start(); lease = run.lease;
+  await assert.rejects(run.promise, /cancelled/); await run.finish();
+  assert.equal(h.events.some(event => event.type === 'chunk'), false);
+  assert.equal(h.children.size, 0);
+});
+
+for (const fault of ['begin-version', 'result-version', 'metadata-count', 'metadata-units', 'metadata-cap', 'path-mismatch']) {
+  test(`linked metadata protocol ${fault} rejects without accepting a partial inventory`, async t => {
+    const h = harness(t, { parsed: parsed([{ id: 'id', name: 'raw.bin', linkedFile: { fullPath: '/missing/raw.bin' } }]),
+      onMessage(message) {
+        if (fault === 'begin-version' && message.type === 'begin') message.protocolVersion++;
+        if (message.type === 'result') {
+          if (fault === 'result-version') message.protocolVersion++;
+          if (fault === 'metadata-count') message.metadataCount++;
+          if (fault === 'metadata-units') message.metadataUnits++;
+        }
+        if (fault === 'metadata-cap' && message.type === 'record' && message.kind === 'linked-metadata') message.textUnits = 65537;
+        if (fault === 'path-mismatch' && message.type === 'text' && message.text === '/missing/raw.bin') message.text = '/missing/bad.bin';
+      } });
+    const run = await h.start();
+    await assert.rejects(run.promise, /invalid_result/);
+    await run.finish();
+    assert.equal(fs.existsSync(run.extractDir) ? fs.readdirSync(run.extractDir).length : 0, 0);
+  });
+}
 
 test('Node advanced IPC: invalid PSD is a controlled error and exits', async t => {
   const h = harness(t);
@@ -528,3 +891,104 @@ test('legacy PSD extraction retries a destination claimed after both name snapsh
   assert.equal(fs.readFileSync(second[0].filePath, 'utf8'), 'legacy b');
   assert.equal(fs.readdirSync(path.dirname(first[0].filePath)).length, 2);
 });
+
+for (const form of ['bit-depth', 'alternate-layer']) {
+  test(`bounded framing recognized ${form} is supported or remains a coverage note`, () => {
+    const bytes = Buffer.from(aliasBytes());
+    if (form === 'bit-depth') bytes.writeUInt16BE(16, 22);
+    if (form === 'alternate-layer') {
+      const length = 30 + bytes.readUInt32BE(26); const mask = length + 4 + bytes.readUInt32BE(length);
+      const end = mask + 4 + bytes.readUInt32BE(mask); const block = Buffer.alloc(18);
+      block.write('8B64Lr16'); block.writeUInt32BE(2, 12);
+      const extended = Buffer.concat([bytes.subarray(0, end), block, bytes.subarray(end)]);
+      extended.writeUInt32BE(bytes.readUInt32BE(mask) + block.length, mask);
+      const facts = inspectPsdLinkFraming(extended);
+      assert.deepEqual(facts.issues, []); assert.equal(facts.status, 'incomplete');
+      assert.deepEqual(facts.notes, ['alternate-layer-carrier-domain-unverified']); return;
+    }
+    const facts = inspectPsdLinkFraming(bytes);
+    assert.deepEqual(facts.issues, []);
+    assert.equal(facts.status, form === 'alternate-layer' ? 'incomplete' : 'framed');
+    assert.deepEqual(facts.notes, form === 'alternate-layer' ? ['alternate-layer-carrier-domain-unverified'] : []);
+  });
+}
+
+for (const fault of ['missing-notes', 'unknown-note', 'note-cap', 'framed-note', 'old-domain']) {
+  test(`receiver rejects incompatible or malformed coverage notes ${fault}`, async t => {
+    const value = parsed();
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3,
+      status: 'incomplete', records: [], mediaCarriers: [], issues: [], notes: [] };
+    if (fault === 'missing-notes') delete value.framing.notes;
+    if (fault === 'unknown-note') value.framing.notes = ['ignore-declared-errors'];
+    if (fault === 'note-cap') value.framing.notes = Array(129).fill('alternate-layer-carrier-domain-unverified');
+    if (fault === 'framed-note') { value.framing.status = 'framed'; value.framing.notes = ['alternate-layer-carrier-domain-unverified']; }
+    if (fault === 'old-domain') { value.framing.domain = 'psd-v1-8bit-link-and-media-descriptors'; value.framing.version = 2; }
+    const h = harness(t, { parsed: value }); const run = await h.start();
+    await assert.rejects(run.promise, /invalid_result/); await run.finish();
+    assert.equal(fs.existsSync(run.extractDir), false);
+  });
+}
+
+for (const fault of ['type', 'version', 'tail', 'incomplete-tail', 'media-version', 'media-tail', 'media-incomplete-tail']) {
+  test(`incomplete receiver derives ${fault} refusal without redundant worker issue`, async t => {
+    const value = parsed([{ id: 'id', name: 'embedded.bin', data: new Uint8Array(8) }]);
+    value.framing = { domain: 'psd-v1-link-and-media-descriptors', version: 3, status: 'incomplete', issues: [],
+      notes: ['alternate-layer-carrier-domain-unverified'], mediaCarriers: [],
+      records: [{ carrier: 'lnk2', layerIndex: null, id: 'id', type: fault === 'type' ? 'liZZ' : 'liFD',
+        version: fault === 'version' ? 8 : 2, tailBytes: fault === 'tail' ? 4 : fault === 'incomplete-tail' ? null : 0 }] };
+    if (fault.startsWith('media-')) value.framing.mediaCarriers.push({ carrier: '1075', carrierIndex: 1, layerIndex: null, layerId: null,
+      status: 'decoded', version: fault === 'media-version' ? 2 : 1, pixelSourceType: null,
+      tailBytes: fault === 'media-tail' ? 4 : fault === 'media-incomplete-tail' ? null : 0, references: [] });
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const reason = { type: 'unsupported-link-form', version: 'unsupported-link-form', tail: 'unexplained-link-tail',
+      'incomplete-tail': 'unresolved-link-record-framing', 'media-version': 'unsupported-media-descriptor-version',
+      'media-tail': 'unexplained-media-tail', 'media-incomplete-tail': 'unresolved-media-descriptor-framing' }[fault];
+    assert.ok(result.linkedInventory.unresolved.some(item => item.reason === reason)); await run.finish();
+  });
+}
+
+
+for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version', 'video-frame-version',
+  'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal']) {
+  test(`media receiver derives ${mode} policy without redundant worker reason`, async t => {
+    const bytes = mode.startsWith('timeline') ? audioBytes() : videoBytes();
+    const value = parsed();
+    value.psd = agPsd.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+    value.framing = inspectPsdLinkFraming(bytes);
+    const carrier = value.framing.mediaCarriers[0], ref = carrier.references[0];
+    value.framing.status = 'incomplete'; value.framing.notes = ['alternate-layer-carrier-domain-unverified'];
+    value.framing.issues = []; ref.reason = null;
+    if (mode.endsWith('frame-version')) ref.frameReader.descVersion = 2;
+    if (mode.endsWith('link-version')) ref.frameReader['Lnk '].descVersion = 9;
+    if (mode === 'video-pixel') carrier.pixelSourceType = 1;
+    if (mode === 'video-reader') ref.frameReader.frameReaderType = 1;
+    if (mode === 'video-worker-refusal') ref.reason = 'unsupported-media-reference-shape';
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const inventory = result.linkedInventory;
+    if (mode === 'video-supported') {
+      assert.deepEqual(Array.from(inventory.unresolved), []);
+      assert.ok(inventory.references.some(x => x.source === 'wire-media' && x.disposition === 'external-reference'));
+    } else {
+      const reason = mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
+        : ['video-pixel', 'video-reader'].includes(mode) ? 'unsupported-video-reader-type' : 'unsupported-media-reference-shape';
+      assert.equal(inventory.unresolved.filter(x => x.reason === reason).length, 1);
+      assert.ok(inventory.references.some(x => x.source === 'wire-media' && x.disposition === 'unresolved-media-reference'));
+    }
+    await run.finish();
+  });
+}
+
+for (const mode of ['timeline', 'video', 'linked']) {
+  test(`not-examined receiver retains ${mode} refusal with parsed observations`, async t => {
+    const value = parsed();
+    if (mode !== 'linked') value.psd = agPsd.readPsd(mode === 'timeline' ? audioBytes() : videoBytes(),
+      { skipLayerImageData: true, skipCompositeImageData: true });
+    else value.psd.linkedFiles = [{ id: 'external', name: 'Linked.png', linkedFile: { fullPath: '/Users/synthetic/Linked.png' } }];
+    value.framing = { status: 'not-examined' };
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const inventory = result.linkedInventory;
+    assert.equal(inventory.unresolved.filter(item => item.reason === 'wire-coverage-not-examined').length, 1);
+    if (mode === 'timeline') assert.equal(inventory.unresolved.filter(item => item.reason === 'unverified-timeline-frame-reader-type').length, 1);
+    assert.ok(inventory.references.length > 0); await run.finish();
+  });
+}

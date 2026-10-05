@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('crate', {
   getAssetWorkspace: (projectId) => ipcRenderer.invoke('projects:get-asset-workspace', projectId),
   getFileVisual: (projectId, visualIdentity, visualRevision) => ipcRenderer.invoke('projects:get-file-visual', projectId, visualIdentity, visualRevision),
   setExistingAssetsDecision: (projectId, decision) => ipcRenderer.invoke('projects:set-existing-assets-decision', projectId, decision),
+  setWorkingSourceSelection: (projectId, visualIdentity, request) => ipcRenderer.invoke('projects:set-working-source-selection', projectId, visualIdentity, request),
   removeFile: (projectId, filePath) => ipcRenderer.invoke('projects:remove-file', projectId, filePath),
   addFiles: (projectId, operationId) => ipcRenderer.invoke('projects:add-files', projectId, operationId),
   cancelAddFiles: (projectId, operationId) => ipcRenderer.invoke('projects:cancel-add-files', projectId, operationId),
