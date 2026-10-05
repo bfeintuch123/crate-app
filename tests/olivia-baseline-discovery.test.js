@@ -20,7 +20,7 @@ replaceExactlyOnce("const test = require('node:test');",
 replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
-  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership,\n' +
+  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification,\n' +
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
@@ -2512,4 +2512,366 @@ function baselineCases() {
   baselineTest('InDesign live declared missing link survives existence filtering and holds unbound saved bytes',
     () => restoreRoute('.indd', 'native-missing'));
   baselineTest('IDML unsupported declared URI blocks without a complete-empty verdict', () => restoreRoute('.idml', 'unsupported', true));
+  baselineTest('Opus correction: legacy hold follows concrete physical and logical reads across Exclude Restore reload', async () => {
+    const object = { id: psdId, name: 'Legacy.png', data: embeddedPng };
+    const f = await workingPsdFixture([object], [], false, false, false);
+    try {
+      currentPsdFixture = () => f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
+      await metadataTestHooks.runScanOnSave(f.project.id, f.filePath);
+      const logical = f.current().files.find(row => row.source === 'scan-on-save-embedded'); assert.ok(logical);
+      const safe = path.join(TEST_HOME, 'Desktop', 'Safe.txt'); fs.writeFileSync(safe, 'independent asset');
+      f.current().files.push({ path: safe, name: 'Safe.txt', ext: '.txt', source: 'user-added', acceptedPending: true, projectRole: 'asset' });
+      const q = path.join(TEST_HOME, 'Desktop', 'Unrelated.ai'); fs.writeFileSync(q, '%PDF-1.7\n%%EOF\n');
+      f.current().files.push({ path: q, name: 'Unrelated.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      let ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); const unrelated = ws.files.find(row => row.name === 'Unrelated.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, unrelated.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      currentPsdFixture = 'actual-source-buffer'; await f.save([object]);
+      const holds = JSON.parse(JSON.stringify(f.current().workingSourceRelationshipHolds)); assert.equal(holds.length, 1);
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset still reads parent');
+      await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
+      ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 0);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, holds); assert.ok(f.current().files.some(row => row.fileId === logical.fileId));
+      storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0);
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+      const consumer = path.join(TEST_HOME, 'Desktop', 'Consumer.ai'); fs.writeFileSync(consumer, `%PDF-1.7\n${f.filePath}\n%%EOF\n`);
+      f.current().files.push({ path: consumer, name: 'Consumer.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, consumer, null, null, { establishBaseline: false, allowPausedBaseline: true })).success, true);
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1, 'other root requires excluded PSD');
+      const consumerRow = f.current().files.find(row => row.path === consumer);
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, consumerRow), { action: 'exclude', expectedRevision: 0 });
+      for (const hold of [null, { reason: 'unknown-hold', sourcePath: f.filePath }, { reason: holds[0].reason, sourcePath: 'relative.psd' }]) {
+        f.current().workingSourceRelationshipHolds = [hold];
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1);
+      }
+      f.current().workingSourceRelationshipHolds = { reason: 'malformed-container' };
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      assert.deepEqual(fs.readFileSync(f.filePath), f.write([object]));
+    } finally { f.cleanup(); }
+  });
+
+  // ag-psd writes only8bit. Build valid16/32 RGB1x1 controls by retaining its
+  // metadata sections and replacing the header/composite raw samples together.
+  // These are synthetic format fixtures, not Photoshop producer acceptance.
+  function higherDepthPsd(actual, depth, linkedFiles = [], alternate = false, layerResources = false) {
+    let bytes = actual.writePsdBuffer({ width: 1, height: 1, channels: 3, bitsPerChannel: 8, colorMode: 3, linkedFiles: layerResources ? [] : linkedFiles,
+      children: layerResources ? [{ name: 'Alternate resources', linkedFiles }] : [] });
+    let offset = 26;
+    for (let i = 0; i < 2; i++) offset += 4 + bytes.readUInt32BE(offset);
+    const maskLengthOffset = offset; offset += 4 + bytes.readUInt32BE(offset);
+    bytes = Buffer.concat([bytes.subarray(0, offset), Buffer.alloc(2 + 3 * (depth / 8))]); bytes.writeUInt16BE(depth, 22);
+    if (alternate) {
+      const primaryLength = bytes.readUInt32BE(maskLengthOffset + 4);
+      const layerData = layerResources ? bytes.subarray(maskLengthOffset + 8, maskLengthOffset + 8 + primaryLength) : Buffer.alloc(2);
+      const block = Buffer.alloc(16 + layerData.length); block.write('8B64Lr' + depth); block.writeUInt32BE(layerData.length, 12); layerData.copy(block, 16);
+      const maskData = layerResources ? Buffer.concat([Buffer.alloc(4), bytes.subarray(maskLengthOffset + 8 + primaryLength, offset), block])
+        : Buffer.concat([bytes.subarray(maskLengthOffset + 4, offset), block]);
+      const maskLength = Buffer.alloc(4); maskLength.writeUInt32BE(maskData.length);
+      bytes = Buffer.concat([bytes.subarray(0, maskLengthOffset), maskLength, maskData, bytes.subarray(offset)]);
+    }
+    return bytes;
+  }
+  for (const depth of [16, 32]) for (const mode of ['empty', 'resources', 'alternate-resources']) for (const role of ['root', 'required']) {
+    baselineTest(`Opus correction: valid synthetic PSD${depth} ${mode} ${role} keeps current declared obligations`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      resetTestHomeWorkspace(); const linked = path.join(TEST_HOME, 'Desktop', 'Depth-linked.png'); fs.writeFileSync(linked, 'linked bytes');
+      const resources = mode !== 'empty' ? [{ id: psdId, name: 'Embedded.png', data: embeddedPng },
+        { id: '33333333-3333-4333-8333-333333333333', name: 'Depth-linked.png', childDocumentID: '',
+          linkedFile: { fileSize: 12, name: 'Depth-linked.png', fullPath: linked, originalPath: linked, relativePath: '../Depth-linked.png' } }] : [];
+      const f = await correctionProject('.psd', higherDepthPsd(actual, depth, resources, true, mode === 'alternate-resources'));
+      fs.writeFileSync(linked, 'linked bytes'); currentPsdFixture = 'actual-source-buffer';
+      try {
+        const parsed = actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true }); assert.equal(parsed.bitsPerChannel, depth);
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); const source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        assert.equal(restored.verificationStatus, 'scanned'); const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), f.current().files.find(x => x.path === f.filePath));
+        const record = f.current().workingSourceVerification[key]; assert.deepEqual(record.unresolved, []); assert.equal(record.inventoryStatus, 'unverified');
+        assert.ok(record.notes.includes('alternate-layer-carrier-domain-unverified'));
+        if (mode !== 'empty') { assert.ok(record.requiredReferences.some(x => x.path === linked)); assert.equal(record.requiredEmbeddedOutputs.length, 1); }
+        if (role === 'required') {
+          const consumer = path.join(TEST_HOME, 'Desktop', 'Depth-consumer.ai'); fs.writeFileSync(consumer, `%PDF-1.7\n${f.filePath}\n%%EOF\n`);
+          f.current().files.push({ path: consumer, name: 'Depth-consumer.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+          assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, consumer, null, null, { establishBaseline: false, allowPausedBaseline: true })).success, true);
+          await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+          const current = await callIpcRaw('projects:get-asset-workspace', f.project.id); const parent = current.files.find(x => x.visualIdentity === source.visualIdentity);
+          assert.equal(parent.includedAsDependency, true); assert.equal(parent.included, true); assert.equal(parent.verificationStatus, 'scanned');
+        }
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+  for (const fault of ['id', 'tail', 'malformed-record', 'pathless', 'notes-not-array', 'notes-unknown', 'notes-cap', 'old-version']) {
+    baselineTest(`Opus correction: partial framing coverage preserves concrete ${fault} refusal`, async () => {
+      const object = { id: psdId, name: 'Control.png', data: embeddedPng };
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd', higherDepthPsd(actual, 16, fault === 'pathless' ?
+        [{ id: psdId, name: 'Pathless.png', childDocumentID: '', linkedFile: { fileSize: 10, name: 'Pathless.png', fullPath: '', originalPath: 'file:///raw/Pathless.png', relativePath: '../Pathless.png' } }] : [object]));
+      const worker = require('../parsers/add-files-psd-worker'); const inspect = worker.inspectPsdLinkFraming;
+      worker.inspectPsdLinkFraming = bytes => {
+        const facts = inspect(bytes); facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified'];
+        if (fault === 'id') facts.records[0].id = 'unmatched-wire-id';
+        if (fault === 'tail') { facts.records[0].tailBytes = 4; facts.issues.push('unexplained-link-tail'); }
+        if (fault === 'malformed-record') facts.issues.push('unsupported-or-malformed-framing');
+        if (fault === 'notes-not-array') facts.notes = {};
+        if (fault === 'notes-unknown') facts.notes = ['erase-record-obligations'];
+        if (fault === 'notes-cap') facts.notes = Array(129).fill('alternate-layer-carrier-domain-unverified');
+        if (fault === 'old-version') facts.version = 2;
+        return facts;
+      };
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); const source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        assert.ok(restored.semanticCounts.unresolvedVerification > 0);
+        const record = Object.values(f.current().workingSourceVerification)[0];
+        if (fault === 'id') assert.ok(record.unresolved.some(x => x.reason === 'wire-parsed-record-disagreement'));
+        if (fault === 'tail') assert.ok(record.unresolved.some(x => x.reason === 'unexplained-link-tail'));
+        if (fault === 'malformed-record') assert.ok(record.unresolved.some(x => x.reason === 'unsupported-or-malformed-framing'));
+        if (fault === 'pathless') assert.ok(record.unresolved.some(x => ['unresolved-declared-reference', 'unresolved-linked-record', 'unresolved-external'].includes(x.reason)), JSON.stringify(record.unresolved));
+        if (fault.startsWith('notes-') || fault === 'old-version') { assert.equal(record.status, 'failed'); assert.equal(f.current().files.some(x => x.source === 'psd-embedded'), false); }
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+  baselineTest('Opus correction: changed source cannot inherit worker output receipts and fresh worker replaces concrete stale reason', async () => {
+    const object = { id: psdId, name: 'Receipt.png', data: embeddedPng }; const f = await workingPsdFixture([object], [], true, false, false);
+    try {
+      const source = f.current().files.find(x => x.path === f.filePath); const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), source);
+      const before = JSON.parse(JSON.stringify(f.current().workingSourceVerification[key])); assert.ok(before.requiredEmbeddedOutputs.length);
+      const oldPaths = f.rows().map(x => x.path); fs.writeFileSync(f.filePath, f.write([object], [], 2));
+      currentPsdFixture = () => f.actual.readPsd(fs.readFileSync(f.filePath), { skipLayerImageData: true, skipCompositeImageData: true });
+      metadataTestHooks.clearPsdParseDebounce(f.filePath);
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { establishBaseline: false })).success, true);
+      const record = f.current().workingSourceVerification[key]; assert.notEqual(record.sourceFingerprint, before.sourceFingerprint);
+      assert.equal(record.status, 'incomplete'); assert.equal(record.reason, 'embedded-output-receipt-stale'); assert.deepEqual(record.requiredEmbeddedOutputs, []);
+      assert.ok(record.unresolved.some(x => x.reason === 'embedded-output-receipt-stale')); assert.ok(metadataTestHooks.getWorkingSourceVerification(f.current(), source));
+      assert.ok(oldPaths.every(p => fs.existsSync(p))); storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      currentPsdFixture = 'actual-source-buffer';
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      const fresh = f.current().workingSourceVerification[key]; assert.equal(fresh.status, 'scanned'); assert.ok(fresh.requiredEmbeddedOutputs.length);
+      assert.ok(fresh.requiredEmbeddedOutputs.every(x => x.sourceDigest === fresh.sourceFingerprint));
+      assert.equal(fresh.unresolved.some(x => x.reason === 'embedded-output-receipt-stale'), false);
+    } finally { f.cleanup(); }
+  });
+  baselineTest('Opus correction: no-state reload last-source exclusion does not establish a baseline', async () => {
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try {
+      f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan', decision: null, establishedAt: null };
+      const pending = { ...f.current().files[0], path: path.join(TEST_HOME, 'Desktop', 'Pending.ai'), name: 'Pending.ai', fileId: 'pending-control', acceptedPending: false, captureState: 'needs-save' };
+      f.current().pendingFiles.push(pending); storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects)); metadataTestHooks.clearAssetBaselineScans();
+      const identity = metadataTestHooks.createProjectFileVisualIdentity(f.project.id, f.current().files.find(x => x.path === f.filePath));
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, identity, { action: 'exclude', expectedRevision: 0 });
+      assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan'); assert.equal(f.current().assetBaseline.establishedAt, null);
+      assert.equal(f.current().files.some(x => x.path === pending.path), false);
+      assert.equal(f.current().pendingFiles.find(x => x.fileId === pending.fileId).captureState, 'needs-save');
+      storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects)); metadataTestHooks.clearAssetBaselineScans();
+      assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
+    } finally { clearTrackedTimers(); }
+  });
+  baselineTest('Opus correction: missing or retired operation refuses without throwing or publishing', async () => {
+    assert.equal(metadataTestHooks.captureProjectOperation('missing-project'), null);
+    assert.deepEqual(await metadataTestHooks.runScanOnOpen('missing-project', '/synthetic/missing.ai'), { success: false, error: 'stale_project_operation' });
+    const f = await correctionProject('.ai', '%PDF-1.7\n%%EOF\n');
+    try { const operation = metadataTestHooks.captureProjectOperation(f.project.id); operation.close();
+      const before = JSON.stringify(f.current());
+      assert.deepEqual(await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, operation), { success: false, error: 'stale_project_operation' });
+      assert.equal(JSON.stringify(f.current()), before);
+    } finally { clearTrackedTimers(); }
+  });
+
+  for (const depth of [16, 32]) {
+    baselineTest(`Opus correction: actual parser tolerates malformed PSD${depth} alternate record but framing keeps concrete refusal`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const bytes = higherDepthPsd(actual, depth, [], true); const alternate = bytes.indexOf('8B64Lr' + depth); assert.ok(alternate > 0);
+      bytes.writeInt16BE(1, alternate + 16); // declares a layer record but supplies none
+      assert.doesNotThrow(() => actual.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true }));
+      const facts = require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(bytes);
+      assert.ok(facts.notes.includes('alternate-layer-carrier-domain-unverified')); assert.ok(facts.issues.includes('unsupported-or-malformed-framing'));
+      const f = await correctionProject('.psd', bytes); currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); const source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        assert.ok(restored.semanticCounts.unresolvedVerification > 0);
+        assert.ok(Object.values(f.current().workingSourceVerification)[0].unresolved.some(x => x.reason === 'unsupported-or-malformed-framing'));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+  baselineTest('Opus correction: observed media disagreement remains blocking beside partial coverage note', async () => {
+    const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+    const bytes = actual.writePsdBuffer({ width: 1, height: 1, imageResources: { timelineInformation: {
+      enabled: true, frameStep: second, frameRate: 24, time: zero, duration: second, workInTime: zero, workOutTime: second,
+      repeats: 0, hasMotion: true, globalTracks: [], audioClipGroups: [{ id: 'group', muted: false, audioClips: [{
+        id: 'clip', start: zero, duration: second, inTime: zero, outTime: second, muted: false, audioLevel: 0,
+        frameReader: { type: 1, mediaDescriptor: '', link: { name: 'Audio.wav', fullPath: '/Users/synthetic/Audio.wav', relativePath: '../Audio.wav' } },
+      }] }],
+    } } });
+    const f = await correctionProject('.psd', bytes); const worker = require('../parsers/add-files-psd-worker'); const inspect = worker.inspectPsdLinkFraming;
+    worker.inspectPsdLinkFraming = data => { const facts = inspect(data); facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified'];
+      facts.mediaCarriers[0].references[0].frameReader['Lnk '].fullPath = '/Users/synthetic/Different.wav'; return facts; };
+    currentPsdFixture = 'actual-source-buffer';
+    try {
+      const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); const source = ws.files.find(x => x.name === 'Correction.psd');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      const record = Object.values(f.current().workingSourceVerification)[0]; assert.ok(record.unresolved.some(x => x.reason === 'wire-parsed-media-disagreement'));
+      assert.ok(record.requiredReferences.some(x => x.path === '/Users/synthetic/Audio.wav')); assert.ok(record.requiredReferences.some(x => x.path === '/Users/synthetic/Different.wav'));
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+    } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+  });
+
+  for (const fault of ['type', 'version', 'tail', 'incomplete-tail', 'media-version', 'media-tail', 'media-incomplete-tail']) {
+    baselineTest(`Receiver correction: incomplete coverage cannot suppress received ${fault} without redundant issue`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd', higherDepthPsd(actual, 16, [{ id: psdId, name: 'Receiver.png', data: embeddedPng }]));
+      const worker = require('../parsers/add-files-psd-worker'), inspect = worker.inspectPsdLinkFraming;
+      worker.inspectPsdLinkFraming = bytes => {
+        const facts = inspect(bytes); facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified']; facts.issues = [];
+        if (fault === 'type') facts.records[0].type = 'liZZ';
+        if (fault === 'version') facts.records[0].version = 8;
+        if (fault === 'tail') facts.records[0].tailBytes = 4;
+        if (fault === 'incomplete-tail') facts.records[0].tailBytes = null;
+        if (fault.startsWith('media-')) facts.mediaCarriers = [{ carrier: '1075', carrierIndex: 1, layerIndex: null, layerId: null,
+          status: 'decoded', version: fault === 'media-version' ? 2 : 1, pixelSourceType: null,
+          tailBytes: fault === 'media-tail' ? 4 : fault === 'media-incomplete-tail' ? null : 0, references: [] }];
+        return facts;
+      };
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id), source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const record = Object.values(f.current().workingSourceVerification)[0]; assert.equal(record.status, 'scanned');
+        const reason = { type: 'unsupported-link-form', version: 'unsupported-link-form', tail: 'unexplained-link-tail',
+          'incomplete-tail': 'unresolved-link-record-framing', 'media-version': 'unsupported-media-descriptor-version',
+          'media-tail': 'unexplained-media-tail', 'media-incomplete-tail': 'unresolved-media-descriptor-framing' }[fault];
+        assert.ok(record.unresolved.some(item => item.reason === reason)); assert.ok(restored.semanticCounts.unresolvedVerification > 0);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, true);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id); assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+      } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
+  function videoBytes({ fullPath = '/Users/synthetic/missing.mov', pixelType = 1986285651,
+    readerType = 1364477522, readerVersion = 1, descriptorVersion = 1, tail = 0 } = {}) {
+    const agPsd = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    const w = originalLoad.call(Module, 'ag-psd/dist/psdWriter', module);
+    const writer = w.createWriter();
+    const id = value => {
+      w.writeUint32(writer, value.length === 4 ? 0 : value.length);
+      w.writeAsciiString(writer, value);
+    };
+    // Explicit test-only Action Descriptor types avoid ag-psd's disabled PxSc
+    // writer's unrelated key-type inference. No production encoder is added.
+    function typedDescriptor(classId, fields) {
+      w.writeUnicodeStringWithPadding(writer, ''); id(classId); w.writeUint32(writer, fields.length);
+      for (const [key, type, value] of fields) {
+        id(key); w.writeSignature(writer, type);
+        if (type === 'Objc') typedDescriptor(value[0], value[1]);
+        else if (type === 'long') w.writeInt32(writer, value);
+        else if (type === 'doub') w.writeFloat64(writer, value);
+        else if (type === 'TEXT') w.writeUnicodeString(writer, value);
+        else if (type === 'bool') w.writeUint8(writer, value ? 1 : 0);
+        else if (type === 'enum') { id(value[0]); id(value[1]); }
+        else if (type === 'tdta') { w.writeInt32(writer, value.length); w.writeBytes(writer, value); }
+        else if (type === 'alis') { w.writeInt32(writer, value.length); w.writeAsciiString(writer, value); }
+        else throw new Error('unsupported synthetic fixture type');
+      }
+    }
+    w.writeUint32(writer, 16);
+    typedDescriptor('PixelSource', [
+      ['pixelSourceType', 'long', pixelType], ['descVersion', 'long', descriptorVersion],
+      ['origin', 'Objc', ['null', [['Hrzn', 'doub', 0], ['Vrtc', 'doub', 0]]]],
+      ['interpretation', 'Objc', ['footageInterpretation', [
+        ['Vrsn', 'long', 1], ['interpretAlpha', 'enum', ['alphaInterpretation', 'straight']], ['profile', 'tdta', new Uint8Array()],
+      ]]],
+      ['frameReader', 'Objc', ['FrameReader', [
+        ['frameReaderType', 'long', readerType], ['descVersion', 'long', readerVersion],
+        ['Lnk ', 'Objc', ['ExternalFileLink', [
+          ['descVersion', 'long', 2], ['Nm  ', 'TEXT', 'movie.mov'], ['fullPath', 'TEXT', fullPath],
+          ['originalPath', 'TEXT', 'file:///raw/original.mov'], ['relPath', 'TEXT', '../raw.mov'], ['alis', 'alis', 'raw-alias\u0000token'],
+        ]]], ['mediaDescriptor', 'TEXT', ''],
+      ]]], ['showAlteredVideo', 'bool', false],
+    ]);
+    const descriptor = Buffer.from(w.getWriterBuffer(writer));
+    const payload = Buffer.concat([descriptor, Buffer.alloc(tail, 7)]);
+    const block = Buffer.alloc(12 + payload.length + payload.length % 2);
+    block.write('8BIM'); block.write('PxSc', 4); block.writeUInt32BE(payload.length, 8); payload.copy(block, 12);
+    const original = agPsd.writePsdBuffer({ width: 1, height: 1, children: [{ id: 42, name: 'video layer' }] });
+    const resourceLength = 30 + original.readUInt32BE(26);
+    const maskLength = resourceLength + 4 + original.readUInt32BE(resourceLength);
+    const layerLength = maskLength + 4;
+    let offset = layerLength + 4 + 2 + 16;
+    const channelCount = original.readUInt16BE(offset); offset += 2 + channelCount * 6 + 12;
+    const extraLength = offset;
+    const extraEnd = extraLength + 4 + original.readUInt32BE(extraLength);
+    const bytes = Buffer.concat([original.subarray(0, extraEnd), block, original.subarray(extraEnd)]);
+    for (const position of [extraLength, layerLength, maskLength]) {
+      bytes.writeUInt32BE(original.readUInt32BE(position) + block.length, position);
+    }
+    return bytes;
+  }
+
+  for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version', 'video-frame-version',
+    'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal']) {
+    baselineTest(`Media receiver correction: actual IPC preserves ${mode} policy without redundant reason`, async () => {
+      resetTestHomeWorkspace();
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const target = path.join(TEST_HOME, 'Desktop', mode.startsWith('timeline') ? 'Media.wav' : 'movie.mov');
+      const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+      const bytes = mode.startsWith('timeline') ? actual.writePsdBuffer({ width: 1, height: 1, imageResources: {
+        timelineInformation: { enabled: true, frameStep: second, frameRate: 24, time: zero, duration: second,
+          workInTime: zero, workOutTime: second, repeats: 0, hasMotion: true, globalTracks: [],
+          audioClipGroups: [{ id: 'group', muted: false, audioClips: [{ id: 'clip', start: zero, duration: second,
+            inTime: zero, outTime: second, muted: false, audioLevel: 0, frameReader: { type: 1, mediaDescriptor: '',
+              link: { name: 'Media.wav', fullPath: target, relativePath: '../Media.wav' } } }] }],
+        },
+      } }) : videoBytes({ fullPath: target });
+      const f = await correctionProject('.psd', bytes); fs.writeFileSync(target, 'synthetic accepted media');
+      f.current().files.push({ path: target, name: path.basename(target), ext: path.extname(target),
+        source: 'user-added', acceptedPending: true, projectRole: 'asset' });
+      const worker = require('../parsers/add-files-psd-worker'), inspect = worker.inspectPsdLinkFraming;
+      worker.inspectPsdLinkFraming = data => {
+        const facts = inspect(data); const carrier = facts.mediaCarriers[0], ref = carrier.references[0];
+        assert.equal(carrier.status, 'decoded'); assert.equal(carrier.version, 1); assert.equal(carrier.tailBytes, 0);
+        facts.status = 'incomplete'; facts.notes = ['alternate-layer-carrier-domain-unverified']; facts.issues = []; ref.reason = null;
+        if (mode.endsWith('frame-version')) ref.frameReader.descVersion = 2;
+        if (mode.endsWith('link-version')) ref.frameReader['Lnk '].descVersion = 9;
+        if (mode === 'video-pixel') carrier.pixelSourceType = 1;
+        if (mode === 'video-reader') ref.frameReader.frameReaderType = 1;
+        if (mode === 'video-worker-refusal') ref.reason = 'unsupported-media-reference-shape';
+        return facts;
+      };
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id), source = ws.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const record = Object.values(f.current().workingSourceVerification)[0]; assert.equal(record.status, 'scanned');
+        assert.ok(record.requiredReferences.some(x => x.path === target));
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        if (mode === 'video-supported') {
+          assert.deepEqual(record.unresolved, []); assert.equal(review.materializable, true); assert.equal(typeof review.token, 'string');
+        } else {
+          const reason = mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
+            : ['video-pixel', 'video-reader'].includes(mode) ? 'unsupported-video-reader-type' : 'unsupported-media-reference-shape';
+          assert.ok(record.unresolved.some(x => x.reason === reason));
+          assert.equal(record.unresolved.filter(x => x.reason === reason).length, 1);
+          assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+          assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, true);
+        }
+      } finally { worker.inspectPsdLinkFraming = inspect; currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
 }

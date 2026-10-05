@@ -51,13 +51,16 @@ function parsePsd(filePath) {
 // wire facts absent from ag-psd's parsed objects. It cannot establish that this
 // named smart-object domain contains every reference required by a PSD.
 function inspectPsdLinkFraming(buffer) {
-  const facts = { domain: 'psd-v1-8bit-link-and-media-descriptors', version: 2,
-    status: 'incomplete', records: [], mediaCarriers: [], keys: [], resourceIds: [], issues: [] };
+  const facts = { domain: 'psd-v1-link-and-media-descriptors', version: 3,
+    status: 'incomplete', records: [], mediaCarriers: [], keys: [], resourceIds: [], issues: [], notes: [] };
   let offset = 0;
   let blocks = 0;
   let issueCount = 0;
   let recordUnits = 0;
   const layerIds = new Map();
+  const mediaLayerScopes = new WeakMap();
+  let currentLayerScope = null;
+  let layerRecords = 0, alternateDepth = 0;
   const issue = reason => {
     if (++issueCount > 128) throw new Error('coverage-limit');
     facts.issues.push(reason);
@@ -85,6 +88,7 @@ function inspectPsdLinkFraming(buffer) {
       pixelSourceType: null, rawPixelSourceType: null, tailBytes: null, references: [], reason: null,
       payloadDigest: crypto.createHash('sha256').update(buffer.subarray(offset, end)).digest('hex') };
     facts.mediaCarriers.push(item);
+    mediaLayerScopes.set(item, currentLayerScope);
     try {
       const reader = createReader(buffer.buffer, buffer.byteOffset + offset, Math.min(65536, end - offset));
       const desc = readVersionAndDescriptor(reader, true);
@@ -197,12 +201,27 @@ function inspectPsdLinkFraming(buffer) {
       }
       if (++blocks > 8192) throw new Error('coverage-limit');
       const sig = signature(end);
-      if (sig !== '8BIM') throw new Error('unsupported-additional-signature');
+      if (!['8BIM', '8B64'].includes(sig)) throw new Error('unsupported-additional-signature');
       const key = signature(end);
       if (facts.keys.length < 128 && !facts.keys.includes(key)) facts.keys.push(key);
-      const blockEnd = section(end);
+      const blockSize = sig === '8B64' ? length64(end) : u32(end);
+      need(blockSize, end);
+      const blockEnd = offset + blockSize;
       const size = blockEnd - offset;
-      if (['Layr', 'Lr16', 'Lr32'].includes(key)) issue('alternate-layer-carrier');
+      if (['Layr', 'Lr16', 'Lr32'].includes(key)) {
+        if (!facts.notes.includes('alternate-layer-carrier-domain-unverified')) facts.notes.push('alternate-layer-carrier-domain-unverified');
+        // Alternate carriers do not prove a global wire/parsed inventory match.
+        // Still walk their bounded record layout: malformed declared records
+        // cannot disappear merely because this carrier's domain is unverified.
+        if (++alternateDepth > 4) throw new Error('coverage-limit');
+        const savedLayerIds = new Map(layerIds);
+        layerIds.clear();
+        try { layerInfo(blockEnd); }
+        finally {
+          layerIds.clear(); for (const [index, id] of savedLayerIds) layerIds.set(index, id);
+          alternateDepth--;
+        }
+      }
       if (key === 'lyid' && layerIndex !== null) {
         if (size !== 4 || layerIds.has(layerIndex)) issue('ambiguous-layer-id');
         else layerIds.set(layerIndex, u32(blockEnd));
@@ -213,13 +232,43 @@ function inspectPsdLinkFraming(buffer) {
       skip(size % 2, end);
     }
   }
+  function layerInfo(layerEnd) {
+    need(2, layerEnd);
+    const count = Math.abs(buffer.readInt16BE(offset)); offset += 2;
+    layerRecords += count;
+    if (layerRecords > 8192) throw new Error('coverage-limit');
+    let channelBytes = 0;
+    for (let index = 0; index < count; index++) {
+      skip(16, layerEnd);
+      const channelCount = u16(layerEnd);
+      if (channelCount > 56) throw new Error('unsupported-layer-channels');
+      for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += u32(layerEnd); }
+      if (signature(layerEnd) !== '8BIM') throw new Error('invalid-layer-signature');
+      skip(8, layerEnd); // blend mode, opacity, clipping, flags, filler
+      const extraEnd = section(layerEnd);
+      offset = section(extraEnd); // mask
+      offset = section(extraEnd); // blending ranges
+      need(1, extraEnd);
+      const nameBytes = buffer[offset++];
+      skip(nameBytes + ((4 - (nameBytes + 1) % 4) % 4), extraEnd);
+      const outerScope = currentLayerScope, layerScope = {};
+      currentLayerScope = layerScope;
+      try { additional(extraEnd, index); }
+      finally { currentLayerScope = outerScope; }
+      for (const carrier of facts.mediaCarriers) {
+        if (mediaLayerScopes.get(carrier) === layerScope) carrier.layerId = layerIds.get(index) ?? null;
+      }
+    }
+    skip(channelBytes, layerEnd);
+    while (offset < layerEnd) if (buffer[offset++] !== 0) issue('unexplained-layer-tail');
+  }
   try {
     const end = buffer.length;
     if (signature(end) !== '8BPS' || u16(end) !== 1) throw new Error('unsupported-psd-version');
     skip(6, end);
     const channels = u16(end);
     skip(8, end); // dimensions; semantic decoding belongs to ag-psd
-    if (channels > 16 || u16(end) !== 8) throw new Error('unsupported-primary-layer-form');
+    if (channels < 1 || channels > 56 || ![1, 8, 16, 32].includes(u16(end))) throw new Error('unsupported-primary-layer-form');
     u16(end); // color mode already checked by the actual parser
     offset = section(end); // color-mode data
     const resourcesEnd = section(end);
@@ -242,36 +291,13 @@ function inspectPsdLinkFraming(buffer) {
       const layerEnd = section(maskEnd);
       const layerStart = offset;
       if (offset < layerEnd) {
-        need(2, layerEnd);
-        const count = Math.abs(buffer.readInt16BE(offset)); offset += 2;
-        if (count > 8192) throw new Error('coverage-limit');
-        let channelBytes = 0;
-        for (let index = 0; index < count; index++) {
-          skip(16, layerEnd);
-          const channelCount = u16(layerEnd);
-          if (channelCount > 16) throw new Error('unsupported-layer-channels');
-          for (let c = 0; c < channelCount; c++) { skip(2, layerEnd); channelBytes += u32(layerEnd); }
-          if (signature(layerEnd) !== '8BIM') throw new Error('invalid-layer-signature');
-          skip(8, layerEnd); // blend mode, opacity, clipping, flags, filler
-          const extraEnd = section(layerEnd);
-          offset = section(extraEnd); // mask
-          offset = section(extraEnd); // blending ranges
-          need(1, extraEnd);
-          const nameBytes = buffer[offset++];
-          skip(nameBytes + ((4 - (nameBytes + 1) % 4) % 4), extraEnd);
-          additional(extraEnd, index);
-          for (const carrier of facts.mediaCarriers) {
-            if (carrier.layerIndex === index) carrier.layerId = layerIds.get(index) ?? null;
-          }
-        }
-        skip(channelBytes, layerEnd);
-        while (offset < layerEnd) if (buffer[offset++] !== 0) issue('unexplained-layer-tail');
+        layerInfo(layerEnd);
       }
       offset = layerEnd;
       skip((layerEnd - layerStart) % 2, maskEnd);
       if (offset < maskEnd) { offset = section(maskEnd); additional(maskEnd, null); }
     }
-    facts.status = facts.issues.length ? 'incomplete' : 'framed';
+    facts.status = facts.issues.length || facts.notes.length ? 'incomplete' : 'framed';
   } catch (error) {
     if (facts.issues.length < 128) facts.issues.push(error.message === 'coverage-limit' ? 'coverage-limit' : 'unsupported-or-malformed-framing');
   }
