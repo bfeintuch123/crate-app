@@ -326,6 +326,8 @@ function safeTempScriptName(name) {
 }
 
 async function runOsascriptInPrivateTemp(buildScripts, entryScriptName, options = {}) {
+  const { language, ...executionOptions } = options;
+  if (language !== undefined && language !== 'JavaScript') throw new Error('Unsupported temporary script language');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), TEMP_SCRIPT_DIR_PREFIX));
   const resolveScriptPath = (name) => path.join(tempDir, safeTempScriptName(name));
 
@@ -348,7 +350,7 @@ async function runOsascriptInPrivateTemp(buildScripts, entryScriptName, options 
       throw new Error('Missing temporary entry script');
     }
 
-    return await execFileAsync('/usr/bin/osascript', [entryScriptPath], options);
+    return await execFileAsync('/usr/bin/osascript', [...(language ? ['-l', language] : []), entryScriptPath], executionOptions);
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -3542,6 +3544,19 @@ function getAssetBaselineSourceRecoveryRouteKey(project, file) {
 
 // Working-source intent is separate from asset selection and survives absent rows.
 // This slice does not infer document continuity from names, dates, or coexistence.
+function isValidWorkingSourceSelectionRecord(project, key, record) {
+  if (!record || !Number.isSafeInteger(record.revision) || record.revision < 1) return false;
+  if (record.state === 'selected') return record.reason === null;
+  if (record.state !== 'excluded') return false;
+  if (record.reason === 'user-excluded') return true;
+  const pair = project?.workingSourceContinuations?.pairs?.[record.pairIdentity];
+  const row = project?.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === key);
+  return record.reason === 'continuation-replaced' && /^[a-f0-9]{64}$/.test(record.pairIdentity || '') &&
+    pair?.version === 1 && pair.predecessorKey === key && pair.decision?.choice === 'replace' &&
+    pair.decision.predecessorSelectionRevision === record.revision &&
+    (!row || pair.predecessorIdentity === getWorkingSourceContinuationIdentity(project, row));
+}
+
 function getWorkingSourceSelection(project, file) {
   const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
   const records = project?.workingSourceSelections;
@@ -3553,9 +3568,7 @@ function getWorkingSourceSelection(project, file) {
     return { state: 'selected', reason: null, revision: 0 };
   }
   const record = records[key];
-  if (!record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
-      !((record.state === 'excluded' && record.reason === 'user-excluded') ||
-        (record.state === 'selected' && record.reason === null))) {
+  if (!isValidWorkingSourceSelectionRecord(project, key, record)) {
     return { state: 'invalid', reason: null, revision: 0 };
   }
   return { state: record.state, reason: record.reason, revision: record.revision };
@@ -3764,8 +3777,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
   }
   const records = project?.workingSourceSelections;
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
-    !/^[a-f0-9]{64}$/.test(key) || !record || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
-    !((record.state === 'excluded' && record.reason === 'user-excluded') || (record.state === 'selected' && record.reason === null))));
+    !/^[a-f0-9]{64}$/.test(key) || !isValidWorkingSourceSelectionRecord(project, key, record)));
   const membership = { facts, counts, requiredByPath, blocked: selectionInvalid || counts.relationshipHolds > 0 ||
     (engaged && (counts.unresolvedVerification > 0 || counts.missingRequiredReferences > 0)) };
   // Only a concrete producer receipt creates an output-byte obligation. Keep
@@ -3815,14 +3827,15 @@ function getDormantWorkingSourceReviewFacts(record) {
     unresolved: record?.unresolved || [] };
 }
 
-function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null) {
+function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null, excludedPreparation = null) {
   const project = getProjects().find(item => item.id === projectId);
   const file = project?.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
     normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
   if (!file || !parentCurrent()) return null;
   const key = getAssetBaselineSourceRecoveryRouteKey(project, file), selection = getWorkingSourceSelection(project, file);
   const previous = getWorkingSourceVerification(project, file);
-  if (selection.state === 'invalid' || (selection.state === 'excluded' &&
+  const preparingExcluded = selection.state === 'excluded' && typeof excludedPreparation === 'function' && excludedPreparation(project, file) === true;
+  if (selection.state === 'invalid' || (selection.state === 'excluded' && !preparingExcluded &&
     !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency)) return null;
   if (attempt && previous?.attempt !== attempt) return null;
   attempt ||= crypto.randomUUID();
@@ -3830,7 +3843,7 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
     if (!parentCurrent()) return false;
     const latest = getProjects().find(item => item.id === projectId);
     const row = latest?.files?.find(item => getAssetBaselineSourceRecoveryRouteKey(latest, item) === key);
-    return !!row && getWorkingSourceSelection(latest, row).revision === selection.revision &&
+    return !!row && (!preparingExcluded || excludedPreparation(latest, row) === true) && getWorkingSourceSelection(latest, row).revision === selection.revision &&
       latest.workingSourceVerification?.[key]?.attempt === attempt;
   };
   mutateProject(projectId, latest => {
@@ -3947,13 +3960,13 @@ async function refreshWorkingSourceVerification(projectId) {
   } finally { operation?.close(); }
 }
 
-async function verifyRestoredWorkingSource(projectId, file, attempt, operation) {
+async function verifyRestoredWorkingSource(projectId, file, attempt, operation, excludedPreparation = null) {
   const key = getAssetBaselineSourceRecoveryRouteKey({ id: projectId }, file);
   const current = () => !!operation?.current() && getProjects().find(item => item.id === projectId)
     ?.workingSourceVerification?.[key]?.attempt === attempt;
   if (!current()) return;
   if (file.virtual === true || !SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())) {
-    const scan = beginWorkingSourceScan(projectId, file.path, current, attempt);
+    const scan = beginWorkingSourceScan(projectId, file.path, current, attempt, excludedPreparation);
     if (file.virtual === true) {
       publishWorkingSourceScan(scan, { status: 'unavailable', reason: 'connected-provider-interface-required', provider: 'connected-provider',
         requiredReferences: [], unresolved: [{ reason: 'connected-provider-interface-required' }], notes: ['required-reference-domain-unverified'] });
@@ -3976,9 +3989,22 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation) 
       status: 'failed', reason: outcome.timedOut ? 'scan-timeout' : 'source-unavailable', unresolved: [{ reason: 'source-unavailable' }] });
     return;
   }
-  const report = await runBoundedScanOnOpenQueue(projectId, [file.path], operation.activationToken ?? null,
-    { ...operation, current, adoptScope: scope => operation.adoptScope(scope) && current() },
-    { addFilesScan: true, allowPausedBaseline: true, workingSourceAttempt: attempt });
+  const scanOperation = { ...operation, current, adoptScope: scope => operation.adoptScope(scope) && current() };
+  const scanOptions = { addFilesScan: true, allowPausedBaseline: true, workingSourceAttempt: attempt,
+    excludedWorkingSourcePreparation: excludedPreparation };
+  const latest = getProjects().find(item => item.id === projectId);
+  let report;
+  if (typeof excludedPreparation === 'function' && excludedPreparation(latest, file) === true &&
+      getWorkingSourceSelection(latest, file).state === 'excluded') {
+    // Baseline queues intentionally omit excluded roots. Explicit Replace may
+    // verify this accepted source through the same bounded ordinary scanner,
+    // without registering it as a selected baseline source before commit.
+    const result = await runScanOnOpen(projectId, file.path, operation.activationToken ?? null, scanOperation,
+      { ...scanOptions, establishBaseline: false });
+    report = { cancelled: !current(), outcomes: [result || { success: false, error: 'scan_on_open_failed' }] };
+  } else {
+    report = await runBoundedScanOnOpenQueue(projectId, [file.path], operation.activationToken ?? null, scanOperation, scanOptions);
+  }
   if (!current()) return;
   const record = getProjects().find(item => item.id === projectId)?.workingSourceVerification?.[key];
   if (report.cancelled || report.outcomes.some(item => !item.success)) {
@@ -4056,6 +4082,426 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       verificationStatus: getWorkingSourceVerification(project, currentFile)?.status || 'unavailable',
       semanticCounts: getWorkingSourceMembership(project).counts };
   } finally { operation?.close(); }
+}
+
+// Adapter v1 is bound to A1 444e4ef. Candidate evidence never authorizes a
+// replacement. Only this pair-bound, trusted owner operation changes intent.
+const WORKING_SOURCE_CONTINUATION_VERSION = 1;
+const illustratorContinuationSnapshots = new Map();
+const workingSourceDocumentIdentityCache = new Map();
+const LOCAL_ADOBE_CONTINUATION_EXTENSIONS = new Set(['.ai', '.ait', '.eps', '.svg', '.psd', '.psb', '.indd', '.idml', '.xd', '.pdf', '.prproj', '.aep', '.aet']);
+
+function getWorkingSourceContinuationPhysicalIdentity(project, file) {
+  if (!file || file.virtual === true || !path.isAbsolute(file.path || '') || !isWorkingSourceFile(file)) return null;
+  if (!LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(file.path).toLowerCase())) return null;
+  try {
+    const stat = fs.lstatSync(file.path, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.birthtimeNs <= 0n) return null;
+    return getAssetBaselineSourcePhysicalIdentityHash(project, stat);
+  } catch (_) { return null; }
+}
+
+function getWorkingSourceContinuationIdentity(project, file) {
+  const physicalIdentity = getWorkingSourceContinuationPhysicalIdentity(project, file);
+  if (!physicalIdentity) return null;
+  const record = project?.workingSourceLocators?.records?.[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+  return record?.version === 1 && record.physicalIdentity === physicalIdentity && /^[a-f0-9]{64}$/.test(record.documentIdentity || '')
+    ? record.documentIdentity : physicalIdentity;
+}
+
+async function readWorkingSourceDocumentIdentity(project, file, operation, timeoutMs = 2000) {
+  const physicalIdentity = getWorkingSourceContinuationPhysicalIdentity(project, file);
+  if (!physicalIdentity || !operation?.current()) return null;
+  const cacheKey = project.id + ':' + getAssetBaselineSourceRecoveryRouteKey(project, file) + ':' + physicalIdentity;
+  const cached = workingSourceDocumentIdentityCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.documentIdentity;
+  let documentIdentity = null;
+  try {
+    // Foundation's kernel document ID survives supported safe saves; copies
+    // receive a distinct ID. Nil/zero/unsupported is unavailable evidence.
+    // This script reads one already scoped path and never addresses an app.
+    const script = `ObjC.import('Foundation');\nvar url = $.NSURL.fileURLWithPath($(${JSON.stringify(file.path)}));\nvar values = url.resourceValuesForKeysError($([$.NSURLDocumentIdentifierKey, $.NSURLVolumeUUIDStringKey]), null);\nif (!values) { JSON.stringify(null); } else {\nvar id = values.objectForKey($.NSURLDocumentIdentifierKey);\nvar volume = values.objectForKey($.NSURLVolumeUUIDStringKey);\nJSON.stringify(id && volume ? { documentId: ObjC.unwrap(id.description), volumeUuid: ObjC.unwrap(volume.description) } : null);\n}`;
+    const { stdout } = await runOsascriptInPrivateTemp(() => ({ 'crate-source-document-identity.js': script }), 'crate-source-document-identity.js',
+      { language: 'JavaScript', timeout: Math.max(1, Math.min(timeoutMs, 2000)), maxBuffer: 4096, encoding: 'utf8' });
+    const value = JSON.parse(String(stdout || '').trim());
+    if (value && /^[1-9][0-9]{0,19}$/.test(value.documentId || '') &&
+        /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value.volumeUuid || '') && operation.current() &&
+        physicalIdentity === getWorkingSourceContinuationPhysicalIdentity(project, file)) {
+      documentIdentity = crypto.createHash('sha256').update(JSON.stringify(['kernel-document-v1', project.id, value.volumeUuid.toLowerCase(), value.documentId])).digest('hex');
+    }
+  } catch (_) {}
+  if (!operation.current()) return null;
+  while (workingSourceDocumentIdentityCache.size >= 256) workingSourceDocumentIdentityCache.delete(workingSourceDocumentIdentityCache.keys().next().value);
+  workingSourceDocumentIdentityCache.set(cacheKey, { documentIdentity, expiresAt: Date.now() + (documentIdentity ? 60000 : 5000) });
+  return documentIdentity;
+}
+
+async function refreshWorkingSourceLocators(projectId, observedPaths = null, parentCurrent = null) {
+  if (Array.isArray(observedPaths) && !observedPaths.some(locator => typeof locator === 'string' && LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(locator).toLowerCase()))) return;
+  const captured = captureProjectOperation(projectId);
+  const operation = captured && { ...captured, current: () => captured.current() && (!parentCurrent || parentCurrent()) };
+  try {
+    const project = getProjects().find(item => item.id === projectId);
+    if (!project || !operation?.current()) return;
+    const beforeSignature = getPackageSelectionInputSignature(project);
+    const state = project.workingSourceLocators;
+    if (state !== undefined && (state?.version !== 1 || !state.records || typeof state.records !== 'object' || Array.isArray(state.records))) return;
+    const records = { ...(state?.records || {}) }, documentRecords = new Map();
+    const sources = (project.files || []).filter(file => file.virtual !== true && isWorkingSourceFile(file) &&
+      LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())).slice(0, 64);
+    if (!sources.length) return;
+    if (Array.isArray(observedPaths) && !state?.records) {
+      const observed = new Set(observedPaths.map(normalizeTrackedFilePath));
+      if (!sources.some(file => observed.has(normalizeTrackedFilePath(file.path)))) return;
+    }
+    const identityDeadline = Date.now() + 2000;
+    for (const file of sources) {
+      const identity = getWorkingSourceContinuationPhysicalIdentity(project, file);
+      if (!identity) continue;
+      const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+      const remainingMs = identityDeadline - Date.now();
+      if (remainingMs <= 0) continue;
+      const documentIdentity = await readWorkingSourceDocumentIdentity(project, file, operation, remainingMs);
+      if (!operation.current()) return;
+      documentRecords.set(key, { version: 1, path: file.path, physicalIdentity: identity, documentIdentity });
+    }
+    const relocated = [], changedBytes = [], aliases = [...(state?.aliases || [])];
+    const selections = { ...(project.workingSourceSelections || {}) }, verification = { ...(project.workingSourceVerification || {}) };
+    const pairs = { ...(project.workingSourceContinuations?.pairs || {}) };
+    let files = [...project.files];
+    const destinations = [...new Set((observedPaths || []).filter(locator => typeof locator === 'string' && path.isAbsolute(locator)))].slice(0, 128);
+    for (const file of sources) {
+      const key = getAssetBaselineSourceRecoveryRouteKey(project, file), previous = records[key], present = documentRecords.get(key);
+      if (present) {
+        if (previous?.physicalIdentity !== present.physicalIdentity && previous?.documentIdentity &&
+            previous.documentIdentity === present.documentIdentity) changedBytes.push({ file, key });
+        records[key] = present;
+        for (const [identity, pair] of Object.entries(pairs)) {
+          if (pair.predecessorKey === key && pair.predecessorIdentity === present.physicalIdentity && present.documentIdentity) pairs[identity] = { ...pair, predecessorIdentity: present.documentIdentity };
+          if (pair.successorKey === key && pair.successorIdentity === present.physicalIdentity && present.documentIdentity) pairs[identity] = { ...pairs[identity], successorIdentity: present.documentIdentity };
+        }
+        continue;
+      }
+      // Rename requires the old locator to be gone, unique same-volume inode
+      // plus birth time, no symlink/hardlink, and no independently admitted row.
+      if (!previous?.physicalIdentity || fs.existsSync(file.path)) continue;
+      const candidates = destinations.filter(locator => !files.some(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(locator)) &&
+        getWorkingSourceContinuationPhysicalIdentity(project, { ...file, path: locator }) === previous.physicalIdentity);
+      if (candidates.length !== 1) continue;
+      const destination = candidates[0], moved = { ...file, path: destination, name: path.basename(destination), ext: path.extname(destination).toLowerCase() };
+      const newKey = getAssetBaselineSourceRecoveryRouteKey(project, moved);
+      // Logical PSD children require their separate producer reconciliation.
+      // Keep their true old-path obligations instead of rewriting declarations.
+      if (!newKey || selections[newKey] || verification[newKey] || records[newKey] ||
+          project.files.some(row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === normalizeTrackedFilePath(file.path))) continue;
+      if (selections[key]) { selections[newKey] = selections[key]; delete selections[key]; }
+      if (verification[key]) { verification[newKey] = { ...verification[key], status: 'stale', reason: 'source-locator-changed', attempt: crypto.randomUUID() }; delete verification[key]; }
+      for (const [identity, pair] of Object.entries(pairs)) pairs[identity] = { ...pair,
+        predecessorKey: pair.predecessorKey === key ? newKey : pair.predecessorKey,
+        successorKey: pair.successorKey === key ? newKey : pair.successorKey };
+      records[newKey] = { ...previous, path: destination }; delete records[key];
+      files = files.map(row => row === file ? moved : row);
+      aliases.push({ version: 1, kind: 'rename', fromKey: key, toKey: newKey, identity: previous.documentIdentity || previous.physicalIdentity });
+      relocated.push({ file: moved, key: newKey, oldKey: key, oldPath: file.path });
+    }
+    for (const { key } of changedBytes) if (verification[key]) verification[key] = { ...verification[key], status: 'stale', reason: 'safe-save-bytes-changed', attempt: crypto.randomUUID() };
+    const nextState = { version: 1, records, aliases: aliases.slice(-128) };
+    if (JSON.stringify(state) === JSON.stringify(nextState) && !relocated.length && !changedBytes.length) return;
+    const result = mutateProject(projectId, latest => {
+      if (!operation.current() || beforeSignature !== getPackageSelectionInputSignature(latest) ||
+          [...documentRecords.values()].some(record => getWorkingSourceContinuationPhysicalIdentity(latest, { path: record.path, projectRole: 'source' }) !== record.physicalIdentity) ||
+          relocated.some(item => fs.existsSync(project.files.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === item.oldKey)?.path || '') ||
+            getWorkingSourceContinuationPhysicalIdentity(latest, item.file) !== records[item.key].physicalIdentity)) return { changed: false };
+      latest.workingSourceLocators = nextState;
+      if (relocated.length || changedBytes.length) {
+        latest.files = files;
+        if (hasWorkingSourceSelectionState(project)) latest.workingSourceSelections = selections;
+        latest.workingSourceVerification = verification;
+        if (latest.workingSourceContinuations) latest.workingSourceContinuations = { ...latest.workingSourceContinuations, pairs };
+        // Ownership locators move with their source; declared reference paths
+        // deliberately remain unchanged until current source bytes rescan.
+        for (const item of relocated) for (const row of latest.files) {
+          for (const field of ['relationshipSourcePath', 'sourceDocumentPath']) if (normalizeTrackedFilePath(row.captureEvidence?.[field]) === normalizeTrackedFilePath(item.oldPath)) row.captureEvidence = { ...row.captureEvidence, [field]: item.file.path };
+          if (normalizeTrackedFilePath(row.assetBaselineSourcePath) === normalizeTrackedFilePath(item.oldPath)) row.assetBaselineSourcePath = item.file.path;
+        }
+        for (const receipt of latest.assetBaseline?.failedRequiredSources || []) for (const item of relocated) if (receipt.sourceKeyHash === item.oldKey) receipt.sourceKeyHash = item.key;
+      }
+      if (latest.workingSourceContinuations) latest.workingSourceContinuations = { ...latest.workingSourceContinuations, pairs };
+      return { changed: true };
+    }, { persistIfChanged: true, trustResultChanged: true });
+    if (!result?.changed) return;
+    invalidatePackageReviewForProject(projectId);
+    const scope = relocated.length && getIllustratorActivationScope(projectId);
+    if (scope) {
+      const revised = reviseIllustratorActivationScope(projectId, scope, next => {
+        for (const item of relocated) for (const field of ['baselineDocumentPaths', 'admittedDocumentPaths']) {
+          if (next[field].delete(normalizeTrackedFilePath(item.oldPath))) next[field].add(normalizeTrackedFilePath(item.file.path));
+        }
+      });
+      if (revised && !operation.adoptScope(revised)) return;
+    }
+    if (relocated.length) reconcileProjectAssetBaselineScanSources(projectId, { allowPaused: true });
+    for (const item of [...relocated, ...changedBytes]) {
+      workingSourceScanLeases.get(projectId + ':' + (item.oldKey || item.key))?.cancel('source-locator-changed');
+      const scan = beginWorkingSourceScan(projectId, item.file.path, operation.current);
+      if (scan) await verifyRestoredWorkingSource(projectId, item.file, scan.attempt, operation);
+      if (!operation.current()) return;
+    }
+    sendToRenderer('project:updated', { projectId });
+  } finally { operation?.close(); }
+}
+
+function getCurrentWorkingSourceContinuationPair(project, pairIdentity) {
+  const state = project?.workingSourceContinuations;
+  const pair = state?.pairs?.[pairIdentity];
+  if (state?.version !== 1 || !pair || pair.version !== 1 || !/^[a-f0-9]{64}$/.test(pairIdentity || '') ||
+      !/^[a-f0-9]{64}$/.test(pair.evidenceIdentity || '') || !Number.isSafeInteger(pair.revision) || pair.revision < 1 ||
+      pair.predecessorKey === pair.successorKey) return null;
+  const scoped = getIllustratorScopedProjectView(project);
+  const find = (rows, key) => {
+    const matches = rows.filter(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === key);
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const accepted = scoped?.files || [], discovered = [...accepted, ...(scoped?.pendingFiles || [])];
+  const predecessor = find(accepted, pair.predecessorKey), successor = find(discovered, pair.successorKey);
+  if (!predecessor || !successor || pair.predecessorIdentity !== getWorkingSourceContinuationIdentity(project, predecessor) ||
+      pair.successorIdentity !== getWorkingSourceContinuationIdentity(project, successor) ||
+      pair.predecessorIdentity === pair.successorIdentity) return null;
+  return { pair, predecessor, successor, successorAdmission: accepted.includes(successor) ? 'accepted' : 'pending' };
+}
+
+function isWorkingSourceContinuationDecisionCurrent(project, current) {
+  const decision = current.pair.decision;
+  return decision?.authority === 'owner-choice' && ['replace', 'keep-both', 'not-related'].includes(decision.choice) &&
+    decision.predecessorSelectionRevision === getWorkingSourceSelection(project, current.predecessor).revision &&
+    decision.successorSelectionRevision === getWorkingSourceSelection(project, current.successor).revision;
+}
+
+function getWorkingSourceContinuationPresentation(project, packageFiles = null) {
+  const candidates = [], packageKeys = packageFiles && new Set(packageFiles.map(file => getAssetBaselineSourceRecoveryRouteKey(project, file)));
+  const membership = getWorkingSourceMembership(project);
+  for (const identity of Object.keys(project?.workingSourceContinuations?.pairs || {}).slice(0, 256)) {
+    const current = getCurrentWorkingSourceContinuationPair(project, identity);
+    if (!current || isWorkingSourceContinuationDecisionCurrent(project, current)) continue;
+    const a = getWorkingSourceSelection(project, current.predecessor), b = getWorkingSourceSelection(project, current.successor);
+    const retainsPredecessorAsDependency = membership.facts.get(getTrackedFileDedupKey(current.predecessor))?.includedAsDependency === true;
+    if ((a.state !== 'selected' && !retainsPredecessorAsDependency) || b.state === 'invalid' ||
+        (packageKeys && !packageKeys.has(current.pair.predecessorKey))) continue;
+    const present = (file, selection, admissionState) => ({ visualIdentity: createProjectFileVisualIdentity(project.id, file),
+      name: sanitizeRendererSourceName(file.name || path.basename(file.path)) || 'Working file', selectionRevision: selection.revision,
+      selectionState: selection.state, admissionState });
+    candidates.push({ pairIdentity: identity, evidenceIdentity: current.pair.evidenceIdentity, revision: current.pair.revision,
+      predecessor: present(current.predecessor, a, 'accepted'), successor: present(current.successor, b, current.successorAdmission),
+      replaceRequires: current.successorAdmission === 'pending' ? 'successor-admission' : null,
+      retainsPredecessorAsDependency });
+  }
+  return { version: WORKING_SOURCE_CONTINUATION_VERSION, capability: 'pair-choice-v1', candidates };
+}
+
+function recordWorkingSourceContinuationCandidate(projectId, predecessorPath, successorPath) {
+  const operation = captureProjectOperation(projectId);
+  try {
+    const result = mutateProject(projectId, project => {
+      if (!operation?.current()) return { changed: false };
+      const scoped = getIllustratorScopedProjectView(project);
+      const find = (rows, locator) => {
+        const matches = rows.filter(file => normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(locator));
+        return matches.length === 1 ? matches[0] : null;
+      };
+      const predecessor = find(scoped?.files || [], predecessorPath);
+      const successor = find([...(scoped?.files || []), ...(scoped?.pendingFiles || [])], successorPath);
+      if (!predecessor || !successor || predecessor === successor) return { changed: false };
+      const predecessorKey = getAssetBaselineSourceRecoveryRouteKey(project, predecessor), successorKey = getAssetBaselineSourceRecoveryRouteKey(project, successor);
+      const predecessorIdentity = getWorkingSourceContinuationIdentity(project, predecessor), successorIdentity = getWorkingSourceContinuationIdentity(project, successor);
+      if (!predecessorIdentity || !successorIdentity || predecessorIdentity === successorIdentity ||
+          getWorkingSourceSelection(project, predecessor).state !== 'selected' ||
+          getWorkingSourceSelection(project, successor).state === 'invalid') return { changed: false };
+      const state = project.workingSourceContinuations;
+      if (state !== undefined && (state?.version !== 1 || !state.pairs || typeof state.pairs !== 'object' || Array.isArray(state.pairs))) return { changed: false };
+      const pairIdentity = crypto.createHash('sha256').update(JSON.stringify([project.id, predecessorKey, successorKey, predecessorIdentity, successorIdentity])).digest('hex');
+      if (state?.pairs[pairIdentity] || Object.keys(state?.pairs || {}).length >= 256) return { changed: false, pairIdentity };
+      project.workingSourceContinuations = { version: 1, pairs: { ...(state?.pairs || {}), [pairIdentity]: {
+        version: 1, predecessorKey, successorKey, predecessorIdentity, successorIdentity,
+        evidenceIdentity: crypto.createHash('sha256').update(crypto.randomUUID()).digest('hex'), revision: 1,
+        classification: 'illustrator-path-transition', decision: null,
+      } } };
+      return { changed: true, pairIdentity };
+    }, { persistIfChanged: true, trustResultChanged: true });
+    if (result?.changed) { invalidatePackageReviewForProject(projectId); sendToRenderer('project:updated', { projectId }); }
+    return result?.pairIdentity || null;
+  } finally { operation?.close(); }
+}
+
+// The primary DOC producer corroborates a possible path transition only when
+// both complete snapshots preserve the other open documents. Copy-close-open
+// produces the same observation; it stays an unresolved candidate, never Replace.
+function observeIllustratorWorkingSourceContinuation(projectId, activationToken, query) {
+  const failure = getIllustratorSnapshotFailureReason(query);
+  if (failure || !query?.running || !getFreshActiveWatchingProject(projectId, activationToken)) {
+    illustratorContinuationSnapshots.delete(projectId); return null;
+  }
+  const documents = query.activeState.documents;
+  const current = documents.filter(doc => doc.current);
+  if (current.length !== 1 || current[0].modified || documents.some(doc => !doc.documentPath)) {
+    illustratorContinuationSnapshots.delete(projectId); return null;
+  }
+  const paths = documents.map(doc => normalizeTrackedFilePath(doc.documentPath)).sort();
+  if (new Set(paths).size !== paths.length) { illustratorContinuationSnapshots.delete(projectId); return null; }
+  const snapshot = { activationToken, current: normalizeTrackedFilePath(current[0].documentPath), paths };
+  const previous = illustratorContinuationSnapshots.get(projectId);
+  if (previous?.activationToken === activationToken && previous.current === snapshot.current &&
+      JSON.stringify(previous.paths) === JSON.stringify(snapshot.paths) && previous.pendingPair) {
+    snapshot.pendingPair = previous.pendingPair;
+    illustratorContinuationSnapshots.set(projectId, snapshot);
+    return recordWorkingSourceContinuationCandidate(projectId, ...snapshot.pendingPair);
+  }
+  illustratorContinuationSnapshots.set(projectId, snapshot);
+  if (!previous || previous.activationToken !== activationToken || previous.current === snapshot.current ||
+      paths.includes(previous.current) || previous.paths.includes(snapshot.current)) return null;
+  const oldOthers = previous.paths.filter(locator => locator !== previous.current);
+  const newOthers = paths.filter(locator => locator !== snapshot.current);
+  if (JSON.stringify(oldOthers) !== JSON.stringify(newOthers)) return null;
+  snapshot.pendingPair = [previous.current, snapshot.current];
+  return recordWorkingSourceContinuationCandidate(projectId, previous.current, snapshot.current);
+}
+
+async function resolveWorkingSourceContinuation(projectId, request) {
+  const keys = ['pairIdentity', 'evidenceIdentity', 'expectedRevision', 'predecessorSelectionRevision', 'successorSelectionRevision', 'choice'];
+  if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).length !== keys.length ||
+      Object.keys(request).some(key => !keys.includes(key)) ||
+      !['replace', 'keep-both', 'not-related'].includes(request.choice) ||
+      !['pairIdentity', 'evidenceIdentity'].every(key => /^[a-f0-9]{64}$/.test(request[key] || '')) ||
+      !['expectedRevision', 'predecessorSelectionRevision', 'successorSelectionRevision'].every(key =>
+        Number.isSafeInteger(request[key]) && request[key] >= 0)) return { success: false, error: 'invalid_continuation_request' };
+  const operation = captureProjectOperation(projectId);
+  let committedDecision = null;
+  let committedProjectId = null;
+  const boundPair = project => {
+    const current = getCurrentWorkingSourceContinuationPair(project, request.pairIdentity);
+    if (!operation?.current() || !current || current.pair.evidenceIdentity !== request.evidenceIdentity ||
+        current.pair.revision !== request.expectedRevision || current.pair.revision >= Number.MAX_SAFE_INTEGER) return null;
+    const a = getWorkingSourceSelection(project, current.predecessor), b = getWorkingSourceSelection(project, current.successor);
+    const predecessorIncluded = a.state === 'selected' || getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(current.predecessor))?.includedAsDependency === true;
+    return predecessorIncluded && a.state !== 'invalid' && b.state !== 'invalid' && a.revision === request.predecessorSelectionRevision &&
+      b.revision === request.successorSelectionRevision && a.revision < Number.MAX_SAFE_INTEGER && b.revision < Number.MAX_SAFE_INTEGER ? current : null;
+  };
+  try {
+    let project = getProjects().find(item => item.id === projectId), current = boundPair(project);
+    if (!current) return { success: false, error: 'continuation_stale' };
+    if (request.choice === 'replace') {
+      if (current.successorAdmission !== 'accepted') return { success: false, error: 'continuation_admission_required' };
+      // This process-local capability allows an ordinary scan of the exact
+      // accepted successor during explicit Replace, without restoring intent.
+      // It is never renderer input and expires with this bound pair operation.
+      const excludedPreparation = (latest, file) => {
+        const bound = boundPair(latest);
+        return !!bound && bound.successorAdmission === 'accepted' &&
+          getAssetBaselineSourceRecoveryRouteKey(latest, file) === bound.pair.successorKey;
+      };
+      // Prepare ordinary verification without changing either source's intent.
+      for (const role of ['successor', 'predecessor']) {
+        project = getProjects().find(item => item.id === projectId); current = boundPair(project);
+        if (!current) return { success: false, error: 'continuation_stale' };
+        const file = current[role];
+        if (role === 'predecessor' && !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency) continue;
+        const record = getWorkingSourceVerification(project, file);
+        if (!['scanned', 'no-extractor'].includes(record?.status) || !isWorkingSourceDiskIdentityCurrent(file, record)) {
+          const scan = beginWorkingSourceScan(projectId, file.path, () => !!boundPair(getProjects().find(item => item.id === projectId)), null, excludedPreparation);
+          if (!scan) return { success: false, error: 'continuation_verification_required' };
+          await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation, excludedPreparation);
+        }
+      }
+    }
+    project = getProjects().find(item => item.id === projectId); current = boundPair(project);
+    if (!current) return { success: false, error: 'continuation_stale' };
+    if (request.choice === 'replace' && current.successorAdmission !== 'accepted') return { success: false, error: 'continuation_stale' };
+    const inputSignature = getPackageSelectionInputSignature(project);
+    const keysForPair = [current.pair.predecessorKey, current.pair.successorKey];
+    const selections = { ...(project.workingSourceSelections || {}) }, verification = { ...(project.workingSourceVerification || {}) };
+    const decision = { authority: 'owner-choice', choice: request.choice,
+      predecessorSelectionRevision: request.predecessorSelectionRevision,
+      successorSelectionRevision: request.successorSelectionRevision };
+    if (request.choice === 'replace') {
+      const a = getWorkingSourceSelection(project, current.predecessor), b = getWorkingSourceSelection(project, current.successor);
+      selections[keysForPair[0]] = { state: 'excluded', reason: 'continuation-replaced', pairIdentity: request.pairIdentity, revision: a.revision + 1 };
+      selections[keysForPair[1]] = { state: 'selected', reason: null, revision: b.revision + 1 };
+      decision.predecessorSelectionRevision++; decision.successorSelectionRevision++;
+      for (const [index, file] of [current.predecessor, current.successor].entries()) {
+        const record = getWorkingSourceVerification(project, file);
+        if (record) verification[keysForPair[index]] = { ...record, selectionRevision: selections[keysForPair[index]].revision, attempt: crypto.randomUUID() };
+      }
+    }
+    const pair = { ...current.pair, revision: current.pair.revision + 1, decision };
+    const continuations = { version: 1, pairs: { ...project.workingSourceContinuations.pairs, [request.pairIdentity]: pair } };
+    const prospective = { ...project, workingSourceSelections: selections, workingSourceVerification: verification, workingSourceContinuations: continuations };
+    const requiredPaths = new Set([current.predecessor.path, current.successor.path]);
+    if (request.choice === 'replace') {
+      const successorRecord = getWorkingSourceVerification(prospective, current.successor);
+      const membership = getWorkingSourceMembership(prospective);
+      if (!['scanned', 'no-extractor'].includes(successorRecord?.status) || successorRecord.unresolved.length || membership.blocked) {
+        return { success: false, error: 'continuation_verification_required' };
+      }
+      for (const obligation of membership.requiredByPath.values()) requiredPaths.add(obligation.path);
+    }
+    const receipt = new Map();
+    // Read current bytes and dependencies, not a renderer-supplied fingerprint.
+    for (const sourcePath of requiredPaths) {
+      const identity = getWorkingSourceDiskIdentity({ path: sourcePath });
+      if (!identity) return { success: false, error: 'continuation_verification_required' };
+      const fingerprint = await getBoundedWorkingSourceContinuationDigest(sourcePath, operation, identity);
+      if (!operation.current() || !fingerprint) return { success: false, error: 'continuation_stale' };
+      receipt.set(sourcePath, { identity, fingerprint });
+    }
+    if (request.choice === 'replace') {
+      const successorRecord = getWorkingSourceVerification(prospective, current.successor);
+      if (receipt.get(current.successor.path).fingerprint !== successorRecord.sourceFingerprint) return { success: false, error: 'continuation_verification_required' };
+      const membership = getWorkingSourceMembership(prospective);
+      for (const file of prospective.files) {
+        const record = getWorkingSourceVerification(prospective, file);
+        const fact = membership.facts.get(getTrackedFileDedupKey(file));
+        if (fact?.included && receipt.has(file.path) && ['scanned', 'no-extractor'].includes(record?.status) &&
+            receipt.get(file.path).fingerprint !== record.sourceFingerprint) return { success: false, error: 'continuation_verification_required' };
+        for (const output of record?.requiredEmbeddedOutputs || []) {
+          if (receipt.has(output.path) && receipt.get(output.path).fingerprint !== output.outputDigest) return { success: false, error: 'continuation_verification_required' };
+        }
+      }
+    }
+    // A second digest pass catches same-stat edits during preparation. The
+    // synchronous commit also fences every disk identity and the full input.
+    for (const [sourcePath, captured] of receipt) {
+      if (captured.fingerprint !== await getBoundedWorkingSourceContinuationDigest(sourcePath, operation, captured.identity)) return { success: false, error: 'continuation_stale' };
+    }
+    const result = mutateProject(projectId, latest => {
+      if (!boundPair(latest) || inputSignature !== getPackageSelectionInputSignature(latest) ||
+          [...receipt].some(([sourcePath, captured]) => !isWorkingSourceDiskIdentityCurrent({ path: sourcePath }, { sourceIdentity: captured.identity }))) {
+        return { success: false, error: 'continuation_stale', changed: false };
+      }
+      // All fallible preparation precedes these assignments: one durable write.
+      if (request.choice === 'replace') {
+        latest.workingSourceSelections = selections;
+        latest.workingSourceVerification = verification;
+      }
+      latest.workingSourceContinuations = continuations;
+      return { success: true, projectId: latest.id, decision, changed: true };
+    }, { persistIfChanged: true, trustResultChanged: true });
+    if (!result?.success) return result || { success: false, error: 'continuation_not_found' };
+    committedDecision = decision;
+    committedProjectId = result.projectId;
+    if (request.choice === 'replace') for (const key of keysForPair) workingSourceScanLeases.get(projectId + ':' + key)?.cancel('continuation-changed');
+    invalidatePackageReviewForProject(projectId);
+    reconcileProjectAssetBaselineScanSources(projectId, { allowPaused: true });
+    sendToRenderer('project:updated', { projectId });
+    return { success: true, projectId: committedProjectId, decision, semanticCounts: getWorkingSourceMembership(getProjects().find(item => item.id === projectId)).counts };
+  } catch (_) { return committedDecision ? { success: true, projectId: committedProjectId, decision: committedDecision } :
+    { success: false, error: 'continuation_verification_required' }; }
+  finally { operation?.close(); }
+}
+
+async function getBoundedWorkingSourceContinuationDigest(sourcePath, operation, identity) {
+  const outcome = await runBoundedAddFilesScan(lease => getAddFilesCurrentSourceDigest(sourcePath, lease, identity),
+    { parentCurrent: () => !!operation?.current(), timeoutMs: ADD_FILES_SCAN_TIMEOUT_MS });
+  if (outcome.timedOut || outcome.cancelled) throw new Error('continuation-verification-unavailable');
+  return outcome.value;
 }
 
 function getAssetBaselineSourcePhysicalIdentityHash(project, stat) {
@@ -4454,6 +4900,7 @@ async function createRendererFilePresentation(project, file, membership = getWor
 
 async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (typeof projectId !== 'string' || !projectId || projectId.length > 128) return null;
+  await refreshWorkingSourceLocators(projectId);
   await refreshWorkingSourceVerification(projectId);
   const project = getProjects().find(item => item && item.id === projectId);
   const scopedProject = project && getIllustratorScopedProjectView(project);
@@ -4538,6 +4985,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     trackedFigmaFiles,
     semanticCounts: membership.counts,
     workingSourceSelectionBlocked: membership.blocked,
+    sourceContinuation: getWorkingSourceContinuationPresentation(project),
   };
 }
 
@@ -9090,6 +9538,10 @@ function pollLsofForProjectCore(projectId, activationToken = null, onComplete = 
       currentPid = null;
       currentType = null;
 
+      if (project.workingSourceLocators) await refreshWorkingSourceLocators(projectId, parsedLines.filter(line => line.startsWith('n')).map(line => line.slice(1)),
+        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
+      if (!isActiveWatchingProject(projectId, activationToken) ||
+          (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))) return;
       const result = mutateProject(projectId, (proj, projectsAtMutation) => {
         if (!isActiveWatchingProject(projectId, activationToken)) return { changed: false };
 
@@ -11636,7 +12088,9 @@ async function queryIllustratorActiveState(projectId, activationToken) {
 async function initializeIllustratorActivationScope(projectId, activationToken) {
   const queryResult = await queryIllustratorActiveState(projectId, activationToken); if (queryResult.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return null;
   const updated = updateIllustratorActivationScope(projectId, activationToken, queryResult, true); if (!updated || !updated.ready) return updated;
-  await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken); return updated;
+  await applyLiveAppEvidenceRefresh(projectId, createIllustratorLiveEvidenceRecords(projectId, queryResult.activeState, updated.project), activationToken);
+  observeIllustratorWorkingSourceContinuation(projectId, activationToken, queryResult);
+  return updated;
 }
 function admitIllustratorSourcesForProject(projectId, filePaths) {
   const activationToken = getActiveWatchingActivationToken(projectId), scope = getIllustratorActivationScope(projectId, activationToken); if (!scope || !getFreshActiveWatchingProject(projectId, activationToken)) return;
@@ -11735,6 +12189,10 @@ async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], 
     return { changed: false, stagedCount: 0, skipped: {} };
   }
   const { candidates, skipped } = collectLiveAppEvidenceCandidates(liveEvidenceRecords);
+  if (candidates.length) {
+    await refreshWorkingSourceLocators(projectId, candidates.map(item => item.evidence.filePath), parentOperation?.current);
+    if (!isBoundWatchingActivationCurrent(projectId, activationToken) || (parentOperation && !parentOperation.current())) return { cancelled: true, changed: false, stagedCount: 0, skipped };
+  }
   const skipSummary = formatLiveAppSkipCounts(skipped);
   if (skipSummary) {
     logLiveAppDiagnostic(projectId, 'candidate-skips', `candidate skip counts for project ${projectId}: ${skipSummary}`);
@@ -12223,6 +12681,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     // --- Illustrator ---
     const illustratorQuery = await queryIllustratorActiveState(projectId, activationToken);
     if (illustratorQuery.stale || !getFreshActiveWatchingProject(projectId, activationToken)) return;
+    if (!getIllustratorSnapshotFailureReason(illustratorQuery)) {
+      await refreshWorkingSourceLocators(projectId, (illustratorQuery.activeState?.documents || []).map(doc => doc.documentPath),
+        () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
+      if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
+    }
     const illustratorRunning = illustratorQuery.running;
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
     recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
@@ -12474,6 +12937,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     if (!refreshOperation.current()) return;
     const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation);
     if (refreshResult.cancelled || !refreshOperation.current()) return;
+    observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
       recordLiveAppStatusBreadcrumb(projectId, appFamily, {
         pollFired: true,
@@ -12538,6 +13002,7 @@ function startPsPolling(projectId, activationToken = null) {
  * Stop Photoshop + InDesign polling for a project.
  */
 function stopPsPolling(projectId) {
+  illustratorContinuationSnapshots.delete(projectId);
   const intervalId = psPollers.get(projectId);
   if (intervalId) {
     clearInterval(intervalId);
@@ -12626,6 +13091,10 @@ async function pollLastUsedForProjectCore(projectId, activationToken = null, wat
     (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
   ) return;
 
+  if (project.workingSourceLocators) await refreshWorkingSourceLocators(projectId, newFiles.map(file => file.path),
+    () => watcherGeneration === null || getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration));
+  if (!isActiveWatchingProject(projectId, activationToken) ||
+      (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))) return;
   const result = mutateProject(projectId, (proj) => {
     if (!isActiveWatchingProject(projectId, activationToken)) return null;
     const acceptedFiles = [];
@@ -14568,11 +15037,13 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
   const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
-  if (hasWorkingSourceSelectionState(currentProject) && sourceFact && !sourceFact.included) {
+  const excludedPreparation = typeof options.excludedWorkingSourcePreparation === 'function' ? options.excludedWorkingSourcePreparation : null;
+  if (hasWorkingSourceSelectionState(currentProject) && sourceFact && !sourceFact.included &&
+      !(excludedPreparation && excludedPreparation(currentProject, sourceRow) === true)) {
     if (ownsOperation) operation?.close();
     return { success: true, skipped: 'source-excluded' };
   }
-  workingScan = beginWorkingSourceScan(projectId, filePath, parentCurrent, options.workingSourceAttempt);
+  workingScan = beginWorkingSourceScan(projectId, filePath, parentCurrent, options.workingSourceAttempt, excludedPreparation);
   scanLease.workingSourceScan = workingScan;
   if (options.workingSourceAttempt && !workingScan) return { success: false, error: 'stale_project_operation' };
   const leaseKey = workingScan && projectId + ':' + workingScan.key;
@@ -16335,7 +16806,12 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         await new Promise(resolve => setTimeout(resolve, 500));
         if (!operationCurrent()) return null;
 
-        const currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+        let currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+        if (currentProject?.workingSourceLocators) {
+          await refreshWorkingSourceLocators(projectId, [filePath], operationCurrent);
+          if (!operationCurrent()) return null;
+          currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+        }
         if (!currentProject || !operationCurrent()) return null;
         const stats = await getBoundedChokidarAddStats(filePath, operationCurrent);
         if (!stats || !operationCurrent()) return null;
@@ -16435,7 +16911,12 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
     // v2.2.6: Only re-scan PRIMARY design source files on change.
     // Same rationale as the 'add' handler — image/media changes are noise here.
     if (PRIMARY_DESIGN_EXTENSIONS.has(ext)) {
-      const currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+      let currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+      if (currentProject?.workingSourceLocators) {
+        await refreshWorkingSourceLocators(projectId, [filePath], isCurrent);
+        if (!isCurrent()) return;
+        currentProject = getFreshActiveWatchingProject(projectId, activationToken);
+      }
       if (!currentProject) return;
       const changeBelongsToCurrentSession = await isUnacceptedGenericChangeInCurrentWatchSession(
         currentProject,
@@ -16839,6 +17320,10 @@ registerTrustedIpcHandler('projects:set-existing-assets-decision', (event, proje
 
 registerTrustedIpcHandler('projects:set-working-source-selection', async (event, projectId, visualIdentity, request) => {
   return await setWorkingSourceSelection(projectId, visualIdentity, request);
+});
+
+registerTrustedIpcHandler('projects:resolve-working-source-continuation', async (event, projectId, request) => {
+  return await resolveWorkingSourceContinuation(projectId, request);
 });
 
 registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileIdOrPath) => {
@@ -19044,6 +19529,8 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
           facts.status || facts.requiredReferences.length || facts.requiredEmbeddedOutputs.length || facts.unresolved.length).sort(([a], [b]) => a.localeCompare(b)))
       : project.workingSourceVerification ?? null,
     workingSourceRelationshipHolds: project.workingSourceRelationshipHolds ?? null,
+    workingSourceContinuations: project.workingSourceContinuations ?? null,
+    workingSourceLocators: project.workingSourceLocators ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],
     watchStartedAt: project.watchStartedAt || null,
     createdAt: project.createdAt || null,
@@ -19094,6 +19581,7 @@ function getUnsatisfiedWorkingPsdOutputEntries(project, membership, files, entri
 }
 
 async function buildCanonicalPackageReviewManifest(projectId) {
+  await refreshWorkingSourceLocators(projectId);
   for (let attempt = 0; attempt < 4; attempt++) {
     const project = getProjects().find(item => item && item.id === projectId);
     if (!project) return { error: 'not_found' };
@@ -19115,6 +19603,10 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     if (inputSignature !== getPackageSelectionInputSignature(currentProject)) continue;
     if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
 
+    const sourceContinuation = getWorkingSourceContinuationPresentation(currentProject, files);
+    if (sourceContinuation.candidates.length) {
+      return { error: 'working_source_continuation_choice_required', projectId: currentProject.id, sourceContinuation };
+    }
     const entries = files.map(getPackageReviewManifestEntry);
     const membership = getWorkingSourceMembership(currentProject, files);
     bindEmbeddedPsdPackageReviewResources(files, entries);
@@ -19390,6 +19882,10 @@ registerTrustedIpcHandler('projects:prepare-package-review', async (event, proje
   const reviewStartedAt = Date.now();
   const manifest = await buildCanonicalPackageReviewManifest(projectId);
   if (manifest.error) {
+    if (manifest.error === 'working_source_continuation_choice_required') {
+      invalidatePackageReviewForProject(projectId);
+      return { error: manifest.error, projectId: manifest.projectId, sourceContinuation: manifest.sourceContinuation };
+    }
     return createPackageReviewErrorResult(projectId, manifest.error, {
       failurePhase: 'prepare-package-review',
       phaseElapsedMs: Math.max(0, Date.now() - reviewStartedAt),

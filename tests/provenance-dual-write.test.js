@@ -9628,6 +9628,51 @@ test('package completion store failure removes published output and preserves al
           source: 'manual-browse',
         }],
       });
+      const unpreparedProject = structuredClone(await getProject(project.id));
+      const preparationUsage = structuredClone(storeInstance.get('usage'));
+      const preparationOutputPaths = structuredClone(storeInstance.get('quickPackageOutputPaths', []));
+      const preparationAccount = structuredClone(testAccountSession.snapshot());
+      const preparationAccountGeneration = testAccountSession.generation;
+      testNotificationSupported = true;
+      testRendererEvents.length = 0;
+      testNotifications.length = 0;
+      const initialReview = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+      assert.equal(initialReview.materializable, true);
+      assert.equal(typeof initialReview.token, 'string');
+      assert.ok(initialReview.token.length > 0);
+      const preparedProject = structuredClone(await getProject(project.id));
+      assert.equal(unpreparedProject.workingSourceLocators, undefined);
+      assert.equal(preparedProject.workingSourceLocators.version, 1);
+      assert.deepEqual(preparedProject.workingSourceLocators.aliases, []);
+      const locatorEntries = Object.entries(preparedProject.workingSourceLocators.records);
+      assert.equal(locatorEntries.length, 1);
+      assert.match(locatorEntries[0][0], /^[a-f0-9]{64}$/);
+      assert.deepEqual(Object.keys(locatorEntries[0][1]).sort(), ['documentIdentity', 'path', 'physicalIdentity', 'version']);
+      assert.equal(locatorEntries[0][1].path, sourcePath);
+      assert.equal(locatorEntries[0][1].version, 1);
+      assert.equal(locatorEntries[0][1].documentIdentity, null);
+      assert.match(locatorEntries[0][1].physicalIdentity, /^[a-f0-9]{64}$/);
+      for (const key of ['files', 'pendingFiles', 'status', 'packagedAt', 'outputPath', 'provenance']) {
+        assert.deepEqual(preparedProject[key], unpreparedProject[key], `preparation changed ${key}`);
+      }
+      assert.deepEqual(storeInstance.get('usage'), preparationUsage);
+      assert.deepEqual(storeInstance.get('quickPackageOutputPaths', []), preparationOutputPaths);
+      assert.deepEqual(testAccountSession.snapshot(), preparationAccount);
+      assert.equal(testAccountSession.generation, preparationAccountGeneration);
+      assert.deepEqual(fs.readdirSync(outputDir), []);
+      assert.deepEqual(testRendererEvents.filter(entry => entry.channel === 'project:updated'), [
+        { channel: 'project:updated', data: { projectId: project.id } },
+      ]);
+      assert.equal(testNotifications.length, 0);
+
+      // The consumer transaction starts after real, destination-bound preparation.
+      testRendererEvents.length = 0;
+      const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
+      assert.equal(review.materializable, true);
+      assert.equal(typeof review.token, 'string');
+      assert.ok(review.token.length > 0);
+      assert.deepEqual(await getProject(project.id), preparedProject);
+      assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
       const beforeProject = structuredClone(await getProject(project.id));
       const beforeUsage = structuredClone(storeInstance.get('usage'));
       const beforeOutputPaths = structuredClone(storeInstance.get('quickPackageOutputPaths', []));
@@ -9648,13 +9693,17 @@ test('package completion store failure removes published output and preserves al
       testNotificationSupported = true;
       testNotifications.length = 0;
 
-      const result = await callIpc('projects:package', project.id, outputDir);
+      testRendererEvents.length = 0;
+      const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
       assert.deepEqual(result, { error: 'forced package completion persistence failure' });
       assert.equal(completionWriteAttempts, 1);
       assert.equal(fs.existsSync(packageFolder(outputDir, projectName)), false);
       assert.deepEqual(await getProject(project.id), beforeProject);
       assert.deepEqual(storeInstance.get('usage'), beforeUsage);
       assert.deepEqual(storeInstance.get('quickPackageOutputPaths', []), beforeOutputPaths);
+      assert.deepEqual(testAccountSession.snapshot(), preparationAccount);
+      assert.equal(testAccountSession.generation, preparationAccountGeneration);
+      assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
       assert.equal(testNotifications.length, 0);
     }
   } finally {
@@ -9730,6 +9779,51 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
 
+    const unpreparedProject = structuredClone(await getProject(failingProject.id));
+    const beforeUsage = structuredClone(storeInstance.get('usage'));
+    const beforeOutputPaths = structuredClone(storeInstance.get('quickPackageOutputPaths', []));
+    const beforeAccount = structuredClone(testAccountSession.snapshot());
+    const beforeAccountGeneration = testAccountSession.generation;
+    testNotificationSupported = true;
+    testRendererEvents.length = 0;
+    testNotifications.length = 0;
+    const initialReview = await callIpcRaw('projects:prepare-package-review', failingProject.id, outputDir);
+    assert.equal(initialReview.materializable, true);
+    assert.equal(typeof initialReview.token, 'string');
+    assert.ok(initialReview.token.length > 0);
+    const preparedProject = structuredClone(await getProject(failingProject.id));
+    assert.equal(unpreparedProject.workingSourceLocators, undefined);
+    assert.equal(preparedProject.workingSourceLocators.version, 1);
+    assert.deepEqual(preparedProject.workingSourceLocators.aliases, []);
+    const locatorEntries = Object.entries(preparedProject.workingSourceLocators.records);
+    assert.equal(locatorEntries.length, 1);
+    assert.match(locatorEntries[0][0], /^[a-f0-9]{64}$/);
+    assert.deepEqual(Object.keys(locatorEntries[0][1]).sort(), ['documentIdentity', 'path', 'physicalIdentity', 'version']);
+    assert.equal(locatorEntries[0][1].path, sourcePath);
+    assert.equal(locatorEntries[0][1].version, 1);
+    assert.equal(locatorEntries[0][1].documentIdentity, null);
+    assert.match(locatorEntries[0][1].physicalIdentity, /^[a-f0-9]{64}$/);
+    for (const key of ['files', 'pendingFiles', 'status', 'packagedAt', 'outputPath', 'provenance']) {
+      assert.deepEqual(preparedProject[key], unpreparedProject[key], `preparation changed ${key}`);
+    }
+    assert.deepEqual(storeInstance.get('usage'), beforeUsage);
+    assert.deepEqual(storeInstance.get('quickPackageOutputPaths', []), beforeOutputPaths);
+    assert.deepEqual(testAccountSession.snapshot(), beforeAccount);
+    assert.equal(testAccountSession.generation, beforeAccountGeneration);
+    assert.equal(fs.existsSync(packageFolder(outputDir, failingName)), false);
+    assert.deepEqual(testRendererEvents.filter(entry => entry.channel === 'project:updated'), [
+      { channel: 'project:updated', data: { projectId: failingProject.id } },
+    ]);
+    assert.equal(testNotifications.length, 0);
+
+    testRendererEvents.length = 0;
+    const review = await callIpcRaw('projects:prepare-package-review', failingProject.id, outputDir);
+    assert.equal(review.materializable, true);
+    assert.equal(typeof review.token, 'string');
+    assert.ok(review.token.length > 0);
+    assert.deepEqual(await getProject(failingProject.id), preparedProject);
+    assert.equal(testRendererEvents.some(entry => entry.channel === 'project:updated'), false);
+    const beforeProject = structuredClone(await getProject(failingProject.id));
     const failingManifestPath = manifestPath(outputDir, failingName);
     let injectedFailure = false;
     fs.promises.open = async function partialManifestWrite(filePath, flags, ...args) {
@@ -9756,7 +9850,7 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     testNotifications.length = 0;
     let failureResult;
     try {
-      failureResult = await callIpc('projects:package', failingProject.id, outputDir);
+      failureResult = await callIpcRaw('projects:package', failingProject.id, outputDir, review.token);
     } finally {
       fs.promises.open = originalOpen;
     }
@@ -9768,6 +9862,11 @@ test('diagnostic manifest package transaction preserves normal modes and fails c
     assert.equal(fs.existsSync(failingManifestPath), false);
     assert.equal(storeInstance.get('usage.packagesThisMonth'), 2);
     fresh = await getProject(failingProject.id);
+    assert.deepEqual(fresh, beforeProject);
+    assert.deepEqual(storeInstance.get('usage'), beforeUsage);
+    assert.deepEqual(storeInstance.get('quickPackageOutputPaths', []), beforeOutputPaths);
+    assert.deepEqual(testAccountSession.snapshot(), beforeAccount);
+    assert.equal(testAccountSession.generation, beforeAccountGeneration);
     assert.notEqual(fresh.status, 'packaged');
     assert.equal(fresh.packagedAt == null, true);
     assert.equal(fresh.outputPath == null, true);

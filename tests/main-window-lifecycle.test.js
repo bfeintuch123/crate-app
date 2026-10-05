@@ -409,7 +409,8 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(ipcHandlers.has('projects:get-asset-workspace'), true);
     assert.equal(ipcHandlers.has('projects:get-file-visual'), true);
     assert.equal(ipcHandlers.has('projects:set-working-source-selection'), true);
-    assert.equal(ipcHandlers.size, 43);
+    assert.equal(ipcHandlers.has('projects:resolve-working-source-continuation'), true);
+    assert.equal(ipcHandlers.size, 44);
     for (const channel of ['account:get','account:begin','account:reopen','account:cancel','account:logout','account:manage','account:refresh']) {
       assert.equal(ipcHandlers.has(channel), true, channel);
       assert.throws(() => ipcHandlers.get(channel)({}), /blocked an untrusted renderer request/);

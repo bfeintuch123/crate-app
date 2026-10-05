@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "scope": "A2 working-source selection controls and backend-owned continuation eligibility",
+  "base": "444e4efebcb856515cfe2b9f5b2b7f022d2ab804",
+  "sourceFiles": {
+    "renderer/app.js": "ac9027e5003e2184884362f77943ab6b5be37532bb813ed5ec33696633ce2853",
+    "renderer/index.html": "53bea58c0d881189e1ebb7c911f6d2134fd2ab817286a50b46a7c09b9d96fd67",
+    "renderer/styles.css": "ebe2e6c78cecc5729eef8654242ec0e82eca29cb27fe28d8fb3be9f94c9249a6",
+    "tests/a2-working-source-controls.test.js": "479e1e3740be664822e4c96f04af0e803434fe83a02563565fb469577a1f4251",
+    "tests/renderer-figma-scope.test.js": "3c164d39cc3c10f780b58b26b9586ff804b75f82faa128f47686612c563703c4"
+  },
+  "backendContract": {
+    "wireVersion": 1,
+    "capability": "pair-choice-v1",
+    "documentSha256": "56bcf9185c78ca8e554e3afdf956432c8b4a77b747dfbe484aa5c7e7935833ad",
+    "sealedMainSha256": "9147881cbb964e3a58da215d84e5a513d1278f95d203205e17e63762b69e5812"
+  },
+  "validation": {
+    "runtime": "Node.js v22.23.1",
+    "command": "node --test tests/a2-working-source-controls.test.js tests/package-review-controls.test.js tests/renderer-figma-scope.test.js",
+    "passed": 408,
+    "failed": 0,
+    "skipped": 0,
+    "tapSha256": "82f7d7d716ca42438e8570e051996ef58b95fdb0587ef9a44877bf8a8927898b",
+    "independentFocusedPassed": 71,
+    "checks": [
+      "node --check renderer/app.js",
+      "git diff --check"
+    ]
+  },
+  "sourceReviews": {
+    "correctness": "Fresh Sol6.1/high final five-file PASS; independently71/71 focused tests",
+    "security": "Fresh Sol6.1/high final five-file PASS; read-only source",
+    "ui": "Fresh Astra/high final five-file PASS; read-only source, native UNVERIFIED"
+  },
+  "limits": [
+    "Renderer tests use synthetic DOM and mocked IPC.",
+    "Corrected A1 and final Save As backend integration is not established by this receipt.",
+    "Native UI and installed-app Save As behavior remain unverified.",
+    "Automatic NEW-FILE Save As remains unimplemented by the referenced backend.",
+    "Independent external review and protected current-head CI remain required before merge."
+  ]
+}
