@@ -40,6 +40,106 @@ function setup(overrides = {}) {
 function descendants(node) { return [node, ...(node.children || []).flatMap(descendants)]; }
 function buttonFor(node, text) { return descendants(node).find(child => child.tagName === 'BUTTON' && child.textContent === text); }
 
+for (const projectStatus of ['paused', 'packaged']) test(`${projectStatus} status uses current inclusion through Exclude and Restore`, async () => {
+  const f = setup(); f.project.status = projectStatus;
+  // Keep the raw inventory unchanged throughout, including an old exclusion
+  // overridden by the backend's current required-asset membership.
+  const later = { ...f.row, name: 'Later.ai', visualIdentity: 'later-source' };
+  const required = { name: 'Required.png', path: '/synthetic/Required.png', visualIdentity: 'required-asset', included: true,
+    includedAsDependency: true, effectiveRole: 'asset' };
+  f.project.files.push(later, required); f.project.excludedAssetKeys = ['/synthetic/Required.png'];
+  f.workspace.files = [f.row, later, required];
+  f.renderer.renderProjectRows();
+  const initialSignature = f.renderer.getRendererItemSignature(f.project);
+  assert.match(f.renderer.getStatusLabel(f.project), /3 included files$/);
+  later.sourceSelection = 'excluded'; later.included = false;
+  f.renderer.renderProjectRows();
+  assert.notEqual(f.renderer.getRendererItemSignature(f.project), initialSignature, 'membership must invalidate keyed project cards');
+  assert.match(f.elements['project-rows'].children[0].innerHTML, /2 included files/);
+  if (projectStatus === 'paused') {
+    await f.renderer.renderFiles();
+    assert.equal(f.elements['files-status-text'].textContent, 'Paused · 2 included files');
+  }
+  later.sourceSelection = 'selected'; later.included = true;
+  f.renderer.fixtureWorkspace = f.workspace;
+  vm.runInContext('state.assetWorkspace = fixtureWorkspace', f.renderer);
+  f.renderer.renderProjectRows();
+  assert.match(f.elements['project-rows'].children[0].innerHTML, /3 included files/);
+  if (projectStatus === 'paused') {
+    await f.renderer.renderFiles();
+    assert.equal(f.elements['files-status-text'].textContent, 'Paused · 3 included files');
+  }
+});
+
+for (const unavailable of ['missing', 'foreign', 'incomplete', 'refreshing', 'empty-fallback', 'account-blocked']) test(`status omits unverified membership count: ${unavailable}`, async () => {
+  const f = setup(); f.project.status = 'paused';
+  if (unavailable === 'missing') vm.runInContext('state.assetWorkspace = null', f.renderer);
+  if (unavailable === 'foreign') f.workspace.projectId = 'another-project';
+  if (unavailable === 'incomplete') delete f.row.included;
+  if (unavailable === 'refreshing') vm.runInContext('assetWorkspaceRequestId += 1', f.renderer);
+  if (unavailable === 'empty-fallback') { f.workspace.files = []; delete f.workspace.semanticCounts; }
+  if (unavailable === 'account-blocked') vm.runInContext('accountStatus.canUseWorkspace = false', f.renderer);
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Paused');
+  f.project.status = 'packaged';
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Packaged');
+});
+
+test('authoritative empty membership reports zero while watching suppresses the counter', () => {
+  const f = setup(); f.workspace.files = [];
+  f.project.status = 'paused';
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Paused · 0 included files');
+  f.project.status = 'watching';
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Watching');
+});
+
+test('status refresh discards the prior count while loading and after a workspace failure', async () => {
+  const f = setup(); f.project.status = 'paused'; const gate = deferred();
+  f.crate.getAssetWorkspace = () => gate.promise;
+  const pending = f.renderer.renderFiles();
+  assert.equal(f.elements['files-status-text'].textContent, 'Paused');
+  gate.resolve(null); await pending;
+  assert.equal(f.elements['files-status-text'].textContent, 'Paused');
+  assert.equal(f.renderer.getStatusLabel(f.project), 'Paused');
+});
+
+test('project cards do not fetch per-project workspaces or borrow another project count', () => {
+  const f = setup(); let requests = 0; f.project.status = 'paused';
+  f.crate.getAssetWorkspace = async () => { requests++; return f.workspace; };
+  f.renderer.foreignProject = { ...f.project, id: 'foreign-project' };
+  vm.runInContext('state.projects.push(foreignProject)', f.renderer);
+  f.renderer.renderProjectRows();
+  assert.match(f.elements['project-rows'].children[0].innerHTML, /1 included file/);
+  assert.doesNotMatch(f.elements['project-rows'].children[1].innerHTML, /included file/);
+  assert.equal(requests, 0);
+});
+
+for (const outcome of ['failure', 'close']) test(`pending continuation keeps keyboard focus before disabling choice: ${outcome}`, async () => {
+  const f = setup(); const gate = deferred(); let refreshed = 0;
+  f.crate.resolveWorkingSourceContinuation = () => gate.promise;
+  const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
+  const button = buttonFor(f.elements['source-continuation-choices'], 'Replace');
+  const originalQuery = f.document.querySelectorAll.bind(f.document);
+  f.document.querySelectorAll = selector => selector === '.continuation-choice' ? [button] : originalQuery(selector);
+  let disabled = button.disabled;
+  Object.defineProperty(button, 'disabled', { get: () => disabled, set: value => {
+    if (value && f.document.activeElement === button) f.document.activeElement = f.document.body;
+    disabled = value;
+  } });
+  button.focus(); f.renderer.showPackageModal = async () => { refreshed++; };
+  const pending = f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer));
+  assert.equal(button.disabled, true);
+  assert.equal(f.document.activeElement, f.elements['btn-back-package']);
+  assert.equal(f.document.activeElement.disabled, false);
+  if (outcome === 'close') {
+    let prevented = false;
+    f.renderer.handlePackageReviewKeydown({ key: 'Escape', preventDefault: () => { prevented = true; } });
+    assert.equal(prevented, true); assert.equal(f.elements['modal-package'].classList.contains('hidden'), true);
+  }
+  gate.resolve({ success: false, error: 'continuation_stale' }); await pending;
+  assert.equal(refreshed, outcome === 'close' ? 0 : 1);
+  if (outcome === 'failure') assert.equal(f.document.activeElement, f.elements['btn-back-package']);
+});
+
 for (const state of ['selected', 'excluded']) test(`working-source ${state} uses an explicit reversible action`, () => {
   const f = setup({ sourceSelection: state, included: state === 'selected' });
   const row = f.renderer.createAssetFileRow(f.project, f.row, { protectedSource: true });

@@ -389,6 +389,7 @@ function getRendererItemSignature(item) {
       packagedAt: item.packagedAt || null,
       fileCount: Array.isArray(item.files) ? item.files.length : 0,
       excludedCount: Array.isArray(item.excludedAssetKeys) ? item.excludedAssetKeys.length : 0,
+      statusLabel: getStatusLabel(item),
     });
   }
   return JSON.stringify({
@@ -886,21 +887,32 @@ function renderProjectRows() {
   }, project => `project:${project.id}`);
 }
 
+function getProjectIncludedFileCount(project) {
+  const workspace = state.assetWorkspace;
+  // Only the current backend projection knows selection and required-asset
+  // overrides. Omit counts for other projects or while a refresh is pending;
+  // project cards must not trigger their own per-project scans.
+  if (!accountStatus.canUseWorkspace || state.selectedProjectId !== project.id ||
+      workspace?.projectId !== project.id || assetWorkspaceLoadedRequestId !== assetWorkspaceRequestId ||
+      !workspace.semanticCounts || !Array.isArray(workspace.files) ||
+      !workspace.files.every(file => typeof file?.included === 'boolean')) return null;
+  return workspace.files.filter(file => file.included).length;
+}
+
 function getStatusLabel(project) {
-  const excluded = new Set(project.excludedAssetKeys || []);
-  const fileCount = (project.files || []).filter(file => !excluded.has(getAssetReviewExclusionKey(file))).length;
-  const filesText = `${fileCount} file${fileCount !== 1 ? 's' : ''}`;
+  const fileCount = getProjectIncludedFileCount(project);
+  const filesText = fileCount === null ? '' : ` \u00B7 ${fileCount} included file${fileCount !== 1 ? 's' : ''}`;
 
   if (project.status === 'watching') {
     // v2.5.0: Remove mid-session file counter — only show count after packaging
     return `Watching`;
   } else if (project.status === 'paused') {
-    return `Paused \u00B7 ${filesText} so far`;
+    return `Paused${filesText}`;
   } else {
     const date = project.packagedAt
       ? new Date(project.packagedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
       : '';
-    return `Packaged${date ? ' \u00B7 ' + date : ''} \u00B7 ${filesText}`;
+    return `Packaged${date ? ' \u00B7 ' + date : ''}${filesText}`;
   }
 }
 
@@ -1641,22 +1653,11 @@ async function renderFiles(renderOptions = {}) {
   const statusText = $('#files-status-text');
   const figmaScopeText = $('#files-figma-scope');
   const figmaWarningText = $('#files-figma-warning');
-  const fileCountExcludedKeys = new Set(project.excludedAssetKeys || []);
-  const fileCount = (project.files || []).filter(file => (
-    !fileCountExcludedKeys.has(getAssetReviewExclusionKey(file))
-  )).length;
 
   statusBar.className = `app-status ${project.status !== 'watching' ? project.status : ''}`;
   statusDot.className = `app-dot ${project.status !== 'watching' ? project.status : ''}`;
 
-  if (project.status === 'watching') {
-    // v2.5.0: No mid-session counter — count shown only after packaging
-    statusText.textContent = `Watching`;
-  } else if (project.status === 'paused') {
-    statusText.textContent = `Paused \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
-  } else {
-    statusText.textContent = `Packaged \u2713 \u00B7 ${fileCount} file${fileCount !== 1 ? 's' : ''}`;
-  }
+  statusText.textContent = getStatusLabel(project);
 
   if (figmaScopeText) {
     const trackedFiles = (project.figmaTrackedFiles || []);
@@ -1731,6 +1732,8 @@ async function renderFiles(renderOptions = {}) {
   }
   state.assetWorkspace = assetWorkspace;
   assetWorkspaceLoadedRequestId = workspaceRequestId;
+  statusText.textContent = getStatusLabel(project);
+  if (isTabActive('projects')) renderProjectRows();
 
   // Pending files (Tier 2)
   renderPendingFiles(project, assetWorkspace.pendingFiles);
@@ -4153,8 +4156,13 @@ async function chooseSourceContinuation(project, pair, choice, lease) {
     isCurrentModalLease('modal-package', owner.lease) && !$('#modal-package')?.classList.contains('hidden');
   continuationChoiceOwner = owner;
   state.packageReviewToken = null;
+  const choiceButtons = Array.from(document.querySelectorAll('.continuation-choice'));
+  if (choiceButtons.includes(document.activeElement)) {
+    const backButton = $('#btn-back-package');
+    if (backButton && !backButton.disabled) backButton.focus({ preventScroll: true });
+  }
   $('#btn-confirm-package').disabled = true;
-  for (const button of document.querySelectorAll('.continuation-choice')) button.disabled = true;
+  for (const button of choiceButtons) button.disabled = true;
   const status = $('#source-continuation-status');
   if (status) status.textContent = 'Applying your choice…';
   try {

@@ -4608,7 +4608,7 @@ test('Package Review binds duplicate display names to distinct authoritative vis
   assert.equal(getElementTreeText(elements['modal-file-list']).includes('/synthetic/'), false);
 });
 
-test('renderer project counts exclude assets skipped by the Existing Assets decision', () => {
+test('renderer project counts need authoritative membership even with an Existing Assets decision', () => {
   const renderer = loadRendererHelpers(createDocumentStub({}));
   const project = {
     status: 'paused',
@@ -4619,10 +4619,10 @@ test('renderer project counts exclude assets skipped by the Existing Assets deci
     excludedAssetKeys: ['/synthetic/Existing.png'],
   };
 
-  assert.equal(renderer.getStatusLabel(project), 'Paused · 1 file so far');
+  assert.equal(renderer.getStatusLabel(project), 'Paused');
 });
 
-test('renderer counts regenerated embedded PSD exclusions by their stable identity', () => {
+test('renderer does not infer membership counts from regenerated embedded PSD exclusion keys', () => {
   const renderer = loadRendererHelpers(createDocumentStub({}));
   const parentPsd = '/Synthetic/Project.psd';
   const project = {
@@ -4638,7 +4638,7 @@ test('renderer counts regenerated embedded PSD exclusions by their stable identi
     excludedAssetKeys: ['embedded-psd:/synthetic/project.psd:0:Embedded.png'],
   };
 
-  assert.equal(renderer.getStatusLabel(project), 'Paused · 1 file so far');
+  assert.equal(renderer.getStatusLabel(project), 'Paused');
 });
 
 test('Current Project raw fallback omits private source metadata when the asset workspace fails', async () => {
@@ -4682,8 +4682,8 @@ test('Current Project raw fallback omits private source metadata when the asset 
 
   await renderer.renderFiles();
 
-  assert.equal(elements['files-status-text'].textContent, 'Paused · 1 file');
-  assert.equal(renderer.getStatusLabel(project), 'Paused · 1 file so far');
+  assert.equal(elements['files-status-text'].textContent, 'Paused');
+  assert.equal(renderer.getStatusLabel(project), 'Paused');
   assert.equal(elements['added-assets-list'].children.length, 1);
   assert.equal(elements['pending-file-list'].children.length, 1);
   const renderedText = [
