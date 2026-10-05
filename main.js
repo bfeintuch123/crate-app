@@ -3612,6 +3612,15 @@ function getWorkingSourceVerification(project, file) {
           /^[a-f0-9]{64}$/.test(output.sourceDigest || '') && output.sourceDigest === record.sourceFingerprint &&
           /^[a-f0-9]{64}$/.test(output.outputDigest || '')) ||
         record.requiredEmbeddedOutputs.reduce((units, output) => units + output.path.length, 0) > 4 * 1024 * 1024)) return null;
+  // A concrete legacy PSD scan proves capture on these bytes, but its ordinary
+  // extractor does not publish the PSD's declared dependency inventory. Once
+  // selection is engaged, retain that receipt and its known obligations while
+  // requiring the existing Restore worker route for declaration proof. Roots
+  // with no receipt keep their untouched legacy readiness.
+  if (hasWorkingSourceSelectionState(project) && record.status === 'scanned' &&
+      record.provider === 'psd-ordinary' && path.extname(file.path || '').toLowerCase() === '.psd') {
+    return { ...record, status: 'incomplete', reason: 'psd-declaration-proof-required' };
+  }
   return record;
 }
 
@@ -5467,6 +5476,10 @@ function establishProjectAssetBaseline(
     if (activationToken !== null && !isActiveWatchingProject(projectId, activationToken)) return null;
     if (!project.assetBaseline || project.assetBaseline.status !== 'awaiting-first-scan') return null;
     if (sourcePath && !isAcceptedProjectFilePath(project, sourcePath)) return null;
+    // All establishment callers share this guard, including empty Add Files
+    // queues and completed cloud snapshots after local scan state is gone.
+    if (hasWorkingSourceSelectionState(project) && (project.files || []).some(isProjectAssetBaselineSource) &&
+        getProjectAssetBaselineSourcePaths(project).length === 0) return null;
     // A partial first cloud snapshot cannot become a completed mixed-source
     // decision merely because the local parser finished first.
     if (!hasEstablishedFigmaAssetBaseline(project) &&

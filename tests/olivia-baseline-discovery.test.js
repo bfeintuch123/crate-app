@@ -3088,4 +3088,136 @@ function baselineCases() {
     });
   }
 
+  for (const route of ['add-files', 'accept-pending', 'figma-complete']) {
+    baselineTest(`Morning bounded correction: last-root exclusion preserves awaiting baseline through ${route}`, async () => {
+      const f = await correctionProject('.ai', '%PDF-1.7\nmissing EOF');
+      try {
+        f.current().assetBaseline = { schemaVersion: 1, status: 'awaiting-first-scan', decision: null, establishedAt: null };
+        const kept = path.join(TEST_HOME, 'Desktop', 'Kept.png'); fs.writeFileSync(kept, 'kept synthetic asset');
+        f.current().files.push({ path: kept, name: 'Kept.png', ext: '.png', source: 'user-added',
+          acceptedPending: true, projectRole: 'asset', assetOrigin: 'existing' });
+        if (route !== 'figma-complete') {
+          assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath)).success, false);
+        }
+        const identity = metadataTestHooks.createProjectFileVisualIdentity(f.project.id, f.current().files.find(x => x.path === f.filePath));
+        assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, identity,
+          { action: 'exclude', expectedRevision: 0 })).success, true);
+        assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan');
+        if (route === 'add-files') {
+          const added = path.join(TEST_HOME, 'Desktop', 'Added.png'); fs.writeFileSync(added, 'added synthetic asset');
+          manualDialogFor([added]); await callIpcRaw('projects:add-files', f.project.id);
+          assert.ok(f.current().files.some(x => x.path === added), 'ordinary asset admission must continue');
+        } else if (route === 'accept-pending') {
+          const root = f.current().files.find(x => x.path === f.filePath);
+          f.current().files = f.current().files.filter(x => x.path !== f.filePath);
+          f.current().pendingFiles.push({ ...root, acceptedPending: false, fileId: 'morning-reaccepted-root' });
+          assert.ok(await callIpcRaw('projects:accept-pending', f.project.id, f.filePath));
+          assert.ok(f.current().files.some(x => x.path === f.filePath));
+        } else {
+          const fileKey = 'morning-complete-file';
+          f.current().figmaTrackedFiles = [{ key: fileKey, requestedPageId: '1:1', requestedNodeId: null }];
+          f.current().figmaScopeMode = 'current-page'; f.current().figmaSession = null;
+          roundTripFakeStore(); metadataTestHooks.clearAssetBaselineScans();
+          const asset = makeSyntheticFigmaAsset(fileKey, 'morning-complete');
+          await withSyntheticFigmaScans([makeSyntheticFigmaScan(fileKey, [asset])],
+            async () => syntheticFigmaAssetResponse(true), async () => {
+              await metadataTestHooks.runFigmaPoll(f.project.id, metadataTestHooks.getActiveWatchingActivationToken(f.project.id));
+            });
+          assert.ok(Number.isSafeInteger(f.current().figmaAssetBaselineEstablishedAt), 'complete cloud snapshot should retain its own receipt');
+        }
+        assert.equal(f.current().assetBaseline.status, 'awaiting-first-scan', 'no excluded local root can establish the local baseline');
+        assert.equal(f.current().assetBaseline.establishedAt, null);
+        const assetOnly = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(assetOnly.materializable, true, 'remaining assets keep the existing packaging policy');
+        assert.equal(assetOnly.semanticCounts.selectedWorkingSources, 0);
+        fs.writeFileSync(f.filePath, '%PDF-1.7\n%%EOF\n');
+        const currentRoot = f.current().files.find(x => x.path === f.filePath);
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, currentRoot), { action: 'restore', expectedRevision: 1 });
+        assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+        assert.equal(f.current().assetBaseline.status, 'decision-required', 'Restore must still establish the deferred first baseline');
+        assert.ok(Number.isFinite(f.current().assetBaseline.establishedAt));
+      } finally { clearTrackedTimers(); }
+    });
+  }
+
+  for (const mode of ['missing', 'audio', 'zero']) {
+    baselineTest(`Morning bounded correction: ordinary pre-engagement PSD ${mode} receipt needs declaration proof`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd');
+      const target = path.join(TEST_HOME, 'Desktop', 'Missing.png');
+      const zero = { numerator: 0, denominator: 1 }, second = { numerator: 1, denominator: 1 };
+      const linkedFiles = mode === 'missing' ? [{ id: '11111111-1111-4111-8111-111111111111', name: 'Missing.png',
+        childDocumentID: '', linkedFile: { fileSize: 10, name: 'Missing.png', fullPath: target, originalPath: target, relativePath: '../Missing.png' } }] : [];
+      const imageResources = mode === 'audio' ? { timelineInformation: { enabled: true, frameStep: second, frameRate: 24,
+        time: zero, duration: second, workInTime: zero, workOutTime: second, repeats: 0, hasMotion: true, globalTracks: [],
+        audioClipGroups: [{ id: 'group', muted: false, audioClips: [{ id: 'clip', start: zero, duration: second,
+          inTime: zero, outTime: second, muted: false, audioLevel: 0, frameReader: { type: 1, mediaDescriptor: '',
+            link: { name: 'Audio.wav', fullPath: path.join(TEST_HOME, 'Desktop', 'Audio.wav'), relativePath: '../Audio.wav' } } }] }],
+      } } : {};
+      const bytes = actual.writePsdBuffer({ width: 1, height: 1, linkedFiles, imageResources });
+      fs.writeFileSync(f.filePath, bytes);
+      // The legacy parser stub receives the actual parsed source; the later
+      // worker uses the actual buffer and framing through the existing harness.
+      currentPsdFixture = actual.readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+      try {
+        const sibling = path.join(TEST_HOME, 'Desktop', 'Other.ai'); fs.writeFileSync(sibling, '%PDF-1.7\n%%EOF\n');
+        f.current().files.push({ path: sibling, name: 'Other.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+        metadataTestHooks.clearPsdParseDebounce(f.filePath);
+        const scan = await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null, { allowPausedBaseline: true });
+        assert.equal(scan.success, true, 'legacy capture stays admitted before engagement');
+        const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), f.current().files[0]);
+        const saved = JSON.parse(JSON.stringify(f.current().workingSourceVerification[key]));
+        assert.equal(saved.provider, 'psd-ordinary'); assert.equal(saved.status, 'scanned');
+        const legacyReview = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(legacyReview.materializable, true);
+        const before = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const other = before.files.find(x => x.name === 'Other.ai'), source = before.files.find(x => x.name === 'Correction.psd');
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        roundTripFakeStore(); metadataTestHooks.clearAssetBaselineScans();
+        assert.deepEqual(f.current().workingSourceVerification[key], saved, 'engagement does not rewrite or invent a worker receipt');
+        assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, legacyReview.token)).error, 'package_review_stale');
+        const blocked = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.equal(blocked.materializable, false); assert.equal(blocked.token, undefined);
+        assert.ok(blocked.semanticCounts.unresolvedVerification > 0);
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(ws.files.find(x => x.name === 'Correction.psd').verificationStatus, 'incomplete');
+        assert.deepEqual(ws.semanticCounts, blocked.semanticCounts);
+        currentPsdFixture = 'actual-source-buffer';
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+        await callIpcRaw('projects:set-working-source-selection', f.project.id, source.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        const proof = f.current().workingSourceVerification[key]; assert.equal(proof.provider, 'psd-agpsd-worker');
+        assert.equal(proof.sourceFingerprint, crypto.createHash('sha256').update(bytes).digest('hex'));
+        const verified = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        if (mode === 'zero') {
+          assert.equal(verified.materializable, true); assert.equal(verified.semanticCounts.unresolvedVerification, 0);
+          assert.equal(typeof verified.token, 'string');
+        } else {
+          assert.equal(verified.materializable, false); assert.equal(verified.token, undefined);
+          if (mode === 'missing') assert.ok(proof.requiredReferences.some(x => x.path === target));
+          else assert.ok(proof.unresolved.some(x => x.reason === 'unverified-timeline-frame-reader-type'));
+        }
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
+  baselineTest('Morning bounded correction: untouched revision-zero PSD without receipt keeps legacy readiness', async () => {
+    const f = await correctionProject('.psd');
+    try {
+      const sibling = path.join(TEST_HOME, 'Desktop', 'Other.ai'); fs.writeFileSync(sibling, '%PDF-1.7\n%%EOF\n');
+      f.current().files.push({ path: sibling, name: 'Other.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const other = workspace.files.find(x => x.name === 'Other.ai');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, other.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const source = f.current().files.find(x => x.path === f.filePath);
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), source);
+      assert.equal(f.current().workingSourceVerification[key], undefined);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.equal(review.semanticCounts.unresolvedVerification, 0);
+      const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(ws.files.find(x => x.name === 'Correction.psd').selectionRevision, 0);
+      assert.deepEqual(ws.semanticCounts, review.semanticCounts);
+    } finally { clearTrackedTimers(); }
+  });
+
 }
