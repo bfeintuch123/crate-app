@@ -40,6 +40,78 @@ function setup(overrides = {}) {
 function descendants(node) { return [node, ...(node.children || []).flatMap(descendants)]; }
 function buttonFor(node, text) { return descendants(node).find(child => child.tagName === 'BUTTON' && child.textContent === text); }
 
+for (const failure of ['rejection', 'error-response-refresh-failure', 'error-response-same-snapshot']) {
+  for (const recovery of ['still-unavailable', 'fresh-membership', 'legacy-backend']) {
+    test(`cached display fallback cannot supply Package Review: ${failure}, ${recovery}`, async () => {
+      const f = setup({ sourceSelection: 'excluded', included: false, excluded: false });
+      const required = { name: 'Required.png', ext: '.png', path: '/synthetic/Required.png',
+        projectRole: 'asset', effectiveRole: 'asset', assetOrigin: 'existing',
+        excluded: true, included: true, includedAsDependency: true };
+      f.project.files.push(required); f.workspace.files.push(required);
+      f.project.excludedAssetKeys = [required.path];
+      let workspaceReads = 0;
+      f.crate.getAssetWorkspace = async () => { workspaceReads++; throw new Error('synthetic workspace failure'); };
+      await f.renderer.renderFiles();
+      const displayFallback = vm.runInContext('state.assetWorkspace', f.renderer);
+      assert.deepEqual(Array.from(displayFallback.files, file => file.name), ['Original.ai', 'Required.png']);
+      assert.ok(displayFallback.files.every(file => file.selectionUnavailable && !file.visualIdentity));
+      assert.match(getElementTreeText(f.elements['working-assets-list']), /Original.ai/);
+      assert.equal(await f.renderer.ensureProjectAssetWorkspace(f.project), displayFallback,
+        'the existing display consumer may still reuse its harmless fallback');
+      assert.equal(workspaceReads, 1);
+
+      f.crate.getAssetWorkspace = async () => {
+        workspaceReads++;
+        if (recovery === 'still-unavailable') throw new Error('synthetic workspace still unavailable');
+        if (recovery === 'legacy-backend') return { projectId: f.project.id,
+          files: [{ name: 'Legacy.png', ext: '.png', projectRole: 'asset', assetOrigin: 'existing' }], pendingFiles: [] };
+        return clone(f.workspace);
+      };
+      f.crate.getProjects = async () => {
+        if (failure === 'error-response-refresh-failure') throw new Error('synthetic project refresh failure');
+        return [f.project];
+      };
+      f.crate.preparePackageReview = async () => {
+        if (failure === 'rejection') throw new Error('synthetic preparation rejection');
+        return { projectId: f.project.id, error: 'package_review_unavailable' };
+      };
+      let renderedReview;
+      const render = f.renderer.renderPackageReview;
+      f.renderer.renderPackageReview = (...args) => { renderedReview = args[1]; return render(...args); };
+      vm.runInContext("state.packageReviewToken = 'obsolete-token'", f.renderer);
+      assert.equal(await f.renderer.showPackageModal({ runPreScan: false }), false);
+      const names = recovery === 'still-unavailable' ? [] : [recovery === 'legacy-backend' ? 'Legacy.png' : 'Required.png'];
+      assert.ok(renderedReview);
+      assert.deepEqual(Array.from(renderedReview.files, file => file.name), names);
+      assert.equal(workspaceReads, 2, 'recovery must seek backend authority instead of accepting a local display cache');
+      assert.equal(renderedReview.totalFiles, names.length);
+      assert.equal(f.elements['modal-file-list'].children.length, names.length);
+      const contents = getElementTreeText(f.elements['modal-file-list']);
+      assert.ok(!contents.includes('Original.ai'));
+      for (const name of names) assert.ok(contents.includes(name));
+      assert.equal(f.elements['package-review-total'].textContent, `${names.length} visual asset${names.length === 1 ? '' : 's'}`);
+      const summary = getElementTreeText(f.elements['package-review-summary-list']);
+      for (const label of ['Working files 0', `Existing assets ${names.length}`, 'Added while working 0', `Needs Review ${names.length}`]) {
+        assert.ok(summary.includes(label), summary);
+      }
+      assert.equal(renderedReview.materializable, false);
+      assert.equal(renderedReview.token, undefined);
+      assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
+      assert.equal(f.elements['btn-confirm-package'].disabled, true);
+      for (const file of renderedReview.files) {
+        assert.equal(file.selectionUnavailable, true);
+        assert.equal(file.visualIdentity, null);
+        assert.equal(file.visualRevision, null);
+        assert.equal(file.path, undefined);
+      }
+      if (recovery === 'still-unavailable') {
+        assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), displayFallback,
+          'seeking recovery authority must not remove the existing display fallback');
+      }
+    });
+  }
+}
+
 for (const failure of ['error-response', 'rejection']) {
   const cases = [
     { label: 'excluded working root', row: { sourceSelection: 'excluded', included: false, excluded: false },

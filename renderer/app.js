@@ -70,6 +70,7 @@ let assetWorkspaceRequestGeneration = 0;
 let assetWorkspaceRequestId = 0;
 let assetWorkspaceLoadedRequestId = 0;
 let assetWorkspaceProjectSnapshot = null;
+const displayOnlyAssetWorkspaces = new WeakSet();
 let packageReviewRequestId = 0;
 let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
@@ -1731,6 +1732,7 @@ async function renderFiles(renderOptions = {}) {
         selectionUnavailable: true,
       })),
     };
+    displayOnlyAssetWorkspaces.add(assetWorkspace);
   }
   state.assetWorkspace = assetWorkspace;
   assetWorkspaceLoadedRequestId = workspaceRequestId;
@@ -1936,14 +1938,15 @@ function hideExistingAssetsDecisionModal({ restoreFocus = true } = {}) {
   existingAssetsDecisionOpener = null;
 }
 
-async function ensureProjectAssetWorkspace(project) {
+async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = true } = {}) {
   if (!project || !project.id) return null;
   if (state.selectedProjectId !== project.id) return null;
   const requestGeneration = assetWorkspaceRequestGeneration;
   if (
     state.assetWorkspace?.projectId === project.id &&
     assetWorkspaceProjectSnapshot === project &&
-    assetWorkspaceLoadedRequestId === assetWorkspaceRequestId
+    assetWorkspaceLoadedRequestId === assetWorkspaceRequestId &&
+    (allowDisplayFallback || !displayOnlyAssetWorkspaces.has(state.assetWorkspace))
   ) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
   const requestId = ++assetWorkspaceRequestId;
@@ -4397,7 +4400,7 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
 }
 
 async function getUnavailableRendererReviewFiles(project) {
-  const workspace = await ensureProjectAssetWorkspace(project);
+  const workspace = await ensureProjectAssetWorkspace(project, { allowDisplayFallback: false });
   if (Array.isArray(workspace?.files)) return workspace.files;
   // A raw project record cannot reliably reproduce stable exclusion identities.
   // Show no guessed inventory when the authoritative workspace is unavailable.
