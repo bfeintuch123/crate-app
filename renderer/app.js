@@ -4408,6 +4408,7 @@ async function createUnavailableRendererReview(project, message) {
   const excludedKeys = new Set(project?.excludedAssetKeys || []);
   const reviewFiles = await getUnavailableRendererReviewFiles(project);
   const includedFiles = reviewFiles.filter(file => {
+    if (typeof file?.included === 'boolean') return file.included;
     if (file?.excluded === true) return false;
     const exclusionKey = getAssetReviewExclusionKey(file);
     return !(exclusionKey && excludedKeys.has(exclusionKey));
@@ -4420,9 +4421,11 @@ async function createUnavailableRendererReview(project, message) {
         : {};
       const dependency = typeof evidence.relationshipSourcePath === 'string' ||
         typeof evidence.sourceDocumentPath === 'string';
-      const projectRole = ['source', 'asset'].includes(file?.projectRole)
-        ? file.projectRole
-        : (dependency || !PRIMARY_WORKING_FILE_EXTS.has(getFileExtension(file)) ? 'asset' : 'source');
+      const projectRole = ['source', 'asset'].includes(file?.effectiveRole)
+        ? file.effectiveRole
+        : ['source', 'asset'].includes(file?.projectRole)
+          ? file.projectRole
+          : (dependency || !PRIMARY_WORKING_FILE_EXTS.has(getFileExtension(file)) ? 'asset' : 'source');
       const sourceName = [file?.sourceName, evidence.sourceName, projectRole === 'source' ? file?.name : null]
         .map(sanitizeRendererSourceName)
         .find(Boolean) || null;

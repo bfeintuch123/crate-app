@@ -40,6 +40,75 @@ function setup(overrides = {}) {
 function descendants(node) { return [node, ...(node.children || []).flatMap(descendants)]; }
 function buttonFor(node, text) { return descendants(node).find(child => child.tagName === 'BUTTON' && child.textContent === text); }
 
+for (const failure of ['error-response', 'rejection']) {
+  const cases = [
+    { label: 'excluded working root', row: { sourceSelection: 'excluded', included: false, excluded: false },
+      names: [], working: 0, existing: 0, added: 0 },
+    { label: 'excluded required dependency', row: { name: 'Required.png', ext: '.png', projectRole: 'asset',
+      effectiveRole: 'asset', excluded: true, included: true, includedAsDependency: true, assetOrigin: 'existing',
+      path: '/synthetic/Required.png' }, names: ['Required.png'], working: 0, existing: 1, added: 0 },
+    { label: 'working root retained as asset', row: { sourceSelection: 'excluded', included: true,
+      includedAsDependency: true, effectiveRole: 'asset', projectRole: 'source', assetOrigin: 'added' },
+      names: ['Original.ai'], working: 0, existing: 0, added: 1 },
+    { label: 'legacy membership and role', row: { included: undefined, effectiveRole: 'invalid',
+      projectRole: 'source' }, names: ['Original.ai'], working: 1, existing: 0, added: 0 },
+    { label: 'unavailable workspace', row: {}, unavailable: true, names: [], working: 0, existing: 0, added: 0 },
+  ];
+  for (const scenario of cases) test(`unavailable Package Review ${failure}: ${scenario.label}`, async () => {
+    const f = setup(scenario.row);
+    // A raw project inventory must not stand in for unavailable workspace data.
+    f.project.files.push({ name: 'Raw-only.ai', projectRole: 'source' });
+    f.project.excludedAssetKeys = ['/synthetic/Required.png', '/synthetic/Legacy-key.png'];
+    if (scenario.label === 'legacy membership and role') {
+      f.workspace.files.push(
+        { name: 'Legacy-direct.png', excluded: true },
+        { name: 'Legacy-key.png', path: '/synthetic/Legacy-key.png' }
+      );
+    }
+    if (scenario.unavailable) {
+      vm.runInContext('state.assetWorkspace = null', f.renderer);
+      f.crate.getAssetWorkspace = async () => null;
+    }
+    f.crate.preparePackageReview = async () => {
+      if (failure === 'rejection') throw new Error('synthetic preparation failure');
+      return { projectId: f.project.id, error: 'package_review_unavailable' };
+    };
+    let renderedReview;
+    const render = f.renderer.renderPackageReview;
+    f.renderer.renderPackageReview = (...args) => { renderedReview = args[1]; return render(...args); };
+    vm.runInContext("state.packageReviewToken = 'obsolete-token'", f.renderer);
+    assert.equal(await f.renderer.showPackageModal({ runPreScan: false }), false);
+    assert.ok(renderedReview, 'the real preparation recovery route must render its fallback');
+    assert.deepEqual(Array.from(renderedReview.files, file => file.name), scenario.names);
+    assert.equal(renderedReview.totalFiles, scenario.names.length);
+    assert.equal(f.elements['package-review-total'].textContent,
+      `${scenario.names.length} visual asset${scenario.names.length === 1 ? '' : 's'}`);
+    const summary = getElementTreeText(f.elements['package-review-summary-list']);
+    for (const [label, count] of [['Working files', scenario.working], ['Existing assets', scenario.existing],
+      ['Added while working', scenario.added], ['Needs Review', scenario.names.length]]) {
+      assert.ok(summary.includes(`${label} ${count}`), `${label} agrees with effective fallback contents: ${summary}`);
+    }
+    const contents = getElementTreeText(f.elements['modal-file-list']);
+    assert.equal(f.elements['modal-file-list'].children.length, scenario.names.length);
+    for (const name of scenario.names) assert.ok(contents.includes(name));
+    for (const name of ['Raw-only.ai', 'Legacy-direct.png', 'Legacy-key.png',
+      ...(scenario.names.includes('Original.ai') ? [] : ['Original.ai'])]) assert.ok(!contents.includes(name));
+    assert.equal(renderedReview.materializable, false);
+    assert.equal(renderedReview.token, undefined);
+    assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
+    assert.equal(f.elements['btn-confirm-package'].disabled, true);
+    assert.equal(f.elements['package-review-ready'].textContent, 'Review required');
+    for (const file of renderedReview.files) {
+      assert.equal(file.status, 'unavailable');
+      assert.equal(file.selectionUnavailable, true);
+      assert.equal(file.visualIdentity, null);
+      assert.equal(file.visualRevision, null);
+      assert.equal(file.path, undefined);
+      assert.equal(file.captureEvidence, undefined);
+    }
+  });
+}
+
 for (const projectStatus of ['paused', 'packaged']) test(`${projectStatus} status uses current inclusion through Exclude and Restore`, async () => {
   const f = setup(); f.project.status = projectStatus;
   // Keep the raw inventory unchanged throughout, including an old exclusion
