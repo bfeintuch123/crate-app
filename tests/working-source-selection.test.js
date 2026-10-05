@@ -24,15 +24,23 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   let api;
   let projects = [];
   const disk = new Map();
+  const physical = new Map();
+  let nextInode = 1n;
   const events = [];
   const invalidated = [];
   let digestGate = null;
+  let afterScan = null;
+  let documentIdentityReader = () => null;
   let authorized = true;
   let epoch = 0;
   const context = vm.createContext({
     path, crypto,
     runBoundedAddFilesScan, ADD_FILES_SCAN_TIMEOUT_MS: 1000,
-    fs: { existsSync: filePath => disk.has(filePath), statSync: filePath => {
+    fs: { existsSync: filePath => disk.has(filePath), lstatSync: filePath => {
+      if (!disk.has(filePath)) throw new Error('missing');
+      const stat = physical.get(filePath);
+      return { ...stat, isFile: () => true, isSymbolicLink: () => stat?.symlink === true };
+    }, statSync: filePath => {
       if (!disk.has(filePath)) throw new Error('missing');
       return { dev: 1, ino: 1, size: disk.get(filePath).length, mtimeMs: 0, ctimeMs: 0, isFile: () => true };
     } },
@@ -46,6 +54,13 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     isScanOnSaveEmbeddedPsdFile: file => !!(file?.embedded && file.source === 'scan-on-save-embedded'),
     isAssetReviewFileExcluded: (project, file) => (project.excludedAssetKeys || []).includes(file.path),
     sanitizeRendererSourceName: name => String(name).replace(/[\r\n]/g, '').slice(0, 256),
+    getPackageSelectionInputSignature: project => crypto.createHash('sha256').update(JSON.stringify(project)).digest('hex'),
+    getIllustratorSnapshotFailureReason: query => query?.failed ? 'partial' : null,
+    getFreshActiveWatchingProject: id => projects.find(project => project.id === id),
+    getIllustratorActivationScope: () => null,
+    runOsascriptInPrivateTemp: async build => ({ stdout: JSON.stringify(documentIdentityReader(Object.values(build({}))[0])) }),
+    getAssetBaselineSourcePhysicalIdentityHash: (project, stat) => stat && crypto.createHash('sha256')
+      .update(JSON.stringify([project.id, String(stat.dev), String(stat.ino), String(stat.birthtimeNs)])).digest('hex'),
     captureProjectOperation: id => {
       const capturedEpoch = epoch;
       let open = true;
@@ -71,10 +86,12 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     REGEX_SOURCE_EXTENSIONS: new Set(['.ai', '.pdf', '.xd', '.ppt', '.fig']),
     extractLinkedAssetsRegex: async filePath => extractLinkedAssetsFromBuffer(disk.get(filePath), filePath, path.extname(filePath)),
     SCAN_ON_OPEN_EXTENSIONS: new Set(['.ai', '.pdf', '.xd', '.ppt', '.fig', '.psd']),
+    runScanOnOpen: async (id, filePath, token, operation, options) =>
+      (await context.runBoundedScanOnOpenQueue(id, [filePath], token, operation, options)).outcomes[0],
     runBoundedScanOnOpenQueue: async (id, paths, token, operation, options) => {
       const outcomes = [];
       for (const filePath of paths) {
-        const scan = api.beginWorkingSourceScan(id, filePath, operation.current, options.workingSourceAttempt);
+        const scan = api.beginWorkingSourceScan(id, filePath, operation.current, options.workingSourceAttempt, options.excludedWorkingSourcePreparation);
         try {
           const digest = await context.getAddFilesCurrentSourceDigest(filePath, operation);
           const evidence = api.collectWorkingSourceScanEvidence(await context.extractLinkedAssetsRegex(filePath));
@@ -84,6 +101,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
           outcomes.push({ success: true });
         } catch (_) { outcomes.push({ success: false, error: 'scan_on_open_failed' }); }
       }
+      if (afterScan) await afterScan();
       return { cancelled: !operation.current(), outcomes };
     },
     isBroadObserverOnlyAcceptedFile: () => false,
@@ -101,10 +119,11 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, getWorkingSourceDiskIdentity})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
+    physical.set(file.path, { dev: 1n, ino: nextInode++, birthtimeNs: 100n, nlink: 1n });
     return file;
   };
   const asset = name => {
@@ -116,12 +135,14 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   projects.push(project);
   const command = (file, action, expectedRevision = api.getWorkingSourceSelection(projects[0], file).revision) =>
     api.setWorkingSourceSelection(project.id, `${project.id}:${file.fileId}`, { action, expectedRevision });
-  return { api, project, source, asset, disk, command, events, invalidated,
+  return { api, project, source, asset, disk, physical, command, events, invalidated,
     reload() { projects = JSON.parse(JSON.stringify(projects)); return projects[0]; },
     replace(project) { projects = [project]; },
     revoke() { authorized = false; },
     changeGeneration() { epoch++; },
-    setDigestGate(callback) { digestGate = callback; } };
+    setDigestGate(callback) { digestGate = callback; },
+    setAfterScan(callback) { afterScan = callback; },
+    setDocumentIdentityReader(callback) { documentIdentityReader = callback; } };
 }
 
 function deferred() {
@@ -456,4 +477,327 @@ test('known ordinary-scan media obligations block when selection engages; absent
   const membership = f.api.getWorkingSourceMembership(f.project);
   assert.equal(membership.blocked, true); assert.equal(membership.counts.unresolvedVerification, 1);
   assert.equal(membership.facts.get(a.path.toLowerCase()).selectionRevision, 0);
+});
+
+function continuationRequest(f, choice = 'replace') {
+  const candidate = f.api.getWorkingSourceContinuationPresentation(f.project).candidates[0];
+  assert.ok(candidate, 'expected a specific current pair');
+  return { pairIdentity: candidate.pairIdentity, evidenceIdentity: candidate.evidenceIdentity,
+    expectedRevision: candidate.revision, predecessorSelectionRevision: candidate.predecessor.selectionRevision,
+    successorSelectionRevision: candidate.successor.selectionRevision, choice };
+}
+
+function continuationFixture() {
+  const f = fixture(), a = f.source('Original.ai'), b = f.source('Successor.ai'), other = f.source('Unrelated.ai');
+  f.project.files.push(a, b, other);
+  assert.ok(f.api.recordWorkingSourceContinuationCandidate(f.project.id, a.path, b.path));
+  return { ...f, a, b, other };
+}
+
+test('a continuation candidate never changes selection, bytes, or generic PSD holds', async () => {
+  const f = continuationFixture();
+  f.project.workingSourceRelationshipHolds = [{ domain: 'psd-embedded', reason: 'unresolved' }];
+  const before = plain(f.project);
+  const pair = f.api.getWorkingSourceContinuationPresentation(f.project).candidates[0];
+  assert.equal(pair.predecessor.name, 'Original.ai');
+  assert.equal(JSON.stringify(pair).includes('/Users/'), false);
+  assert.equal(f.project.workingSourceSelections, undefined);
+  assert.equal((await f.api.selectProjectFilesForPackaging(f.project)).length, 3);
+  assert.deepEqual(plain(f.project), before);
+});
+
+test('Replace commits one verified successor and retains the predecessor required by it', async () => {
+  const f = continuationFixture();
+  f.disk.set(f.b.path, Buffer.from(`%PDF-1.7\n${f.a.path}\n%%EOF\n`));
+  const request = continuationRequest(f);
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, request);
+  assert.equal(result.success, true);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).state, 'excluded');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).reason, 'continuation-replaced');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.b).state, 'selected');
+  assert.equal(f.api.getWorkingSourceVerification(f.project, f.b).status, 'scanned');
+  const membership = f.api.getWorkingSourceMembership(f.project);
+  assert.equal(membership.facts.get(f.a.path.toLowerCase()).includedAsDependency, true);
+  assert.equal(membership.facts.get(f.a.path.toLowerCase()).effectiveRole, 'asset');
+  assert.equal(membership.blocked, false);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+  assert.equal((await f.api.selectProjectFilesForPackaging(f.project)).length, 3);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, request)).error, 'continuation_stale');
+});
+
+test('Keep both and Not related persist without engaging or altering ordinary selection', async () => {
+  for (const choice of ['keep-both', 'not-related']) {
+    const f = continuationFixture();
+    const request = continuationRequest(f, choice);
+    assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, request)).success, true);
+    assert.equal(f.project.workingSourceSelections, undefined);
+    assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+    const reloaded = f.reload();
+    assert.equal(f.api.getWorkingSourceContinuationPresentation(reloaded).candidates.length, 0);
+    f.api.recordWorkingSourceContinuationCandidate(f.project.id, f.a.path, f.b.path);
+    assert.equal(f.api.getWorkingSourceContinuationPresentation(reloaded).candidates.length, 0);
+    assert.equal((await f.api.selectProjectFilesForPackaging(reloaded)).length, 3);
+  }
+});
+
+test('foreign, stale, extra-proof and replayed pair requests cannot partially write intent', async () => {
+  const f = continuationFixture();
+  const request = continuationRequest(f);
+  const before = plain(f.project);
+  assert.equal((await f.api.resolveWorkingSourceContinuation('project-b', request)).success, false);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, { ...request, expectedRevision: 0 })).error, 'continuation_stale');
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, { ...request, authority: 'app-operation' })).error, 'invalid_continuation_request');
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, { ...request, evidenceIdentity: 'f'.repeat(64) })).error, 'continuation_stale');
+  assert.deepEqual(plain(f.project), before);
+});
+
+test('Replace refuses missing dependencies and preserves both selections plus PSD holds', async () => {
+  const f = continuationFixture();
+  f.disk.set(f.b.path, Buffer.from('%PDF-1.7\n/Users/synthetic/Missing.png\n%%EOF\n'));
+  f.project.workingSourceRelationshipHolds = [{ domain: 'psd-embedded', reason: 'ambiguous' }];
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+  assert.equal(result.error, 'continuation_verification_required');
+  assert.equal(f.project.workingSourceSelections, undefined);
+  assert.equal(f.project.workingSourceContinuations.pairs[Object.keys(f.project.workingSourceContinuations.pairs)[0]].decision, null);
+  assert.deepEqual(plain(f.project.workingSourceRelationshipHolds), [{ domain: 'psd-embedded', reason: 'ambiguous' }]);
+});
+
+test('account/generation and selection races invalidate the prepared pair without a half replacement', async () => {
+  for (const change of ['account', 'generation', 'selection', 'identity']) {
+    const f = continuationFixture(), entered = deferred(), release = deferred();
+    f.setDigestGate(async () => { entered.resolve(); await release.promise; });
+    const result = f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+    await entered.promise;
+    if (change === 'account') f.revoke();
+    if (change === 'generation') f.changeGeneration();
+    if (change === 'selection') await f.command(f.a, 'exclude');
+    if (change === 'identity') f.physical.set(f.b.path, { dev: 1n, ino: 900n, birthtimeNs: 200n, nlink: 1n });
+    release.resolve();
+    assert.equal((await result).success, false);
+    assert.notEqual(f.api.getWorkingSourceSelection(f.project, f.a).reason, 'continuation-replaced');
+    assert.equal(f.api.getWorkingSourceSelection(f.project, f.b).revision, 0);
+    assert.equal(Object.values(f.project.workingSourceContinuations.pairs)[0].decision, null);
+  }
+});
+
+test('same-stat byte edit during the second pass refuses the pair and never excludes the original', async () => {
+  const f = continuationFixture();
+  let reads = 0;
+  f.setDigestGate(async () => { if (++reads === 5) f.disk.set(f.a.path, Buffer.from('same-stat replacement')); });
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+  assert.equal(result.success, false);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).state, 'selected');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.b).revision, 0);
+});
+
+test('copy-close-open DOC transition is an unresolved candidate; coexistence, gaps and changed other docs are not', () => {
+  const f = fixture(), a = f.source('Before.ai'), b = f.source('After.ai'), other = f.source('Other.ai');
+  f.project.files.push(a, b, other);
+  const query = (files, current) => ({ running: true, activeState: { documents: files.map(file => ({ documentPath: file.path, current: file === current, modified: false })) } });
+  f.api.observeIllustratorWorkingSourceContinuation(f.project.id, 'activation-one', query([a, other], a));
+  assert.equal(f.api.observeIllustratorWorkingSourceContinuation(f.project.id, 'activation-one', query([a, b, other], b)), null);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+  f.api.observeIllustratorWorkingSourceContinuation(f.project.id, 'activation-two', query([a, other], a));
+  assert.ok(f.api.observeIllustratorWorkingSourceContinuation(f.project.id, 'activation-two', query([b, other], b)));
+  assert.equal(f.api.getWorkingSourceSelection(f.project, a).state, 'selected');
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 1);
+  const g = fixture(), x = g.source('One.ai'), y = g.source('Two.ai'); g.project.files.push(x, y);
+  g.api.observeIllustratorWorkingSourceContinuation(g.project.id, 'same', query([x], x));
+  g.api.observeIllustratorWorkingSourceContinuation(g.project.id, 'same', { failed: true });
+  assert.equal(g.api.observeIllustratorWorkingSourceContinuation(g.project.id, 'same', query([y], y)), null);
+  assert.equal(g.api.getWorkingSourceContinuationPresentation(g.project).candidates.length, 0);
+});
+
+test('hardlink, symlink and inode replacement cannot inherit a pair decision', async () => {
+  for (const unsafe of [{ nlink: 2n }, { symlink: true }, { ino: 99n }, { dev: 2n }]) {
+    const f = continuationFixture();
+    const request = continuationRequest(f, 'keep-both');
+    f.physical.set(f.b.path, { ...f.physical.get(f.b.path), ...unsafe });
+    assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, request)).success, false);
+    assert.equal(Object.values(f.project.workingSourceContinuations.pairs)[0].decision, null);
+  }
+});
+
+test('pair ambiguity follows the included predecessor even without the successor, and later saves preserve durable intent', async () => {
+  const f = continuationFixture();
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project, [f.other]).candidates.length, 0);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project, [f.a, f.other]).candidates.length, 1);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project, [f.a, f.b]).candidates.length, 1);
+  await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f, 'keep-both'));
+  f.disk.set(f.b.path, Buffer.from('later save bytes'));
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+  await f.command(f.a, 'exclude');
+  await f.command(f.a, 'restore');
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 1);
+});
+
+test('a discovered excluded successor holds the old source and Replace verifies before restoring it atomically', async () => {
+  const f = fixture(), a = f.source('Old.ai'), b = f.source('New.ai');
+  f.project.files.push(a, b);
+  await f.command(b, 'exclude');
+  assert.ok(f.api.recordWorkingSourceContinuationCandidate(f.project.id, a.path, b.path));
+  const candidate = f.api.getWorkingSourceContinuationPresentation(f.project, [a]).candidates[0];
+  assert.equal(candidate.successor.admissionState, 'accepted');
+  assert.equal(candidate.successor.selectionState, 'excluded');
+  assert.equal(candidate.replaceRequires, null);
+  let sawExcludedDuringVerification = false;
+  f.setDigestGate(async () => {
+    assert.equal(f.api.getWorkingSourceSelection(f.project, a).state, 'selected');
+    assert.equal(f.api.getWorkingSourceSelection(f.project, b).state, 'excluded');
+    sawExcludedDuringVerification = true;
+  });
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+  assert.equal(result.success, true);
+  assert.equal(sawExcludedDuringVerification, true);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, a).reason, 'continuation-replaced');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, b).state, 'selected');
+  assert.equal(f.api.getWorkingSourceVerification(f.project, b).status, 'scanned');
+});
+
+test('a discovered pending successor remains visible without admission and durable Not related survives later acceptance', async () => {
+  const f = fixture(), a = f.source('Old.ai'), b = f.source('Pending.ai');
+  f.project.files.push(a); f.project.pendingFiles = [b];
+  assert.ok(f.api.recordWorkingSourceContinuationCandidate(f.project.id, a.path, b.path));
+  const candidate = f.api.getWorkingSourceContinuationPresentation(f.project, [a]).candidates[0];
+  assert.equal(candidate.successor.admissionState, 'pending');
+  assert.equal(candidate.replaceRequires, 'successor-admission');
+  const before = plain(f.project);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).error, 'continuation_admission_required');
+  assert.deepEqual(plain(f.project), before);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f, 'not-related'))).success, true);
+  assert.equal(f.project.files.length, 1);
+  assert.equal(f.project.pendingFiles.length, 1);
+  assert.equal(f.project.workingSourceSelections, undefined);
+  const reloaded = f.reload();
+  reloaded.files.push(reloaded.pendingFiles.pop());
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(reloaded).candidates.length, 0);
+});
+
+test('untracked successors are never admitted, and failed excluded-successor verification preserves original intent', async () => {
+  const f = fixture(), a = f.source('Old.ai'), b = f.source('Untracked.ai');
+  f.project.files.push(a);
+  assert.equal(f.api.recordWorkingSourceContinuationCandidate(f.project.id, a.path, b.path), null);
+  assert.equal(f.project.workingSourceContinuations, undefined);
+  f.project.files.push(b); await f.command(b, 'exclude');
+  f.disk.set(b.path, Buffer.from('%PDF-1.7\n/Users/synthetic/Absent.png\n%%EOF\n'));
+  f.api.recordWorkingSourceContinuationCandidate(f.project.id, a.path, b.path);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).error, 'continuation_verification_required');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, a).state, 'selected');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, b).state, 'excluded');
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project, [a]).candidates.length, 1);
+});
+
+test('successor demotion after verification cannot exclude the original without an accepted successor', async () => {
+  const f = continuationFixture();
+  f.setAfterScan(async () => {
+    f.project.files = f.project.files.filter(file => file !== f.b);
+    f.project.pendingFiles = [f.b];
+  });
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+  assert.equal(result.success, false);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).state, 'selected');
+  assert.equal(Object.values(f.project.workingSourceContinuations.pairs)[0].decision, null);
+});
+
+test('proven rename transfers intent, invalidates verification and leaves a new old-path occupant independent', async () => {
+  const f = fixture(), original = f.source('Before.ai'); f.project.files.push(original);
+  await f.command(original, 'exclude');
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  const oldKey = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, original);
+  const destination = '/Users/synthetic/Renamed.ai';
+  f.disk.set(destination, f.disk.get(original.path)); f.disk.delete(original.path);
+  f.physical.set(destination, f.physical.get(original.path)); f.physical.delete(original.path);
+  await f.api.refreshWorkingSourceLocators(f.project.id, [destination]);
+  const moved = f.project.files[0];
+  assert.equal(moved.path, destination);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, moved).reason, 'user-excluded');
+  assert.equal(f.project.workingSourceSelections[oldKey], undefined);
+  assert.equal(f.api.getWorkingSourceVerification(f.project, moved).status, 'stale');
+  const unrelated = f.source('Before.ai', 'new-file-at-old-locator'); f.project.files.push(unrelated);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, unrelated).state, 'selected');
+  assert.equal(f.api.getWorkingSourceSelection(f.project, unrelated).revision, 0);
+  assert.equal(f.project.workingSourceLocators.aliases[0].kind, 'rename');
+});
+
+test('a copy, cross-volume move, hardlink or independently admitted destination cannot become an automatic rename', async () => {
+  for (const variant of ['copy', 'volume', 'hardlink', 'admitted', 'old-present']) {
+    const f = fixture(), old = f.source('Old.ai'); f.project.files.push(old);
+    await f.api.refreshWorkingSourceLocators(f.project.id);
+    const destination = '/Users/synthetic/New.ai';
+    f.disk.set(destination, Buffer.from(f.disk.get(old.path)));
+    const identity = { ...f.physical.get(old.path) };
+    if (variant === 'copy') identity.ino = 999n;
+    if (variant === 'volume') identity.dev = 99n;
+    if (variant === 'hardlink') identity.nlink = 2n;
+    f.physical.set(destination, identity);
+    if (variant !== 'old-present') { f.disk.delete(old.path); f.physical.delete(old.path); }
+    if (variant === 'admitted') f.project.files.push({ ...old, path: destination, fileId: 'independent' });
+    await f.api.refreshWorkingSourceLocators(f.project.id, [destination]);
+    assert.equal(f.project.files[0].path, old.path);
+    assert.equal(f.project.workingSourceLocators.aliases.length, 0);
+  }
+});
+
+test('supported kernel identity keeps pair intent through safe-save but re-verifies the new bytes', async () => {
+  const f = continuationFixture();
+  f.setDocumentIdentityReader(script => ({ documentId: script.includes(JSON.stringify(f.a.path)) ? '101' : script.includes(JSON.stringify(f.b.path)) ? '102' : '103',
+    volumeUuid: '12345678-1234-1234-1234-123456789abc' }));
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f, 'keep-both'));
+  f.physical.set(f.b.path, { ...f.physical.get(f.b.path), ino: 999n, birthtimeNs: 200n });
+  f.disk.set(f.b.path, Buffer.from('%PDF-1.7\nlater safe save\n%%EOF\n'));
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+  assert.equal(f.api.getWorkingSourceVerification(f.project, f.b).status, 'scanned');
+  assert.equal(f.api.getWorkingSourceVerification(f.project, f.b).sourceFingerprint, crypto.createHash('sha256').update(f.disk.get(f.b.path)).digest('hex'));
+  assert.equal(f.project.workingSourceSelections, undefined);
+});
+
+test('unavailable document identity never upgrades an inode replacement to safe-save proof', async () => {
+  const f = fixture(), old = f.source('Saved.ai'); f.project.files.push(old);
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  f.physical.set(old.path, { ...f.physical.get(old.path), ino: 999n });
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  assert.equal(f.project.workingSourceVerification, undefined);
+  assert.equal(f.project.workingSourceLocators.records[f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, old)].documentIdentity, null);
+});
+
+test('rename preserves literal required paths until producer bytes prove an updated link', async () => {
+  const f = fixture(), old = f.source('Old.ai'), root = f.source('Root.ai'); f.project.files.push(old, root);
+  f.disk.set(root.path, Buffer.from(`%PDF-1.7\n${old.path}\n%%EOF\n`));
+  await f.command(root, 'exclude'); await f.command(root, 'restore');
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  const destination = '/Users/synthetic/Moved.ai';
+  f.disk.set(destination, f.disk.get(old.path)); f.disk.delete(old.path);
+  f.physical.set(destination, f.physical.get(old.path)); f.physical.delete(old.path);
+  await f.api.refreshWorkingSourceLocators(f.project.id, [destination]);
+  assert.equal(f.api.getWorkingSourceVerification(f.project, root).requiredReferences[0].path, old.path);
+  assert.equal(f.api.getWorkingSourceMembership(f.project).counts.missingRequiredReferences, 1);
+  assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, true);
+});
+
+test('an unrelated physical replacement at the excluded predecessor path cannot inherit automatic Replace authority', async () => {
+  const f = continuationFixture();
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).success, true);
+  f.physical.set(f.a.path, { ...f.physical.get(f.a.path), ino: 999n });
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).state, 'invalid');
+  assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, true);
+});
+
+test('the identity adapter retains actual Adobe source formats and excludes Figma/virtual sources', async () => {
+  for (const extension of ['ai', 'ait', 'psd', 'psb', 'indd', 'idml', 'xd', 'pdf', 'prproj', 'aep', 'aet']) {
+    const f = fixture(), original = f.source(`Before.${extension}`); f.project.files.push(original);
+    await f.command(original, 'exclude');
+    await f.api.refreshWorkingSourceLocators(f.project.id);
+    const destination = `/Users/synthetic/After.${extension}`;
+    f.disk.set(destination, f.disk.get(original.path)); f.disk.delete(original.path);
+    f.physical.set(destination, f.physical.get(original.path)); f.physical.delete(original.path);
+    await f.api.refreshWorkingSourceLocators(f.project.id, [destination]);
+    assert.equal(f.project.files[0].path, destination, extension);
+    assert.equal(f.api.getWorkingSourceSelection(f.project, f.project.files[0]).reason, 'user-excluded', extension);
+  }
+  const f = fixture(), figma = f.source('Design.fig'), virtual = { ...f.source('Virtual.ai'), virtual: true };
+  f.project.files.push(figma, virtual);
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  assert.equal(f.project.workingSourceLocators, undefined);
 });
