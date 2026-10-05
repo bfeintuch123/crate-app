@@ -1586,8 +1586,9 @@ test('Current Project dashboard uses Working Files and privacy-safe mixed-app or
   assert.equal(getElementTreeText(elements['project-file-list']).includes('Petra Logo'), true);
   assert.equal(getElementTreeText(elements['project-file-list']).includes('Figma · Current Page'), true);
   assert.equal(elements['project-file-list'].children.length, 2);
-  assert.equal(elements['asset-review-summary'].textContent, '3 assets included · 2 Working Files ready');
-  assert.equal(elements['asset-review-footer-summary'].textContent, '3 assets included · 2 Working Files ready');
+  // This fixture omits authoritative selection semantics; rows alone cannot prove readiness.
+  assert.equal(elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
+  assert.equal(elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(getElementTreeText(elements['existing-assets-list']).includes('Illustrator · Brand-System.ai'), true);
   assert.equal(getElementTreeText(elements['added-assets-list']).includes('PowerPoint · Launch-Deck.pptx'), true);
   assert.equal(getElementTreeText(elements['added-assets-list']).includes('Figma · Current Page'), true);
@@ -1877,8 +1878,8 @@ test('Needs Review items all use the individual Add contract through one bulk ac
   assert.equal(fixture.getPersisted().files.length, 5);
   assert.equal(fixture.elements['filter-count-missing'].textContent, '0');
   assert.equal(fixture.elements['filter-count-added'].textContent, '4');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, '4 assets included · 1 Working File ready');
-  assert.equal(fixture.elements['asset-review-footer-summary'].textContent, '4 assets included · 1 Working File ready');
+  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
+  assert.equal(fixture.elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['pending-section'].classList.contains('hidden'), true);
   assert.equal(fixture.elements['asset-review-workspace'].classList.contains('hidden'), false);
   assert.equal(fixture.document.querySelector('#btn-review-assets-continue').disabled, false);
@@ -1898,8 +1899,8 @@ test('Needs Review items all use the individual Skip contract through one bulk a
   assert.equal(fixture.getPersisted().excludedAssetKeys.length, 4);
   assert.equal(fixture.elements['filter-count-all'].textContent, '0');
   assert.equal(fixture.elements['filter-count-missing'].textContent, '0');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, '0 assets included · 1 Working File ready');
-  assert.equal(fixture.elements['asset-review-footer-summary'].textContent, '0 assets included · 1 Working File ready');
+  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
+  assert.equal(fixture.elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['pending-section'].classList.contains('hidden'), true);
 });
 
@@ -1915,7 +1916,7 @@ test('Needs Review bulk Add leaves ineligible candidates unchanged and reports a
   assert.equal(fixture.getPersisted().files.length, 4);
   assert.deepEqual(fixture.getPersisted().pendingFiles.map(file => file.path), [project.pendingFiles[3].path]);
   assert.equal(fixture.elements['filter-count-missing'].textContent, '1');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, '3 assets included · 1 Working File ready · 1 need attention');
+  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable · 1 need attention');
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, false);
 });
 
@@ -2010,9 +2011,7 @@ test('duplicate pending names bind bulk actions by stable identity or original s
         assert.equal(fixture.elements['filter-count-missing'].textContent, '1');
         assert.equal(fixture.elements['filter-count-all'].textContent, decision === 'include' ? '2' : '1');
         assert.equal(fixture.elements['filter-count-added'].textContent, decision === 'include' ? '1' : '0');
-        const expectedSummary = decision === 'include'
-          ? '1 asset included · 1 Working File ready · 1 need attention'
-          : '0 assets included · 1 Working File ready · 1 need attention';
+        const expectedSummary = 'Package selection and verification unavailable · 1 need attention';
         assert.equal(fixture.elements['asset-review-summary'].textContent, expectedSummary);
         assert.equal(fixture.elements['asset-review-footer-summary'].textContent, expectedSummary);
         assert.equal(fixture.document.querySelector('#btn-review-assets-continue').disabled, false);
