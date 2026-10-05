@@ -3512,7 +3512,7 @@ function inferProjectFileRole(file) {
 }
 
 function isProjectAssetBaselineSource(file) {
-  if (!file || typeof file !== 'object') return false;
+  if (!file || typeof file !== 'object' || isScanOnSaveEmbeddedPsdFile(file)) return false;
   const ext = (file.ext || path.extname(file.path || '') || '').toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) return false;
   const source = getFileCaptureSource(file);
@@ -3579,6 +3579,8 @@ function hasWorkingSourceSelectionState(project) {
 }
 
 function isWorkingSourceFile(file) {
+  // Logical embedded resources read their parent, even after pending acceptance.
+  if (isScanOnSaveEmbeddedPsdFile(file)) return false;
   return isProjectAssetBaselineSource(file) || file?.projectRole === 'source';
 }
 
@@ -3703,12 +3705,17 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const verificationRequired = engaged && eligible && ((selectedSource && (selection.revision > 0 ||
       (!!persistedVerification && !unscannedExcludedRole))) ||
       (includedAsDependency && !!persistedVerification && !unscannedExcludedRole));
-    // The final package selector still enforces observer and Figma scope vetoes.
-    // A veto cannot silently remove an engaged root or known required role.
-    const packageSelectionOmitted = engaged && packageKeys && eligible &&
-      (includedAsDependency || (selectedSource && verificationRequired)) && !packageKeys.has(getTrackedFileDedupKey(file));
     let verificationStatus = selection?.state === 'invalid' ? 'invalid' : verification?.status || 'unavailable';
     if (verificationRequired && ['scanned', 'no-extractor'].includes(verification?.status) && !isWorkingSourceDiskIdentityCurrent(file, verification)) verificationStatus = 'stale';
+    // Preserve the observer/scope veto for untouched, clean dormant roots.
+    // Explicit intent and concrete required or failed obligations cannot vanish.
+    const dormantClean = verification && ['scanned', 'no-extractor'].includes(verificationStatus) &&
+      verification.unresolved.length === 0 && verification.requiredReferences.length === 0 &&
+      (verification.requiredEmbeddedOutputs || []).length === 0;
+    const retainedSourceIntent = selectedSource && (selection.revision > 0 ||
+      (!!persistedVerification && !unscannedExcludedRole && !dormantClean));
+    const packageSelectionOmitted = engaged && packageKeys && eligible &&
+      (includedAsDependency || retainedSourceIntent) && !packageKeys.has(getTrackedFileDedupKey(file));
     const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
       (!verification || !['scanned', 'no-extractor'].includes(verificationStatus) || verification.unresolved.length > 0));
     facts.set(getTrackedFileDedupKey(file), { sourceSelection: selection?.state || null, selectionReason: selection?.reason || null,
@@ -3739,11 +3746,25 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       const sourcePath = isScanOnSaveEmbeddedPsdFile(file) ? file.parentPsd || file.path : file.path;
       includedSourcePaths.add(normalizeTrackedFilePath(sourcePath));
     }
+    // Legacy association ambiguity concerns the legacy members actually read,
+    // not the physical parent's unrelated, current validated representation.
+    const includedLegacyParentPaths = new Set();
+    for (const file of [...files, ...(scopedProject?.pendingFiles || [])]) {
+      const legacyParent = isScanOnSaveEmbeddedPsdFile(file) ? file.parentPsd || file.path
+        : file.source === 'psd-embedded' && !file.psdResource ? file.assetBaselineSourcePath : null;
+      const parent = normalizeTrackedFilePath(legacyParent);
+      if (parent && (facts.get(getTrackedFileDedupKey(file))?.included ||
+          (!(files.includes(file)) && !isAssetReviewFileExcluded(project, file) && includedSourcePaths.has(parent)))) {
+        includedLegacyParentPaths.add(parent);
+      }
+    }
     counts.relationshipHolds = Array.isArray(project.workingSourceRelationshipHolds)
       ? project.workingSourceRelationshipHolds.filter(hold => !hold || typeof hold !== 'object' || Array.isArray(hold) ||
         !knownReasons.has(hold.reason) || typeof hold.sourcePath !== 'string' || !path.isAbsolute(hold.sourcePath) ||
         hold.sourcePath.length > 16384 || hold.sourcePath.includes('\0') ||
-        includedSourcePaths.has(normalizeTrackedFilePath(hold.sourcePath))).length : 1;
+        Object.keys(hold).some(key => key !== 'reason' && key !== 'sourcePath') ||
+        (hold.reason === 'legacy-psd-object-association-unverified' ? includedLegacyParentPaths : includedSourcePaths)
+          .has(normalizeTrackedFilePath(hold.sourcePath))).length : 1;
   }
   const records = project?.workingSourceSelections;
   const selectionInvalid = engaged && (!records || typeof records !== 'object' || Array.isArray(records) || Object.entries(records).some(([key, record]) =>
@@ -3780,7 +3801,8 @@ function getDormantWorkingSourceReviewFacts(record) {
 
 function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null, excludedPreparation = null) {
   const project = getProjects().find(item => item.id === projectId);
-  const file = project?.files?.find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const file = project?.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
+    normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
   if (!file || !parentCurrent()) return null;
   const key = getAssetBaselineSourceRecoveryRouteKey(project, file), selection = getWorkingSourceSelection(project, file);
   const previous = getWorkingSourceVerification(project, file);
@@ -13318,6 +13340,7 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     }
     const wireIds = new Map();
     const framingIssues = new Set(framingFacts?.issues || []);
+    if (framingFacts?.status === 'not-examined') framingIssues.add('wire-coverage-not-examined');
     for (const record of framingFacts?.records || []) {
       if (typeof record.id === 'string') wireIds.set(record.id, (wireIds.get(record.id) || 0) + 1);
       // Received concrete observations are obligations in their own right.
@@ -13383,6 +13406,8 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
     }
     const parsedMedia = linkedMetadata.filter(item => item.origin === 'media-reference');
     for (const item of parsedMedia) {
+      // Parsed timeline readers retain the same refusal without wire observations.
+      if (item.carrier === '1075') framingIssues.add('unverified-timeline-frame-reader-type');
       const rawPaths = item.frameReader?.link ?? null;
       const disposition = typeof rawPaths?.fullPath === 'string' && rawPaths.fullPath.length ? 'external-reference' : 'unresolved-media-reference';
       references.push({ source: 'parsed-media', ...item, rawPaths, disposition });
@@ -14795,10 +14820,15 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   }
   // No generic old-row migration: hold only concrete source-associated rows
   // whose object correspondence is unavailable in this reconciliation.
-  if ([...project.files, ...(project.pendingFiles || [])].some(row =>
-      (row.source === 'psd-embedded' && !row.psdResource &&
-        normalizeTrackedFilePath(row.assetBaselineSourcePath) === parent) ||
-      (isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parent))) {
+  const legacyAssociations = [...project.files, ...(project.pendingFiles || [])].filter(row =>
+    (row.source === 'psd-embedded' && !row.psdResource &&
+      normalizeTrackedFilePath(row.assetBaselineSourcePath) === parent) ||
+    (isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === parent));
+  const priorMembership = getWorkingSourceMembership(project);
+  const includedLegacyAssociation = legacyAssociations.some(row =>
+    priorMembership.facts.get(getTrackedFileDedupKey(row))?.included ||
+    ((project.pendingFiles || []).includes(row) && !isAssetReviewFileExcluded(project, row)));
+  if (legacyAssociations.length) {
     holds.push({ reason: 'legacy-psd-object-association-unverified', sourcePath: filePath });
   }
   const items = [];
@@ -14843,7 +14873,8 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   }
   // An authoritative empty result removes attributed resources, including
   // missing-ID rows, without claiming correspondence to a replacement object.
-  const retire = holds.length ? new Set() : new Set(associated.filter(row =>
+  const blockingHolds = holds.some(hold => hold.reason !== 'legacy-psd-object-association-unverified' || includedLegacyAssociation);
+  const retire = blockingHolds ? new Set() : new Set(associated.filter(row =>
     !items.some(item => item.previous === row && item.retained)));
   // Determine independent retention in the prospective graph, after the
   // validated save disproves these old producer edges. Another root reaching
@@ -14874,7 +14905,7 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
     }
     for (const snapshot of snapshots) assertPsdBaselineSnapshot(snapshot);
   };
-  return { items, check, detached, blocked: holds.length > 0, apply(latest) {
+  return { items, check, detached, blocked: blockingHolds, apply(latest) {
     check(latest);
     // Resolve all receipts before any mutation. References are safe only after
     // rebinding to this one canonical writer read, never across store.get calls.
@@ -14891,7 +14922,7 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
       const canonical = rebound.get(row);
       canonical.psdResource = { ...canonical.psdResource, current: false };
     }
-    if (!holds.length) for (const item of items) if (item.retained) rebound.get(item.previous).psdResource = item.resource;
+    if (!blockingHolds) for (const item of items) if (item.retained) rebound.get(item.previous).psdResource = item.resource;
     const previous = latest.workingSourceRelationshipHolds;
     // A completed, source/output-validated reconciliation may retire only this
     // PSD's proven-resolved current-flow guards. Legacy, unknown, other-source
@@ -14899,7 +14930,7 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
     if (previous === undefined || Array.isArray(previous)) {
       const transientReasons = new Set(['psd-resource-identity-ambiguous', 'psd-resource-domain-changed',
         'psd-resource-continuity-unverified']);
-      const preserved = (previous || []).filter(hold => holds.length || !hold ||
+      const preserved = (previous || []).filter(hold => blockingHolds || !hold ||
         !transientReasons.has(hold.reason) || typeof hold.sourcePath !== 'string' ||
         Object.keys(hold).some(key => key !== 'reason' && key !== 'sourcePath') ||
         normalizeTrackedFilePath(hold.sourcePath) !== parent);
@@ -14964,7 +14995,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     return;
   }
 
-  const sourceRow = currentProject.files?.find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const sourceRow = currentProject.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
+    normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
   const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
   const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));

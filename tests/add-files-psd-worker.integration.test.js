@@ -977,3 +977,18 @@ for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version
     await run.finish();
   });
 }
+
+for (const mode of ['timeline', 'video', 'linked']) {
+  test(`not-examined receiver retains ${mode} refusal with parsed observations`, async t => {
+    const value = parsed();
+    if (mode !== 'linked') value.psd = agPsd.readPsd(mode === 'timeline' ? audioBytes() : videoBytes(),
+      { skipLayerImageData: true, skipCompositeImageData: true });
+    else value.psd.linkedFiles = [{ id: 'external', name: 'Linked.png', linkedFile: { fullPath: '/Users/synthetic/Linked.png' } }];
+    value.framing = { status: 'not-examined' };
+    const h = harness(t, { parsed: value }), run = await h.start(), result = await run.promise;
+    const inventory = result.linkedInventory;
+    assert.equal(inventory.unresolved.filter(item => item.reason === 'wire-coverage-not-examined').length, 1);
+    if (mode === 'timeline') assert.equal(inventory.unresolved.filter(item => item.reason === 'unverified-timeline-frame-reader-type').length, 1);
+    assert.ok(inventory.references.length > 0); await run.finish();
+  });
+}
