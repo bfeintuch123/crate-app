@@ -1237,10 +1237,45 @@ function baselineCases() {
       assert.deepEqual(latest.semanticCounts, review.semanticCounts); assert.equal(latest.workingSourceSelectionBlocked, false);
       const source = f.current().files.find(file => file.path === f.filePath);
       const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), source);
+      const priorSource = source.source, priorWatch = f.current().watchStartedAt;
+      source.source = 'user-added'; f.current().watchStartedAt = 0;
+      assert.equal((await metadataTestHooks.runScanOnOpen(project.id, source.path, null, null, { establishBaseline: false, allowPausedBaseline: true })).success, true);
+      assert.equal(f.current().workingSourceVerification[key].status, 'scanned');
+      assert.deepEqual(f.current().workingSourceVerification[key].requiredReferences, []);
+      source.source = priorSource; f.current().watchStartedAt = priorWatch;
+      const cleanDormant = await callIpcRaw('projects:prepare-package-review', project.id);
+      assert.equal(cleanDormant.materializable, true, 'clean dormant revision zero retains observer veto');
+      assert.deepEqual(cleanDormant.files.map(file => file.name), ['Kept.png']);
       f.current().workingSourceVerification[key] = { status: 'failed', selectionRevision: 0, attempt: 'known-failure',
         reason: 'scan-failed', requiredReferences: [], unresolved: [{ reason: 'scan-failed' }] };
       assert.equal((await callIpcRaw('projects:prepare-package-review', project.id)).materializable, false,
         'revision zero does not waive concrete persisted failure');
+    } finally { clearTrackedTimers(); }
+  });
+
+  baselineTest('L2 Current Page veto preserves clean dormant root but blocks explicit restored intent', async () => {
+    const f = await correctionProject('.fig', 'synthetic local fig bytes');
+    try {
+      f.current().figmaScopeMode = 'current-page';
+      const asset = path.join(TEST_HOME, 'Desktop', 'Scope-kept.png'); fs.writeFileSync(asset, 'safe asset');
+      f.current().files.push({ path: asset, name: 'Scope-kept.png', ext: '.png', source: 'user-added', acceptedPending: true, projectRole: 'asset' });
+      assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, f.filePath, null, null,
+        { establishBaseline: false, allowPausedBaseline: true })).success, true);
+      const source = f.current().files.find(row => row.path === f.filePath);
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), source);
+      assert.equal(f.current().workingSourceVerification[key].status, 'scanned');
+      f.current().workingSourceSelections = {};
+      let review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, true); assert.deepEqual(review.files.map(row => row.name), ['Scope-kept.png']);
+      assert.equal(review.semanticCounts.selectedWorkingSources, 0);
+      const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id), row = ws.files.find(item => item.name === 'Correction.fig');
+      await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity, { action: 'restore', expectedRevision: 1 });
+      assert.equal(restored.verificationStatus, 'scanned');
+      review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+      assert.equal(review.materializable, false); assert.equal(review.token, undefined);
+      assert.equal(review.files.some(item => item.name === 'Correction.fig'), false, 'Current Page veto remains in force');
+      assert.ok(review.semanticCounts.unresolvedVerification > 0);
     } finally { clearTrackedTimers(); }
   });
 
@@ -1303,6 +1338,90 @@ function baselineCases() {
   });
 
   const embeddedPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XcAAAAASUVORK5CYII=', 'base64');
+  for (const ext of ['.psd', '.ai']) for (const logicalFirst of [false, true]) {
+    baselineTest(`C1 logical design child ${ext} ${logicalFirst ? 'logical-first' : 'parent-first'} stays an asset across admission reload and source controls`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const f = await correctionProject('.psd', actual.writePsdBuffer({ width: 1, height: 1 }));
+      currentPsdFixture = 'actual-source-buffer';
+      try {
+        const logical = { fileId: 'logical-child', path: f.filePath, parentPsd: f.filePath,
+          name: 'Embedded' + ext, ext, embedded: true, embeddedIndex: 0,
+          embeddedOriginalName: 'Embedded' + ext, projectRole: 'asset', source: 'scan-on-save-embedded' };
+        f.current().pendingFiles = [logical];
+        await callIpcRaw('projects:accept-pending', f.project.id,
+          metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
+        assert.equal(f.current().files.length, 2, 'logical dedup identity survives beside physical parent');
+        assert.equal(f.current().files[1].acceptedPending, true, 'exercise production pending acceptance');
+        const parent = f.current().files[0];
+        const parentKey = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), parent);
+        const logicalKey = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.current(), logical);
+        assert.notEqual(parentKey, logicalKey);
+        if (logicalFirst) f.current().files.reverse();
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        let ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        let child = ws.files.find(row => row.name === logical.name);
+        const root = ws.files.find(row => row.name === parent.name);
+        assert.equal(ws.semanticCounts.selectedWorkingSources, 1);
+        assert.equal(child.sourceSelection, null);
+        assert.equal(child.effectiveRole, 'asset');
+        for (const action of ['exclude', 'restore']) {
+          const result = await callIpcRaw('projects:set-working-source-selection', f.project.id,
+            child.visualIdentity, { action, expectedRevision: 0 });
+          assert.equal(result.error, 'working_source_not_found');
+        }
+        assert.equal(f.current().workingSourceSelections?.[logicalKey], undefined);
+        assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          root.visualIdentity, { action: 'exclude', expectedRevision: 0 })).success, true);
+        // Asset exclusion is independent of source intent. A hidden logical row
+        // must not intercept the physical parent's Restore scan by shared path.
+        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          root.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        assert.equal(restored.success, true);
+        assert.equal(restored.verificationStatus, 'scanned');
+        assert.equal(f.current().workingSourceVerification?.[logicalKey], undefined);
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(ws.semanticCounts.unresolvedVerification, 0);
+        assert.equal(ws.semanticCounts.selectedWorkingSources, 1);
+        assert.equal(ws.semanticCounts.excludedAssets, 1);
+        assert.ok(f.current().files.some(row => row.fileId === 'logical-child'), 'asset exclusion preserves extraction metadata');
+        f.current().excludedAssetKeys = [];
+        f.current().workingSourceRelationshipHolds = [{ sourcePath: f.filePath, reason: 'legacy-psd-object-association-unverified' }];
+        await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          root.visualIdentity, { action: 'exclude', expectedRevision: 2 });
+        ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset retains concrete parent read hold');
+        assert.ok((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.fileId === 'logical-child'));
+        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0);
+        assert.equal(f.current().workingSourceRelationshipHolds.length, 1, 'dormant hold is preserved');
+      } finally { currentPsdFixture = { children: [], linkedFiles: [] }; clearTrackedTimers(); }
+    });
+  }
+
+  for (const ext of ['.psd', '.ai']) {
+    baselineTest(`C1 independently added physical child ${ext} retains Exclude Restore`, async () => {
+      const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+      const childBytes = ext === '.psd' ? actual.writePsdBuffer({ width: 1, height: 1 }) : Buffer.from('%PDF-1.7\n%%EOF\n');
+      const f = await workingPsdFixture([{ id: psdId, name: 'Physical' + ext, data: childBytes }]);
+      try {
+        const physical = f.rows()[0]; assert.ok(physical); assert.notEqual(physical.path, f.filePath);
+        manualDialogFor([physical.path]); await callIpcRaw('projects:add-files', f.project.id);
+        storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+        const ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const child = ws.files.find(row => row.name === 'Physical' + ext); assert.ok(child);
+        assert.equal(child.sourceSelection, 'selected');
+        assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          child.visualIdentity, { action: 'exclude', expectedRevision: 0 })).success, true);
+        const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id,
+          child.visualIdentity, { action: 'restore', expectedRevision: 1 });
+        assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+        assert.deepEqual(fs.readFileSync(physical.path), childBytes);
+      } finally { f.cleanup(); }
+    });
+  }
+
   const psdId = '22222222-2222-4222-8222-222222222222';
   async function workingPsdFixture(linkedFiles, children = [], viaAddFiles = false, forcePending = false, engageProducer = true, retrySibling = false) {
     const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
@@ -2536,16 +2655,24 @@ function baselineCases() {
       storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
       assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0);
       await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'restore', expectedRevision: 1 });
-      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1);
-      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, false);
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0, 'excluded legacy row does not hold the restored current physical root');
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).materializable, true);
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, holds);
+      await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1, 'including legacy row restores its concrete parent-read hold');
       await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 2 });
       const consumer = path.join(TEST_HOME, 'Desktop', 'Consumer.ai'); fs.writeFileSync(consumer, `%PDF-1.7\n${f.filePath}\n%%EOF\n`);
       f.current().files.push({ path: consumer, name: 'Consumer.ai', ext: '.ai', source: 'user-added', acceptedPending: true, projectRole: 'source' });
       assert.equal((await metadataTestHooks.runScanOnOpen(f.project.id, consumer, null, null, { establishBaseline: false, allowPausedBaseline: true })).success, true);
-      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1, 'other root requires excluded PSD');
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1, 'included legacy association still reads the required parent');
+      await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
+      ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(ws.semanticCounts.relationshipHolds, 0);
+      assert.ok(ws.files.find(row => row.name === 'Correction.psd').includedAsDependency, 'required physical parent remains included independently of dormant legacy hold');
+      assert.deepEqual(f.current().workingSourceRelationshipHolds, holds);
       const consumerRow = f.current().files.find(row => row.path === consumer);
       await callIpcRaw('projects:set-working-source-selection', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, consumerRow), { action: 'exclude', expectedRevision: 0 });
-      for (const hold of [null, { reason: 'unknown-hold', sourcePath: f.filePath }, { reason: holds[0].reason, sourcePath: 'relative.psd' }]) {
+      for (const hold of [null, { reason: 'unknown-hold', sourcePath: f.filePath }, { reason: holds[0].reason, sourcePath: 'relative.psd' }, { ...holds[0], unknownAssociation: true }]) {
         f.current().workingSourceRelationshipHolds = [hold];
         assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 1);
       }
@@ -2823,7 +2950,8 @@ function baselineCases() {
   }
 
   for (const mode of ['timeline', 'timeline-frame-version', 'timeline-link-version', 'video-frame-version',
-    'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal']) {
+    'video-link-version', 'video-pixel', 'video-reader', 'video-supported', 'video-worker-refusal',
+    'timeline-not-examined', 'video-not-examined']) {
     baselineTest(`Media receiver correction: actual IPC preserves ${mode} policy without redundant reason`, async () => {
       resetTestHomeWorkspace();
       const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
@@ -2850,6 +2978,7 @@ function baselineCases() {
         if (mode === 'video-pixel') carrier.pixelSourceType = 1;
         if (mode === 'video-reader') ref.frameReader.frameReaderType = 1;
         if (mode === 'video-worker-refusal') ref.reason = 'unsupported-media-reference-shape';
+        if (mode.endsWith('not-examined')) return { status: 'not-examined' };
         return facts;
       };
       currentPsdFixture = 'actual-source-buffer';
@@ -2863,10 +2992,11 @@ function baselineCases() {
         if (mode === 'video-supported') {
           assert.deepEqual(record.unresolved, []); assert.equal(review.materializable, true); assert.equal(typeof review.token, 'string');
         } else {
-          const reason = mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
+          const reason = mode.endsWith('not-examined') ? 'wire-coverage-not-examined' : mode === 'timeline' ? 'unverified-timeline-frame-reader-type'
             : ['video-pixel', 'video-reader'].includes(mode) ? 'unsupported-video-reader-type' : 'unsupported-media-reference-shape';
           assert.ok(record.unresolved.some(x => x.reason === reason));
           assert.equal(record.unresolved.filter(x => x.reason === reason).length, 1);
+          if (mode === 'timeline-not-examined') assert.ok(record.unresolved.some(x => x.reason === 'unverified-timeline-frame-reader-type'));
           assert.equal(review.materializable, false); assert.equal(review.token, undefined);
           assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingSourceSelectionBlocked, true);
         }
