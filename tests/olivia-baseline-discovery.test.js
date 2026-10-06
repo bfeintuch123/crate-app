@@ -308,6 +308,286 @@ function baselineCases() {
     } catch (error) { console.log = originalLog; await f.cleanup(); throw error; }
   }
 
+  baselineTest('WR-4 manual Add Files: completed baseline reload preserves first B parser dependency', async () => {
+    const f = await ld1CompletedFixture();
+    const bytes = f.paths.map(entry => ({ source: fs.readFileSync(entry.source), link: fs.readFileSync(entry.link) }));
+    try {
+      const beforeReload = f.current();
+      assert.equal(beforeReload.assetBaseline.status, 'included');
+      assert.equal(beforeReload.assetBaseline.decision, 'include');
+      assert.ok(Number.isFinite(beforeReload.assetBaseline.establishedAt));
+      assert.notEqual(f.paths[0].link, f.paths[1].link, 'B must have a unique parser-only dependency');
+      assert.equal([...beforeReload.files, ...beforeReload.pendingFiles].some(file =>
+        file.path === f.paths[1].source || file.path === f.paths[1].link), false, 'B was never admitted before reload');
+      assert.equal(f.scanCount(1), 0);
+      assert.equal(f.count(1), 0);
+      const priorVerification = metadataTestHooks.getWorkingSourceVerification(beforeReload,
+        beforeReload.files.find(file => file.path === f.paths[0].source));
+      const oldStoreData = storeInstance.data;
+      // Existing harness reload: persisted JSON bytes become new store objects.
+      // This deliberately retains in-process owners; it is not process restart.
+      roundTripFakeStore();
+      assert.notEqual(storeInstance.data, oldStoreData);
+      const afterReload = f.current();
+      assert.deepEqual(afterReload, beforeReload);
+      f.assertPrior();
+
+      const result = await f.begin([1]); // FIRST B admission, after persisted reload.
+      const immediate = f.current(); // Seal before workspace or any package call.
+      const timersAtReturn = activeTimeouts.size + activeIntervals.size;
+      clearTrackedTimers(); // No wait, poll or queued observer rescues this snapshot.
+      console.log('WR4_RELOAD_EVIDENCE ' + JSON.stringify({
+        chronology: ['A Add Files and Include Existing', 'persisted JSON roundtrip', 'FIRST B Add Files'],
+        beforeReload, afterReload, immediate, result, scans: [...f.scans],
+        producerControls: { opened: f.state.opened, descriptor: f.state.descriptor,
+          structuredLinks: false, timersAtReturn, timersAfterClear: activeTimeouts.size + activeIntervals.size },
+        qualification: 'Existing IPC/mock store reload; no process restart, watcher save, live LINK or package call',
+      }));
+      assert.ok(Array.isArray(result), 'first B Add Files must complete without partial failure');
+      assert.equal(f.state.opened, false);
+      assert.equal(f.state.descriptor, false);
+      assert.equal(activeTimeouts.size + activeIntervals.size, 0);
+      assert.deepEqual(immediate.assetBaseline, beforeReload.assetBaseline, 'baseline decision and timestamp must not reset');
+      assert.deepEqual(immediate.workingSourceSelections, beforeReload.workingSourceSelections, 'no implicit Restore or intent drift');
+      assert.deepEqual(immediate.excludedAssetKeys || [], beforeReload.excludedAssetKeys || []);
+      assert.deepEqual(immediate.pendingFiles, []);
+      f.assertPrior();
+      const a = immediate.files.find(file => file.path === f.paths[0].source);
+      assert.deepEqual(metadataTestHooks.getWorkingSourceVerification(immediate, a), priorVerification);
+      assert.equal(f.scanCount(0), 1, 'reload and B admission must not rescan A');
+      const sources = immediate.files.filter(file => file.path === f.paths[1].source);
+      const links = immediate.files.filter(file => file.path === f.paths[1].link);
+      assert.equal(sources.length, 1);
+      assert.equal(sources[0].source, 'manual-browse');
+      assert.equal(sources[0].projectRole, 'source');
+      assert.equal(sources[0].assetOrigin, 'added');
+      assert.ok(sources[0].addedAt > beforeReload.assetBaseline.establishedAt);
+      assert.equal(links.length, 1, 'parser-only B dependency must already be present');
+      assert.equal(links[0].source, 'scan-on-open');
+      assert.equal(links[0].projectRole, 'asset');
+      assert.equal(links[0].assetOrigin, 'added');
+      assert.equal(f.scanCount(1), 1, 'ordinary selected-source verification scans B once');
+      assert.equal(f.scanCount(2), 0, 'unselected sibling must remain untouched');
+      const verification = metadataTestHooks.getWorkingSourceVerification(immediate, sources[0]);
+      assert.equal(verification?.status, 'scanned');
+      assert.ok(verification.requiredReferences.some(ref => ref.path === f.paths[1].link));
+      assert.equal(verification.sourceFingerprint, crypto.createHash('sha256').update(bytes[1].source).digest('hex'));
+      const identity = fs.statSync(f.paths[1].source);
+      for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(verification.sourceIdentity[field], identity[field]);
+      for (let i = 0; i < 2; i++) {
+        assert.deepEqual(fs.readFileSync(f.paths[i].source), bytes[i].source);
+        assert.deepEqual(fs.readFileSync(f.paths[i].link), bytes[i].link);
+      }
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      console.log('WR4_WORKSPACE_EVIDENCE ' + JSON.stringify({ projectId: workspace.projectId, semanticCounts: workspace.semanticCounts }));
+      assert.equal(workspace.files.find(file => file.name === 'B.ai').sourceSelection, 'selected');
+      assert.equal(workspace.semanticCounts.unresolvedVerification, 0);
+      assert.equal(workspace.semanticCounts.missingRequiredReferences, 0);
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('WR-1 quiet completed baseline: pause resume replaces one watcher without rescan', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      const before = f.current(), token = metadataTestHooks.getActiveWatchingActivationToken(f.project.id);
+      const created = watcherRecords.length, closed = watcherCloseCount;
+      const priorVerification = before.workingSourceVerification;
+      await callIpcRaw('projects:pause', f.project.id);
+      assert.equal(metadataTestHooks.getActiveWatchingActivationToken(f.project.id), null);
+      assert.equal(watcherCloseCount, closed + 1);
+      await callIpcRaw('projects:pause', f.project.id);
+      assert.equal(watcherCloseCount, closed + 1, 'repeated pause must not close another watcher');
+      await callIpcRaw('projects:start-watching', f.project.id);
+      clearTrackedTimers();
+      const after = f.current();
+      const replacement = metadataTestHooks.getActiveWatchingActivationToken(f.project.id);
+      assert.ok(replacement !== null && replacement !== token);
+      assert.equal(watcherRecords.length, created + 1, 'one replacement watcher');
+      assert.equal(watcherCloseCount, closed + 1);
+      assert.equal(after.status, 'watching');
+      assert.deepEqual(after.workingSourceVerification, priorVerification);
+      assert.deepEqual(after.workingSourceSelections, before.workingSourceSelections);
+      assert.deepEqual(after.pendingFiles, []);
+      assert.equal(f.scanCount(1), 0); assert.equal(f.scanCount(2), 0);
+      f.assertPrior();
+      console.log('WR1_EVIDENCE ' + JSON.stringify({ before, after, token, replacement,
+        watchersCreated: watcherRecords.length - created, watchersClosed: watcherCloseCount - closed, scans: f.scans }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('WR-2 stale pending reload resume: raw row survives public projection and project isolation', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      const stored = storeInstance.data.projects.find(project => project.id === f.project.id);
+      const stale = { ...makePendingFile(f.paths[1].source, 'app-opened'), addedAt: stored.watchStartedAt - 1000,
+        captureState: 'needs-save', captureReason: 'unsaved-source-needs-save',
+        captureEvidence: { source: 'app-opened', appFamily: 'illustrator',
+          observerMethod: 'illustrator-active-session', evidenceStrength: 'structured-app-document' } };
+      stored.pendingFiles.push(stale);
+      await callIpcRaw('projects:pause', f.project.id);
+      const other = await createProject('WR2 foreign project');
+      manualDialogFor([f.paths[2].source]);
+      assert.ok(Array.isArray(await callIpcRaw('projects:add-files', other.id, crypto.randomUUID())));
+      clearTrackedTimers();
+      roundTripFakeStore();
+      await callIpcRaw('projects:start-watching', f.project.id);
+      clearTrackedTimers();
+      const raw = f.current(), publicProject = await getProject(f.project.id);
+      const publicFiles = await callIpcRaw('projects:get-files', f.project.id);
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.deepEqual(raw.pendingFiles.filter(file => file.path === stale.path), [stale], 'projection must not delete persisted pending state');
+      assert.equal(publicProject.pendingFiles.some(file => file.path === stale.path), false);
+      assert.equal(publicFiles.some(file => file.path === stale.path || file.path === f.paths[2].source), false);
+      assert.equal(publicFiles.filter(file => file.path === f.paths[0].source).length, 1);
+      assert.equal(workspace.pendingFiles.some(file => file.name === 'B.ai'), false);
+      assert.equal(workspace.files.some(file => file.name === 'C.ai'), false);
+      assert.equal(workspace.files.filter(file => file.name === 'A.ai').length, 1);
+      assert.equal(storeInstance.data.projects.find(project => project.id === other.id).files.filter(file => file.path === f.paths[2].source).length, 1);
+      assert.equal(f.scanCount(1), 0);
+      f.assertPrior();
+      console.log('WR2_EVIDENCE ' + JSON.stringify({ raw, publicProject, publicFiles, workspace, foreignProjectId: other.id }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('WR-3 deferred parser pause resume: retired completion preserves new owner reservation', async () => {
+    const f = await fixture({ sources: 2, sourceNames: ['Retired.ai', 'Current.ai'], structuredLinks: false });
+    const oldGate = deferredScanBoundary();
+    const restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+      if (path.resolve(filePath) === f.paths[0].source) await oldGate.wait();
+      return read();
+    });
+    let retired, freshQueue, newState;
+    try {
+      manualDialogFor([f.paths[0].source]);
+      retired = callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      await oldGate.started;
+      const oldState = metadataTestHooks.getBaselineState(f.project.id);
+      assert.ok(oldState?.inFlightBySource.size);
+      const oldToken = metadataTestHooks.getActiveWatchingActivationToken(f.project.id);
+      await callIpcRaw('projects:pause', f.project.id);
+      await callIpcRaw('projects:start-watching', f.project.id);
+      clearTrackedTimers();
+      assert.notEqual(metadataTestHooks.getActiveWatchingActivationToken(f.project.id), oldToken);
+      manualDialogFor([f.paths[1].source]);
+      const busy = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      assert.deepEqual(busy, { success: false, error: 'add_files_operation_in_progress' });
+      // The public picker intentionally stays busy until its retired operation
+      // settles. Model only the fresh private queue contract at this boundary.
+      freshQueue = metadataTestHooks.reserveProjectAssetBaselineScanQueue(f.project.id, [f.paths[1].source]);
+      newState = metadataTestHooks.getBaselineState(f.project.id);
+      assert.ok(newState && newState !== oldState);
+      assert.equal(newState.queuedSourceKeys.size, 1);
+      const reservation = { required: [...newState.requiredSourceKeys], queued: [...newState.queuedSourceKeys],
+        inFlight: [...newState.inFlightBySource.keys()] };
+      const beforeRelease = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      oldGate.release();
+      assert.equal(await retired, null);
+      assert.deepEqual(storeInstance.data.projects, beforeRelease, 'retired completion must not publish persisted changes');
+      assert.equal(metadataTestHooks.getBaselineState(f.project.id), newState);
+      assert.deepEqual({ required: [...newState.requiredSourceKeys], queued: [...newState.queuedSourceKeys],
+        inFlight: [...newState.inFlightBySource.keys()] }, reservation, 'old cleanup must not consume fresh reservations');
+      assert.equal(oldState.inFlightBySource.size, 0);
+      assert.equal(oldState.activeScans.size, 0);
+      assert.equal(storeInstance.data.projects.find(project => project.id === f.project.id).files
+        .some(file => file.path === f.paths[0].link), false, 'retired completion cannot publish its dependency');
+      // This is the retirement boundary. Subsequent fresh Add Files may scan
+      // both admitted roots while their initial baseline remains awaiting.
+      metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, freshQueue, newState);
+      assert.equal(newState.queuedSourceKeys.size, 0);
+      manualDialogFor([f.paths[1].source]);
+      assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+      const after = JSON.parse(JSON.stringify(storeInstance.data.projects.find(project => project.id === f.project.id)));
+      assert.equal(after.files.filter(file => file.path === f.paths[1].link).length, 1, 'fresh owner positive control');
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(after, after.files.find(file => file.path === f.paths[1].source))?.status, 'scanned');
+      assert.equal(newState.inFlightBySource.size, 0);
+      console.log('WR3_EVIDENCE ' + JSON.stringify({ oldToken, reservation, beforeRelease, after,
+        busy, qualification: 'Trusted IPC retirement plus privately modeled fresh queue reservation; fresh public Add Files only after old picker settles; no native restart' }));
+    } finally {
+      oldGate.release();
+      if (retired) await retired;
+      if (freshQueue) metadataTestHooks.cancelProjectAssetBaselineScanQueue(f.project.id, freshQueue, newState);
+      restoreReads(); await f.cleanup();
+    }
+  });
+
+  baselineTest('WR-7 excluded failed healthy siblings: reload resume readd preserves independent intent and receipts', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      assert.ok(Array.isArray(await f.add(1)));
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.name === 'B.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision })).success, true);
+      fs.writeFileSync(f.paths[2].source, `%PDF-1.7\n${f.paths[2].link}\nmissing EOF`);
+      assertAddFilesPartialScanFailure(await f.add(2));
+      const before = f.current();
+      const failed = metadataTestHooks.getWorkingSourceVerification(before, before.files.find(file => file.path === f.paths[2].source));
+      assert.equal(failed?.status, 'failed');
+      roundTripFakeStore();
+      await callIpcRaw('projects:pause', f.project.id);
+      await callIpcRaw('projects:start-watching', f.project.id);
+      clearTrackedTimers();
+      assert.ok(Array.isArray(await f.add(1, 2)));
+      const after = f.current(), resumed = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.deepEqual(after.workingSourceSelections, before.workingSourceSelections);
+      assert.deepEqual(after.workingSourceVerification, before.workingSourceVerification);
+      assert.equal(resumed.files.find(file => file.name === 'B.ai').sourceSelection, 'excluded');
+      assert.deepEqual(metadataTestHooks.getWorkingSourceVerification(after, after.files.find(file => file.path === f.paths[2].source)), failed);
+      assert.equal(after.files.some(file => file.path === f.paths[2].link), false);
+      assert.equal(after.files.filter(file => file.path === f.paths[1].link).length, 1, 'prior genuine dependency retained');
+      assert.deepEqual([f.scanCount(0), f.scanCount(1), f.scanCount(2)], [1, 1, 1], 'no implicit Restore or failed-source retry');
+      f.assertPrior();
+      console.log('WR7_EVIDENCE ' + JSON.stringify({ before, after, workspace: resumed, scans: f.scans }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('WR-8 deferred watcher account project replacement: retired callback cannot publish to either owner', async () => {
+    const f = await fixture({ sources: 2, structuredLinks: false });
+    const originalStat = fs.promises.stat, gate = deferredScanBoundary();
+    let changing;
+    try {
+      const stat = await originalStat.call(fs.promises, f.paths[0].source);
+      const retiredWatcher = watcherRecords[watcherRecords.length - 1];
+      fs.promises.stat = async (candidate, ...args) => {
+        if (path.resolve(candidate) === f.paths[0].source) { await gate.wait(); return stat; }
+        return originalStat.call(fs.promises, candidate, ...args);
+      };
+      changing = retiredWatcher.handlers.change(f.paths[0].source);
+      await gate.started;
+      const generation = testAccountSession.generation;
+      testAccountSession.invalidate();
+      assert.ok(testAccountSession.generation > generation);
+      const replacement = await createProject('WR8 fresh account generation project');
+      clearTrackedTimers();
+      const currentWatcher = watcherRecords[watcherRecords.length - 1];
+      const beforeRelease = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      testRendererEvents.length = 0;
+      fs.promises.stat = originalStat; gate.release(); await changing;
+      await metadataTestHooks.waitForWatcherIdle(f.project.id);
+      assert.deepEqual(storeInstance.data.projects, beforeRelease);
+      assert.equal(testRendererEvents.filter(event => event.data?.projectId === f.project.id || event.data?.projectId === replacement.id).length, 0);
+      await retiredWatcher.handlers.add(f.paths[0].source);
+      assert.deepEqual(storeInstance.data.projects, beforeRelease, 'retired watcher stays retired after account/project replacement');
+      const currentStored = storeInstance.data.projects.find(project => project.id === replacement.id);
+      await waitForCondition(() => Date.now() > currentStored.watchStartedAt, 'replacement activation clock did not advance');
+      const positiveSource = path.join(TEST_HOME, 'Desktop', 'Created_After_Replacement.ai');
+      writeSyntheticAiFile(positiveSource, f.paths[1].link);
+      await currentWatcher.handlers.add(positiveSource);
+      await metadataTestHooks.waitForWatcherIdle(replacement.id);
+      const after = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      const old = after.find(project => project.id === f.project.id), fresh = after.find(project => project.id === replacement.id);
+      assert.equal(old.status, 'paused'); assert.equal(fresh.status, 'watching');
+      assert.equal([...old.files, ...old.pendingFiles].length, 0);
+      assert.equal(fresh.files.some(file => file.path === f.paths[0].source), false);
+      assert.equal(fresh.files.filter(file => file.path === positiveSource).length, 1, 'current watcher positive control from newly created synthetic source');
+      console.log('WR8_EVIDENCE ' + JSON.stringify({ generation, replacementGeneration: testAccountSession.generation,
+        beforeRelease, after, positiveSource, qualification: 'Synthetic account generation and IPC project replacement; positive file physically created after replacement; no login or process restart' }));
+    } finally {
+      fs.promises.stat = originalStat; gate.release(); if (changing) await changing;
+      await testAccountSession.restore(); await f.cleanup();
+    }
+  });
+
   baselineTest('LD-1 controls: completed baseline ignores re-add, unselected roots and images', async () => {
     const f = await ld1CompletedFixture();
     try {
