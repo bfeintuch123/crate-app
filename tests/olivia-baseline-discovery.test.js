@@ -25,6 +25,7 @@ replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
+  '  getIllustratorPollState(id) { return { scopeRevision: getIllustratorActivationScope(id)?.revision, inProgress: psInProgress.has(id) }; },\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
   '  captureProjectOperation,\n  runScanOnOpen');
 // Exercise the actual retained parser and wire inspection in the complete main
@@ -252,7 +253,7 @@ function baselineCases() {
     });
   }
 
-  async function ld1CompletedFixture() {
+  async function ld1CompletedFixture(beforeFirstAdd = () => {}) {
     const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'B.ai', 'C.ai'], structuredLinks: false });
     const scans = [];
     const originalLog = console.log;
@@ -275,6 +276,7 @@ function baselineCases() {
       return result;
     };
     try {
+      beforeFirstAdd(f);
       assert.ok(Array.isArray(await add(0)));
       const initial = current();
       assert.equal(initial.assetBaseline.status, 'decision-required');
@@ -756,7 +758,7 @@ function baselineCases() {
       `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
       'END\t1\t1\t1\t0',
     ].join('\n');
-    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [] };
+    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [], processCalls: [] };
     const closed = scenario === 'closed' || scenario === 'closed-lookalike-processes';
     const processFailure = scenario.startsWith('process-');
     const inventoryErrors = {
@@ -784,6 +786,8 @@ function baselineCases() {
       if (request.kind === 'execFile' && request.command === '/bin/ps' &&
           request.args.includes('pid=') && request.args.includes('comm=')) {
         counts.processChecks++; counts.enumerations++;
+        counts.processCalls.push({ route: 'selected-source-inventory', kind: request.kind,
+          command: request.command, args: [...request.args] });
         // Model the execFile result contract, not a boolean running-app answer.
         assert.deepEqual(request.args, ['axww', '-o', 'pid=', '-o', 'comm=']);
         assert.equal(request.options.encoding, 'utf8');
@@ -808,6 +812,8 @@ function baselineCases() {
       }
       if (request.kind === 'exec' && String(request.command).includes("grep -i 'Adobe InDesign'")) {
         counts.processChecks++;
+        counts.processCalls.push({ route: 'background-indesign-observer', kind: request.kind,
+          command: request.command, args: [...request.args] });
         if (scenario === 'process-policy-denied') {
           return { error: Object.assign(new Error('synthetic process policy denial'), { code: 'EPERM' }) };
         }
@@ -833,10 +839,198 @@ function baselineCases() {
         // The shared harness may finish another app's modeled callback here.
         // Retain it separately; only InDesign's observer could rescue this scan.
         (script === 'crate-indd-poll.applescript' ? counts.observerScripts : counts.otherObserverScripts).push(script);
+        if (script === 'crate-ai-active-session.applescript') {
+          return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+        }
       }
       return { stdout: '' };
     });
     return { source, savedLink, liveLink, otherLink, counts };
+  }
+
+  for (const scenario of ['running-no-documents', 'closed-lookalike-processes']) {
+    for (const foreignOutput of ['fixture', 'empty-control']) {
+      baselineTest(`LD-1 M1 InDesign callback replacement: ${scenario}/${foreignOutput}`, async () => {
+        const pollGate = deferred(), readGate = deferred();
+        const chronology = [];
+        let held = false, readEntered = false, pending, f;
+        let restoreReads = () => {};
+        try {
+          f = await ld1CompletedFixture(() => {
+            const originalHandler = childProcessHandler;
+            setChildProcessHandler(request => {
+              if (!held && isIllustratorPgrepCheck(request)) {
+                held = true;
+                chronology.push('original-admission-poll-held');
+                return pollGate.promise.then(() => originalHandler(request));
+              }
+              return originalHandler(request);
+            });
+          });
+          assert.equal(held, true, 'hold the actual poll started by A admission');
+          assert.equal(metadataTestHooks.getIllustratorPollState(f.project.id).inProgress, true);
+          const d = ld1InDesignFixture(f, scenario);
+          const inDesignHandler = childProcessHandler;
+          setChildProcessHandler(request => {
+            const result = inDesignHandler(request);
+            if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+              chronology.push('foreign-illustrator-script-dispatched');
+              if (foreignOutput === 'empty-control') return { stdout: '' };
+            }
+            return result;
+          });
+          chronology.push('indesign-handler-installed');
+          restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+            if (path.resolve(filePath) === d.source && !readEntered) {
+              readEntered = true;
+              chronology.push('selected-source-verification-read-held');
+              await readGate.promise;
+            }
+            return read();
+          });
+          pending = f.begin([d.source]);
+          await waitForCondition(() => readEntered, 'selected-source verification did not reach the read gate');
+          const before = metadataTestHooks.getIllustratorPollState(f.project.id);
+          chronology.push('original-poll-released');
+          pollGate.release();
+          await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'original poll did not settle across handler replacement');
+          const after = metadataTestHooks.getIllustratorPollState(f.project.id);
+          chronology.push('original-poll-settled');
+          readGate.release();
+          const result = await pending;
+          await metadataTestHooks.waitForWatcherIdle(f.project.id);
+          const project = f.current();
+          const source = project.files.find(file => file.path === d.source);
+          const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+          console.log('LD1_CALLBACK_REPLACEMENT_EVIDENCE ' + JSON.stringify({ scenario, foreignOutput,
+            chronology, before, after, result, verification: record, counters: d.counts }));
+          assert.deepEqual(chronology, ['original-admission-poll-held', 'indesign-handler-installed',
+            'selected-source-verification-read-held', 'original-poll-released',
+            'foreign-illustrator-script-dispatched', 'original-poll-settled']);
+          assert.deepEqual(d.counts.otherObserverScripts, ['crate-ai-active-session.applescript']);
+          const noQuery = scenario === 'closed-lookalike-processes';
+          assert.deepEqual(d.counts.observerScripts, noQuery ? [] : ['crate-indd-poll.applescript']);
+          if (foreignOutput === 'empty-control') {
+            assert.equal(result, null, 'invalid foreign output must still retire the production lease');
+            assert.equal(after.scopeRevision, before.scopeRevision + 1);
+            assert.equal(record?.status, 'pending');
+            assert.equal(project.files.some(file => file.path === d.savedLink), false);
+          } else {
+            assert.ok(Array.isArray(result), 'valid foreign callback must preserve the InDesign operation');
+            assert.equal(after.scopeRevision, before.scopeRevision);
+            assert.equal(record?.status, 'scanned');
+            assert.equal(record.provider, 'ordinary-indd');
+            assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(d.source)).digest('hex'));
+            assert.ok(record.notes.includes('saved-byte-regex-fallback'));
+            assert.deepEqual(record.unresolved, []);
+            assert.equal(project.files.filter(file => file.path === d.savedLink).length, 1);
+            assert.ok(record.requiredReferences.some(ref => ref.path === d.savedLink));
+          }
+          assert.equal(d.counts.processChecks, foreignOutput === 'empty-control' ? 1 : 2);
+          assert.equal(d.counts.queries, foreignOutput === 'empty-control' || noQuery ? 0 : 1);
+          assert.equal([...project.files, ...project.pendingFiles].some(file => [d.liveLink, d.otherLink].includes(file.path)), false);
+          assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+          assert.deepEqual(project.pendingFiles, []);
+          f.assertPrior();
+        } finally {
+          pollGate.release(); readGate.release();
+          if (pending) await pending;
+          if (f) await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'original callback cleanup did not settle');
+          restoreReads();
+          if (f) await f.cleanup();
+        }
+      });
+    }
+  }
+
+  for (const scenario of ['process-unknown', 'process-stderr']) {
+    for (const timing of ['prior-poll-running', 'prior-poll-settled']) {
+      baselineTest(`LD-1 M1 InDesign process count timing: ${scenario}/${timing}`, async () => {
+        const priorGate = deferred(), laterGate = deferred();
+        const chronology = [];
+        let priorHeld = false, laterHeld = false, pending, f;
+        try {
+          f = await ld1CompletedFixture(() => {
+            const originalHandler = childProcessHandler;
+            setChildProcessHandler(request => {
+              if (!priorHeld && isIllustratorPgrepCheck(request)) {
+                priorHeld = true; chronology.push('prior-admission-poll-held');
+                return priorGate.promise.then(() => originalHandler(request));
+              }
+              return originalHandler(request);
+            });
+          });
+          assert.equal(priorHeld, true);
+          if (timing === 'prior-poll-settled') {
+            priorGate.release();
+            await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+              'prior poll did not settle before handler replacement');
+            chronology.push('prior-poll-settled-before-replacement');
+          }
+          const d = ld1InDesignFixture(f, scenario);
+          const inDesignHandler = childProcessHandler;
+          setChildProcessHandler(request => {
+            if (timing === 'prior-poll-settled' && !laterHeld && isIllustratorPgrepCheck(request)) {
+              laterHeld = true; chronology.push('later-admission-poll-held');
+              return laterGate.promise.then(() => inDesignHandler(request));
+            }
+            return inDesignHandler(request);
+          });
+          chronology.push('indesign-handler-installed');
+          pending = f.add(d.source);
+          const result = await pending;
+          chronology.push('selected-source-operation-settled');
+          const before = structuredClone(d.counts);
+          const pollBefore = metadataTestHooks.getIllustratorPollState(f.project.id);
+          assert.equal(pollBefore.inProgress, true);
+          assert.equal(laterHeld, timing === 'prior-poll-settled');
+          assert.equal(before.processChecks, 1);
+          assert.equal(before.enumerations, 1);
+          assert.deepEqual(before.processCalls, [{ route: 'selected-source-inventory', kind: 'execFile',
+            command: '/bin/ps', args: ['axww', '-o', 'pid=', '-o', 'comm='] }]);
+          priorGate.release(); laterGate.release();
+          chronology.push('background-poll-released');
+          await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'background poll did not settle before count assertion');
+          chronology.push('background-poll-settled');
+          const after = structuredClone(d.counts);
+          const pollAfter = metadataTestHooks.getIllustratorPollState(f.project.id);
+          const project = f.current();
+          const source = project.files.find(file => file.path === d.source);
+          const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+          console.log('LD1_PROCESS_COUNT_TIMING_EVIDENCE ' + JSON.stringify({ scenario, timing,
+            chronology, before, after, pollBefore, pollAfter, result, verification: record }));
+          assertAddFilesPartialScanFailure(result);
+          assert.equal(result.failedCount, 1); assert.equal(result.completedCount, 0);
+          assert.equal(record?.status, 'failed');
+          assert.equal(record.notes?.includes('saved-byte-regex-fallback') || false, false);
+          assert.equal([...project.files, ...project.pendingFiles].some(file =>
+            [d.savedLink, d.liveLink, d.otherLink].includes(file.path)), false);
+          assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+          assert.deepEqual(project.pendingFiles, []);
+          assert.equal(pollAfter.scopeRevision, pollBefore.scopeRevision);
+          assert.equal(after.processChecks, 2); assert.equal(after.enumerations, 1);
+          assert.equal(after.queries, 0); assert.deepEqual(after.observerScripts, []);
+          assert.deepEqual(after.processCalls, [before.processCalls[0], {
+            route: 'background-indesign-observer', kind: 'exec',
+            command: "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep", args: [],
+          }]);
+          assert.deepEqual(after.otherObserverScripts,
+            timing === 'prior-poll-running' ? ['crate-ai-active-session.applescript'] : []);
+          f.assertPrior();
+        } finally {
+          priorGate.release(); laterGate.release();
+          if (pending) await pending;
+          if (f) {
+            await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+              'process count timing cleanup did not settle');
+            await f.cleanup();
+          }
+        }
+      });
+    }
   }
 
   for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
@@ -848,10 +1042,14 @@ function baselineCases() {
     'process-blank-row', 'process-stderr']) {
     baselineTest(`LD-1 M1 InDesign: ${scenario}`, async () => {
       const f = await ld1CompletedFixture();
-      const d = ld1InDesignFixture(f, scenario);
-      const originalBytes = fs.readFileSync(d.source);
       try {
+        await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+          'prior admission poll did not settle before InDesign handler replacement');
+        const d = ld1InDesignFixture(f, scenario);
+        const originalBytes = fs.readFileSync(d.source);
         const result = await f.add(d.source);
+        await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+          'InDesign admission poll did not settle before observer count assertions');
         const project = f.current();
         const source = project.files.find(file => file.path === d.source);
         const record = metadataTestHooks.getWorkingSourceVerification(project, source);
@@ -864,6 +1062,8 @@ function baselineCases() {
           ? [] : ['crate-indd-poll.applescript']);
         if (scenario === 'process-malformed') assert.ok(d.counts.otherObserverScripts.includes('crate-ai-active-session.applescript'));
         assert.equal(d.counts.processChecks, 2);
+        assert.equal(d.counts.processCalls.filter(call => call.route === 'selected-source-inventory').length, 1);
+        assert.equal(d.counts.processCalls.filter(call => call.route === 'background-indesign-observer').length, 1);
         assert.equal(d.counts.queries, noQuery ? 0 : 1);
         assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
         if (success) {
