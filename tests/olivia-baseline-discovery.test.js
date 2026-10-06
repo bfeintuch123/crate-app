@@ -476,7 +476,7 @@ function baselineCases() {
       `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
       'END\t1\t1\t1\t0',
     ].join('\n');
-    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [] };
+    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [] };
     const closed = scenario === 'closed' || scenario === 'closed-lookalike-processes';
     const processFailure = scenario.startsWith('process-');
     const inventoryErrors = {
@@ -509,6 +509,11 @@ function baselineCases() {
         assert.equal(request.options.encoding, 'utf8');
         assert.equal(request.options.timeout, 3000);
         assert.equal(request.options.maxBuffer, 4 * 1024 * 1024);
+        if (scenario === 'process-malformed') {
+          // Deterministically model the foreign callback observed in full CI.
+          // This harness helper dispatches a mocked result; it runs no process.
+          getChildProcessResult('execFile', '/usr/bin/osascript', [path.join(TEST_HOME, 'crate-ai-active-session.applescript')]);
+        }
         if (inventoryErrors[scenario]) return { error: Object.assign(new Error('synthetic process invocation failure'),
           { stdout: validClosedInventory, stderr: '' }, inventoryErrors[scenario]) };
         if (Object.hasOwn(invalidInventories, scenario)) return { stdout: invalidInventories[scenario], stderr: '' };
@@ -543,7 +548,12 @@ function baselineCases() {
         if (scenario === 'snapshot-source-change') fs.appendFileSync(source, `changed bytes\n${otherLink}\n`);
         return { stdout: scenario === 'selected-present' ? selected : scenario === 'running-no-documents' ? 'END\t0\t0\t0\t0' : other };
       }
-      if (request.kind === 'execFile' && request.command === '/usr/bin/osascript') counts.observerScripts.push(path.basename(request.args[0]));
+      if (request.kind === 'execFile' && request.command === '/usr/bin/osascript') {
+        const script = path.basename(request.args[0]);
+        // The shared harness may finish another app's modeled callback here.
+        // Retain it separately; only InDesign's observer could rescue this scan.
+        (script === 'crate-indd-poll.applescript' ? counts.observerScripts : counts.otherObserverScripts).push(script);
+      }
       return { stdout: '' };
     });
     return { source, savedLink, liveLink, otherLink, counts };
@@ -572,6 +582,7 @@ function baselineCases() {
         // empty; only the selected-source query can produce these links.
         assert.deepEqual(d.counts.observerScripts, noQuery
           ? [] : ['crate-indd-poll.applescript']);
+        if (scenario === 'process-malformed') assert.ok(d.counts.otherObserverScripts.includes('crate-ai-active-session.applescript'));
         assert.equal(d.counts.processChecks, 2);
         assert.equal(d.counts.queries, noQuery ? 0 : 1);
         assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
