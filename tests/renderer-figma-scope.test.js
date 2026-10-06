@@ -2557,6 +2557,159 @@ test('Review Assets virtualizes 30, 263, and 500 asset datasets without default 
   }
 });
 
+// Optional data-only input for reproducing a separately prepared workload.
+// CI uses the same existing generator; this never loads a native harness.
+for (const workload of [
+  { file: 'small-30.json', assetCount: 30 },
+  { file: 'reference-263.json', assetCount: 263 },
+  { file: 'large-500.json', assetCount: 500 },
+  { file: 'mixed-500.json', assetCount: 500, pendingCount: 8, excludedCount: 25 },
+  { file: 'paused-mixed-500.json', assetCount: 500, pendingCount: 8, excludedCount: 25, status: 'paused' },
+]) test(`renderer workload actions: ${workload.file}`, async t => {
+  const inputDirectory = process.env.CRATE_RENDERER_WORKLOAD_DIR;
+  let current = inputDirectory
+    ? JSON.parse(fs.readFileSync(path.join(inputDirectory, workload.file), 'utf8'))
+    : createUiSmoothnessFixture(workload);
+  const pendingCount = workload.pendingCount || 0;
+  const excludedCount = workload.excludedCount || 0;
+  const status = workload.status || 'watching';
+  const assets = current.workspace.files.filter(file => file.projectRole === 'asset');
+  assert.equal(assets.length, workload.assetCount);
+  assert.equal(current.workspace.pendingFiles.length, pendingCount);
+  assert.equal(assets.filter(file => file.excluded).length, excludedCount);
+  assert.equal(current.project.status, status);
+  assert.equal(current.workspace.projectId, current.project.id);
+  assert.deepEqual(current.project.files, current.workspace.files);
+  assert.deepEqual(current.project.pendingFiles, current.workspace.pendingFiles);
+
+  const { document, elements } = createInteractiveRendererDom();
+  let workspaceReads = 0;
+  let previewCalls = 0;
+  let dashboardPreviewCalls = 0;
+  const renderer = loadRendererHelpers(document, { crate: {
+    getAssetWorkspace: async projectId => {
+      assert.equal(projectId, current.project.id);
+      workspaceReads += 1;
+      return current.workspace;
+    },
+    getFileVisual: async () => { previewCalls += 1; return { kind: 'fallback' }; },
+  } });
+  const timingsMs = {};
+  const checkpoints = [];
+  const measure = async (name, action) => {
+    const start = process.hrtime.bigint();
+    await action();
+    timingsMs[name] = Number(process.hrtime.bigint() - start) / 1e6;
+  };
+  const bindProject = () => {
+    renderer.workloadProject = current.project;
+    vm.runInContext('state.projects = [workloadProject]; state.selectedProjectId = workloadProject.id;', renderer);
+  };
+  const lists = ['existing-assets-list', 'added-assets-list', 'pending-file-list'];
+  const checkpoint = name => {
+    const mounted = Object.fromEntries(lists.map(id => [id, elements[id].children.length]));
+    for (const count of Object.values(mounted)) assert.ok(count <= 36);
+    assert.equal(previewCalls, dashboardPreviewCalls, 'review actions do not request additional previews');
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.existing.length', renderer), 7);
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.added.length', renderer), workload.assetCount - 7);
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.missing.length', renderer), pendingCount);
+    assert.equal(vm.runInContext('state.assetReviewLogicalItems.added.filter(file => file.excluded).length', renderer), excludedCount);
+    assertNormalWorkingFileFlow(elements['project-file-list'], 4);
+    checkpoints.push({ name, mounted, workspaceReads, previewCalls });
+  };
+  bindProject();
+  elements['tab-projects'].classList.remove('active');
+  elements['tab-current-project'].classList.add('active');
+  await measure('initialRender', () => renderer.renderFiles());
+  // Recent dashboard cards intentionally request previews. Settle their
+  // mocked queue before accounting for the no-default-preview review surface.
+  await new Promise(resolve => setImmediate(resolve));
+  dashboardPreviewCalls = previewCalls;
+  assert.equal(dashboardPreviewCalls, 5);
+  await measure('openReview', () => renderer.openAssetReviewWorkspace());
+  checkpoint('open');
+  const list = elements['added-assets-list'];
+  list.clientHeight = 460;
+  await measure('scrollMiddle', () => {
+    list.scrollTop = Math.floor((workload.assetCount - 7) / 2) * 58;
+    list.dispatchEvent({ type: 'scroll' });
+  });
+  checkpoint('middle');
+  await measure('scrollEnd', () => {
+    list.scrollTop = Number.MAX_SAFE_INTEGER;
+    list.dispatchEvent({ type: 'scroll' });
+  });
+  assert.equal(list.children.at(-1).getAttribute('aria-posinset'), String(workload.assetCount - 7));
+  checkpoint('end');
+  await measure('search', () => {
+    vm.runInContext("state.assetReviewQuery = 'synthetic_smoothness_asset_0250';", renderer);
+    renderer.applyAssetReviewFilter();
+  });
+  assert.equal(list.children.length, workload.assetCount >= 250 ? 1 : 0);
+  if (list.children.length) assert.match(getElementTreeText(list.children[0]), /0250/);
+  checkpoint('search');
+
+  if (pendingCount) {
+    vm.runInContext("state.assetReviewFilter = 'missing'; state.assetReviewQuery = '';", renderer);
+    renderer.applyAssetReviewFilter();
+    assert.equal(elements['pending-file-list'].__assetReviewVirtualState.items.length, pendingCount);
+    checkpoint('missing');
+    vm.runInContext("state.assetReviewFilter = 'excluded';", renderer);
+    renderer.applyAssetReviewFilter();
+    assert.equal(list.__assetReviewVirtualState.items.length, excludedCount);
+    checkpoint('excluded');
+  }
+  await measure('clearAndSelect', () => {
+    vm.runInContext("state.assetReviewFilter = 'added'; state.assetReviewQuery = 'synthetic';", renderer);
+    list.scrollTop = 0;
+    renderer.applyAssetReviewFilter();
+    list.children[0].click();
+    elements['asset-review-search'].value = 'synthetic';
+    elements['asset-review-search'].focus();
+    elements['app-content'].scrollTop = 317;
+  });
+  const selectedRow = list.children[0];
+  const selectedKey = selectedRow.dataset.renderKey;
+  const assertRetainedInteraction = () => {
+    assert.equal(list.children[0], selectedRow);
+    assert.equal(vm.runInContext('state.assetReviewSelectedKey', renderer), selectedKey);
+    assert.equal(selectedRow.getAttribute('aria-selected'), 'true');
+    assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'added');
+    assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'synthetic');
+    assert.equal(document.activeElement, elements['asset-review-search']);
+    assert.equal(elements['app-content'].scrollTop, 317);
+    assert.equal(current.project.status, status);
+  };
+  current = cloneTestValue(current);
+  bindProject();
+  await measure('identicalRefresh', () => renderer.renderFiles());
+  assertRetainedInteraction();
+  checkpoint('identicalRefresh');
+
+  current = cloneTestValue(current);
+  const changed = current.workspace.files.filter(file => file.projectRole === 'asset' && file.assetOrigin === 'added' && !file.excluded)[1];
+  const renamed = 'Synthetic changed unselected row.png';
+  for (const files of [current.project.files, current.workspace.files]) {
+    const file = files.find(item => item.visualIdentity === changed.visualIdentity);
+    file.name = renamed;
+    file.visualRevision += '-changed';
+  }
+  bindProject();
+  await measure('changedRefresh', () => renderer.renderFiles());
+  assertRetainedInteraction();
+  assert.ok(getElementTreeText(list).includes(renamed));
+  checkpoint('changedRefresh');
+  assert.equal(workspaceReads, 3);
+  t.diagnostic(JSON.stringify({
+    workload: workload.file,
+    fixtureSource: inputDirectory ? 'prepared-json' : 'existing-generator',
+    assetCount: workload.assetCount, pendingCount, excludedCount, status,
+    workspaceReads, dashboardPreviewCalls, reviewPreviewCalls: previewCalls - dashboardPreviewCalls,
+    previewCalls, checkpoints, timingsMs,
+    qualification: 'One Node/VM sample per action; no desktop timing or performance acceptance claim.',
+  }));
+});
+
 test('Review Assets preserves filter, selection, focus, and stable row identity across refresh', async () => {
   const fixture = createUiSmoothnessFixture({ assetCount: 30 });
   const { document, elements } = createInteractiveRendererDom();
