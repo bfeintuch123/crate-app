@@ -25,6 +25,7 @@ replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
+  '  getIllustratorPollState(id) { return { scopeRevision: getIllustratorActivationScope(id)?.revision, inProgress: psInProgress.has(id) }; },\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
   '  captureProjectOperation,\n  runScanOnOpen');
 // Exercise the actual retained parser and wire inspection in the complete main
@@ -252,7 +253,7 @@ function baselineCases() {
     });
   }
 
-  async function ld1CompletedFixture() {
+  async function ld1CompletedFixture(beforeFirstAdd = () => {}) {
     const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'B.ai', 'C.ai'], structuredLinks: false });
     const scans = [];
     const originalLog = console.log;
@@ -275,6 +276,7 @@ function baselineCases() {
       return result;
     };
     try {
+      beforeFirstAdd(f);
       assert.ok(Array.isArray(await add(0)));
       const initial = current();
       assert.equal(initial.assetBaseline.status, 'decision-required');
@@ -833,10 +835,110 @@ function baselineCases() {
         // The shared harness may finish another app's modeled callback here.
         // Retain it separately; only InDesign's observer could rescue this scan.
         (script === 'crate-indd-poll.applescript' ? counts.observerScripts : counts.otherObserverScripts).push(script);
+        if (script === 'crate-ai-active-session.applescript') {
+          return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+        }
       }
       return { stdout: '' };
     });
     return { source, savedLink, liveLink, otherLink, counts };
+  }
+
+  for (const scenario of ['running-no-documents', 'closed-lookalike-processes']) {
+    for (const foreignOutput of ['fixture', 'empty-control']) {
+      baselineTest(`LD-1 M1 InDesign callback replacement: ${scenario}/${foreignOutput}`, async () => {
+        const pollGate = deferred(), readGate = deferred();
+        const chronology = [];
+        let held = false, readEntered = false, pending, f;
+        let restoreReads = () => {};
+        try {
+          f = await ld1CompletedFixture(() => {
+            const originalHandler = childProcessHandler;
+            setChildProcessHandler(request => {
+              if (!held && isIllustratorPgrepCheck(request)) {
+                held = true;
+                chronology.push('original-admission-poll-held');
+                return pollGate.promise.then(() => originalHandler(request));
+              }
+              return originalHandler(request);
+            });
+          });
+          assert.equal(held, true, 'hold the actual poll started by A admission');
+          assert.equal(metadataTestHooks.getIllustratorPollState(f.project.id).inProgress, true);
+          const d = ld1InDesignFixture(f, scenario);
+          const inDesignHandler = childProcessHandler;
+          setChildProcessHandler(request => {
+            const result = inDesignHandler(request);
+            if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+              chronology.push('foreign-illustrator-script-dispatched');
+              if (foreignOutput === 'empty-control') return { stdout: '' };
+            }
+            return result;
+          });
+          chronology.push('indesign-handler-installed');
+          restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+            if (path.resolve(filePath) === d.source && !readEntered) {
+              readEntered = true;
+              chronology.push('selected-source-verification-read-held');
+              await readGate.promise;
+            }
+            return read();
+          });
+          pending = f.begin([d.source]);
+          await waitForCondition(() => readEntered, 'selected-source verification did not reach the read gate');
+          const before = metadataTestHooks.getIllustratorPollState(f.project.id);
+          chronology.push('original-poll-released');
+          pollGate.release();
+          await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'original poll did not settle across handler replacement');
+          const after = metadataTestHooks.getIllustratorPollState(f.project.id);
+          chronology.push('original-poll-settled');
+          readGate.release();
+          const result = await pending;
+          await metadataTestHooks.waitForWatcherIdle(f.project.id);
+          const project = f.current();
+          const source = project.files.find(file => file.path === d.source);
+          const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+          console.log('LD1_CALLBACK_REPLACEMENT_EVIDENCE ' + JSON.stringify({ scenario, foreignOutput,
+            chronology, before, after, result, verification: record, counters: d.counts }));
+          assert.deepEqual(chronology, ['original-admission-poll-held', 'indesign-handler-installed',
+            'selected-source-verification-read-held', 'original-poll-released',
+            'foreign-illustrator-script-dispatched', 'original-poll-settled']);
+          assert.deepEqual(d.counts.otherObserverScripts, ['crate-ai-active-session.applescript']);
+          const noQuery = scenario === 'closed-lookalike-processes';
+          assert.deepEqual(d.counts.observerScripts, noQuery ? [] : ['crate-indd-poll.applescript']);
+          if (foreignOutput === 'empty-control') {
+            assert.equal(result, null, 'invalid foreign output must still retire the production lease');
+            assert.equal(after.scopeRevision, before.scopeRevision + 1);
+            assert.equal(record?.status, 'pending');
+            assert.equal(project.files.some(file => file.path === d.savedLink), false);
+          } else {
+            assert.ok(Array.isArray(result), 'valid foreign callback must preserve the InDesign operation');
+            assert.equal(after.scopeRevision, before.scopeRevision);
+            assert.equal(record?.status, 'scanned');
+            assert.equal(record.provider, 'ordinary-indd');
+            assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(fs.readFileSync(d.source)).digest('hex'));
+            assert.ok(record.notes.includes('saved-byte-regex-fallback'));
+            assert.deepEqual(record.unresolved, []);
+            assert.equal(project.files.filter(file => file.path === d.savedLink).length, 1);
+            assert.ok(record.requiredReferences.some(ref => ref.path === d.savedLink));
+          }
+          assert.equal(d.counts.processChecks, foreignOutput === 'empty-control' ? 1 : 2);
+          assert.equal(d.counts.queries, foreignOutput === 'empty-control' || noQuery ? 0 : 1);
+          assert.equal([...project.files, ...project.pendingFiles].some(file => [d.liveLink, d.otherLink].includes(file.path)), false);
+          assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+          assert.deepEqual(project.pendingFiles, []);
+          f.assertPrior();
+        } finally {
+          pollGate.release(); readGate.release();
+          if (pending) await pending;
+          if (f) await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'original callback cleanup did not settle');
+          restoreReads();
+          if (f) await f.cleanup();
+        }
+      });
+    }
   }
 
   for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
