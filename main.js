@@ -14256,13 +14256,39 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
 
   try {
     // Check if InDesign is running
-    const { stdout: psCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(error => {
-      if (options.ordinaryVerification && options.verifySelectedSource !== true) return { stdout: '' };
-      throw error;
-    });
+    let psCheck;
+    if (options.ordinaryVerification === true && options.verifySelectedSource === true) {
+      // Enumerate directly: a shell grep no-match rejects even when ps succeeds.
+      // Only a complete successful inventory may establish that InDesign is closed.
+      const inventory = await execFileAsync('/bin/ps', ['axww', '-o', 'pid=', '-o', 'comm='], {
+        timeout: 3000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+      });
+      if (typeof inventory.stdout !== 'string' || typeof inventory.stderr !== 'string' ||
+          inventory.stderr.trim() || !inventory.stdout.endsWith('\n') || !inventory.stdout.trim()) {
+        throw new Error('asset_baseline_indesign_process_inventory_invalid');
+      }
+      const pids = new Set();
+      const commands = inventory.stdout.slice(0, -1).split('\n').map(line => {
+        const row = /^\s*(0|[1-9]\d*)\s+(.+?)\s*$/.exec(line);
+        const pid = row && Number(row[1]);
+        const command = row && row[2];
+        if (!row || !Number.isSafeInteger(pid) || pids.has(pid) || /[\x00-\x1f\x7f]/.test(command) ||
+            !(command.startsWith('/') || /^[A-Za-z0-9_.+-]+(?: [A-Za-z0-9_.+-]+)*$/.test(command))) {
+          throw new Error('asset_baseline_indesign_process_inventory_invalid');
+        }
+        pids.add(pid);
+        return command;
+      });
+      psCheck = commands.filter(command => /^(?:Adobe )?InDesign$/i.test(path.basename(command))).join('\n');
+    } else {
+      ({ stdout: psCheck } = await execAsync(
+        "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
+        { timeout: 3000, encoding: 'utf8' }
+      ).catch(error => {
+        if (options.ordinaryVerification && options.verifySelectedSource !== true) return { stdout: '' };
+        throw error;
+      }));
+    }
 
     if (!psCheck.trim()) {
       if (strict && !options.ordinaryVerification) throw new Error('asset_baseline_indesign_unavailable');

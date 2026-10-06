@@ -476,14 +476,61 @@ function baselineCases() {
       `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
       'END\t1\t1\t1\t0',
     ].join('\n');
-    const counts = { processChecks: 0, queries: 0, observerScripts: [] };
+    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [] };
+    const closed = scenario === 'closed' || scenario === 'closed-lookalike-processes';
+    const processFailure = scenario.startsWith('process-');
+    const inventoryErrors = {
+      'process-invocation-failure': { code: 'ENOENT' },
+      'process-exit-one': { code: 1, killed: false, signal: null },
+      'process-policy-denied': { code: 'EPERM' },
+      'process-access-denied': { code: 'EACCES' },
+      'process-timeout': { code: null, killed: true, signal: 'SIGTERM' },
+      'process-signal': { code: null, killed: false, signal: 'SIGKILL' },
+      'process-overflow': { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed: true },
+    };
+    const validClosedInventory = '    0 kernel_task\n    1 /sbin/launchd\n  432 /bin/ps\n';
+    const invalidInventories = {
+      'process-empty': '',
+      'process-unknown': 'unknown process inventory\n',
+      'process-malformed': 'not-a-pid /sbin/launchd\n',
+      'process-truncated': validClosedInventory.trimEnd(),
+      'process-duplicate-pid': validClosedInventory + '432 /bin/zsh\n',
+      'process-invalid-pid': '9007199254740992 /bin/ps\n',
+      'process-unknown-command': '432 ???\n',
+      'process-control-byte': '432 /bin/p\0s\n',
+      'process-blank-row': validClosedInventory + '\n',
+    };
     setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/bin/ps' &&
+          request.args.includes('pid=') && request.args.includes('comm=')) {
+        counts.processChecks++; counts.enumerations++;
+        // Model the execFile result contract, not a boolean running-app answer.
+        assert.deepEqual(request.args, ['axww', '-o', 'pid=', '-o', 'comm=']);
+        assert.equal(request.options.encoding, 'utf8');
+        assert.equal(request.options.timeout, 3000);
+        assert.equal(request.options.maxBuffer, 4 * 1024 * 1024);
+        if (inventoryErrors[scenario]) return { error: Object.assign(new Error('synthetic process invocation failure'),
+          { stdout: validClosedInventory, stderr: '' }, inventoryErrors[scenario]) };
+        if (Object.hasOwn(invalidInventories, scenario)) return { stdout: invalidInventories[scenario], stderr: '' };
+        if (scenario === 'process-stderr') return { stdout: validClosedInventory, stderr: 'ps: incomplete result' };
+        if (scenario === 'closed-lookalike-processes') return { stdout: validClosedInventory +
+          '555 /Applications/Adobe InDesign Server.app/Contents/MacOS/Adobe InDesign Server\n' +
+          '556 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign Helper\n', stderr: '' };
+        if (closed) return { stdout: validClosedInventory, stderr: '' };
+        const command = scenario === 'running-bare-name' ? 'Adobe InDesign' :
+          '/Applications/Adobe InDesign 2026/Adobe InDesign 2026.app/Contents/MacOS/Adobe InDesign';
+        return { stdout: validClosedInventory + `555 ${command}\n`, stderr: '' };
+      }
       if (request.kind === 'exec' && String(request.command).includes("grep -i 'Adobe InDesign'")) {
         counts.processChecks++;
         if (scenario === 'process-policy-denied') {
           return { error: Object.assign(new Error('synthetic process policy denial'), { code: 'EPERM' }) };
         }
-        return { stdout: scenario === 'closed' ? '' : '/Applications/Adobe InDesign/Adobe InDesign' };
+        // exec rejects the original grep pipeline when no process matches.
+        // A successful empty stdout would mask the selected-source regression.
+        if (closed || processFailure) return { error: Object.assign(
+          new Error('synthetic grep pipeline no-match'), { code: 1, killed: false, signal: null, stdout: '', stderr: '' }) };
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign' };
       }
       if (isOsascriptInvocation(request, 'crate-indd-query.applescript')) {
         counts.queries++;
@@ -504,7 +551,11 @@ function baselineCases() {
 
   for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
     'malformed', 'count-mismatch', 'query-error-count', 'script-query-failure', 'script-automation-denied', 'process-policy-denied',
-    'snapshot-source-change']) {
+    'snapshot-source-change', 'running-bare-name', 'closed-lookalike-processes',
+    'process-invocation-failure', 'process-exit-one', 'process-access-denied', 'process-timeout', 'process-signal',
+    'process-overflow', 'process-empty', 'process-unknown', 'process-malformed', 'process-truncated',
+    'process-duplicate-pid', 'process-invalid-pid', 'process-unknown-command', 'process-control-byte',
+    'process-blank-row', 'process-stderr']) {
     baselineTest(`LD-1 M1 InDesign: ${scenario}`, async () => {
       const f = await ld1CompletedFixture();
       const d = ld1InDesignFixture(f, scenario);
@@ -514,14 +565,15 @@ function baselineCases() {
         const project = f.current();
         const source = project.files.find(file => file.path === d.source);
         const record = metadataTestHooks.getWorkingSourceVerification(project, source);
-        const success = ['running-other-document', 'running-no-documents', 'selected-present', 'closed'].includes(scenario);
+        const success = ['running-other-document', 'running-no-documents', 'selected-present', 'closed', 'running-bare-name', 'closed-lookalike-processes'].includes(scenario);
+        const noQuery = scenario.startsWith('process-') || ['closed', 'closed-lookalike-processes'].includes(scenario);
         console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario, counters: d.counts, before: f.baseline, after: project, result }));
         // Add Files also refreshes the live observer. Its modeled output is
         // empty; only the selected-source query can produce these links.
-        assert.deepEqual(d.counts.observerScripts, ['closed', 'process-policy-denied'].includes(scenario)
+        assert.deepEqual(d.counts.observerScripts, noQuery
           ? [] : ['crate-indd-poll.applescript']);
         assert.equal(d.counts.processChecks, 2);
-        assert.equal(d.counts.queries, ['closed', 'process-policy-denied'].includes(scenario) ? 0 : 1);
+        assert.equal(d.counts.queries, noQuery ? 0 : 1);
         assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
         if (success) {
           assert.ok(Array.isArray(result), 'valid non-open saved source must not cause a partial failure');
@@ -555,6 +607,7 @@ function baselineCases() {
         assert.equal([...project.files, ...project.pendingFiles].some(file => file.path === d.otherLink), false);
         assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
         assert.deepEqual(project.pendingFiles, []);
+        assert.equal(d.counts.enumerations, 1);
         f.assertPrior();
       } finally { await f.cleanup(); }
     });
@@ -573,6 +626,47 @@ function baselineCases() {
       assert.equal(project.files.some(file => file.path === d.savedLink || file.path === d.otherLink), false);
       assert.equal(d.counts.queries, 1);
       console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline', after: project, result }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 M1 InDesign: strict first baseline still rejects real closed-process no-match', async () => {
+    const f = await fixture({ sources: 2, structuredLinks: false });
+    const d = ld1InDesignFixture(f, 'closed');
+    try {
+      manualDialogFor([d.source]);
+      const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      assertAddFilesPartialScanFailure(result);
+      const project = JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      assert.equal(project.assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(project.assetBaseline.establishedAt, null);
+      assert.equal(project.files.some(file => file.path === d.savedLink || file.path === d.otherLink), false);
+      assert.equal(d.counts.enumerations, 0); assert.equal(d.counts.queries, 0);
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline-closed', counters: d.counts, after: project, result }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 M1 InDesign: Restore still rejects a valid running snapshot missing the selected document', async () => {
+    const f = await ld1CompletedFixture();
+    let d = ld1InDesignFixture(f, 'selected-present');
+    try {
+      assert.ok(Array.isArray(await f.add(d.source)));
+      let row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Later.indd');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision })).success, true);
+      // Same physical saved source; only the modeled live document changes.
+      d = ld1InDesignFixture(f, 'running-other-document');
+      row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Later.indd');
+      const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'restore', expectedRevision: row.selectionRevision });
+      assert.equal(result.success, true);
+      assert.equal(result.verificationStatus, 'failed');
+      assert.equal(d.counts.enumerations, 0); assert.equal(d.counts.queries, 1);
+      const project = f.current();
+      assert.equal(project.files.some(file => file.path === d.otherLink), false);
+      assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+      assert.equal(metadataTestHooks.getWorkingSourceMembership(project).blocked, true);
+      f.assertPrior();
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-restore-missing-selected', counters: d.counts, after: project, result }));
     } finally { await f.cleanup(); }
   });
 
