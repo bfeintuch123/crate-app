@@ -12421,7 +12421,7 @@ function parseInDesignActiveSessionOutput(output) {
   return { documents, links, diagnostics };
 }
 
-function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
+function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath, { allowMissingSelectedSource = false } = {}) {
   const rows = String(output || '').split('\n').map(line => line.trim()).filter(Boolean);
   const documents = new Map();
   const linkCountsByDocument = new Map();
@@ -12493,7 +12493,7 @@ function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath) {
     [...documents].every(([documentPath, expectedLinks]) => (
       (linkCountsByDocument.get(documentPath) || 0) === expectedLinks
     )) &&
-    documents.has(selectedSourcePath) &&
+    (allowMissingSelectedSource || documents.has(selectedSourcePath)) &&
     [...linkCountsByDocument.keys()].every(documentPath => documents.has(documentPath));
   if (!complete) throw new Error('asset_baseline_indesign_snapshot_incomplete');
 
@@ -14256,13 +14256,39 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
 
   try {
     // Check if InDesign is running
-    const { stdout: psCheck } = await execAsync(
-      "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
-      { timeout: 3000, encoding: 'utf8' }
-    ).catch(error => {
-      if (options.ordinaryVerification) return { stdout: '' };
-      throw error;
-    });
+    let psCheck;
+    if (options.ordinaryVerification === true && options.verifySelectedSource === true) {
+      // Enumerate directly: a shell grep no-match rejects even when ps succeeds.
+      // Only a complete successful inventory may establish that InDesign is closed.
+      const inventory = await execFileAsync('/bin/ps', ['axww', '-o', 'pid=', '-o', 'comm='], {
+        timeout: 3000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+      });
+      if (typeof inventory.stdout !== 'string' || typeof inventory.stderr !== 'string' ||
+          inventory.stderr.trim() || !inventory.stdout.endsWith('\n') || !inventory.stdout.trim()) {
+        throw new Error('asset_baseline_indesign_process_inventory_invalid');
+      }
+      const pids = new Set();
+      const commands = inventory.stdout.slice(0, -1).split('\n').map(line => {
+        const row = /^\s*(0|[1-9]\d*)\s+(.+?)\s*$/.exec(line);
+        const pid = row && Number(row[1]);
+        const command = row && row[2];
+        if (!row || !Number.isSafeInteger(pid) || pids.has(pid) || /[\x00-\x1f\x7f]/.test(command) ||
+            !(command.startsWith('/') || /^[A-Za-z0-9_.+-]+(?: [A-Za-z0-9_.+-]+)*$/.test(command))) {
+          throw new Error('asset_baseline_indesign_process_inventory_invalid');
+        }
+        pids.add(pid);
+        return command;
+      });
+      psCheck = commands.filter(command => /^(?:Adobe )?InDesign$/i.test(path.basename(command))).join('\n');
+    } else {
+      ({ stdout: psCheck } = await execAsync(
+        "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep",
+        { timeout: 3000, encoding: 'utf8' }
+      ).catch(error => {
+        if (options.ordinaryVerification && options.verifySelectedSource !== true) return { stdout: '' };
+        throw error;
+      }));
+    }
 
     if (!psCheck.trim()) {
       if (strict && !options.ordinaryVerification) throw new Error('asset_baseline_indesign_unavailable');
@@ -14276,10 +14302,18 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       { timeout: 10000, encoding: 'utf8' }
     );
     const selectedSourcePath = normalizeTrackedFilePath(filePath);
-    options.onProvider?.('indesign-live-current-bytes-unbound');
+    const allowSavedFallback = options.ordinaryVerification === true && options.verifySelectedSource === true;
     const activeState = strict
-      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath)
+      ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath, { allowMissingSelectedSource: allowSavedFallback })
       : parseInDesignActiveSessionOutput(inddPaths);
+    // Only a complete, error-free snapshot can establish that the saved file
+    // is not open. Query/access failures must not become a fallback route.
+    if (allowSavedFallback && !activeState.documents.some(document =>
+      normalizeTrackedFilePath(document.documentPath) === selectedSourcePath)) {
+      options.onProvider?.('saved-byte-regex-fallback');
+      return extractLinkedAssetsRegex(filePath, options);
+    }
+    options.onProvider?.('indesign-live-current-bytes-unbound');
 
     const results = activeState.links
       .filter(link => normalizeTrackedFilePath(link.documentPath) === selectedSourcePath)
@@ -15021,7 +15055,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // Engagement or an explicit Restore still binds publication to its exact
   // verification attempt, including engagement that occurs during this scan.
   const isCurrent = () => parentCurrent() && (!workingScan ||
-    (!options.workingSourceAttempt && !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
+    (!options.workingSourceAttempt && options.verifySelectedSource !== true &&
+      !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
     workingScan.current()) &&
     (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
@@ -15034,7 +15069,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   const sourceRow = currentProject.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
     normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
-  const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt;
+  const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt || options.verifySelectedSource === true;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
   const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
   const excludedPreparation = typeof options.excludedWorkingSourcePreparation === 'function' ? options.excludedWorkingSourcePreparation : null;
@@ -15045,7 +15080,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   }
   workingScan = beginWorkingSourceScan(projectId, filePath, parentCurrent, options.workingSourceAttempt, excludedPreparation);
   scanLease.workingSourceScan = workingScan;
-  if (options.workingSourceAttempt && !workingScan) return { success: false, error: 'stale_project_operation' };
+  if ((options.workingSourceAttempt || options.verifySelectedSource === true) && !workingScan) return { success: false, error: 'stale_project_operation' };
   const leaseKey = workingScan && projectId + ':' + workingScan.key;
   if (leaseKey) {
     const previousLease = workingSourceScanLeases.get(leaseKey);
@@ -15111,6 +15146,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const linkedPaths = await extractLinkedAssets(filePath, {
     strict: strictScan,
     ordinaryVerification: !!workingScan && !baselineScan,
+    verifySelectedSource: options.verifySelectedSource === true && !baselineScan,
     onOrdinaryScanFailure,
     onOrdinaryScanLimit,
     onProvider: value => { providerNote = value; },
@@ -17541,6 +17577,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         .map(filePath => [normalizeTrackedFilePath(filePath), filePath])
         .filter(([normalizedPath, filePath]) => normalizedPath && typeof filePath === 'string' && filePath)
     ).values()];
+    const newSourcePaths = [];
     const result = mutateProject(projectId, (project) => {
       if (!operation.current()) return null;
       const acceptedByKey = new Map();
@@ -17564,6 +17601,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         if (!existingFile) {
           project.files.push(authorizedFile);
           acceptedByKey.set(key, authorizedFile);
+          if (isProjectAssetBaselineSource(authorizedFile)) newSourcePaths.push(filePath);
         }
         project.pendingFiles = (project.pendingFiles || []).filter(file => getTrackedFileDedupKey(file) !== key);
         for (const exclusionKey of [
@@ -17591,15 +17629,24 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     sendProjectFileStateToRenderer(projectId, operation.activationToken);
 
     const updatedProject = getProjects().find(project => project.id === projectId);
-    if (updatedProject?.assetBaseline?.status === 'awaiting-first-scan') {
-      const baselineSources = getProjectAssetBaselineSourcePaths(updatedProject);
+    const establishBaseline = updatedProject?.assetBaseline?.status === 'awaiting-first-scan';
+    const eligibleSources = getProjectAssetBaselineSourcePaths(updatedProject);
+    const newSourceKeys = new Set(newSourcePaths.map(normalizeTrackedFilePath));
+    // Later manual admission scans only new selected roots, retaining the first
+    // cohort and its Existing decision. Re-add is not a Restore/retry route.
+    const selectedSources = establishBaseline ? eligibleSources
+      : Number.isFinite(updatedProject?.assetBaseline?.establishedAt)
+        ? eligibleSources.filter(sourcePath => newSourceKeys.has(normalizeTrackedFilePath(sourcePath))) : [];
+    if (establishBaseline || selectedSources.length > 0) {
       const scanReport = await runBoundedScanOnOpenQueue(
         projectId,
-        baselineSources,
+        selectedSources,
         operation.activationToken,
         operation,
         {
           addFilesScan: true,
+          establishBaseline,
+          verifySelectedSource: !establishBaseline,
           allowPausedBaseline: true,
           scanTimeoutMs: ADD_FILES_SCAN_TIMEOUT_MS,
           onScanLease(scanLease) {

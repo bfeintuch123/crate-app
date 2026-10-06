@@ -46,10 +46,10 @@ function baselineCases() {
     return { promise, release };
   }
 
-  async function fixture({ opened = false, modified = false, descriptor = false, sources = 1, malformed = false, structuredLinks = true } = {}) {
+  async function fixture({ opened = false, modified = false, descriptor = false, sources = 1, malformed = false, structuredLinks = true, sourceNames = null } = {}) {
     resetTestHomeWorkspace();
     const paths = Array.from({ length: sources }, (_, i) => ({
-      source: path.join(TEST_HOME, 'Desktop', `Design_${i}.ai`),
+      source: path.join(TEST_HOME, 'Desktop', sourceNames?.[i] || `Design_${i}.ai`),
       link: path.join(TEST_HOME, 'Desktop', `Link_${i}.png`),
     }));
     for (const p of paths) {
@@ -149,6 +149,537 @@ function baselineCases() {
     assert.equal(review.error, undefined);
     assert.equal(typeof review.token, 'string');
   }
+
+  // LD-1: only the trusted Add Files picker admits each saved source. The
+  // dependency is present solely in its real AI bytes, never an observer LINK.
+  for (const completedBaseline of [false, true]) {
+    baselineTest(`LD-1 manual Add Files: ${completedBaseline ? 'completed baseline retains B parser dependency' : 'awaiting baseline positive control'}`, async () => {
+      const f = await fixture({ sources: 2, sourceNames: ['A.ai', 'B.ai'], structuredLinks: false });
+      const scans = [];
+      const chronology = [];
+      const previousLog = console.log;
+      console.log = function trackLd1Scan(...args) {
+        const message = String(args[0]);
+        for (const entry of f.paths) {
+          if (message === `[crate] scan-on-open: scanning ${path.basename(entry.source)}`) scans.push(entry.source);
+        }
+        return previousLog.apply(console, args);
+      };
+      const snapshot = () => JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      const sourceBytes = f.paths.map(entry => fs.readFileSync(entry.source));
+      const linkBytes = f.paths.map(entry => fs.readFileSync(entry.link));
+      const add = async index => {
+        clearTrackedTimers();
+        manualDialogFor([f.paths[index].source]);
+        chronology.push({ action: `Add ${path.basename(f.paths[index].source)}`, at: Date.now() });
+        const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+        assert.ok(Array.isArray(result), 'trusted Add Files must finish without a partial failure');
+        await metadataTestHooks.waitForWatcherIdle(f.project.id);
+        clearTrackedTimers();
+        return snapshot();
+      };
+      const assertSourceAndLink = (project, index, origin) => {
+        const entry = f.paths[index];
+        const source = project.files.filter(file => file.path === entry.source);
+        const links = project.files.filter(file => file.path === entry.link);
+        assert.equal(source.length, 1, 'manual source must have one admitted row');
+        assert.equal(source[0].source, 'manual-browse');
+        assert.equal(source[0].assetOrigin, 'added');
+        assert.equal(source[0].projectRole, 'source');
+        assert.equal(links.length, 1, 'B parser-only dependency must be admitted after Add Files');
+        assert.equal(links[0].assetOrigin, origin);
+        assert.equal(links[0].projectRole, 'asset');
+        if (origin === 'existing') assert.equal(links[0].assetBaselineSourcePath, entry.source);
+        assert.equal(links[0].source, 'scan-on-open');
+        assert.equal(project.pendingFiles.some(file => file.path === entry.source || file.path === entry.link), false);
+        const verification = metadataTestHooks.getWorkingSourceVerification(project, source[0]);
+        assert.equal(verification?.status, 'scanned');
+        assert.ok(verification.requiredReferences.some(ref => ref.path === entry.link), 'current parser receipt must bind source to dependency');
+        assert.equal(verification.sourceFingerprint, crypto.createHash('sha256').update(sourceBytes[index]).digest('hex'));
+        const identity = fs.statSync(entry.source);
+        for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(verification.sourceIdentity[field], identity[field]);
+        assert.equal(scans.filter(sourcePath => sourcePath === entry.source).length, 1,
+          'one bounded parser scan; hashing/read counts are only supporting evidence');
+        assert.deepEqual(fs.readFileSync(entry.source), sourceBytes[index]);
+        assert.deepEqual(fs.readFileSync(entry.link), linkBytes[index]);
+      };
+      try {
+        const activation = snapshot();
+        assert.equal(activation.assetBaseline.status, 'awaiting-first-scan');
+        assert.deepEqual(activation.files, []);
+        assert.deepEqual(activation.pendingFiles, []);
+        let beforeB = activation;
+        if (completedBaseline) {
+          const afterA = await add(0);
+          assertSourceAndLink(afterA, 0, 'existing');
+          assert.equal(afterA.assetBaseline.status, 'decision-required');
+          assert.ok(Number.isFinite(afterA.assetBaseline.establishedAt));
+          assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+          beforeB = snapshot();
+          chronology.push({ action: 'Include Existing', at: Date.now(), baseline: beforeB.assetBaseline });
+          assert.equal(beforeB.assetBaseline.status, 'included');
+          assert.equal(beforeB.assetBaseline.decision, 'include');
+          // Wait for the real boundary to pass; never fabricate completed state.
+          await waitForCondition(() => Date.now() > beforeB.assetBaseline.establishedAt, 'baseline time did not advance');
+        }
+        const afterB = await add(1);
+        console.log('LD1_EVIDENCE ' + JSON.stringify({ arm: completedBaseline ? 'completed' : 'awaiting',
+          chronology, beforeB, afterB, scans, supportingAsyncSourceReads: f.paths.map((_, i) => f.count(i)),
+          producerControls: { opened: f.state.opened, descriptor: f.state.descriptor, timers: activeTimeouts.size + activeIntervals.size } }));
+        assert.equal(f.state.opened, false);
+        assert.equal(f.state.descriptor, false);
+        assert.equal(activeTimeouts.size + activeIntervals.size, 0);
+        assert.deepEqual(afterB.workingSourceSelections, beforeB.workingSourceSelections);
+        assert.deepEqual(afterB.excludedAssetKeys || [], beforeB.excludedAssetKeys || []);
+        if (completedBaseline) {
+          assert.deepEqual(afterB.assetBaseline, beforeB.assetBaseline, 'prior baseline and Include decision must stay intact');
+          for (const entry of f.paths.slice(0, 1)) {
+            for (const filePath of [entry.source, entry.link]) {
+              assert.deepEqual(afterB.files.find(file => file.path === filePath), beforeB.files.find(file => file.path === filePath));
+            }
+          }
+          assert.equal(scans.filter(sourcePath => sourcePath === f.paths[0].source).length, 1, 'A must not be requeued');
+          assert.ok(afterB.files.find(file => file.path === f.paths[1].source).addedAt > beforeB.assetBaseline.establishedAt);
+        } else {
+          assert.equal(afterB.assetBaseline.status, 'decision-required');
+          assert.ok(Number.isFinite(afterB.assetBaseline.establishedAt));
+        }
+        assertSourceAndLink(afterB, 1, completedBaseline ? 'added' : 'existing');
+      } finally {
+        console.log = previousLog;
+        await f.cleanup();
+      }
+    });
+  }
+
+  async function ld1CompletedFixture() {
+    const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'B.ai', 'C.ai'], structuredLinks: false });
+    const scans = [];
+    const originalLog = console.log;
+    console.log = function trackLd1ControlScan(...args) {
+      for (const entry of f.paths) {
+        if (String(args[0]) === `[crate] scan-on-open: scanning ${path.basename(entry.source)}`) scans.push(entry.source);
+      }
+      return originalLog.apply(console, args);
+    };
+    const current = () => JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+    const begin = (indices, id = crypto.randomUUID()) => {
+      clearTrackedTimers();
+      manualDialogFor(indices.map(index => typeof index === 'number' ? f.paths[index].source : index));
+      return callIpcRaw('projects:add-files', f.project.id, id);
+    };
+    const add = async (...indices) => {
+      const result = await begin(indices);
+      await metadataTestHooks.waitForWatcherIdle(f.project.id);
+      clearTrackedTimers();
+      return result;
+    };
+    try {
+      assert.ok(Array.isArray(await add(0)));
+      const initial = current();
+      assert.equal(initial.assetBaseline.status, 'decision-required');
+      assert.ok(Number.isFinite(initial.assetBaseline.establishedAt));
+      assert.equal(initial.files.find(file => file.path === f.paths[0].link)?.assetOrigin, 'existing');
+      assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+      const baseline = current();
+      await waitForCondition(() => Date.now() > baseline.assetBaseline.establishedAt, 'completed baseline clock did not advance');
+      return { ...f, current, begin, add, scans, baseline,
+        scanCount(index) { return scans.filter(filePath => filePath === f.paths[index].source).length; },
+        assertPrior() {
+          const project = current();
+          assert.deepEqual(project.assetBaseline, baseline.assetBaseline);
+          for (const filePath of [f.paths[0].source, f.paths[0].link]) {
+            assert.deepEqual(project.files.find(file => file.path === filePath), baseline.files.find(file => file.path === filePath));
+          }
+          assert.equal(scans.filter(filePath => filePath === f.paths[0].source).length, 1);
+        },
+        assertMissing(index) {
+          const project = current();
+          assert.equal([...project.files, ...project.pendingFiles].some(file => file.path === f.paths[index].link), false);
+          assert.equal(JSON.stringify(project.provenance).includes(f.paths[index].link), false);
+          const row = project.files.find(file => file.path === f.paths[index].source);
+          assert.notEqual(metadataTestHooks.getWorkingSourceVerification(project, row)?.status, 'scanned');
+        },
+        evidence(control) {
+          console.log('LD1_CONTROL_EVIDENCE ' + JSON.stringify({ control, baseline, after: current(), scans }));
+        },
+        async cleanup() { console.log = originalLog; await f.cleanup(); },
+      };
+    } catch (error) { console.log = originalLog; await f.cleanup(); throw error; }
+  }
+
+  baselineTest('LD-1 controls: completed baseline ignores re-add, unselected roots and images', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      assert.ok(Array.isArray(await f.add(1)));
+      const verified = f.current();
+      const b = verified.files.find(file => file.path === f.paths[1].source);
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(verified, b)?.status, 'scanned');
+      assert.equal(verified.files.find(file => file.path === f.paths[1].link)?.assetOrigin, 'added');
+      assert.deepEqual(verified.pendingFiles, []);
+      assert.ok(Array.isArray(await f.add(1, 1, f.paths[2].link)));
+      assert.equal(f.scanCount(1), 1);
+      assert.equal(f.scanCount(2), 0);
+      assert.equal(f.current().files.some(file => file.path === f.paths[2].source), false);
+      assert.equal(f.current().files.find(file => file.path === f.paths[2].link)?.projectRole, 'asset');
+      assert.deepEqual(f.current().workingSourceVerification, verified.workingSourceVerification);
+      f.assertPrior(); f.evidence('re-add/unselected/image');
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 controls: prior exclusion survives row absence and manual readmission', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      assert.ok(Array.isArray(await f.add(1)));
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const row = workspace.files.find(file => file.name === 'B.ai');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision })).success, true);
+      const excluded = f.current();
+      // Model a persisted absent row, as the existing durable-intent control
+      // does. The exclusion itself and subsequent admission use real IPC.
+      const stored = storeInstance.data.projects.find(project => project.id === f.project.id);
+      stored.files = stored.files.filter(file => file.path !== f.paths[1].source);
+      roundTripFakeStore();
+      assert.ok(Array.isArray(await f.add(1)));
+      const after = f.current();
+      assert.equal(f.scanCount(1), 1, 'new row at an excluded route cannot trigger Restore');
+      assert.deepEqual(after.workingSourceSelections, excluded.workingSourceSelections);
+      assert.deepEqual(after.workingSourceVerification, excluded.workingSourceVerification);
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'B.ai').sourceSelection, 'excluded');
+      assert.deepEqual(after.files.find(file => file.path === f.paths[1].link), excluded.files.find(file => file.path === f.paths[1].link),
+        'genuine prior dependency must survive source exclusion and re-admission');
+      f.assertPrior(); f.evidence('durable exclusion/modeled row absence/manual readmission');
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 controls: malformed later source fails without baseline reset or re-add retry', async () => {
+    const f = await ld1CompletedFixture();
+    try {
+      fs.writeFileSync(f.paths[1].source, `%PDF-1.7\n${f.paths[1].link}\nmissing EOF`);
+      const result = await f.add(1);
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(result.failedCount, 1);
+      assert.equal(result.completedCount, 0);
+      assert.equal(f.scanCount(1), 1);
+      f.assertMissing(1);
+      const failed = f.current().workingSourceVerification;
+      assert.ok(Array.isArray(await f.add(1)));
+      assert.equal(f.scanCount(1), 1);
+      assert.deepEqual(f.current().workingSourceVerification, failed);
+      f.assertPrior(); f.evidence('malformed/no implicit retry');
+    } finally { await f.cleanup(); }
+  });
+
+  for (const interruption of ['source-bytes', 'cancel', 'generation', 'exclude']) {
+    baselineTest(`LD-1 controls: ${interruption} during later scan prevents dependency publication`, async () => {
+      const f = await ld1CompletedFixture();
+      const entered = deferred(), release = deferred();
+      const restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+        if (path.resolve(filePath) === f.paths[1].source) { entered.release(); await release.promise; }
+        return read();
+      });
+      let pending;
+      try {
+        const id = crypto.randomUUID();
+        pending = f.begin([1], id);
+        await entered.promise;
+        if (interruption === 'source-bytes') {
+          writeSyntheticAiFile(f.paths[1].source, `${f.paths[2].link}\nchanged saved bytes`);
+        } else if (interruption === 'cancel') {
+          assert.equal(await callIpcRaw('projects:cancel-add-files', f.project.id, id), true);
+        } else if (interruption === 'generation') {
+          await createProject('LD-1 generation replacement');
+          clearTrackedTimers();
+        } else {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          const row = workspace.files.find(file => file.name === 'B.ai');
+          const excluded = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+            { action: 'exclude', expectedRevision: row.selectionRevision });
+          assert.equal(excluded.success, true);
+        }
+        release.release();
+        const result = await pending;
+        if (['cancel', 'generation'].includes(interruption)) assert.equal(result, null);
+        else assertAddFilesPartialScanFailure(result);
+        f.assertMissing(1);
+        assert.equal(f.current().files.some(file => file.path === f.paths[2].link), false);
+        if (interruption === 'exclude') {
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          assert.equal(workspace.files.find(file => file.name === 'B.ai').sourceSelection, 'excluded');
+          assert.ok(Array.isArray(await f.add(1)));
+          assert.equal(f.scanCount(1), 1, 'excluded re-add must not act as Restore');
+          f.assertMissing(1);
+        }
+        f.assertPrior(); f.evidence(interruption);
+      } finally {
+        release.release();
+        if (pending) await pending;
+        restoreReads();
+        await f.cleanup();
+      }
+    });
+  }
+
+  baselineTest('LD-1 controls: later timeout retains bounded sibling success without late publication', async () => {
+    const f = await ld1CompletedFixture();
+    const entered = deferred(), release = deferred();
+    const restoreReads = interceptBaselineSourceReads(async (filePath, read) => {
+      if (path.resolve(filePath) === f.paths[1].source) { entered.release(); await release.promise; }
+      return read();
+    });
+    const trackedTimer = global.setTimeout;
+    // The established test harness scales only the production scan deadline.
+    global.setTimeout = (callback, delay, ...args) => trackedTimer(callback, delay === 30000 ? 250 : delay, ...args);
+    let pending;
+    try {
+      pending = f.begin([1, 2]);
+      await entered.promise;
+      const result = await pending;
+      assertAddFilesPartialScanFailure(result);
+      assert.equal(result.selectedCount, 2);
+      assert.equal(result.completedCount, 1);
+      assert.equal(result.failedCount, 1);
+      assert.equal(result.scanResults.find(item => item.path === f.paths[1].source).error, 'add_files_scan_timeout');
+      assert.equal(f.current().files.find(file => file.path === f.paths[2].link)?.assetOrigin, 'added');
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.current().files.find(file => file.path === f.paths[2].source))?.status, 'scanned');
+      f.assertMissing(1);
+      release.release();
+      await new Promise(resolve => originalSetTimeout(resolve, 25));
+      f.assertMissing(1);
+      assert.equal(f.scanCount(1), 1); assert.equal(f.scanCount(2), 1);
+      f.assertPrior(); f.evidence('timeout/sibling/late result');
+    } finally {
+      global.setTimeout = trackedTimer;
+      release.release();
+      if (pending) await pending;
+      restoreReads(); await f.cleanup();
+    }
+  });
+
+  function ld1InDesignFixture(f, scenario) {
+    const source = path.join(TEST_HOME, 'Desktop', 'Later.indd');
+    const savedLink = f.paths[1].link;
+    const liveLink = path.join(TEST_HOME, 'Desktop', 'Live-only.png');
+    const otherSource = path.join(TEST_HOME, 'Desktop', 'Other.indd');
+    const otherLink = path.join(TEST_HOME, 'Desktop', 'Other-only.png');
+    fs.writeFileSync(source, `synthetic saved InDesign bytes\n${savedLink}\n`);
+    fs.writeFileSync(liveLink, 'synthetic live linked bytes');
+    fs.writeFileSync(otherLink, 'synthetic unrelated linked bytes');
+    const selected = [
+      `DOC\t${source}\tLater.indd\tfalse\ttrue\t1`,
+      `LINK\t${source}\tLater.indd\t${liveLink}\tfalse\ttrue`,
+      'END\t1\t1\t1\t0',
+    ].join('\n');
+    const other = [
+      `DOC\t${otherSource}\tOther.indd\tfalse\ttrue\t1`,
+      `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
+      'END\t1\t1\t1\t0',
+    ].join('\n');
+    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [] };
+    const closed = scenario === 'closed' || scenario === 'closed-lookalike-processes';
+    const processFailure = scenario.startsWith('process-');
+    const inventoryErrors = {
+      'process-invocation-failure': { code: 'ENOENT' },
+      'process-exit-one': { code: 1, killed: false, signal: null },
+      'process-policy-denied': { code: 'EPERM' },
+      'process-access-denied': { code: 'EACCES' },
+      'process-timeout': { code: null, killed: true, signal: 'SIGTERM' },
+      'process-signal': { code: null, killed: false, signal: 'SIGKILL' },
+      'process-overflow': { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed: true },
+    };
+    const validClosedInventory = '    0 kernel_task\n    1 /sbin/launchd\n  432 /bin/ps\n';
+    const invalidInventories = {
+      'process-empty': '',
+      'process-unknown': 'unknown process inventory\n',
+      'process-malformed': 'not-a-pid /sbin/launchd\n',
+      'process-truncated': validClosedInventory.trimEnd(),
+      'process-duplicate-pid': validClosedInventory + '432 /bin/zsh\n',
+      'process-invalid-pid': '9007199254740992 /bin/ps\n',
+      'process-unknown-command': '432 ???\n',
+      'process-control-byte': '432 /bin/p\0s\n',
+      'process-blank-row': validClosedInventory + '\n',
+    };
+    setChildProcessHandler(request => {
+      if (request.kind === 'execFile' && request.command === '/bin/ps' &&
+          request.args.includes('pid=') && request.args.includes('comm=')) {
+        counts.processChecks++; counts.enumerations++;
+        // Model the execFile result contract, not a boolean running-app answer.
+        assert.deepEqual(request.args, ['axww', '-o', 'pid=', '-o', 'comm=']);
+        assert.equal(request.options.encoding, 'utf8');
+        assert.equal(request.options.timeout, 3000);
+        assert.equal(request.options.maxBuffer, 4 * 1024 * 1024);
+        if (scenario === 'process-malformed') {
+          // Deterministically model the foreign callback observed in full CI.
+          // This harness helper dispatches a mocked result; it runs no process.
+          getChildProcessResult('execFile', '/usr/bin/osascript', [path.join(TEST_HOME, 'crate-ai-active-session.applescript')]);
+        }
+        if (inventoryErrors[scenario]) return { error: Object.assign(new Error('synthetic process invocation failure'),
+          { stdout: validClosedInventory, stderr: '' }, inventoryErrors[scenario]) };
+        if (Object.hasOwn(invalidInventories, scenario)) return { stdout: invalidInventories[scenario], stderr: '' };
+        if (scenario === 'process-stderr') return { stdout: validClosedInventory, stderr: 'ps: incomplete result' };
+        if (scenario === 'closed-lookalike-processes') return { stdout: validClosedInventory +
+          '555 /Applications/Adobe InDesign Server.app/Contents/MacOS/Adobe InDesign Server\n' +
+          '556 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign Helper\n', stderr: '' };
+        if (closed) return { stdout: validClosedInventory, stderr: '' };
+        const command = scenario === 'running-bare-name' ? 'Adobe InDesign' :
+          '/Applications/Adobe InDesign 2026/Adobe InDesign 2026.app/Contents/MacOS/Adobe InDesign';
+        return { stdout: validClosedInventory + `555 ${command}\n`, stderr: '' };
+      }
+      if (request.kind === 'exec' && String(request.command).includes("grep -i 'Adobe InDesign'")) {
+        counts.processChecks++;
+        if (scenario === 'process-policy-denied') {
+          return { error: Object.assign(new Error('synthetic process policy denial'), { code: 'EPERM' }) };
+        }
+        // exec rejects the original grep pipeline when no process matches.
+        // A successful empty stdout would mask the selected-source regression.
+        if (closed || processFailure) return { error: Object.assign(
+          new Error('synthetic grep pipeline no-match'), { code: 1, killed: false, signal: null, stdout: '', stderr: '' }) };
+        return { stdout: '/Applications/Adobe InDesign/Adobe InDesign' };
+      }
+      if (isOsascriptInvocation(request, 'crate-indd-query.applescript')) {
+        counts.queries++;
+        if (scenario === 'script-automation-denied') return { error: Object.assign(
+          new Error('synthetic Not authorized to send Apple events (-1743)'), { code: -1743 }) };
+        if (scenario === 'script-query-failure') return { error: new Error('synthetic query execution failure') };
+        if (scenario === 'malformed') return { stdout: other.replace(/END.*$/, '') };
+        if (scenario === 'count-mismatch') return { stdout: other.replace('END\t1\t1\t1\t0', 'END\t2\t1\t1\t0') };
+        if (scenario === 'query-error-count') return { stdout: other.replace('END\t1\t1\t1\t0', 'END\t1\t1\t1\t1') };
+        if (scenario === 'snapshot-source-change') fs.appendFileSync(source, `changed bytes\n${otherLink}\n`);
+        return { stdout: scenario === 'selected-present' ? selected : scenario === 'running-no-documents' ? 'END\t0\t0\t0\t0' : other };
+      }
+      if (request.kind === 'execFile' && request.command === '/usr/bin/osascript') {
+        const script = path.basename(request.args[0]);
+        // The shared harness may finish another app's modeled callback here.
+        // Retain it separately; only InDesign's observer could rescue this scan.
+        (script === 'crate-indd-poll.applescript' ? counts.observerScripts : counts.otherObserverScripts).push(script);
+      }
+      return { stdout: '' };
+    });
+    return { source, savedLink, liveLink, otherLink, counts };
+  }
+
+  for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
+    'malformed', 'count-mismatch', 'query-error-count', 'script-query-failure', 'script-automation-denied', 'process-policy-denied',
+    'snapshot-source-change', 'running-bare-name', 'closed-lookalike-processes',
+    'process-invocation-failure', 'process-exit-one', 'process-access-denied', 'process-timeout', 'process-signal',
+    'process-overflow', 'process-empty', 'process-unknown', 'process-malformed', 'process-truncated',
+    'process-duplicate-pid', 'process-invalid-pid', 'process-unknown-command', 'process-control-byte',
+    'process-blank-row', 'process-stderr']) {
+    baselineTest(`LD-1 M1 InDesign: ${scenario}`, async () => {
+      const f = await ld1CompletedFixture();
+      const d = ld1InDesignFixture(f, scenario);
+      const originalBytes = fs.readFileSync(d.source);
+      try {
+        const result = await f.add(d.source);
+        const project = f.current();
+        const source = project.files.find(file => file.path === d.source);
+        const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+        const success = ['running-other-document', 'running-no-documents', 'selected-present', 'closed', 'running-bare-name', 'closed-lookalike-processes'].includes(scenario);
+        const noQuery = scenario.startsWith('process-') || ['closed', 'closed-lookalike-processes'].includes(scenario);
+        console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario, counters: d.counts, before: f.baseline, after: project, result }));
+        // Add Files also refreshes the live observer. Its modeled output is
+        // empty; only the selected-source query can produce these links.
+        assert.deepEqual(d.counts.observerScripts, noQuery
+          ? [] : ['crate-indd-poll.applescript']);
+        if (scenario === 'process-malformed') assert.ok(d.counts.otherObserverScripts.includes('crate-ai-active-session.applescript'));
+        assert.equal(d.counts.processChecks, 2);
+        assert.equal(d.counts.queries, noQuery ? 0 : 1);
+        assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
+        if (success) {
+          assert.ok(Array.isArray(result), 'valid non-open saved source must not cause a partial failure');
+          assert.equal(record?.status, 'scanned');
+          assert.equal(record.provider, 'ordinary-indd');
+          assert.equal(record.inventoryStatus, 'unverified');
+          assert.equal(record.sourceFingerprint, crypto.createHash('sha256').update(originalBytes).digest('hex'));
+          const stat = fs.statSync(d.source);
+          for (const key of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) assert.equal(record.sourceIdentity[key], stat[key]);
+          const expectedLink = scenario === 'selected-present' ? d.liveLink : d.savedLink;
+          assert.equal(project.files.filter(file => file.path === expectedLink).length, 1);
+          assert.equal(project.files.find(file => file.path === expectedLink).assetOrigin, 'added');
+          assert.ok(record.requiredReferences.some(ref => ref.path === expectedLink));
+          if (scenario === 'selected-present') {
+            assert.ok(record.unresolved.some(item => item.reason === 'indesign-live-current-bytes-unbound'));
+            assert.equal(record.notes.includes('saved-byte-regex-fallback'), false);
+            assert.equal(project.files.some(file => file.path === d.savedLink), false);
+          } else {
+            assert.ok(record.notes.includes('saved-byte-regex-fallback'));
+            assert.equal(record.notes.includes('indesign-live-current-bytes-unbound'), false);
+            assert.deepEqual(record.unresolved, []);
+            assert.equal(project.files.some(file => file.path === d.liveLink), false);
+          }
+        } else {
+          assertAddFilesPartialScanFailure(result);
+          assert.equal(result.failedCount, 1);
+          assert.equal(record?.status, 'failed');
+          assert.equal([...project.files, ...project.pendingFiles].some(file => [d.savedLink, d.liveLink].includes(file.path)), false);
+          assert.equal(record?.notes?.includes('saved-byte-regex-fallback') || false, false);
+        }
+        assert.equal([...project.files, ...project.pendingFiles].some(file => file.path === d.otherLink), false);
+        assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+        assert.deepEqual(project.pendingFiles, []);
+        assert.equal(d.counts.enumerations, 1);
+        f.assertPrior();
+      } finally { await f.cleanup(); }
+    });
+  }
+
+  baselineTest('LD-1 M1 InDesign: strict first baseline still rejects a valid snapshot missing the selected document', async () => {
+    const f = await fixture({ sources: 2, structuredLinks: false });
+    const d = ld1InDesignFixture(f, 'running-other-document');
+    try {
+      manualDialogFor([d.source]);
+      const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      assertAddFilesPartialScanFailure(result);
+      const project = JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      assert.equal(project.assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(project.assetBaseline.establishedAt, null);
+      assert.equal(project.files.some(file => file.path === d.savedLink || file.path === d.otherLink), false);
+      assert.equal(d.counts.queries, 1);
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline', after: project, result }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 M1 InDesign: strict first baseline still rejects real closed-process no-match', async () => {
+    const f = await fixture({ sources: 2, structuredLinks: false });
+    const d = ld1InDesignFixture(f, 'closed');
+    try {
+      manualDialogFor([d.source]);
+      const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+      assertAddFilesPartialScanFailure(result);
+      const project = JSON.parse(JSON.stringify(storeInstance.data.projects.find(p => p.id === f.project.id)));
+      assert.equal(project.assetBaseline.status, 'awaiting-first-scan');
+      assert.equal(project.assetBaseline.establishedAt, null);
+      assert.equal(project.files.some(file => file.path === d.savedLink || file.path === d.otherLink), false);
+      assert.equal(d.counts.enumerations, 0); assert.equal(d.counts.queries, 0);
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline-closed', counters: d.counts, after: project, result }));
+    } finally { await f.cleanup(); }
+  });
+
+  baselineTest('LD-1 M1 InDesign: Restore still rejects a valid running snapshot missing the selected document', async () => {
+    const f = await ld1CompletedFixture();
+    let d = ld1InDesignFixture(f, 'selected-present');
+    try {
+      assert.ok(Array.isArray(await f.add(d.source)));
+      let row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Later.indd');
+      assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision })).success, true);
+      // Same physical saved source; only the modeled live document changes.
+      d = ld1InDesignFixture(f, 'running-other-document');
+      row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(file => file.name === 'Later.indd');
+      const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'restore', expectedRevision: row.selectionRevision });
+      assert.equal(result.success, true);
+      assert.equal(result.verificationStatus, 'failed');
+      assert.equal(d.counts.enumerations, 0); assert.equal(d.counts.queries, 1);
+      const project = f.current();
+      assert.equal(project.files.some(file => file.path === d.otherLink), false);
+      assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+      assert.equal(metadataTestHooks.getWorkingSourceMembership(project).blocked, true);
+      f.assertPrior();
+      console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-restore-missing-selected', counters: d.counts, after: project, result }));
+    } finally { await f.cleanup(); }
+  });
 
   baselineTest('no descriptor: saved direct admission scans once and requires ordinary Existing decision', async () => {
     const f = await fixture();
