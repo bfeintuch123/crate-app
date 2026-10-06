@@ -758,7 +758,7 @@ function baselineCases() {
       `LINK\t${otherSource}\tOther.indd\t${otherLink}\tfalse\ttrue`,
       'END\t1\t1\t1\t0',
     ].join('\n');
-    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [] };
+    const counts = { processChecks: 0, enumerations: 0, queries: 0, observerScripts: [], otherObserverScripts: [], processCalls: [] };
     const closed = scenario === 'closed' || scenario === 'closed-lookalike-processes';
     const processFailure = scenario.startsWith('process-');
     const inventoryErrors = {
@@ -786,6 +786,8 @@ function baselineCases() {
       if (request.kind === 'execFile' && request.command === '/bin/ps' &&
           request.args.includes('pid=') && request.args.includes('comm=')) {
         counts.processChecks++; counts.enumerations++;
+        counts.processCalls.push({ route: 'selected-source-inventory', kind: request.kind,
+          command: request.command, args: [...request.args] });
         // Model the execFile result contract, not a boolean running-app answer.
         assert.deepEqual(request.args, ['axww', '-o', 'pid=', '-o', 'comm=']);
         assert.equal(request.options.encoding, 'utf8');
@@ -810,6 +812,8 @@ function baselineCases() {
       }
       if (request.kind === 'exec' && String(request.command).includes("grep -i 'Adobe InDesign'")) {
         counts.processChecks++;
+        counts.processCalls.push({ route: 'background-indesign-observer', kind: request.kind,
+          command: request.command, args: [...request.args] });
         if (scenario === 'process-policy-denied') {
           return { error: Object.assign(new Error('synthetic process policy denial'), { code: 'EPERM' }) };
         }
@@ -941,6 +945,94 @@ function baselineCases() {
     }
   }
 
+  for (const scenario of ['process-unknown', 'process-stderr']) {
+    for (const timing of ['prior-poll-running', 'prior-poll-settled']) {
+      baselineTest(`LD-1 M1 InDesign process count timing: ${scenario}/${timing}`, async () => {
+        const priorGate = deferred(), laterGate = deferred();
+        const chronology = [];
+        let priorHeld = false, laterHeld = false, pending, f;
+        try {
+          f = await ld1CompletedFixture(() => {
+            const originalHandler = childProcessHandler;
+            setChildProcessHandler(request => {
+              if (!priorHeld && isIllustratorPgrepCheck(request)) {
+                priorHeld = true; chronology.push('prior-admission-poll-held');
+                return priorGate.promise.then(() => originalHandler(request));
+              }
+              return originalHandler(request);
+            });
+          });
+          assert.equal(priorHeld, true);
+          if (timing === 'prior-poll-settled') {
+            priorGate.release();
+            await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+              'prior poll did not settle before handler replacement');
+            chronology.push('prior-poll-settled-before-replacement');
+          }
+          const d = ld1InDesignFixture(f, scenario);
+          const inDesignHandler = childProcessHandler;
+          setChildProcessHandler(request => {
+            if (timing === 'prior-poll-settled' && !laterHeld && isIllustratorPgrepCheck(request)) {
+              laterHeld = true; chronology.push('later-admission-poll-held');
+              return laterGate.promise.then(() => inDesignHandler(request));
+            }
+            return inDesignHandler(request);
+          });
+          chronology.push('indesign-handler-installed');
+          pending = f.add(d.source);
+          const result = await pending;
+          chronology.push('selected-source-operation-settled');
+          const before = structuredClone(d.counts);
+          const pollBefore = metadataTestHooks.getIllustratorPollState(f.project.id);
+          assert.equal(pollBefore.inProgress, true);
+          assert.equal(laterHeld, timing === 'prior-poll-settled');
+          assert.equal(before.processChecks, 1);
+          assert.equal(before.enumerations, 1);
+          assert.deepEqual(before.processCalls, [{ route: 'selected-source-inventory', kind: 'execFile',
+            command: '/bin/ps', args: ['axww', '-o', 'pid=', '-o', 'comm='] }]);
+          priorGate.release(); laterGate.release();
+          chronology.push('background-poll-released');
+          await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+            'background poll did not settle before count assertion');
+          chronology.push('background-poll-settled');
+          const after = structuredClone(d.counts);
+          const pollAfter = metadataTestHooks.getIllustratorPollState(f.project.id);
+          const project = f.current();
+          const source = project.files.find(file => file.path === d.source);
+          const record = metadataTestHooks.getWorkingSourceVerification(project, source);
+          console.log('LD1_PROCESS_COUNT_TIMING_EVIDENCE ' + JSON.stringify({ scenario, timing,
+            chronology, before, after, pollBefore, pollAfter, result, verification: record }));
+          assertAddFilesPartialScanFailure(result);
+          assert.equal(result.failedCount, 1); assert.equal(result.completedCount, 0);
+          assert.equal(record?.status, 'failed');
+          assert.equal(record.notes?.includes('saved-byte-regex-fallback') || false, false);
+          assert.equal([...project.files, ...project.pendingFiles].some(file =>
+            [d.savedLink, d.liveLink, d.otherLink].includes(file.path)), false);
+          assert.equal(JSON.stringify(project.provenance).includes(d.otherLink), false);
+          assert.deepEqual(project.pendingFiles, []);
+          assert.equal(pollAfter.scopeRevision, pollBefore.scopeRevision);
+          assert.equal(after.processChecks, 2); assert.equal(after.enumerations, 1);
+          assert.equal(after.queries, 0); assert.deepEqual(after.observerScripts, []);
+          assert.deepEqual(after.processCalls, [before.processCalls[0], {
+            route: 'background-indesign-observer', kind: 'exec',
+            command: "/bin/ps ax -o command= 2>/dev/null | grep -i 'Adobe InDesign' | grep -v grep", args: [],
+          }]);
+          assert.deepEqual(after.otherObserverScripts,
+            timing === 'prior-poll-running' ? ['crate-ai-active-session.applescript'] : []);
+          f.assertPrior();
+        } finally {
+          priorGate.release(); laterGate.release();
+          if (pending) await pending;
+          if (f) {
+            await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+              'process count timing cleanup did not settle');
+            await f.cleanup();
+          }
+        }
+      });
+    }
+  }
+
   for (const scenario of ['running-other-document', 'running-no-documents', 'selected-present', 'closed',
     'malformed', 'count-mismatch', 'query-error-count', 'script-query-failure', 'script-automation-denied', 'process-policy-denied',
     'snapshot-source-change', 'running-bare-name', 'closed-lookalike-processes',
@@ -950,10 +1042,14 @@ function baselineCases() {
     'process-blank-row', 'process-stderr']) {
     baselineTest(`LD-1 M1 InDesign: ${scenario}`, async () => {
       const f = await ld1CompletedFixture();
-      const d = ld1InDesignFixture(f, scenario);
-      const originalBytes = fs.readFileSync(d.source);
       try {
+        await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+          'prior admission poll did not settle before InDesign handler replacement');
+        const d = ld1InDesignFixture(f, scenario);
+        const originalBytes = fs.readFileSync(d.source);
         const result = await f.add(d.source);
+        await waitForCondition(() => !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress,
+          'InDesign admission poll did not settle before observer count assertions');
         const project = f.current();
         const source = project.files.find(file => file.path === d.source);
         const record = metadataTestHooks.getWorkingSourceVerification(project, source);
@@ -966,6 +1062,8 @@ function baselineCases() {
           ? [] : ['crate-indd-poll.applescript']);
         if (scenario === 'process-malformed') assert.ok(d.counts.otherObserverScripts.includes('crate-ai-active-session.applescript'));
         assert.equal(d.counts.processChecks, 2);
+        assert.equal(d.counts.processCalls.filter(call => call.route === 'selected-source-inventory').length, 1);
+        assert.equal(d.counts.processCalls.filter(call => call.route === 'background-indesign-observer').length, 1);
         assert.equal(d.counts.queries, noQuery ? 0 : 1);
         assert.equal(source.source, 'manual-browse'); assert.equal(source.assetOrigin, 'added');
         if (success) {
