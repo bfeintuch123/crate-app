@@ -5034,13 +5034,15 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
     assetBaseline: { status: 'decision-required', decision: null, establishedAt: 2 },
   };
   let resolveDecisionA;
+  const decisionCalls = [];
   let packageTrigger;
   const decisionA = new Promise(resolve => { resolveDecisionA = resolve; });
   const noOp = () => {};
   const renderer = loadRendererHelpers(document, { crate: {
-    setExistingAssetsDecision: async projectId => (
-      projectId === projectA.id ? decisionA : { success: true, project: projectB }
-    ),
+    setExistingAssetsDecision: async projectId => {
+      decisionCalls.push(projectId);
+      return projectId === projectA.id ? decisionA : { success: true, project: projectB };
+    },
     getProjects: async () => [projectA, projectB],
     onFilesUpdated: noOp,
     onProjectUpdated: noOp,
@@ -5051,13 +5053,22 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
     onFigmaScanComplete: noOp,
     onFigmaScanError: noOp,
   } });
+  renderer.testProjectA = projectA;
+  renderer.testProjectB = projectB;
   vm.runInContext(`
-    state.projects = [${JSON.stringify(projectA)}, ${JSON.stringify(projectB)}];
-    state.selectedProjectId = '${projectA.id}';
+    state.projects = [testProjectA, testProjectB];
+    state.selectedProjectId = testProjectA.id;
   `, renderer);
-  await renderer.showExistingAssetsDecisionModal(projectA);
+  assert.equal(vm.runInContext('state.projects[0]', renderer), projectA);
+  assert.equal(await renderer.showExistingAssetsDecisionModal(projectA), true);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
+  assert.equal(vm.runInContext('existingAssetsModalSessionId !== null && isCurrentModalLease("modal-existing-assets", existingAssetsModalSessionId)', renderer), true);
   renderer.setupMainProcessListeners();
   const pendingDecision = renderer.submitExistingAssetsDecision('include');
+  assert.deepEqual(decisionCalls, [projectA.id]);
+  assert.equal(vm.runInContext('existingAssetsDecisionRequest.projectId', renderer), projectA.id);
+  assert.equal(elements['btn-include-existing-assets'].disabled, true);
+  assert.equal(elements['btn-skip-existing-assets'].disabled, true);
 
   await packageTrigger({ projectId: projectB.id });
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
@@ -5069,6 +5080,8 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
   await pendingDecision;
 
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(vm.runInContext('existingAssetsDecisionRequest', renderer), null);
+  assert.equal(vm.runInContext('activeModalLease', renderer), null);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 
@@ -8081,6 +8094,9 @@ for (const input of ['click', 'keyboard']) {
       tab.setAttribute('aria-controls', `settings-panel-${name}`);
       tab.setAttribute('aria-selected', String(index === 0));
       f.document.getElementById(`settings-panel-${name}`).hidden = index !== 0;
+      f.elements['tab-settings'].appendChild(tab);
+      assert.equal(tab.isConnected, true);
+      assert.equal(f.elements['tab-settings'].contains(tab), true);
       return tab;
     });
     const queryAll = f.document.querySelectorAll.bind(f.document);

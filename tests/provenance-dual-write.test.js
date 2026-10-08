@@ -22864,10 +22864,13 @@ test('multi-asset PSD extraction partial commit error cleans final and staged ou
   }
 });
 
-test('PSD scan-on-save embedded asset preserves ledger entry and records one parser embed edge', async () => {
+test('PSD scan-on-save embedded asset preserves ledger entry and records one parser embed edge', async (t) => {
   const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD embedded parser provenance');
+    project = await createProject('PSD embedded parser provenance');
     const psdPath = path.join(tmpRoot, 'source.psd');
     fs.writeFileSync(psdPath, 'psd bytes');
     await setProjectFiles(project.id, {
@@ -22879,11 +22882,61 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     currentPsdFixture = {
       children: [],
       linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id }));
     await emitWatcher('change', psdPath);
     let fresh = await waitForProject(
       project.id,
@@ -22931,14 +22984,23 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
     );
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
-test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async () => {
+test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async (t) => {
   const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD embedded asset exclusion');
+    project = await createProject('PSD embedded asset exclusion');
     const psdPath = path.join(tmpRoot, 'source.psd');
     fs.writeFileSync(psdPath, 'psd bytes');
     await setProjectFiles(project.id, {
@@ -22950,11 +23012,61 @@ test('Added While Working embedded PSD exclusion survives regenerated file IDs o
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     currentPsdFixture = {
       children: [],
       linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id }));
     await emitWatcher('change', psdPath);
     let fresh = await waitForProject(
       project.id,
@@ -22984,7 +23096,13 @@ test('Added While Working embedded PSD exclusion survives regenerated file IDs o
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(review.files.map(file => file.name), ['source.psd']);
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
@@ -23021,12 +23139,16 @@ test('PSD scan-on-save missing linked asset does not record parser relationship 
   }
 });
 
-test('PSD parser provenance failure does not block scan-on-save capture', async () => {
-  const tmpRoot = makeTempDir();
+test('PSD parser provenance failure does not block scan-on-save capture', async (t) => {
+  const tmpRoot = fs.mkdtempSync(path.join(process.env.CRATE_TEST_OUTPUT_ROOT || path.resolve(__dirname, '..'), 'psd-provenance-failure-'));
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD parser provenance failure');
+    project = await createProject('PSD parser provenance failure');
     const psdPath = path.join(tmpRoot, 'source.psd');
     const linkedPath = path.join(tmpRoot, 'linked-logo.ai');
+    assert.ok(fs.realpathSync.native(tmpRoot).startsWith('/Users/'), 'linked PSD parser fixture requires a physical /Users source');
     fs.writeFileSync(psdPath, 'psd bytes');
     fs.writeFileSync(linkedPath, 'linked bytes');
     const storedProject = await setProjectFiles(project.id, {
@@ -23038,6 +23160,55 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     storedProject.provenance.nodes = new Proxy({}, {
       set() {
         throw new Error('forced PSD parser provenance failure');
@@ -23048,6 +23219,7 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
       linkedFiles: [],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id, forcedProvenanceFailure: true }));
     await emitWatcher('change', psdPath);
     const fresh = await waitForProject(project.id, item => item.files.length === 2);
 
@@ -23055,7 +23227,13 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
     assert.ok(linkedEntry);
     assert.equal(linkedEntry.source, 'scan-on-save-linked');
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
@@ -23700,14 +23878,16 @@ for (const kind of ['psd', 'presentation']) for (const boundary of ['debounce', 
 }
 
 for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refresh', 'valid']) {
-  test(`scan guard production accepted ${kind} child lifetime ${mode}`, async () => {
+  test(`scan guard production accepted ${kind} child lifetime ${mode}`, async (t) => {
     const root = makeTempDir(), originalNow = testAccountSession.now, originalTimer = global.setTimeout;
     const originalProvider = testAccountSession.provider, originalCredentials = testAccountSession.credentials;
-    let fire;
+    const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+    const originalPsdFixture = currentPsdFixture, originalChildProcessHandler = childProcessHandler;
+    let fire, project, changing;
     try {
       const ext = kind === 'psd' ? '.psd' : '.pptx', source = path.join(root, 'accepted' + ext);
       fs.writeFileSync(source, 'synthetic source');
-      const project = await createProject('Accepted child ownership');
+      project = await createProject('Accepted child ownership');
       await setProjectFiles(project.id, { files: [{ path: source, name: path.basename(source), ext, source: 'manual-browse', addedAt: 0 }] });
       currentPsdFixture = { linkedFiles: [{ name: 'child.png', data: Buffer.alloc(800, 4) }] };
       setChildProcessHandler(({ command, args }) => command === '/usr/bin/unzip'
@@ -23716,14 +23896,65 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         if (delay === 2000) { fire = () => fn(...args); return { synthetic: true }; }
         return originalTimer(fn, delay === 500 ? 0 : delay, ...args);
       };
+      const watcherRecord = watcherRecords.at(-1);
+      const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+      const physicalSource = fs.realpathSync.native(source);
+      const sourceKey = normalizeLedgerPathForTest(source);
+      const sourceStat = fs.lstatSync(source);
+      assert.equal(sourceStat.isFile(), true);
+      assert.equal(sourceStat.isSymbolicLink(), false);
+      assert.equal(sourceStat.nlink, 1);
+      assert.equal(sourceKey, physicalSource.toLowerCase());
+      assert.equal(watcherRecord.closed, false);
+      assert.equal((await getProject(project.id)).status, 'watching');
+      assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+      assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+      assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+      const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+      const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+      let refusedReads = 0, refusedStats = 0;
+      fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(source)) refusedReads++;
+        return originalReadFile.call(fs.promises, candidate, ...args);
+      };
+      fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(source)) refusedStats++;
+        return originalStat.call(fs.promises, candidate, ...args);
+      };
+      try {
+        await emitWatcher('change', source);
+        assert.equal(refusedReads, 0);
+        assert.equal(refusedStats, 0);
+        assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+        assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+        assert.equal(fire, undefined, 'unenrolled event cannot schedule child');
+      } finally {
+        fs.promises.readFile = originalReadFile;
+        fs.promises.stat = originalStat;
+      }
+      t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+        owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+        stateUnchanged: true, eventsUnchanged: true }));
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+      const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+      assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+      assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+      assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+      assert.ok(watcherRecord.addedPaths.has(physicalSource));
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+        lexicalSource: source, physicalSource, owner: project.id, enrolled,
+        roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
       let settled = false;
-      const changing = emitWatcher('change', source).finally(() => { settled = true; });
+      changing = emitWatcher('change', source).finally(() => { settled = true; });
       await waitForCondition(() => !!fire, 'accepted event did not schedule child');
       await new Promise(resolve => originalSetTimeout(resolve, 10));
       // The callback returns without awaiting child work; its original authority
       // must nevertheless survive the debounce and any immediate sibling scan.
       await changing;
       assert.equal(settled, true);
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-parent-settled-child-captured', kind, mode, owner: project.id, childDelayMs: 2000, stageDelayMs: 500, parentSettled: settled }));
       const before = JSON.stringify(storeInstance.get('projects', [])); testRendererEvents.length = 0;
       if (mode === 'refresh') {
         const identity = testAccountSession.status.identity;
@@ -23731,6 +23962,7 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         testAccountSession.provider = { refresh: async () => ({ access_token: 'synthetic-next', refresh_token: 'synthetic-refresh' }), validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 7200000 }), me: async () => identity };
         testAccountSession.credentials = { write() {} }; await testAccountSession.refresh();
       } else invalidateScanAccount(mode);
+      t.diagnostic(JSON.stringify({ milestone: 'child-invalidation-applied', kind, mode, accountGeneration: testAccountSession.generation }));
       await fire(); await changing; assert.equal(settled, true);
       const saved = storeInstance.get('projects', []).find(p => p.id === project.id);
       assert.equal(saved.files.filter(f => f.source === (kind === 'psd' ? 'scan-on-save-embedded' : 'scan-on-save-presentation')).length, mode === 'clock' ? 0 : 1);
@@ -23738,7 +23970,26 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
         assert.equal(testRendererEvents.filter(e => e.data?.projectId === project.id).length, 0);
       }
-    } finally { global.setTimeout = originalTimer; testAccountSession.now = originalNow; testAccountSession.provider = originalProvider; testAccountSession.credentials = originalCredentials; await testAccountSession.restore(); fs.rmSync(root, { recursive: true, force: true }); }
+      t.diagnostic(JSON.stringify({ milestone: 'child-outcome-asserted', kind, mode,
+        expectedOutputCount: mode === 'clock' ? 0 : 1, clockRefusalStateAndEventsUnchanged: mode === 'clock' }));
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      global.setTimeout = originalTimer;
+      testAccountSession.now = originalNow;
+      testAccountSession.provider = originalProvider;
+      testAccountSession.credentials = originalCredentials;
+      await testAccountSession.restore();
+      if (project) await callIpcRaw('projects:pause', project.id);
+      if (changing) await changing;
+      fire = undefined;
+      currentPsdFixture = originalPsdFixture;
+      childProcessHandler = originalChildProcessHandler;
+      fs.rmSync(root, { recursive: true, force: true });
+      t.diagnostic(JSON.stringify({ milestone: 'owned-child-cleanup', kind, mode, owner: project?.id,
+        capturedCallbackReleased: !fire, timersCancelled: true, hooksAndAccountRestored: true,
+        fixtureRemoved: !fs.existsSync(root) }));
+    }
   });
 }
 for (const kind of ['psd', 'presentation']) {
