@@ -3349,12 +3349,27 @@ test.after(() => {
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
+async function waitForPresentationFixtureSignal(signal, label, timeoutMs = 5000) {
+  let timeoutId;
+  try {
+    await Promise.race([
+      signal,
+      new Promise((resolve, reject) => {
+        timeoutId = originalSetTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    originalClearTimeout(timeoutId);
+  }
+}
+
 test('PowerPoint scan-on-save extraction records media provenance without ledger metadata leak', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('PowerPoint Scan Save Provenance');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const mediaBytes = 'JPEG_BINARY_SHOULD_NOT_LEAK token=SHOULD_NOT_LEAK https://signed.example.test/private?sig=1 RAW_SCRIPT_OUTPUT '.repeat(10);
     const forbiddenValues = [
       'JPEG_BINARY_SHOULD_NOT_LEAK',
@@ -3406,18 +3421,20 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('deleting a project during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   let cacheInspection = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Delete During Presentation Extraction');
-    const pptxPath = path.join(tmpRoot, 'Delete-During-Scan.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delete-During-Scan.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -3441,7 +3458,7 @@ test('deleting a project during presentation extraction leaves no late project c
     });
 
     await emitWatcher('change', pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     await callIpc('projects:delete', project.id);
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3449,7 +3466,7 @@ test('deleting a project during presentation extraction leaves no late project c
     );
     cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
     releaseRead();
-    await cacheInspection.observed;
+    await waitForPresentationFixtureSignal(cacheInspection.observed, 'presentation finalizer cache inspection');
     await new Promise(resolve => setImmediate(resolve));
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3461,18 +3478,20 @@ test('deleting a project during presentation extraction leaves no late project c
   } finally {
     releaseRead();
     if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('a delayed presentation scan from an old A activation cannot cache or mutate after A to B to A', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   try {
     resetPresentationCacheRoot();
     const first = await createProject('Delayed Presentation Activation A');
     const firstWatcher = latestWatcherHandlers();
-    const pptxPath = path.join(tmpRoot, 'Delayed-Activation.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delayed-Activation.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(first.id, {
       files: [{
@@ -3496,7 +3515,7 @@ test('a delayed presentation scan from an old A activation cannot cache or mutat
     });
 
     await firstWatcher.change(pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     const second = await createProject('Delayed Presentation Activation B');
     await callIpc('projects:start-watching', first.id);
     releaseRead();
@@ -3513,18 +3532,20 @@ test('a delayed presentation scan from an old A activation cannot cache or mutat
     assert.equal(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).length : 0, 0);
   } finally {
     releaseRead();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('delete-all during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   let cacheInspection = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Delete All During Presentation Extraction');
-    const pptxPath = path.join(tmpRoot, 'Delete-All-During-Scan.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delete-All-During-Scan.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -3548,7 +3569,7 @@ test('delete-all during presentation extraction leaves no late project cache', a
     });
 
     await emitWatcher('change', pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     await callIpc('projects:delete-all');
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3556,7 +3577,7 @@ test('delete-all during presentation extraction leaves no late project cache', a
     );
     cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
     releaseRead();
-    await cacheInspection.observed;
+    await waitForPresentationFixtureSignal(cacheInspection.observed, 'presentation finalizer cache inspection');
     await new Promise(resolve => setImmediate(resolve));
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3568,16 +3589,18 @@ test('delete-all during presentation extraction leaves no late project cache', a
   } finally {
     releaseRead();
     if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('presentation scan-on-save hardens existing permissive cache directories and media files', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Hardening');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const stalePath = path.join(paths.projectDir, 'Deck — existing.jpeg');
     fs.writeFileSync(stalePath, 'existing permissive media bytes', { mode: 0o644 });
@@ -3622,16 +3645,18 @@ test('presentation scan-on-save hardens existing permissive cache directories an
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('presentation scan-on-save ignores stale cache metadata outside the current project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Stale Cache Metadata');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_STALE_PRESENTATION.jpeg');
     const mediaBytes = 'STALE_OUTSIDE_PRESENTATION_BYTES'.repeat(40);
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
@@ -3677,6 +3702,7 @@ test('presentation scan-on-save ignores stale cache metadata outside the current
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_STALE_PRESENTATION'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3685,10 +3711,11 @@ test('presentation scan-on-save ignores a nested cache symlink without reading i
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Nested Cache Symlink');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_NESTED_SYMLINK.jpeg');
     const symlinkPath = path.join(paths.projectDir, 'Deck — linked.jpeg');
@@ -3738,6 +3765,7 @@ test('presentation scan-on-save ignores a nested cache symlink without reading i
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_NESTED_SYMLINK'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3746,10 +3774,11 @@ test('presentation scan-on-save ignores an intermediate cache directory symlink'
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Intermediate Cache Symlink');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const outsideDir = path.join(tmpRoot, 'outside-cache');
     const outsidePath = path.join(outsideDir, 'SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK.jpeg');
@@ -3804,6 +3833,7 @@ test('presentation scan-on-save ignores an intermediate cache directory symlink'
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3812,11 +3842,12 @@ test('presentation cache read rejects a project-directory swap before touching t
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalOpenSync = fs.openSync;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Read Directory Swap');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const parkedProjectDir = `${paths.projectDir}.parked`;
     const outsideDir = path.join(tmpRoot, 'outside-read-cache');
@@ -3886,6 +3917,7 @@ test('presentation cache read rejects a project-directory swap before touching t
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
     fs.openSync = originalOpenSync;
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3894,13 +3926,14 @@ test('presentation cache write rejects a project-directory swap before writing o
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalOpenSync = fs.openSync;
   let paths = null;
   let parkedProjectDir = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Write Directory Swap');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     paths = makePermissivePresentationCacheDirectories(project.id);
     parkedProjectDir = `${paths.projectDir}.parked`;
     const outsideDir = path.join(tmpRoot, 'outside-write-cache');
@@ -3951,6 +3984,7 @@ test('presentation cache write rejects a project-directory swap before writing o
     if (parkedProjectDir && fs.existsSync(parkedProjectDir) && paths) {
       fs.renameSync(parkedProjectDir, paths.projectDir);
     }
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3959,12 +3993,13 @@ test('presentation cache write failure leaves no unsecured media bytes or projec
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalFchmod = fs.fchmodSync;
   let filePermissionFailures = 0;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Permission Failure');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -4006,6 +4041,7 @@ test('presentation cache write failure leaves no unsecured media bytes or projec
     assert.equal(captured.output.includes('UNSECURED_PRESENTATION_BYTES'), false);
   } finally {
     fs.fchmodSync = originalFchmod;
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -4014,10 +4050,11 @@ test('presentation scan-on-save rejects symlinked cache root without leaking tar
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Root Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET');
     fs.mkdirSync(symlinkTarget, { recursive: true });
@@ -4049,6 +4086,7 @@ test('presentation scan-on-save rejects symlinked cache root without leaking tar
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }
@@ -4058,10 +4096,11 @@ test('presentation scan-on-save rejects symlinked category cache directory witho
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Category Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET');
     fs.mkdirSync(paths.crateDir, { recursive: true });
@@ -4094,6 +4133,7 @@ test('presentation scan-on-save rejects symlinked category cache directory witho
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }
@@ -4103,10 +4143,11 @@ test('presentation scan-on-save rejects symlinked project cache directory withou
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Project Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET');
     fs.mkdirSync(paths.assetsDir, { recursive: true });
@@ -4139,6 +4180,7 @@ test('presentation scan-on-save rejects symlinked project cache directory withou
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }

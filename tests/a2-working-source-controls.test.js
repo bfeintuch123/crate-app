@@ -638,6 +638,8 @@ test('focus skips the restored row hidden by Excluded filter and uses visible fa
   const hidden = f.document.createElement('button'); hidden.dataset.sourceIdentity = f.row.visualIdentity;
   hidden.closest = selector => selector === '.filtered-out' ? {} : null;
   const next = f.document.createElement('button'); next.dataset.sourceIdentity = 'other-source';
+  f.document.body.appendChild(hidden);
+  f.document.body.appendChild(next);
   const originalQuery = f.document.querySelectorAll.bind(f.document);
   f.document.querySelectorAll = selector => selector === '.working-source-action' ? [hidden, next] : originalQuery(selector);
   f.renderer.focusWorkingSourceControl(f.row.visualIdentity);
