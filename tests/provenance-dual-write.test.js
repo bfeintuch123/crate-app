@@ -812,18 +812,19 @@ const watcherRecords = [];
 let watcherCloseCount = 0;
 let testUuidCounter = 0;
 setStub('chokidar', () => ({
-  watch: () => {
+  watch: (roots, options) => {
     const handlers = {};
+    const record = { handlers, roots: [...roots], options, addedPaths: new Set(), retiredPaths: new Set(), closed: false };
     const watcher = {
       on(eventName, handler) {
         handlers[eventName] = handler;
         return watcher;
       },
-      close() { watcherCloseCount += 1; },
-      add() {},
-      unwatch() {},
+      close() { watcherCloseCount += 1; record.closed = true; },
+      add(paths) { for (const filePath of [paths].flat()) { record.addedPaths.add(filePath); record.retiredPaths.delete(filePath); } },
+      unwatch(paths) { for (const filePath of [paths].flat()) { record.addedPaths.delete(filePath); record.retiredPaths.add(filePath); } },
     };
-    watcherRecords.push({ handlers });
+    watcherRecords.push(record);
     return watcher;
   },
 }));
@@ -1027,6 +1028,61 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
   const source = fs.readFileSync(filename, 'utf8');
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  getPackageReviewState() {
+    return { tokens: [...packageReviewSnapshots.keys()], current: [...currentPackageReviewTokenByProject.entries()] };
+  },
+  holdPackageReviewPlan(wait) {
+    const prior = buildAuthoritativePackagePlan; let held = false;
+    buildAuthoritativePackagePlan = async (...args) => {
+      const result = await prior(...args);
+      if (!held) { held = true; await wait(); }
+      return result;
+    };
+    return () => { buildAuthoritativePackagePlan = prior; };
+  },
+  syncAcceptedSourceWatchSubscriptions, getWorkingSourceWatchCoverage, getProjectAssetWorkspace,
+  traceWatchCoverageOperations(projectId, trace) {
+    const prior = captureProjectOperation;
+    const snapshot = () => ({ scopeRevision: getIllustratorActivationScope(projectId)?.revision,
+      admittedPaths: [...(getIllustratorActivationScope(projectId)?.admittedDocumentPaths || [])],
+      activationToken: getActiveWatchingActivationToken(projectId), generation: watchingActivationSequence,
+      accountGeneration: accountSession?.generation,
+      status: getProjects().find(project => project.id === projectId)?.status });
+    captureProjectOperation = id => {
+      const operation = prior(id); if (id !== projectId || !operation) return operation;
+      let expected = snapshot(), logged = false;
+      const current = operation.current, adopt = operation.adoptScope;
+      operation.adoptScope = scope => { const result = adopt(scope); if (result) expected = snapshot(); return result; };
+      operation.current = () => {
+        const result = current();
+        if (!result && !logged) { logged = true; trace.push({ expected, actual: snapshot() }); }
+        return result;
+      };
+      return operation;
+    };
+    return () => { captureProjectOperation = prior; };
+  },
+  holdWatchWorkspacePresentation(wait) {
+    const prior = createRendererFilePresentation; let held = false;
+    createRendererFilePresentation = async (...args) => {
+      const result = await prior(...args);
+      if (!held) { held = true; await wait(); }
+      return result;
+    };
+    return () => { createRendererFilePresentation = prior; };
+  },
+  getAcceptedSourceWatchSnapshot(projectId) {
+    const subscription = acceptedSourceWatchSubscriptions.get(projectId);
+    return subscription ? { activationToken: subscription.activationToken, accountGeneration: subscription.accountGeneration,
+      paths: [...subscription.paths] } : null;
+  },
+  failAcceptedSourceWatchAdd(projectId, failedPath) {
+    const watcher = acceptedSourceWatchSubscriptions.get(projectId).watcher, prior = watcher.add;
+    watcher.add = function (...args) {
+      if (args[0] === failedPath) throw new Error('modeled exact-path enrollment failure');
+      return prior.apply(this, args);
+    };
+  },
   captureProjectOperation,
   runScanOnOpen, beginProjectAssetBaselineScan, completeProjectAssetBaselineScan, releaseProjectAssetBaselineScan,
   reserveProjectAssetBaselineScanQueue, cancelProjectAssetBaselineScanQueue,
@@ -5552,6 +5608,7 @@ test('package plan resolves case, Unicode, and diagnostics collisions with one m
 });
 
 test('destination collisions refresh the reviewed folder name before publishing', async () => {
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Bound Destination Collision');
@@ -5628,6 +5685,7 @@ test('destination occupancy drift refreshes again with zero package side effects
 });
 
 test('late destination occupancy refreshes once and the second confirmation publishes the bound folder', async () => {
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const tmpRoot = makeTempDir();
   const originalOpen = fs.promises.open;
   try {
@@ -24099,4 +24157,178 @@ test('mixed Figma and native baseline waits for both complete sources and preser
         assert.deepEqual(included.project.excludedAssetKeys, []);
       });
   }
+});
+
+// Account-lifetime consent tests use the production main issuer, consumer, IPC
+// wrapper/change callback and AccountSession logout/invalidate/publish paths.
+// Electron, credential storage, restore and native acquisition remain modeled.
+async function makeSessionTokenFixture() {
+  const root = makeTempDir(), sourcePath = path.join(root, 'Stable.png');
+  const outputDir = path.join(root, 'out'); fs.mkdirSync(outputDir);
+  fs.writeFileSync(sourcePath, createSyntheticPngBytes());
+  const project = await createProject('Session-token unchanged paused project');
+  await callIpcRaw('projects:pause', project.id);
+  await setProjectFiles(project.id, { files: [{ path: sourcePath, name: 'Stable.png', ext: '.png', addedAt: 0, source: 'manual-browse', assetOrigin: 'added', projectRole: 'asset' }] });
+  const stored = storeInstance.get('projects', []).find(item => item.id === project.id);
+  assert.equal(stored.status, 'paused');
+  const before = JSON.stringify(stored);
+  return { root, sourcePath, outputDir, project, before,
+    review: () => callIpcRaw('projects:prepare-package-review', project.id, outputDir),
+    package: token => callIpcRaw('projects:package', project.id, outputDir, token),
+    assertUnchanged() {
+      assert.equal(JSON.stringify(storeInstance.get('projects', []).find(item => item.id === project.id)), before);
+      assert.deepEqual(fs.readdirSync(outputDir), []);
+      assert.equal(fs.readdirSync(root).some(name => name.startsWith('.crate-package-staging-')), false);
+    },
+    cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+async function assertSessionTokenDeniedBeforeOutput(fixture, token) {
+  const quota = storeInstance.get('usage.packagesThisMonth');
+  const originalMkdir = fs.mkdirSync, originalOpen = fs.promises.open;
+  let outputWrites = 0, sourceOpens = 0;
+  fs.mkdirSync = function(candidate, ...args) {
+    if (path.resolve(candidate).startsWith(fixture.root + path.sep)) outputWrites++;
+    return originalMkdir.call(this, candidate, ...args);
+  };
+  fs.promises.open = async function(candidate, ...args) {
+    if (path.resolve(candidate) === fixture.sourcePath) sourceOpens++;
+    return originalOpen.call(this, candidate, ...args);
+  };
+  try {
+    assert.equal((await fixture.package(token)).error, 'package_review_stale');
+    assert.equal(outputWrites, 0, 'reject before private destination/staging creation');
+    assert.equal(sourceOpens, 0, 'reject before reviewed source handles');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), quota);
+    fixture.assertUnchanged();
+  } finally { fs.mkdirSync = originalMkdir; fs.promises.open = originalOpen; }
+}
+
+for (const mode of ['logout-reauthorize', 'identity-without-event', 'identity-with-event', 'generation-without-event', 'generation-with-allowed-event', 'notified-expiry-reauthorize']) {
+  test(`session-token consent rejects ${mode} before output for unchanged paused project`, async () => {
+    const f = await makeSessionTokenFixture(), originalNow = testAccountSession.now;
+    try {
+      const review = await f.review(); assert.equal(review.materializable, true); assert.equal(typeof review.token, 'string');
+      const generation = testAccountSession.generation;
+      if (mode === 'logout-reauthorize') { await testAccountSession.logout(); await testAccountSession.restore(); }
+      if (mode.startsWith('identity-')) testAccountSession.status = { ...testAccountSession.status, identity: { id: 'different-synthetic-account' } };
+      if (mode === 'identity-with-event') testAccountSession.publish('signed_in');
+      if (mode.startsWith('generation-')) {
+        testAccountSession.invalidate();
+        if (mode === 'generation-with-allowed-event') testAccountSession.publish('signed_in');
+      }
+      if (mode === 'notified-expiry-reauthorize') {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt;
+        testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+        assert.equal(testAccountSession.generation, generation, 'notified expiry need not increment AccountSession generation');
+      }
+      assert.equal(testAccountSession.canUseWorkspace(), true);
+      if (!mode.endsWith('without-event')) assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), false, 'change callback retires consent');
+      await assertSessionTokenDeniedBeforeOutput(f, review.token);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), false, 'consumer retires mismatched token');
+    } finally { testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+for (const mode of ['logout-reauthorize', 'generation-without-event', 'notified-expiry-reauthorize', 'newer-review']) {
+  test(`session-token issuance ${mode} during presentation leaves no old consent`, async () => {
+    const f = await makeSessionTokenFixture(), gate = deferredScanBoundary(), originalNow = testAccountSession.now;
+    let restore = () => {}, completion;
+    try {
+      restore = metadataTestHooks.holdWatchWorkspacePresentation(gate.wait);
+      // Attach rejection handling immediately: the production IPC wrapper rejects
+      // a request from a retired identity/generation even after sign-in returns.
+      completion = f.review().then(value => ({ value }), error => ({ error }));
+      await gate.started;
+      const [oldToken] = metadataTestHooks.getPackageReviewState().tokens;
+      assert.equal(typeof oldToken, 'string');
+      if (mode === 'generation-without-event') testAccountSession.invalidate();
+      else if (mode === 'notified-expiry-reauthorize') {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt; testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+      } else { await testAccountSession.logout(); await testAccountSession.restore(); }
+      let newer;
+      if (mode === 'newer-review') { newer = await f.review(); assert.equal(typeof newer.token, 'string'); }
+      gate.release();
+      const result = await completion;
+      if (mode === 'notified-expiry-reauthorize') assert.equal(result.value?.error, 'package_review_changed');
+      else assert.match(result.error?.message || '', /Sign in to Crate/);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(oldToken), false);
+      await assertSessionTokenDeniedBeforeOutput(f, oldToken);
+      if (newer) {
+        assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(newer.token), true, 'retire only old issuance');
+        assert.equal((await f.package(newer.token)).success, true);
+      }
+    } finally { gate.release(); if (completion) await completion; restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+for (const mode of ['logout-reauthorize', 'notified-expiry-reauthorize']) {
+  test(`session-token issuance ${mode} during manifest cannot mint late consent`, async () => {
+    const f = await makeSessionTokenFixture(), gate = deferredScanBoundary(), originalNow = testAccountSession.now;
+    let restore = () => {}, completion;
+    try {
+      restore = metadataTestHooks.holdPackageReviewPlan(gate.wait);
+      completion = f.review().then(value => ({ value }), error => ({ error })); await gate.started;
+      if (mode === 'logout-reauthorize') { await testAccountSession.logout(); await testAccountSession.restore(); }
+      else {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt; testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+      }
+      gate.release(); const result = await completion;
+      if (mode === 'logout-reauthorize') assert.match(result.error?.message || '', /Sign in to Crate/);
+      else assert.equal(result.value?.error, 'package_review_changed');
+      assert.equal(metadataTestHooks.getPackageReviewState().current.some(([id]) => id === f.project.id), false);
+      f.assertUnchanged();
+    } finally { gate.release(); if (completion) await completion; restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+test('session-token current lifetime succeeds once and expired consent rejects before output', async () => {
+  const f = await makeSessionTokenFixture(), originalDateNow = Date.now;
+  try {
+    const expired = await f.review();
+    const issuedAt = originalDateNow(); Date.now = () => issuedAt + 15 * 60 * 1000 + 1;
+    await assertSessionTokenDeniedBeforeOutput(f, expired.token);
+    Date.now = originalDateNow;
+    const review = await f.review();
+    assert.equal((await f.package(review.token)).success, true);
+    assert.equal((await f.package(review.token)).error, 'package_review_replayed');
+  } finally { Date.now = originalDateNow; f.cleanup(); }
+});
+
+test('session-token package source-open failure after reauthorization cannot mint refreshed consent', async () => {
+  const f = await makeSessionTokenFixture(), gate = deferredScanBoundary();
+  const originalOpen = fs.promises.open;
+  let completion, held = false;
+  try {
+    const review = await f.review();
+    fs.promises.open = async function(candidate, ...args) {
+      if (!held && path.resolve(candidate) === f.sourcePath) {
+        held = true; await gate.wait(); throw new Error('synthetic stale source-open failure');
+      }
+      return originalOpen.call(this, candidate, ...args);
+    };
+    completion = f.package(review.token).then(value => ({ value }), error => ({ error }));
+    await gate.started; await testAccountSession.logout(); await testAccountSession.restore();
+    gate.release(); const result = await completion;
+    assert.match(result.error?.message || '', /Sign in to Crate/);
+    assert.equal(metadataTestHooks.getPackageReviewState().current.some(([id]) => id === f.project.id), false);
+    f.assertUnchanged();
+  } finally { gate.release(); if (completion) await completion; fs.promises.open = originalOpen; await testAccountSession.restore(); f.cleanup(); }
+});
+
+test('session-token allowed account publications in the same lifetime preserve current consent', async () => {
+  const f = await makeSessionTokenFixture();
+  try {
+    const review = await f.review(), generation = testAccountSession.generation;
+    testAccountSession.publish('offline', 'Synthetic verified offline state');
+    assert.equal(testAccountSession.canUseWorkspace(), true);
+    testAccountSession.publish('signed_in');
+    assert.equal(testAccountSession.generation, generation);
+    assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), true);
+    assert.equal((await f.package(review.token)).success, true);
+  } finally { f.cleanup(); }
 });

@@ -61,20 +61,19 @@ function createElementStub(tagName = 'div') {
       const index = element.children.indexOf(child);
       if (index >= 0) element.children.splice(index, 1);
       if (child?.parentNode === element) child.parentNode = null;
+      if (child?.contains?.(element.ownerDocument?.activeElement)) element.ownerDocument.activeElement = element.ownerDocument.body;
       return child;
     },
     replaceChild: (next, previous) => {
       const index = element.children.indexOf(previous);
       if (index >= 0) element.children[index] = next;
       if (previous?.parentNode === element) previous.parentNode = null;
+      if (previous?.contains?.(element.ownerDocument?.activeElement)) element.ownerDocument.activeElement = element.ownerDocument.body;
       if (next) next.parentNode = element;
       return previous;
     },
     replaceChildren: (...children) => {
-      for (const child of element.children) {
-        if (child?.parentNode === element) child.parentNode = null;
-      }
-      element.children = [];
+      for (const child of [...element.children]) element.removeChild(child);
       children.filter(Boolean).forEach(child => element.appendChild(child));
     },
     addEventListener: (type, fn) => {
@@ -91,6 +90,7 @@ function createElementStub(tagName = 'div') {
     },
     click: () => element.dispatchEvent({ type: 'click', preventDefault: () => {}, stopPropagation: () => {} }),
     focus: () => {
+      if (!element.isConnected || element.disabled) return;
       if (element.ownerDocument?.activeElement) element.ownerDocument.activeElement.focused = false;
       element.focused = true;
       if (element.ownerDocument) element.ownerDocument.activeElement = element;
@@ -120,6 +120,11 @@ function createElementStub(tagName = 'div') {
       ) {
         return { addEventListener: () => {} };
       }
+      for (const child of element.children) {
+        if (child.matches?.(selector)) return child;
+        const match = child.querySelector?.(selector);
+        if (match) return match;
+      }
       return null;
     },
     querySelectorAll: selector => {
@@ -127,12 +132,15 @@ function createElementStub(tagName = 'div') {
       if (selector === '[data-render-key]') return createNodeList(element.children);
       return [];
     },
-    closest: () => null,
+    matches: selector => selector === '[data-render-key]' ? !!element.dataset.renderKey
+      : selector.startsWith('.') ? String(element.className || '').split(/\s+/).includes(selector.slice(1)) || classes.has(selector.slice(1))
+      : element.tagName.toLowerCase() === selector,
+    closest: selector => element.matches(selector) ? element : element.parentNode?.closest?.(selector) || null,
   };
 
   let html = '';
   let text = '';
-  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument });
+  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument?.body?.contains(element) });
   Object.defineProperty(element, 'parentElement', { get: () => element.parentNode || null });
   const htmlEscape = value => String(value)
     .replace(/&/g, '&amp;')
@@ -152,7 +160,7 @@ function createElementStub(tagName = 'div') {
     set: value => {
       html = String(value ?? '');
       text = html;
-      element.children = [];
+      element.replaceChildren();
     },
   });
 
@@ -197,7 +205,11 @@ function createDocumentStub(elements = {}, options = {}) {
     return element;
   };
   const getElementById = id => {
-    if (!elements[id] && options.createMissingIds) elements[id] = attach(createElementStub());
+    if (!elements[id] && options.createMissingIds) {
+      elements[id] = attach(createElementStub());
+      elements[id].id = id;
+      body.appendChild(elements[id]);
+    }
     return attach(elements[id] || null);
   };
 
@@ -228,12 +240,19 @@ function createDocumentStub(elements = {}, options = {}) {
     body,
   };
   body.ownerDocument = document;
-  for (const element of Object.values(elements)) attach(element);
+  for (const [id, element] of Object.entries(elements)) {
+    attach(element); element.id = id;
+    if (!element.parentNode) body.appendChild(element);
+  }
   for (const element of [
     ...(options.tabs || []),
     ...(options.tabContents || []),
     ...(options.assetFilters || []),
-  ]) attach(element);
+    options.packageReviewDialog,
+  ].filter(Boolean)) {
+    attach(element);
+    if (!element.parentNode) body.appendChild(element);
+  }
   return document;
 }
 

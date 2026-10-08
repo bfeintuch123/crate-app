@@ -33,6 +33,7 @@ function setup(overrides = {}) {
   const renderer = loadRendererHelpers(document, { crate });
   renderer.fixtureProject = project; renderer.fixtureWorkspace = workspace;
   vm.runInContext('state.projects = [fixtureProject]; state.selectedProjectId = fixtureProject.id; state.assetWorkspace = fixtureWorkspace; assetWorkspaceProjectSnapshot = fixtureProject; accountStatus.canUseWorkspace = true;', renderer);
+  renderer.setAssetReviewProject(project.id);
   const notices = [];
   renderer.showToast = message => notices.push(message);
   return { renderer, document, elements, project, workspace, row, calls, crate, notices };
@@ -712,7 +713,8 @@ for (const error of [null, 'invalid_continuation_request', 'continuation_stale',
   const f = setup(); const order = [];
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); return error ? { success: false, error } : { success: true, decision: { authority: 'owner-choice', choice: 'replace' } }; };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { assert.equal(options.runPreScan, false); order.push('prepare'); };
   await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer));
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']);
@@ -739,7 +741,8 @@ for (const responseProjectId of ['a2-project', 'foreign-project', null, undefine
     return { success: true, projectId: responseProjectId, semanticCounts: { selectedWorkingSources: 999 } };
   };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   const result = await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer));
   assert.equal(result, responseProjectId === f.project.id);
@@ -824,7 +827,8 @@ test('admission-required refusal refreshes ordinary files and gives truthful rec
   const f = setup(); const order = []; let message;
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); return { success: false, error: 'continuation_admission_required' }; };
   const review = pairReview(f), pair = review.sourceContinuation.candidates[0]; f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.match(message, /Close Package Review to return to your files/);
@@ -850,7 +854,8 @@ test('lost resolver reply refreshes authoritative rows before reprepare without 
   const f = setup(); const order = []; let message;
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); throw new Error('reply lost'); };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']);

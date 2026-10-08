@@ -21,12 +21,14 @@ replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification, getStablePackageReviewSourceContentFingerprint, getPackageReviewSourceFingerprint,\n' +
+  '  getWorkingScanLifetime() { return { operations: workingSourceScanOperations.size, leases: workingSourceScanLeases.size }; },\n' +
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
   '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getIllustratorPollState(id) { return { scopeRevision: getIllustratorActivationScope(id)?.revision, inProgress: psInProgress.has(id) }; },\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
+  '  isWatcherGenerationCurrent(projectId, generation) { return getWatcherCoordinator(projectId).isCurrent(projectId, generation); },\n' +
   '  captureProjectOperation,\n  runScanOnOpen');
 // Exercise the actual retained parser and wire inspection in the complete main
 // IPC/store route; the utility-process transport and Electron remain modeled.
@@ -41,6 +43,840 @@ compiled.paths = Module._nodeModulePaths(__dirname);
 compiled._compile(harness + '\n(' + baselineCases.toString() + ')();\n', harnessPath);
 
 function baselineCases() {
+  // V29 drives trusted account IPC into the real AccountSession.cancel and
+  // main change listener. Only native/observer transport remains modeled.
+  async function waitForRecoveryWatcher(f, previousCount) {
+    await waitForCondition(() => watcherRecords.length === previousCount + 1 &&
+      typeof watcherRecords.at(-1).handlers.change === 'function', 'exactly one replacement Watch subscription was not installed');
+    await metadataTestHooks.waitForWatcherIdle(f.project.id);
+    clearTrackedTimers();
+    assert.equal(watcherRecords.length, previousCount + 1);
+    return watcherRecords.at(-1);
+  }
+  for (const location of ['inside', 'outside']) {
+    baselineTest(`v29 Watch recovery ${location}: trusted cancel replaces stale watcher and delivers current source changes`, { timeout: 20000 }, async () => {
+      const f = await tildeWatchFixture(location, 'Recovery.ai');
+      try {
+        assert.ok(testAccountSession instanceof RealAccountSession);
+        const old = f.watch, count = watcherRecords.length;
+        const generation = testAccountSession.generation, identity = testAccountSession.snapshot().identity.id;
+        const startedAt = f.current().watchStartedAt;
+        const oldOperation = metadataTestHooks.captureProjectOperation(f.project.id);
+        const oldSubscription = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id);
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.ok(review.token, JSON.stringify(review));
+        const result = await callIpcRaw('account:cancel');
+        assert.equal(result.state, 'offline'); assert.equal(result.canUseWorkspace, true);
+        assert.equal(result.identity.id, identity); assert.equal(testAccountSession.generation, generation + 1);
+        assert.equal(old.closed, true, 'obsolete Watch retired synchronously before cancel returns');
+        assert.equal(oldOperation.current(), false);
+        assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), false);
+        const currentWatch = await waitForRecoveryWatcher(f, count);
+        const currentSubscription = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id);
+        assert.notEqual(currentSubscription.activationToken, oldSubscription.activationToken);
+        assert.equal(currentSubscription.accountGeneration, testAccountSession.generation);
+        assert.equal(f.current().watchStartedAt, startedAt);
+        assert.equal(storeInstance.data.projects.filter(p => p.status === 'watching').length, 1);
+        assert.equal(watcherRecords.filter(record => !record.closed).length, 1);
+        assert.equal(tildeCoverage(f).status, location === 'inside' ? 'default-root' : 'exact-enrolled');
+        assert.equal(currentWatch.addedPaths.has(f.source), location === 'outside');
+        const x = path.join(TEST_HOME, 'Desktop', 'Recovery-X.png'); fs.writeFileSync(x, 'recovered source dependency');
+        fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n${x}\n%%EOF\n`);
+        const before = JSON.stringify(f.current());
+        await old.handlers.add(f.source); await old.handlers.change(f.source, fs.statSync(f.source));
+        await drainTildeScan(f);
+        assert.equal(JSON.stringify(f.current()), before, 'retired callbacks remain unable to mutate after recovery');
+        await currentWatch.handlers.change(f.source, fs.statSync(f.source)); await drainTildeScan(f);
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint,
+          crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex'));
+        assert.equal(f.current().files.filter(row => row.path === x).length, 1);
+        assert.equal(f.current().files.filter(row => row.path === f.paths[0].link).length, 1, 'independent prior asset remains');
+        assert.equal(watcherRecords.length, count + 1, 'delivery cannot create a second replacement');
+      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  baselineTest('v29 Watch recovery: current default-root add admits once while retired add stays rejected', { timeout: 15000 }, async () => {
+    const f = await fixture({ structuredLinks: false });
+    try {
+      const old = watcherRecords.at(-1), count = watcherRecords.length;
+      const startedAt = (await f.current()).watchStartedAt;
+      await callIpcRaw('account:cancel');
+      const current = await waitForRecoveryWatcher(f, count);
+      await waitForCondition(() => Date.now() > startedAt, 'fixture clock did not advance');
+      const source = path.join(TEST_HOME, 'Desktop', 'Recovery-New.ai');
+      writeSyntheticAiFile(source, f.paths[0].link);
+      const before = JSON.stringify(storeInstance.data.projects);
+      await old.handlers.add(source); assert.equal(JSON.stringify(storeInstance.data.projects), before);
+      await current.handlers.add(source); await metadataTestHooks.waitForWatcherIdle(f.project.id);
+      assert.equal((await f.current()).files.filter(row => row.path === source).length, 1);
+      await current.handlers.add(source); await metadataTestHooks.waitForWatcherIdle(f.project.id);
+      assert.equal((await f.current()).files.filter(row => row.path === source).length, 1);
+    } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  baselineTest('v29 Watch recovery: consecutive trusted cancels install only the latest activation', { timeout: 15000 }, async () => {
+    const f = await tildeWatchFixture('outside', 'Rapid.ai');
+    try {
+      const count = watcherRecords.length, generation = testAccountSession.generation, start = f.current().watchStartedAt;
+      const first = callIpcRaw('account:cancel'), second = callIpcRaw('account:cancel'), third = callIpcRaw('account:cancel');
+      assert.equal(f.watch.closed, true);
+      await Promise.all([first, second, third]);
+      const current = await waitForRecoveryWatcher(f, count);
+      assert.equal(testAccountSession.generation, generation + 3);
+      assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id).accountGeneration, generation + 3);
+      assert.equal(f.current().watchStartedAt, start);
+      assert.equal(current.addedPaths.has(f.source), true);
+      assert.equal(watcherRecords.filter(record => !record.closed).length, 1);
+    } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  baselineTest('v29 Watch recovery: retired coordinator ticket remains stale through held operation drain', { timeout: 15000 }, async () => {
+    const f = await tildeWatchFixture('inside', 'Drain.ai'), gate = deferred();
+    let running, oldTicketGeneration, retiredCurrent, entered = false;
+    try {
+      const operation = metadataTestHooks.captureProjectOperation(f.project.id), count = watcherRecords.length;
+      running = metadataTestHooks.runBackgroundWatcherOperation(f.project.id, 'v29-held', async generation => {
+        oldTicketGeneration = generation; entered = true; await gate.promise;
+        retiredCurrent = metadataTestHooks.isWatcherGenerationCurrent(f.project.id, generation);
+        assert.equal(operation.current(), false);
+      });
+      await waitForCondition(() => entered, 'held coordinator operation did not start');
+      await callIpcRaw('account:cancel');
+      assert.equal(f.watch.closed, true);
+      assert.equal(operation.current(), false);
+      assert.equal(metadataTestHooks.isWatcherGenerationCurrent(f.project.id, oldTicketGeneration), false);
+      assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(f.project.id).running, true, 'retirement preserves the owned drain');
+      gate.release(); await running;
+      await waitForRecoveryWatcher(f, count);
+      await waitForCondition(() => metadataTestHooks.getWatcherCoordinatorSnapshot(f.project.id).pendingKinds.length === 0,
+        'replacement coordinator deferred work did not drain');
+      assert.equal(retiredCurrent, false);
+      assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(f.project.id).running, false);
+      assert.equal(metadataTestHooks.isWatcherGenerationCurrent(f.project.id, oldTicketGeneration), false);
+      assert.equal(tildeCoverage(f).status, 'default-root');
+    } finally { gate.release(); if (running) await running; await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  for (const location of ['inside', 'outside']) {
+    baselineTest(`v29 Watch recovery ${location}: in-flight old source scan cannot publish across trusted cancel`, { timeout: 20000 }, async () => {
+      const f = await tildeWatchFixture(location, 'Held.ai'), gate = deferred();
+      const read = fs.promises.readFile;
+      let entered = false, changing;
+      try {
+        const oldFingerprint = metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint;
+        const x = path.join(TEST_HOME, 'Desktop', 'Held-X.png'); fs.writeFileSync(x, 'late old dependency');
+        fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n${x}\n%%EOF\n`);
+        fs.promises.readFile = async function holdFirstSourceRead(candidate, ...args) {
+          if (!entered && path.resolve(candidate) === f.source) { entered = true; await gate.promise; }
+          return read.call(fs.promises, candidate, ...args);
+        };
+        changing = f.watch.handlers.change(f.source, fs.statSync(f.source));
+        await waitForCondition(() => entered, 'old current-byte scan did not reach held read');
+        const count = watcherRecords.length;
+        await callIpcRaw('account:cancel'); assert.equal(f.watch.closed, true);
+        const current = await waitForRecoveryWatcher(f, count);
+        const before = JSON.stringify(f.current());
+        gate.release(); await changing; await drainTildeScan(f);
+        assert.equal(JSON.stringify(f.current()), before, 'old parser completion cannot overwrite replacement activation');
+        assert.equal(f.current().files.some(row => row.path === x), false);
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint, oldFingerprint);
+        await current.handlers.change(f.source, fs.statSync(f.source)); await drainTildeScan(f);
+        assert.equal(f.current().files.filter(row => row.path === x).length, 1);
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint,
+          crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex'));
+      } finally {
+        gate.release(); if (changing) await changing; fs.promises.readFile = read;
+        await callIpcRaw('projects:pause', f.project.id); await f.cleanup();
+      }
+    });
+  }
+  baselineTest('v29 Watch recovery: cancel without valid access retires Watch until subsequent authorization', { timeout: 15000 }, async () => {
+    const f = await tildeWatchFixture('outside', 'Expired.ai'), now = testAccountSession.now;
+    try {
+      const count = watcherRecords.length, startedAt = f.current().watchStartedAt;
+      testAccountSession.now = () => testAccountSession.accessExpiresAt;
+      const result = await callIpcRaw('account:cancel');
+      assert.equal(result.canUseWorkspace, false); assert.equal(f.watch.closed, true);
+      assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id), null);
+      assert.equal(metadataTestHooks.getActiveWatchingActivationToken(f.project.id), null);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(watcherRecords.length, count);
+      testAccountSession.now = now; await testAccountSession.restore();
+      const current = await waitForRecoveryWatcher(f, count);
+      assert.equal(current.addedPaths.has(f.source), true); assert.equal(f.current().watchStartedAt, startedAt);
+    } finally { testAccountSession.now = now; await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+
+  baselineTest('v29 Watch recovery: real same-generation refresh keeps current watcher and consent', { timeout: 15000 }, async () => {
+    const provider = testAccountSession.provider, credentials = testAccountSession.credentials;
+    const identity = { id: '11111111-1111-4111-8111-111111111111', email: 'fixture@example.invalid', verified: true, methods: [] };
+    testAccountSession.record = { identity, refreshToken: 'modeled-refresh' };
+    testAccountSession.publish('signed_in', '', identity);
+    const f = await tildeWatchFixture('outside', 'Refresh.ai');
+    try {
+      const count = watcherRecords.length, generation = testAccountSession.generation;
+      const subscription = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id);
+      const review = await callIpcRaw('projects:prepare-package-review', f.project.id); assert.ok(review.token);
+      let refreshes = 0;
+      testAccountSession.provider = {
+        async refresh() { refreshes++; return { access_token: 'modeled-current', refresh_token: 'modeled-rotated' }; },
+        async validate() { return { subject: identity.id, expiresAt: Date.now() + 3600000 }; },
+        async me() { return identity; },
+      };
+      testAccountSession.credentials = { write() {} };
+      assert.equal((await callIpcRaw('account:refresh')).canUseWorkspace, true);
+      assert.equal(refreshes, 1); assert.equal(testAccountSession.generation, generation);
+      assert.equal(f.watch.closed, false); assert.equal(watcherRecords.length, count);
+      assert.deepEqual(metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id), subscription);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), true);
+      fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n% refreshed current bytes\n%%EOF\n`);
+      await f.watch.handlers.change(f.source, fs.statSync(f.source)); await drainTildeScan(f);
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint,
+        crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex'));
+    } finally {
+      testAccountSession.provider = provider; testAccountSession.credentials = credentials;
+      await callIpcRaw('projects:pause', f.project.id); await testAccountSession.restore(); await f.cleanup();
+    }
+  });
+  baselineTest('v29 Watch recovery: trusted cancel refuses old review before output and does not resume paused project', async () => {
+    const f = await makeSessionTokenFixture();
+    try {
+      const review = await f.review(); assert.ok(review.token);
+      const count = watcherRecords.length, generation = testAccountSession.generation;
+      const cancelled = await callIpcRaw('account:cancel'); assert.equal(cancelled.canUseWorkspace, true);
+      assert.equal(testAccountSession.generation, generation + 1);
+      await assertSessionTokenDeniedBeforeOutput(f, review.token);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(watcherRecords.length, count); assert.equal(watcherRecords.filter(row => !row.closed).length, 0);
+    } finally { f.cleanup(); }
+  });
+
+  // V25 uses Add Files to admit the named source. Only app/session/chokidar
+  // transport is modeled; these execute the complete production main callbacks
+  // and DTO together and do not claim native filesystem event delivery.
+  async function tildeWatchFixture(location, name = 'Design~.ai', engageSelection = true) {
+    const f = await fixture({ sourceNames: [name], structuredLinks: false });
+    if (location === 'outside') {
+      const outside = path.join(TEST_HOME, 'Tilde-outside'); fs.mkdirSync(outside, { recursive: true });
+      const moved = path.join(outside, name); fs.renameSync(f.paths[0].source, moved); f.paths[0].source = moved;
+    }
+    const source = f.paths[0].source;
+    manualDialogFor([source]);
+    assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+    f.state.opened = true; await f.live(); clearTrackedTimers();
+    await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+    const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+    const row = () => current().files.find(item => item.path === source);
+    assert.ok(row(), 'source is actually accepted through Add Files');
+    assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), row()).status, 'scanned');
+    if (engageSelection) {
+      // Current-byte package blocking and strict publication apply after source
+      // selection is engaged. Establish that production contract through IPC,
+      // rather than attributing legacy lenient capture to the strict route.
+      for (const action of ['exclude', 'restore']) {
+        const dto = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(item => item.name === name);
+        const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, dto.visualIdentity,
+          { action, expectedRevision: dto.selectionRevision });
+        assert.equal(result.success, true, JSON.stringify(result));
+      }
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), row()).status, 'scanned');
+      assert.equal(metadataTestHooks.getWorkingSourceMembership(current()).blocked, false);
+    }
+    return { ...f, source, current, row, watch: watcherRecords.at(-1) };
+  }
+  const tildeCoverage = f => metadataTestHooks.getWorkingSourceWatchCoverage(f.current(), f.row(),
+    metadataTestHooks.getWorkingSourceMembership(f.current()));
+  async function drainTildeScan(f) {
+    await metadataTestHooks.waitForWatcherIdle(f.project.id);
+    await waitForCondition(() => metadataTestHooks.getWorkingScanLifetime().operations === 0, 'tilde source scan did not drain');
+    clearTrackedTimers();
+  }
+  baselineTest('v25 tilde Watch inside: legacy accepted folder change route also has honest coverage', { timeout: 15000 }, async () => {
+    const f = await tildeWatchFixture('inside', 'Design~.ai', false);
+    try {
+      assert.equal(f.current().workingSourceSelections, undefined);
+      const x = path.join(TEST_HOME, 'Desktop', 'Legacy-X.png'); fs.writeFileSync(x, 'legacy tilde X');
+      fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n${x}\n%%EOF\n`);
+      await f.watch.handlers.change(f.source, fs.statSync(f.source)); await drainTildeScan(f);
+      assert.equal(f.current().files.filter(row => row.path === x).length, 1);
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint,
+        crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex'));
+      assert.deepEqual(tildeCoverage(f), { status: 'default-root', reason: 'default-root-eligible', nativeDelivery: 'unverified' });
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.deepEqual(workspace.files.find(row => row.name === 'Design~.ai').watchCoverage, tildeCoverage(f));
+      assert.equal(f.watch.addedPaths.has(f.source), false);
+    } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  for (const location of ['inside', 'outside']) {
+    baselineTest(`v25 tilde Watch ${location}: accepted source change callback and DTO agree without expanding add or exact enrollment`, { timeout: 15000 }, async () => {
+      const f = await tildeWatchFixture(location);
+      try {
+        assert.equal(f.watch.addedPaths.has(f.source), false, 'tilde source never gains exact enrollment');
+        const beforeAdd = JSON.stringify(f.current());
+        await f.watch.handlers.add(f.source);
+        assert.equal(JSON.stringify(f.current()), beforeAdd, 'existing add-name filter is retained');
+        const before = metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint;
+        const x = path.join(TEST_HOME, 'Desktop', 'Tilde-X.png'); fs.writeFileSync(x, 'new tilde X');
+        fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n${x}\n%%EOF\n`);
+        const digest = crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex');
+        await f.watch.handlers.change(f.source, fs.statSync(f.source));
+        await drainTildeScan(f);
+        if (location === 'inside') {
+          assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint, digest,
+            'existing folder callback scans accepted tilde source current bytes');
+          assert.equal(f.current().files.filter(row => row.path === x).length, 1);
+        } else {
+          assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint, before);
+          assert.equal(f.current().files.some(row => row.path === x), false, 'outside unregistered callback cannot admit X');
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).token, undefined,
+            'changed source bytes still block stale package review');
+        }
+        const expected = location === 'inside'
+          ? { status: 'default-root', reason: 'default-root-eligible', nativeDelivery: 'unverified' }
+          : { status: 'ignored', reason: 'event-name-ignored', nativeDelivery: 'unverified' };
+        assert.deepEqual(tildeCoverage(f), expected);
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.deepEqual(workspace.files.find(row => row.name === 'Design~.ai').watchCoverage, expected);
+        assert.equal(metadataTestHooks.getWorkingScanLifetime().leases, 0);
+      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  for (const location of ['inside', 'outside']) {
+    baselineTest(`v25 tilde Watch ${location}: temporary prefix remains ignored by change callback and DTO`, { timeout: 15000 }, async () => {
+      const f = await tildeWatchFixture(location, '~$Temporary.ai');
+      try {
+        const before = JSON.stringify(f.current());
+        fs.appendFileSync(f.source, 'temporary changed bytes');
+        await f.watch.handlers.add(f.source); await f.watch.handlers.change(f.source, fs.statSync(f.source));
+        await drainTildeScan(f);
+        assert.equal(JSON.stringify(f.current()), before);
+        assert.equal(f.watch.addedPaths.has(f.source), false);
+        assert.deepEqual(tildeCoverage(f), { status: 'ignored', reason: 'event-name-ignored', nativeDelivery: 'unverified' });
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.files.find(row => row.name === '~$Temporary.ai').watchCoverage.status, 'ignored');
+      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  for (const invalidation of ['membership', 'account', 'activation', 'changed-bytes']) {
+    baselineTest(`v25 tilde Watch inside: held current-byte scan cannot publish after ${invalidation}`, { timeout: 15000 }, async () => {
+      const f = await tildeWatchFixture('inside'), gate = deferred(), priorRead = fs.promises.readFile;
+      let entered = false, saving;
+      try {
+        assert.deepEqual(tildeCoverage(f), { status: 'default-root', reason: 'default-root-eligible', nativeDelivery: 'unverified' });
+        const beforeFingerprint = metadataTestHooks.getWorkingSourceVerification(f.current(), f.row()).sourceFingerprint;
+        const x = path.join(TEST_HOME, 'Desktop', 'Refused-X.png'); fs.writeFileSync(x, 'refused tilde X');
+        fs.writeFileSync(f.source, `%PDF-1.7\n${f.paths[0].link}\n${x}\n%%EOF\n`);
+        fs.promises.readFile = async function heldTildeSource(filePath, ...args) {
+          if (!entered && path.resolve(filePath) === f.source) { entered = true; await gate.promise; }
+          return priorRead.call(fs.promises, filePath, ...args);
+        };
+        saving = f.watch.handlers.change(f.source, fs.statSync(f.source));
+        await waitForCondition(() => entered, 'tilde scan did not reach the current source read');
+        if (invalidation === 'membership') {
+          const dto = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === 'Design~.ai');
+          const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, dto.visualIdentity,
+            { action: 'exclude', expectedRevision: dto.selectionRevision });
+          assert.equal(result.success, true, JSON.stringify(result));
+          assert.equal(tildeCoverage(f).status, 'not-included');
+        }
+        if (invalidation === 'account') { testAccountSession.generation++; assert.equal(tildeCoverage(f).reason, 'stale-account'); }
+        if (invalidation === 'activation') {
+          await callIpcRaw('projects:pause', f.project.id);
+          assert.equal(tildeCoverage(f).status, 'inactive');
+          await callIpcRaw('projects:start-watching', f.project.id); clearTrackedTimers();
+          assert.deepEqual(tildeCoverage(f), { status: 'default-root', reason: 'default-root-eligible', nativeDelivery: 'unverified' });
+        }
+        if (invalidation === 'changed-bytes') fs.appendFileSync(f.source, 'changed during source read');
+        const retired = JSON.stringify(f.current());
+        gate.release(); await saving; await drainTildeScan(f);
+        assert.equal(f.current().files.some(row => row.path === x), false);
+        assert.equal(f.current().pendingFiles.some(row => row.path === x), false);
+        if (invalidation !== 'changed-bytes') assert.equal(JSON.stringify(f.current()), retired, 'retired work cannot overwrite current intent/lifetime');
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), f.row())?.sourceFingerprint, beforeFingerprint);
+        assert.equal(metadataTestHooks.getWorkingScanLifetime().leases, 0);
+      } finally {
+        gate.release(); if (saving) await saving; fs.promises.readFile = priorRead;
+        await testAccountSession.restore(); await callIpcRaw('projects:pause', f.project.id); await f.cleanup();
+      }
+    });
+  }
+
+  // Seed accepted fixture rows only for capacity/configuration tests; ordinary
+  // B admission and saved-X composition remain the real IPC cases below.
+  async function watchCapacityFixture(count) {
+    const f = await fixture({ sourceNames: ['A.ai'], structuredLinks: false });
+    const outside = path.join(TEST_HOME, 'Watch-capacity'); fs.mkdirSync(outside, { recursive: true });
+    const source = path.join(outside, 'Source_000.ai');
+    fs.renameSync(f.paths[0].source, source); f.paths[0].source = source;
+    manualDialogFor([source]);
+    assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+    assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+    const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+    const template = current().files.find(row => row.path === source); assert.ok(template);
+    const sources = [source];
+    for (let i = 1; i < count; i++) {
+      const sourcePath = path.join(outside, `Source_${String(i).padStart(3, '0')}.ai`);
+      fs.writeFileSync(sourcePath, '%PDF-1.7\n%%EOF\n');
+      current().files.push({ ...template, path: sourcePath, name: path.basename(sourcePath) });
+      sources.push(sourcePath);
+    }
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+    return { ...f, current, outside, sources, template };
+  }
+  for (const count of [255, 256, 257]) {
+    baselineTest(`v23 Watch coverage ${count}: authoritative limit and row reorder stability`, { timeout: 20000 }, async () => {
+      const f = await watchCapacityFixture(count);
+      try {
+        const watch = watcherRecords.at(-1);
+        assert.equal(watch.addedPaths.size, Math.min(count, 256));
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const rows = workspace.files.filter(row => row.ext === '.ai');
+        assert.equal(rows.length, count);
+        assert.equal(rows.filter(row => row.watchCoverage.status === 'exact-enrolled').length, Math.min(count, 256));
+        assert.equal(rows.filter(row => row.watchCoverage.status === 'cap-limited').length, Math.max(0, count - 256));
+        assert.equal(workspace.watchCoverage.exactPathLimit, 256);
+        assert.equal(workspace.watchCoverage.nativeDelivery, 'unverified');
+        assert.ok(rows.every(row => row.watchCoverage.nativeDelivery === 'unverified'));
+        const paths = [...watch.addedPaths];
+        f.current().files.reverse();
+        metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+        assert.deepEqual([...watch.addedPaths], paths, 'reorder cannot displace valid enrollments');
+        assert.equal(watch.retiredPaths.size, 0);
+        const included = await metadataTestHooks.selectProjectFilesForPackaging(f.current());
+        assert.equal(included.filter(row => row.ext === '.ai').length, count, 'cap does not drop accepted package members');
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.ok(review.token, JSON.stringify(review));
+        if (count === 257) {
+          for (const name of ['ZZZ-wait.ai', 'AAA-wait.ai']) {
+            const source = path.join(f.outside, name); fs.writeFileSync(source, '%PDF-1.7\n%%EOF\n');
+            f.current().files.unshift({ ...f.template, path: source, name });
+          }
+          metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+          assert.deepEqual([...watch.addedPaths], paths, 'new waiting rows cannot evict valid subscriptions');
+          f.current().files = f.current().files.filter(row => row.path !== f.sources[100]);
+          metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+          assert.equal(watch.addedPaths.size, 256);
+          assert.equal(watch.retiredPaths.has(f.sources[100]), true);
+          assert.equal(watch.addedPaths.has(path.join(f.outside, 'AAA-wait.ai')), true, 'lexical physical-path order picks first current waiter');
+          assert.equal(watch.addedPaths.has(f.sources[256]), false);
+          assert.equal(watch.addedPaths.has(path.join(f.outside, 'ZZZ-wait.ai')), false);
+        }
+      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  baselineTest('v23 Watch coverage appended B: required A retains slot and actual vacancy promotes B saved X', { timeout: 30000 }, async () => {
+    const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'C.ai', 'D.ai'], structuredLinks: false });
+    const [a, c, d] = f.paths;
+    const outside = path.join(TEST_HOME, 'Coverage-composition'); fs.mkdirSync(outside, { recursive: true });
+    for (const p of f.paths) { const moved = path.join(outside, path.basename(p.source)); fs.renameSync(p.source, moved); p.source = moved; }
+    const shared = path.join(outside, 'Shared.png'); fs.writeFileSync(shared, 'shared coverage bytes');
+    const write = (source, links) => fs.writeFileSync(source, `%PDF-1.7\n${links.join('\n')}\n%%EOF\n`);
+    write(a.source, [a.link, shared]); write(c.source, [c.link, shared, a.source]); write(d.source, [d.link, shared]);
+    const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+    const choose = async source => {
+      const row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(item => item.name === path.basename(source));
+      const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision });
+      assert.equal(result.success, true, JSON.stringify(result));
+    };
+    try {
+      manualDialogFor(f.paths.map(p => p.source));
+      assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+      assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+      const template = current().files.find(row => row.path === d.source);
+      f.state.opened = true; await f.live(); clearTrackedTimers();
+      await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+      const fillers = [];
+      for (let i = 0; i < 253; i++) {
+        const source = path.join(outside, `Filler_${String(i).padStart(3, '0')}.ai`); fs.writeFileSync(source, '%PDF-1.7\n%%EOF\n');
+        current().files.push({ ...template, path: source, name: path.basename(source) }); fillers.push(source);
+      }
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+      const watch = watcherRecords.at(-1); assert.equal(watch.addedPaths.size, 256);
+      const b = path.join(outside, 'B.ai'); write(b, [a.link, shared]);
+      // Use the existing ordinary DOC transition producer, as the V22 composed
+      // route does; do not introduce an uncontrolled concurrent manual poll.
+      f.paths[0] = { source: b, link: a.link }; await f.live(); clearTrackedTimers();
+      const bRow = current().files.find(row => row.path === b);
+      assert.ok(bRow, 'ordinary producer admits saved B after the first 256');
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).status, 'scanned');
+      const aBytes = fs.readFileSync(a.source), cd = JSON.stringify([c,d].map(p => current().files.find(row => row.path === p.source)));
+      await choose(a.source);
+      let workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      const aDto = workspace.files.find(row => row.name === 'A.ai');
+      assert.equal(aDto.sourceSelection, 'excluded'); assert.equal(aDto.includedAsDependency, true);
+      assert.equal(aDto.watchCoverage.status, 'exact-enrolled');
+      assert.equal(workspace.files.find(row => row.name === 'B.ai').watchCoverage.status, 'cap-limited');
+      const x = path.join(outside, 'X.png'); fs.writeFileSync(x, 'new B linked X'); write(b, [a.link, shared, x]);
+      const before = metadataTestHooks.getWorkingSourceVerification(current(), bRow).sourceFingerprint;
+      await watch.handlers.change(b, fs.statSync(b));
+      assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).sourceFingerprint, before, 'unenrolled callback has no authority');
+      assert.equal(current().files.some(row => row.path === x), false);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).token, undefined, 'changed B still blocks stale package');
+      await choose(fillers[0]);
+      assert.equal(watch.addedPaths.has(fillers[0]), false); assert.equal(watch.retiredPaths.has(fillers[0]), true);
+      assert.equal(watch.addedPaths.has(b), true); assert.equal(watch.addedPaths.size, 256);
+      await watch.handlers.change(b, fs.statSync(b));
+      const digest = crypto.createHash('sha256').update(fs.readFileSync(b)).digest('hex');
+      await waitForCondition(() => metadataTestHooks.getWorkingSourceVerification(current(), bRow)?.sourceFingerprint === digest,
+        'promoted B save did not refresh bytes');
+      await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+      assert.equal(current().files.filter(row => row.path === x).length, 1);
+      workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+      assert.equal(workspace.files.find(row => row.name === 'B.ai').watchCoverage.status, 'exact-enrolled');
+      assert.equal(workspace.files.find(row => row.name === path.basename(fillers[0])).watchCoverage.status, 'not-included');
+      const selected = await metadataTestHooks.selectProjectFilesForPackaging(current());
+      for (const p of [a.source, b, c.source, d.source, shared, x]) assert.ok(selected.some(row => row.path === p), p);
+      assert.equal(selected.filter(row => row.path === shared).length, 1);
+      assert.deepEqual(fs.readFileSync(a.source), aBytes);
+      assert.equal(JSON.stringify([c,d].map(p => current().files.find(row => row.path === p.source))), cd);
+      await callIpcRaw('projects:pause', f.project.id);
+      assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id), null);
+      assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === 'B.ai').watchCoverage.status, 'inactive');
+    } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  baselineTest('v23 Watch coverage DTO: default roots unsupported ignored unavailable pending enrollment failure', async () => {
+    const f = await watchCapacityFixture(1);
+    try {
+      const watch = watcherRecords.at(-1), project = f.current();
+      const make = (name, folder = f.outside) => {
+        fs.mkdirSync(folder, { recursive: true }); const filePath = path.join(folder, name);
+        fs.writeFileSync(filePath, '%PDF-1.7\n%%EOF\n');
+        const row = { ...f.template, path: filePath, name, ext: path.extname(name), projectRole: 'source' }; project.files.push(row); return row;
+      };
+      const root = make('Root.ai', path.join(TEST_HOME, 'Desktop'));
+      const deep = make('Deep.ai', path.join(TEST_HOME, 'Desktop', 'one', 'two', 'three', 'four'));
+      const ignored = make('Dot.ai', path.join(f.outside, '.hidden'));
+      const modules = make('Modules.ai', path.join(f.outside, 'node_modules'));
+      const temp = make('Backup~.ai');
+      const unsupported = make('Unsupported.eps');
+      const missing = make('Missing.ai'); fs.unlinkSync(missing.path);
+      const hard = make('Hard.ai'); fs.linkSync(hard.path, hard.path + '.copy');
+      const directory = make('Directory.key'); fs.unlinkSync(directory.path); fs.mkdirSync(directory.path);
+      const symlink = make('Symlink.ai'); fs.unlinkSync(symlink.path); fs.symlinkSync(root.path, symlink.path);
+      const pending = make('Pending.ai'); project.files.pop(); project.pendingFiles.push(pending);
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+      const coverage = row => metadataTestHooks.getWorkingSourceWatchCoverage(project, row, metadataTestHooks.getWorkingSourceMembership(project));
+      for (const [row, status, reason] of [[root,'default-root','default-root-eligible'], [deep,'exact-enrolled','exact-path-enrolled'],
+        [ignored,'ignored','watcher-ignored'], [modules,'ignored','watcher-ignored'], [temp,'ignored','event-name-ignored'],
+        [unsupported,'unsupported','format-unsupported'], [missing,'unavailable','source-unavailable'],
+        [hard,'unsupported','source-hard-linked'], [directory,'unsupported','source-not-regular'], [symlink,'unsupported','source-symlink']]) {
+        assert.deepEqual(coverage(row), { status, reason, nativeDelivery: 'unverified' });
+      }
+      assert.equal(metadataTestHooks.getWorkingSourceWatchCoverage(project, pending, metadataTestHooks.getWorkingSourceMembership(project), true).status, 'not-admitted');
+      const failed = make('Failed.ai'), subscription = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id);
+      assert.ok(subscription);
+      // Registration request failure is modeled; it never grants event authority.
+      metadataTestHooks.failAcceptedSourceWatchAdd(f.project.id, failed.path);
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(f.project.id);
+      assert.deepEqual(coverage(failed), { status: 'unavailable', reason: 'enrollment-failed', nativeDelivery: 'unverified' });
+      assert.equal(watch.addedPaths.has(failed.path), false);
+    } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+  });
+  for (const reconciled of [false, true]) {
+    baselineTest(`v23 Watch coverage manual-at-cap ${reconciled ? 'reconciled seeded scope admission' : 'unreconciled fixture cancellation diagnostic'}`, { timeout: 20000 }, async () => {
+      const f = await watchCapacityFixture(256), trace = [];
+      let restore;
+      try {
+        await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+        if (reconciled) { f.state.opened = true; await f.live(); clearTrackedTimers(); }
+        const b = path.join(f.outside, 'B.ai'); fs.writeFileSync(b, `%PDF-1.7\n${f.paths[0].link}\n%%EOF\n`);
+        const before = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id); assert.equal(before.paths.length, 256);
+        restore = metadataTestHooks.traceWatchCoverageOperations(f.project.id, trace);
+        manualDialogFor([b]); const result = await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID());
+        restore(); restore = null;
+        if (!reconciled) {
+          // This diagnosis retains the original successful-admission expectation
+          // as failed evidence; it proves why these direct fixture seeds cancel
+          // that attempt. It is not a passing manual-admission product claim.
+          assert.equal(result, null);
+          const stale = trace.find(item => item.actual.scopeRevision > item.expected.scopeRevision); assert.ok(stale, JSON.stringify(trace));
+          for (const field of ['activationToken','generation','accountGeneration','status']) assert.equal(stale.actual[field], stale.expected[field], field);
+          // Scope keys are normalized physical paths; the diagnostic's first
+          // comparison incorrectly used the case-preserving fixture spelling.
+          const normalizedSources = f.sources.map(p => fs.realpathSync.native(p).toLowerCase());
+          assert.equal(stale.expected.admittedPaths.includes(normalizedSources[1]), false);
+          assert.equal(stale.actual.admittedPaths.includes(normalizedSources[1]), true);
+          assert.equal(stale.actual.admittedPaths.filter(p => normalizedSources.includes(p)).length, 256);
+          console.log('V23_MANUAL_CAP_DIAGNOSIS ' + JSON.stringify({ classification: 'SCOPE_REVISION_CANCELLED_ORIGINAL_SEEDED_FIXTURE',
+            expectedRevision: stale.expected.scopeRevision, actualRevision: stale.actual.scopeRevision,
+            newlyAdmittedNames: stale.actual.admittedPaths.filter(p => !stale.expected.admittedPaths.includes(p)).map(p => path.basename(p)),
+            retiredAdmittedNames: stale.expected.admittedPaths.filter(p => !stale.actual.admittedPaths.includes(p)).map(p => path.basename(p)),
+            fillerAdmissionBefore: stale.expected.admittedPaths.includes(normalizedSources[1]), fillerAdmissionAfter: stale.actual.admittedPaths.includes(normalizedSources[1]),
+            unchangedAccountActivationStatus: true, originalAdmissionSuccess: false }));
+        } else {
+          assert.ok(Array.isArray(result), JSON.stringify({ result, trace }));
+          const row = f.current().files.find(row => row.path === b); assert.ok(row);
+          assert.equal(metadataTestHooks.getWorkingSourceVerification(f.current(), row).status, 'scanned');
+          const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+          assert.equal(workspace.files.find(row => row.name === 'B.ai').watchCoverage.status, 'cap-limited');
+          assert.equal(watcherRecords.at(-1).addedPaths.has(b), false);
+          assert.ok((await callIpcRaw('projects:prepare-package-review', f.project.id)).token, 'cap alone preserves current saved-source package eligibility');
+          console.log('V23_MANUAL_CAP_RECONCILED ' + JSON.stringify({ admission: 'Add Files', priorExactPaths: 256,
+            BAccepted: true, BScanned: true, coverage: 'cap-limited', validPackageReview: true, nativeDelivery: 'unverified' }));
+        }
+      } finally { restore?.(); await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  for (const invalidation of ['pause', 'project', 'activation', 'account', 'selection']) {
+    baselineTest(`v23 Watch coverage lifetime: stale ${invalidation} workspace cannot certify prior subscription`, { timeout: 20000 }, async () => {
+      const f = await watchCapacityFixture(1), gate = deferred();
+      let entered = false, pending, restore;
+      try {
+        restore = metadataTestHooks.holdWatchWorkspacePresentation(async () => { entered = true; await gate.promise; });
+        pending = metadataTestHooks.getProjectAssetWorkspace(f.project.id);
+        await waitForCondition(() => entered, 'workspace did not reach presentation await');
+        const old = metadataTestHooks.getAcceptedSourceWatchSnapshot(f.project.id);
+        if (invalidation === 'pause') await callIpcRaw('projects:pause', f.project.id);
+        if (invalidation === 'project') { await createProject('New coverage owner'); clearTrackedTimers(); }
+        if (invalidation === 'activation') { await callIpcRaw('projects:pause', f.project.id); await callIpcRaw('projects:start-watching', f.project.id); clearTrackedTimers(); }
+        if (invalidation === 'account') {
+          testAccountSession.generation++;
+          const row = f.current().files.find(row => row.path === f.sources[0]);
+          assert.deepEqual(metadataTestHooks.getWorkingSourceWatchCoverage(f.current(), row,
+            metadataTestHooks.getWorkingSourceMembership(f.current())), { status: 'inactive', reason: 'stale-account', nativeDelivery: 'unverified' });
+        }
+        if (invalidation === 'selection') f.current().files = f.current().files.filter(row => row.path !== f.sources[0]);
+        gate.release(); const result = await pending;
+        if (invalidation === 'account') assert.equal(result, null);
+        if (['pause','project'].includes(invalidation)) assert.equal(result.files.find(row => row.ext === '.ai').watchCoverage.status, 'inactive');
+        if (invalidation === 'activation') assert.notEqual(result.watchCoverage.activationToken, old.activationToken);
+        if (invalidation === 'selection') {
+          assert.equal(result.files.some(row => row.name === 'Source_000.ai'), false);
+          assert.equal(watcherRecords.at(-1).addedPaths.has(f.sources[0]), false);
+        }
+      } finally { gate.release(); if (pending) await pending; restore?.(); await testAccountSession.restore(); await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  for (const location of ['inside', 'outside']) for (const admission of ['ordinary', 'manual']) {
+    baselineTest(`v22 explicit integration ${location} ${admission}: unknown identical-links B choice Watch saved X union`, { timeout: 15000 }, async () => {
+      const f = await fixture({ sources: 3, sourceNames: ['A.ai', 'C.ai', 'D.ai'], structuredLinks: false });
+      const [a, c, d] = f.paths;
+      const write = (source, links) => fs.writeFileSync(source, `%PDF-1.7\n${links.join('\n')}\n%%EOF\n`);
+      const shared = path.join(TEST_HOME, 'Desktop', 'Shared.png');
+      fs.writeFileSync(shared, 'shared asset bytes');
+      write(a.source, [a.link, shared]);
+      write(c.source, [c.link, shared, a.source]);
+      write(d.source, [d.link, shared]);
+      const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+      const digest = source => crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+      const sourceNames = async () => (await metadataTestHooks.selectProjectFilesForPackaging(current())).map(row => row.name).sort();
+      const choose = async (source, action) => {
+        const row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(item => item.name === path.basename(source));
+        assert.ok(row, source);
+        const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+          { action, expectedRevision: row.selectionRevision });
+        assert.equal(result.success, true, JSON.stringify(result));
+      };
+      try {
+        manualDialogFor(f.paths.map(row => row.source));
+        assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+        assert.equal(current().assetBaseline.status, 'decision-required');
+        assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+        const baseline = structuredClone(current().assetBaseline);
+        const aBytes = fs.readFileSync(a.source);
+        const independent = JSON.stringify([c, d].map(row => ({ file: current().files.find(file => file.path === row.source),
+          receipt: metadataTestHooks.getWorkingSourceVerification(current(), current().files.find(file => file.path === row.source)) })));
+        f.state.opened = true;
+        await f.live(); clearTrackedTimers();
+        const directory = location === 'inside' ? path.join(TEST_HOME, 'Desktop') : path.join(TEST_HOME, 'External-volume');
+        fs.mkdirSync(directory, { recursive: true });
+        const b = { source: path.join(directory, 'B.ai'), link: a.link };
+        write(b.source, [a.link, shared]);
+        // Model a DOC path transition while exercising the actual query/parser,
+        // activation scope, admission and continuation observer, not pair seeding.
+        f.paths[0] = b;
+        if (admission === 'manual') f.state.opened = false;
+        await f.live(); clearTrackedTimers();
+        const discovered = { accepted: current().files.some(row => row.path === b.source),
+          pending: current().pendingFiles.some(row => row.path === b.source) };
+        console.log('V22_ORDINARY_B ' + JSON.stringify({ location, admission, ...discovered }));
+        assert.deepEqual(discovered, { accepted: admission === 'ordinary', pending: false });
+        if (!discovered.accepted) {
+          manualDialogFor([b.source]);
+          assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+        }
+        const bRow = current().files.find(row => row.path === b.source); assert.ok(bRow);
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow)?.status, 'scanned',
+          'new accepted B after baseline completion must reserve and finish saved-byte verification');
+        assert.deepEqual(current().assetBaseline, baseline);
+        f.state.opened = true; await f.live(); clearTrackedTimers();
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        const pair = workspace.sourceContinuation.candidates.find(item => item.predecessor.name === 'A.ai' && item.successor.name === 'B.ai');
+        if (pair) {
+          const result = await callIpcRaw('projects:resolve-working-source-continuation', f.project.id,
+            { pairIdentity: pair.pairIdentity, evidenceIdentity: pair.evidenceIdentity, expectedRevision: pair.revision,
+              predecessorSelectionRevision: pair.predecessor.selectionRevision, successorSelectionRevision: pair.successor.selectionRevision, choice: 'replace' });
+          assert.equal(result.success, true, JSON.stringify(result));
+        } else await choose(a.source, 'exclude');
+        assert.equal(!!pair, admission === 'ordinary');
+        console.log('V22_EXPLICIT_CHOICE ' + JSON.stringify({ location, admission, route: pair ? 'Replace' : 'Exclude working-role fallback' }));
+        const selected = await sourceNames();
+        assert.ok(selected.includes('A.ai'), 'C requires A as dependency');
+        for (const name of ['B.ai', 'C.ai', 'D.ai', 'Shared.png']) assert.ok(selected.includes(name), name);
+        assert.equal(selected.filter(name => name === 'Shared.png').length, 1);
+        assert.deepEqual(fs.readFileSync(a.source), aBytes);
+        const watch = watcherRecords.at(-1);
+        const covered = source => !watch.closed && (watch.addedPaths.has(source) || watch.roots.some(root =>
+          source.startsWith(root + path.sep) && path.relative(root, source).split(path.sep).length <= watch.options.depth + 1));
+        assert.equal(covered(b.source), true, 'accepted B needs current exact subscription outside default roots');
+        const before = structuredClone(metadataTestHooks.getWorkingSourceVerification(current(), bRow));
+        f.state.modified = true; await f.live(); clearTrackedTimers();
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).sourceFingerprint, before.sourceFingerprint,
+          'unsaved live observation does not refresh saved dependencies');
+        f.state.modified = false;
+        const x = path.join(directory, 'X.png'); fs.writeFileSync(x, 'new linked X');
+        write(b.source, [a.link, shared, x]);
+        const savedDigest = digest(b.source);
+        await emitWatcher('change', b.source, fs.statSync(b.source));
+        await waitForCondition(() => metadataTestHooks.getWorkingSourceVerification(current(), bRow)?.sourceFingerprint === savedDigest,
+          'saved B did not finish current verification');
+        await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+        const verification = metadataTestHooks.getWorkingSourceVerification(current(), bRow);
+        assert.equal(verification.status, 'scanned');
+        assert.ok(verification.requiredReferences.some(ref => ref.path === x), 'fresh receipt binds X');
+        assert.equal(current().files.filter(row => row.path === x).length, 1, 'Watch admits parser-only X without Add Files X');
+        assert.equal(current().pendingFiles.some(row => row.path === x), false);
+        const finalNames = await sourceNames();
+        const inventory = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.ok(inventory.files.some(row => row.name === path.basename(x) && row.included === true));
+        const review = await callIpcRaw('projects:prepare-package-review', f.project.id);
+        assert.ok(review.token, JSON.stringify(review));
+        assert.equal(review.totalFiles, finalNames.length);
+        assert.equal(finalNames.filter(name => name === 'Shared.png').length, 1);
+        assert.equal(JSON.stringify([c, d].map(row => ({ file: current().files.find(file => file.path === row.source),
+          receipt: metadataTestHooks.getWorkingSourceVerification(current(), current().files.find(file => file.path === row.source)) }))), independent);
+        assert.deepEqual(fs.readFileSync(a.source), aBytes);
+        assert.deepEqual(current().assetBaseline, baseline);
+        assert.equal(inventory.semanticCounts.selectedWorkingSources, 3);
+        assert.equal(inventory.semanticCounts.excludedWorkingSources, 1);
+        assert.equal(inventory.semanticCounts.includedAssets, 6);
+        console.log('V22_SAVED_X_PARITY ' + JSON.stringify({ location, admission, selected: finalNames,
+          totalFiles: review.totalFiles, counts: inventory.semanticCounts, digest: verification.sourceFingerprint,
+          references: verification.requiredReferences, exactPaths: [...watch.addedPaths] }));
+        const oldToken = review.token;
+        await choose(b.source, 'exclude');
+        if (location === 'outside') {
+          assert.equal(watch.addedPaths.has(b.source), false, 'excluded B exact subscription retires');
+          assert.equal(watch.retiredPaths.has(b.source), true);
+        }
+        const y = path.join(directory, 'Y.png'); fs.writeFileSync(y, 'excluded source link');
+        write(b.source, [a.link, shared, x, y]);
+        await watch.handlers.change(b.source, fs.statSync(b.source));
+        await metadataTestHooks.waitForWatcherIdle(f.project.id); clearTrackedTimers();
+        assert.equal(current().files.some(row => row.path === y), false, 'excluded B cannot admit Y');
+        assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).sourceFingerprint, savedDigest);
+        assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, oldToken)).error, 'package_review_stale');
+        await callIpcRaw('projects:pause', f.project.id); assert.equal(watch.closed, true);
+        const frozen = JSON.stringify(current());
+        write(b.source, [a.link, shared]);
+        await watch.handlers.change(b.source, fs.statSync(b.source));
+        assert.equal(JSON.stringify(current()), frozen, 'retired callback cannot mutate paused project');
+      } finally {
+        await callIpcRaw('projects:pause', f.project.id);
+        await f.cleanup();
+      }
+    });
+  }
+  for (const observation of ['pending-unsaved', 'independent-equal-assets-focus']) {
+    baselineTest(`v22 explicit integration negative ${observation}: ordinary DOC query cannot infer succession`, async () => {
+      const f = await fixture({ sources: 2, sourceNames: ['A.ai', 'B.ai'], structuredLinks: false });
+      const [a, b] = f.paths;
+      fs.writeFileSync(b.source, fs.readFileSync(a.source));
+      const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+      try {
+        manualDialogFor([a.source]);
+        assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+        assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+        const baseline = structuredClone(current().assetBaseline), aBytes = fs.readFileSync(a.source);
+        f.state.opened = true; f.state.visible = 1;
+        await f.live(); clearTrackedTimers();
+        f.state.visible = 2; f.state.modified = observation === 'pending-unsaved';
+        await f.live(); clearTrackedTimers();
+        const bRow = current().files.find(row => row.path === b.source);
+        if (observation === 'pending-unsaved') {
+          assert.equal(bRow, undefined);
+          assert.equal(current().pendingFiles.some(row => row.path === b.source), true);
+          assert.equal(watcherRecords.at(-1).addedPaths.has(b.source), false);
+        } else {
+          assert.ok(bRow);
+          assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).status, 'scanned');
+          // Coexisting A stays open when B becomes current. Equal links and
+          // a focus switch do not supply a path-transition pair or owner intent.
+          f.paths.splice(0, 2, b, a);
+          await f.live(); clearTrackedTimers();
+          assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(current()))
+            .filter(row => row.ext === '.ai').map(row => row.name).sort(), ['A.ai', 'B.ai']);
+        }
+        const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(workspace.sourceContinuation.candidates.length, 0);
+        assert.equal(workspace.files.find(row => row.name === 'A.ai').sourceSelection, 'selected');
+        assert.deepEqual(current().assetBaseline, baseline);
+        assert.deepEqual(fs.readFileSync(a.source), aBytes);
+      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+    });
+  }
+  for (const invalidation of ['pause', 'project', 'account', 'reauthorize', 'revision', 'changed-bytes', 'missing']) {
+    baselineTest(`v22 exact B Watch late saved scan refuses ${invalidation}`, { timeout: 15000 }, async () => {
+      const f = await fixture({ sources: 2, sourceNames: ['A.ai', 'B.ai'], structuredLinks: false });
+      const [a, b] = f.paths, gate = deferred();
+      const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+      const priorRead = fs.promises.readFile;
+      let held = false, saving;
+      try {
+        const outside = path.join(TEST_HOME, 'External-volume'); fs.mkdirSync(outside, { recursive: true });
+        const moved = path.join(outside, 'B.ai'); fs.renameSync(b.source, moved); b.source = moved;
+        manualDialogFor([a.source]);
+        assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+        assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+        manualDialogFor([b.source]);
+        assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
+        const choose = async source => {
+          const row = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(item => item.name === path.basename(source));
+          const result = await callIpcRaw('projects:set-working-source-selection', f.project.id, row.visualIdentity,
+            { action: 'exclude', expectedRevision: row.selectionRevision });
+          assert.equal(result.success, true, JSON.stringify(result));
+        };
+        await choose(a.source);
+        const watch = watcherRecords.at(-1); assert.equal(watch.addedPaths.has(b.source), true);
+        const baseline = structuredClone(current().assetBaseline), aBytes = fs.readFileSync(a.source);
+        const x = path.join(outside, 'late-X.png'); fs.writeFileSync(x, 'late X');
+        fs.writeFileSync(b.source, `%PDF-1.7\n${b.link}\n${x}\n%%EOF\n`);
+        fs.promises.readFile = async function heldSavedSource(filePath, ...args) {
+          if (!held && path.resolve(filePath) === b.source) { held = true; await gate.promise; }
+          return priorRead.call(fs.promises, filePath, ...args);
+        };
+        saving = watch.handlers.change(b.source, fs.statSync(b.source));
+        await waitForCondition(() => held, 'current B scan did not reach its owned source read');
+        if (invalidation === 'pause') await callIpcRaw('projects:pause', f.project.id);
+        if (invalidation === 'project') { await createProject('New Watch owner'); clearTrackedTimers(); }
+        if (invalidation === 'account') await testAccountSession.logout();
+        if (invalidation === 'reauthorize') testAccountSession.generation++;
+        if (invalidation === 'revision') await choose(b.source);
+        if (invalidation === 'changed-bytes') fs.appendFileSync(b.source, 'changed during held read');
+        if (invalidation === 'missing') fs.renameSync(b.source, b.source + '.preserved');
+        const retired = JSON.stringify(current());
+        gate.release(); await saving;
+        // Child scans deliberately outlive the callback's return. Wait for the
+        // existing bounded scan lifetime, not just the watcher coordinator.
+        await waitForCondition(() => metadataTestHooks.getWorkingScanLifetime().operations === 0,
+          'retired saved-source work did not drain');
+        assert.equal(current().files.some(row => row.path === x), false, 'late work cannot admit X');
+        assert.equal(current().pendingFiles.some(row => row.path === x), false);
+        if (['pause', 'project', 'account', 'reauthorize', 'revision'].includes(invalidation)) {
+          assert.equal(JSON.stringify(current()), retired, 'retired work cannot publish over current owner');
+        }
+        assert.deepEqual(current().assetBaseline, baseline);
+        assert.deepEqual(fs.readFileSync(a.source), aBytes);
+        assert.equal(metadataTestHooks.getWorkingScanLifetime().leases, 0);
+        console.log('V22_LATE_REFUSAL ' + JSON.stringify({ invalidation, source: 'B.ai', admittedX: false }));
+      } finally {
+        gate.release(); if (saving) await saving;
+        fs.promises.readFile = priorRead;
+        await testAccountSession.restore();
+        await callIpcRaw('projects:pause', f.project.id);
+        await f.cleanup();
+      }
+    });
+  }
   function deferred() {
     let release;
     const promise = new Promise(resolve => { release = resolve; });

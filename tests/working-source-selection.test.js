@@ -28,6 +28,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   let nextInode = 1n;
   const events = [];
   const invalidated = [];
+  const watchSyncCalls = [];
   let digestGate = null;
   let afterScan = null;
   let documentIdentityReader = () => null;
@@ -75,6 +76,13 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
       (project?.files || []).find(file => identity === `${id}:${file.fileId}`),
     createProjectFileVisualIdentity: (id, file) => `${id}:${file.fileId}`,
     invalidatePackageReviewForProject: id => invalidated.push(id),
+    // MODELED closed/no-watcher collaborator only. The complete-main harness
+    // separately exercises actual allocator and callback functions; this VM
+    // neither creates subscriptions nor proves native event delivery.
+    syncAcceptedSourceWatchSubscriptions: projectId => {
+      assert.equal(projects.find(project => project.id === projectId)?.status, 'paused');
+      watchSyncCalls.push({ projectId, watcherState: 'closed/no-watcher' });
+    },
     sendToRenderer: (event, payload) => events.push({ event, payload }),
     reconcileProjectAssetBaselineScanSources() {},
     getAddFilesCurrentSourceDigest: async (filePath, lease) => {
@@ -135,7 +143,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   projects.push(project);
   const command = (file, action, expectedRevision = api.getWorkingSourceSelection(projects[0], file).revision) =>
     api.setWorkingSourceSelection(project.id, `${project.id}:${file.fileId}`, { action, expectedRevision });
-  return { api, project, source, asset, disk, physical, command, events, invalidated,
+  return { api, project, source, asset, disk, physical, command, events, invalidated, watchSyncCalls,
     reload() { projects = JSON.parse(JSON.stringify(projects)); return projects[0]; },
     replace(project) { projects = [project]; },
     revoke() { authorized = false; },
@@ -144,6 +152,17 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     setAfterScan(callback) { afterScan = callback; },
     setDocumentIdentityReader(callback) { documentIdentityReader = callback; } };
 }
+
+test('v25 selection fixture keeps rejected requests outside its modeled closed Watch collaborator', async () => {
+  const f = fixture(), source = f.source('Original.ai'); f.project.files.push(source);
+  assert.equal((await f.api.setWorkingSourceSelection(f.project.id, 'foreign:source',
+    { action: 'exclude', expectedRevision: 0 })).success, false);
+  assert.equal((await f.command(source, 'exclude', 1)).success, false);
+  assert.deepEqual(f.watchSyncCalls, []);
+  assert.equal((await f.command(source, 'exclude')).success, true);
+  assert.equal((await f.command(source, 'restore')).selection.state, 'selected');
+  assert.deepEqual(f.watchSyncCalls, Array.from({ length: 2 }, () => ({ projectId: f.project.id, watcherState: 'closed/no-watcher' })));
+});
 
 function deferred() {
   let resolve;
@@ -173,6 +192,7 @@ test('exclusion preserves bytes, inventory and reason across row absence, re-add
   const result = await f.command(a, 'exclude');
   assert.equal(result.success, true);
   assert.equal(result.selection.reason, 'user-excluded');
+  assert.deepEqual(f.watchSyncCalls, [{ projectId: f.project.id, watcherState: 'closed/no-watcher' }]);
   assert.equal(f.project.files.length, 2);
   assert.deepEqual(f.disk.get(a.path), before);
   assert.deepEqual((await f.api.selectProjectFilesForPackaging(f.project)).map(file => file.name), ['Image.png']);
@@ -216,6 +236,7 @@ test('explicit Restore clears reason with ordinary-scan evidence without certify
   assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, false);
   assert.equal(record.notes[0], 'required-reference-domain-unverified');
   assert.ok(f.invalidated.length >= 2);
+  assert.deepEqual(f.watchSyncCalls, Array.from({ length: 2 }, () => ({ projectId: f.project.id, watcherState: 'closed/no-watcher' })));
 });
 
 test('missing linked path is retained as an unresolved requirement before existence filtering', async () => {
@@ -784,6 +805,74 @@ test('an unrelated physical replacement at the excluded predecessor path cannot 
   assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, true);
 });
 
+for (const mode of ['new-inode', 'missing', 'removed-row', 'pending-row', 'duplicate-row']) {
+  test(`v13 resolved Replace binds the accepted successor after ordinary reverification: ${mode}`, async () => {
+    const f = continuationFixture();
+    assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).success, true);
+    const before = plain(f.api.getWorkingSourceSelection(f.project, f.a));
+    const bytes = Buffer.from(f.disk.get(f.a.path));
+    if (mode === 'new-inode') f.physical.set(f.b.path, { ...f.physical.get(f.b.path), ino: 999n });
+    if (mode === 'missing') f.disk.delete(f.b.path);
+    if (['removed-row', 'pending-row'].includes(mode)) {
+      f.project.files = f.project.files.filter(file => file !== f.b);
+      if (mode === 'pending-row') f.project.pendingFiles = [f.b];
+    }
+    if (mode === 'duplicate-row') f.project.files.push({ ...f.b, fileId: 'duplicate' });
+    if (mode === 'new-inode') {
+      const scan = f.api.beginWorkingSourceScan(f.project.id, f.b.path, () => true);
+      assert.ok(scan);
+      assert.equal(f.api.publishWorkingSourceScan(scan, { status: 'scanned', sourceIdentity: f.api.getWorkingSourceDiskIdentity(f.b),
+        sourceFingerprint: crypto.createHash('sha256').update(f.disk.get(f.b.path)).digest('hex'), requiredReferences: [], unresolved: [] }), true);
+    }
+    assert.deepEqual(plain(f.api.getWorkingSourceSelection(f.project, f.a)), {
+      state: 'invalid', reason: 'continuation-identity-changed', revision: before.revision,
+    });
+    assert.equal(f.api.getWorkingSourceMembership(f.project).blocked, true);
+    assert.deepEqual(f.disk.get(f.a.path), bytes);
+    const recovery = f.api.getWorkingSourceMembership(f.project).facts.get(f.a.path.toLowerCase()).selectionRecovery;
+    assert.deepEqual(plain(recovery), { version: 1, reason: 'continuation-identity-changed', expectedRevision: before.revision, actions: ['exclude', 'restore'] });
+    assert.equal((await f.command(f.a, 'exclude', before.revision - 1)).success, false);
+    assert.equal((await f.command(f.a, 'exclude', before.revision)).success, true);
+    assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).reason, 'user-excluded');
+  });
+}
+
+test('v13 malformed Replace records never project or authorize invalid-state recovery', async () => {
+  const mutations = [
+    (p, key, pair) => { pair.decision.authority = 'untrusted'; },
+    (p, key, pair) => { pair.successorIdentity = null; },
+    (p, key, pair) => { pair.evidenceIdentity = 'malformed'; },
+    (p, key, pair) => { pair.revision = 0; },
+    p => { p.workingSourceContinuations.version = 2; },
+    (p, key) => { p.workingSourceSelections[key].unexpected = true; },
+    (p, key, pair) => { pair.decision.successorSelectionRevision = -1; },
+  ];
+  for (const mutate of mutations) {
+    const f = continuationFixture();
+    const command = continuationRequest(f);
+    assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, command)).success, true);
+    const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, f.a);
+    mutate(f.project, key, f.project.workingSourceContinuations.pairs[command.pairIdentity]);
+    f.physical.set(f.b.path, { ...f.physical.get(f.b.path), ino: 999n });
+    const before = plain(f.project);
+    assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).reason, null);
+    assert.equal(f.api.getWorkingSourceMembership(f.project).facts.get(f.a.path.toLowerCase()).selectionRecovery, undefined);
+    assert.equal((await f.command(f.a, 'exclude', 1)).success, false);
+    assert.deepEqual(plain(f.project), before);
+  }
+});
+
+test('v13 ambiguous canonical predecessor never projects or accepts recovery through a scoped identity', async () => {
+  const f = continuationFixture();
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).success, true);
+  f.project.files.push({ ...f.a, fileId: 'duplicate-predecessor' });
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).state, 'invalid');
+  assert.equal(f.api.getWorkingSourceMembership(f.project).facts.get(f.a.path.toLowerCase()).selectionRecovery, undefined);
+  const before = plain(f.project);
+  assert.equal((await f.command(f.a, 'exclude', 1)).error, 'working_source_not_found');
+  assert.deepEqual(plain(f.project), before);
+});
+
 test('the identity adapter retains actual Adobe source formats and excludes Figma/virtual sources', async () => {
   for (const extension of ['ai', 'ait', 'psd', 'psb', 'indd', 'idml', 'xd', 'pdf', 'prproj', 'aep', 'aet']) {
     const f = fixture(), original = f.source(`Before.${extension}`); f.project.files.push(original);
@@ -800,4 +889,26 @@ test('the identity adapter retains actual Adobe source formats and excludes Figm
   f.project.files.push(figma, virtual);
   await f.api.refreshWorkingSourceLocators(f.project.id);
   assert.equal(f.project.workingSourceLocators, undefined);
+});
+
+
+test('S2 identity upgrades retain the original resolved pair and distinct replacement files create a fresh pair', async () => {
+  const f = continuationFixture();
+  const originalIdentity = Object.keys(f.project.workingSourceContinuations.pairs)[0];
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f, 'keep-both'))).success, true);
+  const decision = plain(f.project.workingSourceContinuations.pairs[originalIdentity].decision);
+  f.setDocumentIdentityReader(script => ({ documentId: script.includes(JSON.stringify(f.a.path)) ? '101' : script.includes(JSON.stringify(f.b.path)) ? '102' : '103',
+    volumeUuid: '12345678-1234-1234-1234-123456789abc' }));
+  await f.api.refreshWorkingSourceLocators(f.project.id);
+  const upgraded = plain(f.project.workingSourceContinuations.pairs[originalIdentity]);
+  assert.equal(f.api.recordWorkingSourceContinuationCandidate(f.project.id, f.a.path, f.b.path), originalIdentity);
+  assert.equal(Object.keys(f.project.workingSourceContinuations.pairs).length, 1);
+  assert.deepEqual(plain(f.project.workingSourceContinuations.pairs[originalIdentity]), upgraded);
+  assert.deepEqual(upgraded.decision, decision);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
+  f.physical.set(f.b.path, { ...f.physical.get(f.b.path), ino: 999n, birthtimeNs: 200n });
+  const freshIdentity = f.api.recordWorkingSourceContinuationCandidate(f.project.id, f.a.path, f.b.path);
+  assert.notEqual(freshIdentity, originalIdentity);
+  assert.equal(Object.keys(f.project.workingSourceContinuations.pairs).length, 2);
+  assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 1);
 });
