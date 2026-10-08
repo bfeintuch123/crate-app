@@ -10028,7 +10028,7 @@ test('PowerPoint provenance failure does not block package extraction success', 
   }
 });
 
-test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async () => {
+test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     resetPresentationCacheRoot();
@@ -10052,6 +10052,26 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(keynotePath);
+    const sourceStat = fs.lstatSync(keynotePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: keynotePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setKeynoteUnzipFixture([{
       internalPath: 'Data/photo-1234.jpeg',
       data: Buffer.from(mediaBytes),
@@ -10106,7 +10126,7 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
   }
 });
 
-test('Keynote scan-on-save captures distinct pasted images with same cleaned base after prior captures', async () => {
+test('Keynote scan-on-save captures distinct pasted images with same cleaned base after prior captures', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     resetPresentationCacheRoot();
@@ -10147,6 +10167,26 @@ test('Keynote scan-on-save captures distinct pasted images with same cleaned bas
         },
       ],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(keynotePath);
+    const sourceStat = fs.lstatSync(keynotePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: keynotePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setKeynoteUnzipFixture([
       { internalPath: 'Data/pasted-image-1001.jpeg', data: mediaBytes('EXISTING_ONE') },
       { internalPath: 'Data/pasted-image-1002.jpeg', data: mediaBytes('EXISTING_TWO') },
@@ -15278,32 +15318,45 @@ test('provenance recording failure does not block manual file capture', async ()
   }
 });
 
-test('chokidar add records session observation only after primary design file add succeeds', async () => {
-  const filePath = path.join(os.tmpdir(), 'layout.psd');
-  fs.writeFileSync(filePath, 'older design file');
-  const project = await createProject('Chokidar add provenance');
-  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+test('chokidar add records session observation only after primary design file add succeeds', async (t) => {
+  const fixtureRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'chokidar-add-'));
+  const filePath = path.join(fixtureRoot, 'layout.psd');
+  try {
+    fs.writeFileSync(filePath, 'older design file');
+    const project = await createProject('Chokidar add provenance');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
 
-  await emitWatcherWithStats('add', filePath, {
-    mtimeMs: stored.watchStartedAt + 1,
-    birthtimeMs: stored.watchStartedAt + 1,
-  });
-  await emitWatcherWithStats('add', filePath, {
-    mtimeMs: stored.watchStartedAt + 1,
-    birthtimeMs: stored.watchStartedAt + 1,
-  });
+    const watcherRecord = watcherRecords.at(-1);
+    const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    const physicalSource = fs.realpathSync.native(filePath);
+    assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 2);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'physical-default-root-source', filePath, physicalSource, physicalRoot, roots: watcherRecord.roots }));
 
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].ext, '.psd');
-  assert.equal(fresh.files[0].source, 'chokidar-add');
-  assertSessionObservedFile(
-    fresh,
-    OBSERVER_KINDS.CHOKIDAR,
-    'add',
-    CONFIDENCE_BANDS.CANDIDATE
-  );
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.files[0].path, filePath);
+    assert.equal(fresh.files[0].ext, '.psd');
+    assert.equal(fresh.files[0].source, 'chokidar-add');
+    assertSessionObservedFile(
+      fresh,
+      OBSERVER_KINDS.CHOKIDAR,
+      'add',
+      CONFIDENCE_BANDS.CANDIDATE
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('chokidar add stages a pre-existing primary design file for review', async () => {
@@ -16345,24 +16398,37 @@ test('resume hides stale pending rows while retaining the selected project sourc
   }
 });
 
-test('chokidar change records observation only for a previously unseen primary design file', async () => {
+test('chokidar change records observation only for a previously unseen primary design file', async (t) => {
   const project = await createProject('Chokidar change provenance');
-  const filePath = path.join(os.tmpdir(), 'identity.ai');
-  fs.writeFileSync(filePath, 'current-session identity source');
+  const fixtureRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'chokidar-change-'));
+  const filePath = path.join(fixtureRoot, 'identity.ai');
+  try {
+    fs.writeFileSync(filePath, 'current-session identity source');
 
-  await emitWatcher('change', filePath);
-  await emitWatcher('change', filePath);
+    const watcherRecord = watcherRecords.at(-1);
+    const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    const physicalSource = fs.realpathSync.native(filePath);
+    assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 2);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'physical-default-root-source', filePath, physicalSource, physicalRoot, roots: watcherRecord.roots }));
 
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].ext, '.ai');
-  assertSessionObservedFile(
-    fresh,
-    OBSERVER_KINDS.CHOKIDAR,
-    'change',
-    CONFIDENCE_BANDS.CANDIDATE
-  );
+    await emitWatcher('change', filePath);
+    await emitWatcher('change', filePath);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.files[0].path, filePath);
+    assert.equal(fresh.files[0].ext, '.ai');
+    assertSessionObservedFile(
+      fresh,
+      OBSERVER_KINDS.CHOKIDAR,
+      'change',
+      CONFIDENCE_BANDS.CANDIDATE
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('current watcher rejects a stale prior-session change before any stateful work', async () => {
@@ -16581,7 +16647,7 @@ test('generic change rescans a file accepted through Add Files while stat is pen
   }
 });
 
-test('generic watcher enforces the exact Watching-session timestamp boundary', async () => {
+test('generic watcher enforces the exact Watching-session timestamp boundary', async (t) => {
   setChildProcessHandler(() => ({ stdout: '' }));
   const cases = [
     { label: 'old birth with fresh save', mtimeOffset: 1, birthtimeOffset: -10000, expected: true },
@@ -16593,18 +16659,30 @@ test('generic watcher enforces the exact Watching-session timestamp boundary', a
   for (const scenario of cases) {
     const project = await createProject(`Generic change boundary: ${scenario.label}`);
     const filePath = path.join(TEST_HOME, 'Desktop', `${scenario.label.replaceAll(' ', '-')}.ai`);
-    const stored = storeInstance.data.projects.find(item => item.id === project.id);
-    await emitWatcher('change', filePath, {
-      mtimeMs: stored.watchStartedAt + scenario.mtimeOffset,
-      birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset,
-    });
+    fs.writeFileSync(filePath, 'timestamp boundary source');
+    try {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+      const physicalSource = fs.realpathSync.native(filePath);
+      const watcherRecord = watcherRecords.at(-1);
+      assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 1);
+      assert.equal(watcherRecord.closed, false);
+      assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      t.diagnostic(JSON.stringify({ milestone: 'timestamp-boundary-delivery', label: scenario.label, filePath, physicalSource, physicalRoot, roots: watcherRecord.roots, mtimeMs: stored.watchStartedAt + scenario.mtimeOffset, birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset, watchStartedAt: stored.watchStartedAt }));
+      await emitWatcher('change', filePath, {
+        mtimeMs: stored.watchStartedAt + scenario.mtimeOffset,
+        birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset,
+      });
 
-    const fresh = await getProject(project.id);
-    assert.equal(
-      fresh.files.some(file => file.path === filePath),
-      scenario.expected,
-      scenario.label
-    );
+      const fresh = await getProject(project.id);
+      assert.equal(
+        fresh.files.some(file => file.path === filePath),
+        scenario.expected,
+        scenario.label
+      );
+    } finally {
+      fs.rmSync(filePath, { force: true });
+    }
   }
 });
 
@@ -16645,13 +16723,12 @@ test('chokidar ignored, non-primary, and temp files do not record provenance', a
   assert.deepEqual(fresh.provenance.observations, []);
 });
 
-test('automatic live capture ignores old package output and diagnostics folders', async () => {
+test('automatic live capture ignores old package output and diagnostics folders', async (t) => {
   const project = await createProject('Package output exclusion');
   const packageRootFile = path.join(
     TEST_HOME,
     'Desktop',
     'Crate-QA',
-    'v2.8.0-qa.5-jenna',
     'package-outputs',
     'Jenna Baseline Existing Files QA_2026-06-07',
     'Pricing Tobias Joseph copy.indd'
@@ -16670,31 +16747,68 @@ test('automatic live capture ignores old package output and diagnostics folders'
     'Presentation1.ai'
   );
 
-  for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, 'excluded auto capture bytes');
-    await emitWatcher('add', filePath);
-    await emitWatcher('change', filePath);
-  }
+  const deepRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'deep-package-'));
+  const deepFile = path.join(deepRoot, 'v2.8.0-qa.5-jenna', 'package-outputs', 'Jenna Baseline Existing Files QA_2026-06-07', 'Deep.ai');
+  const originalReadFile = fs.promises.readFile;
+  const originalStat = fs.promises.stat;
+  let deepReads = 0;
+  let deepStats = 0;
+  try {
+    fs.mkdirSync(path.dirname(deepFile), { recursive: true });
+    fs.writeFileSync(deepFile, 'deep excluded bytes');
+    const physicalDesktop = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    assert.equal(path.relative(physicalDesktop, fs.realpathSync.native(deepFile)).split(path.sep).length, 5);
+    const beforeDeep = await getProject(project.id);
+    fs.promises.readFile = async function countDeepReads(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(deepFile)) deepReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countDeepStats(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(deepFile)) deepStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    await emitWatcher('add', deepFile);
+    await emitWatcher('change', deepFile);
+    assert.equal(deepReads, 0);
+    assert.equal(deepStats, 0);
+    assert.deepEqual(await getProject(project.id), beforeDeep);
+    t.diagnostic(JSON.stringify({ milestone: 'deep-path-refused', depth: 5, reads: deepReads, stats: deepStats, stateUnchanged: true }));
+    for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, 'excluded auto capture bytes');
+      const depth = path.relative(physicalDesktop, fs.realpathSync.native(filePath)).split(path.sep).length;
+      assert.ok(depth <= 4);
+      t.diagnostic(JSON.stringify({ milestone: 'eligible-output-exclusion-delivery', filePath, depth }));
+      await emitWatcher('add', filePath);
+      await emitWatcher('change', filePath);
+    }
 
-  const fresh = await getProject(project.id);
-  assert.deepEqual(fresh.files, []);
-  assert.deepEqual(fresh.pendingFiles, []);
-  assert.deepEqual(fresh.provenance.observations, []);
-  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-    .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
-  assert.ok(ignoredEvidence.length >= 3);
-  assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
-  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
-  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
-    packageRootFile,
-    diagnosticsFile,
-    quickPackageFile,
-    TEST_HOME,
-    'raw',
-    'stdout',
-  ], 'ignored live evidence ledger');
+    const fresh = await getProject(project.id);
+    assert.deepEqual(fresh.files, []);
+    assert.deepEqual(fresh.pendingFiles, []);
+    assert.deepEqual(fresh.provenance.observations, []);
+    const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+      .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
+    assert.ok(ignoredEvidence.length >= 3);
+    assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
+    assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
+    assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
+    assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
+      packageRootFile,
+      diagnosticsFile,
+      quickPackageFile,
+      TEST_HOME,
+      'raw',
+      'stdout',
+    ], 'ignored live evidence ledger');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    fs.rmSync(deepRoot, { recursive: true, force: true });
+    for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
+      fs.rmSync(filePath, { force: true });
+    }
+  }
 });
 
 test('live evidence ledger caps candidates and preserves active project evidence', async () => {
@@ -21633,10 +21747,10 @@ test('broad observer quarantine does not block clean Illustrator DOC/LINK live e
   ], 'clean Illustrator quarantine regression ledger');
 });
 
-test('scan-on-open linked accepted insertion records one deduped candidate session observation', async () => {
+test('scan-on-open linked accepted insertion records one deduped candidate session observation', async (t) => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-provenance');
-  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  assert.ok(path.resolve(repoTempRoot).startsWith('/Users/'), 'linked parser fixture requires a /Users source root');
 
   try {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
@@ -21656,6 +21770,26 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     await emitWatcher('change', sourcePath);
     let fresh = await waitForProject(
       project.id,
@@ -21690,11 +21824,12 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
   }
 });
 
-test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extraction', async () => {
-  const sharedUsersRoot = '/Users/Shared';
+test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extraction', async (t) => {
+  const sharedUsersRoot = path.resolve(__dirname, '..');
+  assert.ok(sharedUsersRoot.startsWith('/Users/'), 'legacy byte-regex fixture requires a /Users source root');
   assert.doesNotThrow(
     () => fs.accessSync(sharedUsersRoot, fs.constants.W_OK),
-    'legacy .ppt watcher coverage requires writable /Users/Shared on the macOS test host'
+    'legacy .ppt watcher coverage requires a writable owned /Users fixture root'
   );
   const fixtureRoot = fs.mkdtempSync(path.join(sharedUsersRoot, 'crate-legacy-ppt-scan-'));
   let unzipCalls = 0;
@@ -21711,6 +21846,26 @@ test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extractio
       addedAt: Date.now(),
       source: 'manual-browse',
     }] });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setChildProcessHandler(({ kind, command }) => {
       if (kind === 'execFile' && command === '/usr/bin/unzip') unzipCalls++;
       return { stdout: '' };
@@ -21854,10 +22009,10 @@ test('scan-on-open deduped-away linked candidate does not record session observa
   }
 });
 
-test('scan-on-open provenance failure does not block accepted ledger insertion', async () => {
+test('scan-on-open provenance failure does not block accepted ledger insertion', async (t) => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-failure-provenance');
-  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  assert.ok(path.resolve(repoTempRoot).startsWith('/Users/'), 'linked parser fixture requires a /Users source root');
 
   try {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
@@ -21876,6 +22031,26 @@ test('scan-on-open provenance failure does not block accepted ledger insertion',
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     storedProject.provenance.nodes = new Proxy({}, {
       set() {
         throw new Error('forced scan-on-open provenance failure');
@@ -22337,7 +22512,7 @@ test('pre-package local Figma recovery ignores generated package folders', async
   assert.deepEqual(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE), []);
 });
 
-test('PSD scan-on-save linked asset preserves ledger entry and records one parser reference edge', async () => {
+test('PSD scan-on-save linked asset preserves ledger entry and records one parser reference edge', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('PSD linked parser provenance');
@@ -22354,6 +22529,26 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: psdPath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     currentPsdFixture = {
       children: [{ linkedFile: { fullPath: linkedPath } }],
       linkedFiles: [],
@@ -22384,61 +22579,144 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
   }
 });
 
-test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async () => {
-  const tmpRoot = makeTempDir();
-  const originalReadFile = fs.promises.readFile;
-  let releaseRead = () => {};
-  try {
-    const first = await createProject('Delayed PSD Activation A');
-    const firstWatcher = latestWatcherHandlers();
-    const psdPath = path.join(tmpRoot, 'delayed-source.psd');
-    const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
-    fs.writeFileSync(psdPath, 'psd bytes');
-    fs.writeFileSync(linkedPath, 'linked bytes');
-    await setProjectFiles(first.id, {
-      files: [{
-        path: psdPath,
-        name: 'delayed-source.psd',
-        ext: '.psd',
-        addedAt: Date.now(),
-        source: 'manual-browse',
-      }],
-    });
-    currentPsdFixture = {
-      children: [{ linkedFile: { fullPath: linkedPath } }],
-      linkedFiles: [],
-    };
+test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async (t) => {
+  async function runAttempt(forceReadStartTimeout) {
+    const tmpRoot = makeTempDir();
+    const originalReadFile = fs.promises.readFile;
+    const originalStat = fs.promises.stat;
+    const watcherStart = watcherRecords.length;
+    let releaseRead = () => {};
+    let first;
+    let second;
+    let readFinished;
+    let readEntered = false;
+    let readReleased = false;
+    try {
+      first = await createProject('Delayed PSD Activation A');
+      const firstWatcher = latestWatcherHandlers();
+      const firstActivation = metadataTestHooks.getActiveWatchingActivationToken(first.id);
+      const psdPath = path.join(tmpRoot, 'delayed-source.psd');
+      const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
+      fs.writeFileSync(psdPath, 'psd bytes');
+      fs.writeFileSync(linkedPath, 'linked bytes');
+      await setProjectFiles(first.id, {
+        files: [{
+          path: psdPath,
+          name: 'delayed-source.psd',
+          ext: '.psd',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        }],
+      });
+      // A stored source does not authorize a callback until exact-path enrollment succeeds.
+      const beforeRefusal = await getProject(first.id);
+      let refusedReads = 0;
+      let refusedStats = 0;
+      fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+        return originalReadFile.call(fs.promises, candidate, ...args);
+      };
+      fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+        return originalStat.call(fs.promises, candidate, ...args);
+      };
+      await firstWatcher.change(psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.deepEqual(await getProject(first.id), beforeRefusal);
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      t.diagnostic(JSON.stringify({ milestone: 'unenrolled-PSD-refused', forceReadStartTimeout, refusedReads, refusedStats, stateUnchanged: true }));
+      const watcherRecord = watcherRecords.at(-1);
+      const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(first.id);
+      const physicalSource = fs.realpathSync.native(psdPath);
+      const sourceStat = fs.lstatSync(psdPath);
+      assert.equal(sourceStat.isFile(), true);
+      assert.equal(sourceStat.isSymbolicLink(), false);
+      assert.equal(sourceStat.nlink, 1);
+      assert.equal(watcherRecord.closed, false);
+      assert.equal((await getProject(first.id)).status, 'watching');
+      assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(first.id));
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+      assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(first.id);
+      const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(first.id);
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: psdPath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+      assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+      assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+      assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+      assert.ok(watcherRecord.addedPaths.has(physicalSource));
 
-    const readGate = new Promise(resolve => { releaseRead = resolve; });
-    let markReadStarted;
-    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
-    fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
-      if (path.resolve(filePath) === path.resolve(psdPath)) {
-        markReadStarted();
-        await readGate;
+      currentPsdFixture = {
+        children: [{ linkedFile: { fullPath: linkedPath } }],
+        linkedFiles: [],
+      };
+      const readGate = new Promise(resolve => { releaseRead = () => { readReleased = true; resolve(); }; });
+      let markReadStarted;
+      let markReadEntered;
+      let markReadFinished;
+      const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+      const actualReadEntered = new Promise(resolve => { markReadEntered = resolve; });
+      readFinished = new Promise(resolve => { markReadFinished = resolve; });
+      fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
+        if (path.resolve(filePath) !== path.resolve(psdPath)) {
+          return originalReadFile.call(fs.promises, filePath, ...args);
+        }
+        readEntered = true;
+        markReadEntered();
+        if (!forceReadStartTimeout) markReadStarted();
+        try {
+          await readGate;
+          return await originalReadFile.call(fs.promises, filePath, ...args);
+        } finally {
+          markReadFinished();
+        }
+      };
+
+      await firstWatcher.change(psdPath);
+      await waitForPresentationFixtureSignal(actualReadEntered, 'delayed PSD physical read entry');
+      t.diagnostic(JSON.stringify({ milestone: 'PSD-source-read-started', forceReadStartTimeout, firstActivation }));
+      await waitForPresentationFixtureSignal(readStarted, 'delayed PSD read-start signal', forceReadStartTimeout ? 50 : 5000);
+      second = await createProject('Delayed PSD Activation B');
+      const secondActivation = metadataTestHooks.getActiveWatchingActivationToken(second.id);
+      await callIpc('projects:start-watching', first.id);
+      const resumedActivation = metadataTestHooks.getActiveWatchingActivationToken(first.id);
+      assert.notEqual(firstActivation, secondActivation);
+      assert.notEqual(firstActivation, resumedActivation);
+      releaseRead();
+      await waitForPresentationFixtureSignal(readFinished, 'delayed PSD read completion');
+      await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+      const firstFresh = await getProject(first.id);
+      const secondFresh = await getProject(second.id);
+      assert.equal(firstFresh.status, 'watching');
+      assert.equal(secondFresh.status, 'paused');
+      assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
+      assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
+      assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+      t.diagnostic(JSON.stringify({ milestone: 'A-B-A-stale-mutation-refused', firstActivation, secondActivation, resumedActivation }));
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      releaseRead();
+      try {
+        if (first) await callIpc('projects:pause', first.id);
+        if (second) await callIpc('projects:pause', second.id);
+        if (readEntered) await waitForPresentationFixtureSignal(readFinished, 'delayed PSD cleanup read completion');
+      } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        assert.equal(fs.promises.readFile, originalReadFile);
+        assert.equal(fs.promises.stat, originalStat);
+        assert.equal(fs.existsSync(tmpRoot), false);
+        assert.ok(watcherRecords.slice(watcherStart).every(record => record.closed));
+        if (readEntered) assert.equal(readReleased, true);
+        t.diagnostic(JSON.stringify({ milestone: 'delayed-PSD-attempt-cleanup', forceReadStartTimeout, readEntered, readReleased, hooksRestored: true, rootRemoved: true, ownedWatchersClosed: true }));
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
-
-    await firstWatcher.change(psdPath);
-    await readStarted;
-    const second = await createProject('Delayed PSD Activation B');
-    await callIpc('projects:start-watching', first.id);
-    releaseRead();
-    await new Promise(resolve => originalSetTimeout(resolve, 100));
-
-    const firstFresh = await getProject(first.id);
-    const secondFresh = await getProject(second.id);
-    assert.equal(firstFresh.status, 'watching');
-    assert.equal(secondFresh.status, 'paused');
-    assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
-    assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
-    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
-  } finally {
-    fs.promises.readFile = originalReadFile;
-    releaseRead();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   }
+
+  await runAttempt(false);
+  await assert.rejects(runAttempt(true), /timed out waiting for delayed PSD read-start signal/);
 });
 
 for (const staleScenario of ['pause', 'delete', 'B-A-B']) {
