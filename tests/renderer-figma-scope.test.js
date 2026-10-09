@@ -61,20 +61,19 @@ function createElementStub(tagName = 'div') {
       const index = element.children.indexOf(child);
       if (index >= 0) element.children.splice(index, 1);
       if (child?.parentNode === element) child.parentNode = null;
+      if (child?.contains?.(element.ownerDocument?.activeElement)) element.ownerDocument.activeElement = element.ownerDocument.body;
       return child;
     },
     replaceChild: (next, previous) => {
       const index = element.children.indexOf(previous);
       if (index >= 0) element.children[index] = next;
       if (previous?.parentNode === element) previous.parentNode = null;
+      if (previous?.contains?.(element.ownerDocument?.activeElement)) element.ownerDocument.activeElement = element.ownerDocument.body;
       if (next) next.parentNode = element;
       return previous;
     },
     replaceChildren: (...children) => {
-      for (const child of element.children) {
-        if (child?.parentNode === element) child.parentNode = null;
-      }
-      element.children = [];
+      for (const child of [...element.children]) element.removeChild(child);
       children.filter(Boolean).forEach(child => element.appendChild(child));
     },
     addEventListener: (type, fn) => {
@@ -91,6 +90,7 @@ function createElementStub(tagName = 'div') {
     },
     click: () => element.dispatchEvent({ type: 'click', preventDefault: () => {}, stopPropagation: () => {} }),
     focus: () => {
+      if (!element.isConnected || element.disabled) return;
       if (element.ownerDocument?.activeElement) element.ownerDocument.activeElement.focused = false;
       element.focused = true;
       if (element.ownerDocument) element.ownerDocument.activeElement = element;
@@ -120,6 +120,11 @@ function createElementStub(tagName = 'div') {
       ) {
         return { addEventListener: () => {} };
       }
+      for (const child of element.children) {
+        if (child.matches?.(selector)) return child;
+        const match = child.querySelector?.(selector);
+        if (match) return match;
+      }
       return null;
     },
     querySelectorAll: selector => {
@@ -127,12 +132,15 @@ function createElementStub(tagName = 'div') {
       if (selector === '[data-render-key]') return createNodeList(element.children);
       return [];
     },
-    closest: () => null,
+    matches: selector => selector === '[data-render-key]' ? !!element.dataset.renderKey
+      : selector.startsWith('.') ? String(element.className || '').split(/\s+/).includes(selector.slice(1)) || classes.has(selector.slice(1))
+      : element.tagName.toLowerCase() === selector,
+    closest: selector => element.matches(selector) ? element : element.parentNode?.closest?.(selector) || null,
   };
 
   let html = '';
   let text = '';
-  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument });
+  Object.defineProperty(element, 'isConnected', { get: () => !!element.ownerDocument?.body?.contains(element) });
   Object.defineProperty(element, 'parentElement', { get: () => element.parentNode || null });
   const htmlEscape = value => String(value)
     .replace(/&/g, '&amp;')
@@ -152,7 +160,7 @@ function createElementStub(tagName = 'div') {
     set: value => {
       html = String(value ?? '');
       text = html;
-      element.children = [];
+      element.replaceChildren();
     },
   });
 
@@ -197,7 +205,11 @@ function createDocumentStub(elements = {}, options = {}) {
     return element;
   };
   const getElementById = id => {
-    if (!elements[id] && options.createMissingIds) elements[id] = attach(createElementStub());
+    if (!elements[id] && options.createMissingIds) {
+      elements[id] = attach(createElementStub());
+      elements[id].id = id;
+      body.appendChild(elements[id]);
+    }
     return attach(elements[id] || null);
   };
 
@@ -228,12 +240,19 @@ function createDocumentStub(elements = {}, options = {}) {
     body,
   };
   body.ownerDocument = document;
-  for (const element of Object.values(elements)) attach(element);
+  for (const [id, element] of Object.entries(elements)) {
+    attach(element); element.id = id;
+    if (!element.parentNode) body.appendChild(element);
+  }
   for (const element of [
     ...(options.tabs || []),
     ...(options.tabContents || []),
     ...(options.assetFilters || []),
-  ]) attach(element);
+    options.packageReviewDialog,
+  ].filter(Boolean)) {
+    attach(element);
+    if (!element.parentNode) body.appendChild(element);
+  }
   return document;
 }
 
@@ -1855,6 +1874,8 @@ test('Existing Assets batch controls use the persisted cohort decision IPC and p
   renderer.testProject = project;
   vm.runInContext('state.projects = [testProject]; state.selectedProjectId = testProject.id;', renderer);
 
+  await renderer.ensureProjectAssetWorkspace(project);
+
   assert.equal(await renderer.submitExistingAssetsBatchDecision('skip'), true);
 
   assert.deepEqual(decisions, [[project.id, 'skip']]);
@@ -2171,8 +2192,8 @@ test('Review Before Packaging uses the approved terminology and retains keyboard
   const fixture = await loadPendingBatchFixture({ id: 'pending-accessibility' });
   assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Add all assets needing review');
   assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Skip all assets needing review');
-  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), undefined);
-  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), undefined);
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), 'false');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), 'false');
   const pendingRow = fixture.elements['pending-file-list'].children[0];
   const pendingStateBadge = pendingRow.children.find(child => child.className === 'pending-state-badge');
   const pendingCopy = pendingRow.children.find(child => child.className === 'pending-file-copy');
@@ -5015,13 +5036,15 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
     assetBaseline: { status: 'decision-required', decision: null, establishedAt: 2 },
   };
   let resolveDecisionA;
+  const decisionCalls = [];
   let packageTrigger;
   const decisionA = new Promise(resolve => { resolveDecisionA = resolve; });
   const noOp = () => {};
   const renderer = loadRendererHelpers(document, { crate: {
-    setExistingAssetsDecision: async projectId => (
-      projectId === projectA.id ? decisionA : { success: true, project: projectB }
-    ),
+    setExistingAssetsDecision: async projectId => {
+      decisionCalls.push(projectId);
+      return projectId === projectA.id ? decisionA : { success: true, project: projectB };
+    },
     getProjects: async () => [projectA, projectB],
     onFilesUpdated: noOp,
     onProjectUpdated: noOp,
@@ -5032,13 +5055,22 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
     onFigmaScanComplete: noOp,
     onFigmaScanError: noOp,
   } });
+  renderer.testProjectA = projectA;
+  renderer.testProjectB = projectB;
   vm.runInContext(`
-    state.projects = [${JSON.stringify(projectA)}, ${JSON.stringify(projectB)}];
-    state.selectedProjectId = '${projectA.id}';
+    state.projects = [testProjectA, testProjectB];
+    state.selectedProjectId = testProjectA.id;
   `, renderer);
-  await renderer.showExistingAssetsDecisionModal(projectA);
+  assert.equal(vm.runInContext('state.projects[0]', renderer), projectA);
+  assert.equal(await renderer.showExistingAssetsDecisionModal(projectA), true);
+  assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
+  assert.equal(vm.runInContext('existingAssetsModalSessionId !== null && isCurrentModalLease("modal-existing-assets", existingAssetsModalSessionId)', renderer), true);
   renderer.setupMainProcessListeners();
   const pendingDecision = renderer.submitExistingAssetsDecision('include');
+  assert.deepEqual(decisionCalls, [projectA.id]);
+  assert.equal(vm.runInContext('existingAssetsDecisionRequest.projectId', renderer), projectA.id);
+  assert.equal(elements['btn-include-existing-assets'].disabled, true);
+  assert.equal(elements['btn-skip-existing-assets'].disabled, true);
 
   await packageTrigger({ projectId: projectB.id });
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), projectA.id);
@@ -5050,6 +5082,8 @@ test('an in-flight Existing Assets decision blocks a competing notification tran
   await pendingDecision;
 
   assert.equal(vm.runInContext('existingAssetsModalProjectId', renderer), null);
+  assert.equal(vm.runInContext('existingAssetsDecisionRequest', renderer), null);
+  assert.equal(vm.runInContext('activeModalLease', renderer), null);
   assert.equal(elements['modal-existing-assets'].classList.contains('hidden'), true);
 });
 
@@ -7484,6 +7518,8 @@ for (const decision of ['include', 'skip']) for (const rejected of [false, true]
       calls.push(target);
       return calls.length === 1 ? held : completed;
     } });
+    attachOliviaReviewDescriptions(f);
+    await f.renderer.ensureProjectAssetWorkspace(f.project);
     const batch = f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'first' }, { target: 'second' }]);
     assert.deepEqual(calls, ['first']);
     vm.runInContext(`acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'${identity}'}});`, f.renderer);
@@ -7492,6 +7528,17 @@ for (const decision of ['include', 'skip']) for (const rejected of [false, true]
     assert.equal(await batch, false);
     assert.deepEqual(calls, ['first']);
     assert.equal(vm.runInContext('state.projects[0].id', f.renderer), f.project.id);
+    assertOliviaBulkReason(f, /Current asset review is unavailable/);
+    assertC1Busy(f, false);
+    await f.renderer.renderFiles();
+    assertOliviaBulkReason(f, /already included/, [true, false]);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'All Existing Included');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
+      assert.equal(f.elements[id].getAttribute('aria-busy'), 'false');
+      assert.equal(f.elements[id].classList.contains('is-action-busy'), false);
+    }
+    assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [f.project]);
   });
 }
 
@@ -8062,6 +8109,9 @@ for (const input of ['click', 'keyboard']) {
       tab.setAttribute('aria-controls', `settings-panel-${name}`);
       tab.setAttribute('aria-selected', String(index === 0));
       f.document.getElementById(`settings-panel-${name}`).hidden = index !== 0;
+      f.elements['tab-settings'].appendChild(tab);
+      assert.equal(tab.isConnected, true);
+      assert.equal(f.elements['tab-settings'].contains(tab), true);
       return tab;
     });
     const queryAll = f.document.querySelectorAll.bind(f.document);
@@ -8081,5 +8131,827 @@ for (const input of ['click', 'keyboard']) {
     assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
     assert.equal(f.document.activeElement, tabs[1]);
     assert.equal(f.decisions(), 0); assert.equal(f.packages(), 0);
+  });
+}
+
+// Olivia's three UI corrections: local DOM/CSS models, not native visual acceptance.
+function attachOliviaReviewDescriptions(fixture) {
+  const html = fs.readFileSync(path.join(__dirname, '../renderer/index.html'), 'utf8');
+  for (const id of ['btn-include-all-existing', 'btn-skip-all-existing', 'btn-review-assets-continue']) {
+    const tag = html.match(new RegExp(`<button\\b[^>]*id="${id}"[^>]*>([^<]*)</button>`));
+    assert.ok(tag, id);
+    const descriptionId = tag[0].match(/aria-describedby="([^"]+)"/)?.[1];
+    assert.ok(descriptionId, `${id} must associate visible guidance`);
+    fixture.document.querySelector(`#${id}`).setAttribute('aria-describedby', descriptionId);
+    const description = fixture.document.querySelector(`#${descriptionId}`);
+    const paragraph = html.match(new RegExp(`<p\\b[^>]*id="${descriptionId}"[^>]*>([^<]*)</p>`));
+    assert.ok(paragraph, descriptionId);
+    if (id === 'btn-review-assets-continue') {
+      fixture.elements[id].textContent = tag[1];
+      description.textContent = paragraph[1];
+    }
+    assert.equal(description.isConnected, true);
+  }
+}
+
+function assertOliviaBulkReason(fixture, expected, disabled = [true, true]) {
+  const reason = fixture.elements['asset-review-batch-reason'];
+  assert.match(reason.textContent, expected);
+  assert.equal(reason.classList.contains('hidden'), false);
+  ['btn-include-all-existing', 'btn-skip-all-existing'].forEach((id, index) => {
+    assert.equal(fixture.elements[id].disabled, disabled[index]);
+    assert.equal(fixture.elements[id].getAttribute('aria-describedby'), reason.id);
+  });
+}
+
+test('Olivia UI: disabled primary CSS wins the cascade while enabled Add All retains its appearance', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../renderer/styles.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  // Evaluate the actual flat rules that can match the bulk buttons, including
+  // source order and class/pseudo-class specificity. No layout/paint claim.
+  const rules = [];
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    for (const selector of match[1].trim().split(/\s*,\s*/)) {
+      if (!selector.includes('.asset-batch-button')) continue;
+      assert.match(selector, /^\.asset-batch-button(?:\.primary)?(?::disabled|:focus-visible|:hover:not\(:disabled\))?$/);
+      const declarations = Object.fromEntries(match[2].trim().split(';').filter(value => value.trim()).map(value => {
+        const colon = value.indexOf(':');
+        return [value.slice(0, colon).trim(), value.slice(colon + 1).trim()];
+      }));
+      rules.push({ selector, declarations });
+    }
+  }
+  const compute = (primary, disabled, focused = false, hovered = false) => {
+    const winners = {};
+    for (const { selector, declarations } of rules) {
+      if (selector.includes('.primary') && !primary) continue;
+      if (selector.includes(':focus-visible') && !focused) continue;
+      if (selector.includes(':hover') && (!hovered || disabled)) continue;
+      if (selector.endsWith(':disabled') && !disabled) continue;
+      const specificity = (selector.match(/\.[\w-]+/g) || []).length +
+        (selector.includes(':focus-visible') ? 1 : 0) +
+        (selector.includes(':hover') ? 1 : 0) + (selector.includes(':disabled') ? 1 : 0);
+      for (const [property, value] of Object.entries(declarations)) {
+        if (!winners[property] || winners[property].specificity <= specificity) winners[property] = { value, specificity };
+      }
+    }
+    return Object.fromEntries(Object.entries(winners).map(([key, winner]) => [key, winner.value]));
+  };
+  for (const primary of [false, true]) for (const focused of [false, true]) {
+    const disabled = compute(primary, true, focused, true);
+    assert.equal(disabled.background, 'var(--gray-50)');
+    assert.equal(disabled.color, 'var(--gray-300)');
+    assert.equal(disabled.cursor, 'not-allowed');
+  }
+  const enabled = compute(true, false);
+  assert.equal(enabled.background, 'var(--black)');
+  assert.equal(enabled.color, 'var(--white)');
+  assert.equal(enabled.cursor, 'pointer');
+});
+
+for (const kind of ['needs-save-opened', 'unidentified']) {
+  test(`Olivia UI: ${kind} bulk reason is associated and decisions leave rows untouched`, async () => {
+    const project = createPendingBatchProject(`olivia-${kind}`);
+    project.pendingFiles = kind === 'unidentified'
+      ? [{ name: 'Unidentified.png', captureState: 'pending' }]
+      : project.pendingFiles.slice(0, 2).map((file, index) => ({ ...file, captureState: index ? 'observed' : 'needs-save' }));
+    const before = cloneTestValue(project);
+    const f = await loadPendingBatchFixture({ project });
+    attachOliviaReviewDescriptions(f);
+    assertOliviaBulkReason(f, kind === 'unidentified' ? /cannot identify which files/ : /No assets are eligible.*Needs Save or Opened/);
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision('include'), false);
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), false);
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.getPersisted(), before);
+    // A new authoritative eligible row clears the former disabled reason.
+    project.pendingFiles = createPendingBatchProject().pendingFiles.slice(0, 1);
+    vm.runInContext('state.assetWorkspace = null', f.renderer);
+    f.renderer.updateAssetReviewBatchControls(project, [], 0);
+    assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+    assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+    assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+    assert.equal(f.elements['asset-review-batch-reason'].classList.contains('hidden'), true);
+  });
+}
+
+test('Olivia UI: Existing Assets reasons follow actual included counts and clear for partial inclusion', () => {
+  const f = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(f.document);
+  attachOliviaReviewDescriptions(f);
+  const project = { id: 'olivia-existing', pendingFiles: [] };
+  const assets = [{ name: 'C.png' }, { name: 'D.png' }];
+  renderer.updateAssetReviewBatchControls(project, [], 0);
+  assertOliviaBulkReason(f, /no existing assets/);
+  renderer.updateAssetReviewBatchControls(project, assets, 2);
+  assertOliviaBulkReason(f, /already included/, [true, false]);
+  renderer.updateAssetReviewBatchControls(project, assets, 0);
+  assertOliviaBulkReason(f, /No existing assets are included/, [false, true]);
+  renderer.updateAssetReviewBatchControls(project, assets, 1);
+  assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+  assert.equal(f.elements['asset-review-batch-reason'].classList.contains('hidden'), true);
+  assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+  assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+});
+
+test('Olivia UI: busy mixed batch explains both controls and preserves unresolved and independent selections', async () => {
+  const held = createDeferred();
+  const project = createPendingBatchProject('olivia-mixed');
+  project.files.push(...['C', 'D', 'Shared'].map(name => ({ path: `/synthetic/${name}.png`, name: `${name}.png`, included: true, assetOrigin: 'existing', projectRole: 'asset' })));
+  project.workingSourceSelection = { selectedSourceIds: ['C', 'D'], unresolved: ['A', 'B'] };
+  project.pendingFiles[1].captureState = 'needs-save';
+  project.pendingFiles[2].captureState = 'observed';
+  project.pendingFiles[3] = { name: 'No target.png', captureState: 'pending' };
+  const before = cloneTestValue(project);
+  const f = await loadPendingBatchFixture({ project, beforeAccept: () => held.promise });
+  attachOliviaReviewDescriptions(f);
+  assertOliviaBulkReason(f, /only to eligible review items.*Other items stay unchanged/, [false, false]);
+  const action = f.renderer.submitAssetReviewBatchDecision('include');
+  assertOliviaBulkReason(f, /Updating assets.*Wait/);
+  assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), undefined);
+  assertOliviaBulkReason(f, /Updating assets.*Wait/);
+  assert.equal(f.calls.length, 1);
+  held.resolve();
+  assert.equal(await action, true);
+  assert.deepEqual(f.calls.map(call => call.target), [before.pendingFiles[0].path]);
+  assert.deepEqual(f.getPersisted().pendingFiles, before.pendingFiles.slice(1));
+  assert.deepEqual(f.getPersisted().files.slice(0, before.files.length), before.files);
+  assert.deepEqual(f.getPersisted().workingSourceSelection, before.workingSourceSelection);
+  assert.deepEqual(f.getPersisted().assetBaseline, before.assetBaseline);
+  assertOliviaBulkReason(f, /cannot identify which files/);
+});
+
+test('Olivia UI: stale project batch completion cannot replace the current eligibility explanation', async () => {
+  const held = createDeferred();
+  const f = await loadPendingBatchFixture({ id: 'olivia-old-project', beforeAccept: () => held.promise });
+  attachOliviaReviewDescriptions(f);
+  const action = f.renderer.submitAssetReviewBatchDecision('include');
+  f.renderer.otherProject = { id: 'olivia-new-project', files: [], pendingFiles: [] };
+  vm.runInContext("state.projects.push(otherProject); setSelectedProject(otherProject.id);", f.renderer);
+  f.renderer.window.crate.getAssetWorkspace = async () => ({ projectId: 'olivia-new-project', files: [], pendingFiles: [] });
+  await f.renderer.renderFiles();
+  const currentReason = f.elements['asset-review-batch-reason'].textContent;
+  const currentProjects = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+  assertOliviaBulkReason(f, /no existing assets/);
+  held.resolve();
+  assert.equal(await action, false);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.elements['btn-include-all-existing'].disabled, true,
+    'C1 current B include control must remain disabled after retired A cleanup');
+  assertOliviaBulkReason(f, /no existing assets/);
+  assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
+    assert.equal(f.elements[id].getAttribute('aria-busy'), 'false');
+    assert.equal(f.elements[id].classList.contains('is-action-busy'), false);
+  }
+  assert.equal(f.elements['asset-review-batch-reason'].textContent, currentReason);
+  assert.equal(vm.runInContext('state.selectedProjectId', f.renderer), 'olivia-new-project');
+  assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), currentProjects);
+});
+
+for (const baseline of ['awaiting-first-scan', 'invalid', 'unknown']) {
+  test(`Olivia UI: ${baseline} baseline recovery keeps Package Review unavailable without inventing file failures`, async () => {
+    const f = createInteractiveRendererDom();
+    const project = createPendingBatchProject(`olivia-baseline-${baseline}`);
+    if (baseline === 'unknown') delete project.assetBaseline;
+    else project.assetBaseline = { status: baseline };
+    let packages = 0;
+    const renderer = loadRendererHelpers(f.document, { crate: {
+      preparePackageReview: async () => ({ error: 'asset_baseline_scan_incomplete', diagnostics: {
+        failurePhase: 'pre-package-discovery', candidateCount: 2,
+        sourcePath: '/synthetic/private/untrusted.ai', token: 'private-sentinel',
+      } }),
+      getProjects: async () => [project],
+      packageProject: async () => { packages += 1; },
+    } });
+    renderer.testProject = project;
+    vm.runInContext("state.projects=[testProject]; state.selectedProjectId=testProject.id; state.settings={namingTemplate:'{Project}'}; state.packageReviewToken='old-token';", renderer);
+    const before = cloneTestValue(project);
+    assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
+    const message = f.elements['modal-package-review-message'].textContent;
+    assert.match(message, /^Initial file verification has not completed; a scan may have failed\. No package was created\./);
+    assert.match(message, /Review.*Needs Save or Needs attention/);
+    assert.match(message, /controls offered for each item/);
+    assert.match(message, /Saving alone may not resolve a failed scan/);
+    assert.match(message, /Packaging stays blocked/);
+    assert.match(message, /Diagnostic: code asset_baseline_scan_incomplete/);
+    assert.doesNotMatch(message, /untrusted.ai|private-sentinel|\/synthetic|Working.ai|automatically|re-add/);
+    assert.equal(f.elements['btn-confirm-package'].disabled, true);
+    assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+    assert.equal(f.elements['package-review-ready'].textContent, 'Review required');
+    await renderer.confirmPackage();
+    assert.equal(packages, 0);
+    assert.deepEqual(project, before);
+    assert.equal(vm.runInContext('state.lastPackagedPath', renderer), null);
+  });
+}
+
+for (const mode of ['unresolved', 'resolved', 'empty']) {
+  test(`Olivia UI: Back to Project is close-only and restores focus for ${mode} Review`, async () => {
+    const f = createInteractiveRendererDom();
+    attachOliviaReviewDescriptions(f);
+    const project = createPendingBatchProject(`olivia-exit-${mode}`);
+    if (mode !== 'unresolved') project.pendingFiles = [];
+    if (mode === 'empty') project.files = [];
+    if (mode === 'unresolved') project.assetBaseline = { status: 'awaiting-first-scan' };
+    project.workingSourceSelection = { selectedSourceIds: ['C', 'D'], shared: ['asset'] };
+    const mutations = [];
+    const renderer = loadRendererHelpers(f.document, { crate: {
+      getProjects: async () => [project],
+      preparePackageReview: async () => ({ error: 'asset_baseline_scan_incomplete' }),
+      acceptPending: async () => mutations.push('accept'), rejectPending: async () => mutations.push('skip'),
+      setExistingAssetsDecision: async () => mutations.push('existing'), packageProject: async () => mutations.push('package'),
+    } });
+    renderer.testProject = project;
+    vm.runInContext("state.projects=[testProject]; state.selectedProjectId=testProject.id; state.settings={namingTemplate:'{Project}'};", renderer);
+    renderer.setupEventListeners();
+    await renderer.renderFiles();
+    renderer.openAssetReviewWorkspace();
+    const before = JSON.stringify(vm.runInContext('({projects:state.projects, workspace:state.assetWorkspace, token:state.packageReviewToken})', renderer));
+    assert.equal(f.elements['btn-review-assets-continue'].textContent, 'Back to Project');
+    assert.match(f.elements['asset-review-exit-reason'].textContent, /leaves unresolved items unchanged.*Packaging stays blocked/);
+    f.elements['btn-review-assets-continue'].click();
+    assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
+    assert.equal(f.elements['asset-review-workspace'].classList.contains('hidden'), true);
+    assert.equal(f.elements['project-dashboard'].classList.contains('hidden'), false);
+    assert.equal(f.document.activeElement, f.elements['btn-review-assets']);
+    assert.equal(JSON.stringify(vm.runInContext('({projects:state.projects, workspace:state.assetWorkspace, token:state.packageReviewToken})', renderer)), before);
+    assert.deepEqual(mutations, []);
+    if (mode === 'unresolved') {
+      assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
+      assert.equal(f.elements['btn-confirm-package'].disabled, true);
+      assert.equal(vm.runInContext('state.packageReviewToken', renderer), null);
+      assert.deepEqual(mutations, []);
+    }
+  });
+}
+
+function assertC1Busy(f, busy) {
+  for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
+    assert.equal(f.elements[id].isConnected, true);
+    assert.equal(f.elements[id].getAttribute('aria-busy'), String(busy));
+    assert.equal(f.elements[id].classList.contains('is-action-busy'), busy);
+    assert.equal(f.elements[id].getAttribute('aria-describedby'), 'asset-review-batch-reason');
+    assert.equal(f.elements[id].dataset.actionIdleLabel, undefined);
+  }
+}
+
+for (const decision of ['include', 'skip']) for (const rejected of [false, true]) {
+  test(`C1: still-signed-out ${decision} cleanup stays inaccessible (reject=${rejected})`, async () => {
+    const held = createDeferred();
+    const calls = [];
+    const f = accountModalFixture({ [decision === 'include' ? 'acceptPending' : 'rejectPending']: async (_id, target) => {
+      calls.push(target); return held.promise;
+    } });
+    attachOliviaReviewDescriptions(f);
+    const before = cloneTestValue(f.project);
+    await f.renderer.ensureProjectAssetWorkspace(f.project);
+    const action = f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'first' }, { target: 'second' }]);
+    vm.runInContext("acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}})", f.renderer);
+    if (rejected) held.reject(new Error('retired request'));
+    else held.resolve(decision === 'include' ? { files: [{ name: 'STALE.png' }], pendingFiles: [] } : []);
+    assert.equal(await action, false);
+    assert.deepEqual(calls, ['first']);
+    assertOliviaBulkReason(f, /Sign in to review assets/);
+    assertC1Busy(f, false);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [before]);
+    assert.equal(await f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'second' }]), false);
+    assert.deepEqual(calls, ['first']);
+  });
+}
+
+for (const rejected of [false, true]) {
+  test(`C1: A to B to A retires the earlier selection without admitting a same-key duplicate (reject=${rejected})`, async () => {
+    const held = createDeferred(), fresh = createDeferred();
+    const project = createPendingBatchProject('c1-return-A');
+    project.files.push(...['C', 'D'].map(name => ({ name: `${name}.png`, path: `/synthetic/${name}.png`,
+      assetOrigin: 'existing', projectRole: 'asset' })));
+    const f = await loadPendingBatchFixture({ project });
+    attachOliviaReviewDescriptions(f);
+    const retained = vm.runInContext('state.assetWorkspace', f.renderer);
+    assert.equal(retained.files.filter(file => file.assetOrigin === 'existing').length, 2);
+    assert.equal(retained.files.some(file => file.excluded === true), false);
+    const calls = [];
+    f.renderer.window.crate.acceptPending = async (_id, target) => { calls.push(target); return held.promise; };
+    const action = f.renderer.submitAssetReviewBatchDecision('include');
+    f.renderer.setSelectedProject('c1-B');
+    f.renderer.currentA = { ...cloneTestValue(f.project), pendingFiles: [], excludedAssetKeys: ['/synthetic/D.png'],
+      workingSourceSelection: { selected: ['C', 'D'], unresolvedPairs: ['A/B'], shared: ['Shared.png'] } };
+    vm.runInContext('state.projects=[currentA]; setSelectedProject(currentA.id);', f.renderer);
+    assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), retained);
+    let workspaceReads = 0;
+    f.renderer.window.crate.getAssetWorkspace = async id => {
+      assert.equal(id, project.id); workspaceReads += 1; return fresh.promise;
+    };
+    const refresh = f.renderer.renderFiles();
+    assert.equal(workspaceReads, 1);
+    assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), retained);
+    assert.equal(vm.runInContext('assetWorkspaceLoadedRequestId !== assetWorkspaceRequestId', f.renderer), true);
+    const before = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision('include'), undefined);
+    assert.equal(calls.length, 1);
+    if (rejected) held.reject(new Error('retired request'));
+    else held.resolve({ files: [{ name: 'STALE.png' }], pendingFiles: [] });
+    assert.equal(await action, false);
+    assert.equal(calls.length, 1);
+    assert.equal(f.elements['btn-skip-all-existing'].disabled, true,
+      'SEC-S1-001 held fresh A projection must not enable Skip from retained C/D rows');
+    assertOliviaBulkReason(f, /Current asset review is unavailable/, [true, true]);
+    assertC1Busy(f, false);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
+    assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:c1-return-A')", f.renderer), false);
+    assert.equal(workspaceReads, 1, 'retired cleanup must not fetch another workspace');
+    const currentWorkspace = { ...cloneTestValue(retained), pendingFiles: [], files: retained.files.map(file => ({
+      ...file, included: file.visualIdentity !== '/synthetic/D.png', excluded: file.visualIdentity === '/synthetic/D.png',
+    })) };
+    fresh.resolve(currentWorkspace);
+    await refresh;
+    assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), currentWorkspace);
+    assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+    assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+    assert.equal(f.elements['asset-review-batch-reason'].classList.contains('hidden'), true);
+    assertC1Busy(f, false);
+    assert.equal(workspaceReads, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
+  });
+}
+
+for (const newerDecision of ['include', 'skip']) {
+  test(`C1: retired A cleanup preserves newer B ${newerDecision} ownership and duplicate suppression`, async () => {
+    const heldA = createDeferred(), heldB = createDeferred();
+    const f = await loadPendingBatchFixture({ id: 'c1-owned-A' });
+    attachOliviaReviewDescriptions(f);
+    const b = createPendingBatchProject('c1-owned-B');
+    b.pendingFiles = b.pendingFiles.slice(0, 1);
+    const calls = [];
+    const invoke = async (projectId, target) => { calls.push([projectId, target]); return projectId === f.project.id ? heldA.promise : heldB.promise; };
+    f.renderer.window.crate.acceptPending = invoke;
+    f.renderer.window.crate.rejectPending = invoke;
+    f.renderer.window.crate.getProjects = async () => cloneTestValue([f.project, b]);
+    const bridgeB = createPendingBatchBridge(b);
+    const getWorkspaceA = f.renderer.window.crate.getAssetWorkspace;
+    f.renderer.window.crate.getAssetWorkspace = id => id === b.id ? bridgeB.bridge.getAssetWorkspace(id) : getWorkspaceA(id);
+    const actionA = f.renderer.submitAssetReviewBatchDecision('include');
+    f.renderer.projectB = b;
+    vm.runInContext('state.projects.push(projectB); setSelectedProject(projectB.id);', f.renderer);
+    await f.renderer.ensureProjectAssetWorkspace(b);
+    const actionB = f.renderer.submitAssetReviewBatchDecision(newerDecision);
+    assert.equal(calls.length, 2);
+    assertOliviaBulkReason(f, /Updating assets/);
+    assertC1Busy(f, true);
+    const before = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+    heldA.resolve({ files: [{ name: 'STALE.png' }], pendingFiles: [] });
+    assert.equal(await actionA, false);
+    assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
+    assertOliviaBulkReason(f, /Updating assets/);
+    assertC1Busy(f, true);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Add All');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All');
+    assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:c1-owned-B')", f.renderer), true);
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision(newerDecision), undefined);
+    assert.equal(calls.length, 2);
+    // Current B fails normally: its rows remain available and its own cleanup retires busy state.
+    heldB.resolve(null);
+    assert.equal(await actionB, false);
+    assertC1Busy(f, false);
+    assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+    assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+    assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+    assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:c1-owned-B')", f.renderer), false);
+  });
+}
+
+test('C1: removed current project stays disabled when a retired action settles', async () => {
+  const held = createDeferred();
+  const f = await loadPendingBatchFixture({ id: 'c1-no-project', beforeAccept: () => held.promise });
+  attachOliviaReviewDescriptions(f);
+  const action = f.renderer.submitAssetReviewBatchDecision('include');
+  f.renderer.setSelectedProject(null);
+  held.resolve();
+  assert.equal(await action, false);
+  assert.equal(f.calls.length, 1);
+  assertOliviaBulkReason(f, /Select a project to review assets/);
+  assertC1Busy(f, false);
+  assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+});
+
+for (const decision of ['include', 'skip']) for (const outcome of ['success', 'error']) {
+  test(`C1: current pending ${decision} ${outcome} cleanup preserves unrelated state and usable eligibility`, async () => {
+    const held = createDeferred();
+    const project = createPendingBatchProject(`c1-current-${decision}-${outcome}`);
+    project.pendingFiles = project.pendingFiles.slice(0, 3);
+    project.pendingFiles[1].captureState = 'needs-save';
+    project.pendingFiles[2].captureState = 'observed';
+    project.files.push(...['C', 'D', 'Shared'].map(name => ({ name: `${name}.png`, path: `/synthetic/${name}.png`, assetOrigin: 'existing', projectRole: 'asset' })));
+    project.workingSourceSelection = { selected: ['C', 'D'], unresolvedPairs: ['A/B'] };
+    const f = await loadPendingBatchFixture({ project });
+    attachOliviaReviewDescriptions(f);
+    const method = decision === 'include' ? 'acceptPending' : 'rejectPending';
+    const original = f.renderer.window.crate[method];
+    let calls = 0;
+    f.renderer.window.crate[method] = async (...args) => {
+      calls += 1; await held.promise;
+      if (outcome === 'error') throw new Error('synthetic current decision failure');
+      return original(...args);
+    };
+    const before = cloneTestValue(f.getPersisted());
+    const action = f.renderer.submitAssetReviewBatchDecision(decision);
+    assertOliviaBulkReason(f, /Updating assets/);
+    assertC1Busy(f, true);
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision(decision), undefined);
+    assert.equal(calls, 1);
+    held.resolve();
+    assert.equal(await action, outcome === 'success');
+    assertC1Busy(f, false);
+    assert.equal(calls, 1);
+    assert.deepEqual(f.getPersisted().files.slice(0, before.files.length), before.files);
+    assert.deepEqual(f.getPersisted().workingSourceSelection, before.workingSourceSelection);
+    assert.deepEqual(f.getPersisted().assetBaseline, before.assetBaseline);
+    if (outcome === 'success') {
+      assertOliviaBulkReason(f, /No assets are eligible/);
+      assert.deepEqual(f.getPersisted().pendingFiles, before.pendingFiles.slice(1));
+    } else {
+      assertOliviaBulkReason(f, /only to eligible review items/, [false, false]);
+      assert.deepEqual(f.getPersisted(), before);
+    }
+  });
+}
+
+for (const decision of ['include', 'skip']) for (const outcome of ['success', 'error']) {
+  test(`C1: current Existing Assets ${decision} ${outcome} cleanup uses refreshed inclusion`, async () => {
+    const held = createDeferred();
+    const f = createInteractiveRendererDom();
+    const project = createPendingBatchProject(`c1-existing-${decision}-${outcome}`);
+    project.pendingFiles = [];
+    project.files.push({ name: 'C.png', path: '/synthetic/C.png', assetOrigin: 'existing', projectRole: 'asset' },
+      { name: 'D.png', path: '/synthetic/D.png', assetOrigin: 'existing', projectRole: 'asset' });
+    project.excludedAssetKeys = ['/synthetic/D.png'];
+    const before = cloneTestValue(project);
+    let saved = cloneTestValue(project), calls = 0;
+    const renderer = loadRendererHelpers(f.document, { crate: {
+      setExistingAssetsDecision: async () => {
+        calls += 1; await held.promise;
+        if (outcome === 'error') throw new Error('synthetic current Existing Assets failure');
+        saved.excludedAssetKeys = decision === 'include' ? [] : ['/synthetic/C.png', '/synthetic/D.png'];
+        return { success: true };
+      },
+      getProjects: async () => [cloneTestValue(saved)],
+    } });
+    f.renderer = renderer; renderer.testProject = project;
+    vm.runInContext('state.projects=[testProject];state.selectedProjectId=testProject.id;', renderer);
+    await renderer.renderFiles();
+    attachOliviaReviewDescriptions(f);
+    const action = renderer.submitAssetReviewBatchDecision(decision);
+    assertOliviaBulkReason(f, /Updating assets/); assertC1Busy(f, true);
+    assert.equal(await renderer.submitAssetReviewBatchDecision(decision), undefined);
+    held.resolve();
+    assert.equal(await action, outcome === 'success');
+    assert.equal(calls, 1); assertC1Busy(f, false);
+    assert.deepEqual(saved.files, before.files);
+    assert.deepEqual(saved.assetBaseline, before.assetBaseline);
+    if (outcome === 'error') {
+      assert.deepEqual(saved, before);
+      assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+      assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+      assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+    } else assertOliviaBulkReason(f, decision === 'include' ? /already included/ : /No existing assets are included/,
+      decision === 'include' ? [true, false] : [false, true]);
+  });
+}
+
+for (const phase of ['decision', 'project-read']) {
+  test(`C1: retired Existing Assets ${phase} cannot merge stale projects or reset current controls`, async () => {
+    const held = createDeferred();
+    const f = accountModalFixture({
+      setExistingAssetsDecision: async () => phase === 'decision' ? held.promise : { success: true },
+      getProjects: async () => held.promise,
+    });
+    attachOliviaReviewDescriptions(f);
+    let reading;
+    const readStarted = new Promise(resolve => { reading = resolve; });
+    if (phase === 'project-read') f.renderer.window.crate.getProjects = () => { reading(); return held.promise; };
+    await f.renderer.ensureProjectAssetWorkspace(f.project);
+    const action = f.renderer.submitExistingAssetsBatchDecision('skip');
+    if (phase === 'project-read') await readStarted;
+    f.renderer.otherProject = { id: 'c1-existing-B', files: [], pendingFiles: [] };
+    vm.runInContext('state.projects=[otherProject];setSelectedProject(otherProject.id);', f.renderer);
+    await f.renderer.renderFiles();
+    held.resolve(phase === 'decision' ? { success: true } : [{ id: 'STALE', files: [] }]);
+    assert.equal(await action, false);
+    assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [f.renderer.otherProject]);
+    assertOliviaBulkReason(f, /no existing assets/); assertC1Busy(f, false);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  });
+}
+
+test('C1: generic Watch Add Files and Package Review action cleanup keeps its original default contract', async () => {
+  const f = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(f.document);
+  for (const key of ['watch:current', 'add-files:current', 'package-review:current']) for (const rejected of [false, true]) {
+    const held = createDeferred(), button = f.document.querySelector('#btn-package');
+    button.textContent = 'Original label';
+    const action = renderer.runRendererAction(key, button, 'Working', () => held.promise, 'Original label');
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, 'Working');
+    assert.equal(button.getAttribute('aria-busy'), 'true');
+    assert.equal(await renderer.runRendererAction(key, button, 'Wrong', () => assert.fail('duplicate ran')), undefined);
+    if (rejected) {
+      const rejection = assert.rejects(action, /synthetic generic failure/);
+      held.reject(new Error('synthetic generic failure')); await rejection;
+    } else { held.resolve('done'); assert.equal(await action, 'done'); }
+    assert.equal(button.disabled, false);
+    assert.equal(button.textContent, 'Original label');
+    assert.equal(button.getAttribute('aria-busy'), 'false');
+    assert.equal(button.classList.contains('is-action-busy'), false);
+  }
+});
+
+async function createSecProjectionFixture() {
+  const project = createPendingBatchProject('sec-projection-A');
+  project.pendingFiles = [];
+  project.files.push(...['C', 'D'].map(name => ({ name: `${name}.png`, path: `/synthetic/${name}.png`,
+    assetOrigin: 'existing', projectRole: 'asset' })));
+  const f = await loadPendingBatchFixture({ project });
+  attachOliviaReviewDescriptions(f);
+  vm.runInContext("accountStatus={revision:1,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}};", f.renderer);
+  // The account identity is initialized before a fresh producer publishes its receipt.
+  await f.renderer.renderFiles();
+  assertOliviaBulkReason(f, /already included/, [true, false]);
+  return f;
+}
+
+for (const invalidation of ['account', 'selection', 'generation', 'request', 'loaded-receipt', 'project-object', 'workspace-object']) {
+  test(`SEC-S1-001: ${invalidation} invalidates bulk projection until a fresh producer publishes`, async () => {
+    const f = await createSecProjectionFixture();
+    const priorWorkspace = vm.runInContext('state.assetWorkspace', f.renderer);
+    const fresh = createDeferred();
+    let reads = 0;
+    f.renderer.window.crate.getAssetWorkspace = async id => { assert.equal(id, f.project.id); reads += 1; return fresh.promise; };
+    let refresh = null;
+    if (invalidation === 'account') {
+      vm.runInContext("acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'B'}});", f.renderer);
+    } else if (invalidation === 'selection') {
+      f.renderer.setSelectedProject('sec-projection-B'); f.renderer.setSelectedProject(f.project.id);
+    } else if (invalidation === 'generation') f.renderer.setAssetReviewProject('sec-retired-workspace');
+    else if (invalidation === 'request') refresh = f.renderer.renderFiles();
+    else if (invalidation === 'loaded-receipt') vm.runInContext('assetWorkspaceLoadedRequestId = 0;', f.renderer);
+    else if (invalidation === 'project-object') {
+      f.renderer.replacementProject = cloneTestValue(f.project);
+      vm.runInContext('state.projects=[replacementProject];', f.renderer);
+    } else {
+      f.renderer.replacementWorkspace = cloneTestValue(priorWorkspace);
+      vm.runInContext('state.assetWorkspace=replacementWorkspace;', f.renderer);
+    }
+    const current = vm.runInContext('state.projects[0]', f.renderer);
+    if (!['account', 'selection', 'generation', 'request'].includes(invalidation)) f.renderer.reconcileCurrentAssetReviewBatchControls();
+    assertOliviaBulkReason(f, /Current asset review is unavailable/);
+    assertC1Busy(f, false);
+    assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+    assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+    assert.equal(reads, invalidation === 'request' ? 1 : 0, 'projection cleanup is synchronous and never fetches');
+    const decisionCalls = [];
+    for (const method of ['setExistingAssetsDecision', 'acceptPending', 'rejectPending']) {
+      f.renderer.window.crate[method] = async (...args) => { decisionCalls.push([method, ...args]); return null; };
+    }
+    const recordsBeforeAdmission = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+    for (const decision of ['include', 'skip']) {
+      assert.equal(await f.renderer.submitAssetReviewBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitExistingAssetsBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitPendingAssetsBatchDecision(decision, current, [{ target: 'pending-sentinel' }]), false);
+    }
+    assert.deepEqual(decisionCalls, []);
+    assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), recordsBeforeAdmission);
+    assert.equal(reads, invalidation === 'request' ? 1 : 0);
+    if (!refresh) refresh = f.renderer.renderFiles();
+    assert.equal(reads, 1);
+    const published = { ...cloneTestValue(priorWorkspace), files: priorWorkspace.files.map(file => ({
+      ...file, included: file.visualIdentity !== '/synthetic/D.png', excluded: file.visualIdentity === '/synthetic/D.png',
+    })) };
+    fresh.resolve(published); await refresh;
+    assert.equal(vm.runInContext('state.projects[0]', f.renderer), current);
+    assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(current), published);
+    assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+    assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+    assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+    assertC1Busy(f, false);
+    assert.equal(reads, 1);
+  });
+}
+
+for (const failure of ['null', 'rejected']) {
+  test(`SEC-S1-001: ${failure} workspace read cannot turn display fallback into bulk authority`, async () => {
+    const f = await createSecProjectionFixture();
+    const good = cloneTestValue(vm.runInContext('state.assetWorkspace', f.renderer));
+    let reads = 0;
+    f.renderer.window.crate.getAssetWorkspace = async () => {
+      reads += 1;
+      if (failure === 'rejected') throw new Error('synthetic unavailable projection');
+      return null;
+    };
+    await f.renderer.renderFiles();
+    assert.equal(vm.runInContext('displayOnlyAssetWorkspaces.has(state.assetWorkspace)', f.renderer), true);
+    assertOliviaBulkReason(f, /Current asset review is unavailable/); assertC1Busy(f, false);
+    f.renderer.reconcileCurrentAssetReviewBatchControls();
+    assert.equal(reads, 1);
+    assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(f.project), null);
+    const decisionCalls = [];
+    for (const method of ['setExistingAssetsDecision', 'acceptPending', 'rejectPending']) {
+      f.renderer.window.crate[method] = async (...args) => { decisionCalls.push([method, ...args]); return null; };
+    }
+    const recordsBeforeAdmission = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+    for (const decision of ['include', 'skip']) {
+      assert.equal(await f.renderer.submitAssetReviewBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitExistingAssetsBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'pending-sentinel' }]), false);
+    }
+    assert.deepEqual(decisionCalls, []);
+    assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), recordsBeforeAdmission);
+    assert.equal(reads, 1, 'display-only admission does not acquire authority');
+    f.renderer.window.crate.getAssetWorkspace = async () => { reads += 1; return good; };
+    await f.renderer.renderFiles();
+    assert.equal(reads, 2);
+    assertOliviaBulkReason(f, /already included/, [true, false]); assertC1Busy(f, false);
+  });
+}
+
+test('SEC-S1-001: ensure workspace publishes a fresh receipt after selection retirement and reuses only its current projection', async () => {
+  const f = await createSecProjectionFixture();
+  const old = vm.runInContext('state.assetWorkspace', f.renderer);
+  const fresh = createDeferred(); let reads = 0;
+  f.renderer.window.crate.getAssetWorkspace = async () => { reads += 1; return fresh.promise; };
+  assert.equal(await f.renderer.ensureProjectAssetWorkspace(f.project), old);
+  assert.equal(reads, 0);
+  f.renderer.setSelectedProject('sec-B'); f.renderer.setSelectedProject(f.project.id);
+  const ensure = f.renderer.ensureProjectAssetWorkspace(f.project);
+  assert.equal(reads, 1);
+  assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), old);
+  assertOliviaBulkReason(f, /Current asset review is unavailable/); assertC1Busy(f, false);
+  const current = { ...cloneTestValue(old), files: old.files.map(file => ({
+    ...file, included: file.visualIdentity !== '/synthetic/D.png', excluded: file.visualIdentity === '/synthetic/D.png',
+  })) };
+  fresh.resolve(current);
+  assert.equal(await ensure, current);
+  assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(f.project), current);
+  assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+  assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+  assertC1Busy(f, false);
+  assert.equal(await f.renderer.ensureProjectAssetWorkspace(f.project), current);
+  assert.equal(reads, 1);
+});
+
+test('SEC-S1-001: retired A cannot clear newer B busy ownership during a held projection refresh', async () => {
+  const oldDecision = createDeferred(), newDecision = createDeferred(), fresh = createDeferred();
+  const f = await loadPendingBatchFixture({ id: 'sec-owned-A' });
+  attachOliviaReviewDescriptions(f);
+  const calls = [];
+  f.renderer.window.crate.acceptPending = async (id, target) => { calls.push(['pending', id, target]); return oldDecision.promise; };
+  const actionA = f.renderer.submitAssetReviewBatchDecision('include');
+  const b = createPendingBatchProject('sec-owned-B'); b.pendingFiles = [];
+  b.files.push(...['C', 'D'].map(name => ({ name: `${name}.png`, path: `/synthetic/${name}.png`, assetOrigin: 'existing', projectRole: 'asset' })));
+  const bridge = createPendingBatchBridge(b);
+  f.renderer.window.crate.getAssetWorkspace = bridge.bridge.getAssetWorkspace;
+  f.renderer.projectB = b;
+  vm.runInContext('state.projects.push(projectB); setSelectedProject(projectB.id);', f.renderer);
+  await f.renderer.renderFiles();
+  const priorWorkspace = vm.runInContext('state.assetWorkspace', f.renderer);
+  f.renderer.window.crate.setExistingAssetsDecision = async (id, decision) => { calls.push(['existing', id, decision]); return newDecision.promise; };
+  const actionB = f.renderer.submitAssetReviewBatchDecision('skip');
+  let reads = 0;
+  f.renderer.window.crate.getAssetWorkspace = async () => { reads += 1; return fresh.promise; };
+  f.renderer.currentB = { ...cloneTestValue(b), excludedAssetKeys: ['/synthetic/D.png'] };
+  vm.runInContext('state.projects=[currentB];', f.renderer);
+  const refresh = f.renderer.renderFiles();
+  assert.equal(reads, 1);
+  assert.equal(vm.runInContext('state.assetWorkspace', f.renderer), priorWorkspace);
+  const before = JSON.stringify(vm.runInContext('state.projects', f.renderer));
+  oldDecision.resolve({ files: [{ name: 'STALE.png' }], pendingFiles: [] });
+  assert.equal(await actionA, false);
+  assertOliviaBulkReason(f, /Updating assets/); assertC1Busy(f, true);
+  assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
+  assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
+  assert.equal(vm.runInContext("rendererActionsInFlight.has('asset-review-batch:sec-owned-B')", f.renderer), true);
+  assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), undefined);
+  assert.equal(calls.length, 2);
+  newDecision.resolve({ success: false });
+  assert.equal(await actionB, false);
+  assertOliviaBulkReason(f, /Current asset review is unavailable/); assertC1Busy(f, false);
+  assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
+  assert.equal(reads, 1);
+  fresh.resolve({ ...cloneTestValue(priorWorkspace), files: priorWorkspace.files.map(file => ({
+    ...file, included: file.visualIdentity !== '/synthetic/D.png', excluded: file.visualIdentity === '/synthetic/D.png',
+  })) });
+  await refresh;
+  assert.equal(f.elements['btn-include-all-existing'].disabled, false);
+  assert.equal(f.elements['btn-skip-all-existing'].disabled, false);
+  assert.equal(f.elements['asset-review-batch-reason'].textContent, '');
+  assertC1Busy(f, false);
+  assert.equal(reads, 1); assert.equal(calls.length, 2);
+  assert.equal(JSON.stringify(vm.runInContext('state.projects', f.renderer)), before);
+});
+
+
+for (const identity of ['A', 'B']) {
+  test(`COR-699E-001: actual account reentry holds bulk admission until fresh projection (identity=${identity})`, async () => {
+    const f = await createSecProjectionFixture();
+    f.project.workingSourceSelection = { selected: ['C', 'D'], unresolvedPairs: ['A/B'], shared: ['Shared.png'] };
+    const priorWorkspace = vm.runInContext('state.assetWorkspace', f.renderer);
+    const before = cloneTestValue(f.project);
+    const reload = createDeferred(), fresh = createDeferred();
+    const reloadReads = [], decisions = [];
+    let workspaceReads = 0, reloadPublished = false;
+    let saved = cloneTestValue(f.project);
+    f.renderer.window.crate.getProjects = async () => {
+      if (!reloadPublished) { reloadReads.push('projects'); return reload.promise; }
+      return [cloneTestValue(saved)];
+    };
+    f.renderer.window.crate.getSettings = async () => { reloadReads.push('settings'); await reload.promise; return {}; };
+    f.renderer.window.crate.getUsage = async () => { reloadReads.push('usage'); await reload.promise; return {}; };
+    f.renderer.window.crate.getFigmaStatus = async () => ({ connected: false });
+    f.renderer.window.crate.reportRendererStartupDataComplete = () => { reloadPublished = true; };
+    f.renderer.window.crate.getAssetWorkspace = async id => {
+      assert.equal(id, f.project.id); workspaceReads += 1;
+      if (workspaceReads === 1) return fresh.promise;
+      return { ...cloneTestValue(priorWorkspace), files: priorWorkspace.files.map(file => ({
+        ...file, excluded: saved.excludedAssetKeys.includes(file.visualIdentity),
+        included: !saved.excludedAssetKeys.includes(file.visualIdentity),
+      })) };
+    };
+    f.renderer.window.crate.setExistingAssetsDecision = async (id, decision) => {
+      decisions.push(['existing', id, decision]);
+      saved.excludedAssetKeys = decision === 'skip' ? ['/synthetic/C.png', '/synthetic/D.png'] : [];
+      return { success: true };
+    };
+    f.renderer.window.crate.acceptPending = async (...args) => { decisions.push(['pending-include', ...args]); return { pendingFiles: [] }; };
+    f.renderer.window.crate.rejectPending = async (...args) => { decisions.push(['pending-skip', ...args]); return []; };
+    f.renderer.setupEventListeners();
+    vm.runInContext('accountStartupLoaded=true;renderAccount();', f.renderer);
+    const skip = f.elements['btn-skip-all-existing'];
+    assert.equal(skip.isConnected, true);
+    assert.equal(skip.disabled, false);
+    assert.equal(f.elements['app-main'].inert, false);
+    assert.equal(f.elements['modal-existing-assets'].classList.contains('hidden'), true);
+    assert.equal(f.elements['modal-package'].classList.contains('hidden'), true);
+    assert.equal(f.project.pendingFiles.length, 0);
+    assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(f.project), priorWorkspace);
+    vm.runInContext("acceptAccountSnapshot({revision:2,state:'expired',canUseWorkspace:false,identity:{id:'A'}});", f.renderer);
+    const expiredSkipDisabled = skip.disabled;
+    const expiredReason = f.elements['asset-review-batch-reason'].textContent;
+    assert.equal(f.elements['app-main'].inert, true);
+    vm.runInContext(`acceptAccountSnapshot({revision:3,state:'signed_in',canUseWorkspace:true,identity:{id:'${identity}'}});`, f.renderer);
+    assert.equal(f.elements['app-main'].inert, false);
+    assert.deepEqual(reloadReads, ['projects', 'settings', 'usage']);
+    assert.equal(reloadPublished, false);
+    assert.equal(workspaceReads, 0);
+    assert.equal(skip.disabled, true,
+      'COR-699E-001 actual reentry must disable stale Skip before held account reload settles');
+    assert.equal(expiredSkipDisabled, true);
+    assert.match(expiredReason, /Sign in to review assets/);
+    assertOliviaBulkReason(f, /Current asset review is unavailable/); assertC1Busy(f, false);
+    assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(f.project), null);
+    // The stub dispatches even disabled clicks: the real listener must also enforce admission.
+    skip.click(); await new Promise(setImmediate);
+    for (const decision of ['include', 'skip']) {
+      assert.equal(await f.renderer.submitAssetReviewBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitExistingAssetsBatchDecision(decision), false);
+      assert.equal(await f.renderer.submitPendingAssetsBatchDecision(decision, f.project, [{ target: 'pending-sentinel' }]), false);
+    }
+    assert.deepEqual(decisions, []);
+    assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [before]);
+    assert.deepEqual(saved, before);
+    assert.equal(workspaceReads, 0, 'admission does not acquire a workspace');
+    reload.resolve([cloneTestValue(saved)]); await new Promise(setImmediate);
+    assert.equal(reloadPublished, true);
+    assert.equal(workspaceReads, 0, 'account reload alone is not asset projection acceptance');
+    assertOliviaBulkReason(f, /Current asset review is unavailable/); assertC1Busy(f, false);
+    const current = vm.runInContext('state.projects[0]', f.renderer);
+    assert.equal(f.renderer.getCurrentAssetReviewBatchWorkspace(current), null);
+    assert.equal(await f.renderer.submitExistingAssetsBatchDecision('skip'), false);
+    const refresh = f.renderer.renderFiles();
+    assert.equal(workspaceReads, 1);
+    assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), false);
+    assert.equal(await f.renderer.submitPendingAssetsBatchDecision('include', current, [{ target: 'pending-sentinel' }]), false);
+    assert.deepEqual(decisions, []);
+    assertOliviaBulkReason(f, /Current asset review is unavailable/);
+    fresh.resolve(cloneTestValue(priorWorkspace)); await refresh;
+    assertOliviaBulkReason(f, /already included/, [true, false]); assertC1Busy(f, false);
+    assert.ok(f.renderer.getCurrentAssetReviewBatchWorkspace(current));
+    assert.equal(skip.listeners.click.length, 1);
+    assert.equal(await skip.listeners.click[0]({ type: 'click', target: skip }), true);
+    assert.deepEqual(decisions, [['existing', f.project.id, 'skip']]);
+    assert.equal(workspaceReads, 2);
+    assertOliviaBulkReason(f, /No existing assets are included/, [false, true]); assertC1Busy(f, false);
+    assert.deepEqual(saved.files, before.files);
+    assert.deepEqual(saved.workingSourceSelection, before.workingSourceSelection);
+    assert.deepEqual(saved.assetBaseline, before.assetBaseline);
+    assert.deepEqual(saved.pendingFiles, before.pendingFiles);
   });
 }

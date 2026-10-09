@@ -689,7 +689,8 @@ body {
   outline-offset: 2px;
 }
 
-.asset-batch-button:disabled {
+.asset-batch-button:disabled,
+.asset-batch-button.primary:disabled {
   color: var(--gray-300);
   background: var(--gray-50);
   cursor: not-allowed;
@@ -1049,6 +1050,13 @@ body {
 
 .asset-review-toolbar .asset-panel-actions { margin: 0; }
 .asset-batch-button.primary { background: var(--black); color: var(--white); }
+
+.asset-review-guidance {
+  margin: 8px 0;
+  color: var(--gray-600);
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 .asset-review-workspace .asset-workspace {
   margin-top: 8px;
@@ -3444,3 +3452,18 @@ body {
   grid-row: 1;
   white-space: nowrap;
 }
+
+/* Explicit recovery of a changed continuation selection. */
+.working-source-recovery-detail { margin-top: 4px; color: var(--gray-500); font-size: 12px; line-height: 1.45; }
+.working-source-recovery-detail:focus { outline: 2px solid currentColor; outline-offset: 3px; }
+.working-source-recovery-action { flex-shrink: 0; padding: 5px 9px; border: 1px solid var(--gray-300); border-radius: 6px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.working-source-recovery-action:disabled { opacity: .5; cursor: default; }
+.working-source-recovery-action:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
+/* Watch facts remain separate from saved-file verification and selection. */
+.working-source-watch { margin-top: 5px; font-size: 12px; line-height: 1.4; color: var(--text-secondary, #666); overflow-wrap: anywhere; }
+.working-source-watch summary { cursor: pointer; }
+.working-source-watch summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; border-radius: 2px; }
+.working-source-watch > div { margin-top: 5px; }
+.working-source-watch[data-watch-status="cap-limited"] summary,
+.working-source-watch[data-watch-status="unavailable"] summary { font-weight: 600; }

@@ -169,6 +169,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/powerpoint.js',
   'parsers/premiere.js',
   'parsers/psd.js',
+  'parsers/working-source-witness.js',
 ]);
 const REVIEWED_EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
   Object.freeze({

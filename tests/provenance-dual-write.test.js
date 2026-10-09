@@ -812,18 +812,19 @@ const watcherRecords = [];
 let watcherCloseCount = 0;
 let testUuidCounter = 0;
 setStub('chokidar', () => ({
-  watch: () => {
+  watch: (roots, options) => {
     const handlers = {};
+    const record = { handlers, roots: [...roots], options, addedPaths: new Set(), retiredPaths: new Set(), closed: false };
     const watcher = {
       on(eventName, handler) {
         handlers[eventName] = handler;
         return watcher;
       },
-      close() { watcherCloseCount += 1; },
-      add() {},
-      unwatch() {},
+      close() { watcherCloseCount += 1; record.closed = true; },
+      add(paths) { for (const filePath of [paths].flat()) { record.addedPaths.add(filePath); record.retiredPaths.delete(filePath); } },
+      unwatch(paths) { for (const filePath of [paths].flat()) { record.addedPaths.delete(filePath); record.retiredPaths.add(filePath); } },
     };
-    watcherRecords.push({ handlers });
+    watcherRecords.push(record);
     return watcher;
   },
 }));
@@ -1027,6 +1028,61 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
   const source = fs.readFileSync(filename, 'utf8');
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  getPackageReviewState() {
+    return { tokens: [...packageReviewSnapshots.keys()], current: [...currentPackageReviewTokenByProject.entries()] };
+  },
+  holdPackageReviewPlan(wait) {
+    const prior = buildAuthoritativePackagePlan; let held = false;
+    buildAuthoritativePackagePlan = async (...args) => {
+      const result = await prior(...args);
+      if (!held) { held = true; await wait(); }
+      return result;
+    };
+    return () => { buildAuthoritativePackagePlan = prior; };
+  },
+  syncAcceptedSourceWatchSubscriptions, getWorkingSourceWatchCoverage, getProjectAssetWorkspace,
+  traceWatchCoverageOperations(projectId, trace) {
+    const prior = captureProjectOperation;
+    const snapshot = () => ({ scopeRevision: getIllustratorActivationScope(projectId)?.revision,
+      admittedPaths: [...(getIllustratorActivationScope(projectId)?.admittedDocumentPaths || [])],
+      activationToken: getActiveWatchingActivationToken(projectId), generation: watchingActivationSequence,
+      accountGeneration: accountSession?.generation,
+      status: getProjects().find(project => project.id === projectId)?.status });
+    captureProjectOperation = id => {
+      const operation = prior(id); if (id !== projectId || !operation) return operation;
+      let expected = snapshot(), logged = false;
+      const current = operation.current, adopt = operation.adoptScope;
+      operation.adoptScope = scope => { const result = adopt(scope); if (result) expected = snapshot(); return result; };
+      operation.current = () => {
+        const result = current();
+        if (!result && !logged) { logged = true; trace.push({ expected, actual: snapshot() }); }
+        return result;
+      };
+      return operation;
+    };
+    return () => { captureProjectOperation = prior; };
+  },
+  holdWatchWorkspacePresentation(wait) {
+    const prior = createRendererFilePresentation; let held = false;
+    createRendererFilePresentation = async (...args) => {
+      const result = await prior(...args);
+      if (!held) { held = true; await wait(); }
+      return result;
+    };
+    return () => { createRendererFilePresentation = prior; };
+  },
+  getAcceptedSourceWatchSnapshot(projectId) {
+    const subscription = acceptedSourceWatchSubscriptions.get(projectId);
+    return subscription ? { activationToken: subscription.activationToken, accountGeneration: subscription.accountGeneration,
+      paths: [...subscription.paths] } : null;
+  },
+  failAcceptedSourceWatchAdd(projectId, failedPath) {
+    const watcher = acceptedSourceWatchSubscriptions.get(projectId).watcher, prior = watcher.add;
+    watcher.add = function (...args) {
+      if (args[0] === failedPath) throw new Error('modeled exact-path enrollment failure');
+      return prior.apply(this, args);
+    };
+  },
   captureProjectOperation,
   runScanOnOpen, beginProjectAssetBaselineScan, completeProjectAssetBaselineScan, releaseProjectAssetBaselineScan,
   reserveProjectAssetBaselineScanQueue, cancelProjectAssetBaselineScanQueue,
@@ -3293,12 +3349,27 @@ test.after(() => {
   fs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
+async function waitForPresentationFixtureSignal(signal, label, timeoutMs = 5000) {
+  let timeoutId;
+  try {
+    await Promise.race([
+      signal,
+      new Promise((resolve, reject) => {
+        timeoutId = originalSetTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    originalClearTimeout(timeoutId);
+  }
+}
+
 test('PowerPoint scan-on-save extraction records media provenance without ledger metadata leak', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('PowerPoint Scan Save Provenance');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const mediaBytes = 'JPEG_BINARY_SHOULD_NOT_LEAK token=SHOULD_NOT_LEAK https://signed.example.test/private?sig=1 RAW_SCRIPT_OUTPUT '.repeat(10);
     const forbiddenValues = [
       'JPEG_BINARY_SHOULD_NOT_LEAK',
@@ -3350,18 +3421,20 @@ test('PowerPoint scan-on-save extraction records media provenance without ledger
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-presentation').length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('deleting a project during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   let cacheInspection = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Delete During Presentation Extraction');
-    const pptxPath = path.join(tmpRoot, 'Delete-During-Scan.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delete-During-Scan.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -3385,7 +3458,7 @@ test('deleting a project during presentation extraction leaves no late project c
     });
 
     await emitWatcher('change', pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     await callIpc('projects:delete', project.id);
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3393,7 +3466,7 @@ test('deleting a project during presentation extraction leaves no late project c
     );
     cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
     releaseRead();
-    await cacheInspection.observed;
+    await waitForPresentationFixtureSignal(cacheInspection.observed, 'presentation finalizer cache inspection');
     await new Promise(resolve => setImmediate(resolve));
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3405,18 +3478,20 @@ test('deleting a project during presentation extraction leaves no late project c
   } finally {
     releaseRead();
     if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('a delayed presentation scan from an old A activation cannot cache or mutate after A to B to A', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   try {
     resetPresentationCacheRoot();
     const first = await createProject('Delayed Presentation Activation A');
     const firstWatcher = latestWatcherHandlers();
-    const pptxPath = path.join(tmpRoot, 'Delayed-Activation.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delayed-Activation.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(first.id, {
       files: [{
@@ -3440,7 +3515,7 @@ test('a delayed presentation scan from an old A activation cannot cache or mutat
     });
 
     await firstWatcher.change(pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     const second = await createProject('Delayed Presentation Activation B');
     await callIpc('projects:start-watching', first.id);
     releaseRead();
@@ -3457,18 +3532,20 @@ test('a delayed presentation scan from an old A activation cannot cache or mutat
     assert.equal(fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).length : 0, 0);
   } finally {
     releaseRead();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('delete-all during presentation extraction leaves no late project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   let releaseRead = () => {};
   let cacheInspection = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Delete All During Presentation Extraction');
-    const pptxPath = path.join(tmpRoot, 'Delete-All-During-Scan.pptx');
+    const pptxPath = path.join(watchedRoot, 'Delete-All-During-Scan.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -3492,7 +3569,7 @@ test('delete-all during presentation extraction leaves no late project cache', a
     });
 
     await emitWatcher('change', pptxPath);
-    await readStarted;
+    await waitForPresentationFixtureSignal(readStarted, 'presentation media read start');
     await callIpc('projects:delete-all');
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3500,7 +3577,7 @@ test('delete-all during presentation extraction leaves no late project cache', a
     );
     cacheInspection = observeProjectCacheInspection(presentationCachePaths(project.id).projectDir);
     releaseRead();
-    await cacheInspection.observed;
+    await waitForPresentationFixtureSignal(cacheInspection.observed, 'presentation finalizer cache inspection');
     await new Promise(resolve => setImmediate(resolve));
     await waitForPathMissing(
       presentationCachePaths(project.id).projectDir,
@@ -3512,16 +3589,18 @@ test('delete-all during presentation extraction leaves no late project cache', a
   } finally {
     releaseRead();
     if (cacheInspection) cacheInspection.restore();
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('presentation scan-on-save hardens existing permissive cache directories and media files', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Hardening');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const stalePath = path.join(paths.projectDir, 'Deck — existing.jpeg');
     fs.writeFileSync(stalePath, 'existing permissive media bytes', { mode: 0o644 });
@@ -3566,16 +3645,18 @@ test('presentation scan-on-save hardens existing permissive cache directories an
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 1);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.RESOURCE_MATERIALIZED_AS_FILE).length, 1);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
 test('presentation scan-on-save ignores stale cache metadata outside the current project cache', async () => {
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Stale Cache Metadata');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_STALE_PRESENTATION.jpeg');
     const mediaBytes = 'STALE_OUTSIDE_PRESENTATION_BYTES'.repeat(40);
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
@@ -3621,6 +3702,7 @@ test('presentation scan-on-save ignores stale cache metadata outside the current
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_STALE_PRESENTATION'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3629,10 +3711,11 @@ test('presentation scan-on-save ignores a nested cache symlink without reading i
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Nested Cache Symlink');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const outsidePath = path.join(tmpRoot, 'SHOULD_NOT_APPEAR_NESTED_SYMLINK.jpeg');
     const symlinkPath = path.join(paths.projectDir, 'Deck — linked.jpeg');
@@ -3682,6 +3765,7 @@ test('presentation scan-on-save ignores a nested cache symlink without reading i
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_NESTED_SYMLINK'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3690,10 +3774,11 @@ test('presentation scan-on-save ignores an intermediate cache directory symlink'
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Intermediate Cache Symlink');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const outsideDir = path.join(tmpRoot, 'outside-cache');
     const outsidePath = path.join(outsideDir, 'SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK.jpeg');
@@ -3748,6 +3833,7 @@ test('presentation scan-on-save ignores an intermediate cache directory symlink'
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_INTERMEDIATE_SYMLINK'), false);
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3756,11 +3842,12 @@ test('presentation cache read rejects a project-directory swap before touching t
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalOpenSync = fs.openSync;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Read Directory Swap');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = makePermissivePresentationCacheDirectories(project.id);
     const parkedProjectDir = `${paths.projectDir}.parked`;
     const outsideDir = path.join(tmpRoot, 'outside-read-cache');
@@ -3830,6 +3917,7 @@ test('presentation cache read rejects a project-directory swap before touching t
     assert.equal(captured.output.includes(mediaBytes), false);
   } finally {
     fs.openSync = originalOpenSync;
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3838,13 +3926,14 @@ test('presentation cache write rejects a project-directory swap before writing o
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalOpenSync = fs.openSync;
   let paths = null;
   let parkedProjectDir = null;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Write Directory Swap');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     paths = makePermissivePresentationCacheDirectories(project.id);
     parkedProjectDir = `${paths.projectDir}.parked`;
     const outsideDir = path.join(tmpRoot, 'outside-write-cache');
@@ -3895,6 +3984,7 @@ test('presentation cache write rejects a project-directory swap before writing o
     if (parkedProjectDir && fs.existsSync(parkedProjectDir) && paths) {
       fs.renameSync(parkedProjectDir, paths.projectDir);
     }
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3903,12 +3993,13 @@ test('presentation cache write failure leaves no unsecured media bytes or projec
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   const originalFchmod = fs.fchmodSync;
   let filePermissionFailures = 0;
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Cache Permission Failure');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     fs.writeFileSync(pptxPath, Buffer.from('pptx container bytes'));
     await setProjectFiles(project.id, {
       files: [{
@@ -3950,6 +4041,7 @@ test('presentation cache write failure leaves no unsecured media bytes or projec
     assert.equal(captured.output.includes('UNSECURED_PRESENTATION_BYTES'), false);
   } finally {
     fs.fchmodSync = originalFchmod;
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
@@ -3958,10 +4050,11 @@ test('presentation scan-on-save rejects symlinked cache root without leaking tar
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Root Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET');
     fs.mkdirSync(symlinkTarget, { recursive: true });
@@ -3993,6 +4086,7 @@ test('presentation scan-on-save rejects symlinked cache root without leaking tar
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_ROOT_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }
@@ -4002,10 +4096,11 @@ test('presentation scan-on-save rejects symlinked category cache directory witho
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Category Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET');
     fs.mkdirSync(paths.crateDir, { recursive: true });
@@ -4038,6 +4133,7 @@ test('presentation scan-on-save rejects symlinked category cache directory witho
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_CATEGORY_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }
@@ -4047,10 +4143,11 @@ test('presentation scan-on-save rejects symlinked project cache directory withou
   if (process.platform === 'win32') return;
 
   const tmpRoot = makeTempDir();
+  const watchedRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'presentation-source-'));
   try {
     resetPresentationCacheRoot();
     const project = await createProject('Presentation Symlink Project Cache');
-    const pptxPath = path.join(tmpRoot, 'Deck.pptx');
+    const pptxPath = path.join(watchedRoot, 'Deck.pptx');
     const paths = presentationCachePaths(project.id);
     const symlinkTarget = path.join(TEST_HOME, 'SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET');
     fs.mkdirSync(paths.assetsDir, { recursive: true });
@@ -4083,6 +4180,7 @@ test('presentation scan-on-save rejects symlinked project cache directory withou
     assert.equal(captured.output.includes(symlinkTarget), false);
     assert.equal(captured.output.includes('SHOULD_NOT_APPEAR_PRESENTATION_PROJECT_TARGET'), false);
   } finally {
+    fs.rmSync(watchedRoot, { recursive: true, force: true });
     fs.rmSync(tmpRoot, { recursive: true, force: true });
     resetPresentationCacheRoot();
   }
@@ -5552,6 +5650,7 @@ test('package plan resolves case, Unicode, and diagnostics collisions with one m
 });
 
 test('destination collisions refresh the reviewed folder name before publishing', async () => {
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('Bound Destination Collision');
@@ -5628,6 +5727,7 @@ test('destination occupancy drift refreshes again with zero package side effects
 });
 
 test('late destination occupancy refreshes once and the second confirmation publishes the bound folder', async () => {
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const tmpRoot = makeTempDir();
   const originalOpen = fs.promises.open;
   try {
@@ -9928,7 +10028,7 @@ test('PowerPoint provenance failure does not block package extraction success', 
   }
 });
 
-test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async () => {
+test('Keynote scan-on-save extraction records Data media provenance without ledger metadata leak', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     resetPresentationCacheRoot();
@@ -9952,6 +10052,26 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(keynotePath);
+    const sourceStat = fs.lstatSync(keynotePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: keynotePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setKeynoteUnzipFixture([{
       internalPath: 'Data/photo-1234.jpeg',
       data: Buffer.from(mediaBytes),
@@ -10006,7 +10126,7 @@ test('Keynote scan-on-save extraction records Data media provenance without ledg
   }
 });
 
-test('Keynote scan-on-save captures distinct pasted images with same cleaned base after prior captures', async () => {
+test('Keynote scan-on-save captures distinct pasted images with same cleaned base after prior captures', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     resetPresentationCacheRoot();
@@ -10047,6 +10167,26 @@ test('Keynote scan-on-save captures distinct pasted images with same cleaned bas
         },
       ],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(keynotePath);
+    const sourceStat = fs.lstatSync(keynotePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: keynotePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setKeynoteUnzipFixture([
       { internalPath: 'Data/pasted-image-1001.jpeg', data: mediaBytes('EXISTING_ONE') },
       { internalPath: 'Data/pasted-image-1002.jpeg', data: mediaBytes('EXISTING_TWO') },
@@ -15178,32 +15318,45 @@ test('provenance recording failure does not block manual file capture', async ()
   }
 });
 
-test('chokidar add records session observation only after primary design file add succeeds', async () => {
-  const filePath = path.join(os.tmpdir(), 'layout.psd');
-  fs.writeFileSync(filePath, 'older design file');
-  const project = await createProject('Chokidar add provenance');
-  const stored = storeInstance.data.projects.find(item => item.id === project.id);
+test('chokidar add records session observation only after primary design file add succeeds', async (t) => {
+  const fixtureRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'chokidar-add-'));
+  const filePath = path.join(fixtureRoot, 'layout.psd');
+  try {
+    fs.writeFileSync(filePath, 'older design file');
+    const project = await createProject('Chokidar add provenance');
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
 
-  await emitWatcherWithStats('add', filePath, {
-    mtimeMs: stored.watchStartedAt + 1,
-    birthtimeMs: stored.watchStartedAt + 1,
-  });
-  await emitWatcherWithStats('add', filePath, {
-    mtimeMs: stored.watchStartedAt + 1,
-    birthtimeMs: stored.watchStartedAt + 1,
-  });
+    const watcherRecord = watcherRecords.at(-1);
+    const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    const physicalSource = fs.realpathSync.native(filePath);
+    assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 2);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'physical-default-root-source', filePath, physicalSource, physicalRoot, roots: watcherRecord.roots }));
 
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].ext, '.psd');
-  assert.equal(fresh.files[0].source, 'chokidar-add');
-  assertSessionObservedFile(
-    fresh,
-    OBSERVER_KINDS.CHOKIDAR,
-    'add',
-    CONFIDENCE_BANDS.CANDIDATE
-  );
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+    await emitWatcherWithStats('add', filePath, {
+      mtimeMs: stored.watchStartedAt + 1,
+      birthtimeMs: stored.watchStartedAt + 1,
+    });
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.files[0].path, filePath);
+    assert.equal(fresh.files[0].ext, '.psd');
+    assert.equal(fresh.files[0].source, 'chokidar-add');
+    assertSessionObservedFile(
+      fresh,
+      OBSERVER_KINDS.CHOKIDAR,
+      'add',
+      CONFIDENCE_BANDS.CANDIDATE
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('chokidar add stages a pre-existing primary design file for review', async () => {
@@ -16245,24 +16398,37 @@ test('resume hides stale pending rows while retaining the selected project sourc
   }
 });
 
-test('chokidar change records observation only for a previously unseen primary design file', async () => {
+test('chokidar change records observation only for a previously unseen primary design file', async (t) => {
   const project = await createProject('Chokidar change provenance');
-  const filePath = path.join(os.tmpdir(), 'identity.ai');
-  fs.writeFileSync(filePath, 'current-session identity source');
+  const fixtureRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'chokidar-change-'));
+  const filePath = path.join(fixtureRoot, 'identity.ai');
+  try {
+    fs.writeFileSync(filePath, 'current-session identity source');
 
-  await emitWatcher('change', filePath);
-  await emitWatcher('change', filePath);
+    const watcherRecord = watcherRecords.at(-1);
+    const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    const physicalSource = fs.realpathSync.native(filePath);
+    assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 2);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'physical-default-root-source', filePath, physicalSource, physicalRoot, roots: watcherRecord.roots }));
 
-  const fresh = await getProject(project.id);
-  assert.equal(fresh.files.length, 1);
-  assert.equal(fresh.files[0].path, filePath);
-  assert.equal(fresh.files[0].ext, '.ai');
-  assertSessionObservedFile(
-    fresh,
-    OBSERVER_KINDS.CHOKIDAR,
-    'change',
-    CONFIDENCE_BANDS.CANDIDATE
-  );
+    await emitWatcher('change', filePath);
+    await emitWatcher('change', filePath);
+
+    const fresh = await getProject(project.id);
+    assert.equal(fresh.files.length, 1);
+    assert.equal(fresh.files[0].path, filePath);
+    assert.equal(fresh.files[0].ext, '.ai');
+    assertSessionObservedFile(
+      fresh,
+      OBSERVER_KINDS.CHOKIDAR,
+      'change',
+      CONFIDENCE_BANDS.CANDIDATE
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('current watcher rejects a stale prior-session change before any stateful work', async () => {
@@ -16481,7 +16647,7 @@ test('generic change rescans a file accepted through Add Files while stat is pen
   }
 });
 
-test('generic watcher enforces the exact Watching-session timestamp boundary', async () => {
+test('generic watcher enforces the exact Watching-session timestamp boundary', async (t) => {
   setChildProcessHandler(() => ({ stdout: '' }));
   const cases = [
     { label: 'old birth with fresh save', mtimeOffset: 1, birthtimeOffset: -10000, expected: true },
@@ -16493,18 +16659,30 @@ test('generic watcher enforces the exact Watching-session timestamp boundary', a
   for (const scenario of cases) {
     const project = await createProject(`Generic change boundary: ${scenario.label}`);
     const filePath = path.join(TEST_HOME, 'Desktop', `${scenario.label.replaceAll(' ', '-')}.ai`);
-    const stored = storeInstance.data.projects.find(item => item.id === project.id);
-    await emitWatcher('change', filePath, {
-      mtimeMs: stored.watchStartedAt + scenario.mtimeOffset,
-      birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset,
-    });
+    fs.writeFileSync(filePath, 'timestamp boundary source');
+    try {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      const physicalRoot = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+      const physicalSource = fs.realpathSync.native(filePath);
+      const watcherRecord = watcherRecords.at(-1);
+      assert.equal(path.relative(physicalRoot, physicalSource).split(path.sep).length, 1);
+      assert.equal(watcherRecord.closed, false);
+      assert.equal(metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id).activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      t.diagnostic(JSON.stringify({ milestone: 'timestamp-boundary-delivery', label: scenario.label, filePath, physicalSource, physicalRoot, roots: watcherRecord.roots, mtimeMs: stored.watchStartedAt + scenario.mtimeOffset, birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset, watchStartedAt: stored.watchStartedAt }));
+      await emitWatcher('change', filePath, {
+        mtimeMs: stored.watchStartedAt + scenario.mtimeOffset,
+        birthtimeMs: stored.watchStartedAt + scenario.birthtimeOffset,
+      });
 
-    const fresh = await getProject(project.id);
-    assert.equal(
-      fresh.files.some(file => file.path === filePath),
-      scenario.expected,
-      scenario.label
-    );
+      const fresh = await getProject(project.id);
+      assert.equal(
+        fresh.files.some(file => file.path === filePath),
+        scenario.expected,
+        scenario.label
+      );
+    } finally {
+      fs.rmSync(filePath, { force: true });
+    }
   }
 });
 
@@ -16545,13 +16723,12 @@ test('chokidar ignored, non-primary, and temp files do not record provenance', a
   assert.deepEqual(fresh.provenance.observations, []);
 });
 
-test('automatic live capture ignores old package output and diagnostics folders', async () => {
+test('automatic live capture ignores old package output and diagnostics folders', async (t) => {
   const project = await createProject('Package output exclusion');
   const packageRootFile = path.join(
     TEST_HOME,
     'Desktop',
     'Crate-QA',
-    'v2.8.0-qa.5-jenna',
     'package-outputs',
     'Jenna Baseline Existing Files QA_2026-06-07',
     'Pricing Tobias Joseph copy.indd'
@@ -16570,31 +16747,68 @@ test('automatic live capture ignores old package output and diagnostics folders'
     'Presentation1.ai'
   );
 
-  for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, 'excluded auto capture bytes');
-    await emitWatcher('add', filePath);
-    await emitWatcher('change', filePath);
-  }
+  const deepRoot = fs.mkdtempSync(path.join(TEST_HOME, 'Desktop', 'deep-package-'));
+  const deepFile = path.join(deepRoot, 'v2.8.0-qa.5-jenna', 'package-outputs', 'Jenna Baseline Existing Files QA_2026-06-07', 'Deep.ai');
+  const originalReadFile = fs.promises.readFile;
+  const originalStat = fs.promises.stat;
+  let deepReads = 0;
+  let deepStats = 0;
+  try {
+    fs.mkdirSync(path.dirname(deepFile), { recursive: true });
+    fs.writeFileSync(deepFile, 'deep excluded bytes');
+    const physicalDesktop = fs.realpathSync.native(path.join(TEST_HOME, 'Desktop'));
+    assert.equal(path.relative(physicalDesktop, fs.realpathSync.native(deepFile)).split(path.sep).length, 5);
+    const beforeDeep = await getProject(project.id);
+    fs.promises.readFile = async function countDeepReads(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(deepFile)) deepReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countDeepStats(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(deepFile)) deepStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    await emitWatcher('add', deepFile);
+    await emitWatcher('change', deepFile);
+    assert.equal(deepReads, 0);
+    assert.equal(deepStats, 0);
+    assert.deepEqual(await getProject(project.id), beforeDeep);
+    t.diagnostic(JSON.stringify({ milestone: 'deep-path-refused', depth: 5, reads: deepReads, stats: deepStats, stateUnchanged: true }));
+    for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, 'excluded auto capture bytes');
+      const depth = path.relative(physicalDesktop, fs.realpathSync.native(filePath)).split(path.sep).length;
+      assert.ok(depth <= 4);
+      t.diagnostic(JSON.stringify({ milestone: 'eligible-output-exclusion-delivery', filePath, depth }));
+      await emitWatcher('add', filePath);
+      await emitWatcher('change', filePath);
+    }
 
-  const fresh = await getProject(project.id);
-  assert.deepEqual(fresh.files, []);
-  assert.deepEqual(fresh.pendingFiles, []);
-  assert.deepEqual(fresh.provenance.observations, []);
-  const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
-    .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
-  assert.ok(ignoredEvidence.length >= 3);
-  assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
-  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
-  assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
-  assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
-    packageRootFile,
-    diagnosticsFile,
-    quickPackageFile,
-    TEST_HOME,
-    'raw',
-    'stdout',
-  ], 'ignored live evidence ledger');
+    const fresh = await getProject(project.id);
+    assert.deepEqual(fresh.files, []);
+    assert.deepEqual(fresh.pendingFiles, []);
+    assert.deepEqual(fresh.provenance.observations, []);
+    const ignoredEvidence = Object.values((fresh.liveEvidenceLedger && fresh.liveEvidenceLedger.candidates) || {})
+      .filter(entry => entry.latest && entry.latest.captureRecommendation === 'ignored');
+    assert.ok(ignoredEvidence.length >= 3);
+    assert.ok(ignoredEvidence.every(entry => entry.latest.reason === 'crate-output-path'));
+    assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'candidateName')));
+    assert.ok(ignoredEvidence.every(entry => !Object.prototype.hasOwnProperty.call(entry.latest, 'sourceDocumentName')));
+    assertTextExcludes(JSON.stringify(fresh.liveEvidenceLedger || {}), [
+      packageRootFile,
+      diagnosticsFile,
+      quickPackageFile,
+      TEST_HOME,
+      'raw',
+      'stdout',
+    ], 'ignored live evidence ledger');
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    fs.rmSync(deepRoot, { recursive: true, force: true });
+    for (const filePath of [packageRootFile, diagnosticsFile, quickPackageFile]) {
+      fs.rmSync(filePath, { force: true });
+    }
+  }
 });
 
 test('live evidence ledger caps candidates and preserves active project evidence', async () => {
@@ -21533,10 +21747,10 @@ test('broad observer quarantine does not block clean Illustrator DOC/LINK live e
   ], 'clean Illustrator quarantine regression ledger');
 });
 
-test('scan-on-open linked accepted insertion records one deduped candidate session observation', async () => {
+test('scan-on-open linked accepted insertion records one deduped candidate session observation', async (t) => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-provenance');
-  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  assert.ok(path.resolve(repoTempRoot).startsWith('/Users/'), 'linked parser fixture requires a /Users source root');
 
   try {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
@@ -21556,6 +21770,26 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     await emitWatcher('change', sourcePath);
     let fresh = await waitForProject(
       project.id,
@@ -21590,11 +21824,12 @@ test('scan-on-open linked accepted insertion records one deduped candidate sessi
   }
 });
 
-test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extraction', async () => {
-  const sharedUsersRoot = '/Users/Shared';
+test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extraction', async (t) => {
+  const sharedUsersRoot = path.resolve(__dirname, '..');
+  assert.ok(sharedUsersRoot.startsWith('/Users/'), 'legacy byte-regex fixture requires a /Users source root');
   assert.doesNotThrow(
     () => fs.accessSync(sharedUsersRoot, fs.constants.W_OK),
-    'legacy .ppt watcher coverage requires writable /Users/Shared on the macOS test host'
+    'legacy .ppt watcher coverage requires a writable owned /Users fixture root'
   );
   const fixtureRoot = fs.mkdtempSync(path.join(sharedUsersRoot, 'crate-legacy-ppt-scan-'));
   let unzipCalls = 0;
@@ -21611,6 +21846,26 @@ test('legacy .ppt watcher uses byte-regex linked discovery without ZIP extractio
       addedAt: Date.now(),
       source: 'manual-browse',
     }] });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     setChildProcessHandler(({ kind, command }) => {
       if (kind === 'execFile' && command === '/usr/bin/unzip') unzipCalls++;
       return { stdout: '' };
@@ -21754,10 +22009,10 @@ test('scan-on-open deduped-away linked candidate does not record session observa
   }
 });
 
-test('scan-on-open provenance failure does not block accepted ledger insertion', async () => {
+test('scan-on-open provenance failure does not block accepted ledger insertion', async (t) => {
   resetTestHomeWorkspace();
   const repoTempRoot = path.join(path.resolve(__dirname, '..'), 'test-scan-open-failure-provenance');
-  if (!path.resolve(repoTempRoot).startsWith('/Users/')) return;
+  assert.ok(path.resolve(repoTempRoot).startsWith('/Users/'), 'linked parser fixture requires a /Users source root');
 
   try {
     fs.rmSync(repoTempRoot, { recursive: true, force: true });
@@ -21776,6 +22031,26 @@ test('scan-on-open provenance failure does not block accepted ledger insertion',
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(sourcePath);
+    const sourceStat = fs.lstatSync(sourcePath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: sourcePath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     storedProject.provenance.nodes = new Proxy({}, {
       set() {
         throw new Error('forced scan-on-open provenance failure');
@@ -22237,7 +22512,7 @@ test('pre-package local Figma recovery ignores generated package folders', async
   assert.deepEqual(getProvenanceObservations(fresh, EDGE_TYPES.SESSION_OBSERVED_FILE), []);
 });
 
-test('PSD scan-on-save linked asset preserves ledger entry and records one parser reference edge', async () => {
+test('PSD scan-on-save linked asset preserves ledger entry and records one parser reference edge', async (t) => {
   const tmpRoot = makeTempDir();
   try {
     const project = await createProject('PSD linked parser provenance');
@@ -22254,6 +22529,26 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: psdPath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+
     currentPsdFixture = {
       children: [{ linkedFile: { fullPath: linkedPath } }],
       linkedFiles: [],
@@ -22284,61 +22579,144 @@ test('PSD scan-on-save linked asset preserves ledger entry and records one parse
   }
 });
 
-test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async () => {
-  const tmpRoot = makeTempDir();
-  const originalReadFile = fs.promises.readFile;
-  let releaseRead = () => {};
-  try {
-    const first = await createProject('Delayed PSD Activation A');
-    const firstWatcher = latestWatcherHandlers();
-    const psdPath = path.join(tmpRoot, 'delayed-source.psd');
-    const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
-    fs.writeFileSync(psdPath, 'psd bytes');
-    fs.writeFileSync(linkedPath, 'linked bytes');
-    await setProjectFiles(first.id, {
-      files: [{
-        path: psdPath,
-        name: 'delayed-source.psd',
-        ext: '.psd',
-        addedAt: Date.now(),
-        source: 'manual-browse',
-      }],
-    });
-    currentPsdFixture = {
-      children: [{ linkedFile: { fullPath: linkedPath } }],
-      linkedFiles: [],
-    };
+test('a delayed PSD scan from an old A activation cannot mutate after A to B to A', async (t) => {
+  async function runAttempt(forceReadStartTimeout) {
+    const tmpRoot = makeTempDir();
+    const originalReadFile = fs.promises.readFile;
+    const originalStat = fs.promises.stat;
+    const watcherStart = watcherRecords.length;
+    let releaseRead = () => {};
+    let first;
+    let second;
+    let readFinished;
+    let readEntered = false;
+    let readReleased = false;
+    try {
+      first = await createProject('Delayed PSD Activation A');
+      const firstWatcher = latestWatcherHandlers();
+      const firstActivation = metadataTestHooks.getActiveWatchingActivationToken(first.id);
+      const psdPath = path.join(tmpRoot, 'delayed-source.psd');
+      const linkedPath = path.join(tmpRoot, 'delayed-linked.ai');
+      fs.writeFileSync(psdPath, 'psd bytes');
+      fs.writeFileSync(linkedPath, 'linked bytes');
+      await setProjectFiles(first.id, {
+        files: [{
+          path: psdPath,
+          name: 'delayed-source.psd',
+          ext: '.psd',
+          addedAt: Date.now(),
+          source: 'manual-browse',
+        }],
+      });
+      // A stored source does not authorize a callback until exact-path enrollment succeeds.
+      const beforeRefusal = await getProject(first.id);
+      let refusedReads = 0;
+      let refusedStats = 0;
+      fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+        return originalReadFile.call(fs.promises, candidate, ...args);
+      };
+      fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+        return originalStat.call(fs.promises, candidate, ...args);
+      };
+      await firstWatcher.change(psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.deepEqual(await getProject(first.id), beforeRefusal);
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      t.diagnostic(JSON.stringify({ milestone: 'unenrolled-PSD-refused', forceReadStartTimeout, refusedReads, refusedStats, stateUnchanged: true }));
+      const watcherRecord = watcherRecords.at(-1);
+      const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(first.id);
+      const physicalSource = fs.realpathSync.native(psdPath);
+      const sourceStat = fs.lstatSync(psdPath);
+      assert.equal(sourceStat.isFile(), true);
+      assert.equal(sourceStat.isSymbolicLink(), false);
+      assert.equal(sourceStat.nlink, 1);
+      assert.equal(watcherRecord.closed, false);
+      assert.equal((await getProject(first.id)).status, 'watching');
+      assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(first.id));
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-before-enrollment', physicalSource, beforeEnrollment, roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+      assert.equal(beforeEnrollment.paths.some(([source]) => source === physicalSource.toLowerCase()), false);
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(first.id);
+      const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(first.id);
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', lexicalSource: psdPath, physicalSource, roots: watcherRecord.roots, beforeEnrollment, enrolled, addedPaths: [...watcherRecord.addedPaths] }));
+      assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+      assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+      assert.ok(enrolled.paths.some(([source, physical]) => source === physicalSource.toLowerCase() && physical === physicalSource));
+      assert.ok(watcherRecord.addedPaths.has(physicalSource));
 
-    const readGate = new Promise(resolve => { releaseRead = resolve; });
-    let markReadStarted;
-    const readStarted = new Promise(resolve => { markReadStarted = resolve; });
-    fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
-      if (path.resolve(filePath) === path.resolve(psdPath)) {
-        markReadStarted();
-        await readGate;
+      currentPsdFixture = {
+        children: [{ linkedFile: { fullPath: linkedPath } }],
+        linkedFiles: [],
+      };
+      const readGate = new Promise(resolve => { releaseRead = () => { readReleased = true; resolve(); }; });
+      let markReadStarted;
+      let markReadEntered;
+      let markReadFinished;
+      const readStarted = new Promise(resolve => { markReadStarted = resolve; });
+      const actualReadEntered = new Promise(resolve => { markReadEntered = resolve; });
+      readFinished = new Promise(resolve => { markReadFinished = resolve; });
+      fs.promises.readFile = async function gatedPsdRead(filePath, ...args) {
+        if (path.resolve(filePath) !== path.resolve(psdPath)) {
+          return originalReadFile.call(fs.promises, filePath, ...args);
+        }
+        readEntered = true;
+        markReadEntered();
+        if (!forceReadStartTimeout) markReadStarted();
+        try {
+          await readGate;
+          return await originalReadFile.call(fs.promises, filePath, ...args);
+        } finally {
+          markReadFinished();
+        }
+      };
+
+      await firstWatcher.change(psdPath);
+      await waitForPresentationFixtureSignal(actualReadEntered, 'delayed PSD physical read entry');
+      t.diagnostic(JSON.stringify({ milestone: 'PSD-source-read-started', forceReadStartTimeout, firstActivation }));
+      await waitForPresentationFixtureSignal(readStarted, 'delayed PSD read-start signal', forceReadStartTimeout ? 50 : 5000);
+      second = await createProject('Delayed PSD Activation B');
+      const secondActivation = metadataTestHooks.getActiveWatchingActivationToken(second.id);
+      await callIpc('projects:start-watching', first.id);
+      const resumedActivation = metadataTestHooks.getActiveWatchingActivationToken(first.id);
+      assert.notEqual(firstActivation, secondActivation);
+      assert.notEqual(firstActivation, resumedActivation);
+      releaseRead();
+      await waitForPresentationFixtureSignal(readFinished, 'delayed PSD read completion');
+      await new Promise(resolve => originalSetTimeout(resolve, 100));
+
+      const firstFresh = await getProject(first.id);
+      const secondFresh = await getProject(second.id);
+      assert.equal(firstFresh.status, 'watching');
+      assert.equal(secondFresh.status, 'paused');
+      assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
+      assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
+      assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
+      t.diagnostic(JSON.stringify({ milestone: 'A-B-A-stale-mutation-refused', firstActivation, secondActivation, resumedActivation }));
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      releaseRead();
+      try {
+        if (first) await callIpc('projects:pause', first.id);
+        if (second) await callIpc('projects:pause', second.id);
+        if (readEntered) await waitForPresentationFixtureSignal(readFinished, 'delayed PSD cleanup read completion');
+      } finally {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        assert.equal(fs.promises.readFile, originalReadFile);
+        assert.equal(fs.promises.stat, originalStat);
+        assert.equal(fs.existsSync(tmpRoot), false);
+        assert.ok(watcherRecords.slice(watcherStart).every(record => record.closed));
+        if (readEntered) assert.equal(readReleased, true);
+        t.diagnostic(JSON.stringify({ milestone: 'delayed-PSD-attempt-cleanup', forceReadStartTimeout, readEntered, readReleased, hooksRestored: true, rootRemoved: true, ownedWatchersClosed: true }));
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
-    };
-
-    await firstWatcher.change(psdPath);
-    await readStarted;
-    const second = await createProject('Delayed PSD Activation B');
-    await callIpc('projects:start-watching', first.id);
-    releaseRead();
-    await new Promise(resolve => originalSetTimeout(resolve, 100));
-
-    const firstFresh = await getProject(first.id);
-    const secondFresh = await getProject(second.id);
-    assert.equal(firstFresh.status, 'watching');
-    assert.equal(secondFresh.status, 'paused');
-    assert.equal(firstFresh.files.some(file => file.path === linkedPath), false);
-    assert.equal(secondFresh.files.some(file => file.path === linkedPath), false);
-    assert.equal(getProvenanceEdges(firstFresh, EDGE_TYPES.CONTAINER_REFERENCES_FILE).length, 0);
-  } finally {
-    fs.promises.readFile = originalReadFile;
-    releaseRead();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   }
+
+  await runAttempt(false);
+  await assert.rejects(runAttempt(true), /timed out waiting for delayed PSD read-start signal/);
 });
 
 for (const staleScenario of ['pause', 'delete', 'B-A-B']) {
@@ -22486,10 +22864,13 @@ test('multi-asset PSD extraction partial commit error cleans final and staged ou
   }
 });
 
-test('PSD scan-on-save embedded asset preserves ledger entry and records one parser embed edge', async () => {
+test('PSD scan-on-save embedded asset preserves ledger entry and records one parser embed edge', async (t) => {
   const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD embedded parser provenance');
+    project = await createProject('PSD embedded parser provenance');
     const psdPath = path.join(tmpRoot, 'source.psd');
     fs.writeFileSync(psdPath, 'psd bytes');
     await setProjectFiles(project.id, {
@@ -22501,11 +22882,61 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     currentPsdFixture = {
       children: [],
       linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id }));
     await emitWatcher('change', psdPath);
     let fresh = await waitForProject(
       project.id,
@@ -22553,14 +22984,23 @@ test('PSD scan-on-save embedded asset preserves ledger entry and records one par
     );
     assert.equal(fresh.files.filter(file => file.source === 'scan-on-save-embedded').length, 1);
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
-test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async () => {
+test('Added While Working embedded PSD exclusion survives regenerated file IDs on rescan', async (t) => {
   const tmpRoot = makeTempDir();
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD embedded asset exclusion');
+    project = await createProject('PSD embedded asset exclusion');
     const psdPath = path.join(tmpRoot, 'source.psd');
     fs.writeFileSync(psdPath, 'psd bytes');
     await setProjectFiles(project.id, {
@@ -22572,11 +23012,61 @@ test('Added While Working embedded PSD exclusion survives regenerated file IDs o
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     currentPsdFixture = {
       children: [],
       linkedFiles: [{ name: 'embedded-logo.png', data: Buffer.from('embedded bytes') }],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id }));
     await emitWatcher('change', psdPath);
     let fresh = await waitForProject(
       project.id,
@@ -22606,7 +23096,13 @@ test('Added While Working embedded PSD exclusion survives regenerated file IDs o
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(review.files.map(file => file.name), ['source.psd']);
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
@@ -22643,12 +23139,16 @@ test('PSD scan-on-save missing linked asset does not record parser relationship 
   }
 });
 
-test('PSD parser provenance failure does not block scan-on-save capture', async () => {
-  const tmpRoot = makeTempDir();
+test('PSD parser provenance failure does not block scan-on-save capture', async (t) => {
+  const tmpRoot = fs.mkdtempSync(path.join(process.env.CRATE_TEST_OUTPUT_ROOT || path.resolve(__dirname, '..'), 'psd-provenance-failure-'));
+  const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+  const originalPsdFixture = currentPsdFixture;
+  let project;
   try {
-    const project = await createProject('PSD parser provenance failure');
+    project = await createProject('PSD parser provenance failure');
     const psdPath = path.join(tmpRoot, 'source.psd');
     const linkedPath = path.join(tmpRoot, 'linked-logo.ai');
+    assert.ok(fs.realpathSync.native(tmpRoot).startsWith('/Users/'), 'linked PSD parser fixture requires a physical /Users source');
     fs.writeFileSync(psdPath, 'psd bytes');
     fs.writeFileSync(linkedPath, 'linked bytes');
     const storedProject = await setProjectFiles(project.id, {
@@ -22660,6 +23160,55 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
         source: 'manual-browse',
       }],
     });
+    const watcherRecord = watcherRecords.at(-1);
+    const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    const physicalSource = fs.realpathSync.native(psdPath);
+    const sourceKey = normalizeLedgerPathForTest(psdPath);
+    const sourceStat = fs.lstatSync(psdPath);
+    assert.equal(sourceStat.isFile(), true);
+    assert.equal(sourceStat.isSymbolicLink(), false);
+    assert.equal(sourceStat.nlink, 1);
+    assert.equal(sourceKey, physicalSource.toLowerCase());
+    assert.equal(watcherRecord.closed, false);
+    assert.equal((await getProject(project.id)).status, 'watching');
+    assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+    assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+    assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+    const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+    const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+    let refusedReads = 0, refusedStats = 0;
+    fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedReads++;
+      return originalReadFile.call(fs.promises, candidate, ...args);
+    };
+    fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+      if (path.resolve(candidate) === path.resolve(psdPath)) refusedStats++;
+      return originalStat.call(fs.promises, candidate, ...args);
+    };
+    try {
+      await emitWatcher('change', psdPath);
+      assert.equal(refusedReads, 0);
+      assert.equal(refusedStats, 0);
+      assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+      assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+    }
+    t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+      owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+      stateUnchanged: true, eventsUnchanged: true }));
+    metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+    const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+    assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+    assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+    assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+    assert.ok(watcherRecord.addedPaths.has(physicalSource));
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+      lexicalSource: psdPath, physicalSource, owner: project.id, enrolled,
+      roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
     storedProject.provenance.nodes = new Proxy({}, {
       set() {
         throw new Error('forced PSD parser provenance failure');
@@ -22670,6 +23219,7 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
       linkedFiles: [],
     };
 
+    t.diagnostic(JSON.stringify({ milestone: 'accepted-watcher-change-entered', owner: project.id, forcedProvenanceFailure: true }));
     await emitWatcher('change', psdPath);
     const fresh = await waitForProject(project.id, item => item.files.length === 2);
 
@@ -22677,7 +23227,13 @@ test('PSD parser provenance failure does not block scan-on-save capture', async 
     assert.ok(linkedEntry);
     assert.equal(linkedEntry.source, 'scan-on-save-linked');
   } finally {
+    fs.promises.readFile = originalReadFile;
+    fs.promises.stat = originalStat;
+    if (project) await callIpcRaw('projects:pause', project.id);
+    currentPsdFixture = originalPsdFixture;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    t.diagnostic(JSON.stringify({ milestone: 'owned-fixture-cleanup', owner: project?.id,
+      timersCancelled: true, hooksRestored: true, fixtureRemoved: !fs.existsSync(tmpRoot) }));
   }
 });
 
@@ -23322,14 +23878,16 @@ for (const kind of ['psd', 'presentation']) for (const boundary of ['debounce', 
 }
 
 for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refresh', 'valid']) {
-  test(`scan guard production accepted ${kind} child lifetime ${mode}`, async () => {
+  test(`scan guard production accepted ${kind} child lifetime ${mode}`, async (t) => {
     const root = makeTempDir(), originalNow = testAccountSession.now, originalTimer = global.setTimeout;
     const originalProvider = testAccountSession.provider, originalCredentials = testAccountSession.credentials;
-    let fire;
+    const originalReadFile = fs.promises.readFile, originalStat = fs.promises.stat;
+    const originalPsdFixture = currentPsdFixture, originalChildProcessHandler = childProcessHandler;
+    let fire, project, changing;
     try {
       const ext = kind === 'psd' ? '.psd' : '.pptx', source = path.join(root, 'accepted' + ext);
       fs.writeFileSync(source, 'synthetic source');
-      const project = await createProject('Accepted child ownership');
+      project = await createProject('Accepted child ownership');
       await setProjectFiles(project.id, { files: [{ path: source, name: path.basename(source), ext, source: 'manual-browse', addedAt: 0 }] });
       currentPsdFixture = { linkedFiles: [{ name: 'child.png', data: Buffer.alloc(800, 4) }] };
       setChildProcessHandler(({ command, args }) => command === '/usr/bin/unzip'
@@ -23338,14 +23896,65 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         if (delay === 2000) { fire = () => fn(...args); return { synthetic: true }; }
         return originalTimer(fn, delay === 500 ? 0 : delay, ...args);
       };
+      const watcherRecord = watcherRecords.at(-1);
+      const beforeEnrollment = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+      const physicalSource = fs.realpathSync.native(source);
+      const sourceKey = normalizeLedgerPathForTest(source);
+      const sourceStat = fs.lstatSync(source);
+      assert.equal(sourceStat.isFile(), true);
+      assert.equal(sourceStat.isSymbolicLink(), false);
+      assert.equal(sourceStat.nlink, 1);
+      assert.equal(sourceKey, physicalSource.toLowerCase());
+      assert.equal(watcherRecord.closed, false);
+      assert.equal((await getProject(project.id)).status, 'watching');
+      assert.equal(beforeEnrollment.activationToken, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+      assert.equal(beforeEnrollment.accountGeneration, testAccountSession.generation);
+      assert.equal(beforeEnrollment.paths.some(([key]) => key === sourceKey), false);
+      assert.equal(watcherRecord.addedPaths.has(physicalSource), false);
+      const beforeRefusal = JSON.stringify(storeInstance.get('projects', []));
+      const eventsBeforeRefusal = JSON.stringify(testRendererEvents);
+      let refusedReads = 0, refusedStats = 0;
+      fs.promises.readFile = async function countUnenrolledRead(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(source)) refusedReads++;
+        return originalReadFile.call(fs.promises, candidate, ...args);
+      };
+      fs.promises.stat = async function countUnenrolledStat(candidate, ...args) {
+        if (path.resolve(candidate) === path.resolve(source)) refusedStats++;
+        return originalStat.call(fs.promises, candidate, ...args);
+      };
+      try {
+        await emitWatcher('change', source);
+        assert.equal(refusedReads, 0);
+        assert.equal(refusedStats, 0);
+        assert.equal(JSON.stringify(storeInstance.get('projects', [])), beforeRefusal);
+        assert.equal(JSON.stringify(testRendererEvents), eventsBeforeRefusal);
+        assert.equal(fire, undefined, 'unenrolled event cannot schedule child');
+      } finally {
+        fs.promises.readFile = originalReadFile;
+        fs.promises.stat = originalStat;
+      }
+      t.diagnostic(JSON.stringify({ milestone: 'unenrolled-source-refused', sourceKey, physicalSource,
+        owner: project.id, beforeEnrollment, roots: watcherRecord.roots, refusedReads, refusedStats,
+        stateUnchanged: true, eventsUnchanged: true }));
+      metadataTestHooks.syncAcceptedSourceWatchSubscriptions(project.id);
+      const enrolled = metadataTestHooks.getAcceptedSourceWatchSnapshot(project.id);
+      assert.equal(enrolled.activationToken, beforeEnrollment.activationToken);
+      assert.equal(enrolled.accountGeneration, beforeEnrollment.accountGeneration);
+      assert.ok(enrolled.paths.some(([key, physical]) => key === sourceKey && physical === physicalSource));
+      assert.ok(watcherRecord.addedPaths.has(physicalSource));
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-source-exact-enrollment', sourceKey,
+        lexicalSource: source, physicalSource, owner: project.id, enrolled,
+        roots: watcherRecord.roots, addedPaths: [...watcherRecord.addedPaths] }));
+
       let settled = false;
-      const changing = emitWatcher('change', source).finally(() => { settled = true; });
+      changing = emitWatcher('change', source).finally(() => { settled = true; });
       await waitForCondition(() => !!fire, 'accepted event did not schedule child');
       await new Promise(resolve => originalSetTimeout(resolve, 10));
       // The callback returns without awaiting child work; its original authority
       // must nevertheless survive the debounce and any immediate sibling scan.
       await changing;
       assert.equal(settled, true);
+      t.diagnostic(JSON.stringify({ milestone: 'accepted-parent-settled-child-captured', kind, mode, owner: project.id, childDelayMs: 2000, stageDelayMs: 500, parentSettled: settled }));
       const before = JSON.stringify(storeInstance.get('projects', [])); testRendererEvents.length = 0;
       if (mode === 'refresh') {
         const identity = testAccountSession.status.identity;
@@ -23353,6 +23962,7 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         testAccountSession.provider = { refresh: async () => ({ access_token: 'synthetic-next', refresh_token: 'synthetic-refresh' }), validate: async () => ({ subject: identity.id, expiresAt: Date.now() + 7200000 }), me: async () => identity };
         testAccountSession.credentials = { write() {} }; await testAccountSession.refresh();
       } else invalidateScanAccount(mode);
+      t.diagnostic(JSON.stringify({ milestone: 'child-invalidation-applied', kind, mode, accountGeneration: testAccountSession.generation }));
       await fire(); await changing; assert.equal(settled, true);
       const saved = storeInstance.get('projects', []).find(p => p.id === project.id);
       assert.equal(saved.files.filter(f => f.source === (kind === 'psd' ? 'scan-on-save-embedded' : 'scan-on-save-presentation')).length, mode === 'clock' ? 0 : 1);
@@ -23360,7 +23970,26 @@ for (const kind of ['psd', 'presentation']) for (const mode of ['clock', 'refres
         assert.equal(JSON.stringify(storeInstance.get('projects', [])), before);
         assert.equal(testRendererEvents.filter(e => e.data?.projectId === project.id).length, 0);
       }
-    } finally { global.setTimeout = originalTimer; testAccountSession.now = originalNow; testAccountSession.provider = originalProvider; testAccountSession.credentials = originalCredentials; await testAccountSession.restore(); fs.rmSync(root, { recursive: true, force: true }); }
+      t.diagnostic(JSON.stringify({ milestone: 'child-outcome-asserted', kind, mode,
+        expectedOutputCount: mode === 'clock' ? 0 : 1, clockRefusalStateAndEventsUnchanged: mode === 'clock' }));
+    } finally {
+      fs.promises.readFile = originalReadFile;
+      fs.promises.stat = originalStat;
+      global.setTimeout = originalTimer;
+      testAccountSession.now = originalNow;
+      testAccountSession.provider = originalProvider;
+      testAccountSession.credentials = originalCredentials;
+      await testAccountSession.restore();
+      if (project) await callIpcRaw('projects:pause', project.id);
+      if (changing) await changing;
+      fire = undefined;
+      currentPsdFixture = originalPsdFixture;
+      childProcessHandler = originalChildProcessHandler;
+      fs.rmSync(root, { recursive: true, force: true });
+      t.diagnostic(JSON.stringify({ milestone: 'owned-child-cleanup', kind, mode, owner: project?.id,
+        capturedCallbackReleased: !fire, timersCancelled: true, hooksAndAccountRestored: true,
+        fixtureRemoved: !fs.existsSync(root) }));
+    }
   });
 }
 for (const kind of ['psd', 'presentation']) {
@@ -24099,4 +24728,178 @@ test('mixed Figma and native baseline waits for both complete sources and preser
         assert.deepEqual(included.project.excludedAssetKeys, []);
       });
   }
+});
+
+// Account-lifetime consent tests use the production main issuer, consumer, IPC
+// wrapper/change callback and AccountSession logout/invalidate/publish paths.
+// Electron, credential storage, restore and native acquisition remain modeled.
+async function makeSessionTokenFixture() {
+  const root = makeTempDir(), sourcePath = path.join(root, 'Stable.png');
+  const outputDir = path.join(root, 'out'); fs.mkdirSync(outputDir);
+  fs.writeFileSync(sourcePath, createSyntheticPngBytes());
+  const project = await createProject('Session-token unchanged paused project');
+  await callIpcRaw('projects:pause', project.id);
+  await setProjectFiles(project.id, { files: [{ path: sourcePath, name: 'Stable.png', ext: '.png', addedAt: 0, source: 'manual-browse', assetOrigin: 'added', projectRole: 'asset' }] });
+  const stored = storeInstance.get('projects', []).find(item => item.id === project.id);
+  assert.equal(stored.status, 'paused');
+  const before = JSON.stringify(stored);
+  return { root, sourcePath, outputDir, project, before,
+    review: () => callIpcRaw('projects:prepare-package-review', project.id, outputDir),
+    package: token => callIpcRaw('projects:package', project.id, outputDir, token),
+    assertUnchanged() {
+      assert.equal(JSON.stringify(storeInstance.get('projects', []).find(item => item.id === project.id)), before);
+      assert.deepEqual(fs.readdirSync(outputDir), []);
+      assert.equal(fs.readdirSync(root).some(name => name.startsWith('.crate-package-staging-')), false);
+    },
+    cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+async function assertSessionTokenDeniedBeforeOutput(fixture, token) {
+  const quota = storeInstance.get('usage.packagesThisMonth');
+  const originalMkdir = fs.mkdirSync, originalOpen = fs.promises.open;
+  let outputWrites = 0, sourceOpens = 0;
+  fs.mkdirSync = function(candidate, ...args) {
+    if (path.resolve(candidate).startsWith(fixture.root + path.sep)) outputWrites++;
+    return originalMkdir.call(this, candidate, ...args);
+  };
+  fs.promises.open = async function(candidate, ...args) {
+    if (path.resolve(candidate) === fixture.sourcePath) sourceOpens++;
+    return originalOpen.call(this, candidate, ...args);
+  };
+  try {
+    assert.equal((await fixture.package(token)).error, 'package_review_stale');
+    assert.equal(outputWrites, 0, 'reject before private destination/staging creation');
+    assert.equal(sourceOpens, 0, 'reject before reviewed source handles');
+    assert.equal(storeInstance.get('usage.packagesThisMonth'), quota);
+    fixture.assertUnchanged();
+  } finally { fs.mkdirSync = originalMkdir; fs.promises.open = originalOpen; }
+}
+
+for (const mode of ['logout-reauthorize', 'identity-without-event', 'identity-with-event', 'generation-without-event', 'generation-with-allowed-event', 'notified-expiry-reauthorize']) {
+  test(`session-token consent rejects ${mode} before output for unchanged paused project`, async () => {
+    const f = await makeSessionTokenFixture(), originalNow = testAccountSession.now;
+    try {
+      const review = await f.review(); assert.equal(review.materializable, true); assert.equal(typeof review.token, 'string');
+      const generation = testAccountSession.generation;
+      if (mode === 'logout-reauthorize') { await testAccountSession.logout(); await testAccountSession.restore(); }
+      if (mode.startsWith('identity-')) testAccountSession.status = { ...testAccountSession.status, identity: { id: 'different-synthetic-account' } };
+      if (mode === 'identity-with-event') testAccountSession.publish('signed_in');
+      if (mode.startsWith('generation-')) {
+        testAccountSession.invalidate();
+        if (mode === 'generation-with-allowed-event') testAccountSession.publish('signed_in');
+      }
+      if (mode === 'notified-expiry-reauthorize') {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt;
+        testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+        assert.equal(testAccountSession.generation, generation, 'notified expiry need not increment AccountSession generation');
+      }
+      assert.equal(testAccountSession.canUseWorkspace(), true);
+      if (!mode.endsWith('without-event')) assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), false, 'change callback retires consent');
+      await assertSessionTokenDeniedBeforeOutput(f, review.token);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), false, 'consumer retires mismatched token');
+    } finally { testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+for (const mode of ['logout-reauthorize', 'generation-without-event', 'notified-expiry-reauthorize', 'newer-review']) {
+  test(`session-token issuance ${mode} during presentation leaves no old consent`, async () => {
+    const f = await makeSessionTokenFixture(), gate = deferredScanBoundary(), originalNow = testAccountSession.now;
+    let restore = () => {}, completion;
+    try {
+      restore = metadataTestHooks.holdWatchWorkspacePresentation(gate.wait);
+      // Attach rejection handling immediately: the production IPC wrapper rejects
+      // a request from a retired identity/generation even after sign-in returns.
+      completion = f.review().then(value => ({ value }), error => ({ error }));
+      await gate.started;
+      const [oldToken] = metadataTestHooks.getPackageReviewState().tokens;
+      assert.equal(typeof oldToken, 'string');
+      if (mode === 'generation-without-event') testAccountSession.invalidate();
+      else if (mode === 'notified-expiry-reauthorize') {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt; testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+      } else { await testAccountSession.logout(); await testAccountSession.restore(); }
+      let newer;
+      if (mode === 'newer-review') { newer = await f.review(); assert.equal(typeof newer.token, 'string'); }
+      gate.release();
+      const result = await completion;
+      if (mode === 'notified-expiry-reauthorize') assert.equal(result.value?.error, 'package_review_changed');
+      else assert.match(result.error?.message || '', /Sign in to Crate/);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(oldToken), false);
+      await assertSessionTokenDeniedBeforeOutput(f, oldToken);
+      if (newer) {
+        assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(newer.token), true, 'retire only old issuance');
+        assert.equal((await f.package(newer.token)).success, true);
+      }
+    } finally { gate.release(); if (completion) await completion; restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+for (const mode of ['logout-reauthorize', 'notified-expiry-reauthorize']) {
+  test(`session-token issuance ${mode} during manifest cannot mint late consent`, async () => {
+    const f = await makeSessionTokenFixture(), gate = deferredScanBoundary(), originalNow = testAccountSession.now;
+    let restore = () => {}, completion;
+    try {
+      restore = metadataTestHooks.holdPackageReviewPlan(gate.wait);
+      completion = f.review().then(value => ({ value }), error => ({ error })); await gate.started;
+      if (mode === 'logout-reauthorize') { await testAccountSession.logout(); await testAccountSession.restore(); }
+      else {
+        testAccountSession.now = () => testAccountSession.accessExpiresAt; testAccountSession.publish('offline');
+        testAccountSession.now = originalNow; await testAccountSession.restore();
+      }
+      gate.release(); const result = await completion;
+      if (mode === 'logout-reauthorize') assert.match(result.error?.message || '', /Sign in to Crate/);
+      else assert.equal(result.value?.error, 'package_review_changed');
+      assert.equal(metadataTestHooks.getPackageReviewState().current.some(([id]) => id === f.project.id), false);
+      f.assertUnchanged();
+    } finally { gate.release(); if (completion) await completion; restore(); testAccountSession.now = originalNow; await testAccountSession.restore(); f.cleanup(); }
+  });
+}
+
+test('session-token current lifetime succeeds once and expired consent rejects before output', async () => {
+  const f = await makeSessionTokenFixture(), originalDateNow = Date.now;
+  try {
+    const expired = await f.review();
+    const issuedAt = originalDateNow(); Date.now = () => issuedAt + 15 * 60 * 1000 + 1;
+    await assertSessionTokenDeniedBeforeOutput(f, expired.token);
+    Date.now = originalDateNow;
+    const review = await f.review();
+    assert.equal((await f.package(review.token)).success, true);
+    assert.equal((await f.package(review.token)).error, 'package_review_replayed');
+  } finally { Date.now = originalDateNow; f.cleanup(); }
+});
+
+test('session-token package source-open failure after reauthorization cannot mint refreshed consent', async () => {
+  const f = await makeSessionTokenFixture(), gate = deferredScanBoundary();
+  const originalOpen = fs.promises.open;
+  let completion, held = false;
+  try {
+    const review = await f.review();
+    fs.promises.open = async function(candidate, ...args) {
+      if (!held && path.resolve(candidate) === f.sourcePath) {
+        held = true; await gate.wait(); throw new Error('synthetic stale source-open failure');
+      }
+      return originalOpen.call(this, candidate, ...args);
+    };
+    completion = f.package(review.token).then(value => ({ value }), error => ({ error }));
+    await gate.started; await testAccountSession.logout(); await testAccountSession.restore();
+    gate.release(); const result = await completion;
+    assert.match(result.error?.message || '', /Sign in to Crate/);
+    assert.equal(metadataTestHooks.getPackageReviewState().current.some(([id]) => id === f.project.id), false);
+    f.assertUnchanged();
+  } finally { gate.release(); if (completion) await completion; fs.promises.open = originalOpen; await testAccountSession.restore(); f.cleanup(); }
+});
+
+test('session-token allowed account publications in the same lifetime preserve current consent', async () => {
+  const f = await makeSessionTokenFixture();
+  try {
+    const review = await f.review(), generation = testAccountSession.generation;
+    testAccountSession.publish('offline', 'Synthetic verified offline state');
+    assert.equal(testAccountSession.canUseWorkspace(), true);
+    testAccountSession.publish('signed_in');
+    assert.equal(testAccountSession.generation, generation);
+    assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(review.token), true);
+    assert.equal((await f.package(review.token)).success, true);
+  } finally { f.cleanup(); }
 });
