@@ -51,7 +51,7 @@ function stageInventory(root) {
 }
 
 function archiveFixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-launcher-'));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'crate-launcher-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const archiveName = 'electron-v42.10.0-darwin-arm64.zip';
   const archive = path.join(root, archiveName);
@@ -149,6 +149,35 @@ async function invokeFixture(fixture, args = REQUIRED_ARGS, env = {}, build = as
     else process.env.npm_config_cache = originalCache;
   }
 }
+
+test('release launcher fixture canonicalizes an owned temporary directory alias before archive authentication', async t => {
+  const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'crate-launcher-alias-')));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const alias = path.join(tempRoot, 'temp-alias');
+  fs.symlinkSync(tempRoot, alias, 'dir');
+  assert.equal(fs.lstatSync(alias).isSymbolicLink(), true);
+  assert.equal(fs.realpathSync(alias), tempRoot);
+  const originalTmpdir = process.env.TMPDIR;
+  let fixture;
+  try {
+    process.env.TMPDIR = alias;
+    assert.equal(os.tmpdir(), alias);
+    fixture = archiveFixture(t);
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+  }
+  const aliasedArchive = path.join(alias, path.basename(fixture.root), path.basename(fixture.archive));
+  assert.notEqual(aliasedArchive, fixture.archive);
+  assert.equal(fs.realpathSync(aliasedArchive), fixture.archive);
+  assert.equal(fs.realpathSync(fixture.root), fixture.root);
+  assert.equal(fs.lstatSync(fixture.archive).isFile(), true);
+  assert.equal(fs.lstatSync(fixture.archive).isSymbolicLink(), false);
+  const result = await invokeFixture(fixture);
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0);
+  assert.equal(result.builderCalls, 1);
+});
 
 test('release launcher passes only the authenticated local ZIP to the supported Builder configuration', async t => {
   const fixture = archiveFixture(t);
