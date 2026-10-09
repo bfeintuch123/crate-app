@@ -2192,8 +2192,8 @@ test('Review Before Packaging uses the approved terminology and retains keyboard
   const fixture = await loadPendingBatchFixture({ id: 'pending-accessibility' });
   assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-label'), 'Add all assets needing review');
   assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-label'), 'Skip all assets needing review');
-  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), undefined);
-  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), undefined);
+  assert.equal(fixture.elements['btn-include-all-existing'].getAttribute('aria-busy'), 'false');
+  assert.equal(fixture.elements['btn-skip-all-existing'].getAttribute('aria-busy'), 'false');
   const pendingRow = fixture.elements['pending-file-list'].children[0];
   const pendingStateBadge = pendingRow.children.find(child => child.className === 'pending-state-badge');
   const pendingCopy = pendingRow.children.find(child => child.className === 'pending-file-copy');
