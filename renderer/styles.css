@@ -689,7 +689,8 @@ body {
   outline-offset: 2px;
 }
 
-.asset-batch-button:disabled {
+.asset-batch-button:disabled,
+.asset-batch-button.primary:disabled {
   color: var(--gray-300);
   background: var(--gray-50);
   cursor: not-allowed;
@@ -1049,6 +1050,13 @@ body {
 
 .asset-review-toolbar .asset-panel-actions { margin: 0; }
 .asset-batch-button.primary { background: var(--black); color: var(--white); }
+
+.asset-review-guidance {
+  margin: 8px 0;
+  color: var(--gray-600);
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 .asset-review-workspace .asset-workspace {
   margin-top: 8px;

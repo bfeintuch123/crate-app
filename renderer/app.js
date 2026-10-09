@@ -71,6 +71,7 @@ let assetWorkspaceRequestId = 0;
 let assetWorkspaceLoadedRequestId = 0;
 let workingSourceRecoveryOwner = null;
 let assetWorkspaceProjectSnapshot = null;
+let assetReviewBatchProjection = null;
 const displayOnlyAssetWorkspaces = new WeakSet();
 let displayOnlyAssetWorkspaceProvenance = null;
 // Display receipt only; never grants selection, subscription or package authority.
@@ -593,6 +594,7 @@ function setAssetReviewProject(projectId) {
   if (state.assetReviewProjectId === projectId) return;
   state.assetReviewProjectId = projectId;
   assetWorkspaceRequestGeneration += 1;
+  reconcileCurrentAssetReviewBatchControls();
   state.assetReviewSelectedKey = null;
   state.assetReviewLogicalItems = { working: [], existing: [], added: [], missing: [] };
   for (const id of ['project-file-list', 'working-assets-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
@@ -624,6 +626,8 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
   workingSourceActions.clear();
   continuationChoiceOwner = null;
   continuationChoicePresentation = null;
@@ -688,7 +692,7 @@ function setRendererActionBusy(element, busy, busyLabel, idleLabel = null) {
   if (element.dataset) delete element.dataset.actionIdleLabel;
 }
 
-async function runRendererAction(key, element, busyLabel, action, idleLabel = null) {
+async function runRendererAction(key, element, busyLabel, action, idleLabel = null, reconcileControls = null) {
   if (rendererActionsInFlight.has(key)) return undefined;
   rendererActionsInFlight.add(key);
   setRendererActionBusy(element, true, busyLabel, idleLabel);
@@ -696,7 +700,11 @@ async function runRendererAction(key, element, busyLabel, action, idleLabel = nu
     return await action();
   } finally {
     rendererActionsInFlight.delete(key);
-    setRendererActionBusy(element, false, busyLabel, idleLabel);
+    // Bulk controls are shared across project/account lifetimes. Their opt-in
+    // cleanup projects current state after this reservation retires, rather
+    // than restoring the captured element's old label and enabled state.
+    if (reconcileControls) reconcileControls();
+    else setRendererActionBusy(element, false, busyLabel, idleLabel);
   }
 }
 
@@ -1639,6 +1647,8 @@ function updateNamingPreview() {
 async function renderFiles(renderOptions = {}) {
   const renderRequestId = ++fileWorkspaceRenderRequestId;
   const workspaceRequestId = ++assetWorkspaceRequestId;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
   const isRenderCurrent = typeof renderOptions.isCurrent === 'function'
     ? renderOptions.isCurrent
     : () => true;
@@ -1791,6 +1801,8 @@ async function renderFiles(renderOptions = {}) {
   state.assetWorkspace = assetWorkspace;
   assetWorkspaceLoadedRequestId = authoritative ? workspaceRequestId : 0;
   assetWorkspaceProjectSnapshot = project;
+  assetReviewBatchProjection = authoritative
+    ? captureAssetReviewBatchProjection(project, assetWorkspace, workspaceRequestId) : null;
   watchCoveragePresentation = authoritative ? captureWatchCoveragePresentation(project, assetWorkspace) : null;
   // Display reuse never supplies the authoritative refresh receipt or mutation authority.
   displayOnlyAssetWorkspaceProvenance = authoritative ? null : {
@@ -1931,7 +1943,7 @@ function getPendingAssetsForBatchDecision(project) {
   });
 }
 
-function updateAssetReviewBatchControls(project, existingAssets, includedExistingCount) {
+function updateAssetReviewBatchControls(project, existingAssets, includedExistingCount, projectionUnavailable = false) {
   const includeAll = $('#btn-include-all-existing');
   const skipAll = $('#btn-skip-all-existing');
   if (!includeAll && !skipAll) return;
@@ -1943,6 +1955,8 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   const pendingCandidates = getPendingAssetsForBatchDecision(project);
   const hasPendingReviewSurface = visiblePending.length > 0;
   const eligiblePendingCount = pendingCandidates.filter(candidate => candidate.target).length;
+  const unavailable = !project || accountStatus.canUseWorkspace === false;
+  const busy = !unavailable && rendererActionsInFlight.has(`asset-review-batch:${project.id}`);
   const controls = $('.asset-panel-actions');
   if (controls) {
     controls.setAttribute('aria-label', hasPendingReviewSurface ? 'Review Before Packaging controls' : 'Existing Assets controls');
@@ -1953,28 +1967,76 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
     includeAll.textContent = hasPendingReviewSurface ? 'Add All' : (allIncluded ? 'All Existing Included' : 'Include All Existing');
     includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : (allIncluded ? 'All existing assets are already included' : 'Include all existing assets'));
     includeAll.title = !hasPendingReviewSurface && allIncluded ? 'All existing assets are already included.' : '';
-    includeAll.disabled = hasPendingReviewSurface
+    includeAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
-      : existingAssets.length === 0 || includedExistingCount === existingAssets.length;
+      : existingAssets.length === 0 || includedExistingCount === existingAssets.length);
   }
   if (skipAll) {
     skipAll.textContent = hasPendingReviewSurface ? 'Skip All' : 'Skip All Existing';
     skipAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Skip all assets needing review' : 'Skip all existing assets');
-    skipAll.disabled = hasPendingReviewSurface
+    skipAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
-      : existingAssets.length === 0 || includedExistingCount === 0;
+      : existingAssets.length === 0 || includedExistingCount === 0);
+  }
+  for (const button of [includeAll, skipAll].filter(Boolean)) {
+    button.setAttribute('aria-busy', String(busy));
+    button.classList.toggle('is-action-busy', busy);
+    if (button.dataset) delete button.dataset.actionIdleLabel;
+  }
+  const reason = $('#asset-review-batch-reason');
+  if (reason) {
+    let message = '';
+    if (unavailable) message = accountStatus.canUseWorkspace === false
+      ? 'Sign in to review assets.' : 'Select a project to review assets.';
+    else if (busy) message = 'Updating assets. Wait for this action to finish.';
+    else if (projectionUnavailable) message = 'Current asset review is unavailable. Review the current project again before using bulk actions.';
+    else if (hasPendingReviewSurface) {
+      if (pendingCandidates.length === 0) {
+        message = 'No assets are eligible for Add All or Skip All. Check the review list for Needs Save or Opened items.';
+      } else if (eligiblePendingCount === 0) {
+        message = 'Crate cannot identify which files to update. Add All and Skip All are unavailable.';
+      } else if (eligiblePendingCount < visiblePending.length) {
+        message = 'Add All and Skip All apply only to eligible review items. Other items stay unchanged.';
+      }
+    } else if (existingAssets.length === 0) message = 'There are no existing assets to include or skip.';
+    else if (includedExistingCount === existingAssets.length) message = 'All existing assets are already included.';
+    else if (includedExistingCount === 0) message = 'No existing assets are included.';
+    reason.textContent = message;
+    reason.classList.toggle('hidden', !message);
   }
 }
 
+function captureAssetReviewBatchProjection(project, workspace, requestId) {
+  return { project, workspace, requestId, status: project.status,
+    account: accountWorkspaceEpoch, selection: projectSelectionEpoch, generation: assetWorkspaceRequestGeneration };
+}
+
+function getCurrentAssetReviewBatchWorkspace(project) {
+  const receipt = assetReviewBatchProjection, workspace = state.assetWorkspace;
+  if (!project || !receipt || receipt.project !== project || receipt.workspace !== workspace ||
+      state.projects.find(item => item.id === project.id) !== project || state.selectedProjectId !== project.id ||
+      assetWorkspaceProjectSnapshot !== project || workspace?.projectId !== project.id ||
+      receipt.status !== project.status || receipt.account !== accountWorkspaceEpoch ||
+      receipt.selection !== projectSelectionEpoch || receipt.generation !== assetWorkspaceRequestGeneration ||
+      !receipt.requestId || receipt.requestId !== assetWorkspaceRequestId ||
+      receipt.requestId !== assetWorkspaceLoadedRequestId || accountStatus.canUseWorkspace === false ||
+      displayOnlyAssetWorkspaces.has(workspace) || !Array.isArray(workspace.files)) return null;
+  return workspace;
+}
+
 function restoreAssetReviewBatchControls(project) {
-  if (!project) return;
-  const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
-  const files = Array.isArray(workspace?.files) ? workspace.files : (project.files || []);
+  const workspace = getCurrentAssetReviewBatchWorkspace(project);
+  const files = workspace?.files || [];
   const existingAssets = files.filter(file => (
     file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.projectRole !== 'source'
   ));
   const includedExistingCount = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
-  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
+  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount, !workspace);
+}
+
+function reconcileCurrentAssetReviewBatchControls() {
+  restoreAssetReviewBatchControls(accountStatus.canUseWorkspace === false ? null
+    : state.projects.find(item => item.id === state.selectedProjectId));
 }
 
 function getExistingAssetsDecisionFocusableElements() {
@@ -2030,7 +2092,7 @@ async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = tru
   if (
     state.assetWorkspace?.projectId === project.id &&
     assetWorkspaceProjectSnapshot === project &&
-    (assetWorkspaceLoadedRequestId === assetWorkspaceRequestId ||
+    (getCurrentAssetReviewBatchWorkspace(project) ||
       (allowDisplayFallback === true && displayOnlyAssetWorkspaces.has(state.assetWorkspace) &&
         displayOnlyAssetWorkspaceProvenance?.workspace === state.assetWorkspace &&
         displayOnlyAssetWorkspaceProvenance.requestId === assetWorkspaceRequestId &&
@@ -2043,6 +2105,8 @@ async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = tru
   ) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
   const requestId = ++assetWorkspaceRequestId;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
   const account = accountWorkspaceEpoch, selection = projectSelectionEpoch, status = project.status;
   try {
     const workspace = await window.crate.getAssetWorkspace(project.id);
@@ -2057,6 +2121,8 @@ async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = tru
     state.assetWorkspace = workspace;
     assetWorkspaceLoadedRequestId = requestId;
     assetWorkspaceProjectSnapshot = project;
+    assetReviewBatchProjection = captureAssetReviewBatchProjection(project, workspace, requestId);
+    restoreAssetReviewBatchControls(project);
     watchCoveragePresentation = captureWatchCoveragePresentation(project, workspace);
     return workspace;
   } catch (error) {
@@ -2228,40 +2294,11 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
 async function submitExistingAssetsBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
-  const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
-  const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
-  const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
-    buttons.forEach(button => { button.disabled = true; });
-    let renderedUpdatedState = false;
-    try {
-      const result = await window.crate.setExistingAssetsDecision(project.id, decision);
-      if (!result || result.success !== true) {
-        showToast('Crate could not update Existing Assets. Try again.');
-        return false;
-      }
-      state.projects = await getAccountCurrentProjects();
-      await renderFiles();
-      renderedUpdatedState = true;
-      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
-      return true;
-    } catch (error) {
-      logRendererError('existing assets batch decision failed', error);
-      showToast('Crate could not update Existing Assets. Try again.');
-      return false;
-    } finally {
-      if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
-    }
-  }, clickedButton?.textContent || null);
-  restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
-  return result;
-}
-
-function getPendingFilesFromDecisionResult(result, decision) {
-  if (decision === 'include') return Array.isArray(result?.pendingFiles) ? result.pendingFiles : null;
-  return Array.isArray(result) ? result : null;
-}
-
-async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
   const accountEpoch = accountWorkspaceEpoch;
   const selectionEpoch = projectSelectionEpoch;
   const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
@@ -2272,9 +2309,56 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
   const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
   const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
     buttons.forEach(button => { button.disabled = true; });
+    restoreAssetReviewBatchControls(project);
+    try {
+      const result = await window.crate.setExistingAssetsDecision(project.id, decision);
+      if (!isCurrent()) return false;
+      if (!result || result.success !== true) {
+        showToast('Crate could not update Existing Assets. Try again.');
+        return false;
+      }
+      const projects = await getAccountCurrentProjects();
+      if (!isCurrent()) return false;
+      state.projects = projects;
+      await renderFiles();
+      if (!isCurrent()) return false;
+      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
+      return true;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      logRendererError('existing assets batch decision failed', error);
+      showToast('Crate could not update Existing Assets. Try again.');
+      return false;
+    }
+  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
+  return result;
+}
+
+function getPendingFilesFromDecisionResult(result, decision) {
+  if (decision === 'include') return Array.isArray(result?.pendingFiles) ? result.pendingFiles : null;
+  return Array.isArray(result) ? result : null;
+}
+
+async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
+  if (!project || !['include', 'skip'].includes(decision)) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  if (!isCurrent()) return false;
+  const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
+  const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
+  const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
+    buttons.forEach(button => { button.disabled = true; });
+    restoreAssetReviewBatchControls(project);
     let appliedCount = 0;
     let failedCount = 0;
-    let renderedUpdatedState = false;
     try {
       for (const candidate of pendingCandidates) {
         if (!isCurrent()) return false;
@@ -2308,7 +2392,6 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       state.projects = projects;
       await renderFiles();
       if (!isCurrent()) return false;
-      renderedUpdatedState = true;
       const actionLabel = decision === 'include' ? 'added' : 'skipped';
       if (appliedCount === 0) {
         showToast('No eligible assets were updated. Review the list and try the batch action again.');
@@ -2323,17 +2406,19 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       logRendererError('pending assets batch decision failed', error);
       showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
-    } finally {
-      if (isCurrent() && !renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
     }
-  }, clickedButton?.textContent || null);
-  if (isCurrent()) restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
+  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
   return result;
 }
 
 async function submitAssetReviewBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
   const excluded = new Set(project.excludedAssetKeys || []);
   const visiblePending = (project.pendingFiles || []).filter(file => (
     file && !excluded.has(getAssetReviewExclusionKey(file))
@@ -3504,7 +3589,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
 
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
   $('#working-assets-section')?.classList.toggle('hidden', sourceFiles.length === 0);
-  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
+  restoreAssetReviewBatchControls(project);
   $('#project-dashboard')?.classList.toggle('hidden', state.assetReviewOpen === true);
   $('#asset-review-workspace')?.classList.toggle('hidden', state.assetReviewOpen !== true);
 }
@@ -3836,6 +3921,9 @@ function acceptAccountSnapshot(snapshot) {
     notificationPackageTriggerInFlight = false;
     setSelectedProject(state.selectedProjectId, { invalidate: true, restoreFocus: false });
   }
+  // Account reentry may remove inert before its workspace reload resolves.
+  // Reconcile the retired receipt synchronously before exposing those controls.
+  reconcileCurrentAssetReviewBatchControls();
   renderAccount();
   if (projectCreationPhase === 'reconciling') {
     if (newerSnapshot) void requestProjectCreationRecovery();
@@ -4895,6 +4983,12 @@ function getPackageReviewRecoveryMessage(error, diagnostics = null, project = nu
   if (error === 'package_review_changed') message = PACKAGE_REVIEW_CHANGED_MESSAGE;
   else if (error === 'package_review_unavailable') message = PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
   else if (error === 'package_scan_incomplete') message = PACKAGE_SCAN_INCOMPLETE_MESSAGE;
+  else if (error === 'asset_baseline_scan_incomplete') {
+    message = 'Initial file verification has not completed; a scan may have failed. No package was created. ' +
+      'Return to the project and open Review to check Needs Save or Needs attention items. ' +
+      'Save files marked Needs Save in their app, and use the review or recovery controls offered for each item. ' +
+      'Saving alone may not resolve a failed scan. Packaging stays blocked until required verification is complete.';
+  }
   else if (error === FIGMA_PACKAGE_TRANSFER_ERROR_MESSAGE) message = getFigmaPackageRecoveryMessage(project);
   const diagnosticSummary = formatPackageReviewDiagnosticSummary(error, diagnostics);
   return diagnosticSummary ? `${message} ${diagnosticSummary}` : message;
@@ -5745,6 +5839,7 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
     assetWorkspaceProjectSnapshot = null;
   }
   state.projects = Array.isArray(projects) ? projects : [];
+  reconcileCurrentAssetReviewBatchControls();
   if (isTabActive('projects')) renderProjects();
   if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
     renderFiles();
