@@ -408,9 +408,55 @@ test('main window uses normal macOS app lifecycle', async () => {
     assert.equal(ipcHandlers.has('projects:set-existing-assets-decision'), true);
     assert.equal(ipcHandlers.has('projects:get-asset-workspace'), true);
     assert.equal(ipcHandlers.has('projects:get-file-visual'), true);
-    assert.equal(ipcHandlers.has('projects:set-working-source-selection'), true);
-    assert.equal(ipcHandlers.has('projects:resolve-working-source-continuation'), true);
-    assert.equal(ipcHandlers.size, 44);
+    // Reviewed production inventory: every channel remains subject to the
+    // unauthorized and untrusted renderer checks surrounding this assertion.
+    const expectedChannels = [
+      'account:begin',
+      'account:cancel',
+      'account:get',
+      'account:logout',
+      'account:manage',
+      'account:refresh',
+      'account:reopen',
+      'figma:connect',
+      'figma:disconnect',
+      'figma:project-assets',
+      'figma:scan-now',
+      'figma:scan-project',
+      'figma:status',
+      'inactivity:keep-watching',
+      'inactivity:pause',
+      'projects:accept-pending',
+      'projects:add-files',
+      'projects:cancel-add-files',
+      'projects:create',
+      'projects:delete',
+      'projects:delete-all',
+      'projects:get-all',
+      'projects:get-asset-workspace',
+      'projects:get-file-visual',
+      'projects:get-files',
+      'projects:package',
+      'projects:pause',
+      'projects:pre-package-scan',
+      'projects:prepare-package-review',
+      'projects:reject-pending',
+      'projects:remove-file',
+      'projects:resolve-working-source-continuation',
+      'projects:select-output',
+      'projects:set-existing-assets-decision',
+      'projects:set-figma-link',
+      'projects:set-working-source-selection',
+      'projects:start-watching',
+      'settings:get',
+      'settings:update',
+      'shell:open-folder',
+      'usage:get',
+      'v2:browse-file',
+      'v2:package-file',
+      'v2:supported-extensions',
+    ];
+    assert.deepEqual([...ipcHandlers.keys()].sort(), expectedChannels);
     for (const channel of ['account:get','account:begin','account:reopen','account:cancel','account:logout','account:manage','account:refresh']) {
       assert.equal(ipcHandlers.has(channel), true, channel);
       assert.throws(() => ipcHandlers.get(channel)({}), /blocked an untrusted renderer request/);
