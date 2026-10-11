@@ -176,7 +176,7 @@ async function collectGeometry(window) {
         heading: rect('.asset-review-header > div'),
         search: rect('.asset-review-search'),
         filters: rect('#asset-review-filters'),
-        summary: rect('#asset-review-summary'),
+        summary: rect('#asset-review-batch-reason'),
         actions: rect('.asset-review-toolbar .asset-panel-actions'),
         existing: rect('#existing-assets-section'),
         added: rect('#added-assets-section'),

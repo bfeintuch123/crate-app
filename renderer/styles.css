@@ -3467,3 +3467,66 @@ body {
 .working-source-watch > div { margin-top: 5px; }
 .working-source-watch[data-watch-status="cap-limited"] summary,
 .working-source-watch[data-watch-status="unavailable"] summary { font-weight: 600; }
+
+/* Approved Opus workspace: one review entry, quiet counts, source hierarchy. */
+#project-dashboard .project-dashboard-header { display: block; margin-bottom: 24px; }
+#project-dashboard .project-dashboard-header > div { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+#project-dashboard .app-project-name { margin: 0; }
+#project-dashboard .project-dashboard-status { padding: 5px 10px; border: 1px solid #bfe6c7; border-radius: 8px; background: #eef9f0; }
+.project-review-entry { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px 22px; margin-bottom: 22px; border: 1px solid #ecd48a; border-radius: 14px; background: linear-gradient(90deg, #fff6d9, #fff 80%); }
+.project-review-copy { min-width: 0; }
+.project-review-eyebrow { color: #806000; font-size: 12px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+#project-dashboard .project-dashboard-alert { width: auto; padding: 0; margin-top: 5px; border: 0; background: transparent; color: #171717; font-size: 18px; overflow-wrap: anywhere; }
+#project-review-detail { color: #666; font-size: 13px; line-height: 1.5; margin: 5px 0 0; }
+.project-review-entry .review-assets-button { flex: none; width: auto; margin: 0; padding: 12px 22px; border: 1px solid #8f6b00; border-radius: 10px; background: #f5c443; color: #221a00; font-weight: 700; }
+.project-review-entry .review-assets-button:hover { background: #efbc32; }
+.project-review-entry .review-assets-button:focus-visible { outline: 3px solid #584800; outline-offset: 3px; }
+#project-dashboard .asset-metric { min-height: 90px; padding: 16px; border-radius: 10px; }
+#project-dashboard .asset-metric strong { font-size: 30px; }
+#project-dashboard .asset-metric span { font-size: 13px; color: #333; }
+#project-dashboard .asset-metric.missing { display: grid; }
+.project-dashboard-primary, .project-dashboard-secondary { min-width: 0; }
+#project-dashboard .project-dashboard-action-row { margin-top: 28px; }
+#project-dashboard .project-dashboard-controls { margin-top: 16px; }
+#project-dashboard .asset-origin-summary { border-radius: 12px; background: #fff; }
+#asset-review-workspace .asset-review-toolbar { flex-wrap: wrap; align-items: center; gap: 10px; }
+#asset-review-workspace .asset-review-toolbar .asset-review-guidance { flex: 1 1 200px; margin: 0; }
+#pending-section .asset-panel-header { justify-content: flex-start; flex-wrap: wrap; gap: 10px; }
+.pending-package-note { color: #777; font-size: 12px; }
+#pending-section { border-color: #ecd48a; }
+#pending-batch-slot { margin: 0 0 10px; }
+#asset-review-workspace .working-file-list { max-height: none; overflow: visible; }
+#asset-review-workspace .working-source-assets { grid-column: 1 / -1; grid-row: auto; width: 100%; min-width: 0; border-top: 1px solid #ececef; border-left: 2px solid #d4d4d8; margin-top: 8px; }
+#asset-review-workspace .working-source-assets .asset-file-row { background: #fafafb; }
+#asset-review-workspace .working-source-assets .asset-file-copy { overflow: hidden; }
+#asset-review-workspace .working-source-assets .app-file-name { font-size: 13px; }
+#asset-review-workspace .working-source-assets .working-source-assets { display: none; }
+#asset-review-workspace .asset-review-footer { box-shadow: none; }
+@media (max-width: 1000px) {
+  .project-review-entry { flex-wrap: wrap; }
+  .project-review-entry .review-assets-button { min-height: 44px; }
+}
+#project-dashboard .working-file-list > .asset-file-row,
+#asset-review-workspace .working-file-list > .asset-file-row {
+  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; gap: 10px; align-items: center;
+}
+.working-file-list > .asset-file-row > .file-visual { grid-column: 1; grid-row: 1; }
+.working-file-list > .asset-file-row > .asset-file-copy { grid-column: 2; grid-row: 1; min-width: 0; }
+.working-file-list > .asset-file-row > .file-status-badge { grid-column: 3; grid-row: 1; }
+.working-file-list > .asset-file-row > .working-source-action { grid-column: 4; grid-row: 1; }
+.working-file-list > .asset-file-row > .working-source-watch { grid-column: 1 / -1; grid-row: auto; margin: 0; padding: 8px 8px 3px 46px; border-top: 1px solid #ececef; }
+#pending-file-list { border: 1px solid #ecd48a; border-radius: 10px; }
+#pending-section .asset-review-guidance { font-weight: 400; color: #666; }
+.review-empty-states { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; margin-top: 20px; }
+.review-empty-states > div { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border: 1px dashed #dcdce0; border-radius: 10px; color: #777; font-size: 12px; }
+.review-empty-states strong { color: #444; font-weight: 600; }
+#asset-review-workspace .working-source-assets { border: 0; box-shadow: inset 2px 0 #d4d4d8; }
+#pending-file-list { border: 0; box-shadow: inset 0 0 0 1px #ecd48a; }
+
+/* Keep package-level warnings distinct from pending filenames. */
+.project-package-warning { padding: 12px 16px; margin: -8px 0 20px; border-left: 3px solid #b87914; background: #fff8e7; color: #704810; font-size: 13px; line-height: 1.5; }
+.project-review-entry.is-clear { border-color: #e5e5e8; background: #fff; }
+.project-review-entry.is-clear .project-review-eyebrow { color: #666; }
+.nested-asset-origin { color: #555; font-weight: 600; flex-shrink: 0; }
+#existing-batch-slot .asset-review-guidance { font-weight: 400; }
+#existing-batch-slot { margin-bottom: 8px; }

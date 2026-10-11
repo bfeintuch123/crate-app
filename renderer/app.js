@@ -1919,6 +1919,22 @@ function getPendingWorkspacePresentation(rawFile, sourceIndex, presentations) {
   return presentations.find(file => file && file.sourceIndex === sourceIndex) || null;
 }
 
+function composePendingReviewFiles(project, presentedPendingFiles) {
+  const presentations = Array.isArray(presentedPendingFiles)
+    ? presentedPendingFiles.filter(file => file.excluded !== true)
+    : [];
+  // Compose once against authoritative raw entries; filtering must reuse these
+  // objects rather than attempt to rebind a cloned presentation by its name.
+  return getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
+      ? { ...rawFile, ...presentation }
+      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
+    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
+    return file;
+  });
+}
+
 function getPendingAssetsForBatchDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const pending = getVisiblePendingAssetEntries(project).filter(({ rawFile }) => (
@@ -1954,6 +1970,10 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   ));
   const pendingCandidates = getPendingAssetsForBatchDecision(project);
   const hasPendingReviewSurface = visiblePending.length > 0;
+  const batch = $('#asset-review-batch-controls');
+  const slot = hasPendingReviewSurface ? $('#pending-batch-slot') : $('#existing-batch-slot');
+  if (batch && slot && batch.parentElement !== slot) slot.appendChild(batch);
+  $('#existing-batch-slot')?.classList.toggle('hidden', hasPendingReviewSurface);
   const eligiblePendingCount = pendingCandidates.filter(candidate => candidate.target).length;
   const unavailable = !project || accountStatus.canUseWorkspace === false;
   const busy = !unavailable && rendererActionsInFlight.has(`asset-review-batch:${project.id}`);
@@ -1992,13 +2012,13 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
     else if (projectionUnavailable) message = 'Current asset review is unavailable. Review the current project again before using bulk actions.';
     else if (hasPendingReviewSurface) {
       if (pendingCandidates.length === 0) {
-        message = 'No assets are eligible for Add All or Skip All. Check the review list for Needs Save or Opened items.';
+        message = 'No eligible items.';
       } else if (eligiblePendingCount === 0) {
         message = 'Crate cannot identify which files to update. Add All and Skip All are unavailable.';
       } else if (eligiblePendingCount < visiblePending.length) {
         message = 'Add All and Skip All apply only to eligible review items. Other items stay unchanged.';
       }
-    } else if (existingAssets.length === 0) message = 'There are no existing assets to include or skip.';
+    } else if (existingAssets.length === 0) message = 'No existing assets.';
     else if (includedExistingCount === existingAssets.length) message = 'All existing assets are already included.';
     else if (includedExistingCount === 0) message = 'No existing assets are included.';
     reason.textContent = message;
@@ -3083,7 +3103,7 @@ function appendWorkingSourceControls(row, copy, project, file) {
   const detail = document.createElement('div');
   detail.className = 'working-source-detail';
   detail.textContent = status.detail;
-  copy.appendChild(detail);
+  if (status.label !== 'Selected' || file.verificationStatus === 'no-extractor') copy.appendChild(detail);
   const identity = getFileVisualIdentity(file);
   if (!identity || !Number.isSafeInteger(file.selectionRevision) || file.selectionRevision < 0 ||
       !['selected', 'excluded'].includes(file.sourceSelection) ||
@@ -3114,6 +3134,7 @@ function createAssetFileRow(
     previewPriority = 0,
     loadVisual = true,
     selectable = false,
+    showAssetOrigin = false,
   } = {}
 ) {
   // Ordinary assets use effective membership: a required dependency can
@@ -3162,6 +3183,18 @@ function createAssetFileRow(
   name.title = name.textContent;
   copy.appendChild(name);
   appendAppOriginLabel(copy, file, project, { includeSource: !protectedSource });
+  if (showAssetOrigin && ['existing', 'added'].includes(file.assetOrigin)) {
+    let origin = copy.querySelector('.file-origin');
+    if (!origin) {
+      origin = document.createElement('div');
+      origin.className = 'file-origin';
+      copy.appendChild(origin);
+    }
+    const category = document.createElement('span');
+    category.className = 'nested-asset-origin';
+    category.textContent = file.assetOrigin === 'existing' ? 'Existing' : 'Added';
+    origin.insertBefore(category, origin.children[0] || null);
+  }
   row.appendChild(copy);
 
   let hasStatusBadge = false;
@@ -3200,7 +3233,7 @@ function createAssetFileRow(
     if (!hasStatusBadge) appendFileStatusBadge(row, 'Included', 'included', 'Included in this package');
     appendAssetFileRemovalAction(row, project, file);
   }
-  appendWorkingSourceWatchCoverage(copy, project, file);
+  appendWorkingSourceWatchCoverage(protectedSource ? row : copy, project, file);
   return row;
 }
 
@@ -3223,6 +3256,7 @@ function renderAssetPanelList(list, project, files, options = {}) {
     previewPriority: options.previewPriority || 0,
     loadVisual: options.loadVisual !== false,
     selectable: options.selectable === true,
+    showAssetOrigin: options.showAssetOrigin === true,
   });
   if (!Array.isArray(files) || files.length === 0) {
     const emptyMessage = options.emptyMessage || 'No assets in this group.';
@@ -3277,12 +3311,80 @@ function setCountText(id, value) {
   if (element) element.textContent = String(value);
 }
 
+// Nest only an unambiguous dependency under a currently presented source.
+// Names, extensions, and observation order never establish a relationship.
+function getAssetReviewParent(file, sources) {
+  if (!isPresentedAssetIncluded(file)) return null;
+  const identities = Array.isArray(file.requiredSourceIdentities) ? [...new Set(file.requiredSourceIdentities)] : [];
+  const matches = identities.length === 1
+    ? sources.filter(source => getFileVisualIdentity(source) === identities[0] && source.included === true)
+    : identities.length === 0 && file.figmaSourceIdentity
+      ? sources.filter(source => source.virtualFigmaSource && getFileVisualIdentity(source) === `figma-source:${file.figmaSourceIdentity}`)
+      : [];
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function renderAssetReviewHierarchy(filterItems) {
+  const logical = state.assetReviewLogicalItems;
+  const project = state.projects.find(item => item.id === state.selectedProjectId);
+  if (!logical || !project) return;
+  const sources = logical.working || [];
+  const groups = new Map(sources.map(source => [source, []]));
+  const standalone = { existing: [], added: [] };
+  for (const category of ['existing', 'added']) {
+    for (const file of logical[category] || []) {
+      const parent = getAssetReviewParent(file, sources);
+      if (parent) groups.get(parent).push({ file, category });
+      else standalone[category].push(file);
+    }
+  }
+  let visibleSources = 0;
+  const workingList = $('#working-assets-list');
+  for (const source of sources) {
+    const row = Array.from(workingList?.children || []).find(node => node.dataset?.renderKey === getRendererItemKey(source));
+    if (!row) continue;
+    const entries = groups.get(source);
+    const visible = entries.filter(entry => filterItems([entry.file], entry.category).length);
+    let children = row.querySelector('.working-source-assets');
+    if (entries.length && !children) {
+      children = document.createElement('div');
+      children.className = 'working-source-assets asset-card-grid';
+      children.setAttribute('role', 'list');
+      children.setAttribute('aria-label', `Assets used by ${source.name || 'working file'}`);
+      const watch = row.querySelector('.working-source-watch');
+      if (watch) row.insertBefore(children, watch);
+      else row.appendChild(children);
+    }
+    if (children) {
+      renderAssetPanelList(children, project, visible.map(entry => entry.file), {
+        virtualized: true, loadVisual: false, selectable: true, showAssetOrigin: true,
+      });
+      children.classList.toggle('hidden', visible.length === 0);
+    }
+    const show = filterItems([source], 'working').length > 0 || visible.length > 0;
+    row.classList.toggle('filtered-out', !show);
+    if (show) visibleSources++;
+  }
+  $('#working-assets-section')?.classList.toggle('filtered-out', visibleSources === 0);
+  let visibleStandalone = 0;
+  for (const category of ['existing', 'added']) {
+    const list = $(`#${category}-assets-list`);
+    const visible = filterItems(standalone[category], category);
+    if (list?.__assetReviewVirtualState) setVirtualAssetItems(list, visible, list.__assetReviewVirtualState.build);
+    const section = $(`#${category}-assets-section`);
+    visibleStandalone += visible.length;
+    section?.classList.toggle('hidden', visible.length === 0);
+    setAssetPanelCount($(`#${category}-assets-count`), visible.filter(isPresentedAssetIncluded).length, visible.length);
+  }
+  return visibleSources + visibleStandalone;
+}
+
 function applyAssetReviewFilter() {
   const filter = state.assetReviewFilter || 'all';
   const query = String(state.assetReviewQuery || '').trim().toLowerCase();
   const logicalItems = state.assetReviewLogicalItems || {};
   const filterItems = (items, category) => (Array.isArray(items) ? items : []).filter(file => {
-    const excluded = isWorkingSourcePresentation(file)
+    const excluded = category === 'missing' ? file.excluded === true : isWorkingSourcePresentation(file)
       ? file.sourceSelection === 'excluded'
       : !isPresentedAssetIncluded(file);
     const matchesFilter = filter === 'all'
@@ -3343,6 +3445,20 @@ function applyAssetReviewFilter() {
       pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
     }
   }
+  const visibleHierarchyCount = renderAssetReviewHierarchy(filterItems);
+  const emptyAdded = (logicalItems.added || []).length === 0;
+  const excludedCount = [...(logicalItems.working || []), ...(logicalItems.existing || []), ...(logicalItems.added || [])]
+    .filter(file => isWorkingSourcePresentation(file) ? file.sourceSelection === 'excluded' : !isPresentedAssetIncluded(file)).length;
+  if (visibleHierarchyCount === undefined) $('#added-assets-section')?.classList.toggle('hidden', emptyAdded);
+  const emptyResult = $('#asset-review-empty');
+  if (emptyResult) {
+    const noMatches = visibleHierarchyCount === 0 && filterItems(logicalItems.missing, 'missing').length === 0;
+    emptyResult.classList.toggle('hidden', !noMatches || (filter === 'all' && !query));
+    emptyResult.textContent = query ? 'No files match your search.' : ({ added: 'No added assets.', existing: 'No existing assets.', excluded: 'No excluded files.', missing: 'No files need review.' })[filter] || '';
+  }
+  $('#added-empty-tile')?.classList.toggle('hidden', !emptyAdded);
+  $('#excluded-empty-tile')?.classList.toggle('hidden', excludedCount !== 0);
+  $('#review-empty-states')?.classList.toggle('hidden', filter !== 'all' || !!query || (!emptyAdded && excludedCount !== 0));
   $$('.asset-filter').forEach(button => {
     const active = button.dataset.assetFilter === filter;
     button.classList.toggle('active', active);
@@ -3361,7 +3477,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   const counts = workspace?.semanticCounts;
   const workingSummary = $('#working-source-summary');
   if (workingSummary) {
-    workingSummary.classList.toggle('hidden', !counts);
+    workingSummary.classList.add('hidden');
     workingSummary.textContent = counts ? `${counts.selectedWorkingSources} selected local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
       `${figmaSourceCount ? ` · ${figmaSourceCount} tracked Figma working file(s)` : ''} · ${counts.includedAssets} included asset(s)` : '';
   }
@@ -3374,18 +3490,29 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   setCountText('filter-count-excluded', excludedCount);
 
   const alert = $('#project-linking-alert');
+  const blocked = workspace?.workingSourceSelectionBlocked === true;
   if (alert) {
-    alert.textContent = pendingFiles.length
+    const first = pendingFiles[0];
+    alert.textContent = first ? `${first.name || 'Untitled file'}${pendingFiles.length > 1 ? ` + ${pendingFiles.length - 1} more` : ''}` : 'Review project assets';
+    const detail = $('#project-review-detail');
+    const eyebrow = $('#project-review-eyebrow');
+    if (eyebrow) eyebrow.textContent = pendingFiles.length
       ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
-      : '';
-    if (workspace?.workingSourceSelectionBlocked) {
-      const facts = [];
-      if (counts?.unresolvedVerification) facts.push(`${counts.unresolvedVerification} working-file verification issue(s)`);
-      if (counts?.missingRequiredReferences) facts.push(`${counts.missingRequiredReferences} required link(s) unavailable`);
-      if (counts?.relationshipHolds) facts.push('unresolved file relationships');
-      alert.textContent = [alert.textContent, 'Package verification needs attention.', ...facts].filter(Boolean).join(' ');
-    }
-    alert.classList.toggle('hidden', pendingFiles.length === 0 && !workspace?.workingSourceSelectionBlocked);
+      : blocked ? 'Package needs review' : 'Project assets';
+    if (detail) detail.textContent = first
+      ? `${getPendingCaptureState(first) === 'observed' ? 'Opened · Pending' : getPendingFileReason(first).replace(/\.$/, '')} · Not in the package`
+      : 'View working files, included assets and exclusions.';
+    alert.classList.remove('hidden');
+    $('.project-review-entry')?.classList.toggle('is-clear', !pendingFiles.length && !blocked);
+  }
+  const packageWarning = $('#project-package-warning');
+  if (packageWarning) {
+    const facts = [];
+    if (counts?.unresolvedVerification) facts.push(`${counts.unresolvedVerification} working file${counts.unresolvedVerification === 1 ? ' needs' : 's need'} verification`);
+    if (counts?.missingRequiredReferences) facts.push(`${counts.missingRequiredReferences} required link${counts.missingRequiredReferences === 1 ? '' : 's'} unavailable`);
+    if (counts?.relationshipHolds) facts.push(`${counts.relationshipHolds} unresolved file relationship${counts.relationshipHolds === 1 ? '' : 's'}`);
+    packageWarning.textContent = blocked ? `Package blocked${facts.length ? `: ${facts.join(' · ')}` : ': verification needs attention'}. Review working files and required assets.` : '';
+    packageWarning.classList.toggle('hidden', !blocked);
   }
 
   const recentList = $('#recent-assets-list');
@@ -3430,10 +3557,8 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     ` · ${counts.selectedWorkingSources} ${figmaSourceCount ? 'local ' : ''}Working File${counts.selectedWorkingSources === 1 ? '' : 's'} selected` +
     `${figmaSourceCount ? ` · ${figmaSourceCount} Figma Working File${figmaSourceCount === 1 ? '' : 's'} tracked` : ''}` +
     `${workspace?.workingSourceSelectionBlocked ? ' · Verification needs attention' : ''}` : 'Package selection and verification unavailable') +
-    `${pendingFiles.length ? ` · ${pendingFiles.length} need attention` : ''}`;
-  const reviewSummary = $('#asset-review-summary');
+    `${pendingFiles.length ? ` · ${pendingFiles.length} needs review` : ''}`;
   const reviewFooter = $('#asset-review-footer-summary');
-  if (reviewSummary) reviewSummary.textContent = summary;
   if (reviewFooter) reviewFooter.textContent = summary;
 }
 
@@ -3574,9 +3699,8 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const includedAddedCount = addedAssets.filter(isPresentedAssetIncluded).length;
   setAssetPanelCount($('#added-assets-count'), includedAddedCount, addedAssets.length);
 
-  const pendingFiles = state.assetWorkspace?.projectId === project.id
-    ? (state.assetWorkspace.pendingFiles || []).filter(file => file.excluded !== true)
-    : [];
+  const pendingFiles = composePendingReviewFiles(project, state.assetWorkspace?.projectId === project.id
+    ? state.assetWorkspace.pendingFiles : []);
   const pendingReviewFiles = $('#pending-file-list')?.__assetReviewAllItems || [];
   state.assetReviewLogicalItems = {
     working: sourceFiles,
@@ -3585,11 +3709,10 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     missing: pendingReviewFiles,
   };
   renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles, figmaSourceFiles.length);
-  applyAssetReviewFilter();
-
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
   $('#working-assets-section')?.classList.toggle('hidden', sourceFiles.length === 0);
   restoreAssetReviewBatchControls(project);
+  applyAssetReviewFilter();
   $('#project-dashboard')?.classList.toggle('hidden', state.assetReviewOpen === true);
   $('#asset-review-workspace')?.classList.toggle('hidden', state.assetReviewOpen !== true);
 }
@@ -3756,19 +3879,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   if (!section || !list) return;
   setAssetReviewProject(project.id);
 
-  const presentations = Array.isArray(presentedPendingFiles)
-    ? presentedPendingFiles.filter(file => file.excluded !== true)
-    : [];
-  // Compose once against authoritative raw entries; filtering must reuse these
-  // objects rather than attempt to rebind a cloned presentation by its name.
-  const pending = getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
-    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
-    const file = presentation
-      ? { ...rawFile, ...presentation }
-      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
-    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
-    return file;
-  });
+  const pending = composePendingReviewFiles(project, presentedPendingFiles);
   pending.forEach(getRendererItemKey);
 
   if (pending.length === 0) {
@@ -3779,6 +3890,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   }
 
   section.classList.remove('hidden');
+  setCountText('pending-assets-count', pending.length);
   const buildPendingRow = file => {
     const row = document.createElement('div');
     row.className = 'pending-file';
@@ -5450,7 +5562,6 @@ function setupEventListeners() {
 
   $('#btn-review-assets').addEventListener('click', openAssetReviewWorkspace);
   $('#btn-review-assets-back').addEventListener('click', closeAssetReviewWorkspace);
-  $('#btn-review-assets-cancel').addEventListener('click', closeAssetReviewWorkspace);
   $('#btn-review-assets-continue').addEventListener('click', closeAssetReviewWorkspace);
   $$('.asset-filter').forEach(button => {
     button.addEventListener('click', () => {

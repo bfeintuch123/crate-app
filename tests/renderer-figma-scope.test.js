@@ -344,7 +344,7 @@ function createInteractiveRendererDom() {
     if (tabName === 'projects') tabContent.classList.add('active');
     return tabContent;
   });
-  const assetFilters = ['all', 'existing', 'added', 'missing', 'excluded'].map(filter => {
+  const assetFilters = ['all', 'missing', 'existing', 'added', 'excluded'].map(filter => {
     const button = createElementStub('button');
     button.dataset.assetFilter = filter;
     if (filter === 'all') {
@@ -1606,7 +1606,6 @@ test('Current Project dashboard uses Working Files and privacy-safe mixed-app or
   assert.equal(getElementTreeText(elements['project-file-list']).includes('Figma · Current Page'), true);
   assert.equal(elements['project-file-list'].children.length, 2);
   // This fixture omits authoritative selection semantics; rows alone cannot prove readiness.
-  assert.equal(elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(getElementTreeText(elements['existing-assets-list']).includes('Illustrator · Brand-System.ai'), true);
   assert.equal(getElementTreeText(elements['added-assets-list']).includes('PowerPoint · Launch-Deck.pptx'), true);
@@ -1702,23 +1701,21 @@ test('unknown generic assets omit the generic origin marker while retaining mean
   assert.equal(getElementTreeText(knownLabel).includes('Illustrator · Brand-System.ai'), true);
 });
 
-test('Current Project review alert uses correct singular and plural copy', () => {
+test('Current Project review alert announces pending count from raw entries and main-shaped rows', () => {
   const { document, elements } = createInteractiveRendererDom();
-  const project = { id: 'linking-copy', files: [], pendingFiles: [], excludedAssetKeys: [] };
-  const renderer = loadRendererHelpers(document, { crate: {} });
-  const pending = index => ({
-    name: `Missing-${index}.png`, ext: '.png', captureState: 'needs-save',
-    visualIdentity: `missing-${index}`, visualRevision: `missing-r${index}`,
-  });
-
-  renderer.testWorkspace = { projectId: project.id, files: [], pendingFiles: [pending(1)] };
-  vm.runInContext('state.assetWorkspace = testWorkspace;', renderer);
-  renderer.renderAssetWorkspace(project, {}, []);
-  assert.equal(elements['project-linking-alert'].textContent, '1 file needs review');
-
-  renderer.testWorkspace.pendingFiles.push(pending(2));
-  renderer.renderAssetWorkspace(project, {}, []);
-  assert.equal(elements['project-linking-alert'].textContent, '2 files need review');
+  const raw = index => ({name: `Pending-${index}.pptx`, ext: '.pptx', captureState: 'observed'});
+  const project = {id:'linking-copy',files:[],pendingFiles:[raw(1)],excludedAssetKeys:[]};
+  const renderer = loadRendererHelpers(document, {crate:{}});
+  renderer.testWorkspace = {projectId:project.id,files:[],pendingFiles:[{name:'Pending-1.pptx',ext:'.pptx',sourceIndex:0,visualIdentity:'one'}]};
+  vm.runInContext('state.assetWorkspace=testWorkspace', renderer);
+  renderer.renderAssetWorkspace(project,{},[]);
+  assert.equal(elements['project-review-eyebrow'].textContent,'1 file needs review');
+  assert.match(elements['project-review-detail'].textContent,/Opened.*Pending/);
+  project.pendingFiles.push(raw(2));
+  renderer.testWorkspace.pendingFiles.push({name:'Pending-2.pptx',ext:'.pptx',sourceIndex:1,visualIdentity:'two'});
+  renderer.renderAssetWorkspace(project,{},[]);
+  assert.equal(elements['project-review-eyebrow'].textContent,'2 files need review');
+  assert.match(elements['project-linking-alert'].textContent,/1 more/);
 });
 
 test('Figma Working File and asset labels reflect Entire File scope without fabricating a local source file', () => {
@@ -1791,7 +1788,7 @@ test('Review Assets switches from the dashboard without changing inclusion state
   vm.runInContext("state.assetReviewFilter = 'added';", renderer);
   renderer.applyAssetReviewFilter();
   assert.equal(assetFilters[0].getAttribute('aria-pressed'), 'false');
-  assert.equal(assetFilters[2].getAttribute('aria-pressed'), 'true');
+  assert.equal(assetFilters[3].getAttribute('aria-pressed'), 'true');
 
   renderer.closeAssetReviewWorkspace();
   assert.equal(elements['project-dashboard'].classList.contains('hidden'), false);
@@ -1799,11 +1796,11 @@ test('Review Assets switches from the dashboard without changing inclusion state
   assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
 });
 
-test('Review Assets has one action inside Needs Review and stays usable with zero pending assets', () => {
+test('Review Assets has one action in the review card and stays usable with zero pending assets', () => {
   const html = fs.readFileSync(path.join(__dirname, '../renderer/index.html'), 'utf8');
-  const metric = html.slice(html.indexOf('<div class="asset-metric missing">'), html.indexOf('<div class="asset-metric excluded">'));
+  const metric = html.slice(html.indexOf('<section class="project-review-entry"'), html.indexOf('<div class="asset-metric-grid"'));
   assert.equal((html.match(/id="btn-review-assets"/g) || []).length, 1);
-  assert.match(metric, /<button[^>]*id="btn-review-assets"[^>]*aria-describedby="metric-missing-count metric-missing-label"[^>]*>Review Assets<\/button>/);
+  assert.match(metric, /<button[^>]*id="btn-review-assets"[^>]*>Review Assets<\/button>/);
   assert.doesNotMatch(metric, /disabled|role="button"|tabindex="[1-9]/);
   const { document, elements, assetFilters } = createInteractiveRendererDom();
   const renderer = loadRendererHelpers(document, { crate: {} });
@@ -1899,7 +1896,6 @@ test('Needs Review items all use the individual Add contract through one bulk ac
   assert.equal(fixture.getPersisted().files.length, 5);
   assert.equal(fixture.elements['filter-count-missing'].textContent, '0');
   assert.equal(fixture.elements['filter-count-added'].textContent, '4');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['pending-section'].classList.contains('hidden'), true);
   assert.equal(fixture.elements['asset-review-workspace'].classList.contains('hidden'), false);
@@ -1920,7 +1916,6 @@ test('Needs Review items all use the individual Skip contract through one bulk a
   assert.equal(fixture.getPersisted().excludedAssetKeys.length, 4);
   assert.equal(fixture.elements['filter-count-all'].textContent, '0');
   assert.equal(fixture.elements['filter-count-missing'].textContent, '0');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable');
   assert.equal(fixture.elements['pending-section'].classList.contains('hidden'), true);
 });
@@ -1937,7 +1932,7 @@ test('Needs Review bulk Add leaves ineligible candidates unchanged and reports a
   assert.equal(fixture.getPersisted().files.length, 4);
   assert.deepEqual(fixture.getPersisted().pendingFiles.map(file => file.path), [project.pendingFiles[3].path]);
   assert.equal(fixture.elements['filter-count-missing'].textContent, '1');
-  assert.equal(fixture.elements['asset-review-summary'].textContent, 'Package selection and verification unavailable · 1 need attention');
+  assert.equal(fixture.elements['asset-review-footer-summary'].textContent, 'Package selection and verification unavailable · 1 needs review');
   assert.equal(fixture.elements['btn-include-all-existing'].disabled, false);
 });
 
@@ -2032,8 +2027,7 @@ test('duplicate pending names bind bulk actions by stable identity or original s
         assert.equal(fixture.elements['filter-count-missing'].textContent, '1');
         assert.equal(fixture.elements['filter-count-all'].textContent, decision === 'include' ? '2' : '1');
         assert.equal(fixture.elements['filter-count-added'].textContent, decision === 'include' ? '1' : '0');
-        const expectedSummary = 'Package selection and verification unavailable · 1 need attention';
-        assert.equal(fixture.elements['asset-review-summary'].textContent, expectedSummary);
+        const expectedSummary = 'Package selection and verification unavailable · 1 needs review';
         assert.equal(fixture.elements['asset-review-footer-summary'].textContent, expectedSummary);
         assert.equal(fixture.document.querySelector('#btn-review-assets-continue').disabled, false);
         assert.equal(fixture.elements['btn-include-all-existing'].disabled, true);
@@ -2182,8 +2176,8 @@ test('Review Before Packaging uses the approved terminology and retains keyboard
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   assert.match(html, /<span[^>]*>Needs Review<\/span>/);
   assert.match(html, /data-asset-filter="missing"[^>]*aria-pressed="false">Needs Review/);
-  assert.match(html, /<p>Crate automatically includes files it can confidently connect to this project\. Review anything it could not verify\.<\/p>/);
-  assert.match(html, /<h2 class="asset-panel-title" id="pending-header">Review Before Packaging<\/h2>/);
+  assert.doesNotMatch(html, /<p>Crate automatically includes files/);
+  assert.match(html, /<h2 class="asset-panel-title" id="pending-header">Needs Review<\/h2>/);
   assert.match(html, /<button type="button"[^>]*id="btn-include-all-existing"[^>]*>Add All<\/button>/);
   assert.match(html, /<button type="button"[^>]*id="btn-skip-all-existing"[^>]*>Skip All<\/button>/);
   assert.match(html, /id="btn-include-all-existing"[^>]*aria-label="Add all assets needing review"/);
@@ -8217,7 +8211,7 @@ for (const kind of ['needs-save-opened', 'unidentified']) {
     const before = cloneTestValue(project);
     const f = await loadPendingBatchFixture({ project });
     attachOliviaReviewDescriptions(f);
-    assertOliviaBulkReason(f, kind === 'unidentified' ? /cannot identify which files/ : /No assets are eligible.*Needs Save or Opened/);
+    assertOliviaBulkReason(f, kind === 'unidentified' ? /cannot identify which files/ : /No eligible items/);
     assert.equal(await f.renderer.submitAssetReviewBatchDecision('include'), false);
     assert.equal(await f.renderer.submitAssetReviewBatchDecision('skip'), false);
     assert.deepEqual(f.calls, []);
@@ -8240,7 +8234,7 @@ test('Olivia UI: Existing Assets reasons follow actual included counts and clear
   const project = { id: 'olivia-existing', pendingFiles: [] };
   const assets = [{ name: 'C.png' }, { name: 'D.png' }];
   renderer.updateAssetReviewBatchControls(project, [], 0);
-  assertOliviaBulkReason(f, /no existing assets/);
+  assertOliviaBulkReason(f, /No existing assets/);
   renderer.updateAssetReviewBatchControls(project, assets, 2);
   assertOliviaBulkReason(f, /already included/, [true, false]);
   renderer.updateAssetReviewBatchControls(project, assets, 0);
@@ -8290,13 +8284,13 @@ test('Olivia UI: stale project batch completion cannot replace the current eligi
   await f.renderer.renderFiles();
   const currentReason = f.elements['asset-review-batch-reason'].textContent;
   const currentProjects = JSON.stringify(vm.runInContext('state.projects', f.renderer));
-  assertOliviaBulkReason(f, /no existing assets/);
+  assertOliviaBulkReason(f, /No existing assets/);
   held.resolve();
   assert.equal(await action, false);
   assert.equal(f.calls.length, 1);
   assert.equal(f.elements['btn-include-all-existing'].disabled, true,
     'C1 current B include control must remain disabled after retired A cleanup');
-  assertOliviaBulkReason(f, /no existing assets/);
+  assertOliviaBulkReason(f, /No existing assets/);
   assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
   assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
   for (const id of ['btn-include-all-existing', 'btn-skip-all-existing']) {
@@ -8368,7 +8362,7 @@ for (const mode of ['unresolved', 'resolved', 'empty']) {
     renderer.openAssetReviewWorkspace();
     const before = JSON.stringify(vm.runInContext('({projects:state.projects, workspace:state.assetWorkspace, token:state.packageReviewToken})', renderer));
     assert.equal(f.elements['btn-review-assets-continue'].textContent, 'Back to Project');
-    assert.match(f.elements['asset-review-exit-reason'].textContent, /leaves unresolved items unchanged.*Packaging stays blocked/);
+    assert.match(f.elements['asset-review-exit-reason'].textContent, /Unresolved items stay unchanged.*required reviews and verification before packaging/);
     f.elements['btn-review-assets-continue'].click();
     assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
     assert.equal(f.elements['asset-review-workspace'].classList.contains('hidden'), true);
@@ -8576,7 +8570,7 @@ for (const decision of ['include', 'skip']) for (const outcome of ['success', 'e
     assert.deepEqual(f.getPersisted().workingSourceSelection, before.workingSourceSelection);
     assert.deepEqual(f.getPersisted().assetBaseline, before.assetBaseline);
     if (outcome === 'success') {
-      assertOliviaBulkReason(f, /No assets are eligible/);
+      assertOliviaBulkReason(f, /No eligible items/);
       assert.deepEqual(f.getPersisted().pendingFiles, before.pendingFiles.slice(1));
     } else {
       assertOliviaBulkReason(f, /only to eligible review items/, [false, false]);
@@ -8647,7 +8641,7 @@ for (const phase of ['decision', 'project-read']) {
     held.resolve(phase === 'decision' ? { success: true } : [{ id: 'STALE', files: [] }]);
     assert.equal(await action, false);
     assert.deepEqual(cloneTestValue(vm.runInContext('state.projects', f.renderer)), [f.renderer.otherProject]);
-    assertOliviaBulkReason(f, /no existing assets/); assertC1Busy(f, false);
+    assertOliviaBulkReason(f, /No existing assets/); assertC1Busy(f, false);
     assert.equal(f.elements['btn-include-all-existing'].textContent, 'Include All Existing');
     assert.equal(f.elements['btn-skip-all-existing'].textContent, 'Skip All Existing');
   });

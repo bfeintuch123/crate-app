@@ -24903,3 +24903,130 @@ test('session-token allowed account publications in the same lifetime preserve c
     assert.equal((await f.package(review.token)).success, true);
   } finally { f.cleanup(); }
 });
+
+test('workspace hierarchy projects opaque dependency roots without matching duplicate names', async () => {
+  const root = makeTempDir();
+  try {
+    const project = await createProject('Opaque hierarchy');
+    const first = { path: path.join(root, 'first', 'Same.ai'), name: 'Same.ai', ext: '.ai', projectRole: 'source', source: 'manual-browse' };
+    const second = { ...first, path: path.join(root, 'second', 'Same.ai') };
+    const asset = { path: path.join(root, 'image.png'), name: 'image.png', ext: '.png', projectRole: 'asset', assetOrigin: 'existing', assetBaselineSourcePath: first.path };
+    for (const file of [first, second, asset]) { fs.mkdirSync(path.dirname(file.path), { recursive: true }); fs.writeFileSync(file.path, 'synthetic bytes'); }
+    await setProjectFiles(project.id, { files: [first, second, asset] });
+    const current = await getProject(project.id);
+    const parent = await metadataTestHooks.createRendererFilePresentation(current, current.files[0]);
+    const other = await metadataTestHooks.createRendererFilePresentation(current, current.files[1]);
+    const child = await metadataTestHooks.createRendererFilePresentation(current, current.files[2]);
+    assert.deepEqual(child.requiredSourceIdentities, [parent.visualIdentity]);
+    assert.notEqual(parent.visualIdentity, other.visualIdentity);
+    assert.equal(JSON.stringify(child).includes(root), false);
+    const unrelatedFile = { ...current.files[2], assetBaselineSourcePath: undefined, captureEvidence: { sourceName: 'Same.ai' } };
+    const unrelatedProject = { ...current, files: [current.files[0], current.files[1], unrelatedFile] };
+    const unrelated = await metadataTestHooks.createRendererFilePresentation(unrelatedProject, unrelatedFile);
+    assert.equal(unrelated.requiredSourceIdentities, undefined, 'a display name does not establish graph membership');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Opus correction: actual main pending projection retains raw capture states in both renderer screens', async () => {
+  const root = makeTempDir();
+  try {
+    const project = await createProject('Projection Fidelity');
+    const pendingFiles = ['observed', 'needs-save', 'pending'].map((captureState, index) => ({
+      path: path.join(root, `Pending-${index}.pptx`), name: `Pending-${index}.pptx`, ext: '.pptx',
+      projectRole: 'source', source: 'live-app', captureState, captureEvidence: { appFamily: 'powerpoint' },
+    }));
+    for (const file of pendingFiles) fs.writeFileSync(file.path, 'synthetic presentation bytes');
+    await setProjectFiles(project.id, { pendingFiles });
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    const current = await getProject(project.id);
+    assert.equal(workspace.pendingFiles.length, 3);
+    for (const file of workspace.pendingFiles) {
+      assert.equal(Object.hasOwn(file, 'captureState'), false);
+      assert.equal(Object.hasOwn(file, 'captureEvidence'), false);
+      assert.equal(Object.hasOwn(file, 'included'), false);
+    }
+    const { loadProjectedWorkspace } = require('./opus-renderer-helpers');
+    const f = loadProjectedWorkspace(current, workspace);
+    assert.match(f.elements['project-review-detail'].textContent, /Opened.*Pending.*Not in the package/);
+    assert.match(f.elements['project-review-eyebrow'].textContent, /3 files need review/);
+    assert.match(f.elements['project-linking-alert'].textContent, /Pending-0.pptx.*2 more/);
+    assert.match(f.text(f.elements['pending-file-list']), /Needs Save/);
+    if (process.env.CRATE_OPUS_PROJECTION_EVIDENCE) {
+      fs.writeFileSync(process.env.CRATE_OPUS_PROJECTION_EVIDENCE, JSON.stringify({ project: current, workspace }, null, 2));
+    }
+  } finally { fs.rmSync(root, {recursive:true,force:true}); }
+});
+
+test('Opus correction: real main mixed asset projection drives nested renderer categories and standalone counts', async () => {
+  const root = makeTempDir();
+  try {
+    const project = await createProject('Main Projection Workspace');
+    const source = {path:path.join(root,'Working.ai'),name:'Working.ai',ext:'.ai',projectRole:'source',source:'manual-browse'};
+    const assets = ['existing','added'].map((assetOrigin,index)=>({path:path.join(root,`Image-${index}.png`),name:`Image-${index}.png`,ext:'.png',projectRole:'asset',assetOrigin,assetBaselineSourcePath:source.path}));
+    const pendingFiles = ['observed','needs-save'].map((captureState,index)=>({path:path.join(root,`Pending-${index}.pptx`),name:`Pending-${index}.pptx`,ext:'.pptx',projectRole:'source',source:'live-app',captureState,captureEvidence:{appFamily:'powerpoint'}}));
+    for(const file of [source,...assets,...pendingFiles]) fs.writeFileSync(file.path,'synthetic bytes');
+    await setProjectFiles(project.id,{files:[source,...assets],pendingFiles});
+    const workspace=await callIpcRaw('projects:get-asset-workspace',project.id),current=await getProject(project.id);
+    const parent=workspace.files.find(file=>file.name==='Working.ai');
+    assert.equal(parent.included,true);
+    for(const child of workspace.files.filter(file=>file.projectRole==='asset')) assert.deepEqual(child.requiredSourceIdentities,[parent.visualIdentity]);
+    const f=require('./opus-renderer-helpers').loadProjectedWorkspace(current,workspace);
+    const nested=f.elements['working-assets-list'].children[0].querySelector('.working-source-assets');
+    assert.equal(nested.__assetReviewVirtualState.items.length,2);
+    assert.match(f.text(nested),/Existing/);assert.match(f.text(nested),/Added/);
+    assert.equal(f.elements['added-assets-section'].classList.contains('hidden'),true);
+    assert.equal(f.elements['existing-assets-section'].classList.contains('hidden'),true);
+    if(process.env.CRATE_OPUS_MIXED_EVIDENCE) fs.writeFileSync(process.env.CRATE_OPUS_MIXED_EVIDENCE,JSON.stringify({project:current,workspace},null,2));
+    await setProjectFiles(project.id,{files:[source,...assets],pendingFiles:[]});
+    const existingWorkspace=await callIpcRaw('projects:get-asset-workspace',project.id);
+    const existingProject=await getProject(project.id);
+    const existingUi=require('./opus-renderer-helpers').loadProjectedWorkspace(existingProject,existingWorkspace);
+    assert.equal(existingUi.elements['asset-review-batch-controls'].parentElement,existingUi.elements['existing-batch-slot']);
+    assert.equal(existingUi.elements['existing-assets-section'].classList.contains('hidden'),true);
+    if(process.env.CRATE_OPUS_EXISTING_EVIDENCE) fs.writeFileSync(process.env.CRATE_OPUS_EXISTING_EVIDENCE,JSON.stringify({project:existingProject,workspace:existingWorkspace},null,2));
+    await setProjectFiles(project.id,{files:[source,...assets],pendingFiles});
+    await callIpcRaw('projects:get-asset-workspace',project.id);
+
+    const logical={...assets[0],source:'scan-on-save-embedded',embedded:true,parentPsd:source.path};
+    const logicalProject={...current,files:[source,logical]};
+    const projected=await metadataTestHooks.createRendererFilePresentation(logicalProject,logical);
+    assert.deepEqual(projected.requiredBy,[]);
+    assert.equal(projected.requiredSourceIdentities,undefined,'logical PSD resources follow the authoritative requiredBy guard');
+    const excluded=await callIpcRaw('projects:set-working-source-selection',project.id,parent.visualIdentity,{action:'exclude',expectedRevision:parent.selectionRevision});
+    assert.equal(excluded.success,true);
+    const excludedWorkspace=await callIpcRaw('projects:get-asset-workspace',project.id);
+    const excludedParent=excludedWorkspace.files.find(file=>file.name==='Working.ai');
+    const restored=await callIpcRaw('projects:set-working-source-selection',project.id,excludedParent.visualIdentity,{action:'restore',expectedRevision:excludedParent.selectionRevision});
+    assert.equal(restored.success,true);
+    fs.unlinkSync(source.path);
+    fs.unlinkSync(assets[0].path);
+    const blockedWorkspace=await callIpcRaw('projects:get-asset-workspace',project.id);
+    assert.equal(blockedWorkspace.workingSourceSelectionBlocked,true);
+    const blockedProject=await getProject(project.id);
+    const blockedUi=require('./opus-renderer-helpers').loadProjectedWorkspace(blockedProject,blockedWorkspace);
+    assert.match(blockedUi.elements['project-package-warning'].textContent,/Package blocked/);
+    assert.doesNotMatch(blockedUi.elements['project-linking-alert'].textContent,/Package blocked|verification/);
+    if(process.env.CRATE_OPUS_BLOCKED_EVIDENCE) fs.writeFileSync(process.env.CRATE_OPUS_BLOCKED_EVIDENCE,JSON.stringify({project:blockedProject,workspace:blockedWorkspace},null,2));
+    const zero=await createProject('Empty Main Projection');
+    const zeroWorkspace=await callIpcRaw('projects:get-asset-workspace',zero.id);
+    if(process.env.CRATE_OPUS_ZERO_EVIDENCE) fs.writeFileSync(process.env.CRATE_OPUS_ZERO_EVIDENCE,JSON.stringify({project:await getProject(zero.id),workspace:zeroWorkspace},null,2));
+
+
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('Opus correction: actual pending projections preserve capture copy across registered source formats', async () => {
+  const root=makeTempDir();
+  try {
+    const project=await createProject('Cross Format Pending');
+    const extensions=['ai','ait','psd','psb','indd','idml','prproj','aep','aet','pptx','ppt','key','fig','sketch','xd','afdesign','afphoto','afpub','pxd','pdf','svg'];
+    for(const ext of extensions) for(const captureState of ['observed','needs-save']) {
+      const file={path:path.join(root,`Pending.${ext}`),name:`Pending.${ext}`,ext:'.'+ext,projectRole:'source',source:'live-app',captureState};
+      fs.writeFileSync(file.path,'synthetic bytes');await setProjectFiles(project.id,{pendingFiles:[file]});
+      const workspace=await callIpcRaw('projects:get-asset-workspace',project.id),current=await getProject(project.id);
+      assert.equal(Object.hasOwn(workspace.pendingFiles[0],'captureState'),false);
+      const f=require('./opus-renderer-helpers').loadProjectedWorkspace(current,workspace);
+      assert.match(f.elements['project-review-detail'].textContent,captureState==='observed'?/Opened.*Pending/:/Save to make package-ready/,ext);
+    }
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});

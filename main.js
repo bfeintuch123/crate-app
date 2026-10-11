@@ -5188,6 +5188,11 @@ async function createRendererFilePresentation(project, file, membership = getWor
     appFamily,
     sourceName,
     ...(figmaSourceIdentity ? { figmaSourceIdentity } : {}),
+    ...(!isScanOnSaveEmbeddedPsdFile(file) && membership.requiredByPath?.get(normalizeTrackedFilePath(file?.path))?.sources.size ? {
+      // Presentation-only grouping uses existing dependency identities, never names.
+      requiredSourceIdentities: [...membership.requiredByPath.get(normalizeTrackedFilePath(file.path)).sources.values()]
+        .map(source => createProjectFileVisualIdentity(project.id, source)).filter(Boolean),
+    } : {}),
     assetOrigin: ASSET_ORIGINS.has(file?.assetOrigin) ? file.assetOrigin : null,
     projectRole: PROJECT_FILE_ROLES.has(file?.projectRole) ? file.projectRole : inferProjectFileRole(file),
     protectedSource: isProjectAssetBaselineSource(file),

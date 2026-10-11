@@ -891,7 +891,7 @@ test('unexpected workspace refresh exception keeps packaging blocked instead of 
 test('unavailable workspace never claims working-file readiness or package inclusion in either summary', async () => {
   const f = setup(); f.crate.getAssetWorkspace = async () => { throw new Error('unavailable'); };
   await f.renderer.renderFiles();
-  for (const id of ['asset-review-summary', 'asset-review-footer-summary']) {
+  for (const id of ['asset-review-footer-summary']) {
     assert.match(f.elements[id].textContent, /selection and verification unavailable/);
     assert.doesNotMatch(f.elements[id].textContent, /ready|included|selected/i);
   }
@@ -905,7 +905,7 @@ test('tracked Figma working source remains counted independently of physical sel
   assert.equal(f.elements['working-assets-count'].textContent, '1');
   assert.equal(f.elements['project-file-count'].textContent, '1');
   assert.match(f.elements['working-source-summary'].textContent, /1 tracked Figma working file/);
-  assert.match(f.elements['asset-review-summary'].textContent, /1 Figma Working File tracked/);
+  assert.match(f.elements['asset-review-footer-summary'].textContent, /1 Figma Working File tracked/);
   assert.match(getElementTreeText(f.elements['working-assets-list']), /Synthetic Figma/);
   assert.equal(buttonFor(f.elements['working-assets-list'], 'Exclude'), undefined);
 });
