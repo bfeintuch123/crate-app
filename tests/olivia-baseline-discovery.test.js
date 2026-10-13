@@ -609,6 +609,13 @@ function baselineCases() {
           const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
           assert.equal(workspace.files.find(row => row.name === 'B.ai').watchCoverage.status, 'cap-limited');
           assert.equal(watcherRecords.at(-1).addedPaths.has(b), false);
+          const held = await callIpcRaw('projects:prepare-package-review', f.project.id);
+          assert.equal(held.error, 'working_file_choice_required');
+          assert.deepEqual(held.workingFileChoices.choices.map(row => row.source.name), ['B.ai']);
+          const card = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices[0];
+          assert.ok(card.ready);
+          assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+            { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
           assert.ok((await callIpcRaw('projects:prepare-package-review', f.project.id)).token, 'cap alone preserves current saved-source package eligibility');
           console.log('V23_MANUAL_CAP_RECONCILED ' + JSON.stringify({ admission: 'Add Files', priorExactPaths: 256,
             BAccepted: true, BScanned: true, coverage: 'cap-limited', validPackageReview: true, nativeDelivery: 'unverified' }));
@@ -671,6 +678,14 @@ function baselineCases() {
         assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
         assert.equal(current().assetBaseline.status, 'decision-required');
         assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
+        // These independent sources are intentional Keep both decisions, not
+        // inferred successors. Refetch each revision after the preceding choice.
+        for (const name of ['C.ai', 'D.ai']) {
+          const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === name);
+          assert.ok(entry?.ready, JSON.stringify(entry));
+          assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+            { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+        }
         const baseline = structuredClone(current().assetBaseline);
         const aBytes = fs.readFileSync(a.source);
         const independent = JSON.stringify([c, d].map(row => ({ file: current().files.find(file => file.path === row.source),
@@ -700,15 +715,15 @@ function baselineCases() {
         assert.deepEqual(current().assetBaseline, baseline);
         f.state.opened = true; await f.live(); clearTrackedTimers();
         const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
-        const pair = workspace.sourceContinuation.candidates.find(item => item.predecessor.name === 'A.ai' && item.successor.name === 'B.ai');
-        if (pair) {
-          const result = await callIpcRaw('projects:resolve-working-source-continuation', f.project.id,
-            { pairIdentity: pair.pairIdentity, evidenceIdentity: pair.evidenceIdentity, expectedRevision: pair.revision,
-              predecessorSelectionRevision: pair.predecessor.selectionRevision, successorSelectionRevision: pair.successor.selectionRevision, choice: 'replace' });
-          assert.equal(result.success, true, JSON.stringify(result));
-        } else await choose(a.source, 'exclude');
-        assert.equal(!!pair, admission === 'ordinary');
-        console.log('V22_EXPLICIT_CHOICE ' + JSON.stringify({ location, admission, route: pair ? 'Replace' : 'Exclude working-role fallback' }));
+        const explicit = workspace.workingFileChoices.choices.find(item => item.source.name === 'B.ai');
+        assert.ok(explicit?.ready, 'new admitted B presents a verified neutral choice');
+        assert.equal(workspace.sourceContinuation.candidates.length, 0, 'no duplicate inferred pair');
+        const predecessor = explicit.predecessors.find(item => item.name === 'A.ai');
+        assert.ok(predecessor);
+        const result = await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          {id:explicit.id,revision:explicit.revision,choice:'replace',predecessorIdentity:predecessor.visualIdentity});
+        assert.equal(result.success,true,JSON.stringify(result));
+        console.log('V22_EXPLICIT_CHOICE ' + JSON.stringify({location,admission,route:'owner-selected predecessor'}));
         const selected = await sourceNames();
         assert.ok(selected.includes('A.ai'), 'C requires A as dependency');
         for (const name of ['B.ai', 'C.ai', 'D.ai', 'Shared.png']) assert.ok(selected.includes(name), name);
@@ -719,12 +734,13 @@ function baselineCases() {
           source.startsWith(root + path.sep) && path.relative(root, source).split(path.sep).length <= watch.options.depth + 1));
         assert.equal(covered(b.source), true, 'accepted B needs current exact subscription outside default roots');
         const before = structuredClone(metadataTestHooks.getWorkingSourceVerification(current(), bRow));
-        f.state.modified = true; await f.live(); clearTrackedTimers();
+        f.state.modifiedBySource.set(b.source, true); await f.live(); clearTrackedTimers();
         assert.equal(metadataTestHooks.getWorkingSourceVerification(current(), bRow).sourceFingerprint, before.sourceFingerprint,
           'unsaved live observation does not refresh saved dependencies');
-        f.state.modified = false;
+        f.state.modifiedBySource.set(b.source, false);
         const x = path.join(directory, 'X.png'); fs.writeFileSync(x, 'new linked X');
         write(b.source, [a.link, shared, x]);
+        await f.live(); clearTrackedTimers(); // Fresh per-document clean evidence; C/D were never dirty.
         const savedDigest = digest(b.source);
         await emitWatcher('change', b.source, fs.statSync(b.source));
         await waitForCondition(() => metadataTestHooks.getWorkingSourceVerification(current(), bRow)?.sourceFingerprint === savedDigest,
@@ -894,7 +910,7 @@ function baselineCases() {
       if (malformed) fs.writeFileSync(p.source, '%PDF-1.7\n' + p.link + '\nmissing EOF');
       else writeSyntheticAiFile(p.source, p.link);
     }
-    const state = { opened, modified, descriptor, visible: sources };
+    const state = { opened, modified, modifiedBySource: new Map(), descriptor, visible: sources };
     const reads = new Map(paths.map(p => [p.source, 0]));
     const gates = new Map();
     const entered = new Set();
@@ -914,8 +930,8 @@ function baselineCases() {
         if (!state.opened) return { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
         const visible = paths.slice(0, state.visible);
         return { stdout: visible.map((p, i) =>
-          `DOC\t${p.source}\t${path.basename(p.source)}\t${state.modified}\t${i === 0}\n` +
-          (structuredLinks ? `LINK\t${p.source}\t${path.basename(p.source)}\t${p.link}\t${state.modified}\t${i === 0}\n` : '')
+          `DOC\t${p.source}\t${path.basename(p.source)}\t${state.modifiedBySource.get(p.source) ?? state.modified}\t${i === 0}\n` +
+          (structuredLinks ? `LINK\t${p.source}\t${path.basename(p.source)}\t${p.link}\t${state.modifiedBySource.get(p.source) ?? state.modified}\t${i === 0}\n` : '')
         ).join('') + `COMPLETE\t${visible.length}\t${structuredLinks ? visible.length : 0}\n` };
       }
       if ((command === '/bin/ps' && args.includes('pid=')) ||
@@ -2256,6 +2272,14 @@ function baselineCases() {
       assert.equal(partial.assetBaseline.status, 'awaiting-first-scan', 'partial snapshot must remain immutable');
       // One triggered baseline read plus the existing package-time raw-link
       // and double-check reads; unchanged live polls must add no further reads.
+
+      // Explicitly retain the independently admitted second source.
+      {
+        const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === 'Design_1.ai');
+        assert.ok(entry?.ready, JSON.stringify(entry));
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
       await assertComplete(f, 3);
       assert.equal(f.count(1), 3);
       for (let i = 0; i < 3; i++) await f.live();
@@ -2327,6 +2351,14 @@ function baselineCases() {
       assert.equal(partial.files.some(row => row.path === f.paths[0].link), true);
       assert.equal(partial.files.some(row => row.path === f.paths[1].link), false);
       b.release(); await scan;
+
+      // Explicitly retain the independently admitted second source.
+      {
+        const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === 'Design_1.ai');
+        assert.ok(entry?.ready, JSON.stringify(entry));
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
       await assertComplete(f);
       assert.equal(f.count(1), 1);
       assert.equal(partial.assetBaseline.status, 'awaiting-first-scan');
@@ -2455,6 +2487,14 @@ function baselineCases() {
     const f = await fixture({ sources: 2 });
     try {
       f.state.opened = true; await f.live();
+
+      // Explicitly retain the independently admitted second source.
+      {
+        const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === 'Design_1.ai');
+        assert.ok(entry?.ready, JSON.stringify(entry));
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
       await assertComplete(f);
       const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
       fs.writeFileSync(f.paths[0].source, fs.readFileSync(f.paths[0].source, 'utf8')
@@ -2487,6 +2527,14 @@ function baselineCases() {
     const f = await fixture({ sources: 2 });
     try {
       f.state.opened = true; await f.live();
+
+      // Explicitly retain the independently admitted second source.
+      {
+        const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === 'Design_1.ai');
+        assert.ok(entry?.ready, JSON.stringify(entry));
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
       await assertComplete(f);
       const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
       fs.writeFileSync(f.paths[0].source, fs.readFileSync(f.paths[0].source, 'utf8')
@@ -2563,7 +2611,15 @@ function baselineCases() {
   baselineTest('working selection: excluding one source preserves untouched sibling readiness in the real workspace and review', async () => {
     const f = await fixture({ sources: 2 });
     try {
-      f.state.opened = true; await f.live(); await assertComplete(f);
+      f.state.opened = true; await f.live();
+      // Explicitly retain the independently admitted second source.
+      {
+        const entry = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).workingFileChoices.choices.find(row => row.source.name === 'Design_1.ai');
+        assert.ok(entry?.ready, JSON.stringify(entry));
+        assert.equal((await callIpcRaw('projects:resolve-working-file-choice', f.project.id,
+          { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+      }
+      await assertComplete(f);
       await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
       const workspace = await callIpcRaw('projects:get-asset-workspace', f.project.id);
       const row = workspace.files.find(file => file.name === 'Design_0.ai');

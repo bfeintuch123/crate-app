@@ -1812,7 +1812,7 @@ test('Review Assets has one action in the review card and stays usable with zero
   assert.equal(vm.runInContext('state.assetReviewFilter', renderer), 'excluded');
   assert.equal(vm.runInContext('state.assetReviewQuery', renderer), 'logo');
   assert.equal(assetFilters[4].getAttribute('aria-pressed'), 'true');
-  document.querySelector('#btn-review-assets-back').click();
+  document.querySelector('#btn-review-assets-continue').click();
   assert.equal(document.activeElement, opener);
   assert.equal(elements['project-dashboard'].classList.contains('hidden'), false);
 });
@@ -5605,7 +5605,8 @@ test('navigation uses Projects, Quick Package, and Project Workspace consistentl
     visibleHtml,
     /<button(?=[^>]*data-tab="projects")[^>]*>\s*Projects\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="current-project")[^>]*>\s*Project Workspace\s*<\/button>[\s\S]*<button(?=[^>]*data-tab="quick-package")[^>]*>\s*Quick Package\s*<\/button>/
   );
-  assert.match(visibleHtml, /id="btn-review-assets-back">&lsaquo; Project Workspace<\/button>/);
+  assert.doesNotMatch(visibleHtml, /id="btn-review-assets-back"/);
+  assert.match(visibleHtml, /id="btn-review-assets-continue"/);
   assert.equal(visibleHtml.includes('Current Project'), false);
 });
 

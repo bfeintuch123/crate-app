@@ -723,6 +723,15 @@
         </div>
 
         <div id="files-view" class="hidden">
+          <details class="working-file-support">
+            <summary>Working-file choices and app coverage</summary>
+            <p>Crate offers a choice after a new saved working file is added and verified in this project. Choose the file to replace yourself. Until you choose, both files stay selected and packaging is blocked. Opened files and files needing a save still need review first.</p>
+            <p>Project scans cover Illustrator (.ai), Photoshop (.psd), InDesign (.indd, .idml), XD, Sketch, Affinity Designer/Photo/Publisher, Pixelmator (.pxd), PowerPoint (.pptx, .ppt), Keynote (.key), local Figma (.fig), and explicitly added PDFs. Verification and automatic discovery vary by app. InDesign may need access to the open document; failed verification keeps the choice unavailable.</p>
+            <p>If a saved file does not appear, use Add Files. Save As into another folder, cloud-only documents, unavailable volumes, and unobserved app activity may not be discovered. Existing source saves do not create a second working-file choice.</p>
+            <p>Figma cloud currently supports one linked file per project. To keep two cloud files, use separate projects. Replacing the link changes this project's tracked cloud file. Local .fig files use the saved-file route.</p>
+            <p>Premiere, After Effects, Illustrator templates, and Photoshop large documents have Quick Package routes, without ongoing project choices. Word, Excel, Pages, Numbers, VS Code, .pptm and .keynote do not have a verified native-document choice route. PDF and image editors do not identify working documents automatically; add supported PDFs or individual assets explicitly. Quick Package is a separate one-time workflow.</p>
+          </details>
+          <section id="working-file-choices" class="working-file-choices hidden" aria-label="New working files"></section>
           <div class="project-dashboard" id="project-dashboard">
             <header class="project-dashboard-header">
               <div>
@@ -793,7 +802,6 @@
           </div>
 
           <section class="asset-review-workspace hidden" id="asset-review-workspace" aria-labelledby="asset-review-heading">
-            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Project Workspace</button>
             <div class="asset-review-header">
               <div>
                 <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
@@ -1218,7 +1226,7 @@
           <div class="form-field">
             <label class="app-label" for="edit-figma-url">Replace Figma URL (optional)</label>
             <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="edit-figma-url-help" style="width:100%;box-sizing:border-box;">
-            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link.</div>
+            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link. One cloud file is supported per project. To keep both cloud files, create a separate project for the new link.</div>
           </div>
           <div class="form-field">
             <label class="app-label" for="edit-figma-scope">Scope</label>

@@ -442,6 +442,7 @@ test('main window uses normal macOS app lifecycle', async () => {
       'projects:prepare-package-review',
       'projects:reject-pending',
       'projects:remove-file',
+      'projects:resolve-working-file-choice',
       'projects:resolve-working-source-continuation',
       'projects:select-output',
       'projects:set-existing-assets-decision',

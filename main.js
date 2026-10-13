@@ -2387,6 +2387,60 @@ function recordLiveEvidence(project, fileEntry, classification) {
     strongestState: LIVE_CAPTURE_STATES.IGNORED,
     observations: [],
   };
+  // Dirty editor state is a durable source obligation, independent of the
+  // latest observation and the bounded evidence history. Only a trusted clean
+  // document observation of this same physical source may discharge it.
+  const sourceFile = [...(project.files || []), ...(project.pendingFiles || [])].find(file =>
+    normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(fileEntry.path)) || fileEntry;
+  const routeKey = getAssetBaselineSourceRecoveryRouteKey(project, sourceFile);
+  const identity = getExplicitWorkingFileIdentity(project, sourceFile);
+  const holds = project.workingFileDirtyHolds;
+  const validHolds = holds === undefined || (holds && holds.version === 1 && holds.records &&
+    typeof holds.records === 'object' && !Array.isArray(holds.records));
+  let dirtyChanged = false;
+  if (routeKey && isWorkingSourceFile(sourceFile) && validHolds) {
+    const records = { ...(holds?.records || {}) };
+    let migratedEvidence = holds?.migratedEvidence;
+    const trustedDocument = classification.evidence.source === 'app-opened' &&
+      classification.evidence.evidenceStrength === LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT &&
+      Object.values(LIVE_APP_OBSERVER_METHODS).includes(classification.evidence.observerMethod) &&
+      normalizeTrackedFilePath(classification.evidence.sourceDocumentPath) === normalizeTrackedFilePath(sourceFile.path);
+    const hasRecord = Object.hasOwn(records, routeKey);
+    const previous = records[routeKey];
+    const validIdentity = value => value === null || (typeof value === 'string' && /^[a-f0-9]{64}$/.test(value));
+    // Version 1 holds migrate without rebinding. Malformed/future records stay
+    // opaque vetoes; an observation must not silently repair or replace them.
+    let identities = !hasRecord ? [] : previous?.version === 1 && validIdentity(previous.identity)
+      ? [previous.identity] : previous?.version === 2 && Array.isArray(previous.identities) &&
+        previous.identities.length > 0 && previous.identities.every(validIdentity) &&
+        new Set(previous.identities).size === previous.identities.length ? [...previous.identities] : null;
+    if (identities) {
+      if (!hasRecord && (existing.latest?.needsSave === true || existing.latest?.documentModified === true) &&
+          !hasMigratedWorkingFileDirtyEvidence(holds, routeKey, existing.latest)) {
+        // A legacy observation did not retain its physical binding. Neither a
+        // new dirty observation nor today's filesystem can identify that buffer.
+        identities.push(null);
+      }
+      if (summary.needsSave === true || summary.documentModified === true) {
+        if (!identities.includes(identity || null)) identities.push(identity || null);
+        // A fresh dirty observation is a new obligation even when the ledger
+        // deduplicates its summary. Retire only this path's historical receipt.
+        if (migratedEvidence && typeof migratedEvidence === 'object' && !Array.isArray(migratedEvidence) &&
+            Object.hasOwn(migratedEvidence, routeKey)) {
+          migratedEvidence = { ...migratedEvidence }; delete migratedEvidence[routeKey]; dirtyChanged = true;
+        }
+      }
+      if (trustedDocument && summary.documentModified === false && classification.evidence.requiresSave !== true && identity) {
+        identities = identities.filter(value => value !== identity);
+      }
+      if (identities.length) {
+        const hold = { version: 2, identities };
+        if (JSON.stringify(previous) !== JSON.stringify(hold)) { records[routeKey] = hold; dirtyChanged = true; }
+      } else if (hasRecord) { delete records[routeKey]; dirtyChanged = true; }
+    }
+    if (dirtyChanged) project.workingFileDirtyHolds = { ...(holds || { version: 1 }), records,
+      ...(migratedEvidence === undefined ? {} : { migratedEvidence }) };
+  }
   // Repeated lsof/live-app observations carry a fresh timestamp but no new
   // evidence. Avoid rewriting the ledger for that semantic no-op; a changed
   // capture state, source, or relationship still falls through and persists.
@@ -2396,7 +2450,7 @@ function recordLiveEvidence(project, fileEntry, classification) {
       delete copy.observedAt;
       return JSON.stringify(copy);
     };
-    if (comparable(existing.latest) === comparable(summary)) return ledgerShapeChanged;
+    if (comparable(existing.latest) === comparable(summary)) return ledgerShapeChanged || dirtyChanged;
   }
   const currentRank = getLiveCaptureStateRank(existing.strongestState);
   const nextRank = getLiveCaptureStateRank(summary.captureRecommendation);
@@ -2646,6 +2700,12 @@ function stageLiveObservedFile(project, fileEntry, observation = {}) {
       getTrackedFileDedupKey(file) !== candidateKey &&
       normalizeTrackedFilePath(file && file.path) !== normalizedPath
     ));
+    // Initial open-file snapshots establish context, not a newly saved source.
+    if (!String(observation.reason || '').startsWith('initial-') &&
+        (classification.evidence?.savedEvidence || classification.evidence?.filesystemSaved ||
+         classification.evidence?.parserConfirmed || observation.reason === 'chokidar-add')) {
+      noteWorkingFileChoiceAdmission(project, stagedFile, observation.reason || observation.appFamily);
+    }
     project.files.push(stagedFile);
     project.files = deduplicateFiles(project.files);
     return { ...classification, changed: true, evidenceChanged, file: stagedFile };
@@ -3957,7 +4017,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
         selection.revision < Number.MAX_SAFE_INTEGER &&
         canonicalSourceCounts.get(getAssetBaselineSourceRecoveryRouteKey(project, file)) === 1 ? { selectionRecovery: {
           version: 1, reason: selection.reason, expectedRevision: selection.revision,
-          actions: ['exclude', ...(getWorkingSourceContinuationPhysicalIdentity(project, file) ? ['restore'] : [])],
+          actions: ['exclude', ...(getExplicitWorkingFileIdentity(project, file) ? ['restore'] : [])],
         } } : {}),
       effectiveRole: selectedSource ? 'source' : 'asset', verificationStatus, verificationRequired,
       requiredBy: requiredBy.map(item => sanitizeRendererSourceName(item.name || path.basename(item.path)) || 'Working file') });
@@ -4294,7 +4354,7 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       }
       const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
       if (!key) return { success: false, error: 'working_source_identity_unavailable' };
-      if (recoverable && request.action === 'restore' && !getWorkingSourceContinuationPhysicalIdentity(project, file)) {
+      if (recoverable && request.action === 'restore' && !getExplicitWorkingFileIdentity(project, file)) {
         return { success: false, error: 'working_source_identity_unavailable' };
       }
       // Recovery of unchanged A after B changes can retain A's current receipt.
@@ -4344,6 +4404,366 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       verificationStatus: getWorkingSourceVerification(project, currentFile)?.status || 'unavailable',
       semanticCounts: getWorkingSourceMembership(project).counts };
   } finally { operation?.close(); }
+}
+
+// New-source choices describe explicit project intent, never inferred Save As identity.
+// Producers retain their own admission policy; only admitted saved physical sources
+// with an ordinary verification receipt may reach an enabled choice.
+function noteWorkingFileChoiceAdmission(project, file, route) {
+  if (!isWorkingSourceFile(file) || file.virtual === true ||
+      !SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())) return;
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  if (!key || project.workingFileChoices?.records?.[key] || (project.files || []).some(row =>
+    getAssetBaselineSourceRecoveryRouteKey(project, row) === key)) return;
+  const priorKeys = [...new Set((project.files || []).filter(row => isWorkingSourceFile(row) &&
+    row.virtual !== true && getWorkingSourceSelection(project, row).state === 'selected')
+    .map(row => getAssetBaselineSourceRecoveryRouteKey(project, row)).filter(value => value && value !== key))];
+  if (!priorKeys.length) return;
+  const state = project.workingFileChoices;
+  if (getWorkingFileChoiceObligations(project).invalid) { project.workingFileChoiceLimit = true; return; }
+  const records = { ...(state?.records || {}) };
+  // Acknowledged receipts may be retired; never discard an unanswered choice.
+  if (Object.keys(records).length >= 128) {
+    const acknowledged = Object.keys(records).find(id => records[id]?.acknowledged === true);
+    if (acknowledged) delete records[acknowledged];
+  }
+  records[key] = { version: 1, id: crypto.randomUUID(), priorKeys, route, acknowledged: false };
+  project.workingFileChoices = { version: 1, records };
+}
+
+// The canonical hold is independent of scoped/bounded UI projection. Storage is
+// tied to admitted project membership; only acknowledged records can be retired.
+// A legacy overflow or malformed ledger requires an explicit rebuild, never an
+// inferred Keep both. Display at most 128 cards and drain by recorded decisions.
+function getWorkingFileChoiceObligations(project) {
+  const state = project?.workingFileChoices;
+  let invalid = project?.workingFileChoiceLimit !== undefined && project.workingFileChoiceLimit !== false;
+  if (state === undefined) return { invalid, pending: [], blocked: invalid };
+  if (!state || state.version !== 1 || !state.records || typeof state.records !== 'object' || Array.isArray(state.records)) {
+    return { invalid: true, pending: [], blocked: true };
+  }
+  const ids = new Set(), byKey = new Map();
+  for (const file of project.files || []) {
+    if (!isWorkingSourceFile(file) || file.virtual === true) continue;
+    const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+    byKey.set(key, byKey.has(key) ? null : file);
+  }
+  const pending = [];
+  for (const [key, event] of Object.entries(state.records)) {
+    const valid = /^[a-f0-9]{64}$/.test(key) && event && event.version === 1 &&
+      typeof event.id === 'string' && event.id.length > 0 && event.id.length <= 64 && !ids.has(event.id) &&
+      typeof event.acknowledged === 'boolean' && typeof event.route === 'string' && event.route.length <= 64 &&
+      Array.isArray(event.priorKeys) && event.priorKeys.every(value => typeof value === 'string' &&
+        /^[a-f0-9]{64}$/.test(value) && value !== key) && new Set(event.priorKeys).size === event.priorKeys.length;
+    if (!valid) { invalid = true; continue; }
+    ids.add(event.id);
+    if (event.acknowledged) continue;
+    const file = byKey.get(key);
+    if (!file) { invalid = true; continue; }
+    // Explicit exclusion is a decision about membership. Restoring the source
+    // reactivates its unanswered obligation; no silent acknowledgement occurs.
+    if (getWorkingSourceSelection(project, file).state !== 'excluded') pending.push([key, event]);
+  }
+  return { invalid, pending, blocked: invalid || pending.length > 0 };
+}
+
+function getWorkingFileChoiceRecoveryRevision(project) {
+  return crypto.createHash('sha256').update(JSON.stringify([project.id, accountSession?.generation,
+    getActiveWatchingActivationToken(project.id), getPackageSelectionInputSignature(project)])).digest('hex');
+}
+
+function getExplicitWorkingFileIdentity(project, file) {
+  if (!file || file.virtual === true || !isWorkingSourceFile(file) ||
+      !path.isAbsolute(file.path || '') || !SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path).toLowerCase())) return null;
+  try {
+    const stat = fs.lstatSync(file.path, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.birthtimeNs <= 0n) return null;
+    return getAssetBaselineSourcePhysicalIdentityHash(project, stat);
+  } catch (_) { return null; }
+}
+
+// A receipt accounts for one exact historical dirty summary whose obligation
+// moved with a recognized source. It is not a clean assertion or an alias veto:
+// present holds always win, and new dirty observations invalidate the receipt.
+function hasMigratedWorkingFileDirtyEvidence(state, key, latest) {
+  const receipts = state?.migratedEvidence;
+  if (!receipts || typeof receipts !== 'object' || Array.isArray(receipts) || !Object.hasOwn(receipts, key)) return false;
+  const receipt = receipts[key];
+  return receipt?.version === 1 && /^[a-f0-9]{64}$/.test(receipt.evidenceHash || '') &&
+    Object.keys(receipt).every(field => ['version', 'evidenceHash'].includes(field)) &&
+    (latest?.needsSave === true || latest?.documentModified === true) &&
+    receipt.evidenceHash === crypto.createHash('sha256').update(JSON.stringify(latest)).digest('hex');
+}
+
+function hasWorkingFileDirtyHold(project, file) {
+  const state = project.workingFileDirtyHolds;
+  if (state !== undefined && (!state || state.version !== 1 || !state.records ||
+      typeof state.records !== 'object' || Array.isArray(state.records))) return true;
+  const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+  // Retain mismatched/unavailable identity holds conservatively. Filesystem
+  // replacement alone cannot prove that an editor buffer has been saved.
+  if (state?.records && Object.hasOwn(state.records, key)) return true;
+  const latest = project.liveEvidenceLedger?.candidates?.[getLiveEvidenceKeyHash(normalizeTrackedFilePath(file.path))]?.latest;
+  return (latest?.needsSave === true || latest?.documentModified === true) &&
+    !hasMigratedWorkingFileDirtyEvidence(state, key, latest);
+}
+
+function getWorkingFileChoicePresentation(project) {
+  const obligations = getWorkingFileChoiceObligations(project);
+  const summary = { version: 1, blocked: obligations.blocked, remaining: obligations.pending.length,
+    limited: obligations.pending.length > 128, recoveryRequired: obligations.invalid,
+    recoveryRevision: obligations.invalid ? getWorkingFileChoiceRecoveryRevision(project) : null };
+  if (obligations.invalid) return { ...summary, choices: [] };
+  const files = getIllustratorScopedProjectView(project)?.files || [];
+  const byKey = new Map();
+  for (const file of files) {
+    const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
+    byKey.set(key, byKey.has(key) ? null : file);
+  }
+  const find = key => byKey.get(key);
+  const inputSignature = getPackageSelectionInputSignature(project);
+  // Only project-owned folder names are exposed, never absolute paths. Expand
+  // identical immediate folders to the shortest distinct suffix (at most four).
+  const folderParts = file => path.dirname(file.path).split(path.sep).filter(Boolean)
+    .slice(-4).map(part => (sanitizeRendererSourceName(part) || 'Folder').slice(0, 24));
+  const folderLabel = file => {
+    const parts = folderParts(file), peers = files.filter(other => other !== file &&
+      sanitizeRendererSourceName(other.name || path.basename(other.path)) === sanitizeRendererSourceName(file.name || path.basename(file.path)));
+    let depth = 1;
+    while (depth < parts.length && peers.some(other => folderParts(other).slice(-depth).join(' › ') === parts.slice(-depth).join(' › '))) depth++;
+    const label = parts.slice(-depth).join(' › ');
+    const collisions = [file, ...peers.filter(other => folderParts(other).slice(-depth).join(' › ') === label)]
+      .sort((a, b) => createProjectFileVisualIdentity(project.id, a).localeCompare(createProjectFileVisualIdentity(project.id, b)));
+    return collisions.length > 1 ? `${label} · File ${collisions.indexOf(file) + 1}` : label;
+  };
+  const present = file => ({ visualIdentity: createProjectFileVisualIdentity(project.id, file),
+    name: sanitizeRendererSourceName(file.name || path.basename(file.path)),
+    folder: folderLabel(file),
+    selectionRevision: getWorkingSourceSelection(project, file).revision });
+  const choices = [];
+  for (const [key, event] of obligations.pending) {
+    if (choices.length >= 128) break;
+    const source = find(key);
+    if (!source || getWorkingSourceSelection(project, source).state !== 'selected') continue;
+    const predecessors = event.priorKeys.map(find).filter(file => file && file !== source &&
+      getWorkingSourceSelection(project, file).state === 'selected' && getExplicitWorkingFileIdentity(project, file));
+    const receipt = getWorkingSourceVerification(project, source);
+    const identity = getExplicitWorkingFileIdentity(project, source);
+    const ready = !!identity && !hasWorkingFileDirtyHold(project, source) && ['scanned', 'no-extractor'].includes(receipt?.status) &&
+      !receipt.unresolved.length && isWorkingSourceDiskIdentityCurrent(source, receipt);
+    // Presentation tokens bind all choices, current source bytes and all package
+    // input state. Renderer text/path hints are never mutation authority.
+    const revision = crypto.createHash('sha256').update(JSON.stringify([event.id, identity, accountSession?.generation, getActiveWatchingActivationToken(project.id),
+      receipt?.sourceFingerprint, getWorkingSourceDiskIdentity(source), inputSignature,
+      predecessors.map(file => [getExplicitWorkingFileIdentity(project, file), present(file)])])).digest('hex');
+    choices.push({ id: event.id, revision, ready, source: present(source), predecessors: predecessors.map(present),
+      route: event.route, reason: ready ? null : 'saved-file-verification-required' });
+  }
+  return { ...summary, choices };
+}
+
+const workingFileChoiceOperations = new Set();
+async function resolveWorkingFileChoice(projectId, request) {
+  const keys = ['id', 'revision', 'choice', 'predecessorIdentity'];
+  if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).length !== keys.length ||
+      Object.keys(request).some(key => !keys.includes(key)) || typeof request.id !== 'string' || request.id.length > 64 ||
+      !/^[a-f0-9]{64}$/.test(request.revision || '') || !['keep-both', 'replace', 'retry', 'recover'].includes(request.choice) ||
+      (request.choice !== 'replace' ? request.predecessorIdentity !== null : typeof request.predecessorIdentity !== 'string' || request.predecessorIdentity.length > 256)) {
+    return { success: false, error: 'invalid_working_file_choice' };
+  }
+  if (workingFileChoiceOperations.has(projectId)) return { success: false, error: 'working_file_choice_busy' };
+  const operation = captureProjectOperation(projectId);
+  if (!operation) return { success: false, error: 'working_file_choice_stale' };
+  workingFileChoiceOperations.add(projectId);
+  try {
+    const project = getProjects().find(item => item.id === projectId);
+    if (request.choice === 'recover') {
+      if (request.id !== 'recovery' || !getWorkingFileChoiceObligations(project).invalid ||
+          request.revision !== getWorkingFileChoiceRecoveryRevision(project)) return { success: false, error: 'working_file_choice_stale' };
+      const recovered = mutateProject(projectId, current => {
+        if (!operation.current() || request.revision !== getWorkingFileChoiceRecoveryRevision(current)) return false;
+        const sources = (current.files || []).filter(file => isWorkingSourceFile(file) && file.virtual !== true &&
+          SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path || '').toLowerCase()));
+        const keys = sources.map(file => getAssetBaselineSourceRecoveryRouteKey(current, file));
+        if (keys.some(key => !key) || new Set(keys).size !== keys.length) return false;
+        const records = Object.fromEntries(keys.map(key => [key, { version: 1, id: crypto.randomUUID(),
+          priorKeys: keys.filter(other => other !== key), route: 'explicit-ledger-recovery', acknowledged: false }]));
+        current.workingFileChoices = { version: 1, records, recoveredFrom: request.revision };
+        delete current.workingFileChoiceLimit;
+        return true;
+      });
+      if (!recovered) return { success: false, error: 'working_file_choice_stale' };
+      invalidatePackageReviewForProject(projectId);
+      sendToRenderer('project:updated', { projectId });
+      return { success: true };
+    }
+    const choice = getWorkingFileChoicePresentation(project).choices.find(item => item.id === request.id && item.revision === request.revision);
+    if (!choice || (!choice.ready && request.choice !== 'retry') || !operation.current()) return { success: false, error: 'working_file_choice_stale' };
+    const source = resolveProjectOwnedFileVisualRecord(projectId, choice.source.visualIdentity, project);
+    if (request.choice === 'retry') {
+      // Disk verification cannot erase a retained dirty app observation. The
+      // owner must save and obtain a fresh trusted clean observation first.
+      if (hasWorkingFileDirtyHold(project, source)) return { success: false, error: 'working_file_saved_observation_required' };
+      if (!getExplicitWorkingFileIdentity(project, source)) return { success: false, error: 'working_source_identity_unavailable' };
+      const key = getAssetBaselineSourceRecoveryRouteKey(project, source);
+      const attempt = crypto.randomUUID();
+      const reserved = mutateProject(projectId, current => {
+        if (!operation.current() || !getWorkingFileChoicePresentation(current).choices.some(item =>
+          item.id === request.id && item.revision === request.revision)) return false;
+        const receipt = getWorkingSourceVerification(current, source);
+        const selection = getWorkingSourceSelection(current, source);
+        if (selection.state !== 'selected') return false;
+        current.workingSourceVerification = { ...(current.workingSourceVerification || {}), [key]: {
+          ...receipt, version: 1, status: 'pending', reason: 'verification-required', attempt,
+          selectionRevision: selection.revision, sourceIdentity: null,
+          provider: receipt?.provider || 'ordinary-scan', coverage: 'ordinary-route',
+          sourceFingerprint: receipt?.sourceFingerprint || null,
+          requiredReferences: receipt?.requiredReferences || [], unresolved: receipt?.unresolved || [],
+        } };
+        workingSourceScanLeases.get(projectId + ':' + key)?.cancel('verification-retry');
+        return true;
+      });
+      if (!reserved) return { success: false, error: 'working_file_choice_stale' };
+      invalidatePackageReviewForProject(projectId);
+      await verifyRestoredWorkingSource(projectId, source, attempt, operation);
+      if (!operation.current()) return { success: false, error: 'working_file_choice_stale' };
+      sendToRenderer('project:updated', { projectId });
+      const ready = getWorkingFileChoicePresentation(getProjects().find(item => item.id === projectId)).choices.find(item => item.id === request.id)?.ready === true;
+      return { success: ready, error: ready ? undefined : 'continuation_verification_required' };
+    }
+    const receipt = getWorkingSourceVerification(project, source);
+    const sourceIdentity = getWorkingSourceDiskIdentity(source);
+    if (!sourceIdentity || receipt?.sourceFingerprint !== await getBoundedWorkingSourceContinuationDigest(source.path, operation, sourceIdentity)) {
+      return { success: false, error: 'continuation_verification_required' };
+    }
+    const latest = getProjects().find(item => item.id === projectId);
+    if (!operation.current() || !getWorkingFileChoicePresentation(latest).choices.some(item => item.id === request.id && item.revision === request.revision && item.ready)) {
+      return { success: false, error: 'working_file_choice_stale' };
+    }
+    if (request.choice === 'replace') {
+      const predecessorPresentation = choice.predecessors.find(item => item.visualIdentity === request.predecessorIdentity);
+      const predecessor = predecessorPresentation && resolveProjectOwnedFileVisualRecord(projectId, request.predecessorIdentity, latest);
+      if (!predecessor) return { success: false, error: 'working_file_choice_stale' };
+      const successorKey = getAssetBaselineSourceRecoveryRouteKey(latest, source);
+      const predecessorKey = getAssetBaselineSourceRecoveryRouteKey(latest, predecessor);
+      const predecessorIdentity = getExplicitWorkingFileIdentity(latest, predecessor), successorIdentity = getExplicitWorkingFileIdentity(latest, source);
+      if (!predecessorIdentity || !successorIdentity || predecessorIdentity === successorIdentity) return { success: false, error: 'working_file_choice_stale' };
+      const pairIdentity = crypto.createHash('sha256').update(JSON.stringify(['owner-selected', request.id, predecessorKey, successorKey, predecessorIdentity, successorIdentity])).digest('hex');
+      const pair = mutateProject(projectId, current => {
+        if (!operation.current() || !getWorkingFileChoicePresentation(current).choices.some(item => item.id === request.id && item.revision === request.revision)) return null;
+        const state = current.workingSourceContinuations;
+        if (state !== undefined && (state?.version !== 1 || !state.pairs || typeof state.pairs !== 'object' || Array.isArray(state.pairs))) return null;
+        if (!state?.pairs[pairIdentity] && Object.keys(state?.pairs || {}).length >= 256) return null;
+        const value = { version: 1, predecessorKey, successorKey, predecessorIdentity, successorIdentity,
+          evidenceIdentity: crypto.createHash('sha256').update(crypto.randomUUID()).digest('hex'), revision: 1,
+          classification: 'owner-selected', choiceEventId: request.id, decision: null };
+        current.workingSourceContinuations = { version: 1, pairs: { ...(state?.pairs || {}), [pairIdentity]: value } };
+        return value;
+      });
+      if (!pair) return { success: false, error: 'working_file_choice_stale' };
+      const result = await resolveWorkingSourceContinuation(projectId, { pairIdentity, evidenceIdentity: pair.evidenceIdentity,
+        expectedRevision: pair.revision, predecessorSelectionRevision: predecessorPresentation.selectionRevision,
+        successorSelectionRevision: choice.source.selectionRevision, choice: 'replace' });
+      // The continuation transaction commits this exact acknowledgement with
+      // both selections. Never acknowledge again after its awaited preparation.
+      return result;
+    }
+    // Keep both changes no selection and rechecks the original ready revision.
+    const acknowledged = mutateProject(projectId, current => {
+      if (!operation.current()) return false;
+      if (request.choice === 'keep-both' && !getWorkingFileChoicePresentation(current).choices.some(item =>
+        item.id === request.id && item.revision === request.revision && item.ready)) return false;
+      for (const event of Object.values(current.workingFileChoices?.records || {})) {
+        if (event.id === request.id) { event.acknowledged = true; return true; }
+      }
+      return false;
+    });
+    if (!acknowledged) return { success: false, error: 'working_file_choice_stale' };
+    sendToRenderer('project:updated', { projectId });
+    return { success: true };
+  } catch (_) { return { success: false, error: 'continuation_verification_required' }; }
+  finally { workingFileChoiceOperations.delete(projectId); operation.close(); }
+}
+
+// Presentation extraction can reuse a prior materialized row. Record exact byte
+// matches even when dedup creates no new row. These receipts are display-only.
+function getWorkingMediaDiskIdentity(filePath) {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return null;
+    return { ...getAddFilesSourceIdentity(stat), ctimeMs: stat.ctimeMs };
+  } catch (_) { return null; }
+}
+
+function createWorkingMediaAttribution(project, sourcePath) {
+  const source = (project.files || []).find(file => file.path === sourcePath && isWorkingSourceFile(file));
+  const key = source && getAssetBaselineSourceRecoveryRouteKey(project, source);
+  const sourceIdentity = source && getWorkingSourceDiskIdentity(source);
+  const byDigest = new Map(), matched = new Map();
+  const same = (a, b) => a && b && Object.keys(a).every(key => a[key] === b[key]);
+  return {
+    candidate(filePath, data, before) {
+      if (!key || byDigest.size >= 8192) return;
+      const identity = getWorkingMediaDiskIdentity(filePath);
+      if (!same(before, identity)) return;
+      const digest = crypto.createHash('sha256').update(data).digest('hex');
+      const rows = byDigest.get(digest) || [];
+      rows.push({ path: filePath, identity }); byDigest.set(digest, rows);
+    },
+    used(data) {
+      if (!key) return;
+      for (const row of byDigest.get(crypto.createHash('sha256').update(data).digest('hex')) || []) {
+        if (matched.size < 8192) matched.set(row.path, row);
+      }
+    },
+    next(current) {
+      if (!key || !same(sourceIdentity, getWorkingSourceDiskIdentity({ path: sourcePath }))) return null;
+      const canonical = current.files?.find(file => file.path === sourcePath && isWorkingSourceFile(file));
+      if (!canonical || getAssetBaselineSourceRecoveryRouteKey(current, canonical) !== key) return null;
+      const receipt = { sourceIdentity, targets: [...matched.values()].sort((a, b) => a.path.localeCompare(b.path)) };
+      const previous = current.workingFileMediaAttribution?.[key];
+      const normalized = previous && { sourceIdentity: previous.sourceIdentity,
+        targets: [...(previous.targets || [])].sort((a, b) => a.path.localeCompare(b.path)) };
+      return JSON.stringify(normalized) === JSON.stringify(receipt) ? null : receipt;
+    },
+    publish(current) {
+      const receipt = this.next(current);
+      if (!receipt) return false;
+      current.workingFileMediaAttribution = { ...(current.workingFileMediaAttribution || {}), [key]: receipt };
+      return true;
+    },
+  };
+}
+
+// Display current verified relationships independently from historical capture
+// labels and from the conservative package-obligation graph. No selection change.
+function getCurrentWorkingFileAttribution(project) {
+  const files = getIllustratorScopedProjectView(project)?.files || [];
+  const edges = new Map(), result = new Map();
+  for (const file of files.filter(isWorkingSourceFile)) {
+    const receipt = getWorkingSourceVerification(project, file);
+    if (!['scanned', 'no-extractor'].includes(receipt?.status) || !isWorkingSourceDiskIdentityCurrent(file, receipt)) continue;
+    const media = project.workingFileMediaAttribution?.[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+    const mediaPaths = media && isWorkingSourceDiskIdentityCurrent(file, media) && Array.isArray(media.targets)
+      ? media.targets.slice(0, 8192).filter(row => {
+        const identity = row && typeof row.path === 'string' && getWorkingMediaDiskIdentity(row.path);
+        return identity && row.identity && Object.entries(identity).every(([key, value]) => row.identity[key] === value);
+      }).map(row => row.path) : [];
+    edges.set(normalizeTrackedFilePath(file.path), [...(receipt.requiredReferences || []).map(ref => ref.path),
+      ...(receipt.requiredEmbeddedOutputs || []).map(output => output.path), ...mediaPaths]);
+  }
+  for (const root of files.filter(file => isWorkingSourceFile(file) && getWorkingSourceSelection(project, file).state === 'selected')) {
+    const rootPath = normalizeTrackedFilePath(root.path), seen = new Set([rootPath]), queue = [rootPath];
+    for (let i = 0; i < queue.length; i++) for (const target of edges.get(queue[i]) || []) {
+      const key = normalizeTrackedFilePath(target);
+      if (!key || seen.has(key)) continue;
+      seen.add(key); queue.push(key);
+      const parents = result.get(key) || new Map();
+      parents.set(createProjectFileVisualIdentity(project.id, root), sanitizeRendererSourceName(root.name || path.basename(root.path)));
+      result.set(key, parents);
+    }
+  }
+  return result;
 }
 
 // Adapter v1 is bound to A1 444e4ef. Candidate evidence never authorizes a
@@ -4407,7 +4827,12 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     if (!project || !operation?.current()) return;
     const beforeSignature = getPackageSelectionInputSignature(project);
     const state = project.workingSourceLocators;
-    if (state !== undefined && (state?.version !== 1 || !state.records || typeof state.records !== 'object' || Array.isArray(state.records))) return;
+    if (getWorkingFileChoiceObligations(project).invalid) { project.workingFileChoiceLimit = true; return; }
+    if (state !== undefined && (!state || state.version !== 1 || !state.records ||
+        typeof state.records !== 'object' || Array.isArray(state.records) || !Array.isArray(state.aliases))) return;
+    const dirtyState = project.workingFileDirtyHolds;
+    if (dirtyState !== undefined && (!dirtyState || dirtyState.version !== 1 || !dirtyState.records ||
+        typeof dirtyState.records !== 'object' || Array.isArray(dirtyState.records))) return;
     const records = { ...(state?.records || {}) }, documentRecords = new Map();
     const sources = (project.files || []).filter(file => file.virtual !== true && isWorkingSourceFile(file) &&
       LOCAL_ADOBE_CONTINUATION_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())).slice(0, 64);
@@ -4430,6 +4855,9 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     const relocated = [], changedBytes = [], aliases = [...(state?.aliases || [])];
     const selections = { ...(project.workingSourceSelections || {}) }, verification = { ...(project.workingSourceVerification || {}) };
     const pairs = { ...(project.workingSourceContinuations?.pairs || {}) };
+    const choices = { ...(project.workingFileChoices?.records || {}) };
+    const dirtyHolds = { ...(project.workingFileDirtyHolds?.records || {}) };
+    let migratedEvidence = dirtyState?.migratedEvidence;
     let files = [...project.files];
     const destinations = [...new Set((observedPaths || []).filter(locator => typeof locator === 'string' && path.isAbsolute(locator)))].slice(0, 128);
     for (const file of sources) {
@@ -4446,6 +4874,8 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
             previous.documentIdentity === present.documentIdentity) changedBytes.push({ file, key });
         records[key] = present;
         for (const [identity, pair] of Object.entries(pairs)) {
+          // Explicit owner-selected pairs are validated in the physical domain.
+          if (pair.classification === 'owner-selected') continue;
           if (pair.predecessorKey === key && pair.predecessorIdentity === present.physicalIdentity && present.documentIdentity) pairs[identity] = { ...pair, predecessorIdentity: present.documentIdentity };
           if (pair.successorKey === key && pair.successorIdentity === present.physicalIdentity && present.documentIdentity) pairs[identity] = { ...pairs[identity], successorIdentity: present.documentIdentity };
         }
@@ -4461,8 +4891,27 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
       const newKey = getAssetBaselineSourceRecoveryRouteKey(project, moved);
       // Logical PSD children require their separate producer reconciliation.
       // Keep their true old-path obligations instead of rewriting declarations.
-      if (!newKey || selections[newKey] || verification[newKey] || records[newKey] ||
+      if (!newKey || selections[newKey] || verification[newKey] || records[newKey] || choices[newKey] || Object.hasOwn(dirtyHolds, newKey) ||
           project.files.some(row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === normalizeTrackedFilePath(file.path))) continue;
+      // A pre-hold ledger can still veto this old locator. Preserve that
+      // unbound buffer before moving the lookup keys; rename/rescan cannot
+      // prove its physical identity or that the editor saved it.
+      const legacyDirty = project.liveEvidenceLedger?.candidates?.[getLiveEvidenceKeyHash(normalizeTrackedFilePath(file.path))]?.latest;
+      if (!Object.hasOwn(dirtyHolds, key) && (legacyDirty?.needsSave === true || legacyDirty?.documentModified === true) &&
+          !hasMigratedWorkingFileDirtyEvidence(dirtyState, key, legacyDirty)) {
+        dirtyHolds[key] = { version: 2, identities: [null] };
+      }
+      // Account for history only when its hold actually moves in this same
+      // fenced transaction. Keep malformed receipt containers opaque.
+      if (Object.hasOwn(dirtyHolds, key) && (legacyDirty?.needsSave === true || legacyDirty?.documentModified === true) &&
+          (migratedEvidence === undefined || (migratedEvidence && typeof migratedEvidence === 'object' && !Array.isArray(migratedEvidence)))) {
+        migratedEvidence = { ...(migratedEvidence || {}), [key]: { version: 1,
+          evidenceHash: crypto.createHash('sha256').update(JSON.stringify(legacyDirty)).digest('hex') } };
+      }
+      if (choices[key]) { choices[newKey] = choices[key]; delete choices[key]; }
+      for (const [choiceKey, event] of Object.entries(choices)) choices[choiceKey] = { ...event,
+        priorKeys: event.priorKeys.map(prior => prior === key ? newKey : prior) };
+      if (Object.hasOwn(dirtyHolds, key)) { dirtyHolds[newKey] = dirtyHolds[key]; delete dirtyHolds[key]; }
       if (selections[key]) { selections[newKey] = selections[key]; delete selections[key]; }
       if (verification[key]) { verification[newKey] = { ...verification[key], status: 'stale', reason: 'source-locator-changed', attempt: crypto.randomUUID() }; delete verification[key]; }
       for (const [identity, pair] of Object.entries(pairs)) pairs[identity] = { ...pair,
@@ -4484,6 +4933,9 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
       latest.workingSourceLocators = nextState;
       if (relocated.length || changedBytes.length) {
         latest.files = files;
+        if (latest.workingFileChoices) latest.workingFileChoices = { ...latest.workingFileChoices, records: choices };
+        if (latest.workingFileDirtyHolds || Object.keys(dirtyHolds).length) latest.workingFileDirtyHolds = { ...(latest.workingFileDirtyHolds || { version: 1 }), records: dirtyHolds,
+          ...(migratedEvidence === undefined ? {} : { migratedEvidence }) };
         if (hasWorkingSourceSelectionState(project)) latest.workingSourceSelections = selections;
         latest.workingSourceVerification = verification;
         if (latest.workingSourceContinuations) latest.workingSourceContinuations = { ...latest.workingSourceContinuations, pairs };
@@ -4536,8 +4988,9 @@ function getCurrentWorkingSourceContinuationPair(project, pairIdentity, { allowI
   if (!predecessor || !successor || !find(project.files || [], pair.predecessorKey) ||
       !find([...(project.files || []), ...(project.pendingFiles || [])], pair.successorKey) ||
       pair.predecessorIdentity === pair.successorIdentity) return null;
-  const predecessorIdentity = getWorkingSourceContinuationIdentity(project, predecessor);
-  const successorIdentity = getWorkingSourceContinuationIdentity(project, successor);
+  const identityForPair = pair.classification === 'owner-selected' ? getExplicitWorkingFileIdentity : getWorkingSourceContinuationIdentity;
+  const predecessorIdentity = identityForPair(project, predecessor);
+  const successorIdentity = identityForPair(project, successor);
   const identityCurrent = pair.predecessorIdentity === predecessorIdentity && pair.successorIdentity === successorIdentity;
   if (!identityCurrent && !allowIdentityMismatch) return null;
   return { pair, predecessor, successor, successorAdmission: accepted.includes(successor) ? 'accepted' : 'pending', identityCurrent,
@@ -4562,6 +5015,7 @@ function getWorkingSourceContinuationPresentation(project, packageFiles = null) 
     // Presentation retains an unresolved hold when the original pair's rows
     // still exist but their identity cannot be rebound. This relaxed lookup
     // never authorizes a decision: the receiver requires the strict lookup.
+    if (project.workingSourceContinuations.pairs[identity]?.classification === 'owner-selected' && !project.workingSourceContinuations.pairs[identity].decision) continue;
     const current = getCurrentWorkingSourceContinuationPair(project, identity, { allowIdentityMismatch: true });
     if (!current || (current.identityCurrent && isWorkingSourceContinuationDecisionCurrent(project, current))) continue;
     // Only unresolved evidence carries this fallback hold. A prior Replace's
@@ -4600,6 +5054,7 @@ function recordWorkingSourceContinuationCandidate(projectId, predecessorPath, su
       const successor = find([...(scoped?.files || []), ...(scoped?.pendingFiles || [])], successorPath);
       if (!predecessor || !successor || predecessor === successor) return { changed: false };
       const predecessorKey = getAssetBaselineSourceRecoveryRouteKey(project, predecessor), successorKey = getAssetBaselineSourceRecoveryRouteKey(project, successor);
+      if (project.workingFileChoices?.records?.[successorKey]) return { changed: false };
       const predecessorIdentity = getWorkingSourceContinuationIdentity(project, predecessor), successorIdentity = getWorkingSourceContinuationIdentity(project, successor);
       if (!predecessorIdentity || !successorIdentity || predecessorIdentity === successorIdentity ||
           getWorkingSourceSelection(project, predecessor).state !== 'selected' ||
@@ -4680,6 +5135,11 @@ async function resolveWorkingSourceContinuation(projectId, request) {
     const current = getCurrentWorkingSourceContinuationPair(project, request.pairIdentity);
     if (!operation?.current() || !current || current.pair.evidenceIdentity !== request.evidenceIdentity ||
         current.pair.revision !== request.expectedRevision || current.pair.revision >= Number.MAX_SAFE_INTEGER) return null;
+    if (request.choice === 'replace' && current.pair.classification === 'owner-selected') {
+      const event = project.workingFileChoices?.records?.[current.pair.successorKey];
+      if (getWorkingFileChoiceObligations(project).invalid || !event || event.acknowledged ||
+          event.id !== current.pair.choiceEventId || hasWorkingFileDirtyHold(project, current.successor)) return null;
+    }
     const a = getWorkingSourceSelection(project, current.predecessor), b = getWorkingSourceSelection(project, current.successor);
     const predecessorIncluded = a.state === 'selected' || getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(current.predecessor))?.includedAsDependency === true;
     return predecessorIncluded && a.state !== 'invalid' && b.state !== 'invalid' && a.revision === request.predecessorSelectionRevision &&
@@ -4705,7 +5165,7 @@ async function resolveWorkingSourceContinuation(projectId, request) {
         const file = current[role];
         if (role === 'predecessor' && !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency) continue;
         const record = getWorkingSourceVerification(project, file);
-        if (!['scanned', 'no-extractor'].includes(record?.status) || !isWorkingSourceDiskIdentityCurrent(file, record)) {
+        if (!['scanned', 'no-extractor'].includes(record?.status) || record?.provider === 'psd-ordinary' || !isWorkingSourceDiskIdentityCurrent(file, record)) {
           const scan = beginWorkingSourceScan(projectId, file.path, () => !!boundPair(getProjects().find(item => item.id === projectId)), null, excludedPreparation);
           if (!scan) return { success: false, error: 'continuation_verification_required' };
           await verifyRestoredWorkingSource(projectId, file, scan.attempt, operation, excludedPreparation);
@@ -4776,8 +5236,16 @@ async function resolveWorkingSourceContinuation(projectId, request) {
           [...receipt].some(([sourcePath, captured]) => !isWorkingSourceDiskIdentityCurrent({ path: sourcePath }, { sourceIdentity: captured.identity }))) {
         return { success: false, error: 'continuation_stale', changed: false };
       }
+      // The bound owner choice remains clean through preparation and this
+      // synchronous commit. Its acknowledgement and selection changes share
+      // one durable write, so no observer can see a half-committed Replace.
+      const choices = request.choice === 'replace' && current.pair.classification === 'owner-selected'
+        ? { ...latest.workingFileChoices, records: { ...latest.workingFileChoices.records,
+          [current.pair.successorKey]: { ...latest.workingFileChoices.records[current.pair.successorKey], acknowledged: true } } }
+        : null;
       // All fallible preparation precedes these assignments: one durable write.
       if (request.choice === 'replace') {
+        if (choices) latest.workingFileChoices = choices;
         latest.workingSourceSelections = selections;
         latest.workingSourceVerification = verification;
       }
@@ -5153,7 +5621,7 @@ async function createProjectFileVisualRevision(projectId, file) {
   }
 }
 
-async function createRendererFilePresentation(project, file, membership = getWorkingSourceMembership(project)) {
+async function createRendererFilePresentation(project, file, membership = getWorkingSourceMembership(project), attribution = null) {
   const ext = (file?.ext || path.extname(file?.path || file?.name || '') || '').toLowerCase();
   const captureEvidence = file?.captureEvidence && typeof file.captureEvidence === 'object'
     ? file.captureEvidence
@@ -5187,6 +5655,7 @@ async function createRendererFilePresentation(project, file, membership = getWor
     linked: DEPENDENCY_CAPTURE_SOURCES.has(getFileCaptureSource(file)),
     appFamily,
     sourceName,
+    ...(attribution && !isScanOnSaveEmbeddedPsdFile(file) ? { currentWorkingSources: [...(attribution.get(normalizeTrackedFilePath(file.path)) || [])].map(([identity, name]) => ({ identity, name })) } : {}),
     ...(figmaSourceIdentity ? { figmaSourceIdentity } : {}),
     ...(!isScanOnSaveEmbeddedPsdFile(file) && membership.requiredByPath?.get(normalizeTrackedFilePath(file?.path))?.sources.size ? {
       // Presentation-only grouping uses existing dependency identities, never names.
@@ -5224,12 +5693,13 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const cacheGeneration = fileVisualProjectCacheGeneration;
   const workspaceActivationToken = getActiveWatchingActivationToken(projectId);
   const workspaceSubscription = acceptedSourceWatchSubscriptions.get(projectId);
+  const attribution = getCurrentWorkingFileAttribution(project);
   const files = await Promise.all((scopedProject.files || []).map(async (file, sourceIndex) => ({
-    ...(await createRendererFilePresentation(project, file, membership)),
+    ...(await createRendererFilePresentation(project, file, membership, attribution)),
     sourceIndex,
   })));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
-    ...(await createRendererFilePresentation(project, file, membership)),
+    ...(await createRendererFilePresentation(project, file, membership, attribution)),
     sourceIndex,
   })));
   const visualRecords = new Map();
@@ -5310,6 +5780,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
       activationToken: workspaceActivationToken, exactPathLimit: MAX_ACCEPTED_SOURCE_WATCH_PATHS,
       nativeDelivery: 'unverified' },
     sourceContinuation: getWorkingSourceContinuationPresentation(project),
+    workingFileChoices: getWorkingFileChoicePresentation(project),
   };
 }
 
@@ -10941,7 +11412,8 @@ function hardenOwnerOnlyCacheFileSync(filePath, cacheDir, label, mode = OWNER_ON
   const handle = openVerifiedCacheFileSync(filePath, cacheDir, label);
   if (!handle) return false;
   try {
-    fs.fchmodSync(handle.fd, mode);
+    // Avoid changing ctime when the verified descriptor already has the required mode.
+    if ((handle.stat.mode & 0o777) !== mode) fs.fchmodSync(handle.fd, mode);
     const finalStat = assertCacheFileDescriptorIdentity(
       handle.fd,
       filePath,
@@ -11033,7 +11505,8 @@ function readOwnerOnlyCacheFileSync(filePath, cacheDir, label, mode = OWNER_ONLY
   const handle = openVerifiedCacheFileSync(filePath, cacheDir, label);
   if (!handle) throw cacheSafetyError(label, 'unavailable');
   try {
-    fs.fchmodSync(handle.fd, mode);
+    // Avoid changing ctime when the verified descriptor already has the required mode.
+    if ((handle.stat.mode & 0o777) !== mode) fs.fchmodSync(handle.fd, mode);
     const finalStat = assertCacheFileDescriptorIdentity(
       handle.fd,
       filePath,
@@ -15056,12 +15529,14 @@ async function captureExistingPresentationMediaBaseline(
 
   const tempDir = ensurePresentationAssetsDir(projectId);
   const extractionRecords = [];
+  const displayAttribution = createWorkingMediaAttribution(project, presentationPath);
   const discoveredOccurrences = [];
   const invocationFiles = [];
   let keepInvocationFiles = false;
   try {
     const extractedPaths = await extractEmbeddedMedia(presentationPath, tempDir, project.files || [], {
       source: 'scan-on-save-presentation',
+      displayAttribution,
       logicalPresentationPath: presentationPath,
       onBeforeMaterialize: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
       onBeforeWrite: () => { if (!isCurrent()) throw new Error('stale_project_operation'); },
@@ -15106,6 +15581,7 @@ async function captureExistingPresentationMediaBaseline(
         !isAcceptedProjectFilePath(proj, presentationPath)
       ) return null;
 
+      displayAttribution.publish(proj);
       let changed = false;
       const acceptedFiles = [];
       for (const extractedPath of extractedPaths) {
@@ -16171,6 +16647,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
     const project = currentProjects.find(p => p.id === projectId);
     if (!project || !isCurrent()) return;
     const projectFiles = project.files || [];
+    const displayAttribution = createWorkingMediaAttribution(project, presentationPath);
+    let displayScanFailed = false;
 
     // Name-based dedup for .key files. Do not add prior scan-on-save media to
     // this base-name set: Keynote commonly saves multiple distinct pasted
@@ -16205,6 +16683,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
             && (typeof f.path !== 'string' || !safePresentationCachePaths.has(path.resolve(f.path)))) {
             continue;
           }
+          const before = getWorkingSourceDiskIdentity(f);
           const buf = fromPresentationCache
             ? readOwnerOnlyCacheFileSync(
               f.path,
@@ -16213,6 +16692,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
               PRESENTATION_ASSET_FILE_MODE
             )
             : fs.readFileSync(f.path);
+          displayAttribution.candidate(f.path, buf, before);
           const size = buf.length;
           capturedSizes.add(size);
           const hash = crypto.createHash('md5').update(buf).digest('hex');
@@ -16301,6 +16781,7 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
           encoding: 'buffer'
         });
         if (!isCurrent()) return;
+        displayAttribution.used(data);
         let extractedFingerprint = null;
 
         // Content-based dedup for presentation media.
@@ -16352,6 +16833,8 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
 
         if (!isCurrent()) return;
         writeOwnerOnlyCacheFileSync(destPath, data, tempDir, PRESENTATION_ASSET_FILE_MODE);
+        displayAttribution.candidate(destPath, data, getWorkingSourceDiskIdentity({ path: destPath }));
+        displayAttribution.used(data);
         invocationFiles.push(captureOwnedDirectCacheFile(destPath, tempDir, 'presentation-cache-file'));
         console.log(`[crate] scan-on-save-presentation: extracted ${outputName}`);
 
@@ -16365,15 +16848,25 @@ async function runScanOnSavePresentation(projectId, presentationPath, activation
           presentationPath,
         });
       } catch (e) {
+        displayScanFailed = true;
         console.error(`[crate] scan-on-save-presentation: failed to extract ${zipPath}:`, redactFigmaLogText(e.message));
       }
     }
 
-    if (newEntries.length === 0) return;
+    if (newEntries.length === 0) {
+      const current = getProjects().find(proj => proj.id === projectId);
+      if (isCurrent() && !displayScanFailed && current && displayAttribution.next(current)) {
+        const result = mutateProject(projectId, proj => ({ changed: isCurrent() && displayAttribution.publish(proj) }),
+          { persistIfChanged: true, trustResultChanged: true });
+        if (result?.changed) sendToRenderer('project:updated', { projectId });
+      }
+      return;
+    }
     if (!isCurrent()) return;
 
     const result = mutateProject(projectId, (proj) => {
       if (!isCurrent()) return null;
+      if (!displayScanFailed) displayAttribution.publish(proj);
       let changed = false;
 
       for (const entry of newEntries) {
@@ -17815,6 +18308,8 @@ registerTrustedIpcHandler('projects:set-working-source-selection', async (event,
   return await setWorkingSourceSelection(projectId, visualIdentity, request);
 });
 
+registerTrustedIpcHandler('projects:resolve-working-file-choice', async (event, projectId, request) => resolveWorkingFileChoice(projectId, request));
+
 registerTrustedIpcHandler('projects:resolve-working-source-continuation', async (event, projectId, request) => {
   return await resolveWorkingSourceContinuation(projectId, request);
 });
@@ -17838,6 +18333,15 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
     const removedFile = project.files.find(file => (
       matchesProjectFileIdentity(project.id, file, fileIdOrPath)
     ));
+    // Recheck the canonical record after the async recovery receipt lookup.
+    // Exclude preserves an unanswered choice for Restore; deletion would leave
+    // that obligation orphaned and invalidate the whole choice ledger.
+    const choiceKey = removedFile && isWorkingSourceFile(removedFile) &&
+      getAssetBaselineSourceRecoveryRouteKey(project, removedFile);
+    const choice = choiceKey && project.workingFileChoices?.records?.[choiceKey];
+    if (choice && choice.acknowledged !== true) {
+      throw new Error('Exclude this working file instead of removing it while its choice is unanswered.');
+    }
     if (
       removedFile &&
       isProjectAssetBaselineSource(removedFile) &&
@@ -17897,6 +18401,7 @@ registerTrustedIpcHandler('projects:accept-pending', async (event, projectId, fi
       const acceptedFile = {
         ...createAcceptedPendingFile(file),
       };
+      noteWorkingFileChoiceAdmission(project, acceptedFile, 'accepted-pending');
       project.files.push(acceptedFile);
       recordPendingFileDecision(project, acceptedFile, 'accepted');
       project.files = deduplicateFiles(project.files);
@@ -18056,6 +18561,7 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
         const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
         if (!existingFile) {
+          noteWorkingFileChoiceAdmission(project, authorizedFile, 'manual-browse');
           project.files.push(authorizedFile);
           acceptedByKey.set(key, authorizedFile);
           if (isProjectAssetBaselineSource(authorizedFile)) newSourcePaths.push(filePath);
@@ -19230,7 +19736,9 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
       const candidateExt = path.extname(f && (f.path || f.name) || '').toLowerCase();
       if (!EMBEDDED_MEDIA_EXTENSIONS.has(candidateExt)) continue;
       try {
+        const before = options.displayAttribution && getWorkingSourceDiskIdentity(f);
         const buf = fs.readFileSync(f.path);
+        options.displayAttribution?.candidate(f.path, buf, before);
         capturedSizes.add(buf.length);
         contentFingerprints.add(getPackageContentFingerprint(buf));
       } catch (e) {
@@ -19344,6 +19852,7 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
 
       try {
         const { data, outputTail } = await extractEmbeddedArchiveEntryData(presentationPath, zipPath, ext, listedZipPaths);
+        options.displayAttribution?.used(data);
         let extractedFingerprint = null;
 
         // v1.3.18: Content-based dedup for presentation media — skip if
@@ -19431,6 +19940,8 @@ async function extractEmbeddedMedia(presentationPath, destFolder, projectFiles, 
           if (options.rollbackOnFailure) invocationFiles.push(materialized);
           if (typeof options.onMaterialized === 'function') options.onMaterialized(materialized);
         }
+        options.displayAttribution?.candidate(destPath, data, getWorkingSourceDiskIdentity({ path: destPath }));
+        options.displayAttribution?.used(data);
         extracted.push(destPath);
         if (typeof options.onExtracted === 'function') {
           try {
@@ -20034,6 +20545,9 @@ function getPackageSelectionInputSignature(project, reviewedSemantics = false) {
       : project.workingSourceVerification ?? null,
     workingSourceRelationshipHolds: project.workingSourceRelationshipHolds ?? null,
     workingSourceContinuations: project.workingSourceContinuations ?? null,
+    workingFileChoices: project.workingFileChoices ?? null,
+    workingFileDirtyHolds: project.workingFileDirtyHolds ?? null,
+    workingFileChoiceLimit: project.workingFileChoiceLimit ?? null,
     workingSourceLocators: project.workingSourceLocators ?? null,
     excludedAssetKeys: Array.isArray(project.excludedAssetKeys) ? project.excludedAssetKeys : [],
     watchStartedAt: project.watchStartedAt || null,
@@ -20108,6 +20622,10 @@ async function buildCanonicalPackageReviewManifest(projectId) {
     if (inputSignature !== getPackageSelectionInputSignature(currentProject)) continue;
     if (packageSettingsKey !== JSON.stringify(getRelevantPackageReviewSettings())) continue;
 
+    const workingFileChoices = getWorkingFileChoicePresentation(currentProject);
+    if (getWorkingFileChoiceObligations(currentProject).blocked) {
+      return { error: 'working_file_choice_required', projectId: currentProject.id, workingFileChoices };
+    }
     const sourceContinuation = getWorkingSourceContinuationPresentation(currentProject, files);
     if (sourceContinuation.candidates.length) {
       return { error: 'working_source_continuation_choice_required', projectId: currentProject.id, sourceContinuation };
@@ -20281,8 +20799,9 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
   const settingsKey = manifest.reviewedSettingsKey;
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const diskInput = captureWorkingSourcePresentationDiskInput(manifest.files, membership);
+  const attribution = getCurrentWorkingFileAttribution(manifest.project);
   const presentations = await Promise.all(
-    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership, attribution))
   );
   const currentProject = getProjects().find(item => item.id === projectId);
   const diskCurrent = currentProject && diskInput === captureWorkingSourcePresentationDiskInput(manifest.files,
@@ -20312,6 +20831,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
     })),
     totalFiles: manifest.entries.length,
     semanticCounts: membership.counts,
+    workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: true,
     folderName: destinationBinding?.folderName || manifest.plan.destinationFolderName,
     planSummary: {
@@ -20330,8 +20850,9 @@ async function createUnavailablePackageReview(projectId, manifest) {
   const settingsKey = manifest.reviewedSettingsKey;
   const membership = getWorkingSourceMembership(manifest.project, manifest.files);
   const diskInput = captureWorkingSourcePresentationDiskInput(manifest.files, membership);
+  const attribution = getCurrentWorkingFileAttribution(manifest.project);
   const presentations = await Promise.all(
-    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership))
+    manifest.files.map(file => createRendererFilePresentation(manifest.project, file, membership, attribution))
   );
   const currentProject = getProjects().find(item => item.id === projectId);
   const diskCurrent = currentProject && diskInput === captureWorkingSourcePresentationDiskInput(manifest.files,
@@ -20352,6 +20873,7 @@ async function createUnavailablePackageReview(projectId, manifest) {
     })),
     totalFiles: manifest.entries.length,
     semanticCounts: membership.counts,
+    workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: false,
     message: manifest.files.length === 0 ? 'No files are selected for packaging.' :
       (membership.counts.relationshipHolds > 0 ? 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' :
@@ -20417,9 +20939,9 @@ registerTrustedIpcHandler('projects:prepare-package-review', async (event, proje
   if (!isPackageReviewAuthorizationCurrent(accountAuthorization)) return { error: 'package_review_changed' };
   const manifest = await buildCanonicalPackageReviewManifest(projectId);
   if (manifest.error) {
-    if (manifest.error === 'working_source_continuation_choice_required') {
+    if (['working_source_continuation_choice_required', 'working_file_choice_required'].includes(manifest.error)) {
       invalidatePackageReviewForProject(projectId);
-      return { error: manifest.error, projectId: manifest.projectId, sourceContinuation: manifest.sourceContinuation };
+      return { error: manifest.error, projectId: manifest.projectId, sourceContinuation: manifest.sourceContinuation, workingFileChoices: manifest.workingFileChoices };
     }
     return createPackageReviewErrorResult(projectId, manifest.error, {
       failurePhase: 'prepare-package-review',

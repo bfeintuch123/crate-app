@@ -646,7 +646,12 @@ class TestUtilityProcess extends EventEmitter {
               parse: filePath => {
                 if (fixture instanceof Error) throw fixture;
                 const stat = fs.statSync(filePath);
+                if (fixture?.readActualSavedPsd === true) {
+                  Object.assign(fixture, originalLoad.call(Module, 'ag-psd/dist/index.js', module).readPsd(fs.readFileSync(filePath),
+                    { skipLayerImageData: true, skipCompositeImageData: true }));
+                }
                 return {
+                  ...(fixture?.readActualSavedPsd === true ? { framing: require('../parsers/add-files-psd-worker').inspectPsdLinkFraming(fs.readFileSync(filePath)) } : {}),
                   psd: fixture,
                   sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
                   sourceDigest: crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'),
@@ -4579,6 +4584,7 @@ test('unchanged reviewed manifest packages exactly the reviewed files', async ()
         linked: false,
         appFamily: 'illustrator',
         sourceName: null,
+        currentWorkingSources: [],
         assetOrigin: 'added',
         projectRole: 'source',
         ...expectedDormantWorkingSourceFacts('source'),
@@ -4628,6 +4634,7 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
         linked: false,
         appFamily: 'illustrator',
         sourceName: null,
+        currentWorkingSources: [],
         assetOrigin: 'added',
         projectRole: 'source',
         ...expectedDormantWorkingSourceFacts('source'),
@@ -4661,6 +4668,7 @@ test('unmaterializable reviews expose safe status without tokens and recover aft
         linked: false,
         appFamily: 'illustrator',
         sourceName: null,
+        currentWorkingSources: [],
         assetOrigin: 'added',
         projectRole: 'source',
         ...expectedDormantWorkingSourceFacts('source'),
@@ -4700,6 +4708,7 @@ test('unsupported virtual entries are reviewable by safe name but cannot issue a
     linked: false,
     appFamily: 'illustrator',
     sourceName: null,
+        currentWorkingSources: [],
     assetOrigin: 'added',
     projectRole: 'source',
     ...expectedDormantWorkingSourceFacts('source'),
@@ -19448,6 +19457,7 @@ test('Illustrator activation fails closed when the structured snapshot contains 
 
 test('Illustrator activation scope excludes baseline A and admits B1/B2 with shared-link inclusion', async () => {
   resetTestHomeWorkspace();
+  storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const aSource = path.join(TEST_HOME, 'Desktop', 'A_Project.ai');
   const aLink = path.join(TEST_HOME, 'Desktop', 'A_Asset.png');
   const sharedLink = path.join(TEST_HOME, 'Desktop', 'Shared_Asset.png');
@@ -19459,6 +19469,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   for (const filePath of [aSource, aLink, sharedLink, b1Source, b1Link, b2Source, b2Link]) {
     fs.writeFileSync(filePath, path.basename(filePath));
   }
+  for (const source of [aSource, b1Source, b2Source]) writeSyntheticAiFile(source, source === aSource ? aLink : source === b1Source ? b1Link : b2Link);
   fs.mkdirSync(outputDir, { recursive: true });
 
   let rows = [
@@ -19485,6 +19496,8 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   assertProvenanceTextExcludes(fresh, [aSource, aLink, sharedLink]);
   assert.equal(JSON.stringify(fresh.liveEvidenceLedger || {}).includes('A_Project.ai'), false);
 
+  const savedNow = new Date(Math.max(Date.now(), project.watchStartedAt + 1000));
+  for (const source of [b1Source, b2Source]) fs.utimesSync(source, savedNow, savedNow);
   rows = [
     ...rows,
     `DOC\t${b1Source}\tB1_Project.ai\tfalse\ttrue`,
@@ -19514,13 +19527,25 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   }
 
   await callIpc('projects:pre-package-scan', project.id);
-  await settleAssetBaselineForUnrelatedPackageTest(project.id);
+  const baseline = await getProject(project.id);
+  assert.equal(baseline.assetBaseline.status, 'decision-required');
+  assert.equal((await callIpcRaw('projects:set-existing-assets-decision', project.id, 'include')).success, true);
+  const held = await callIpcRaw('projects:prepare-package-review', project.id);
+  console.log('SCOPE_B1_B2_CHOICE_ERROR', held.error);
+  assert.equal(held.error, 'working_file_choice_required');
+  assert.deepEqual(held.workingFileChoices.choices.map(row => row.source.name), ['B2_Project.ai']);
+  const card = (await callIpcRaw('projects:get-asset-workspace', project.id)).workingFileChoices.choices[0];
+  assert.ok(card.ready, JSON.stringify(card));
+  assert.equal((await callIpcRaw('projects:resolve-working-file-choice', project.id,
+    { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
   const packageResult = await callIpc('projects:package', project.id, outputDir);
   assertPackageResultShape(packageResult);
   assert.equal(packageResult.success, true);
+  assert.equal(packageResult.totalFiles, 5);
+  for (const source of [b1Source,b2Source,b1Link,b2Link,sharedLink]) assert.deepEqual(fs.readFileSync(path.join(packageResult.folderPath,path.basename(source))),fs.readFileSync(source));
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(aSource))), false);
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(aLink))), false);
-  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b1Source))), true);
+  assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b1Source))), true, JSON.stringify({packageResult, outputs:fs.readdirSync(packageResult.folderPath,{recursive:true})}));
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b2Source))), true);
 });
 
@@ -19546,7 +19571,14 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
     }
     fs.mkdirSync(outputDir, { recursive: true });
 
+    currentPsdFixture = { readActualSavedPsd: true };
+    const actualPsd = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    for (const filePath of [trustedAiAnchor, ...appPaths, ...genericPaths]) {
+      if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
+      if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
+    }
     setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         if (scopeState === 'failed') return { stdout: 'ERROR\tillustrator-query-failed\nCOMPLETE\t0\t0\n' };
@@ -19575,6 +19607,7 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
     const project = await createProject(`Unrelated ${scopeState} scope`);
     manualDialogFor([trustedAiAnchor]);
     await callIpc('projects:add-files', project.id);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
     const currentSessionStats = {
       mtimeMs: project.watchStartedAt + 1,
       birthtimeMs: project.watchStartedAt + 1,
@@ -19609,7 +19642,27 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       getSessionObservedByMethod(fresh, 'projects:accept-pending').length,
       genericPaths.length
     );
-    await settleAssetBaselineForUnrelatedPackageTest(project.id);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
+    const held = await callIpcRaw('projects:prepare-package-review', project.id);
+    console.log('SCOPE_INDEPENDENT_CHOICE_ERROR', scopeState, held.error);
+    assert.equal(held.error, 'working_file_choice_required');
+    const expectedSources = [...appPaths, ...genericPaths.filter(file => ['.pdf', '.ai'].includes(path.extname(file)))];
+    assert.deepEqual(held.workingFileChoices.choices.map(row => row.source.name).sort(), expectedSources.map(file => path.basename(file)).sort());
+    for (const filePath of expectedSources) {
+      let card = (await callIpcRaw('projects:get-asset-workspace', project.id)).workingFileChoices.choices.find(row => row.source.name === path.basename(filePath));
+      assert.ok(card, filePath);
+      // Real bounded saved-file verification; no seeded ready receipt.
+      if (!card.ready) {
+        const retry = await callIpcRaw('projects:resolve-working-file-choice', project.id,
+          { id: card.id, revision: card.revision, choice: 'retry', predecessorIdentity: null });
+        assert.equal(retry.success, true, JSON.stringify({ file: path.basename(filePath), retry }));
+        card = (await callIpcRaw('projects:get-asset-workspace', project.id)).workingFileChoices.choices.find(row => row.source.name === path.basename(filePath));
+      }
+      assert.ok(card.ready, JSON.stringify(card));
+      const decision = await callIpcRaw('projects:resolve-working-file-choice', project.id,
+        { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null });
+      assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
+    }
 
     const packageResult = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(packageResult);
@@ -19626,6 +19679,7 @@ test('unrelated app and generic assets survive ready and failed Illustrator scop
       getProvenanceEdges(fresh, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
       appPaths.length + genericPaths.length + 1
     );
+    currentPsdFixture = { children: [], linkedFiles: [] };
     await callIpc('projects:delete-all');
   }
 });
@@ -19656,7 +19710,14 @@ for (const scopeState of ['ready', 'failed']) {
     fs.writeFileSync(anchorPath, 'manual anchor bytes');
     for (const candidate of candidates) fs.writeFileSync(candidate.path, `${candidate.appFamily} bytes`);
     fs.mkdirSync(outputDir, { recursive: true });
+    currentPsdFixture = { readActualSavedPsd: true };
+    const actualPsd = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    for (const filePath of [anchorPath, ...candidates.map(item => item.path)]) {
+      if (['.ai','.pdf'].includes(path.extname(filePath))) writeSyntheticAiFile(filePath, 'saved source');
+      if (path.extname(filePath) === '.psd') fs.writeFileSync(filePath, actualPsd.writePsdBuffer({ width: 1, height: 1 }));
+    }
     setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'execFile' && command === '/bin/ps' && JSON.stringify(args) === JSON.stringify(['axww','-o','pid=','-o','comm='])) return { stdout: '0 kernel_task\n1 /sbin/launchd\n432 /bin/ps\n', stderr: '' };
       if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
       if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
         const rows = [
@@ -19675,6 +19736,7 @@ for (const scopeState of ['ready', 'failed']) {
     const project = await createProject(`Same path ${scopeState}`);
     manualDialogFor([anchorPath]);
     await callIpc('projects:add-files', project.id);
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
     const stored = storeInstance.data.projects.find(item => item.id === project.id);
     for (const candidate of candidates) {
       seedScopedRendererCandidate(stored, candidate.path, candidate);
@@ -19706,7 +19768,31 @@ for (const scopeState of ['ready', 'failed']) {
     for (const candidate of candidates) {
       assert.equal(view.files.some(file => file.path === candidate.path), true);
     }
-    await settleAssetBaselineForUnrelatedPackageTest(project.id);
+    // The scope assertions above run against the failed/ready observer. Freeze
+    // that proven admission state before user decisions so a background failed
+    // poll cannot deliberately retire the decision lease midway through hashing.
+    await callIpc('projects:pause', project.id); clearTrackedTimers();
+    assert.equal((await getProject(project.id)).assetBaseline.status, 'empty');
+    const held = await callIpcRaw('projects:prepare-package-review', project.id);
+    console.log('SCOPE_INDEPENDENT_CHOICE_ERROR', scopeState, held.error);
+    assert.equal(held.error, 'working_file_choice_required');
+    const expectedSources = candidates.filter(item => ['.psd','.indd','.pptx','.pdf','.ai'].includes(path.extname(item.path))).map(item => item.path);
+    assert.deepEqual(held.workingFileChoices.choices.map(row => row.source.name).sort(), expectedSources.map(file => path.basename(file)).sort());
+    for (const filePath of expectedSources) {
+      let card = (await callIpcRaw('projects:get-asset-workspace', project.id)).workingFileChoices.choices.find(row => row.source.name === path.basename(filePath));
+      assert.ok(card, filePath);
+      // Real bounded saved-file verification; no seeded ready receipt.
+      if (!card.ready) {
+        const retry = await callIpcRaw('projects:resolve-working-file-choice', project.id,
+          { id: card.id, revision: card.revision, choice: 'retry', predecessorIdentity: null });
+        assert.equal(retry.success, true, JSON.stringify({ file: path.basename(filePath), retry }));
+        card = (await callIpcRaw('projects:get-asset-workspace', project.id)).workingFileChoices.choices.find(row => row.source.name === path.basename(filePath));
+      }
+      assert.ok(card.ready, JSON.stringify(card));
+      const decision = await callIpcRaw('projects:resolve-working-file-choice', project.id,
+        { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null });
+      assert.equal(decision.success, true, JSON.stringify({file:path.basename(filePath),decision,card}));
+    }
     await callIpc('projects:pause', project.id);
     const result = await callIpc('projects:package', project.id, outputDir);
     assert.equal(
@@ -19728,6 +19814,7 @@ for (const scopeState of ['ready', 'failed']) {
       getProvenanceEdges(view, EDGE_TYPES.PACKAGE_INCLUDES_FILE).length,
       candidates.length + 1
     );
+    currentPsdFixture = { children: [], linkedFiles: [] };
   });
 }
 
@@ -24958,7 +25045,7 @@ test('Opus correction: actual main pending projection retains raw capture states
 });
 
 test('Opus correction: real main mixed asset projection drives nested renderer categories and standalone counts', async () => {
-  const root = makeTempDir();
+  const root = fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'projection-synthetic-'));
   try {
     const project = await createProject('Main Projection Workspace');
     const source = {path:path.join(root,'Working.ai'),name:'Working.ai',ext:'.ai',projectRole:'source',source:'manual-browse'};
@@ -24966,6 +25053,10 @@ test('Opus correction: real main mixed asset projection drives nested renderer c
     const pendingFiles = ['observed','needs-save'].map((captureState,index)=>({path:path.join(root,`Pending-${index}.pptx`),name:`Pending-${index}.pptx`,ext:'.pptx',projectRole:'source',source:'live-app',captureState,captureEvidence:{appFamily:'powerpoint'}}));
     for(const file of [source,...assets,...pendingFiles]) fs.writeFileSync(file.path,'synthetic bytes');
     await setProjectFiles(project.id,{files:[source,...assets],pendingFiles});
+    writeSyntheticAiFile(source.path, assets.map(file=>file.path).join('\n'));
+    const scanOperation=metadataTestHooks.captureProjectOperation(project.id);
+    try { await metadataTestHooks.runScanOnOpen(project.id,source.path,scanOperation.activationToken,scanOperation,{allowPausedBaseline:true,verifySelectedSource:true,establishBaseline:false}); }
+    finally {scanOperation.close();}
     const workspace=await callIpcRaw('projects:get-asset-workspace',project.id),current=await getProject(project.id);
     const parent=workspace.files.find(file=>file.name==='Working.ai');
     assert.equal(parent.included,true);

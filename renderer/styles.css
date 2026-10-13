@@ -712,8 +712,8 @@ body {
 }
 
 .asset-file-row.is-excluded .app-file-name {
-  color: var(--gray-400);
-  text-decoration: line-through;
+  color: #6b6060;
+  text-decoration: none;
 }
 
 .asset-panel-empty {
@@ -1334,9 +1334,9 @@ body {
 }
 
 .file-status-badge.excluded {
-  color: var(--gray-500);
-  background: var(--gray-50);
-  border: 1px solid var(--gray-200);
+  color: #8b3434;
+  background: #f8eaea;
+  border: 1px solid #dcb6b6;
 }
 
 .file-status-badge.recovery {
@@ -3530,3 +3530,21 @@ body {
 .nested-asset-origin { color: #555; font-weight: 600; flex-shrink: 0; }
 #existing-batch-slot .asset-review-guidance { font-weight: 400; }
 #existing-batch-slot { margin-bottom: 8px; }
+
+/* Explicit new-working-file choices remain visible in workspace and asset review. */
+.working-file-choices { border: 1px solid #d7c68e; border-radius: 12px; padding: 18px; margin-bottom: 20px; background: #fffdf7; }
+.working-file-choices h2 { font-size: 16px; margin: 0 0 10px; }
+.working-file-choice + .working-file-choice { border-top: 1px solid #e1ddd0; margin-top: 14px; padding-top: 12px; }
+.working-file-choice p { overflow-wrap: anywhere; margin: 4px 0 10px; }
+.working-file-choice-actions, .working-file-predecessor { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.working-file-predecessor { margin-top: 12px; }
+.working-file-predecessor label { display: grid; gap: 5px; max-width: 100%; font-size: 12px; color: #454545; }
+.working-file-predecessor select { max-width: 100%; padding: 8px; color: #252525; background: #fff; border: 1px solid #999; border-radius: 6px; }
+.working-choice-status { color: #555; font-size: 12px; }
+.asset-file-row.is-excluded { background: #f5f2f2; }
+.asset-file-row.is-excluded .app-file-visual { filter: saturate(.5); }
+.asset-file-row.is-excluded .working-source-action { opacity: 1; }
+
+.working-file-support { margin-bottom: 16px; font-size: 12px; color: #555; }
+.working-file-support summary { cursor: pointer; color: #454545; }
+.working-file-support p { max-width: 80ch; line-height: 1.5; margin: 10px 0; }
