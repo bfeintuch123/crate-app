@@ -69,8 +69,13 @@ let fileWorkspaceRenderRequestId = 0;
 let assetWorkspaceRequestGeneration = 0;
 let assetWorkspaceRequestId = 0;
 let assetWorkspaceLoadedRequestId = 0;
+let workingSourceRecoveryOwner = null;
 let assetWorkspaceProjectSnapshot = null;
+let assetReviewBatchProjection = null;
 const displayOnlyAssetWorkspaces = new WeakSet();
+let displayOnlyAssetWorkspaceProvenance = null;
+// Display receipt only; never grants selection, subscription or package authority.
+let watchCoveragePresentation = null;
 let packageReviewRequestId = 0;
 let packageReviewModalProjectId = null;
 let packageReviewModalSelectionEpoch = null;
@@ -310,6 +315,8 @@ function getRendererViewState() {
   const scroller = $('.app-content');
   const activeElement = document.activeElement;
   const activeRow = activeElement?.closest?.('[data-render-key]');
+  const focusContext = [accountWorkspaceEpoch, projectSelectionEpoch, tabNavigationEpoch, state.assetReviewOpen,
+    assetWorkspaceRequestId, assetWorkspaceRequestGeneration, modalLeaseSequence, packageReviewRequestId];
   const assetScrollTops = {};
   for (const id of ['existing-assets-list', 'added-assets-list', 'pending-file-list']) {
     const list = $(`#${id}`);
@@ -323,13 +330,33 @@ function getRendererViewState() {
     activeId: activeElement?.id || null,
     activeRenderKey: activeRow?.dataset?.renderKey || null,
     activeClassName: activeElement?.className || null,
+    focusContext,
+    watchFocus: activeElement?.matches?.('.working-source-watch-summary') && activeRow ? {
+      surface: activeRow.parentElement,
+      key: activeRow.dataset.renderKey,
+      unique: Array.from(activeRow.parentElement?.children || []).filter(row => row.dataset?.renderKey === activeRow.dataset.renderKey).length === 1,
+      context: focusContext,
+    } : null,
   };
 }
 
 function findRendererFocusTarget(viewState) {
   if (!viewState) return null;
   const activeElement = viewState.activeElement;
-  if (activeElement && (activeElement.isConnected || activeElement.parentNode)) return activeElement;
+  if (viewState.watchFocus) {
+    const { surface, key, context, unique } = viewState.watchFocus;
+    const currentContext = [accountWorkspaceEpoch, projectSelectionEpoch, tabNavigationEpoch, state.assetReviewOpen,
+      assetWorkspaceRequestId, assetWorkspaceRequestGeneration, modalLeaseSequence, packageReviewRequestId];
+    if (!unique || !surface?.isConnected || context.some((value, index) => value !== currentContext[index]) ||
+        (document.activeElement !== activeElement && document.activeElement !== document.body)) return null;
+    // The same source appears on both surfaces. Never cross surfaces or guess
+    // between duplicate identities when a refresh replaces the focused row.
+    const rows = Array.from(surface.children).filter(row => row.dataset?.renderKey === key);
+    if (rows.length !== 1) return null;
+    const summary = rows[0].querySelector('.working-source-watch-summary');
+    return summary?.isConnected && !summary.closest('.hidden') && !summary.closest('.filtered-out') ? summary : null;
+  }
+  if (activeElement?.isConnected) return activeElement;
   if (viewState.activeId) {
     const element = $(`#${viewState.activeId}`);
     if (element) return element;
@@ -404,15 +431,23 @@ function getRendererItemSignature(item) {
     protectedSource: item.protectedSource === true,
     sourceRecoveryAllowed: item.sourceRecoveryAllowed === true,
     excluded: item.excluded === true,
+    currentWorkingSources: item.currentWorkingSources,
     sourceSelection: item.sourceSelection,
     selectionRevision: item.selectionRevision,
+    selectionReason: item.selectionReason,
+    selectionRecovery: item.selectionRecovery,
+    // Recovery controls belong to the current authoritative presentation.
+    recoveryPresentation: item.sourceSelection === 'invalid'
+      ? [assetWorkspaceLoadedRequestId, accountWorkspaceEpoch, projectSelectionEpoch, tabNavigationEpoch, modalLeaseSequence, packageReviewRequestId] : null,
     included: item.included,
     includedAsDependency: item.includedAsDependency,
     effectiveRole: item.effectiveRole,
     verificationStatus: item.verificationStatus,
     verificationRequired: item.verificationRequired,
+    watchCoverage: getWorkingSourceWatchPresentation(state.projects.find(project => project.id === state.selectedProjectId), item),
     requiredBy: item.requiredBy,
     selectionBusy: isWorkingSourceActionPending(getFileVisualIdentity(item)),
+    recoveryBusy: item.sourceSelection === 'invalid' && !!workingSourceRecoveryOwner,
     selectionUnavailable: item.selectionUnavailable === true,
     embedded: item.embedded === true,
     linked: item.linked === true,
@@ -425,17 +460,27 @@ function getRendererItemSignature(item) {
 function reconcileKeyedList(list, items, build, keyForItem = getRendererItemKey) {
   if (!list) return;
   const existing = new Map();
+  const existingCounts = new Map();
   for (const child of Array.from(list.children || [])) {
-    if (child.dataset?.renderKey) existing.set(child.dataset.renderKey, child);
+    if (child.dataset?.renderKey) {
+      existing.set(child.dataset.renderKey, child);
+      existingCounts.set(child.dataset.renderKey, (existingCounts.get(child.dataset.renderKey) || 0) + 1);
+    }
   }
   const retained = new Set();
   const nextItems = Array.isArray(items) ? items : [];
+  const nextKeys = nextItems.map(keyForItem);
+  const keyCounts = new Map();
+  for (const key of nextKeys) keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
   nextItems.forEach((item, index) => {
-    const key = keyForItem(item, index);
-    let child = existing.get(key);
+    const key = nextKeys[index];
+    let child = keyCounts.get(key) === 1 && existingCounts.get(key) === 1 ? existing.get(key) : null;
     const signature = getRendererItemSignature(item);
     if (!child || child.dataset.renderSignature !== signature) {
+      const previousDisclosure = child?.querySelector('.working-source-watch');
       child = build(item, index);
+      const nextDisclosure = child.querySelector('.working-source-watch');
+      if (previousDisclosure && nextDisclosure) nextDisclosure.open = previousDisclosure.open;
       child.dataset.renderKey = key;
       child.dataset.renderSignature = signature;
     }
@@ -550,6 +595,7 @@ function setAssetReviewProject(projectId) {
   if (state.assetReviewProjectId === projectId) return;
   state.assetReviewProjectId = projectId;
   assetWorkspaceRequestGeneration += 1;
+  reconcileCurrentAssetReviewBatchControls();
   state.assetReviewSelectedKey = null;
   state.assetReviewLogicalItems = { working: [], existing: [], added: [], missing: [] };
   for (const id of ['project-file-list', 'working-assets-list', 'existing-assets-list', 'added-assets-list', 'pending-file-list', 'recent-assets-list']) {
@@ -581,8 +627,12 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
   workingSourceActions.clear();
+  workingFileChoiceOwner = null;
   continuationChoiceOwner = null;
+  continuationChoicePresentation = null;
   // A project switch invalidates every modal session.  The caller must not
   // allow an async callback from the previous project to reopen a modal.
   activeModalLease = null;
@@ -644,7 +694,7 @@ function setRendererActionBusy(element, busy, busyLabel, idleLabel = null) {
   if (element.dataset) delete element.dataset.actionIdleLabel;
 }
 
-async function runRendererAction(key, element, busyLabel, action, idleLabel = null) {
+async function runRendererAction(key, element, busyLabel, action, idleLabel = null, reconcileControls = null) {
   if (rendererActionsInFlight.has(key)) return undefined;
   rendererActionsInFlight.add(key);
   setRendererActionBusy(element, true, busyLabel, idleLabel);
@@ -652,7 +702,11 @@ async function runRendererAction(key, element, busyLabel, action, idleLabel = nu
     return await action();
   } finally {
     rendererActionsInFlight.delete(key);
-    setRendererActionBusy(element, false, busyLabel, idleLabel);
+    // Bulk controls are shared across project/account lifetimes. Their opt-in
+    // cleanup projects current state after this reservation retires, rather
+    // than restoring the captured element's old label and enabled state.
+    if (reconcileControls) reconcileControls();
+    else setRendererActionBusy(element, false, busyLabel, idleLabel);
   }
 }
 
@@ -1595,6 +1649,8 @@ function updateNamingPreview() {
 async function renderFiles(renderOptions = {}) {
   const renderRequestId = ++fileWorkspaceRenderRequestId;
   const workspaceRequestId = ++assetWorkspaceRequestId;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
   const isRenderCurrent = typeof renderOptions.isCurrent === 'function'
     ? renderOptions.isCurrent
     : () => true;
@@ -1690,6 +1746,9 @@ async function renderFiles(renderOptions = {}) {
 
   const excludedAssetKeys = new Set(project.excludedAssetKeys || []);
   const visiblePendingFiles = (project.pendingFiles || []).filter(file => !excludedAssetKeys.has(getAssetReviewExclusionKey(file)));
+  const workspaceAccount = accountWorkspaceEpoch, workspaceSelection = projectSelectionEpoch;
+  const workspaceGeneration = assetWorkspaceRequestGeneration;
+  const workspaceStatus = project.status;
   let assetWorkspace = null;
   if (typeof window.crate?.getAssetWorkspace === 'function') {
     try {
@@ -1700,11 +1759,17 @@ async function renderFiles(renderOptions = {}) {
   }
   if (
     renderRequestId !== fileWorkspaceRenderRequestId ||
+    workspaceAccount !== accountWorkspaceEpoch || workspaceSelection !== projectSelectionEpoch ||
+    workspaceGeneration !== assetWorkspaceRequestGeneration || project.status !== workspaceStatus ||
+    state.projects.find(item => item.id === project.id) !== project ||
     workspaceRequestId !== assetWorkspaceRequestId ||
     state.selectedProjectId !== project.id ||
     !isRenderCurrent()
   ) return;
-  if (!assetWorkspace || assetWorkspace.projectId !== project.id) {
+  const authoritative = !!assetWorkspace && assetWorkspace.projectId === project.id && Array.isArray(assetWorkspace.files);
+  if (!authoritative) {
+    if (workspaceGeneration !== assetWorkspaceRequestGeneration ||
+        state.projects.find(item => item.id === project.id) !== project) return;
     assetWorkspace = {
       projectId: project.id,
       files: (project.files || []).map(file => ({
@@ -1722,6 +1787,7 @@ async function renderFiles(renderOptions = {}) {
       })),
       pendingFiles: (project.pendingFiles || []).map(file => ({
         name: file.name,
+        projectRole: file.projectRole,
         ext: getFileExtension(file),
         appFamily: file.captureEvidence?.appFamily || getAppFamilyFromExtension(file),
         sourceName: sanitizeRendererSourceName(file.captureEvidence?.sourceName),
@@ -1735,10 +1801,35 @@ async function renderFiles(renderOptions = {}) {
     displayOnlyAssetWorkspaces.add(assetWorkspace);
   }
   state.assetWorkspace = assetWorkspace;
-  assetWorkspaceLoadedRequestId = workspaceRequestId;
+  renderWorkingFileChoices(project, authoritative ? assetWorkspace : null);
+  assetWorkspaceLoadedRequestId = authoritative ? workspaceRequestId : 0;
   assetWorkspaceProjectSnapshot = project;
+  assetReviewBatchProjection = authoritative
+    ? captureAssetReviewBatchProjection(project, assetWorkspace, workspaceRequestId) : null;
+  watchCoveragePresentation = authoritative ? captureWatchCoveragePresentation(project, assetWorkspace) : null;
+  // Display reuse never supplies the authoritative refresh receipt or mutation authority.
+  displayOnlyAssetWorkspaceProvenance = authoritative ? null : {
+    workspace: assetWorkspace, requestId: workspaceRequestId, project,
+    account: workspaceAccount, selection: workspaceSelection, generation: workspaceGeneration,
+  };
   statusText.textContent = getStatusLabel(project);
   if (isTabActive('projects')) renderProjectRows();
+
+  const latest = getRendererViewState();
+  if (viewState.watchFocus || latest.watchFocus || latest.activeElement !== viewState.activeElement) {
+    // Read the latest intent before reconciliation can detach its node and
+    // leave body focused. Keep the original request/context fence: recapturing
+    // focus must not revive a refresh retired by navigation or a modal change.
+    viewState.activeElement = latest.activeElement;
+    viewState.activeId = null;
+    viewState.activeRenderKey = null;
+    viewState.activeClassName = null;
+    viewState.watchFocus = latest.watchFocus
+      ? { ...latest.watchFocus, context: viewState.focusContext }
+      : null;
+    // A newer external control may stay connected. For any other target,
+    // retire the old Watch intent instead of guessing a replacement control.
+  }
 
   // Pending files (Tier 2)
   renderPendingFiles(project, assetWorkspace.pendingFiles);
@@ -1759,6 +1850,15 @@ async function renderFiles(renderOptions = {}) {
   await syncExistingAssetsDecisionModal(project);
   if (!isRenderCurrent()) return;
   restoreRendererViewState(viewState);
+  return { authoritative: authoritative && renderRequestId === fileWorkspaceRenderRequestId &&
+    workspaceRequestId === assetWorkspaceRequestId && isRenderCurrent(),
+    workspace: assetWorkspace, requestId: workspaceRequestId };
+}
+
+function isAuthoritativeWorkspaceRefresh(result, projectId) {
+  return result?.authoritative === true && result.workspace === state.assetWorkspace &&
+    result.workspace?.projectId === projectId && result.requestId === assetWorkspaceRequestId &&
+    result.requestId === assetWorkspaceLoadedRequestId;
 }
 
 function getAssetReviewExclusionKey(file) {
@@ -1822,6 +1922,22 @@ function getPendingWorkspacePresentation(rawFile, sourceIndex, presentations) {
   return presentations.find(file => file && file.sourceIndex === sourceIndex) || null;
 }
 
+function composePendingReviewFiles(project, presentedPendingFiles) {
+  const presentations = Array.isArray(presentedPendingFiles)
+    ? presentedPendingFiles.filter(file => file.excluded !== true)
+    : [];
+  // Compose once against authoritative raw entries; filtering must reuse these
+  // objects rather than attempt to rebind a cloned presentation by its name.
+  return getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
+    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
+    const file = presentation
+      ? { ...rawFile, ...presentation }
+      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
+    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
+    return file;
+  });
+}
+
 function getPendingAssetsForBatchDecision(project) {
   if (!project || typeof project !== 'object') return [];
   const pending = getVisiblePendingAssetEntries(project).filter(({ rawFile }) => (
@@ -1846,7 +1962,7 @@ function getPendingAssetsForBatchDecision(project) {
   });
 }
 
-function updateAssetReviewBatchControls(project, existingAssets, includedExistingCount) {
+function updateAssetReviewBatchControls(project, existingAssets, includedExistingCount, projectionUnavailable = false) {
   const includeAll = $('#btn-include-all-existing');
   const skipAll = $('#btn-skip-all-existing');
   if (!includeAll && !skipAll) return;
@@ -1857,7 +1973,13 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
   ));
   const pendingCandidates = getPendingAssetsForBatchDecision(project);
   const hasPendingReviewSurface = visiblePending.length > 0;
+  const batch = $('#asset-review-batch-controls');
+  const slot = hasPendingReviewSurface ? $('#pending-batch-slot') : $('#existing-batch-slot');
+  if (batch && slot && batch.parentElement !== slot) slot.appendChild(batch);
+  $('#existing-batch-slot')?.classList.toggle('hidden', hasPendingReviewSurface);
   const eligiblePendingCount = pendingCandidates.filter(candidate => candidate.target).length;
+  const unavailable = !project || accountStatus.canUseWorkspace === false;
+  const busy = !unavailable && rendererActionsInFlight.has(`asset-review-batch:${project.id}`);
   const controls = $('.asset-panel-actions');
   if (controls) {
     controls.setAttribute('aria-label', hasPendingReviewSurface ? 'Review Before Packaging controls' : 'Existing Assets controls');
@@ -1868,28 +1990,76 @@ function updateAssetReviewBatchControls(project, existingAssets, includedExistin
     includeAll.textContent = hasPendingReviewSurface ? 'Add All' : (allIncluded ? 'All Existing Included' : 'Include All Existing');
     includeAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Add all assets needing review' : (allIncluded ? 'All existing assets are already included' : 'Include all existing assets'));
     includeAll.title = !hasPendingReviewSurface && allIncluded ? 'All existing assets are already included.' : '';
-    includeAll.disabled = hasPendingReviewSurface
+    includeAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
-      : existingAssets.length === 0 || includedExistingCount === existingAssets.length;
+      : existingAssets.length === 0 || includedExistingCount === existingAssets.length);
   }
   if (skipAll) {
     skipAll.textContent = hasPendingReviewSurface ? 'Skip All' : 'Skip All Existing';
     skipAll.setAttribute('aria-label', hasPendingReviewSurface ? 'Skip all assets needing review' : 'Skip all existing assets');
-    skipAll.disabled = hasPendingReviewSurface
+    skipAll.disabled = unavailable || projectionUnavailable || busy || (hasPendingReviewSurface
       ? eligiblePendingCount === 0
-      : existingAssets.length === 0 || includedExistingCount === 0;
+      : existingAssets.length === 0 || includedExistingCount === 0);
+  }
+  for (const button of [includeAll, skipAll].filter(Boolean)) {
+    button.setAttribute('aria-busy', String(busy));
+    button.classList.toggle('is-action-busy', busy);
+    if (button.dataset) delete button.dataset.actionIdleLabel;
+  }
+  const reason = $('#asset-review-batch-reason');
+  if (reason) {
+    let message = '';
+    if (unavailable) message = accountStatus.canUseWorkspace === false
+      ? 'Sign in to review assets.' : 'Select a project to review assets.';
+    else if (busy) message = 'Updating assets. Wait for this action to finish.';
+    else if (projectionUnavailable) message = 'Current asset review is unavailable. Review the current project again before using bulk actions.';
+    else if (hasPendingReviewSurface) {
+      if (pendingCandidates.length === 0) {
+        message = 'No eligible items.';
+      } else if (eligiblePendingCount === 0) {
+        message = 'Crate cannot identify which files to update. Add All and Skip All are unavailable.';
+      } else if (eligiblePendingCount < visiblePending.length) {
+        message = 'Add All and Skip All apply only to eligible review items. Other items stay unchanged.';
+      }
+    } else if (existingAssets.length === 0) message = 'No existing assets.';
+    else if (includedExistingCount === existingAssets.length) message = 'All existing assets are already included.';
+    else if (includedExistingCount === 0) message = 'No existing assets are included.';
+    reason.textContent = message;
+    reason.classList.toggle('hidden', !message);
   }
 }
 
+function captureAssetReviewBatchProjection(project, workspace, requestId) {
+  return { project, workspace, requestId, status: project.status,
+    account: accountWorkspaceEpoch, selection: projectSelectionEpoch, generation: assetWorkspaceRequestGeneration };
+}
+
+function getCurrentAssetReviewBatchWorkspace(project) {
+  const receipt = assetReviewBatchProjection, workspace = state.assetWorkspace;
+  if (!project || !receipt || receipt.project !== project || receipt.workspace !== workspace ||
+      state.projects.find(item => item.id === project.id) !== project || state.selectedProjectId !== project.id ||
+      assetWorkspaceProjectSnapshot !== project || workspace?.projectId !== project.id ||
+      receipt.status !== project.status || receipt.account !== accountWorkspaceEpoch ||
+      receipt.selection !== projectSelectionEpoch || receipt.generation !== assetWorkspaceRequestGeneration ||
+      !receipt.requestId || receipt.requestId !== assetWorkspaceRequestId ||
+      receipt.requestId !== assetWorkspaceLoadedRequestId || accountStatus.canUseWorkspace === false ||
+      displayOnlyAssetWorkspaces.has(workspace) || !Array.isArray(workspace.files)) return null;
+  return workspace;
+}
+
 function restoreAssetReviewBatchControls(project) {
-  if (!project) return;
-  const workspace = state.assetWorkspace?.projectId === project.id ? state.assetWorkspace : null;
-  const files = Array.isArray(workspace?.files) ? workspace.files : (project.files || []);
+  const workspace = getCurrentAssetReviewBatchWorkspace(project);
+  const files = workspace?.files || [];
   const existingAssets = files.filter(file => (
     file && file.assetOrigin === 'existing' && file.protectedSource !== true && file.projectRole !== 'source'
   ));
   const includedExistingCount = existingAssets.filter(file => (typeof file.included === 'boolean' ? file.included : file.excluded !== true)).length;
-  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
+  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount, !workspace);
+}
+
+function reconcileCurrentAssetReviewBatchControls() {
+  restoreAssetReviewBatchControls(accountStatus.canUseWorkspace === false ? null
+    : state.projects.find(item => item.id === state.selectedProjectId));
 }
 
 function getExistingAssetsDecisionFocusableElements() {
@@ -1945,15 +2115,28 @@ async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = tru
   if (
     state.assetWorkspace?.projectId === project.id &&
     assetWorkspaceProjectSnapshot === project &&
-    assetWorkspaceLoadedRequestId === assetWorkspaceRequestId &&
+    (getCurrentAssetReviewBatchWorkspace(project) ||
+      (allowDisplayFallback === true && displayOnlyAssetWorkspaces.has(state.assetWorkspace) &&
+        displayOnlyAssetWorkspaceProvenance?.workspace === state.assetWorkspace &&
+        displayOnlyAssetWorkspaceProvenance.requestId === assetWorkspaceRequestId &&
+        displayOnlyAssetWorkspaceProvenance.project === project &&
+        state.projects.find(item => item.id === project.id) === project &&
+        displayOnlyAssetWorkspaceProvenance.account === accountWorkspaceEpoch &&
+        displayOnlyAssetWorkspaceProvenance.selection === projectSelectionEpoch &&
+        displayOnlyAssetWorkspaceProvenance.generation === requestGeneration)) &&
     (allowDisplayFallback || !displayOnlyAssetWorkspaces.has(state.assetWorkspace))
   ) return state.assetWorkspace;
   if (typeof window.crate?.getAssetWorkspace !== 'function') return null;
   const requestId = ++assetWorkspaceRequestId;
+  assetReviewBatchProjection = null;
+  reconcileCurrentAssetReviewBatchControls();
+  const account = accountWorkspaceEpoch, selection = projectSelectionEpoch, status = project.status;
   try {
     const workspace = await window.crate.getAssetWorkspace(project.id);
     if (
       requestId !== assetWorkspaceRequestId ||
+      account !== accountWorkspaceEpoch || selection !== projectSelectionEpoch || project.status !== status ||
+      state.projects.find(item => item.id === project.id) !== project ||
       requestGeneration !== assetWorkspaceRequestGeneration ||
       state.selectedProjectId !== project.id
     ) return null;
@@ -1961,6 +2144,9 @@ async function ensureProjectAssetWorkspace(project, { allowDisplayFallback = tru
     state.assetWorkspace = workspace;
     assetWorkspaceLoadedRequestId = requestId;
     assetWorkspaceProjectSnapshot = project;
+    assetReviewBatchProjection = captureAssetReviewBatchProjection(project, workspace, requestId);
+    restoreAssetReviewBatchControls(project);
+    watchCoveragePresentation = captureWatchCoveragePresentation(project, workspace);
     return workspace;
   } catch (error) {
     logRendererError('asset workspace unavailable', error);
@@ -2131,40 +2317,11 @@ async function submitExistingAssetsDecision(decision, { openReview = false } = {
 async function submitExistingAssetsBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
-  const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
-  const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
-  const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
-    buttons.forEach(button => { button.disabled = true; });
-    let renderedUpdatedState = false;
-    try {
-      const result = await window.crate.setExistingAssetsDecision(project.id, decision);
-      if (!result || result.success !== true) {
-        showToast('Crate could not update Existing Assets. Try again.');
-        return false;
-      }
-      state.projects = await getAccountCurrentProjects();
-      await renderFiles();
-      renderedUpdatedState = true;
-      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
-      return true;
-    } catch (error) {
-      logRendererError('existing assets batch decision failed', error);
-      showToast('Crate could not update Existing Assets. Try again.');
-      return false;
-    } finally {
-      if (!renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
-    }
-  }, clickedButton?.textContent || null);
-  restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
-  return result;
-}
-
-function getPendingFilesFromDecisionResult(result, decision) {
-  if (decision === 'include') return Array.isArray(result?.pendingFiles) ? result.pendingFiles : null;
-  return Array.isArray(result) ? result : null;
-}
-
-async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
   const accountEpoch = accountWorkspaceEpoch;
   const selectionEpoch = projectSelectionEpoch;
   const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
@@ -2175,9 +2332,56 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
   const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
   const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
     buttons.forEach(button => { button.disabled = true; });
+    restoreAssetReviewBatchControls(project);
+    try {
+      const result = await window.crate.setExistingAssetsDecision(project.id, decision);
+      if (!isCurrent()) return false;
+      if (!result || result.success !== true) {
+        showToast('Crate could not update Existing Assets. Try again.');
+        return false;
+      }
+      const projects = await getAccountCurrentProjects();
+      if (!isCurrent()) return false;
+      state.projects = projects;
+      await renderFiles();
+      if (!isCurrent()) return false;
+      showToast(decision === 'include' ? 'Existing assets included' : 'Existing assets skipped');
+      return true;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      logRendererError('existing assets batch decision failed', error);
+      showToast('Crate could not update Existing Assets. Try again.');
+      return false;
+    }
+  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
+  return result;
+}
+
+function getPendingFilesFromDecisionResult(result, decision) {
+  if (decision === 'include') return Array.isArray(result?.pendingFiles) ? result.pendingFiles : null;
+  return Array.isArray(result) ? result : null;
+}
+
+async function submitPendingAssetsBatchDecision(decision, project, pendingCandidates) {
+  if (!project || !['include', 'skip'].includes(decision)) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
+  const accountEpoch = accountWorkspaceEpoch;
+  const selectionEpoch = projectSelectionEpoch;
+  const isCurrent = () => accountWorkspaceEpoch === accountEpoch &&
+    projectSelectionEpoch === selectionEpoch && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace !== false;
+  if (!isCurrent()) return false;
+  const buttons = [$('#btn-include-all-existing'), $('#btn-skip-all-existing')].filter(Boolean);
+  const clickedButton = decision === 'include' ? $('#btn-include-all-existing') : $('#btn-skip-all-existing');
+  const result = await runRendererAction(`asset-review-batch:${project.id}`, clickedButton, 'Updating…', async () => {
+    buttons.forEach(button => { button.disabled = true; });
+    restoreAssetReviewBatchControls(project);
     let appliedCount = 0;
     let failedCount = 0;
-    let renderedUpdatedState = false;
     try {
       for (const candidate of pendingCandidates) {
         if (!isCurrent()) return false;
@@ -2211,7 +2415,6 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       state.projects = projects;
       await renderFiles();
       if (!isCurrent()) return false;
-      renderedUpdatedState = true;
       const actionLabel = decision === 'include' ? 'added' : 'skipped';
       if (appliedCount === 0) {
         showToast('No eligible assets were updated. Review the list and try the batch action again.');
@@ -2226,17 +2429,19 @@ async function submitPendingAssetsBatchDecision(decision, project, pendingCandid
       logRendererError('pending assets batch decision failed', error);
       showToast('Crate could not update the assets. Review the list and try the batch action again.');
       return false;
-    } finally {
-      if (isCurrent() && !renderedUpdatedState) buttons.forEach(button => { button.disabled = false; });
     }
-  }, clickedButton?.textContent || null);
-  if (isCurrent()) restoreAssetReviewBatchControls(state.projects.find(item => item.id === state.selectedProjectId));
+  }, clickedButton?.textContent || null, reconcileCurrentAssetReviewBatchControls);
   return result;
 }
 
 async function submitAssetReviewBatchDecision(decision) {
   const project = state.projects.find(item => item.id === state.selectedProjectId);
   if (!project || !['include', 'skip'].includes(decision)) return false;
+  if (rendererActionsInFlight.has(`asset-review-batch:${project.id}`)) return undefined;
+  if (!getCurrentAssetReviewBatchWorkspace(project)) {
+    reconcileCurrentAssetReviewBatchControls();
+    return false;
+  }
   const excluded = new Set(project.excludedAssetKeys || []);
   const visiblePending = (project.pendingFiles || []).filter(file => (
     file && !excluded.has(getAssetReviewExclusionKey(file))
@@ -2581,8 +2786,215 @@ function appendAssetFileRestorationAction(row, project, file) {
   row.appendChild(restoreButton);
 }
 
+function getWorkingSourceRecoveryActions(project, file) {
+  const recovery = file?.selectionRecovery;
+  const identity = getFileVisualIdentity(file);
+  const workspace = state.assetWorkspace;
+  if (!project || state.selectedProjectId !== project.id || workspace?.projectId !== project.id ||
+      !assetWorkspaceLoadedRequestId || assetWorkspaceLoadedRequestId !== assetWorkspaceRequestId ||
+      !identity || file.protectedSource !== true || file.projectRole !== 'source' ||
+      file.sourceSelection !== 'invalid' || file.selectionReason !== 'continuation-identity-changed' ||
+      recovery?.version !== 1 || recovery.reason !== 'continuation-identity-changed' ||
+      !Number.isSafeInteger(file.selectionRevision) || file.selectionRevision < 0 ||
+      file.selectionRevision >= Number.MAX_SAFE_INTEGER || recovery.expectedRevision !== file.selectionRevision ||
+      !Array.isArray(recovery.actions) || !recovery.actions.length ||
+      recovery.actions.some(action => !['exclude', 'restore'].includes(action)) ||
+      new Set(recovery.actions).size !== recovery.actions.length ||
+      typeof window.crate?.setWorkingSourceSelection !== 'function') return [];
+  const matches = [...(workspace.files || []), ...(workspace.pendingFiles || [])]
+    .filter(row => getFileVisualIdentity(row) === identity);
+  return matches.length === 1 && matches[0] === file && workspace.files.includes(file) ? recovery.actions : [];
+}
+
+function appendWorkingSourceRecovery(row, copy, project, file) {
+  const actions = getWorkingSourceRecoveryActions(project, file);
+  appendFileStatusBadge(row, 'Needs attention', 'recovery', 'Packaging is blocked until this selection is resolved.');
+  const detail = document.createElement('div');
+  detail.className = 'working-source-recovery-detail';
+  detail.setAttribute('role', 'status');
+  detail.setAttribute('tabindex', '-1');
+  detail.textContent = actions.length
+    ? 'The files in the previous Replace choice changed. Choose whether this file should be a working file. Your original files stay on disk.'
+    : 'This selection could not be verified. Refresh the project to check the current files. Packaging remains blocked.';
+  if (file.includedAsDependency) detail.textContent += ' Another working file requires this file as an asset; excluding its working-file role does not remove that requirement.';
+  if (actions.length && !actions.includes('restore')) detail.textContent += ' Restore is unavailable until the saved file can be verified.';
+  copy.appendChild(detail);
+  const presentation = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, tab: tabNavigationEpoch,
+    generation: assetWorkspaceRequestGeneration, workspace: assetWorkspaceRequestId, modal: modalLeaseSequence,
+    request: packageReviewRequestId, revision: file.selectionRevision, actions: [...actions], row, detail, retired: false, buttons: [] };
+  for (const action of actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'working-source-recovery-action';
+    button.textContent = action === 'exclude' ? 'Exclude' : 'Restore';
+    button.setAttribute('aria-label', `${button.textContent} ${file.name || 'working file'} as a working file`);
+    button.disabled = !!workingSourceRecoveryOwner;
+    presentation.buttons.push(button);
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      return changeWorkingSourceSelection(project, file, action, presentation, button);
+    });
+    row.appendChild(button);
+  }
+}
+
+async function recoverWorkingSourceSelection(project, file, action, presentation, button) {
+  const current = () => presentation.account === accountWorkspaceEpoch && presentation.selection === projectSelectionEpoch &&
+    presentation.tab === tabNavigationEpoch && presentation.generation === assetWorkspaceRequestGeneration &&
+    presentation.workspace === assetWorkspaceRequestId && presentation.modal === modalLeaseSequence &&
+    presentation.request === packageReviewRequestId && state.selectedProjectId === project.id &&
+    accountStatus.canUseWorkspace && !hasModalInteraction();
+  const mounted = ['project-file-list', 'working-assets-list'].some(id => $(`#${id}`)?.contains(presentation.row));
+  if (!current() || !mounted || presentation.row.closest?.('.hidden, .filtered-out') || presentation.retired || button?.disabled || !presentation.buttons.includes(button) ||
+      !presentation.row.contains(button) || workingSourceRecoveryOwner || continuationChoiceOwner ||
+      packageReviewConfirmationInFlight || presentation.revision !== file.selectionRevision ||
+      !presentation.actions.includes(action) || !getWorkingSourceRecoveryActions(project, file).includes(action)) return false;
+  presentation.retired = true;
+  workingSourceRecoveryOwner = presentation;
+  // Retire every old package token before crossing the mutation boundary.
+  state.packageReviewToken = null;
+  presentation.request = ++packageReviewRequestId;
+  const confirm = $('#btn-confirm-package');
+  if (confirm) confirm.disabled = true;
+  presentation.detail.focus({ preventScroll: true });
+  for (const control of presentation.buttons) control.disabled = true;
+  presentation.detail.textContent = action === 'exclude' ? 'Excluding the working-file role…' : 'Restoring the working-file role…';
+  try {
+    let result = null;
+    try {
+      result = await window.crate.setWorkingSourceSelection(project.id, getFileVisualIdentity(file), {
+        action, expectedRevision: presentation.revision,
+      });
+    } catch (_) { /* Lost replies require refresh, never automatic replay. */ }
+    if (!current()) return false;
+    presentation.workspace = assetWorkspaceRequestId + 1;
+    const refreshed = await renderFiles({ isCurrent: current });
+    if (!current()) return false;
+    if (!isAuthoritativeWorkspaceRefresh(refreshed, project.id)) {
+      showToast('Crate could not refresh the current files. Refresh the project before packaging or choosing again.');
+      return false;
+    }
+    workingSourceRecoveryOwner = null;
+    const latest = refreshed.workspace.files.find(row => getFileVisualIdentity(row) === getFileVisualIdentity(file));
+    const succeeded = result?.success === true && (!result.projectId || result.projectId === project.id) &&
+      latest?.selectionRevision === presentation.revision + 1 &&
+      latest.sourceSelection === (action === 'exclude' ? 'excluded' : 'selected');
+    await showPackageModal({ runPreScan: false, message: succeeded
+      ? 'Selection saved. Review the updated package and any required files.'
+      : 'Crate could not confirm that selection change. Review the refreshed files before choosing again.' });
+    return succeeded;
+  } catch (_) {
+    if (current()) showToast('Crate could not refresh the current files. Refresh the project before packaging or choosing again.');
+    return false;
+  } finally {
+    if (workingSourceRecoveryOwner === presentation) {
+      workingSourceRecoveryOwner = null;
+      // The current workspace owns this reconciliation, even if the retired
+      // action belongs to an older account epoch. Never reuse its row or reply.
+      const project = state.projects.find(item => item.id === state.selectedProjectId);
+      const workspace = state.assetWorkspace;
+      if (accountStatus.canUseWorkspace && project && !hasModalInteraction() &&
+          assetWorkspaceProjectSnapshot === project && workspace?.projectId === project.id &&
+          assetWorkspaceLoadedRequestId && assetWorkspaceLoadedRequestId === assetWorkspaceRequestId &&
+          !displayOnlyAssetWorkspaces.has(workspace)) {
+        renderAssetWorkspace(project, { trackedFigmaFiles: workspace.trackedFigmaFiles,
+          hasActiveCandidates: (workspace.pendingFiles || []).some(file => file.excluded !== true) }, workspace.files);
+      }
+    }
+  }
+}
+
 function isWorkingSourcePresentation(file) {
   return ['selected', 'excluded', 'invalid'].includes(file?.sourceSelection);
+}
+
+function watchCoverageRowBinding(file) {
+  return JSON.stringify([file.visualIdentity, file.visualRevision, file.selectionRevision, file.sourceSelection,
+    file.included, file.includedAsDependency, file.effectiveRole, file.requiredBy, file.watchCoverage]);
+}
+
+function captureWatchCoveragePresentation(project, workspace) {
+  return { project, workspace, status: project.status, account: accountWorkspaceEpoch,
+    selection: projectSelectionEpoch, generation: assetWorkspaceRequestGeneration, request: assetWorkspaceRequestId,
+    envelope: JSON.stringify(workspace.watchCoverage),
+    rows: new WeakMap([...(workspace.files || []), ...(workspace.pendingFiles || [])]
+      .filter(row => row && typeof row === 'object').map(row => [row, watchCoverageRowBinding(row)])) };
+}
+
+function getWorkingSourceWatchPresentation(project, file) {
+  // Virtual Figma cards and ordinary assets do not use physical-source Watch.
+  if (!file || file.virtualFigmaSource === true || !getFileExtension(file) || !(isWorkingSourcePresentation(file) || file.projectRole === 'source')) return null;
+  const unknown = { status: 'unknown', label: 'Watch coverage unknown',
+    detail: 'Current Watch coverage could not be confirmed. Package Review checks saved files separately.' };
+  const receipt = watchCoveragePresentation, workspace = state.assetWorkspace, envelope = workspace?.watchCoverage;
+  if (!project || !receipt || receipt.workspace !== workspace || receipt.project !== project ||
+      receipt.status !== project.status || receipt.account !== accountWorkspaceEpoch ||
+      receipt.selection !== projectSelectionEpoch || receipt.generation !== assetWorkspaceRequestGeneration ||
+      receipt.request !== assetWorkspaceRequestId || assetWorkspaceLoadedRequestId !== receipt.request ||
+      state.selectedProjectId !== project.id || workspace?.projectId !== project.id ||
+      assetWorkspaceProjectSnapshot !== project || state.projects.find(item => item.id === project.id) !== project ||
+      accountStatus.canUseWorkspace !== true || displayOnlyAssetWorkspaces.has(workspace) ||
+      !envelope || receipt.envelope !== JSON.stringify(envelope) || envelope.exactPathLimit !== 256 || envelope.nativeDelivery !== 'unverified' ||
+      !Number.isSafeInteger(envelope.accountGeneration) || envelope.accountGeneration < 0 ||
+      !(envelope.activationToken === null || Number.isSafeInteger(envelope.activationToken) && envelope.activationToken > 0)) return unknown;
+  const identity = getFileVisualIdentity(file), revision = getFileVisualRevision(file);
+  if (!identity || !revision || file.selectionUnavailable) return unknown;
+  const matches = [...(workspace.files || []), ...(workspace.pendingFiles || [])].filter(row => getFileVisualIdentity(row) === identity);
+  if (matches.length !== 1) return unknown;
+  const current = matches[0], pending = (workspace.pendingFiles || []).includes(current);
+  if (receipt.rows.get(current) !== watchCoverageRowBinding(current) ||
+      receipt.rows.get(current) !== watchCoverageRowBinding(file) || getFileVisualRevision(current) !== revision || current.selectionRevision !== file.selectionRevision ||
+      current.sourceSelection !== file.sourceSelection || current.included !== file.included ||
+      current.includedAsDependency !== file.includedAsDependency) return unknown;
+  const coverage = current.watchCoverage;
+  if (!coverage || coverage.nativeDelivery !== 'unverified') return unknown;
+  const reasons = {
+    'default-root': ['default-root-eligible'], 'exact-enrolled': ['exact-path-enrolled'],
+    'cap-limited': ['exact-path-limit'], inactive: ['watch-inactive', 'watch-unavailable', 'stale-account'],
+    'not-included': ['source-not-included'], 'not-admitted': ['source-pending'],
+    unsupported: ['format-unsupported', 'source-not-regular', 'source-symlink', 'source-hard-linked'],
+    ignored: ['watcher-ignored', 'event-name-ignored'], unavailable: ['source-unavailable', 'enrollment-failed'],
+  };
+  if (!Object.hasOwn(reasons, coverage.status) || !reasons[coverage.status].includes(coverage.reason)) return unknown;
+  if (pending !== (coverage.status === 'not-admitted')) return unknown;
+  if (['default-root', 'exact-enrolled', 'cap-limited'].includes(coverage.status) &&
+      (project.status !== 'watching' || envelope.activationToken === null || current.included !== true)) return unknown;
+  const presentations = {
+    'default-root': ['Watch configured · folder', 'This file is eligible within an existing watched folder. Delivery of file changes is unverified.'],
+    'exact-enrolled': ['Watch configured · file', 'Watch enrollment is requested for this file. Delivery of file changes is unverified.'],
+    'cap-limited': ['Not watched · 256-file limit', 'The 256 individual-file Watch slots are full. This file has no individual-file Watch enrollment. When a slot is freed, eligible waiting files are enrolled in path order. Existing enrollments stay in place when rows are reordered. Excluding a file still required by another working file does not free its slot. Refreshing does not guarantee a slot. This limit alone does not prevent packaging; Package Review checks saved files separately.'],
+    inactive: ['Not watched · inactive', coverage.reason === 'watch-inactive'
+      ? 'Watch is inactive. Resume starts Watch and checks coverage again; delivery remains unverified.'
+      : 'No current Watch subscription is available for this file.'],
+    'not-included': ['Not watched · excluded', 'This file is not included as a working file or required asset.'],
+    'not-admitted': ['Not watched · pending', 'This file has not been added to the project. Watch enrollment is not established.'],
+    unsupported: ['Not watched · unsupported', ({ 'format-unsupported': 'Watch does not support this file type.',
+      'source-not-regular': 'Watch requires a regular file.', 'source-symlink': 'Watch does not enroll symbolic links.',
+      'source-hard-linked': 'Watch does not enroll files with multiple hard links.' })[coverage.reason]],
+    ignored: ['Not watched · ignored', coverage.reason === 'event-name-ignored'
+      ? 'The filename is excluded by Watch rules.' : 'The file location is excluded by Watch rules.'],
+    unavailable: ['Not watched · unavailable', coverage.reason === 'enrollment-failed'
+      ? 'Watch could not enroll this file.' : 'The file is unavailable for Watch.'],
+  };
+  const [label, detail] = presentations[coverage.status];
+  return { status: coverage.status, label, detail };
+}
+
+function appendWorkingSourceWatchCoverage(copy, project, file) {
+  const coverage = getWorkingSourceWatchPresentation(project, file);
+  if (!coverage) return;
+  const disclosure = document.createElement('details');
+  disclosure.className = 'working-source-watch';
+  disclosure.dataset.watchStatus = coverage.status;
+  const summary = document.createElement('summary');
+  summary.className = 'working-source-watch-summary';
+  summary.textContent = coverage.label;
+  summary.setAttribute('aria-label', `${file.name || 'Working file'}: ${coverage.label}`);
+  const detail = document.createElement('div');
+  detail.textContent = coverage.detail;
+  disclosure.appendChild(summary);
+  disclosure.appendChild(detail);
+  copy.appendChild(disclosure);
 }
 
 function isWorkingSourceActionPending(identity) {
@@ -2629,7 +3041,11 @@ function getWorkingSourceActionError(error) {
   return 'Crate could not confirm this selection change. Refresh the project before choosing again.';
 }
 
-async function changeWorkingSourceSelection(project, file, action) {
+async function changeWorkingSourceSelection(project, file, action, presentation = null, button = null) {
+  if (file?.sourceSelection === 'invalid') {
+    if (!presentation) return false;
+    return recoverWorkingSourceSelection(project, file, action, presentation, button);
+  }
   const identity = getFileVisualIdentity(file);
   const currentRow = state.assetWorkspace?.projectId === project.id && state.assetWorkspace.files?.find(row => getFileVisualIdentity(row) === identity);
   if (!identity || !currentRow || currentRow.selectionRevision !== file.selectionRevision ||
@@ -2684,12 +3100,13 @@ async function changeWorkingSourceSelection(project, file, action) {
 }
 
 function appendWorkingSourceControls(row, copy, project, file) {
+  if (file.sourceSelection === 'invalid') return appendWorkingSourceRecovery(row, copy, project, file);
   const status = getWorkingSourceStatus(file);
   appendFileStatusBadge(row, status.label, file.sourceSelection === 'excluded' ? 'excluded' : 'protected', status.detail);
   const detail = document.createElement('div');
   detail.className = 'working-source-detail';
   detail.textContent = status.detail;
-  copy.appendChild(detail);
+  if (status.label !== 'Selected' || file.verificationStatus === 'no-extractor') copy.appendChild(detail);
   const identity = getFileVisualIdentity(file);
   if (!identity || !Number.isSafeInteger(file.selectionRevision) || file.selectionRevision < 0 ||
       !['selected', 'excluded'].includes(file.sourceSelection) ||
@@ -2720,11 +3137,13 @@ function createAssetFileRow(
     previewPriority = 0,
     loadVisual = true,
     selectable = false,
+    showAssetOrigin = false,
   } = {}
 ) {
   // Ordinary assets use effective membership: a required dependency can
   // override saved exclusion intent. Working-source intent stays separate.
   if (!isWorkingSourcePresentation(file) && typeof file?.included === 'boolean') excluded = !isPresentedAssetIncluded(file);
+  if (file?.sourceSelection === 'excluded') excluded = true;
   const row = document.createElement('div');
   row.className = `app-file asset-file-row${excluded ? ' is-excluded' : ''}${protectedSource ? ' is-protected' : ''}${sourceRecoveryAllowed ? ' is-recoverable' : ''}`;
   row.setAttribute('role', 'listitem');
@@ -2768,6 +3187,18 @@ function createAssetFileRow(
   name.title = name.textContent;
   copy.appendChild(name);
   appendAppOriginLabel(copy, file, project, { includeSource: !protectedSource });
+  if (showAssetOrigin && ['existing', 'added'].includes(file.assetOrigin)) {
+    let origin = copy.querySelector('.file-origin');
+    if (!origin) {
+      origin = document.createElement('div');
+      origin.className = 'file-origin';
+      copy.appendChild(origin);
+    }
+    const category = document.createElement('span');
+    category.className = 'nested-asset-origin';
+    category.textContent = file.assetOrigin === 'existing' ? 'Existing' : 'Added';
+    origin.insertBefore(category, origin.children[0] || null);
+  }
   row.appendChild(copy);
 
   let hasStatusBadge = false;
@@ -2806,6 +3237,7 @@ function createAssetFileRow(
     if (!hasStatusBadge) appendFileStatusBadge(row, 'Included', 'included', 'Included in this package');
     appendAssetFileRemovalAction(row, project, file);
   }
+  appendWorkingSourceWatchCoverage(protectedSource ? row : copy, project, file);
   return row;
 }
 
@@ -2828,6 +3260,7 @@ function renderAssetPanelList(list, project, files, options = {}) {
     previewPriority: options.previewPriority || 0,
     loadVisual: options.loadVisual !== false,
     selectable: options.selectable === true,
+    showAssetOrigin: options.showAssetOrigin === true,
   });
   if (!Array.isArray(files) || files.length === 0) {
     const emptyMessage = options.emptyMessage || 'No assets in this group.';
@@ -2882,12 +3315,81 @@ function setCountText(id, value) {
   if (element) element.textContent = String(value);
 }
 
+// Nest only an unambiguous dependency under a currently presented source.
+// Names, extensions, and observation order never establish a relationship.
+function getAssetReviewParent(file, sources) {
+  if (!isPresentedAssetIncluded(file)) return null;
+  const relationships = Array.isArray(file.currentWorkingSources) ? file.currentWorkingSources.map(source => source.identity) : file.requiredSourceIdentities;
+  const identities = Array.isArray(relationships) ? [...new Set(relationships)] : [];
+  const matches = identities.length === 1
+    ? sources.filter(source => getFileVisualIdentity(source) === identities[0] && source.included === true)
+    : identities.length === 0 && file.figmaSourceIdentity
+      ? sources.filter(source => source.virtualFigmaSource && getFileVisualIdentity(source) === `figma-source:${file.figmaSourceIdentity}`)
+      : [];
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function renderAssetReviewHierarchy(filterItems) {
+  const logical = state.assetReviewLogicalItems;
+  const project = state.projects.find(item => item.id === state.selectedProjectId);
+  if (!logical || !project) return;
+  const sources = logical.working || [];
+  const groups = new Map(sources.map(source => [source, []]));
+  const standalone = { existing: [], added: [] };
+  for (const category of ['existing', 'added']) {
+    for (const file of logical[category] || []) {
+      const parent = getAssetReviewParent(file, sources);
+      if (parent) groups.get(parent).push({ file, category });
+      else standalone[category].push(file);
+    }
+  }
+  let visibleSources = 0;
+  const workingList = $('#working-assets-list');
+  for (const source of sources) {
+    const row = Array.from(workingList?.children || []).find(node => node.dataset?.renderKey === getRendererItemKey(source));
+    if (!row) continue;
+    const entries = groups.get(source);
+    const visible = entries.filter(entry => filterItems([entry.file], entry.category).length);
+    let children = row.querySelector('.working-source-assets');
+    if (entries.length && !children) {
+      children = document.createElement('div');
+      children.className = 'working-source-assets asset-card-grid';
+      children.setAttribute('role', 'list');
+      children.setAttribute('aria-label', `Assets used by ${source.name || 'working file'}`);
+      const watch = row.querySelector('.working-source-watch');
+      if (watch) row.insertBefore(children, watch);
+      else row.appendChild(children);
+    }
+    if (children) {
+      renderAssetPanelList(children, project, visible.map(entry => entry.file), {
+        virtualized: true, loadVisual: false, selectable: true, showAssetOrigin: true,
+      });
+      children.classList.toggle('hidden', visible.length === 0);
+    }
+    const show = filterItems([source], 'working').length > 0 || visible.length > 0;
+    row.classList.toggle('filtered-out', !show);
+    if (show) visibleSources++;
+  }
+  $('#working-assets-section')?.classList.toggle('filtered-out', visibleSources === 0);
+  let visibleStandalone = 0;
+  for (const category of ['existing', 'added']) {
+    const list = $(`#${category}-assets-list`);
+    const visible = filterItems(standalone[category], category);
+    if (list?.__assetReviewVirtualState) setVirtualAssetItems(list, visible, list.__assetReviewVirtualState.build);
+    const section = $(`#${category}-assets-section`);
+    visibleStandalone += visible.length;
+    section?.classList.toggle('hidden', visible.length === 0);
+    setAssetPanelCount($(`#${category}-assets-count`), visible.filter(isPresentedAssetIncluded).length, visible.length);
+  }
+  return visibleSources + visibleStandalone;
+}
+
 function applyAssetReviewFilter() {
   const filter = state.assetReviewFilter || 'all';
   const query = String(state.assetReviewQuery || '').trim().toLowerCase();
   const logicalItems = state.assetReviewLogicalItems || {};
   const filterItems = (items, category) => (Array.isArray(items) ? items : []).filter(file => {
-    const excluded = isWorkingSourcePresentation(file)
+    const excluded = category === 'missing' ? file.excluded === true : isWorkingSourcePresentation(file)
       ? file.sourceSelection === 'excluded'
       : !isPresentedAssetIncluded(file);
     const matchesFilter = filter === 'all'
@@ -2948,6 +3450,20 @@ function applyAssetReviewFilter() {
       pending.classList.toggle('filtered-out', !['all', 'missing'].includes(filter) || visiblePendingCount === 0);
     }
   }
+  const visibleHierarchyCount = renderAssetReviewHierarchy(filterItems);
+  const emptyAdded = (logicalItems.added || []).length === 0;
+  const excludedCount = [...(logicalItems.working || []), ...(logicalItems.existing || []), ...(logicalItems.added || [])]
+    .filter(file => isWorkingSourcePresentation(file) ? file.sourceSelection === 'excluded' : !isPresentedAssetIncluded(file)).length;
+  if (visibleHierarchyCount === undefined) $('#added-assets-section')?.classList.toggle('hidden', emptyAdded);
+  const emptyResult = $('#asset-review-empty');
+  if (emptyResult) {
+    const noMatches = visibleHierarchyCount === 0 && filterItems(logicalItems.missing, 'missing').length === 0;
+    emptyResult.classList.toggle('hidden', !noMatches || (filter === 'all' && !query));
+    emptyResult.textContent = query ? 'No files match your search.' : ({ added: 'No added assets.', existing: 'No existing assets.', excluded: 'No excluded files.', missing: 'No files need review.' })[filter] || '';
+  }
+  $('#added-empty-tile')?.classList.toggle('hidden', !emptyAdded);
+  $('#excluded-empty-tile')?.classList.toggle('hidden', excludedCount !== 0);
+  $('#review-empty-states')?.classList.toggle('hidden', filter !== 'all' || !!query || (!emptyAdded && excludedCount !== 0));
   $$('.asset-filter').forEach(button => {
     const active = button.dataset.assetFilter === filter;
     button.classList.toggle('active', active);
@@ -2966,7 +3482,7 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   const counts = workspace?.semanticCounts;
   const workingSummary = $('#working-source-summary');
   if (workingSummary) {
-    workingSummary.classList.toggle('hidden', !counts);
+    workingSummary.classList.add('hidden');
     workingSummary.textContent = counts ? `${counts.selectedWorkingSources} selected local working file(s) · ${counts.excludedWorkingSources} excluded local working file(s)` +
       `${figmaSourceCount ? ` · ${figmaSourceCount} tracked Figma working file(s)` : ''} · ${counts.includedAssets} included asset(s)` : '';
   }
@@ -2979,18 +3495,29 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
   setCountText('filter-count-excluded', excludedCount);
 
   const alert = $('#project-linking-alert');
+  const blocked = workspace?.workingSourceSelectionBlocked === true;
   if (alert) {
-    alert.textContent = pendingFiles.length
+    const first = pendingFiles[0];
+    alert.textContent = first ? `${first.name || 'Untitled file'}${pendingFiles.length > 1 ? ` + ${pendingFiles.length - 1} more` : ''}` : 'Review project assets';
+    const detail = $('#project-review-detail');
+    const eyebrow = $('#project-review-eyebrow');
+    if (eyebrow) eyebrow.textContent = pendingFiles.length
       ? `${pendingFiles.length} file${pendingFiles.length === 1 ? ' needs' : 's need'} review`
-      : '';
-    if (workspace?.workingSourceSelectionBlocked) {
-      const facts = [];
-      if (counts?.unresolvedVerification) facts.push(`${counts.unresolvedVerification} working-file verification issue(s)`);
-      if (counts?.missingRequiredReferences) facts.push(`${counts.missingRequiredReferences} required link(s) unavailable`);
-      if (counts?.relationshipHolds) facts.push('unresolved file relationships');
-      alert.textContent = [alert.textContent, 'Package verification needs attention.', ...facts].filter(Boolean).join(' ');
-    }
-    alert.classList.toggle('hidden', pendingFiles.length === 0 && !workspace?.workingSourceSelectionBlocked);
+      : blocked ? 'Package needs review' : 'Project assets';
+    if (detail) detail.textContent = first
+      ? `${getPendingCaptureState(first) === 'observed' ? 'Opened · Pending' : getPendingFileReason(first).replace(/\.$/, '')} · Not in the package`
+      : 'View working files, included assets and exclusions.';
+    alert.classList.remove('hidden');
+    $('.project-review-entry')?.classList.toggle('is-clear', !pendingFiles.length && !blocked);
+  }
+  const packageWarning = $('#project-package-warning');
+  if (packageWarning) {
+    const facts = [];
+    if (counts?.unresolvedVerification) facts.push(`${counts.unresolvedVerification} working file${counts.unresolvedVerification === 1 ? ' needs' : 's need'} verification`);
+    if (counts?.missingRequiredReferences) facts.push(`${counts.missingRequiredReferences} required link${counts.missingRequiredReferences === 1 ? '' : 's'} unavailable`);
+    if (counts?.relationshipHolds) facts.push(`${counts.relationshipHolds} unresolved file relationship${counts.relationshipHolds === 1 ? '' : 's'}`);
+    packageWarning.textContent = blocked ? `Package blocked${facts.length ? `: ${facts.join(' · ')}` : ': verification needs attention'}. Review working files and required assets.` : '';
+    packageWarning.classList.toggle('hidden', !blocked);
   }
 
   const recentList = $('#recent-assets-list');
@@ -3035,10 +3562,8 @@ function renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets,
     ` · ${counts.selectedWorkingSources} ${figmaSourceCount ? 'local ' : ''}Working File${counts.selectedWorkingSources === 1 ? '' : 's'} selected` +
     `${figmaSourceCount ? ` · ${figmaSourceCount} Figma Working File${figmaSourceCount === 1 ? '' : 's'} tracked` : ''}` +
     `${workspace?.workingSourceSelectionBlocked ? ' · Verification needs attention' : ''}` : 'Package selection and verification unavailable') +
-    `${pendingFiles.length ? ` · ${pendingFiles.length} need attention` : ''}`;
-  const reviewSummary = $('#asset-review-summary');
+    `${pendingFiles.length ? ` · ${pendingFiles.length} needs review` : ''}`;
   const reviewFooter = $('#asset-review-footer-summary');
-  if (reviewSummary) reviewSummary.textContent = summary;
   if (reviewFooter) reviewFooter.textContent = summary;
 }
 
@@ -3085,6 +3610,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
       name: sourceName,
       ext: '',
       appFamily: 'figma',
+      virtualFigmaSource: true,
       sourceName: null,
       assetOrigin: 'added',
       projectRole: 'source',
@@ -3118,6 +3644,7 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
         name: sourceName,
         ext: '',
         appFamily: 'figma',
+        virtualFigmaSource: true,
         sourceName: null,
         assetOrigin: 'added',
         projectRole: 'source',
@@ -3177,9 +3704,8 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
   const includedAddedCount = addedAssets.filter(isPresentedAssetIncluded).length;
   setAssetPanelCount($('#added-assets-count'), includedAddedCount, addedAssets.length);
 
-  const pendingFiles = state.assetWorkspace?.projectId === project.id
-    ? (state.assetWorkspace.pendingFiles || []).filter(file => file.excluded !== true)
-    : [];
+  const pendingFiles = composePendingReviewFiles(project, state.assetWorkspace?.projectId === project.id
+    ? state.assetWorkspace.pendingFiles : []);
   const pendingReviewFiles = $('#pending-file-list')?.__assetReviewAllItems || [];
   state.assetReviewLogicalItems = {
     working: sourceFiles,
@@ -3188,11 +3714,10 @@ function renderAssetWorkspace(project, options = {}, presentedFiles = null) {
     missing: pendingReviewFiles,
   };
   renderAssetDashboard(project, sourceFiles, existingAssets, addedAssets, pendingFiles, figmaSourceFiles.length);
-  applyAssetReviewFilter();
-
   $('#existing-assets-section')?.classList.toggle('hidden', existingAssets.length === 0);
   $('#working-assets-section')?.classList.toggle('hidden', sourceFiles.length === 0);
-  updateAssetReviewBatchControls(project, existingAssets, includedExistingCount);
+  restoreAssetReviewBatchControls(project);
+  applyAssetReviewFilter();
   $('#project-dashboard')?.classList.toggle('hidden', state.assetReviewOpen === true);
   $('#asset-review-workspace')?.classList.toggle('hidden', state.assetReviewOpen !== true);
 }
@@ -3280,7 +3805,8 @@ function getFileAppPresentation(file, project = null) {
 
 function createAppOriginLabel(file, project, { includeSource = true } = {}) {
   const app = getFileAppPresentation(file, project);
-  const safeSourceName = sanitizeRendererSourceName(file?.sourceName);
+  const currentParents = Array.isArray(file?.currentWorkingSources) ? file.currentWorkingSources.map(source => sanitizeRendererSourceName(source.name)).filter(Boolean) : null;
+  const safeSourceName = currentParents ? currentParents.join(', ') : sanitizeRendererSourceName(file?.sourceName);
   if (app.family === 'generic' && !safeSourceName) return null;
   const wrapper = document.createElement('div');
   wrapper.className = `file-origin${app.family === 'generic' ? ' file-origin-context-only' : ''}`;
@@ -3294,15 +3820,15 @@ function createAppOriginLabel(file, project, { includeSource = true } = {}) {
     wrapper.appendChild(mark);
   }
   const sourceName = includeSource && app.family !== 'figma' && safeSourceName
-    ? ` · ${safeSourceName}`
+    ? ` · ${currentParents?.length > 1 ? 'Shared by ' : currentParents?.length ? 'Used by ' : ''}${safeSourceName}`
     : '';
   const figmaScope = app.family === 'figma' && projectHasFigmaContext(project)
     ? ` · ${getProjectFigmaScopeMode(project) === 'entire-file' ? 'Entire File' : 'Current Page'}`
     : '';
   label.textContent = app.family === 'generic'
-    ? safeSourceName
+    ? `${currentParents?.length > 1 ? 'Shared by ' : currentParents?.length ? 'Used by ' : ''}${safeSourceName}`
     : `${app.label}${sourceName || figmaScope}`;
-  label.title = label.textContent;
+  label.title = label.textContent + (currentParents && file?.sourceName ? ` · Originally captured from ${sanitizeRendererSourceName(file.sourceName)}` : '');
   wrapper.appendChild(label);
   return wrapper;
 }
@@ -3359,19 +3885,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   if (!section || !list) return;
   setAssetReviewProject(project.id);
 
-  const presentations = Array.isArray(presentedPendingFiles)
-    ? presentedPendingFiles.filter(file => file.excluded !== true)
-    : [];
-  // Compose once against authoritative raw entries; filtering must reuse these
-  // objects rather than attempt to rebind a cloned presentation by its name.
-  const pending = getVisiblePendingAssetEntries(project).map(({ rawFile, sourceIndex }) => {
-    const presentation = getPendingWorkspacePresentation(rawFile, sourceIndex, presentations);
-    const file = presentation
-      ? { ...rawFile, ...presentation }
-      : { ...rawFile, protectedSource: true, visualIdentity: null, sourceName: null };
-    rendererFallbackItemKeys.set(file, getRendererItemKey(rawFile));
-    return file;
-  });
+  const pending = composePendingReviewFiles(project, presentedPendingFiles);
   pending.forEach(getRendererItemKey);
 
   if (pending.length === 0) {
@@ -3382,6 +3896,7 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   }
 
   section.classList.remove('hidden');
+  setCountText('pending-assets-count', pending.length);
   const buildPendingRow = file => {
     const row = document.createElement('div');
     row.className = 'pending-file';
@@ -3419,7 +3934,12 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
     name.title = name.textContent;
     const reasonElement = document.createElement('span');
     reasonElement.className = 'pending-file-reason';
-    reasonElement.textContent = reason;
+    const coverage = getWorkingSourceWatchPresentation(project, file);
+    reasonElement.textContent = coverage ? `${coverage.label} · ${reason}` : reason;
+    if (coverage) {
+      reasonElement.title = `${coverage.label}. ${coverage.detail} ${reason}`;
+      reasonElement.setAttribute('aria-label', reasonElement.title);
+    }
     copy.appendChild(name);
     copy.appendChild(reasonElement);
     row.appendChild(copy);
@@ -3519,6 +4039,9 @@ function acceptAccountSnapshot(snapshot) {
     notificationPackageTriggerInFlight = false;
     setSelectedProject(state.selectedProjectId, { invalidate: true, restoreFocus: false });
   }
+  // Account reentry may remove inert before its workspace reload resolves.
+  // Reconcile the retired receipt synchronously before exposing those controls.
+  reconcileCurrentAssetReviewBatchControls();
   renderAccount();
   if (projectCreationPhase === 'reconciling') {
     if (newerSnapshot) void requestProjectCreationRecovery();
@@ -3920,6 +4443,21 @@ function cancelPackageReview() {
   packageReviewRequestId += 1;
   hidePackageReviewDialog({ restoreFocus: true });
   releaseModalLease('modal-package');
+  // Cancellation advances the review epochs. Replace current recovery controls;
+  // callbacks retained from the prior presentation must remain stale.
+  const project = state.projects.find(item => item.id === state.selectedProjectId);
+  const workspace = state.assetWorkspace;
+  if (accountStatus.canUseWorkspace && project && !hasModalInteraction() &&
+      assetWorkspaceProjectSnapshot === project && workspace?.projectId === project.id &&
+      assetWorkspaceLoadedRequestId && assetWorkspaceLoadedRequestId === assetWorkspaceRequestId &&
+      !displayOnlyAssetWorkspaces.has(workspace)) {
+    renderAssetWorkspace(project, { trackedFigmaFiles: workspace.trackedFigmaFiles,
+      hasActiveCandidates: (workspace.pendingFiles || []).some(file => file.excluded !== true) }, workspace.files);
+  } else if (accountStatus.canUseWorkspace && project && !hasModalInteraction() && !workingSourceRecoveryOwner) {
+    // A review may have replaced the project snapshot. Obtain new authority
+    // instead of promoting cached display rows into actionable controls.
+    return renderFiles();
+  }
 }
 
 function changePackageReviewSelection() {
@@ -3941,8 +4479,7 @@ function handlePackageReviewKeydown(event) {
   if (event.key === 'Escape') {
     if (packageReviewConfirmationInFlight) return;
     event.preventDefault();
-    cancelPackageReview();
-    return;
+    return cancelPackageReview();
   }
   if (event.key !== 'Tab') return;
 
@@ -4146,18 +4683,142 @@ function togglePackageReviewContents() {
   focusTarget?.focus?.({ preventScroll: true });
 }
 
+// Proactive choices consume backend admission evidence; the renderer never infers pairs.
+let workingFileChoiceOwner = null;
+function renderWorkingFileChoices(project, workspace) {
+  const region = $('#working-file-choices');
+  if (!region) return;
+  const contract = workspace?.projectId === project.id && workspace?.workingFileChoices;
+  const choices = contract?.version === 1 && Array.isArray(contract.choices) ? contract.choices : [];
+  const signature = JSON.stringify([project.id, accountWorkspaceEpoch, projectSelectionEpoch, choices, contract?.limited, contract?.blocked, contract?.recoveryRevision, !!workingFileChoiceOwner]);
+  if (region.dataset.choiceSignature === signature) return;
+  const hadFocus = region.contains(document.activeElement);
+  region.dataset.choiceSignature = signature;
+  region.replaceChildren();
+  region.classList.toggle('hidden', choices.length === 0 && !contract?.blocked);
+  if (contract?.limited) {
+    const limit = document.createElement('p');
+    limit.textContent = `${contract.remaining} working files still need a decision. The next choices appear as you finish these.`;
+    region.appendChild(limit);
+  }
+  if (contract?.recoveryRequired) {
+    const help = document.createElement('p');
+    help.textContent = 'Saved working-file decisions need recovery. Packaging is blocked. Recover decisions to review each current working file again; this does not change your selections or originals.';
+    const recover = document.createElement('button'); recover.type = 'button'; recover.textContent = 'Recover decisions';
+    recover.disabled = !!workingFileChoiceOwner || typeof window.crate?.resolveWorkingFileChoice !== 'function';
+    recover.addEventListener('click', () => { void submitWorkingFileChoice(project.id,
+      { id: 'recovery', revision: contract.recoveryRevision }, 'recover', null); });
+    region.appendChild(help); region.appendChild(recover);
+  } else if (contract?.blocked && !choices.length) {
+    const help = document.createElement('p'); help.textContent = 'Working-file decisions are unavailable in the current scope. Packaging remains blocked until those files are available for review.';
+    region.appendChild(help);
+  }
+  if (!choices.length) { if (hadFocus) $('#btn-review-assets')?.focus(); return; }
+  const heading = document.createElement('h2');
+  heading.textContent = choices.length === 1 ? 'New working file' : `${choices.length} new working files`;
+  heading.tabIndex = -1; region.appendChild(heading);
+  const status = document.createElement('p'); status.className = 'working-choice-status'; status.setAttribute('role', 'status');
+  status.textContent = workingFileChoiceOwner ? 'Verifying your choice…' : ''; region.appendChild(status);
+  for (const entry of choices) {
+    const card = document.createElement('div'); card.className = 'working-file-choice';
+    const title = document.createElement('p');
+    title.textContent = `${sanitizeRendererSourceName(entry.source?.name) || 'A new file'}${entry.source?.folder ? ` · ${sanitizeRendererSourceName(entry.source.folder)}` : ''} was added as a working file.`; card.appendChild(title);
+    const help = document.createElement('p'); help.className = 'working-source-detail';
+    help.textContent = entry.ready
+      ? 'Keep it alongside your other files, or choose a working file to replace. Required assets stay included. Your originals stay on disk.'
+      : 'Save the file, then retry verification. If the app last reported unsaved changes, resume watching and obtain a saved-file observation first. Retrying checks disk bytes without changing your selections.';
+    card.appendChild(help);
+    const actions = document.createElement('div'); actions.className = 'working-file-choice-actions';
+    const keep = document.createElement('button'); keep.type = 'button'; keep.className = 'working-source-action'; keep.textContent = 'Keep both';
+    const use = document.createElement('button'); use.type = 'button'; use.className = 'working-source-action'; use.textContent = 'Use this instead of…';
+    const disabled = !entry.ready || !!workingFileChoiceOwner || typeof window.crate?.resolveWorkingFileChoice !== 'function';
+    keep.disabled = disabled; use.disabled = disabled;
+    keep.addEventListener('click', () => { void submitWorkingFileChoice(project.id, entry, 'keep-both', null); });
+    const picker = document.createElement('div'); picker.className = 'working-file-predecessor hidden';
+    const label = document.createElement('label'); label.textContent = 'Choose the working file to replace';
+    const select = document.createElement('select'); select.setAttribute('aria-label', `Working file to replace with ${sanitizeRendererSourceName(entry.source?.name)}`);
+    const blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a file…'; select.appendChild(blank);
+    for (const prior of entry.predecessors || []) {
+      const option = document.createElement('option'); option.value = prior.visualIdentity;
+      option.textContent = `${sanitizeRendererSourceName(prior.name)}${prior.folder ? ` · ${sanitizeRendererSourceName(prior.folder)}` : ''}`; select.appendChild(option);
+    }
+    select.value = ''; label.appendChild(select); picker.appendChild(label);
+    const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'working-source-action'; confirm.disabled = true; confirm.textContent = 'Use this file';
+    select.addEventListener('change', () => {
+      const prior = (entry.predecessors || []).find(item => item.visualIdentity === select.value);
+      confirm.disabled = !prior || disabled; confirm.textContent = prior ? `Replace ${sanitizeRendererSourceName(prior.name)}` : 'Use this file';
+    });
+    confirm.addEventListener('click', () => { void submitWorkingFileChoice(project.id, entry, 'replace', select.value); }); picker.appendChild(confirm);
+    use.addEventListener('click', () => { picker.classList.remove('hidden'); use.setAttribute('aria-expanded', 'true'); select.focus(); }); use.setAttribute('aria-expanded', 'false');
+    if (!entry.ready) {
+      const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'working-source-action'; retry.textContent = 'Retry verification';
+      retry.disabled = !!workingFileChoiceOwner || typeof window.crate?.resolveWorkingFileChoice !== 'function';
+      retry.addEventListener('click', () => { void submitWorkingFileChoice(project.id, entry, 'retry', null); });
+      actions.appendChild(retry);
+    }
+    actions.appendChild(keep); actions.appendChild(use); card.appendChild(actions); card.appendChild(picker); region.appendChild(card);
+  }
+  if (hadFocus) heading.focus();
+}
+
+async function submitWorkingFileChoice(projectId, entry, choice, predecessorIdentity) {
+  const project = state.projects.find(item => item.id === projectId);
+  const contract = state.assetWorkspace?.projectId === projectId ? state.assetWorkspace.workingFileChoices : null;
+  const currentEntry = state.assetWorkspace?.projectId === projectId && state.assetWorkspace.workingFileChoices?.choices?.find(item => item.id === entry.id && item.revision === entry.revision);
+  if (!project || state.selectedProjectId !== projectId || !accountStatus.canUseWorkspace || workingFileChoiceOwner || activeModalLease ||
+      (choice === 'recover' ? !contract?.recoveryRequired || entry.revision !== contract.recoveryRevision
+        : !currentEntry || (choice !== 'retry' && !currentEntry.ready)) || typeof window.crate?.resolveWorkingFileChoice !== 'function' ||
+      (choice === 'replace' && !currentEntry.predecessors.some(item => item.visualIdentity === predecessorIdentity)) ||
+      !['keep-both', 'replace', 'retry', 'recover'].includes(choice)) return false;
+  const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, tab: tabNavigationEpoch };
+  const current = () => owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch &&
+    owner.tab === tabNavigationEpoch && state.selectedProjectId === projectId && accountStatus.canUseWorkspace;
+  workingFileChoiceOwner = owner;
+  state.packageReviewToken = null; packageReviewRequestId += 1;
+  const packageButton = $('#btn-confirm-package'); if (packageButton) packageButton.disabled = true;
+  renderWorkingFileChoices(project, state.assetWorkspace);
+  try {
+    const result = await window.crate.resolveWorkingFileChoice(projectId, { id: entry.id, revision: entry.revision, choice,
+      predecessorIdentity: choice === 'replace' ? predecessorIdentity : null });
+    if (!current()) return false;
+    showToast(result?.success ? (choice === 'retry' ? 'Saved file verified. Choose what to keep.' : choice === 'recover' ? 'Review the recovered working-file decisions.' : 'Working-file choice saved.')
+      : result?.error === 'working_file_saved_observation_required' ? 'Save in the app and resume watching to obtain a fresh saved-file observation.' : 'The files changed or could not be verified. Review the current files before choosing again.');
+    return result?.success === true;
+  } catch (_) { if (current()) showToast('The choice could not be saved. Review the current files and try again.'); return false; }
+  finally {
+    if (workingFileChoiceOwner === owner) {
+      workingFileChoiceOwner = null;
+      // Completion from a retired tab cannot report a result, but its busy
+      // controls may be visible again. Refresh only the current view, retaining
+      // account/selection ownership and retiring this read if a new choice starts.
+      const reconciliationTab = tabNavigationEpoch;
+      const reconcileCurrent = () => owner.account === accountWorkspaceEpoch &&
+        owner.selection === projectSelectionEpoch && state.selectedProjectId === projectId &&
+        accountStatus.canUseWorkspace && reconciliationTab === tabNavigationEpoch &&
+        !workingFileChoiceOwner && isTabActive('current-project');
+      if (reconcileCurrent()) await renderFiles({ isCurrent: reconcileCurrent });
+    }
+  }
+}
+
 // Save As pair-choice-v1 with explicit backend admission/selection eligibility.
 // Never infer pairs or admission from names, paths, or missing projection fields.
 let continuationChoiceOwner = null;
+let continuationChoicePresentation = null;
 function isSourceContinuationCandidate(pair) {
-  return !!pair && typeof pair.pairIdentity === 'string' && !!pair.pairIdentity &&
-    typeof pair.evidenceIdentity === 'string' && !!pair.evidenceIdentity && Number.isSafeInteger(pair.revision) && pair.revision >= 0 &&
+  return !!pair && typeof pair.pairIdentity === 'string' && /^[a-f0-9]{64}$/.test(pair.pairIdentity) &&
+    typeof pair.evidenceIdentity === 'string' && /^[a-f0-9]{64}$/.test(pair.evidenceIdentity) && Number.isSafeInteger(pair.revision) && pair.revision >= 0 &&
     [pair.predecessor, pair.successor].every(source => source && typeof source.visualIdentity === 'string' && source.visualIdentity &&
       Number.isSafeInteger(source.selectionRevision) && source.selectionRevision >= 0 &&
       ['selected', 'excluded'].includes(source.selectionState)) &&
     pair.predecessor.admissionState === 'accepted' &&
     ((pair.successor.admissionState === 'accepted' && pair.replaceRequires === null) ||
       (pair.successor.admissionState === 'pending' && pair.replaceRequires === 'successor-admission'));
+}
+
+function continuationNeedsIdentityRefresh(pair) {
+  // Unknown identity requirements also stay blocked until a fresh projection.
+  return pair.resolutionRequires != null || pair.identityStatus != null;
 }
 
 function getContinuationCandidates(review) {
@@ -4175,12 +4836,21 @@ function continuationErrorMessage(error) {
 
 async function chooseSourceContinuation(project, pair, choice, lease) {
   if (!['replace', 'keep-both', 'not-related'].includes(choice) ||
-      !isSourceContinuationCandidate(pair) || (choice === 'replace' && pair.replaceRequires !== null) ||
-      typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || continuationChoiceOwner ||
+      !isSourceContinuationCandidate(pair) || continuationNeedsIdentityRefresh(pair) ||
+      continuationChoicePresentation?.lease !== lease.sessionId ||
+      continuationChoicePresentation.request !== packageReviewRequestId ||
+      continuationChoicePresentation.account !== accountWorkspaceEpoch ||
+      continuationChoicePresentation.selection !== projectSelectionEpoch ||
+      continuationChoicePresentation.workspace !== assetWorkspaceRequestGeneration ||
+      !continuationChoicePresentation.candidates.includes(pair) ||
+      (choice === 'replace' && pair.replaceRequires !== null) ||
+      typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || continuationChoiceOwner || workingSourceRecoveryOwner ||
       state.selectedProjectId !== project.id || !isCurrentModalLease('modal-package', lease.sessionId) ||
       $('#modal-package')?.classList.contains('hidden') || packageReviewConfirmationInFlight || !accountStatus.canUseWorkspace) return false;
-  const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, request: packageReviewRequestId, lease: lease.sessionId };
+  const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, request: packageReviewRequestId,
+    workspace: assetWorkspaceRequestGeneration, lease: lease.sessionId, presentation: continuationChoicePresentation };
   const current = () => owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch &&
+    owner.workspace === assetWorkspaceRequestGeneration && owner.presentation === continuationChoicePresentation &&
     owner.request === packageReviewRequestId && state.selectedProjectId === project.id && accountStatus.canUseWorkspace &&
     isCurrentModalLease('modal-package', owner.lease) && !$('#modal-package')?.classList.contains('hidden');
   continuationChoiceOwner = owner;
@@ -4208,8 +4878,14 @@ async function chooseSourceContinuation(project, pair, choice, lease) {
     if (!current()) return false;
     // Contract v1 requires fresh workspace facts before preparing a new review.
     // This response may omit semanticCounts even after a successful commit.
-    await renderFiles({ isCurrent: current });
+    const refreshed = await renderFiles({ isCurrent: current });
     if (!current()) return false;
+    if (!isAuthoritativeWorkspaceRefresh(refreshed, project.id)) {
+      if (status) status.textContent = 'Crate could not refresh the current files. Close Package Review and refresh the project before packaging.';
+      // Retire detached callbacks as well as the disabled visible controls.
+      continuationChoicePresentation = null;
+      return false;
+    }
     continuationChoiceOwner = null;
     const succeeded = result?.success === true && result.projectId === project.id;
     const message = succeeded ? 'Choice saved. Review the updated package.' : continuationErrorMessage(result?.error);
@@ -4218,11 +4894,24 @@ async function chooseSourceContinuation(project, pair, choice, lease) {
   } catch (_) {
     if (current()) {
       continuationChoiceOwner = null;
+      continuationChoicePresentation = null;
       if (status) status.textContent = 'Crate could not refresh the current files. Close Package Review and refresh the project before packaging.';
     }
     return false;
   } finally {
-    if (continuationChoiceOwner === owner) continuationChoiceOwner = null;
+    if (continuationChoiceOwner === owner) {
+      continuationChoiceOwner = null;
+      const presentation = continuationChoicePresentation;
+      if (presentation && presentation !== owner.presentation &&
+          presentation.account === accountWorkspaceEpoch && presentation.selection === projectSelectionEpoch &&
+          presentation.workspace === assetWorkspaceRequestGeneration && presentation.request === packageReviewRequestId &&
+          state.selectedProjectId === project.id && accountStatus.canUseWorkspace &&
+          isCurrentModalLease('modal-package', presentation.lease) && !$('#modal-package')?.classList.contains('hidden')) {
+        // A fresh projection may have arrived while this request was pending.
+        // Restore only its controls; never replay or apply the obsolete result.
+        renderSourceContinuationChoices(project, presentation.review, presentation.modalLease);
+      }
+    }
   }
 }
 
@@ -4232,7 +4921,17 @@ function renderSourceContinuationChoices(project, review, lease) {
   region.replaceChildren();
   if (continuationChoiceOwner && (continuationChoiceOwner.lease !== lease.sessionId || continuationChoiceOwner.request !== packageReviewRequestId)) continuationChoiceOwner = null;
   const candidates = getContinuationCandidates(review);
-  region.classList.toggle('hidden', candidates.length === 0);
+  continuationChoicePresentation = { lease: lease.sessionId, request: packageReviewRequestId, candidates,
+    account: accountWorkspaceEpoch, selection: projectSelectionEpoch, workspace: assetWorkspaceRequestGeneration,
+    review, modalLease: lease };
+  const outstanding = review?.workingFileChoices?.version === 1 ? review.workingFileChoices.choices || [] : [];
+  const choiceHold = review?.workingFileChoices?.blocked === true || review?.error === 'working_file_choice_required' || outstanding.length > 0;
+  region.classList.toggle('hidden', candidates.length === 0 && !choiceHold);
+  if (choiceHold) {
+    const pending = document.createElement('p');
+    pending.textContent = 'Packaging is blocked until working-file decisions are resolved. Go back to Project Workspace to review or recover those decisions.';
+    region.appendChild(pending);
+  }
   if (!candidates.length) return;
   const heading = document.createElement('h3');
   heading.textContent = 'Choose which working files to include';
@@ -4249,7 +4948,15 @@ function renderSourceContinuationChoices(project, review, lease) {
     help.className = 'working-source-detail';
     help.textContent = 'Replace selects the later working file after verification. Keep both leaves your file selections unchanged. Not related dismisses this relationship and also leaves selections unchanged. Original files stay on disk.';
     card.appendChild(help);
-    if (pair.successor.admissionState === 'pending') {
+    const identityHold = continuationNeedsIdentityRefresh(pair);
+    if (identityHold) {
+      const identity = document.createElement('p');
+      identity.className = 'working-source-detail';
+      identity.textContent = pair.identityStatus === 'changed'
+        ? 'A file identity changed. These choices are paused until Crate verifies the current files and refreshes this relationship. Close Package Review and refresh the project, then review the current pair again.'
+        : 'Crate could not verify the current file identities. These choices are paused until the files and this relationship can be verified again. Close Package Review and refresh the project, then review the current pair again.';
+      card.appendChild(identity);
+    } else if (pair.successor.admissionState === 'pending') {
       const admission = document.createElement('p');
       admission.className = 'working-source-detail';
       admission.textContent = `“${newer}” has not been added to this project. Close Package Review and review it in your files before choosing Replace. Keep both and Not related will not add it.`;
@@ -4273,7 +4980,7 @@ function renderSourceContinuationChoices(project, review, lease) {
       button.type = 'button';
       button.className = 'working-source-action continuation-choice';
       button.textContent = label;
-      button.disabled = typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || !!continuationChoiceOwner ||
+      button.disabled = identityHold || typeof window.crate?.resolveWorkingSourceContinuation !== 'function' || !!continuationChoiceOwner ||
         (choice === 'replace' && pair.replaceRequires !== null);
       button.setAttribute('aria-label', `${label}: ${older} and ${newer}`);
       button.addEventListener('click', () => { void chooseSourceContinuation(project, pair, choice, lease); });
@@ -4302,7 +5009,9 @@ function renderPackageReview(project, review, message = '', suppliedLease = null
   const hasContinuationChoices = getContinuationCandidates(review).length > 0;
   const hasUnresolvedContinuation = review?.error === 'working_source_continuation_choice_required' ||
     (Array.isArray(review?.sourceContinuation?.candidates) && review.sourceContinuation.candidates.length > 0);
-  const canPackage = !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
+  const hasWorkingFileChoices = review?.error === 'working_file_choice_required' ||
+    (review?.workingFileChoices?.version === 1 && (review.workingFileChoices.blocked === true || review.workingFileChoices.choices?.length > 0));
+  const canPackage = !hasWorkingFileChoices && !hasUnresolvedContinuation && !hasContinuationChoices && review.materializable !== false && typeof review.token === 'string';
   renderSourceContinuationChoices(project, review, lease);
   state.packageReviewToken = canPackage ? review.token : null;
 
@@ -4519,6 +5228,12 @@ function getPackageReviewRecoveryMessage(error, diagnostics = null, project = nu
   if (error === 'package_review_changed') message = PACKAGE_REVIEW_CHANGED_MESSAGE;
   else if (error === 'package_review_unavailable') message = PACKAGE_REVIEW_UNAVAILABLE_MESSAGE;
   else if (error === 'package_scan_incomplete') message = PACKAGE_SCAN_INCOMPLETE_MESSAGE;
+  else if (error === 'asset_baseline_scan_incomplete') {
+    message = 'Initial file verification has not completed; a scan may have failed. No package was created. ' +
+      'Return to the project and open Review to check Needs Save or Needs attention items. ' +
+      'Save files marked Needs Save in their app, and use the review or recovery controls offered for each item. ' +
+      'Saving alone may not resolve a failed scan. Packaging stays blocked until required verification is complete.';
+  }
   else if (error === FIGMA_PACKAGE_TRANSFER_ERROR_MESSAGE) message = getFigmaPackageRecoveryMessage(project);
   const diagnosticSummary = formatPackageReviewDiagnosticSummary(error, diagnostics);
   return diagnosticSummary ? `${message} ${diagnosticSummary}` : message;
@@ -4532,6 +5247,7 @@ async function showPackageModal({
   review: suppliedReview = null,
   outputPath: reviewedOutputPath,
 } = {}) {
+  if (workingSourceRecoveryOwner) return false;
   const projectId = state.selectedProjectId;
   if (!projectId) return false;
   // A refresh requested by the current package flow is a serialized
@@ -4547,8 +5263,10 @@ async function showPackageModal({
   const requestId = ++packageReviewRequestId;
   const projectRequestGeneration = assetWorkspaceRequestGeneration;
   const selectionEpoch = projectSelectionEpoch;
+  const reviewAccountEpoch = accountWorkspaceEpoch;
   const isCurrentRequest = () => (
     packageReviewRequestId === requestId &&
+    accountWorkspaceEpoch === reviewAccountEpoch &&
     state.selectedProjectId === projectId &&
     projectSelectionEpoch === selectionEpoch &&
     assetWorkspaceRequestGeneration === projectRequestGeneration &&
@@ -4576,6 +5294,10 @@ async function showPackageModal({
   );
   if (!isCurrentRequest()) return false;
   if (review?.projectId && review.projectId !== projectId) return false;
+  if (review?.projectId === projectId && review?.error === 'working_file_choice_required' && project) {
+    renderPackageReview(project, { ...review, materializable: false }, message || 'Decide how to use the new working files before packaging.', lease);
+    return false;
+  }
   if (review?.projectId === projectId && review?.error === 'working_source_continuation_choice_required' && getContinuationCandidates(review).length && project) {
     renderPackageReview(project, { ...review, materializable: false }, message || review.message || '', lease);
     return false;
@@ -4976,8 +5698,6 @@ function setupEventListeners() {
   $('#btn-skip-all-existing').addEventListener('click', () => submitAssetReviewBatchDecision('skip'));
 
   $('#btn-review-assets').addEventListener('click', openAssetReviewWorkspace);
-  $('#btn-review-assets-back').addEventListener('click', closeAssetReviewWorkspace);
-  $('#btn-review-assets-cancel').addEventListener('click', closeAssetReviewWorkspace);
   $('#btn-review-assets-continue').addEventListener('click', closeAssetReviewWorkspace);
   $$('.asset-filter').forEach(button => {
     button.addEventListener('click', () => {
@@ -5366,6 +6086,7 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
     assetWorkspaceProjectSnapshot = null;
   }
   state.projects = Array.isArray(projects) ? projects : [];
+  reconcileCurrentAssetReviewBatchControls();
   if (isTabActive('projects')) renderProjects();
   if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
     renderFiles();

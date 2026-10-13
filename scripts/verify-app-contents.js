@@ -21,7 +21,8 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'package-transaction-worker.js',
   'powerpoint.js',
   'premiere.js',
-  'psd.js'
+  'psd.js',
+  'working-source-witness.js'
 ]);
 
 const REQUIRED_ASAR_ENTRIES = Object.freeze([

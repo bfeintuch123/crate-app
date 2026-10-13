@@ -723,6 +723,15 @@
         </div>
 
         <div id="files-view" class="hidden">
+          <details class="working-file-support">
+            <summary>Working-file choices and app coverage</summary>
+            <p>Crate offers a choice after a new saved working file is added and verified in this project. Choose the file to replace yourself. Until you choose, both files stay selected and packaging is blocked. Opened files and files needing a save still need review first.</p>
+            <p>Project scans cover Illustrator (.ai), Photoshop (.psd), InDesign (.indd, .idml), XD, Sketch, Affinity Designer/Photo/Publisher, Pixelmator (.pxd), PowerPoint (.pptx, .ppt), Keynote (.key), local Figma (.fig), and explicitly added PDFs. Verification and automatic discovery vary by app. InDesign may need access to the open document; failed verification keeps the choice unavailable.</p>
+            <p>If a saved file does not appear, use Add Files. Save As into another folder, cloud-only documents, unavailable volumes, and unobserved app activity may not be discovered. Existing source saves do not create a second working-file choice.</p>
+            <p>Figma cloud currently supports one linked file per project. To keep two cloud files, use separate projects. Replacing the link changes this project's tracked cloud file. Local .fig files use the saved-file route.</p>
+            <p>Premiere, After Effects, Illustrator templates, and Photoshop large documents have Quick Package routes, without ongoing project choices. Word, Excel, Pages, Numbers, VS Code, .pptm and .keynote do not have a verified native-document choice route. PDF and image editors do not identify working documents automatically; add supported PDFs or individual assets explicitly. Quick Package is a separate one-time workflow.</p>
+          </details>
+          <section id="working-file-choices" class="working-file-choices hidden" aria-label="New working files"></section>
           <div class="project-dashboard" id="project-dashboard">
             <header class="project-dashboard-header">
               <div>
@@ -732,32 +741,30 @@
                   <span class="app-status-text" id="files-status-text">Watching</span>
                 </div>
               </div>
-              <div class="project-dashboard-alert hidden" id="project-linking-alert" role="status" aria-live="polite" aria-atomic="true"></div>
             </header>
 
-            <div class="project-dashboard-controls">
-              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link" aria-label="Edit Figma link"></div>
-              <div id="files-figma-warning" class="figma-warning-card hidden" role="status" aria-live="polite" aria-atomic="true"></div>
-            </div>
+            <section class="project-review-entry" aria-label="Asset review">
+              <div class="project-review-copy" id="project-review-status" role="status" aria-live="polite" aria-atomic="true">
+                <div class="project-review-eyebrow" id="project-review-eyebrow">Project assets</div>
+                <div class="project-dashboard-alert" id="project-linking-alert"></div>
+                <p id="project-review-detail"></p>
+              </div>
+              <button type="button" class="app-btn review-assets-button" id="btn-review-assets">Review Assets</button>
+            </section>
+
+            <p id="project-package-warning" class="project-package-warning hidden" role="status" aria-live="polite" aria-atomic="true"></p>
 
             <div class="asset-metric-grid" aria-label="Asset summary">
               <div class="asset-metric existing"><strong id="metric-existing-count">0</strong><span>Existing</span></div>
-              <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added while working</span></div>
+              <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added</span></div>
               <div class="asset-metric missing">
                 <div class="asset-metric-copy"><strong id="metric-missing-count">0</strong><span id="metric-missing-label">Needs Review</span></div>
-                <button type="button" class="app-btn review-assets-button" id="btn-review-assets" aria-describedby="metric-missing-count metric-missing-label">Review Assets</button>
               </div>
               <div class="asset-metric excluded"><strong id="metric-excluded-count">0</strong><span>Excluded</span></div>
             </div>
 
-            <div class="project-dashboard-action-row">
-              <section class="recent-assets" aria-labelledby="recent-assets-heading">
-                <h2 id="recent-assets-heading">Recently Found</h2>
-                <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
-              </section>
-            </div>
-
             <div class="project-dashboard-grid">
+              <div class="project-dashboard-primary">
               <section class="working-files-panel" id="project-file-section" aria-labelledby="project-file-heading">
                 <div class="asset-panel-header">
                   <h2 class="asset-panel-title" id="project-file-heading">Working Files</h2>
@@ -767,10 +774,25 @@
                 <div class="asset-file-list working-file-list" id="project-file-list" role="list"></div>
               </section>
 
+            <div class="project-dashboard-action-row">
+              <section class="recent-assets" aria-labelledby="recent-assets-heading">
+                <h2 id="recent-assets-heading">Recently Found</h2>
+                <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
+              </section>
+            </div>
+
+              </div>
+              <div class="project-dashboard-secondary">
               <aside class="asset-origin-summary" aria-labelledby="asset-origin-heading">
-                <h2 id="asset-origin-heading">Where Assets Came From</h2>
+                <h2 id="asset-origin-heading">Asset Sources</h2>
                 <dl id="asset-origin-list"></dl>
               </aside>
+            <div class="project-dashboard-controls">
+              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link" aria-label="Edit Figma link"></div>
+              <div id="files-figma-warning" class="figma-warning-card hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            </div>
+
+              </div>
             </div>
 
             <div class="project-package-actions">
@@ -780,38 +802,45 @@
           </div>
 
           <section class="asset-review-workspace hidden" id="asset-review-workspace" aria-labelledby="asset-review-heading">
-            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Project Workspace</button>
             <div class="asset-review-header">
               <div>
                 <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
-                <p>Crate automatically includes files it can confidently connect to this project. Review anything it could not verify.</p>
               </div>
               <label class="asset-review-search">
                 <span class="sr-only">Search assets</span>
-                <input type="search" id="asset-review-search" placeholder="Search by name or type">
+                <input type="search" id="asset-review-search" placeholder="Search">
               </label>
             </div>
 
             <div class="asset-review-filters" id="asset-review-filters" role="group" aria-label="Filter assets">
               <button type="button" class="asset-filter active" data-asset-filter="all" aria-pressed="true">All <span id="filter-count-all">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Review <span id="filter-count-missing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="existing" aria-pressed="false">Existing <span id="filter-count-existing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="added" aria-pressed="false">Added <span id="filter-count-added">0</span></button>
-              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Review <span id="filter-count-missing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="excluded" aria-pressed="false">Excluded <span id="filter-count-excluded">0</span></button>
             </div>
 
-            <div class="asset-review-toolbar">
-              <div id="asset-review-summary">0 assets</div>
-              <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
-                <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review">Add All</button>
-                <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review">Skip All</button>
-              </div>
-            </div>
-
             <div class="asset-workspace" id="file-list" aria-label="Project assets">
+              <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="pending-header">Needs Review</h2>
+                  <span class="asset-panel-count" id="pending-assets-count"></span>
+                  <span class="pending-package-note">Not in the package</span>
+                </div>
+                <div id="pending-batch-slot"></div>
+                <div id="pending-file-list" class="missing-asset-grid"></div>
+              </section>
+              <div class="asset-review-toolbar" id="asset-review-batch-controls">
+                <p id="asset-review-batch-reason" class="asset-review-guidance hidden" role="status" aria-live="polite"></p>
+                <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
+                  <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review" aria-describedby="asset-review-batch-reason">Add All</button>
+                  <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review" aria-describedby="asset-review-batch-reason">Skip All</button>
+                </div>
+              </div>
+              <div id="existing-batch-slot"></div>
               <section class="asset-panel" id="working-assets-section" aria-labelledby="working-assets-heading">
                 <div class="asset-panel-header">
-                  <h2 class="asset-panel-title" id="working-assets-heading">Working Files</h2>
+                  <h2 class="asset-panel-title" id="working-assets-heading">Working Files and Assets</h2>
                   <span class="asset-panel-count" id="working-assets-count"></span>
                 </div>
                 <div class="asset-file-list working-file-list" id="working-assets-list" role="list"></div>
@@ -833,19 +862,20 @@
                 <div class="asset-file-list asset-card-grid" id="added-assets-list" role="list"></div>
               </section>
 
-              <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
-                <div class="asset-panel-header">
-                  <h2 class="asset-panel-title" id="pending-header">Review Before Packaging</h2>
-                </div>
-                <div id="pending-file-list" class="missing-asset-grid"></div>
-              </section>
+
             </div>
 
+            <p id="asset-review-empty" class="asset-review-guidance hidden" role="status"></p>
+            <div class="review-empty-states" id="review-empty-states">
+              <div id="added-empty-tile"><strong>Added</strong> <span>0</span></div>
+              <div id="excluded-empty-tile"><strong>Excluded</strong> <span>0</span></div>
+            </div>
+
+            <p id="asset-review-exit-reason" class="asset-review-guidance">Unresolved items stay unchanged. Finish required reviews and verification before packaging.</p>
             <footer class="asset-review-footer">
               <span id="asset-review-footer-summary">0 assets included</span>
               <div>
-                <button type="button" class="modal-btn-secondary" id="btn-review-assets-cancel">Back</button>
-                <button type="button" class="modal-btn-primary" id="btn-review-assets-continue">Continue</button>
+                <button type="button" class="modal-btn-primary" id="btn-review-assets-continue" aria-describedby="asset-review-exit-reason">Back to Project</button>
               </div>
             </footer>
           </section>
@@ -1196,7 +1226,7 @@
           <div class="form-field">
             <label class="app-label" for="edit-figma-url">Replace Figma URL (optional)</label>
             <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="edit-figma-url-help" style="width:100%;box-sizing:border-box;">
-            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link.</div>
+            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link. One cloud file is supported per project. To keep both cloud files, create a separate project for the new link.</div>
           </div>
           <div class="form-field">
             <label class="app-label" for="edit-figma-scope">Scope</label>

@@ -33,6 +33,7 @@ function setup(overrides = {}) {
   const renderer = loadRendererHelpers(document, { crate });
   renderer.fixtureProject = project; renderer.fixtureWorkspace = workspace;
   vm.runInContext('state.projects = [fixtureProject]; state.selectedProjectId = fixtureProject.id; state.assetWorkspace = fixtureWorkspace; assetWorkspaceProjectSnapshot = fixtureProject; accountStatus.canUseWorkspace = true;', renderer);
+  renderer.setAssetReviewProject(project.id);
   const notices = [];
   renderer.showToast = message => notices.push(message);
   return { renderer, document, elements, project, workspace, row, calls, crate, notices };
@@ -637,6 +638,8 @@ test('focus skips the restored row hidden by Excluded filter and uses visible fa
   const hidden = f.document.createElement('button'); hidden.dataset.sourceIdentity = f.row.visualIdentity;
   hidden.closest = selector => selector === '.filtered-out' ? {} : null;
   const next = f.document.createElement('button'); next.dataset.sourceIdentity = 'other-source';
+  f.document.body.appendChild(hidden);
+  f.document.body.appendChild(next);
   const originalQuery = f.document.querySelectorAll.bind(f.document);
   f.document.querySelectorAll = selector => selector === '.working-source-action' ? [hidden, next] : originalQuery(selector);
   f.renderer.focusWorkingSourceControl(f.row.visualIdentity);
@@ -712,7 +715,8 @@ for (const error of [null, 'invalid_continuation_request', 'continuation_stale',
   const f = setup(); const order = [];
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); return error ? { success: false, error } : { success: true, decision: { authority: 'owner-choice', choice: 'replace' } }; };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { assert.equal(options.runPreScan, false); order.push('prepare'); };
   await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer));
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']);
@@ -739,7 +743,8 @@ for (const responseProjectId of ['a2-project', 'foreign-project', null, undefine
     return { success: true, projectId: responseProjectId, semanticCounts: { selectedWorkingSources: 999 } };
   };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   const result = await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer));
   assert.equal(result, responseProjectId === f.project.id);
@@ -824,7 +829,8 @@ test('admission-required refusal refreshes ordinary files and gives truthful rec
   const f = setup(); const order = []; let message;
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); return { success: false, error: 'continuation_admission_required' }; };
   const review = pairReview(f), pair = review.sourceContinuation.candidates[0]; f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.match(message, /Close Package Review to return to your files/);
@@ -850,7 +856,8 @@ test('lost resolver reply refreshes authoritative rows before reprepare without 
   const f = setup(); const order = []; let message;
   f.crate.resolveWorkingSourceContinuation = async () => { order.push('resolve'); throw new Error('reply lost'); };
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
-  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); };
+  const renderFiles = f.renderer.renderFiles;
+  f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, review.sourceContinuation.candidates[0], 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']);
@@ -884,7 +891,7 @@ test('unexpected workspace refresh exception keeps packaging blocked instead of 
 test('unavailable workspace never claims working-file readiness or package inclusion in either summary', async () => {
   const f = setup(); f.crate.getAssetWorkspace = async () => { throw new Error('unavailable'); };
   await f.renderer.renderFiles();
-  for (const id of ['asset-review-summary', 'asset-review-footer-summary']) {
+  for (const id of ['asset-review-footer-summary']) {
     assert.match(f.elements[id].textContent, /selection and verification unavailable/);
     assert.doesNotMatch(f.elements[id].textContent, /ready|included|selected/i);
   }
@@ -898,7 +905,7 @@ test('tracked Figma working source remains counted independently of physical sel
   assert.equal(f.elements['working-assets-count'].textContent, '1');
   assert.equal(f.elements['project-file-count'].textContent, '1');
   assert.match(f.elements['working-source-summary'].textContent, /1 tracked Figma working file/);
-  assert.match(f.elements['asset-review-summary'].textContent, /1 Figma Working File tracked/);
+  assert.match(f.elements['asset-review-footer-summary'].textContent, /1 Figma Working File tracked/);
   assert.match(getElementTreeText(f.elements['working-assets-list']), /Synthetic Figma/);
   assert.equal(buttonFor(f.elements['working-assets-list'], 'Exclude'), undefined);
 });
