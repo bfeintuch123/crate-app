@@ -1033,6 +1033,39 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
   const source = fs.readFileSync(filename, 'utf8');
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  controlLiveAppStartupPoll() {
+    const priorSchedule = scheduleWatcherStartupTimer, priorPoll = pollPsForProject;
+    const scheduled = [];
+    let releasing = false, completion, pollCalls = 0, releases = 0;
+    scheduleWatcherStartupTimer = (projectId, kind, delayMs, callback) => {
+      if (kind !== 'live-app') return priorSchedule(projectId, kind, delayMs, callback);
+      scheduled.push({ projectId, kind, delayMs, callback });
+    };
+    pollPsForProject = (...args) => {
+      const result = priorPoll(...args);
+      if (releasing) { completion = result; pollCalls++; }
+      return result;
+    };
+    return {
+      get scheduled() { return scheduled.map(({ callback, ...entry }) => entry); },
+      get releases() { return releases; },
+      async release() {
+        if (scheduled.length !== 1 || releases !== 0) throw new Error('Expected one unrun live-app startup callback');
+        releases++;
+        releasing = true;
+        try { scheduled[0].callback(); } finally { releasing = false; }
+        if (pollCalls !== 1) throw new Error('Startup callback must invoke the production poll once');
+        await completion;
+      },
+      async restore() {
+        try { if (completion) await completion; }
+        finally { scheduleWatcherStartupTimer = priorSchedule; pollPsForProject = priorPoll; }
+      },
+    };
+  },
+  getReviewedPackageInputSignature(projectId) {
+    return getPackageSelectionInputSignature(getProjects().find(project => project.id === projectId), true);
+  },
   getPackageReviewState() {
     return { tokens: [...packageReviewSnapshots.keys()], current: [...currentPackageReviewTokenByProject.entries()] };
   },
@@ -19455,7 +19488,11 @@ test('Illustrator activation fails closed when the structured snapshot contains 
   )), false);
 });
 
-test('Illustrator activation scope excludes baseline A and admits B1/B2 with shared-link inclusion', async () => {
+// Both schedules use the same explicit choices and the same production startup
+// callback. Only its ordering relative to fresh review differs.
+async function createIllustratorActivationScopeFixture(t) {
+  const startup = metadataTestHooks.controlLiveAppStartupPoll();
+  t.after(() => startup.restore());
   resetTestHomeWorkspace();
   storeInstance.set('settings.packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
   const aSource = path.join(TEST_HOME, 'Desktop', 'A_Project.ai');
@@ -19488,6 +19525,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   });
 
   const project = await createProject('Illustrator activation scope B');
+  assert.deepEqual(startup.scheduled, [{ projectId: project.id, kind: 'live-app', delayMs: 500 }]);
   await waitForProject(project.id, () => queryCount >= 1, 5000);
   await new Promise(resolve => originalSetTimeout(resolve, 50));
   let fresh = await getProject(project.id);
@@ -19538,6 +19576,24 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   assert.ok(card.ready, JSON.stringify(card));
   assert.equal((await callIpcRaw('projects:resolve-working-file-choice', project.id,
     { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+
+  await metadataTestHooks.waitForWatcherIdle(project.id);
+  return {
+    project, startup, aSource, aLink, b1Source, b2Source, b1Link, b2Link, sharedLink, outputDir,
+    async releaseStartup() {
+      const before = queryCount;
+      await startup.release();
+      await metadataTestHooks.waitForWatcherIdle(project.id);
+      assert.equal(startup.releases, 1);
+      assert.equal(queryCount, before + 1, 'Startup refresh must perform exactly one Illustrator query');
+    },
+  };
+}
+
+test('Illustrator activation scope excludes baseline A and admits B1/B2 with shared-link inclusion', async t => {
+  const { project, aSource, aLink, b1Source, b2Source, b1Link, b2Link, sharedLink, outputDir, releaseStartup } =
+    await createIllustratorActivationScopeFixture(t);
+  await releaseStartup();
   const packageResult = await callIpc('projects:package', project.id, outputDir);
   assertPackageResultShape(packageResult);
   assert.equal(packageResult.success, true);
@@ -19547,6 +19603,71 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(aLink))), false);
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b1Source))), true, JSON.stringify({packageResult, outputs:fs.readdirSync(packageResult.folderPath,{recursive:true})}));
   assert.equal(fs.existsSync(path.join(packageResult.folderPath, path.basename(b2Source))), true);
+});
+
+test('Illustrator activation scope refuses review when startup changes admitted membership during presentation', async t => {
+  const f = await createIllustratorActivationScopeFixture(t);
+  const gate = deferredScanBoundary();
+  let restorePresentation = () => {}, completion, packageCalls = 0, reviewCalls = 0, reviewResult;
+  t.after(async () => {
+    gate.release();
+    try { if (completion) await completion; }
+    finally { restorePresentation(); }
+  });
+  const stableState = () => {
+    const project = storeInstance.get('projects', []).find(item => item.id === f.project.id);
+    return structuredClone({
+      account: testAccountSession.snapshot(), accountGeneration: testAccountSession.generation,
+      activationToken: metadataTestHooks.getActiveWatchingActivationToken(f.project.id), status: project.status,
+      fields: Object.fromEntries(['files', 'pendingFiles', 'assetBaseline', 'workingSourceSelections',
+        'workingSourceVerification', 'workingSourceRelationshipHolds', 'workingSourceContinuations',
+        'workingFileChoices', 'workingFileDirtyHolds', 'workingFileChoiceLimit', 'workingSourceLocators',
+        'liveEvidenceLedger', 'excludedAssetKeys'].map(key => [key, project[key] ?? null])),
+    });
+  };
+  const automaticCaller = createAutomaticPackageReviewCaller(async (channel, ...args) => {
+    if (channel === 'projects:package') packageCalls++;
+    if (channel === 'projects:prepare-package-review') reviewCalls++;
+    const result = await callIpcRaw(channel, ...args);
+    if (channel === 'projects:prepare-package-review') reviewResult = result;
+    return result;
+  });
+  restorePresentation = metadataTestHooks.holdWatchWorkspacePresentation(gate.wait);
+  completion = automaticCaller('projects:package', f.project.id, f.outputDir);
+  await waitForPresentationFixtureSignal(gate.started, 'Illustrator startup overlap review presentation');
+  const before = stableState();
+  const choices = Object.values(before.fields.workingFileChoices.records);
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].acknowledged, true);
+  assert.equal(testAccountSession.canUseWorkspace(), true);
+  const scopeBefore = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id);
+  const revisionBefore = metadataTestHooks.getProjectOperationScope(f.project.id).revision;
+  const signatureBefore = metadataTestHooks.getReviewedPackageInputSignature(f.project.id);
+  const tokensBefore = metadataTestHooks.getPackageReviewState();
+  assert.equal(tokensBefore.tokens.length, 1);
+  assert.deepEqual(tokensBefore.current, [[f.project.id, tokensBefore.tokens[0]]]);
+  const b2Asset = normalizeLedgerPathForTest(f.b2Link);
+  assert.equal(scopeBefore.admittedDocumentPaths.includes(b2Asset), false);
+  assert.equal(scopeBefore.allowedLinkedPaths.includes(b2Asset), true);
+
+  await f.releaseStartup();
+  const scopeAfter = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id);
+  assert.deepEqual(scopeAfter, {
+    ...scopeBefore, admittedDocumentPaths: [...scopeBefore.admittedDocumentPaths, b2Asset].sort(),
+  });
+  assert.equal(metadataTestHooks.getProjectOperationScope(f.project.id).revision, revisionBefore + 1);
+  assert.notEqual(metadataTestHooks.getReviewedPackageInputSignature(f.project.id), signatureBefore);
+  assert.deepEqual(stableState(), before, 'Poll must preserve acknowledged choice, files, verification, dirty holds and ownership');
+  assert.deepEqual(metadataTestHooks.getPackageReviewState(), tokensBefore);
+
+  gate.release();
+  assert.deepEqual(await completion, { error: 'package_review_changed' });
+  assert.deepEqual(reviewResult, { error: 'package_review_changed' });
+  assert.equal(reviewCalls, 1);
+  assert.equal(packageCalls, 0, 'Automatic caller must not invoke package after review refusal');
+  assert.deepEqual(metadataTestHooks.getPackageReviewState(), { tokens: [], current: [] });
+  assert.deepEqual(stableState(), before);
+  assert.deepEqual(fs.readdirSync(f.outputDir), []);
 });
 
 test('unrelated app and generic assets survive ready and failed Illustrator scopes', async () => {
