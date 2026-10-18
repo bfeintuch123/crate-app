@@ -43,6 +43,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { fileURLToPath, pathToFileURL } = require('url');
 const { readPsd } = require('ag-psd');
+const { inspectLinks: inspectOoxmlLinks, rewriteLinks: rewriteOoxmlLinks } = require('./parsers/ooxml-links');
 const fetch = require('node-fetch');
 const {
   NODE_TYPES,
@@ -1734,6 +1735,18 @@ function getDesignerReasonForLiveEvidence({ appFamily, evidenceStrength, capture
 // Apps and filesystem watchers provide facts. This policy layer derives the
 // capture decision; future AI review can consume the compact summaries here
 // without ever seeing raw lsof/ps/mdls/AppleScript/JXA output.
+const inDesignObservationEpoch = crypto.randomUUID();
+let inDesignObservationSequence = 0;
+function beginInDesignObservation() {
+  return { epoch: inDesignObservationEpoch, sequence: ++inDesignObservationSequence };
+}
+function isValidInDesignObservationOrder(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value) &&
+    /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.epoch || '') &&
+    Number.isSafeInteger(value.sequence) && value.sequence > 0 &&
+    Object.keys(value).every(key => key === 'epoch' || key === 'sequence');
+}
+
 function createLiveAppEvidence(input = {}) {
   const filePath = typeof input.filePath === 'string' ? input.filePath.trim() : '';
   if (!filePath || !path.isAbsolute(filePath)) return null;
@@ -1768,6 +1781,7 @@ function createLiveAppEvidence(input = {}) {
     parserConfirmed: input.parserConfirmed === true,
     allowDirect: input.allowDirect === true,
     forcePending: input.forcePending === true ? true : (input.forcePending === false ? false : null),
+    ...(appFamily === 'indesign' && input.inDesignObservation ? { inDesignObservation: input.inDesignObservation } : {}),
   };
 
   if (input.captureRecommendation || input.captureHint) {
@@ -2111,6 +2125,7 @@ function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedP
     explicitUserAdd: observation.explicitUserAdd === true,
     acceptedPending: observation.acceptedPending === true,
     captureHint: normalizeLiveCaptureState(liveEvidence.captureHint || observation.captureState, null),
+    ...(appFamily === 'indesign' && liveEvidence.inDesignObservation ? { inDesignObservation: liveEvidence.inDesignObservation } : {}),
   };
 
   evidence.evidenceStrength = deriveLiveEvidenceStrength(fileEntry, liveEvidence);
@@ -2414,6 +2429,10 @@ function recordLiveEvidence(project, fileEntry, classification) {
       ? [previous.identity] : previous?.version === 2 && Array.isArray(previous.identities) &&
         previous.identities.length > 0 && previous.identities.every(validIdentity) &&
         new Set(previous.identities).size === previous.identities.length ? [...previous.identities] : null;
+    const isInDesignSource = path.extname(sourceFile.path || '').toLowerCase() === '.indd';
+    const inDesignObservation = classification.evidence.inDesignObservation;
+    let inDesignOrder = previous?.inDesignOrder;
+    if (isInDesignSource && inDesignOrder !== undefined && !isValidInDesignObservationOrder(inDesignOrder)) identities = null;
     if (identities) {
       if (!hasRecord && (existing.latest?.needsSave === true || existing.latest?.documentModified === true) &&
           !hasMigratedWorkingFileDirtyEvidence(holds, routeKey, existing.latest)) {
@@ -2422,7 +2441,21 @@ function recordLiveEvidence(project, fileEntry, classification) {
         identities.push(null);
       }
       if (summary.needsSave === true || summary.documentModified === true) {
-        if (!identities.includes(identity || null)) identities.push(identity || null);
+        // An awaited collector/locator refresh must not rebind an older dirty
+        // buffer to a replacement now occupying its pathname.
+        const dirtyIdentity = isInDesignSource && inDesignObservation
+          ? (validIdentity(inDesignObservation.identity) ? inDesignObservation.identity : null) : identity || null;
+        if (!identities.includes(dirtyIdentity)) identities.push(dirtyIdentity);
+        if (isInDesignSource) {
+          // Query order is captured before native collection, not after an
+          // awaited locator refresh. Keep one bounded marker per existing hold.
+          const observedOrder = inDesignObservation?.order;
+          const nextOrder = isValidInDesignObservationOrder(observedOrder) && observedOrder.epoch === inDesignObservationEpoch
+            ? observedOrder : beginInDesignObservation();
+          if (!inDesignOrder || inDesignOrder.epoch !== inDesignObservationEpoch || nextOrder.sequence > inDesignOrder.sequence) {
+            inDesignOrder = { ...nextOrder };
+          }
+        }
         // A fresh dirty observation is a new obligation even when the ledger
         // deduplicates its summary. Retire only this path's historical receipt.
         if (migratedEvidence && typeof migratedEvidence === 'object' && !Array.isArray(migratedEvidence) &&
@@ -2430,11 +2463,18 @@ function recordLiveEvidence(project, fileEntry, classification) {
           migratedEvidence = { ...migratedEvidence }; delete migratedEvidence[routeKey]; dirtyChanged = true;
         }
       }
-      if (trustedDocument && summary.documentModified === false && classification.evidence.requiresSave !== true && identity) {
+      const cleanInDesignObservation = !isInDesignSource || (
+        !inDesignOrder && !inDesignObservation ||
+        isValidInDesignObservationOrder(inDesignObservation?.order) &&
+        inDesignObservation.order.epoch === inDesignObservationEpoch && inDesignObservation.complete === true &&
+        inDesignObservation.identity === identity &&
+        (!inDesignOrder || inDesignOrder.epoch !== inDesignObservationEpoch || inDesignObservation.order.sequence > inDesignOrder.sequence)
+      );
+      if (trustedDocument && summary.documentModified === false && classification.evidence.requiresSave !== true && identity && cleanInDesignObservation) {
         identities = identities.filter(value => value !== identity);
       }
       if (identities.length) {
-        const hold = { version: 2, identities };
+        const hold = { version: 2, identities, ...(inDesignOrder === undefined ? {} : { inDesignOrder }) };
         if (JSON.stringify(previous) !== JSON.stringify(hold)) { records[routeKey] = hold; dirtyChanged = true; }
       } else if (hasRecord) { delete records[routeKey]; dirtyChanged = true; }
     }
@@ -4253,7 +4293,7 @@ async function refreshWorkingSourceVerification(projectId) {
   } finally { operation?.close(); }
 }
 
-async function verifyRestoredWorkingSource(projectId, file, attempt, operation, excludedPreparation = null) {
+async function verifyRestoredWorkingSource(projectId, file, attempt, operation, excludedPreparation = null, selectedInDesignRetry = false) {
   const lifecycle = {};
   workingSourceScanOperations.add(lifecycle);
   try {
@@ -4292,7 +4332,8 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
     }
     const scanOperation = { ...operation, current, adoptScope: scope => operation.adoptScope(scope) && current() };
     const scanOptions = { addFilesScan: true, allowPausedBaseline: true, workingSourceAttempt: attempt,
-      excludedWorkingSourcePreparation: excludedPreparation };
+      excludedWorkingSourcePreparation: excludedPreparation,
+      verifySelectedSource: selectedInDesignRetry && path.extname(file.path || '').toLowerCase() === '.indd' };
     const latest = getProjects().find(item => item.id === projectId);
     let report;
     if (typeof excludedPreparation === 'function' && excludedPreparation(latest, file) === true &&
@@ -4311,7 +4352,9 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
     if (report.cancelled || report.outcomes.some(item => !item.success)) {
       mutateProject(projectId, project => {
         if (!current()) return false;
-        project.workingSourceVerification[key] = { ...record, status: 'failed', reason: report.outcomes[0]?.error || 'scan-cancelled' };
+        project.workingSourceVerification[key] = { ...record, status: 'failed',
+          reason: path.extname(file.path || '').toLowerCase() === '.indd' && record?.status === 'failed'
+            ? record.reason : report.outcomes[0]?.error || 'scan-cancelled' };
         return true;
       });
       invalidatePackageReviewForProject(projectId);
@@ -4508,6 +4551,33 @@ function hasWorkingFileDirtyHold(project, file) {
     !hasMigratedWorkingFileDirtyEvidence(state, key, latest);
 }
 
+// Renderer contract is an allowlist, never raw extractor errors or paths.
+function getWorkingFileVerificationReason(project, source, receipt) {
+  if (path.extname(source.path || '').toLowerCase() !== '.indd') {
+    if (hasWorkingFileDirtyHold(project, source)) return 'working-file-save-required';
+    if (receipt?.status === 'pending') return 'working-file-verification-pending';
+    if (receipt && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
+    if (receipt?.unresolved?.length) return 'working-file-dependencies-unverified';
+    return 'saved-file-verification-required';
+  }
+  if (hasWorkingFileDirtyHold(project, source)) return 'indesign-save-required';
+  if (!receipt || !isWorkingSourceDiskIdentityCurrent(source, receipt)) {
+    if (receipt?.reason === 'indesign-access-denied' || receipt?.reason === 'indesign-query-failed') return receipt.reason;
+    return 'indesign-saved-file-unverified';
+  }
+  if (receipt?.unresolved?.some(item => item.reason === 'indesign-live-current-bytes-unbound')) return 'indesign-live-unbound';
+  return 'indesign-saved-file-unverified';
+}
+
+// Picker labels are bounded basenames. Keep the distinguishing suffix of a
+// normal filesystem filename without broadening generic diagnostic text.
+function sanitizeWorkingFileChoiceName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.trim();
+  if (!name || /[\\/\u0000-\u001f\u007f]/.test(name) || /^[a-z][a-z0-9+.-]*:/i.test(name)) return null;
+  return Array.from(name).slice(0, 255).join('');
+}
+
 function getWorkingFileChoicePresentation(project) {
   const obligations = getWorkingFileChoiceObligations(project);
   const summary = { version: 1, blocked: obligations.blocked, remaining: obligations.pending.length,
@@ -4537,7 +4607,7 @@ function getWorkingFileChoicePresentation(project) {
     return collisions.length > 1 ? `${label} · File ${collisions.indexOf(file) + 1}` : label;
   };
   const present = file => ({ visualIdentity: createProjectFileVisualIdentity(project.id, file),
-    name: sanitizeRendererSourceName(file.name || path.basename(file.path)),
+    name: sanitizeWorkingFileChoiceName(file.name || path.basename(file.path)),
     folder: folderLabel(file),
     selectionRevision: getWorkingSourceSelection(project, file).revision });
   const choices = [];
@@ -4549,15 +4619,17 @@ function getWorkingFileChoicePresentation(project) {
       getWorkingSourceSelection(project, file).state === 'selected' && getExplicitWorkingFileIdentity(project, file));
     const receipt = getWorkingSourceVerification(project, source);
     const identity = getExplicitWorkingFileIdentity(project, source);
+    const inDesignDependenciesAvailable = path.extname(source.path || '').toLowerCase() !== '.indd' ||
+      (receipt?.requiredReferences || []).every(ref => isAcceptedProjectFilePath(project, ref.path) && fs.existsSync(ref.path));
     const ready = !!identity && !hasWorkingFileDirtyHold(project, source) && ['scanned', 'no-extractor'].includes(receipt?.status) &&
-      !receipt.unresolved.length && isWorkingSourceDiskIdentityCurrent(source, receipt);
+      !receipt.unresolved.length && isWorkingSourceDiskIdentityCurrent(source, receipt) && inDesignDependenciesAvailable;
     // Presentation tokens bind all choices, current source bytes and all package
     // input state. Renderer text/path hints are never mutation authority.
     const revision = crypto.createHash('sha256').update(JSON.stringify([event.id, identity, accountSession?.generation, getActiveWatchingActivationToken(project.id),
       receipt?.sourceFingerprint, getWorkingSourceDiskIdentity(source), inputSignature,
       predecessors.map(file => [getExplicitWorkingFileIdentity(project, file), present(file)])])).digest('hex');
     choices.push({ id: event.id, revision, ready, source: present(source), predecessors: predecessors.map(present),
-      route: event.route, reason: ready ? null : 'saved-file-verification-required' });
+      route: event.route, reason: ready ? null : getWorkingFileVerificationReason(project, source, receipt) });
   }
   return { ...summary, choices };
 }
@@ -4625,7 +4697,7 @@ async function resolveWorkingFileChoice(projectId, request) {
       });
       if (!reserved) return { success: false, error: 'working_file_choice_stale' };
       invalidatePackageReviewForProject(projectId);
-      await verifyRestoredWorkingSource(projectId, source, attempt, operation);
+      await verifyRestoredWorkingSource(projectId, source, attempt, operation, null, true);
       if (!operation.current()) return { success: false, error: 'working_file_choice_stale' };
       sendToRenderer('project:updated', { projectId });
       const ready = getWorkingFileChoicePresentation(getProjects().find(item => item.id === projectId)).choices.find(item => item.id === request.id)?.ready === true;
@@ -5673,6 +5745,25 @@ async function createRendererFilePresentation(project, file, membership = getWor
   };
 }
 
+// Display-only order from committed, still-current owner decisions. This never
+// changes membership, verification, original file order or mutation authority.
+function getWorkingSourceDisplayOrder(project) {
+  const order = [];
+  for (const identity of Object.keys(project?.workingSourceContinuations?.pairs || {}).slice(0, 256).reverse()) {
+    const current = getCurrentWorkingSourceContinuationPair(project, identity);
+    // Restore changes membership, not the history of which file was chosen.
+    // Keep display priority while the pair's physical identities still match.
+    if (!current || current.pair.decision?.authority !== 'owner-choice' ||
+        current.pair.decision.choice !== 'replace' ||
+        !Number.isSafeInteger(current.pair.decision.successorSelectionRevision) ||
+        current.pair.decision.successorSelectionRevision > getWorkingSourceSelection(project, current.successor).revision ||
+        getWorkingSourceSelection(project, current.successor).state !== 'selected') continue;
+    const visualIdentity = createProjectFileVisualIdentity(project.id, current.successor);
+    if (visualIdentity && !order.includes(visualIdentity)) order.push(visualIdentity);
+  }
+  return order;
+}
+
 async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   if (typeof projectId !== 'string' || !projectId || projectId.length > 128) return null;
   const workspaceAccountGeneration = accountSession?.generation;
@@ -5781,6 +5872,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
       nativeDelivery: 'unverified' },
     sourceContinuation: getWorkingSourceContinuationPresentation(project),
     workingFileChoices: getWorkingFileChoicePresentation(project),
+    workingSourceDisplayOrder: getWorkingSourceDisplayOrder(project),
   };
 }
 
@@ -6250,9 +6342,54 @@ function getExistingAssetReviewFiles(project) {
   ));
 }
 
+const assetContentFingerprintCache = new Map();
+function getAssetReviewContentFingerprint(file) {
+  if (!file || inferProjectFileRole(file) !== 'asset') return null;
+  if (file.embedded) {
+    try {
+      const source = file.parentPsd || file.path;
+      const fingerprint = getPackageReviewSourceFingerprint(source);
+      const key = JSON.stringify([fingerprint, file.embeddedIndex, file.embeddedOriginalName, file.name]);
+      if (assetContentFingerprintCache.has(key)) return assetContentFingerprintCache.get(key);
+      const parsed = readStablePsdForPackageReview(source, fingerprint);
+      const match = findEmbeddedPsdLinkedFileMatch(file, parsed.linkedFiles || []);
+      if (!match) return null;
+      const value = getEmbeddedPsdResourceFingerprint(match).contentFingerprint;
+      if (assetContentFingerprintCache.size >= 256) assetContentFingerprintCache.delete(assetContentFingerprintCache.keys().next().value);
+      assetContentFingerprintCache.set(key, value);
+      return value;
+    } catch (_) { return null; }
+  }
+  if (!EMBEDDED_MEDIA_EXTENSIONS.has(path.extname(file.path || file.name || '').toLowerCase())) return null;
+  try {
+    const fingerprint = getPackageReviewSourceFingerprint(file.path);
+    if (fingerprint.state !== 'present' || BigInt(fingerprint.source.size) > BigInt(MAX_PARSE_FILE_SIZE)) return null;
+    const key = JSON.stringify(fingerprint);
+    if (assetContentFingerprintCache.has(key)) return assetContentFingerprintCache.get(key);
+    const value = getStablePackageReviewSourceContentFingerprint(file.path, fingerprint, MAX_PARSE_FILE_SIZE);
+    if (assetContentFingerprintCache.size >= 256) assetContentFingerprintCache.delete(assetContentFingerprintCache.keys().next().value);
+    assetContentFingerprintCache.set(key, value);
+    return value;
+  } catch (_) { return null; }
+}
+function getIndividualAssetContentExclusions(project) {
+  const excluded = new Set(project?.excludedAssetKeys || []), values = new Set();
+  for (const file of project?.files || []) {
+    if (!excluded.has(getAssetReviewExclusionKey(file)) || inferProjectFileRole(file) !== 'asset') continue;
+    if (project.assetBaseline?.decision === 'skip' && file.assetOrigin === 'existing' && !file.individualContentExclusion) continue;
+    const fingerprint = file.individualContentExclusion || getAssetReviewContentFingerprint(file);
+    if (isPackageContentFingerprint(fingerprint)) values.add(fingerprint);
+  }
+  return values;
+}
 function isAssetReviewFileExcluded(project, file) {
   const key = getAssetReviewExclusionKey(file);
-  return !!(key && new Set(project && project.excludedAssetKeys || []).has(key));
+  if (key && new Set(project?.excludedAssetKeys || []).has(key)) return true;
+  if (!file || inferProjectFileRole(file) !== 'asset') return false;
+  const excluded = getIndividualAssetContentExclusions(project);
+  if (!excluded.size) return false;
+  const fingerprint = getAssetReviewContentFingerprint(file);
+  return !!(fingerprint && fingerprint !== file.individualContentInclude && excluded.has(fingerprint));
 }
 
 function getProjectAssetBaselineSourceKeys(project, startedAt) {
@@ -13220,17 +13357,23 @@ const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
       set documentCount to documentCount + 1
       set docName to ""
       set docPathText to ""
-      set docModified to false
+      set docModified to "unknown"
       set docCurrent to false
       set documentLinkCount to 0
       try
         set docName to name of aDoc
+      on error
+        set queryErrorCount to queryErrorCount + 1
       end try
       try
         set docModified to modified of aDoc
+      on error
+        set queryErrorCount to queryErrorCount + 1
       end try
       try
         set docCurrent to (aDoc is active document)
+      on error
+        set queryErrorCount to queryErrorCount + 1
       end try
       try
         set docPathValue to file path of aDoc
@@ -13238,6 +13381,8 @@ const INDD_APPLESCRIPT = `tell application "Adobe InDesign"
           set docPathText to POSIX path of (docPathValue as alias)
           if docPathText ends with "/" then set docPathText to docPathText & docName
         end if
+      on error
+        set queryErrorCount to queryErrorCount + 1
       end try
       try
         set documentLinkCount to count of every link of aDoc
@@ -13297,7 +13442,7 @@ function parseInDesignActiveSessionOutput(output) {
       documents.push({
         documentPath: documentPath.path,
         documentName,
-        modified: parts[3] === 'true',
+        modified: parts[3] === 'true' ? true : parts[3] === 'false' ? false : null,
         current: parts[4] === 'true',
       });
       continue;
@@ -13312,7 +13457,7 @@ function parseInDesignActiveSessionOutput(output) {
         documentPath: documentPath.path,
         documentName: sanitizeLiveEvidenceText(parts[2]) || (documentPath.path ? path.basename(documentPath.path) : null),
         linkedPath: linkedPath.path,
-        modified: parts[4] === 'true',
+        modified: parts[4] === 'true' ? true : parts[4] === 'false' ? false : null,
         current: parts[5] === 'true',
       });
       continue;
@@ -13352,6 +13497,7 @@ function parseDependableInDesignBaselineSnapshot(output, selectedSourcePath, { a
       if (
         parts.length !== 6 ||
         !documentPath ||
+        !parts[2]?.trim() ||
         !isBooleanText(parts[3]) ||
         !isBooleanText(parts[4]) ||
         expectedLinks === null ||
@@ -13491,7 +13637,7 @@ function classifyInDesignDocumentSessionRelevance(doc, scope) {
   return { relevant: false, reason: 'unrelated-document' };
 }
 
-function createInDesignLiveEvidenceRecords(projectId, activeState, project = null, diagnostics = null) {
+function createInDesignLiveEvidenceRecords(projectId, activeState, project = null, diagnostics = null, observation = null) {
   const evidenceRecords = [];
   const scope = buildInDesignSessionScope(project, activeState);
 
@@ -13502,7 +13648,7 @@ function createInDesignLiveEvidenceRecords(projectId, activeState, project = nul
       continue;
     }
     if (!doc.documentPath) continue;
-    const saved = doc.modified !== true;
+    const saved = doc.modified === false;
     evidenceRecords.push(createLiveAppEvidence({
       projectId,
       filePath: doc.documentPath,
@@ -13519,6 +13665,12 @@ function createInDesignLiveEvidenceRecords(projectId, activeState, project = nul
       allowDirect: saved,
       forcePending: !saved,
       evidenceReason: saved ? 'indesign-saved-document' : 'app-live-evidence',
+      // Unknown paths have no identity captured before native collection. Keep
+      // that obligation unresolved; a post-collection stat could bind a replacement.
+      inDesignObservation: observation ? { order: observation.order, complete: observation.complete === true,
+        identity: observation.identities.has(normalizeTrackedFilePath(doc.documentPath))
+          ? observation.identities.get(normalizeTrackedFilePath(doc.documentPath))
+          : null } : null,
     }));
   }
 
@@ -13530,7 +13682,7 @@ function createInDesignLiveEvidenceRecords(projectId, activeState, project = nul
       incrementLiveAppSkipCount(diagnostics && diagnostics.skipped, relevance.reason);
       continue;
     }
-    const saved = link.modified !== true && !!link.documentPath;
+    const saved = link.modified === false && !!link.documentPath;
     const evidence = createLiveAppEvidence({
       projectId,
       filePath: link.linkedPath,
@@ -13783,6 +13935,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
 
     if (indesignRunning) {
       polledApps.push('indesign');
+      const inDesignObservation = { order: beginInDesignObservation(), identities: new Map(
+        [...(project.files || []), ...(project.pendingFiles || [])]
+          .filter(file => path.extname(file.path || '').toLowerCase() === '.indd')
+          .map(file => [normalizeTrackedFilePath(file.path), getExplicitWorkingFileIdentity(project, file)])
+      ), complete: false };
       try {
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
           pollFired: true,
@@ -13797,8 +13954,22 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
         );
         if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
         const inddActiveState = parseInDesignActiveSessionOutput(inddOut);
+        try {
+          parseDependableInDesignBaselineSnapshot(inddOut, null, { allowMissingSelectedSource: true });
+          inDesignObservation.complete = true;
+        } catch (_) { /* Partial observations may retain obligations, never clear them. */ }
         const inddDiagnostics = { skipped: {} };
-        const inddRecords = createInDesignLiveEvidenceRecords(projectId, inddActiveState, project, inddDiagnostics);
+        let inddRecords = createInDesignLiveEvidenceRecords(projectId, inddActiveState, project, inddDiagnostics, inDesignObservation);
+        if (!inDesignObservation.complete) {
+          // A conflicting clean row must not win path deduplication over a
+          // dirty/unknown document. Keep unrelated discovery records and the
+          // incomplete observation's existing identity/order safeguards.
+          const dirtyDocumentPaths = new Set(inddRecords
+            .filter(record => record.source === 'app-opened' && record.documentModified !== false)
+            .map(record => normalizeTrackedFilePath(record.filePath)));
+          inddRecords = inddRecords.filter(record => record.source !== 'app-opened' ||
+            record.documentModified !== false || !dirtyDocumentPaths.has(normalizeTrackedFilePath(record.filePath)));
+        }
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
           pollFired: true,
           projectWatching: true,
@@ -13818,6 +13989,14 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
         liveEvidenceRecords.push(...inddRecords);
       } catch (e) {
         if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
+        // Failed native collection can still reveal unsaved buffers. Retain only
+        // recognizable dirty/unknown document obligations with the original
+        // pre-collection order/identities; no links or clean/absence proof.
+        const partialState = parseInDesignActiveSessionOutput(e?.stdout);
+        partialState.links = [];
+        liveEvidenceRecords.push(...createInDesignLiveEvidenceRecords(
+          projectId, partialState, project, null, { ...inDesignObservation, complete: false })
+          .filter(record => record.documentModified !== false));
         logLiveAppEvidenceUnavailable('InDesign', e);
         recordLiveAppStatusBreadcrumb(projectId, 'indesign', {
           pollFired: true,
@@ -15180,7 +15359,7 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       // Only a complete successful inventory may establish that InDesign is closed.
       const inventory = await execFileAsync('/bin/ps', ['axww', '-o', 'pid=', '-o', 'comm='], {
         timeout: 3000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
-      });
+      }).catch(() => { throw new Error('indesign-query-failed'); });
       if (typeof inventory.stdout !== 'string' || typeof inventory.stderr !== 'string' ||
           inventory.stderr.trim() || !inventory.stdout.endsWith('\n') || !inventory.stdout.trim()) {
         throw new Error('asset_baseline_indesign_process_inventory_invalid');
@@ -15214,12 +15393,25 @@ async function extractLinkedAssetsInDesign(filePath, options = {}) {
       return extractLinkedAssetsRegex(filePath, options);
     }
 
+    const selectedSourcePath = normalizeTrackedFilePath(filePath);
+    const observationOrder = beginInDesignObservation();
+    const retainSelectedObligation = output => {
+      const document = parseInDesignActiveSessionOutput(output).documents.find(doc =>
+        normalizeTrackedFilePath(doc.documentPath) === selectedSourcePath && doc.modified !== false);
+      if (document) options.onInDesignDirtyDocument?.(document, observationOrder);
+    };
     const { stdout: inddPaths } = await runOsascriptInPrivateTemp(
       () => ({ 'crate-indd-query.applescript': INDD_APPLESCRIPT }),
       'crate-indd-query.applescript',
       { timeout: 10000, encoding: 'utf8' }
-    );
-    const selectedSourcePath = normalizeTrackedFilePath(filePath);
+    ).catch(error => {
+      retainSelectedObligation(error?.stdout);
+      const denied = error?.code === -1743 || /(?:^|[^0-9])-1743(?:[^0-9]|$)/.test(String(error?.stderr || '') + ' ' + String(error?.message || ''));
+      throw new Error(denied ? 'indesign-access-denied' : 'indesign-query-failed');
+    });
+    // A recognizable dirty/unknown selected row is an obligation even when
+    // other rows or the terminal counts fail. It is never absence/readiness proof.
+    retainSelectedObligation(inddPaths);
     const allowSavedFallback = options.ordinaryVerification === true && options.verifySelectedSource === true;
     const activeState = strict
       ? parseDependableInDesignBaselineSnapshot(inddPaths, selectedSourcePath, { allowMissingSelectedSource: allowSavedFallback })
@@ -15415,6 +15607,17 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
  * externally linked files (rare but possible in Keynote).
  */
 async function extractLinkedAssetsZipMedia(filePath, options = {}) {
+  if (path.extname(filePath).toLowerCase() === '.pptx') {
+    try {
+      const source = options.sourceBuffer || require('./parsers/admission-budgets').readFileWithinBudget(filePath, MAX_PARSE_FILE_SIZE, 'Presentation is too large to inspect safely.');
+      return [...new Set(inspectOoxmlLinks(source, filePath).map(link => link.resolvedPath))];
+    } catch (error) {
+      options.onUnresolvedDependency?.('presentation-links-unverified');
+      if (options.strict === true) throw error;
+      options.onOrdinaryScanFailure?.();
+      return [];
+    }
+  }
   const results = [];
   try {
     const buf = await fs.promises.readFile(filePath);
@@ -15990,6 +16193,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   const sourceRow = currentProject.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
     normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+  const inDesignSourceIdentity = ext === '.indd' ? getExplicitWorkingFileIdentity(currentProject, sourceRow) : null;
   const verificationScan = hasWorkingSourceSelectionState(currentProject) || !!options.workingSourceAttempt || options.verifySelectedSource === true;
   const previousVerification = sourceRow && getWorkingSourceVerification(currentProject, sourceRow);
   const sourceFact = sourceRow && getWorkingSourceMembership(currentProject).facts.get(getTrackedFileDedupKey(sourceRow));
@@ -16030,6 +16234,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     });
   }
   let dependableScanCompleted = false;
+  let scanFailureReason = 'ordinary-scan-failed';
   let psdTransaction = null;
   let baselinePsdOutputs = [];
   try {
@@ -16074,6 +16279,23 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     onOrdinaryScanFailure,
     onOrdinaryScanLimit,
     onProvider: value => { providerNote = value; },
+    onInDesignDirtyDocument: (document, order) => {
+      if (!workingScan?.current() || !isCurrent()) return;
+      mutateProject(projectId, project => {
+        if (!workingScan.current() || !isCurrent()) return false;
+        const file = project.files?.find(row => normalizeTrackedFilePath(row.path) === normalizeTrackedFilePath(filePath));
+        if (!file) return false;
+        // A query can discover unsaved work even while paused. Retain the same
+        // durable obligation as the watcher; only a later trusted poll clears it.
+        const evidence = createLiveAppEvidence({ projectId, filePath, source: 'app-opened', appFamily: 'indesign',
+          observerMethod: LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT,
+          sourceDocumentPath: filePath, documentModified: document.modified,
+          inDesignObservation: { order, complete: false, identity: inDesignSourceIdentity },
+          evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT, requiresSave: true });
+        return recordLiveEvidence(project, file, classifyLiveObservedFile(project, file, { liveEvidence: evidence }));
+      });
+      invalidatePackageReviewForProject(projectId);
+    },
     onUnresolvedDependency: reason => {
       if (declaredIssues.length < 128) declaredIssues.push({ reason });
       else declaredIssueLimit = true;
@@ -16143,7 +16365,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   // Filter to existing files on disk with design-relevant extensions
   const validPaths = [];
   for (const p of linkedPaths) {
-    if (!p.startsWith('/Users/')) continue;
+    if (!p.startsWith('/Users/') && !p.startsWith('/Volumes/') && !p.startsWith(os.homedir() + path.sep)) continue;
     const pExt = path.extname(p).toLowerCase();
     if (!DESIGN_FILE_EXTENSIONS.has(pExt)) continue;
     try {
@@ -16436,8 +16658,12 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   dependableScanCompleted = true;
   return { success: true };
   } catch (error) {
-    publishWorkingSourceScan(workingScan, { status: 'failed', reason: error?.message === 'asset_baseline_source_changed' ? 'source-bytes-changed' : 'ordinary-scan-failed',
-      unresolved: [{ reason: 'ordinary-scan-failed' }] });
+    scanFailureReason = error?.message === 'asset_baseline_source_changed' ? 'source-bytes-changed'
+      : ext === '.indd' && error?.message === 'indesign-access-denied' ? 'indesign-access-denied'
+      : ext === '.indd' && (error?.message === 'indesign-query-failed' || error?.message?.startsWith('asset_baseline_indesign_')) ? 'indesign-query-failed'
+      : 'ordinary-scan-failed';
+    publishWorkingSourceScan(workingScan, { status: 'failed', reason: scanFailureReason,
+      unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
     console.error('[crate] scan-on-open: controlled failure:', baselineScan ? 'asset-baseline-scan-failed' : 'scan-on-open-failed');
     return {
       success: false,
@@ -16458,7 +16684,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       workingSourceScanOperations.delete(scanLifecycle);
       if (leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease) workingSourceScanLeases.delete(leaseKey);
       if (workingScan?.current() && !dependableScanCompleted) publishWorkingSourceScan(workingScan, {
-        status: 'failed', reason: 'ordinary-scan-failed', unresolved: [{ reason: 'ordinary-scan-failed' }] });
+        status: 'failed', reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed',
+        unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
       if (ownsOperation) operation?.close();
     }
   }
@@ -18092,7 +18319,7 @@ function startInactivityChecker() {
           type: 'question',
           title: 'Crate — Still working?',
           message: `⏸ Still working on "${project.name}"?`,
-          detail: `Crate hasn't detected any new design files in 3 hours. Would you like to keep watching or pause?`,
+          detail: `No new design files detected for 3 hours.`,
           buttons: ['Keep Watching', 'Pause', 'Package Now'],
           defaultId: 0,
           cancelId: 0
@@ -18353,10 +18580,15 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
       const exclusionKey = getAssetReviewExclusionKey(removedFile);
       if (exclusionKey) {
         const priorExclusions = new Set(project.excludedAssetKeys || []);
-        if (priorExclusions.has(exclusionKey)) {
+        const fingerprint = getAssetReviewContentFingerprint(removedFile);
+        if (isAssetReviewFileExcluded(project, removedFile)) {
           priorExclusions.delete(exclusionKey);
+          delete removedFile.individualContentExclusion;
+          if (fingerprint) removedFile.individualContentInclude = fingerprint;
         } else {
           priorExclusions.add(exclusionKey);
+          delete removedFile.individualContentInclude;
+          if (fingerprint) removedFile.individualContentExclusion = fingerprint;
         }
         project.excludedAssetKeys = [...priorExclusions];
         changed = true;
@@ -18559,6 +18791,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
         const key = getTrackedFileDedupKey(fileEntry);
         const existingFile = acceptedByKey.get(key);
         const authorizedFile = existingFile ? grantExplicitUserAuthority(existingFile) : fileEntry;
+        const includedFingerprint = getAssetReviewContentFingerprint(authorizedFile);
+        if (includedFingerprint) authorizedFile.individualContentInclude = includedFingerprint;
+        delete authorizedFile.individualContentExclusion;
         const pendingFile = (project.pendingFiles || []).find(file => getTrackedFileDedupKey(file) === key);
         if (!existingFile) {
           noteWorkingFileChoiceAdmission(project, authorizedFile, 'manual-browse');
@@ -20152,6 +20387,21 @@ function getPackageReviewManifestEntry(file) {
   };
 }
 
+function readStablePackageReviewBuffer(sourcePath, expectedFingerprint) {
+  if (!packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) throw new PackageReviewChangedError();
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  const fd = fs.openSync(sourcePath, fs.constants.O_RDONLY | noFollow);
+  try {
+    const before = fs.fstatSync(fd, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(MAX_PARSE_FILE_SIZE) ||
+        !packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(before))) throw new PackageReviewChangedError();
+    const buffer = fs.readFileSync(fd);
+    if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(fs.fstatSync(fd, { bigint: true }))) ||
+        !packageReviewFingerprintsMatch(expectedFingerprint, getPackageReviewSourceFingerprint(sourcePath))) throw new PackageReviewChangedError();
+    return buffer;
+  } finally { fs.closeSync(fd); }
+}
+
 function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
   const beforeFingerprint = getPackageReviewSourceFingerprint(sourcePath);
   if (!packageReviewFingerprintsMatch(expectedFingerprint, beforeFingerprint)) {
@@ -20272,13 +20522,24 @@ function bindEmbeddedPsdPackageReviewResources(files, entries) {
 const PACKAGE_PRESENTATION_EXTENSIONS = new Set(['.key', '.pptx']);
 
 function getSkippedExistingPresentationMediaSuppression(project) {
-  const fingerprints = new Set();
+  const fingerprints = getIndividualAssetContentExclusions(project);
   const nameBases = new Set();
   const occurrences = normalizePresentationMediaOccurrences(
     project && project.assetBaseline && project.assetBaseline.presentationMediaOccurrences
   );
+  for (const file of project?.files || []) {
+    if (!file || inferProjectFileRole(file) !== 'asset' || !isAssetReviewFileExcluded(project, file) ||
+        (project.assetBaseline?.decision === 'skip' && file.assetOrigin === 'existing')) continue;
+    const ext = path.extname(file.path || file.name || '').toLowerCase();
+    if (!EMBEDDED_MEDIA_EXTENSIONS.has(ext)) continue;
+    if (isPackageContentFingerprint(file.presentationContentFingerprint)) fingerprints.add(file.presentationContentFingerprint);
+    else if (!file.embedded && typeof file.path === 'string') {
+      const sourceFingerprint = getPackageReviewSourceFingerprint(file.path);
+      if (sourceFingerprint.state === 'present') fingerprints.add(getStablePackageReviewSourceContentFingerprint(file.path, sourceFingerprint, MAX_PARSE_FILE_SIZE));
+    }
+  }
   if (!project || project.assetBaseline?.decision !== 'skip') {
-    return { fingerprints: [], nameBases: [], occurrences: [] };
+    return { fingerprints: [...fingerprints].sort(), nameBases: [], occurrences: [] };
   }
 
   for (const file of project.files || []) {
@@ -20416,6 +20677,31 @@ async function buildAuthoritativePackagePlan(
     }
   });
 
+  for (const input of reviewedSourceInputs) {
+    const index = input.entryIndex;
+    if (entries[index].ext !== '.pptx') continue;
+    const source = readStablePackageReviewBuffer(files[index].path, entries[index].sourceFingerprint);
+    const links = inspectOoxmlLinks(source, files[index].path);
+    if (!links.length) continue;
+    const replacements = Object.create(null);
+    const pictureInputs = [];
+    const pictureData = Object.create(null);
+    for (const link of links) {
+      const matches = reviewedSourceInputs.filter(candidate =>
+        entries[candidate.entryIndex].identity.normalizedPath === normalizeTrackedFilePath(link.resolvedPath));
+      if (matches.length !== 1) throw new PackageReviewChangedError();
+      const relative = path.posix.relative(path.posix.dirname(input.relativePath), matches[0].relativePath);
+      replacements[link.resolvedPath] = relative.split('/').map(encodeURIComponent).join('/');
+      if (packageSettings.portablePictures === true && /\/image$/.test(link.type)) {
+        const linkedIndex = matches[0].entryIndex;
+        pictureData[link.resolvedPath] = readStablePackageReviewBuffer(files[linkedIndex].path, entries[linkedIndex].sourceFingerprint);
+        pictureInputs.push({ path: link.resolvedPath, entryIndex: linkedIndex });
+      }
+    }
+    const rewritten = rewriteOoxmlLinks(source, files[index].path, replacements, { portablePictures: packageSettings.portablePictures === true, pictureData });
+    input.portableReferences = { replacements, portablePictures: packageSettings.portablePictures === true, pictureInputs, outputFingerprint: getPackageContentFingerprint(rewritten) };
+  }
+
   const presentationEntryIndexes = [];
   const seenPresentationSources = new Set();
   for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
@@ -20510,6 +20796,7 @@ function getRelevantPackageReviewSettings() {
   const settings = store.get('settings') || {};
   return {
     includeDiagnosticReport: settings.includeDiagnosticReport === true,
+    portablePictures: settings.packagePortablePictures === true,
     namingTemplate: sanitizeNamingTemplate(settings.namingTemplate),
     outputLayoutMode: getPackageOutputLayoutModeFromSettings(settings),
   };
@@ -20650,6 +20937,13 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => unavailableOutputs.has(index) ? 'unavailable' : status),
       reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
+    };
+    const excludedRequired = files.map(file => inferProjectFileRole(file) === 'asset' && isAssetReviewFileExcluded(currentProject, file));
+    if (excludedRequired.some(Boolean)) return {
+      project: currentProject, files, entries,
+      entryStatuses: entryStatuses.map((status, index) => excludedRequired[index] ? 'unavailable' : status),
+      reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
+      packageMessage: 'A working file requires an excluded asset. Restore the asset or exclude that working file.',
     };
     let plan;
     try {
@@ -20816,6 +21110,19 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
     if (currentPackageReviewTokenByProject.get(projectId) === token) currentPackageReviewTokenByProject.delete(projectId);
     return { error: 'package_review_changed' };
   }
+  const additionalMedia = manifest.plan.deterministicDerivedOutputs
+    .filter(item => item.materialization === 'presentation-media')
+    .flatMap(item => item.expectedOutputs.map(output => ({
+      name: output.outputName,
+      ext: path.extname(output.outputName).toLowerCase(),
+      embedded: true,
+      projectRole: 'asset',
+      effectiveRole: 'asset',
+      source: 'package-extraction',
+      packageFolder: path.posix.dirname(output.relativePath) === '.'
+        ? 'Package root' : path.posix.dirname(output.relativePath),
+      status: 'ready',
+    })));
   return {
     token,
     projectId,
@@ -20828,8 +21135,8 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
       embedded: entry.embedded,
       packageFolder: getPackageReviewEntryFolder(manifest.plan, index),
       status: 'ready',
-    })),
-    totalFiles: manifest.entries.length,
+    })).concat(additionalMedia),
+    totalFiles: manifest.entries.length + additionalMedia.length,
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: true,
@@ -20840,6 +21147,7 @@ async function issuePackageReviewSnapshot(projectId, manifest, destinationBindin
       derivedDesignGeneratorCount: manifest.plan.deterministicDerivedOutputs.filter(item => item.materialization === 'presentation-media').length,
       diagnosticsMetadataIncluded: !!manifest.plan.diagnosticsMetadata,
       outputLayoutMode: manifest.plan.layoutMode,
+      portablePictures: manifest.plan.packageSettings.portablePictures === true,
     },
   };
 }
@@ -20875,10 +21183,10 @@ async function createUnavailablePackageReview(projectId, manifest) {
     semanticCounts: membership.counts,
     workingFileChoices: getWorkingFileChoicePresentation(manifest.project),
     materializable: false,
-    message: manifest.files.length === 0 ? 'No files are selected for packaging.' :
+    message: manifest.packageMessage || (manifest.files.length === 0 ? 'No files are selected for packaging.' :
       (membership.counts.relationshipHolds > 0 ? 'Photoshop asset association is unresolved. Your files are preserved; this package is blocked.' :
         membership.blocked ? 'Working-source verification is unresolved. Resolve it before packaging.' :
-        'Some files are unavailable. Resolve them before packaging.'),
+        'Some files are unavailable. Resolve them before packaging.')),
   };
 }
 
@@ -22598,6 +22906,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         materialization: item.materialization,
         outputName: item.expectedOutputName,
         relativePath: item.relativePath,
+        ...(item.portableReferences ? { portableReferences: item.portableReferences } : {}),
       })),
       ...manifest.plan.deterministicDerivedOutputs
         .filter(item => item.materialization === 'psd-embedded-resource')
@@ -22654,13 +22963,31 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
         if (plannedOutput.materialization !== 'source-copy') throw new PackageReviewChangedError();
         if (!file.path) throw new PackageReviewChangedError();
         const finalPath = packageWrites.prepare(plannedOutput.relativePath);
-        await copyReviewedPackageSource(
-          reviewedPackageSources.get(plannedOutput.entryIndex),
-          finalPath,
-          packageWrites.verify,
-          packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeSource : null,
-          packageWrites.rememberOwned
-        );
+        if (plannedOutput.portableReferences) {
+          const source = await withStableReviewedPackageSource(reviewedPackageSources.get(plannedOutput.entryIndex),
+            (handle, stat) => {
+              if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+              return readReviewedPackageSourceBuffer(handle, stat.size);
+            });
+          const pictureData = Object.create(null);
+          for (const input of plannedOutput.portableReferences.pictureInputs || []) {
+            pictureData[input.path] = await withStableReviewedPackageSource(reviewedPackageSources.get(input.entryIndex),
+              (handle, stat) => {
+                if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
+                return readReviewedPackageSourceBuffer(handle, stat.size);
+              });
+          }
+          const rewritten = rewriteOoxmlLinks(source, file.path, plannedOutput.portableReferences.replacements,
+            { portablePictures: plannedOutput.portableReferences.portablePictures === true, pictureData });
+          if (getPackageContentFingerprint(rewritten) !== plannedOutput.portableReferences.outputFingerprint) throw new PackageReviewChangedError();
+          if (packageWrites.isDescriptorBound(finalPath)) await packageWrites.materializeBuffer(finalPath, rewritten, OWNER_ONLY_FILE_MODE);
+          else await packageWrites.materializeDirectBuffer(finalPath, rewritten, OWNER_ONLY_FILE_MODE);
+        } else {
+          await copyReviewedPackageSource(
+            reviewedPackageSources.get(plannedOutput.entryIndex), finalPath, packageWrites.verify,
+            packageWrites.isDescriptorBound(finalPath) ? packageWrites.materializeSource : null, packageWrites.rememberOwned
+          );
+        }
         stagedSourceByFile.set(file, finalPath);
         packageProvenanceEvents.push({
           relationType: EDGE_TYPES.PACKAGE_INCLUDES_FILE,
@@ -22758,7 +23085,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       await writePackageProvenanceManifest(id, packageProvenanceInfo, {
         copiedCount,
         embeddedCount,
-        totalFiles: packageFiles.length,
+        totalFiles: copiedCount + embeddedCount,
         errors,
       }, manifestProject, true, stagingFolder, manifest.plan.diagnosticsMetadata.relativePath, (relativePath, data) => {
         const diagnosticPath = organizedDiagnostics
@@ -22819,7 +23146,7 @@ registerTrustedIpcHandler('projects:package', async (event, id, outputPath, revi
       success: true,
       copiedCount,
       embeddedCount,
-      totalFiles: packageFiles.length,
+      totalFiles: copiedCount + embeddedCount,
       folderPath: destFolder,
       errors
     };
@@ -23247,10 +23574,17 @@ registerTrustedIpcHandler('settings:get', () => {
 
 registerTrustedIpcHandler('settings:update', (event, key, value) => {
   // FIX 7 (M1): Whitelist allowed setting keys to prevent arbitrary store writes
-  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "existingAssetsNotifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode"]);
+  const ALLOWED_SETTINGS = new Set(["namingTemplate", "notifications", "existingAssetsNotifications", "includeDiagnosticReport", "showPackageDetails", "packageOutputLayoutMode", "packagePortablePictures"]);
   if (!ALLOWED_SETTINGS.has(key)) return store.get('settings');
   if (key === 'namingTemplate') {
     store.set(`settings.${key}`, sanitizeNamingTemplate(value));
+    return store.get('settings');
+  }
+  if (key === 'packagePortablePictures') {
+    if (typeof value !== 'boolean') return store.get('settings');
+    const previous = store.get('settings.packagePortablePictures') === true;
+    store.set('settings.packagePortablePictures', value);
+    if (previous !== value) invalidateAllPackageReviews();
     return store.get('settings');
   }
   if (key === 'packageOutputLayoutMode') {
@@ -23300,7 +23634,7 @@ app.whenReady().then(async () => {
     startupPhaseJournal.mark('startup-error');
     dialog.showErrorBox(
       'Crate could not open',
-      'Crate could not secure its local settings. No project data was opened. Please quit and reopen Crate. If this continues, contact support.'
+      'Crate could not secure local settings. Restart Crate; contact support if this continues.'
     );
     app.quit();
     return;

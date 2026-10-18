@@ -8,6 +8,20 @@ harness = harness.replace("const test = require('node:test');", "const choiceTes
 harness = harness.replace("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))", "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'choice-synthetic-home-'))");
 harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', '  refreshWorkingSourceLocators, clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); }, getAssetBaselineSourceRecoveryRouteKey, stageLiveObservedFile, mutateProject, pollPsForProject, readOwnerOnlyCacheFileSync, hardenOwnerOnlyCacheFileSync, ensurePresentationAssetsDir, getWorkingSourceSelection, getWorkingSourceVerification, getWorkingFileChoicePresentation, getWorkingSourceMembership,\n  captureProjectOperation,\n  runScanOnOpen');
 harness = harness.replace('                  psd: fixture,', '                  psd: fixture, framing: require("../parsers/add-files-psd-worker").inspectPsdLinkFraming(fs.readFileSync(filePath)),');
+harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', `
+  delayInDesignPublication(filePath) {
+    const original = refreshWorkingSourceLocators;
+    let enter, release, held = false;
+    const entered = new Promise(resolve => { enter = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    refreshWorkingSourceLocators = async (...args) => {
+      if (!held && args[1]?.includes(filePath)) { held = true; enter(); await gate; }
+      return original(...args);
+    };
+    return { entered, release, restore() { release(); refreshWorkingSourceLocators = original; } };
+  },
+  captureProjectOperation,
+  runScanOnOpen`);
 const compiled = new Module(harnessPath, module);
 compiled.filename = harnessPath; compiled.paths = Module._nodeModulePaths(__dirname);
 compiled._compile(harness + '\n(' + cases.toString() + ')();', harnessPath);
@@ -44,6 +58,401 @@ function cases() {
     assert.equal((await resolve(initial)).success, true);
     return { id: project.id, ext, a, c, stored, workspace, add, resolve };
   }
+  async function inDesignRecoveryFixture({ admit = true } = {}) {
+    const f = await setup();
+    await metadataTestHooks.waitForWatcherIdle(f.id);
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    const target = path.join(TEST_HOME, 'Desktop', 'Recovery.indd');
+    const shared = path.join(TEST_HOME, 'Desktop', 'Required-shared.png'); fs.writeFileSync(shared, 'shared original');
+    writeSyntheticAiFile(f.c, shared);
+    const operation = metadataTestHooks.captureProjectOperation(f.id);
+    try { await metadataTestHooks.runScanOnOpen(f.id, f.c, operation.activationToken, operation,
+      { allowPausedBaseline: true, verifySelectedSource: true, establishBaseline: false }); } finally { operation.close(); }
+    const state = { mode: 'open', modified: false, queryWait: null, queries: 0, inventories: 0, observer: false };
+    const snapshot = () => `DOC\t${target}\tRecovery.indd\t${state.modified}\ttrue\t1\nLINK\t${target}\tRecovery.indd\t${shared}\t${state.modified}\ttrue\nEND\t1\t1\t1\t0`;
+    setChildProcessHandler(request => {
+      if (isIllustratorPgrepCheck(request)) return { stdout: '' };
+      if (request.kind === 'execFile' && request.command === '/bin/ps') {
+        state.inventories++;
+        if (state.mode === 'process-failed') return { error: Object.assign(new Error('process denied'), {code:'EPERM'}) };
+        if (state.mode === 'process-incomplete') return {stdout:'1 /sbin/launchd',stderr:''};
+        return { stdout: '1 /sbin/launchd\n' + (state.mode === 'app-absent' ? '' : '2 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n'), stderr: '' };
+      }
+      if (String(request.command).includes("grep -i 'Adobe InDesign'")) return {stdout:'Adobe InDesign'};
+      if (isOsascriptInvocation(request, 'crate-indd-query.applescript')) {
+        state.queries++;
+        const result = () => {
+          if (state.mode === 'denied') return {error:Object.assign(new Error('Not authorized (-1743) private/path'),{code:-1743})};
+          if (state.mode === 'timeout') return {error:new Error('execution timeout -1712 private/path')};
+          if (state.mode === 'incomplete') return {stdout:snapshot().replace(/END.*$/, '')};
+          if (state.mode === 'count-mismatch') return {stdout:snapshot().replace('END\t1\t1\t1\t0','END\t2\t1\t1\t0')};
+          if (state.mode === 'query-error') return {stdout:snapshot().replace('END\t1\t1\t1\t0','END\t1\t1\t1\t1')};
+          if (state.mode === 'rejected-partial') return {error:Object.assign(new Error('execution failed'),{stdout:snapshot().replace(/END.*$/, '')})};
+          return {stdout:state.mode === 'closed' ? 'END\t0\t0\t0\t0' : snapshot()};
+        };
+        return state.queryWait ? state.queryWait.promise.then(result) : result();
+      }
+      if (isOsascriptInvocation(request, 'crate-indd-poll.applescript')) {
+        const output=state.pollOutput ?? (state.observer ? (state.pollIncomplete ? snapshot().replace(/END.*$/, '') : snapshot()) : '');
+        const result=state.pollReject ? {error:Object.assign(new Error('execution failed'),{stdout:output})} : {stdout:output};
+        if(state.pollQueryWait) { state.pollQueryWait.enter(); return state.pollQueryWait.promise.then(()=>result); }
+        return result;
+      }
+      return {stdout:''};
+    });
+    if(admit) await f.add('Recovery.indd', shared);
+    else fs.writeFileSync(target,'%PDF-1.7\n'+shared+'\n%%EOF\n');
+    await metadataTestHooks.waitForWatcherIdle(f.id);
+    await callIpcRaw('projects:pause', f.id); clearTrackedTimers();
+    const card = async () => (await f.workspace()).workingFileChoices.choices.find(row => row.source.name === 'Recovery.indd');
+    const original = [f.a, f.c, target, shared].map(p => [p, fs.readFileSync(p)]);
+    return {...f,target,shared,state,card,original};
+  }
+  for (const mode of ['closed','app-absent']) choiceTest(`InDesign Retry verifies ${mode} saved bytes and preserves choices/shared assets`, async () => {
+    const f = await inDesignRecoveryFixture();
+    const before = await f.card(); assert.equal(before.reason, 'indesign-live-unbound'); assert.equal(before.ready,false);
+    assert.equal((await f.resolve(before,'retry')).success,false,'open clean never binds live inventory');
+    f.state.mode = mode;
+    const counts = {...f.state};
+    assert.equal((await f.resolve(await f.card(),'retry')).success,true);
+    assert.equal(f.state.inventories,counts.inventories+1);
+    assert.equal(f.state.queries,counts.queries+(mode==='closed'?1:0));
+    assert.equal((await f.card()).ready,true);
+    assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+    assert.equal((await f.resolve(before,'keep-both')).success,false,'stale unbound token remains invalid');
+    const ready=await f.card();
+    assert.equal((await f.resolve(ready,'replace',ready.predecessors.find(row=>row.name==='A.ai').visualIdentity)).success,true);
+    const ws=await f.workspace();
+    assert.equal(ws.files.find(row=>row.name==='A.ai').sourceSelection,'excluded');
+    assert.equal(ws.files.find(row=>row.name==='C.ai').sourceSelection,'selected');
+    assert.equal(ws.workingSourceDisplayOrder[0],ws.files.find(row=>row.name==='Recovery.indd').visualIdentity);
+    assert.ok(ws.files.some(row=>row.name==='Required-shared.png'));
+    const source=f.stored().files.find(row=>row.path===f.target);
+    assert.ok(metadataTestHooks.getWorkingSourceVerification(f.stored(),source).requiredReferences.some(ref=>ref.path===f.shared));
+    for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+  });
+  for (const mode of ['denied','timeout','incomplete','count-mismatch','query-error','process-failed','process-incomplete','missing-link']) {
+    choiceTest(`InDesign Retry refuses ${mode} with a sanitized reason`, async () => {
+      const f=await inDesignRecoveryFixture(); f.state.mode=mode==='missing-link'?'closed':mode;
+      if(mode==='missing-link') fs.unlinkSync(f.shared);
+      const choice=await f.card();
+      assert.equal((await f.resolve(choice,'retry')).success,false);
+      const after=await f.card(); assert.equal(after.ready,false);
+      assert.equal(after.reason,mode==='denied'?'indesign-access-denied':mode==='missing-link'?'indesign-saved-file-unverified':'indesign-query-failed');
+      assert.equal(JSON.stringify(after).includes('private/path'),false);
+      assert.equal((await f.resolve(after,'keep-both')).success,false);
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      assert.ok((await f.workspace()).files.filter(row=>['A.ai','C.ai','Recovery.indd'].includes(row.name)).every(row=>row.sourceSelection==='selected'));
+    });
+  }
+  choiceTest('InDesign dirty query holds survive closing early; trusted clean poll permits later closed-file Retry', async () => {
+    const f=await inDesignRecoveryFixture(); f.state.modified=true;
+    assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+    assert.equal((await f.card()).reason,'indesign-save-required');
+    f.state.mode='closed';
+    const inventories=f.state.inventories;
+    assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+    assert.equal(f.state.inventories,inventories,'closing early cannot bypass dirty hold');
+    f.state.mode='open'; f.state.observer=true; f.state.modified='unknown';
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    assert.equal((await f.card()).reason,'indesign-save-required','failed modified read cannot clear hold');
+    f.state.modified=false;
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.notEqual((await f.card()).reason,'indesign-save-required');
+    assert.equal((await f.card()).ready,false,'clean observation is not saved-byte binding');
+    await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+    assert.equal((await f.resolve(await f.card(),'retry')).success,true);
+  });
+  choiceTest('InDesign Retry serializes repeated clicks and refuses dirty evidence arriving during its query', async () => {
+    const f=await inDesignRecoveryFixture(); f.state.mode='closed';
+    let release; const gate={promise:new Promise(resolve=>{release=resolve;}),release:()=>release()}; f.state.queryWait=gate;
+    const entry=await f.card(),queries=f.state.queries;
+    const pending=f.resolve(entry,'retry');
+    await waitForCondition(()=>f.state.queries>queries,'retry query not entered');
+    assert.equal((await f.resolve(entry,'retry')).error,'working_file_choice_busy');
+    const source=f.stored().files.find(row=>row.path===f.target);
+    metadataTestHooks.mutateProject(f.id,project=>metadataTestHooks.stageLiveObservedFile(project,source,{liveEvidence:{
+      source:'app-opened',appFamily:'indesign',observerMethod:'indesign-live-applescript',
+      evidenceStrength:'structured-app-document',sourceDocumentPath:f.target,documentModified:true}}));
+    gate.release(); assert.equal((await pending).success,false);
+    assert.equal((await f.card()).reason,'indesign-save-required');
+    assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+  });
+
+  for (const mode of ['incomplete','count-mismatch','query-error','rejected-partial']) {
+    for (const modified of [true,'unknown']) choiceTest(`InDesign correction retains ${modified} obligation after ${mode} then close`, async () => {
+      const f=await inDesignRecoveryFixture(); f.state.mode=mode; f.state.modified=modified;
+      assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      roundTripFakeStore();
+      f.state.mode='closed'; const inventories=f.state.inventories;
+      assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+      assert.equal(f.state.inventories,inventories);
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+    });
+  }
+  choiceTest('InDesign correction incomplete clean poll cannot discharge a retained obligation', async () => {
+    const f=await inDesignRecoveryFixture(); f.state.modified=true;
+    assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+    f.state.modified=false; f.state.observer=true; f.state.pollIncomplete=true;
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.equal((await f.card()).reason,'indesign-save-required');
+    f.state.pollIncomplete=false;
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.notEqual((await f.card()).reason,'indesign-save-required');
+    assert.equal((await f.card()).ready,false);
+  });
+  choiceTest('InDesign correction delayed older clean publication cannot clear a newer dirty Retry hold', async () => {
+    const f=await inDesignRecoveryFixture();
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    f.state.observer=true;
+    const gate=metadataTestHooks.delayInDesignPublication(f.target);
+    const pending=metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id));
+    try {
+      await gate.entered;
+      f.state.modified=true;
+      assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      gate.release(); await pending; clearTrackedTimers();
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      f.state.mode='closed';
+      assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+      f.state.mode='open'; f.state.modified=false;
+      await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+      assert.notEqual((await f.card()).reason,'indesign-save-required');
+      assert.equal((await f.card()).ready,false);
+      await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+      assert.equal((await f.resolve(await f.card(),'retry')).success,true);
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+    } finally { gate.release(); await pending; gate.restore(); clearTrackedTimers(); }
+  });
+  choiceTest('InDesign correction query order precedes delayed native result delivery', async () => {
+    const f=await inDesignRecoveryFixture();
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    f.state.observer=true;
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    f.state.pollQueryWait={enter,promise:new Promise(resolve=>{release=resolve;})};
+    const pending=metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id));
+    try {
+      await entered;
+      f.state.modified=true;
+      assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+      release(); await pending; clearTrackedTimers();
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      f.state.mode='closed';
+      assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+    } finally { release(); await pending; f.state.pollQueryWait=null; clearTrackedTimers(); }
+  });
+  for(const boundary of ['poll-publication','retry-query']) choiceTest(`InDesign correction dirty ${boundary} retains the observed physical source across replacement`, async () => {
+    const f=await inDesignRecoveryFixture();
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    f.state.observer=true; f.state.modified=true;
+    let pending,release,restore=()=>{};
+    if(boundary==='poll-publication') {
+      const gate=metadataTestHooks.delayInDesignPublication(f.target); release=gate.release; restore=gate.restore;
+      pending=metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id));
+      await gate.entered;
+    } else {
+      f.state.queryWait={promise:new Promise(resolve=>{release=resolve;})};
+      const queries=f.state.queries;
+      pending=f.resolve(await f.card(),'retry');
+      await waitForCondition(()=>f.state.queries>queries,'dirty retry did not enter native collection');
+    }
+    try {
+      const oldBytes=fs.readFileSync(f.target);
+      fs.renameSync(f.target,f.target+'.observed-original'); fs.writeFileSync(f.target,oldBytes);
+      release(); await pending; clearTrackedTimers();
+      f.state.queryWait=null;
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      f.state.modified=false;
+      await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+      assert.equal((await f.card()).reason,'indesign-save-required','clean replacement cannot discharge the original physical source');
+      await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+      assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+      assert.deepEqual(fs.readFileSync(f.target+'.observed-original'),oldBytes);
+    } finally { release(); await pending; restore(); f.state.queryWait=null; clearTrackedTimers(); }
+  });
+  choiceTest('InDesign correction newly discovered dirty source retains unresolved identity through later clean', async () => {
+    const f=await inDesignRecoveryFixture({admit:false});
+    const project=await createProject('New InDesign source');
+    await metadataTestHooks.waitForWatcherIdle(project.id); clearTrackedTimers();
+    const stored=()=>storeInstance.data.projects.find(row=>row.id===project.id);
+    f.state.modified=true; f.state.observer=true;
+    await metadataTestHooks.pollPsForProject(project.id,metadataTestHooks.getActiveWatchingActivationToken(project.id)); clearTrackedTimers();
+    const source=[...stored().files,...stored().pendingFiles].find(row=>row.path===f.target);
+    assert.ok(source);
+    const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(stored(),source);
+    assert.deepEqual(stored().workingFileDirtyHolds.records[key].identities,[null]);
+    f.state.modified=false;
+    await metadataTestHooks.pollPsForProject(project.id,metadataTestHooks.getActiveWatchingActivationToken(project.id)); clearTrackedTimers();
+    assert.deepEqual(stored().workingFileDirtyHolds.records[key].identities,[null],'post-collection identity cannot identify the original buffer');
+    for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+  });
+  for (const modified of [true,'unknown']) choiceTest(`InDesign second correction rejected dirty ${modified} poll survives close and Retry`, async () => {
+    const f=await inDesignRecoveryFixture();
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    f.state.modified=modified; f.state.observer=true; f.state.pollIncomplete=true; f.state.pollReject=true;
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.equal((await f.card()).reason,'indesign-save-required');
+    roundTripFakeStore();
+    await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+    const inventories=f.state.inventories;
+    assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+    assert.equal(f.state.inventories,inventories);
+    assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+    f.state.mode='open'; f.state.modified=false;
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.equal((await f.card()).reason,'indesign-save-required','rejected clean rows cannot clear');
+    f.state.pollReject=false; f.state.pollIncomplete=false;
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.notEqual((await f.card()).reason,'indesign-save-required');
+    assert.equal((await f.card()).ready,false);
+    await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+    assert.equal((await f.resolve(await f.card(),'retry')).success,true);
+    for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+  });
+  for (const rejected of [false,true]) choiceTest(`InDesign second correction discovered source replacement during ${rejected?'rejected':'resolved'} collection stays unresolved`, async () => {
+    const f=await inDesignRecoveryFixture({admit:false});
+    const project=await createProject('Collection identity');
+    await metadataTestHooks.waitForWatcherIdle(project.id); clearTrackedTimers();
+    const stored=()=>storeInstance.data.projects.find(row=>row.id===project.id);
+    f.state.modified=true; f.state.observer=true; f.state.pollReject=rejected; f.state.pollIncomplete=rejected;
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    f.state.pollQueryWait={enter,promise:new Promise(resolve=>{release=resolve;})};
+    const pending=metadataTestHooks.pollPsForProject(project.id,metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    try {
+      await entered;
+      fs.renameSync(f.target,f.target+'.observed-original'); fs.writeFileSync(f.target,'%PDF-1.7\nreplacement\n%%EOF\n');
+      release(); await pending; clearTrackedTimers(); f.state.pollQueryWait=null;
+      const source=[...stored().files,...stored().pendingFiles].find(row=>row.path===f.target);
+      assert.ok(source,'dirty partial output must be retained');
+      const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(stored(),source);
+      assert.deepEqual(stored().workingFileDirtyHolds.records[key].identities,[null]);
+      roundTripFakeStore(); f.state.modified=false; f.state.pollReject=false; f.state.pollIncomplete=false;
+      await metadataTestHooks.pollPsForProject(project.id,metadataTestHooks.getActiveWatchingActivationToken(project.id)); clearTrackedTimers();
+      assert.deepEqual(stored().workingFileDirtyHolds.records[key].identities,[null],'clean replacement cannot discharge unknown original');
+      assert.deepEqual(fs.readFileSync(f.target+'.observed-original'),f.original.find(([p])=>p===f.target)[1]);
+    } finally {release(); await pending; clearTrackedTimers();}
+  });
+  for (const modified of [true,'unknown']) for (const order of ['clean-first','dirty-first','clean-sandwich']) {
+    for (const result of ['duplicate-terminal','incomplete','rejected']) choiceTest(`InDesign third correction ${modified} ${order} ${result} duplicates retain hold through close and Retry`, async () => {
+      const f=await inDesignRecoveryFixture();
+      await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+      const states=order==='clean-first'?[false,modified]:order==='dirty-first'?[modified,false]:[false,modified,false];
+      const rows=states.map(value=>`DOC\t${f.target}\tRecovery.indd\t${value}\ttrue\t0`);
+      f.state.pollOutput=rows.join('\n')+(result==='duplicate-terminal'?`\nEND\t${rows.length}\t${rows.length}\t0\t0`:'');
+      f.state.pollReject=result==='rejected';
+      await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+      assert.equal((await f.card()).reason,'indesign-save-required','a clean duplicate must never hide dirty or unknown work');
+      roundTripFakeStore();
+      await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+      const inventories=f.state.inventories;
+      assert.equal((await f.resolve(await f.card(),'retry')).error,'working_file_saved_observation_required');
+      assert.equal(f.state.inventories,inventories,'closed-file Retry cannot bypass the retained hold');
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      // The same malformed snapshot cannot clear the hold even if every row is clean.
+      f.state.pollOutput=f.state.pollOutput.replace(/\t(?:true|unknown)\ttrue\t0/g,'\tfalse\ttrue\t0');
+      f.state.mode='open';
+      await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+      await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+      assert.equal((await f.card()).reason,'indesign-save-required');
+      // A later complete clean observation may clear the same physical source.
+      f.state.pollOutput=null; f.state.pollReject=false; f.state.observer=true; f.state.modified=false;
+      await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+      assert.notEqual((await f.card()).reason,'indesign-save-required');
+      assert.equal((await f.card()).ready,false,'open clean remains unbound to saved bytes');
+      await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+      assert.equal((await f.resolve(await f.card(),'retry')).success,true);
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+    });
+  }
+  for (const modified of [true,'unknown']) choiceTest(`InDesign third correction close consequence after clean-first ${modified} duplicate`, async () => {
+    const f=await inDesignRecoveryFixture();
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    f.state.pollOutput=`DOC\t${f.target}\tRecovery.indd\tfalse\ttrue\t0\nDOC\t${f.target}\tRecovery.indd\t${modified}\ttrue\t0\nEND\t2\t2\t0\t0`;
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    await callIpcRaw('projects:pause',f.id); f.state.mode='closed';
+    const retry=await f.resolve(await f.card(),'retry');
+    assert.equal(retry.success,false,'closing after malformed dirty output must not verify saved bytes');
+    assert.equal(retry.error,'working_file_saved_observation_required');
+    assert.equal((await f.card()).ready,false);
+    for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+  });
+  for(const order of [null,{epoch:'invalid',sequence:1}]) choiceTest(`InDesign correction malformed stored observation order ${JSON.stringify(order)} remains opaque`, async () => {
+    const f=await inDesignRecoveryFixture(); f.state.modified=true;
+    assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+    const source=f.stored().files.find(row=>row.path===f.target);
+    const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
+    metadataTestHooks.mutateProject(f.id,project=>{project.workingFileDirtyHolds.records[key].inDesignOrder=order;return true;});
+    roundTripFakeStore(); const before=JSON.stringify(f.stored().workingFileDirtyHolds);
+    f.state.modified=false; f.state.observer=true;
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.equal((await f.card()).reason,'indesign-save-required');
+    assert.equal(JSON.stringify(f.stored().workingFileDirtyHolds),before);
+  });
+  choiceTest('InDesign correction fresh complete observation can clear a valid hold from an earlier process epoch', async () => {
+    const f=await inDesignRecoveryFixture(); f.state.modified=true;
+    assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+    const source=f.stored().files.find(row=>row.path===f.target);
+    const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
+    metadataTestHooks.mutateProject(f.id,project=>{
+      const epoch='ffffffff-ffff-4fff-8fff-ffffffffffff';
+      assert.notEqual(project.workingFileDirtyHolds.records[key].inDesignOrder.epoch,epoch);
+      project.workingFileDirtyHolds.records[key].inDesignOrder={epoch,sequence:999999};return true;
+    });
+    roundTripFakeStore(); f.state.modified=false; f.state.observer=true;
+    await callIpcRaw('projects:start-watching',f.id); await metadataTestHooks.waitForWatcherIdle(f.id); clearTrackedTimers();
+    await metadataTestHooks.pollPsForProject(f.id,metadataTestHooks.getActiveWatchingActivationToken(f.id)); clearTrackedTimers();
+    assert.notEqual((await f.card()).reason,'indesign-save-required');
+    assert.equal((await f.card()).ready,false);
+  });
+  for(const variant of ['absent','malformed','revision-mismatch']) choiceTest(`InDesign correction ${variant} receipt projects guidance and permits Retry recovery`, async () => {
+    const f=await inDesignRecoveryFixture();
+    const source=f.stored().files.find(row=>row.path===f.target);
+    const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
+    metadataTestHooks.mutateProject(f.id,project=>{
+      if(variant==='absent') delete project.workingSourceVerification[key];
+      else if(variant==='malformed') project.workingSourceVerification[key]={status:'scanned'};
+      else project.workingSourceVerification[key].selectionRevision+=1;
+      return true;
+    });
+    roundTripFakeStore();
+    const before=await f.card();
+    assert.equal(before.ready,false); assert.equal(before.reason,'indesign-saved-file-unverified');
+    f.state.mode='closed';
+    assert.equal((await f.resolve(before,'retry')).success,true);
+    assert.equal((await f.card()).ready,true);
+    assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+  });
+
+  for (const boundary of ['account','project-delete','activation']) choiceTest(`InDesign Retry rejects a stale ${boundary} query result`, async () => {
+    const f=await inDesignRecoveryFixture(); f.state.mode='closed';
+    let release; f.state.queryWait={promise:new Promise(resolve=>{release=resolve;})};
+    const before=JSON.stringify(f.stored().workingSourceSelections),queries=f.state.queries,now=testAccountSession.now;
+    const pending=f.resolve(await f.card(),'retry').catch(error=>({success:false,error:error.message}));
+    try {
+      await waitForCondition(()=>f.state.queries>queries,'retry query not entered');
+      if(boundary==='account') invalidateScanAccount('clock');
+      else if(boundary==='project-delete') await callIpcRaw('projects:delete',f.id);
+      else { await callIpcRaw('projects:start-watching',f.id); clearTrackedTimers(); }
+      release(); assert.equal((await pending).success,false);
+      if(boundary==='project-delete') assert.equal(f.stored(),undefined);
+      else assert.equal(JSON.stringify(f.stored().workingSourceSelections),before);
+      for(const [p,bytes] of f.original) assert.deepEqual(fs.readFileSync(p),bytes);
+    } finally {
+      release(); await pending;
+      testAccountSession.now=now; await testAccountSession.restore(); clearTrackedTimers();
+    }
+  });
+
   async function failedRemovalFixture() {
     resetTestHomeWorkspace(); setPresentationUnzipFixture([]);
     const project = await createProject('Retained removal choices');
@@ -240,10 +649,22 @@ function cases() {
       for (const name of ['C.ai', '1A' + ext]) assert.equal(after.files.find(row => row.name === name).sourceSelection, 'selected');
       assert.ok(fs.existsSync(f.a)); assert.ok(fs.existsSync(successor));
       assert.equal(after.workingFileChoices.choices.length, 0);
-      roundTripFakeStore(); assert.equal((await f.workspace()).workingFileChoices.choices.length, 0);
+      assert.equal(after.workingSourceDisplayOrder[0], after.files.find(row=>row.name==='1A'+ext).visualIdentity);
+      roundTripFakeStore(); const reloaded=await f.workspace(); assert.equal(reloaded.workingFileChoices.choices.length, 0);
+      assert.deepEqual(reloaded.workingSourceDisplayOrder,after.workingSourceDisplayOrder);
       clearTrackedTimers();
     });
   }
+  choiceTest('picker display order survives explicit Restore and reload without changing other selections or original bytes',async()=>{
+    const f=await setup(),target=await f.add('B.ai'),entry=(await f.workspace()).workingFileChoices.choices[0];
+    const prior=entry.predecessors.find(row=>row.name==='A.ai');assert.equal((await f.resolve(entry,'replace',prior.visualIdentity)).success,true);
+    let ws=await f.workspace(),a=ws.files.find(row=>row.name==='A.ai');const b=ws.files.find(row=>row.name==='B.ai');
+    const bytes=[f.a,f.c,target].map(p=>[p,fs.readFileSync(p)]);
+    assert.equal((await callIpcRaw('projects:set-working-source-selection',f.id,a.visualIdentity,{action:'restore',expectedRevision:a.selectionRevision})).success,true);
+    roundTripFakeStore();ws=await f.workspace();assert.equal(ws.workingSourceDisplayOrder[0],b.visualIdentity);
+    for(const name of ['A.ai','B.ai','C.ai'])assert.equal(ws.files.find(row=>row.name===name).sourceSelection,'selected');
+    for(const [p,value] of bytes)assert.deepEqual(fs.readFileSync(p),value);
+  });
   choiceTest('Keep both persists across restart and duplicate admission without changing selections', async () => {
     const f = await setup(), target = await f.add('1A.ai'), entry = (await f.workspace()).workingFileChoices.choices[0];
     assert.equal((await f.resolve(entry)).success, true);
@@ -486,7 +907,7 @@ function cases() {
     const ui=require('./opus-renderer-helpers').loadProjectedWorkspace(await getProject(f.id),await f.workspace());
     ui.renderer.renderPackageReview(await getProject(f.id),{...review,token:'forged',materializable:true});
     assert.equal(ui.elements['btn-confirm-package'].disabled,true);
-    assert.match(ui.text(ui.elements['source-continuation-choices']),/Packaging is blocked/);
+    assert.match(ui.text(ui.elements['source-continuation-choices']),/Packaging (?:is )?blocked/);
     assert.equal((await f.resolve(review.workingFileChoices.choices[0])).success,true);
     assert.ok((await callIpcRaw('projects:prepare-package-review',f.id)).token);
   });
@@ -504,12 +925,14 @@ function cases() {
     const ui=require('./opus-renderer-helpers').loadProjectedWorkspace(await getProject(f.id),ws);
     ui.renderer.renderWorkingFileChoices(await getProject(f.id),ws);
     const descend = el => [el,...el.children.flatMap(descend)];
-    const select=descend(ui.elements['working-file-choices']).find(el=>el.tagName==='SELECT');
-    assert.equal(select.value,'');
-    const labels=select.children.filter(el=>el.textContent.includes('Deck.ai')).map(el=>el.textContent);
+    const buttons=descend(ui.elements['project-file-list']).filter(el=>el.tagName==='BUTTON'&&el.dataset.choice==='replace');
+    assert.equal(descend(ui.elements['project-file-list']).some(el=>el.tagName==='SELECT'),false);
+    const labels=buttons.filter(el=>el.textContent.includes('Deck.ai')).map(el=>el.getAttribute('aria-label'));
     assert.equal(new Set(labels).size,2);
-    select.focus(); ui.renderer.renderWorkingFileChoices(await getProject(f.id),await f.workspace());
-    assert.equal(ui.document.activeElement,select,'identical refresh preserves picker/focus');
+    assert.ok(labels.some(label=>label.includes('One › Work')));assert.ok(labels.some(label=>label.includes('Two › Work')));
+    const question=ui.elements['project-file-list'].querySelector('.working-file-choice-question');question.focus();
+    ui.renderer.renderWorkingFileChoices(await getProject(f.id),await f.workspace());
+    assert.ok(ui.document.activeElement===question,'identical refresh preserves decision context/focus');
   });
   choiceTest('cache hardening/read preserve correct-mode ctime and still reject unsafe targets', async () => {
     const f=await setup(),dir=metadataTestHooks.ensurePresentationAssetsDir(f.id),target=path.join(dir,'Safe.png');
@@ -540,13 +963,13 @@ function cases() {
     const ui=require('./opus-renderer-helpers').loadProjectedWorkspace(await getProject(f.id),ws);
     ui.renderer.renderWorkingFileChoices(await getProject(f.id),ws);
     const descend=el=>[el,...el.children.flatMap(descend)];
-    const select=descend(ui.elements['working-file-choices']).find(el=>el.tagName==='SELECT'); select.focus();
+    const question=ui.elements['project-file-list'].querySelector('.working-file-choice-question');question.focus();
     const before=JSON.stringify(f.stored()), writes=storeInstance.projectSetCount, events=testRendererEvents.length;
     await metadataTestHooks.runScanOnSavePresentation(f.id,path.join(TEST_HOME,'Desktop','SameMedia'+ext));
     assert.equal(JSON.stringify(f.stored()),before); assert.equal(storeInstance.projectSetCount,writes);
     assert.equal(testRendererEvents.length,events);
     ws=await f.workspace(); ui.renderer.renderWorkingFileChoices(await getProject(f.id),ws);
-    assert.equal(ui.document.activeElement,select);
+    assert.ok(ui.document.activeElement===question,'unchanged media refresh preserves decision focus');
     for (const entry of ws.workingFileChoices.choices) {
       const current=(await f.workspace()).workingFileChoices.choices.find(row=>row.id===entry.id);
       assert.equal((await f.resolve(current)).success,true);

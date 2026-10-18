@@ -17,6 +17,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
+const { decodeXMLPath } = require('./xml-path');
 const {
   ADMISSION_LIMITS,
   decompressGzipWithinBudget,
@@ -111,7 +112,7 @@ class PremiereParser extends BaseParser {
     GENERIC_PATH_REGEX.lastIndex = 0;
     while ((match = GENERIC_PATH_REGEX.exec(xmlContent)) !== null) {
       // Remove leading '>' from the match (it's part of the lookahead)
-      const mediaPath = match[0].startsWith('>') ? match[0].slice(1) : match[0];
+      const mediaPath = this.decodeXMLEntities(match[0].startsWith('>') ? match[0].slice(1) : match[0]);
 
       if (this.isUserPath(mediaPath)) {
         const exists = this.fileExists(mediaPath);
@@ -133,14 +134,7 @@ class PremiereParser extends BaseParser {
    * @returns {string} - Decoded string
    */
   decodeXMLEntities(str) {
-    return str
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&apos;/g, "'")
-      .replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec))
-      .replace(/&#x([0-9a-f]+);/gi, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
+    return decodeXMLPath(str);
   }
 
   static get extensions() {

@@ -82,7 +82,7 @@ test('pair controls appear only for backend versioned candidates inside Package 
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
   const region = f.elements['source-continuation-choices'];
   for (const text of ['Replace', 'Keep both', 'Not related']) assert.ok(buttonFor(region, text));
-  assert.match(getElementTreeText(region), /still required as an asset/);
+  assert.match(getElementTreeText(region), /remains a required asset/);
   assert.equal(f.elements['btn-confirm-package'].disabled, true);
   assert.equal(f.renderer.getContinuationCandidates({ ...review, sourceContinuation: { ...review.sourceContinuation, version: 2 } }).length, 0);
 });
@@ -209,8 +209,8 @@ for (const selectionState of ['selected', 'excluded']) test(`pending ${selection
   assert.equal(buttonFor(region, 'Replace').disabled, true);
   assert.equal(buttonFor(region, 'Keep both').disabled, false);
   assert.equal(buttonFor(region, 'Not related').disabled, false);
-  assert.match(getElementTreeText(region), /has not been added to this project/);
-  assert.match(getElementTreeText(region), /Keep both and Not related will not add it/);
+  assert.match(getElementTreeText(region), /is not in this project/);
+  assert.match(getElementTreeText(region), /Keep both \/ Not related won’t add it/);
   assert.doesNotMatch(getElementTreeText(region), /includes both versions/);
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.equal(calls, 0, 'disabled UI also has a handler-level admission guard');
@@ -239,7 +239,7 @@ test('accepted excluded successor permits explicit Replace without promising Kee
   f.renderer.renderPackageReview(f.project, review);
   const region = f.elements['source-continuation-choices'];
   assert.equal(buttonFor(region, 'Replace').disabled, false);
-  assert.match(getElementTreeText(region), /Keep both and Not related leave it excluded/);
+  assert.match(getElementTreeText(region), /other choices keep it excluded/);
   assert.doesNotMatch(getElementTreeText(region), /includes both versions|Ready to package/);
   f.renderer.showPackageModal = async () => {};
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), true);
@@ -278,8 +278,8 @@ test('admission-required refusal refreshes ordinary files and gives truthful rec
   f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
-  assert.match(message, /Close Package Review to return to your files/);
-  assert.match(message, /cannot add it to the project/);
+  assert.match(message, /Review it in Project Workspace before choosing Replace/);
+  assert.match(message, /File not added/);
   assert.doesNotMatch(message, /Choice saved/);
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']); assert.equal(f.calls.length, 0);
 });
@@ -348,8 +348,8 @@ for (const identityStatus of ['changed', 'unavailable']) {
       await f.renderer.showPackageModal({ runPreScan: false });
       const region = f.elements['source-continuation-choices'];
       assert.equal(region.classList.contains('hidden'), false);
-      assert.match(getElementTreeText(region), /choices are paused.*refresh the project/i);
-      assert.match(getElementTreeText(region), identityStatus === 'changed' ? /identity changed/ : /could not verify/);
+      assert.match(getElementTreeText(region), /File identity (?:changed|unverified).*Refresh the project/i);
+      assert.match(getElementTreeText(region), identityStatus === 'changed' ? /identity changed/ : /identity unverified/);
       for (const [choice, label] of [['replace', 'Replace'], ['keep-both', 'Keep both'], ['not-related', 'Not related']]) {
         assert.equal(buttonFor(region, label).disabled, true);
         assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, choice,
@@ -530,7 +530,7 @@ test('v14 recovery displays blocked status, dependency obligation, labeled contr
   const f = await recoverySetup({ includedAsDependency: true });
   const row = f.recoveryRow(), button = buttonFor(row, 'Exclude'), gate = deferred();
   assert.match(getElementTreeText(row), /Needs attention/);
-  assert.match(getElementTreeText(row), /does not remove that requirement/);
+  assert.match(getElementTreeText(row), /Required as an asset/);
   assert.doesNotMatch(getElementTreeText(row), /Ready|always included/);
   assert.match(button.getAttribute('aria-label'), /Original.ai as a working file/);
   f.crate.setWorkingSourceSelection = async (...args) => { f.calls.push(args); assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null); return gate.promise; };
@@ -557,7 +557,7 @@ for (const [name, change] of [
 test('v14 missing A only offers the projected Exclude; duplicate identity and foreign workspace offer no action', async () => {
   const f = await recoverySetup({ selectionRecovery: { version: 1, reason: 'continuation-identity-changed', expectedRevision: 3, actions: ['exclude'] } });
   assert.ok(buttonFor(f.recoveryRow(), 'Exclude')); assert.equal(buttonFor(f.recoveryRow(), 'Restore'), undefined);
-  assert.match(getElementTreeText(f.recoveryRow()), /Restore is unavailable/);
+  assert.match(getElementTreeText(f.recoveryRow()), /Verify the saved file to restore/);
   f.workspace.pendingFiles.push(clone(f.row)); await f.renderer.renderFiles();
   assert.equal(buttonFor(f.recoveryRow(), 'Exclude'), undefined);
   f.workspace.projectId = 'foreign'; await f.renderer.renderFiles();
@@ -1007,6 +1007,10 @@ for (const [status, reasons, label] of [
     assert.equal(nodes[0].children[0].getAttribute('aria-label'), `Original.ai: ${label}`);
     assert.doesNotMatch(getElementTreeText(nodes[0]), /Ready|verified delivery|automatically replace/i);
     if (status === 'exact-enrolled' || status === 'default-root') assert.match(getElementTreeText(nodes[0]), /unverified/);
+    if (['inactive', 'unsupported', 'ignored', 'unavailable'].includes(status)) {
+      assert.ok(getElementTreeText(nodes[0]).includes(currentCoverage(f).detail), 'essential Watch reason stays visible without a disclosure');
+      assert.equal(nodes[0].tagName, 'DIV');
+    }
   }
   assert.equal(f.calls.length, 0);
 });
@@ -1058,13 +1062,11 @@ test('v24 Watch UI cap leaves valid packaging and verification copy independent'
   assert.equal(f.elements['btn-confirm-package'].disabled, false);
   assert.equal(f.elements['btn-package'].disabled, false);
   const detail = currentCoverage(f).detail;
-  assert.match(detail, /256 individual-file/); assert.match(detail, /eligible waiting files.*path order/);
-  assert.match(detail, /still required.*does not free/); assert.match(detail, /Refreshing does not guarantee/);
-  assert.match(detail, /limit alone does not prevent packaging/);
+  assert.equal(detail, '256 individual-file Watch limit reached.');
   Object.assign(f.row, { verificationRequired: true, verificationStatus: 'stale' });
   await f.renderer.renderFiles();
   const text = getElementTreeText(f.elements['working-assets-list']);
-  assert.match(text, /saved file changed/); assert.match(text, /Needs attention/); assert.match(text, /256-file limit/);
+  assert.match(text, /File changed/); assert.match(text, /Needs attention/); assert.match(text, /256-file limit/);
   assert.equal(f.calls.length, 0);
 });
 
@@ -1092,7 +1094,7 @@ test('v24 Watch UI required A and C D shared roles survive coverage refresh', as
   f.workspace.files.push(c, d, shared); f.project.files.push(c, d, shared);
   const before = clone(f.workspace.files);
   await f.renderer.renderFiles();
-  assert.match(getElementTreeText(f.elements['working-assets-list']), /Still included because C.ai uses it/);
+  assert.match(getElementTreeText(f.elements['working-assets-list']), /Required by C.ai/);
   assert.equal(watchNodes(f).length, 3);
   f.workspace.files.reverse(); await f.renderer.renderFiles();
   assert.deepEqual(clone(f.workspace.files).reverse(), before);

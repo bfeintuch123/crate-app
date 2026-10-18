@@ -475,7 +475,7 @@ for (const state of ['selected', 'excluded']) test(`working-source ${state} uses
 test('excluded dependency remains required and uses safe requiring-source names', () => {
   const f = setup({ sourceSelection: 'excluded', included: true, includedAsDependency: true, effectiveRole: 'asset', requiredBy: ['Current.ai'] });
   const row = f.renderer.createAssetFileRow(f.project, f.row, { protectedSource: true });
-  assert.match(getElementTreeText(row), /Still included because Current.ai uses it/);
+  assert.match(getElementTreeText(row), /Required by Current.ai/);
   assert.ok(buttonFor(row, 'Restore'));
 });
 
@@ -542,7 +542,7 @@ test('successful Restore intent with failed verification refetches facts and nev
     return { success: true, semanticCounts: { selectedWorkingSources: 999 } };
   };
   await f.renderer.changeWorkingSourceSelection(f.project, { ...f.row }, 'restore');
-  assert.match(f.notices.at(-1), /not finished successfully/);
+  assert.match(f.notices.at(-1), /Verification failed/);
   assert.equal(vm.runInContext('state.assetWorkspace.semanticCounts.selectedWorkingSources', f.renderer), 1);
   assert.equal(vm.runInContext('state.packageReviewToken', f.renderer), null);
 });
@@ -570,7 +570,7 @@ test('pair controls appear only for backend versioned candidates inside Package 
   const review = pairReview(f); f.renderer.renderPackageReview(f.project, review);
   const region = f.elements['source-continuation-choices'];
   for (const text of ['Replace', 'Keep both', 'Not related']) assert.ok(buttonFor(region, text));
-  assert.match(getElementTreeText(region), /still required as an asset/);
+  assert.match(getElementTreeText(region), /remains a required asset/);
   assert.equal(f.elements['btn-confirm-package'].disabled, true);
   assert.equal(f.renderer.getContinuationCandidates({ ...review, sourceContinuation: { ...review.sourceContinuation, version: 2 } }).length, 0);
 });
@@ -610,7 +610,7 @@ for (const status of ['pending', 'failed', 'stale', 'incomplete']) test(`exclude
   const text = getElementTreeText(row);
   assert.doesNotMatch(text, /Still included/);
   assert.match(text, status === 'pending' ? /Verifying/ : /Needs attention/);
-  assert.match(text, /Excluded as a working file/);
+  assert.match(text, /Excluded working file/);
   assert.ok(buttonFor(row, 'Restore'));
 });
 
@@ -764,8 +764,8 @@ for (const selectionState of ['selected', 'excluded']) test(`pending ${selection
   assert.equal(buttonFor(region, 'Replace').disabled, true);
   assert.equal(buttonFor(region, 'Keep both').disabled, false);
   assert.equal(buttonFor(region, 'Not related').disabled, false);
-  assert.match(getElementTreeText(region), /has not been added to this project/);
-  assert.match(getElementTreeText(region), /Keep both and Not related will not add it/);
+  assert.match(getElementTreeText(region), /is not in this project/);
+  assert.match(getElementTreeText(region), /Keep both \/ Not related won’t add it/);
   assert.doesNotMatch(getElementTreeText(region), /includes both versions/);
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
   assert.equal(calls, 0, 'disabled UI also has a handler-level admission guard');
@@ -794,7 +794,7 @@ test('accepted excluded successor permits explicit Replace without promising Kee
   f.renderer.renderPackageReview(f.project, review);
   const region = f.elements['source-continuation-choices'];
   assert.equal(buttonFor(region, 'Replace').disabled, false);
-  assert.match(getElementTreeText(region), /Keep both and Not related leave it excluded/);
+  assert.match(getElementTreeText(region), /other choices keep it excluded/);
   assert.doesNotMatch(getElementTreeText(region), /includes both versions|Ready to package/);
   f.renderer.showPackageModal = async () => {};
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), true);
@@ -833,8 +833,8 @@ test('admission-required refusal refreshes ordinary files and gives truthful rec
   f.renderer.renderFiles = async options => { assert.equal(options.isCurrent(), true); order.push('workspace'); return renderFiles(options); };
   f.renderer.showPackageModal = async options => { order.push('prepare'); message = options.message; };
   assert.equal(await f.renderer.chooseSourceContinuation(f.project, pair, 'replace', vm.runInContext('packageReviewContents.lease', f.renderer)), false);
-  assert.match(message, /Close Package Review to return to your files/);
-  assert.match(message, /cannot add it to the project/);
+  assert.match(message, /Review it in Project Workspace before choosing Replace/);
+  assert.match(message, /File not added/);
   assert.doesNotMatch(message, /Choice saved/);
   assert.deepEqual(order, ['resolve', 'workspace', 'prepare']); assert.equal(f.calls.length, 0);
 });

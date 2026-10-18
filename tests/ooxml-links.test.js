@@ -1,0 +1,21 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process');
+const {inspectLinks,rewriteLinks,resolveLocalTarget,relationshipParts,readArchive}=require('../parsers/ooxml-links');
+const NS='http://schemas.openxmlformats.org/package/2006/relationships',TYPE='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image';
+function archive(t,target,extra=''){
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'crate-ooxml-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ fs.mkdirSync(path.join(dir,'ppt/slides/_rels'),{recursive:true});fs.writeFileSync(path.join(dir,'ppt/slides/_rels/slide1.xml.rels'),`<?xml version="1.0"?><Relationships xmlns="${NS}"><Relationship Id="rId4" Type="${TYPE}" Target="${target}" TargetMode="External"/>${extra}</Relationships>`);fs.writeFileSync(path.join(dir,'ppt/slides/slide1.xml'),'<slide>untouched</slide>');cp.execFileSync('/usr/bin/zip',['-q','-r','deck.pptx','ppt'],{cwd:dir});return {dir,buffer:fs.readFileSync(path.join(dir,'deck.pptx'))};
+}
+for(const target of ['file:///Users/test/a%20b.png','file:////Users/test/a%20b.png','file://localhost/Users/test/a%20b.png','/Users/test/a%20b.png'])test('resolve local native URI '+target,()=>assert.equal(resolveLocalTarget('/Users/test/deck.pptx',target),'/Users/test/a b.png'));
+test('relative relationship resolves from document directory',()=>assert.equal(resolveLocalTarget('/tmp/project/deck.pptx','../assets/a%20b.png'),'/tmp/assets/a b.png'));
+for(const target of ['file://remote/share/a.png','https://example.com/a.png','//remote/a.png','file:relative.png','bad%XX.png','bad%00.png','a\\b.png'])test('refuse unsafe/unsupported target '+target,()=>assert.throws(()=>resolveLocalTarget('/tmp/deck.pptx',target)));
+test('compressed native external link is discovered and rewritten portably without source mutation',t=>{
+ const {dir,buffer}=archive(t,'file:////Users/test/QA-new-green.png');const before=Buffer.from(buffer);const links=inspectLinks(buffer,path.join(dir,'deck.pptx'));assert.equal(links.length,1);assert.equal(links[0].resolvedPath,'/Users/test/QA-new-green.png');
+ const packaged=rewriteLinks(buffer,path.join(dir,'deck.pptx'),{'/Users/test/QA-new-green.png':'../PNG/QA%20new.png'});assert.deepEqual(buffer,before);assert.equal(inspectLinks(packaged,'/relocated/PPTX/deck.pptx')[0].resolvedPath,'/relocated/PNG/QA new.png');
+ const output=path.join(dir,'out.pptx');fs.writeFileSync(output,packaged);cp.execFileSync('/usr/bin/unzip',['-t',output]);assert.equal(cp.execFileSync('/usr/bin/unzip',['-p',output,'ppt/slides/slide1.xml'],{encoding:'utf8'}),'<slide>untouched</slide>');
+});
+test('missing planned dependency refuses rewrite',t=>{const {buffer}=archive(t,'file:///tmp/missing.png');assert.throws(()=>rewriteLinks(buffer,'/tmp/a.pptx',{}),/external_dependency_not_packaged/);});
+test('duplicate targets retained as distinct relationships but map to one packaged source',t=>{const {buffer}=archive(t,'a.png',`<Relationship Id="rId5" Type="${TYPE}" Target="./a.png" TargetMode="External"/>`);const result=rewriteLinks(buffer,'/tmp/deck.pptx',{'/tmp/a.png':'a.png'});assert.equal(inspectLinks(result,'/relocated/deck.pptx').length,2);assert.deepEqual([...new Set(inspectLinks(result,'/relocated/deck.pptx').map(x=>x.resolvedPath))],['/relocated/a.png']);});
+for(const xml of [`<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><Relationships xmlns="${NS}"/>`,`<Relationships xmlns="evil"/>`,`<Relationships xmlns="${NS}"><Relationship Id="a" Type="${TYPE}" Target="a" TargetMode="External"/><Relationship Id="a" Type="${TYPE}" Target="b"/></Relationships>`,`<Relationships xmlns="${NS}"><Relationship Id="a" Type="${TYPE}" Target="&unknown;"/></Relationships>`])test('malformed or unsafe relationship XML refused '+xml.slice(0,35),()=>assert.throws(()=>relationshipParts(xml)));
+test('XML entities preserve filename semantics',()=>assert.equal(relationshipParts(`<Relationships xmlns="${NS}"><Relationship Id="a" Type="${TYPE}" Target="A&amp;B.png" TargetMode="External"/></Relationships>`)[0].value,'A&B.png'));
+test('truncated archive refused',()=>assert.throws(()=>readArchive(Buffer.from('PK'))));

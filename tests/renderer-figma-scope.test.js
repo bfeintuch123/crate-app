@@ -729,9 +729,9 @@ test('Edit Figma Link keeps the saved URL out of the renderer and preserves it w
 test('Edit Figma Link markup offers explicit replacement and removal controls', () => {
   const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
 
-  assert.match(indexHtml, /Leave blank to keep the current link/);
+  assert.match(indexHtml, /blank keeps current/);
   assert.match(indexHtml, /id="btn-edit-figma-remove"/);
-  assert.match(indexHtml, /Replace Figma URL \(optional\)/);
+  assert.match(indexHtml, /Replace Figma URL \(blank keeps current\)/);
 });
 
 test('Edit Figma Link refuses arbitration without staging hidden state', () => {
@@ -3931,7 +3931,7 @@ test('Added list tears down populated state, preserves its empty message through
   await renderer.renderFiles();
   const placeholder = list.children[0];
   assert.equal(placeholder.className, 'asset-panel-empty');
-  assert.equal(placeholder.textContent, 'New package-ready assets will appear here as you work.');
+  assert.equal(placeholder.textContent, 'No added assets.');
   assert.equal(list.__assetReviewVirtualState, undefined);
   assert.equal(list.style.height, '');
   assert.equal(list.style['--asset-review-logical-height'], undefined);
@@ -4259,18 +4259,18 @@ test('Added Assets empty-state copy updates in both directions without replacing
   renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
   const firstEmpty = elements['added-assets-list'].children[0];
   const existingRow = elements['existing-assets-list'].children[0];
-  assert.equal(getElementTreeText(firstEmpty), 'New package-ready assets will appear here as you work.');
+  assert.equal(getElementTreeText(firstEmpty), 'No added assets.');
 
   renderer.renderAssetWorkspace(project, { hasActiveCandidates: true }, project.files);
   const activeEmpty = elements['added-assets-list'].children[0];
   assert.notEqual(activeEmpty, firstEmpty);
-  assert.equal(getElementTreeText(activeEmpty), 'No package-ready assets yet. Review the files Crate observed.');
+  assert.equal(getElementTreeText(activeEmpty), 'No package-ready assets.');
   assert.equal(elements['existing-assets-list'].children[0], existingRow);
 
   renderer.renderAssetWorkspace(project, { hasActiveCandidates: false }, project.files);
   const restoredEmpty = elements['added-assets-list'].children[0];
   assert.notEqual(restoredEmpty, activeEmpty);
-  assert.equal(getElementTreeText(restoredEmpty), 'New package-ready assets will appear here as you work.');
+  assert.equal(getElementTreeText(restoredEmpty), 'No added assets.');
   assert.equal(elements['existing-assets-list'].children[0], existingRow);
 });
 
@@ -4513,7 +4513,7 @@ test('failed organization refresh keeps the saved mode but shows the authoritati
   assert.equal(vm.runInContext('state.settings.packageOutputLayoutMode', renderer), 'by-extension-v1');
   assert.equal(elements['btn-confirm-package'].disabled, true);
   assert.equal(elements['toggle-package-review-folders'].checked, true);
-  assert.match(message, /Crate could not finish checking project files/);
+  assert.match(message, /File checks failed/);
   assert.match(message, /code package_scan_incomplete/);
   assert.match(message, /phase pre-package-discovery/);
   assert.equal(message.includes('Package organization changed'), false);
@@ -5368,8 +5368,7 @@ test('renderer surfaces typed Package Review scan diagnostics without private va
   const message = elements['modal-package-review-message'].textContent;
   assert.equal(
     message,
-    'Crate could not finish checking project files. No package was created. ' +
-      'Record the diagnostic below before retrying. ' +
+    'File checks failed. Save the diagnostic, then retry. ' +
       'Diagnostic: code package_scan_incomplete · phase pre-package-discovery · elapsed 8000 ms · ' +
       'candidates 129 · xattr resolved 128 · metadata fallback 1.'
   );
@@ -5495,8 +5494,7 @@ test('renderer surfaces final package-confirmation diagnostics after Package Now
   assert.equal(packageCalls[0][2], review.token);
   assert.equal(
     elements['modal-package-review-message'].textContent,
-    'Crate could not finish checking project files. No package was created. ' +
-      'Record the diagnostic below before retrying. ' +
+    'File checks failed. Save the diagnostic, then retry. ' +
       'Diagnostic: code package_scan_incomplete · phase pre-package-discovery · elapsed 8000 ms · ' +
       'candidates 129 · xattr resolved 128 · metadata fallback 1.'
   );
@@ -5573,7 +5571,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
 
   assert.match(html, /id="modal-existing-assets"[^>]*role="dialog"[^>]*aria-modal="true"/);
-  assert.match(html, /all existing assets in the project, including any not shown here/);
+  assert.match(html, /All existing assets · Working files unchanged/);
   assert.match(html, /<button[^>]*id="btn-skip-existing-assets"[^>]*>Skip existing assets<\/button>/);
   assert.match(html, /<button[^>]*id="btn-include-existing-assets"[^>]*>Include existing assets<\/button>/);
   assert.match(html, /id="modal-package"[^>]*role="dialog"[^>]*aria-modal="true"/);
@@ -5584,7 +5582,7 @@ test('Package Review dialog exposes live status semantics and visible disabled s
   assert.match(html, /id="asset-review-heading"[^>]*tabindex="-1"/);
   assert.match(html, /data-asset-filter="all"[^>]*aria-pressed="true"/);
   assert.match(html, /data-asset-filter="existing"[^>]*aria-pressed="false"/);
-  assert.match(html, /<input(?=[^>]*id="toggle-package-folders")(?=[^>]*aria-labelledby="setting-package-folders-label")(?=[^>]*aria-describedby="setting-package-folders-desc")[^>]*>/);
+  assert.match(html, /<input(?=[^>]*id="toggle-package-folders")(?=[^>]*aria-labelledby="setting-package-folders-label")[^>]*>/);
   assert.match(html, /id="toggle-package-review-folders"[^>]*aria-labelledby="package-review-organization-label"[^>]*aria-describedby="package-review-organization-status"/);
   assert.match(css, /\.modal-btn-primary:disabled[\s\S]*cursor:\s*not-allowed/);
   assert.match(css, /\.modal-review-message\.is-empty\s*\{[\s\S]*visibility:\s*hidden;/);
@@ -6532,7 +6530,7 @@ test('Pending-only live session renders active review state instead of empty tra
   assert.equal(pendingText.includes('Save to make package-ready'), true);
   assert.equal(pendingText.includes('provenance'), false);
   assert.equal(pendingText.includes('lsof'), false);
-  assert.equal(elements['file-list'].innerHTML.includes('No package-ready files yet'), true);
+  assert.equal(elements['file-list'].innerHTML.includes('No package-ready files.'), true);
   assert.equal(elements['file-list'].innerHTML.includes('No files tracked yet'), false);
 });
 
@@ -8136,15 +8134,16 @@ function attachOliviaReviewDescriptions(fixture) {
     const tag = html.match(new RegExp(`<button\\b[^>]*id="${id}"[^>]*>([^<]*)</button>`));
     assert.ok(tag, id);
     const descriptionId = tag[0].match(/aria-describedby="([^"]+)"/)?.[1];
+    if (id === 'btn-review-assets-continue') {
+      assert.equal(descriptionId, undefined);
+      fixture.document.querySelector(`#${id}`).textContent = tag[1];
+      continue;
+    }
     assert.ok(descriptionId, `${id} must associate visible guidance`);
     fixture.document.querySelector(`#${id}`).setAttribute('aria-describedby', descriptionId);
     const description = fixture.document.querySelector(`#${descriptionId}`);
     const paragraph = html.match(new RegExp(`<p\\b[^>]*id="${descriptionId}"[^>]*>([^<]*)</p>`));
     assert.ok(paragraph, descriptionId);
-    if (id === 'btn-review-assets-continue') {
-      fixture.elements[id].textContent = tag[1];
-      description.textContent = paragraph[1];
-    }
     assert.equal(description.isConnected, true);
   }
 }
@@ -8323,11 +8322,8 @@ for (const baseline of ['awaiting-first-scan', 'invalid', 'unknown']) {
     const before = cloneTestValue(project);
     assert.equal(await renderer.showPackageModal({ runPreScan: false }), false);
     const message = f.elements['modal-package-review-message'].textContent;
-    assert.match(message, /^Initial file verification has not completed; a scan may have failed\. No package was created\./);
-    assert.match(message, /Review.*Needs Save or Needs attention/);
-    assert.match(message, /controls offered for each item/);
-    assert.match(message, /Saving alone may not resolve a failed scan/);
-    assert.match(message, /Packaging stays blocked/);
+    assert.match(message, /^File verification incomplete\. Open Review to resolve Needs Save or Needs attention\./);
+    assert.doesNotMatch(message, /Saving alone|controls offered for each item|No package was created/);
     assert.match(message, /Diagnostic: code asset_baseline_scan_incomplete/);
     assert.doesNotMatch(message, /untrusted.ai|private-sentinel|\/synthetic|Working.ai|automatically|re-add/);
     assert.equal(f.elements['btn-confirm-package'].disabled, true);
@@ -8363,7 +8359,7 @@ for (const mode of ['unresolved', 'resolved', 'empty']) {
     renderer.openAssetReviewWorkspace();
     const before = JSON.stringify(vm.runInContext('({projects:state.projects, workspace:state.assetWorkspace, token:state.packageReviewToken})', renderer));
     assert.equal(f.elements['btn-review-assets-continue'].textContent, 'Back to Project');
-    assert.match(f.elements['asset-review-exit-reason'].textContent, /Unresolved items stay unchanged.*required reviews and verification before packaging/);
+    assert.equal(f.elements['asset-review-exit-reason'], undefined);
     f.elements['btn-review-assets-continue'].click();
     assert.equal(vm.runInContext('state.assetReviewOpen', renderer), false);
     assert.equal(f.elements['asset-review-workspace'].classList.contains('hidden'), true);

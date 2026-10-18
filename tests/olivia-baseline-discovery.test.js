@@ -20,7 +20,7 @@ replaceExactlyOnce("const test = require('node:test');",
 replaceExactlyOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'olivia-synthetic-home-'))");
 replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
-  '  selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification, getStablePackageReviewSourceContentFingerprint, getPackageReviewSourceFingerprint,\n' +
+  '  parseInDesignActiveSessionOutput, createInDesignLiveEvidenceRecords, parseDependableInDesignBaselineSnapshot, inDesignScript: INDD_APPLESCRIPT, selectProjectFilesForPackaging, extractLinkedAssets, extractLinkedAssetsIdml, createProjectFileVisualIdentity, getAssetBaselineSourceRecoveryRouteKey, getWorkingSourceMembership, getWorkingSourceVerification, getStablePackageReviewSourceContentFingerprint, getPackageReviewSourceFingerprint,\n' +
   '  getWorkingScanLifetime() { return { operations: workingSourceScanOperations.size, leases: workingSourceScanLeases.size }; },\n' +
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
@@ -1986,6 +1986,27 @@ function baselineCases() {
       assert.equal(d.counts.enumerations, 0); assert.equal(d.counts.queries, 0);
       console.log('LD1_M1_EVIDENCE ' + JSON.stringify({ scenario: 'strict-first-baseline-closed', counters: d.counts, after: project, result }));
     } finally { await f.cleanup(); }
+  });
+
+  baselineTest('InDesign unknown modified state is never clean evidence or a dependable snapshot', () => {
+    const source = path.join(TEST_HOME, 'Desktop', 'Unknown.indd');
+    for (const modified of ['unknown', '', 'FALSE', 'null']) {
+      const output = `DOC\t${source}\tUnknown.indd\t${modified}\ttrue\t0\nEND\t1\t0\t0\t0`;
+      const parsed = metadataTestHooks.parseInDesignActiveSessionOutput(output);
+      assert.equal(parsed.documents[0].modified, null);
+      const records = metadataTestHooks.createInDesignLiveEvidenceRecords('test', parsed);
+      assert.equal(records.length, 1);
+      assert.equal(records[0].savedEvidence, false); assert.equal(records[0].requiresSave, true);
+      assert.throws(() => metadataTestHooks.parseDependableInDesignBaselineSnapshot(output, source), /snapshot_incomplete/);
+    }
+    assert.throws(() => metadataTestHooks.parseDependableInDesignBaselineSnapshot(
+      `DOC\t${path.dirname(source)}/\t\tfalse\ttrue\t0\nEND\t1\t0\t0\t0`, source,
+      { allowMissingSelectedSource: true }), /snapshot_incomplete/, 'missing document name cannot establish selected-source absence');
+    assert.match(metadataTestHooks.inDesignScript, /set docName to name of aDoc\s+on error\s+set queryErrorCount to queryErrorCount \+ 1/);
+    assert.match(metadataTestHooks.inDesignScript, /set docCurrent to \(aDoc is active document\)\s+on error\s+set queryErrorCount to queryErrorCount \+ 1/);
+    assert.match(metadataTestHooks.inDesignScript, /docPathText & docName\s+end if\s+on error\s+set queryErrorCount to queryErrorCount \+ 1/);
+    assert.match(metadataTestHooks.inDesignScript, /set docModified to "unknown"/);
+    assert.match(metadataTestHooks.inDesignScript, /set docModified to modified of aDoc\s+on error\s+set queryErrorCount to queryErrorCount \+ 1/);
   });
 
   baselineTest('LD-1 M1 InDesign: Restore still rejects a valid running snapshot missing the selected document', async () => {

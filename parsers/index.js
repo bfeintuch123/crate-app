@@ -29,6 +29,7 @@ const {
   copyFileIntoPackage,
   ensureSafePackageDirectory,
   removeCreatedPackageFiles,
+  writeFileIntoPackage,
 } = require('./package-safety');
 
 // Import all parsers
@@ -215,7 +216,42 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   }
 
   result.assetsFound = assets.length;
+  if (path.extname(filePath).toLowerCase() === '.pptx' && assets.some(asset => asset.source === 'pptx-linked')) {
+    const { readFileWithinBudget, ADMISSION_LIMITS } = require('./admission-budgets');
+    const { rewriteLinks } = require('./ooxml-links');
+    const source = readFileWithinBudget(filePath, ADMISSION_LIMITS.localParserFileBytes, 'Presentation is too large to package safely.');
+    const replacements = Object.create(null);
+    try {
+      for (const asset of assets.filter(item => item.source === 'pptx-linked')) {
+        if (!asset.exists) throw new Error('A linked presentation asset is unavailable.');
+        const copied = copyFileIntoPackage(asset.path, outputRoot, path.basename(asset.path));
+        result.files.push({ original: asset.path, copied, source: asset.source });
+        result.assetsCopied++;
+        replacements[asset.path] = path.relative(outputRoot, copied).split(path.sep).map(encodeURIComponent).join('/');
+      }
+      const rewritten = rewriteLinks(source, filePath, replacements);
+      const master = writeFileIntoPackage(outputRoot, path.basename(filePath), rewritten);
+      result.files.unshift({ original: filePath, copied: master, source: 'master' });
+      if (includeEmbedded && parser.extractToDirectory) {
+        const failures = [];
+        const extracted = await parser.extractToDirectory(filePath, outputRoot, assets,
+          { onExtractionError: failure => failures.push(failure) });
+        for (const item of extracted) {
+          result.assetsCopied++;
+          result.files.push({ original: `${filePath}!${item.originalZipPath}`, copied: item.extractedPath, source: 'embedded' });
+        }
+        if (failures.length) throw new Error('Presentation media could not be packaged.');
+      }
+      if (onProgress) onProgress({ stage: 'complete', current: result.assetsCopied, total: result.assetsFound, file: null });
+      return result;
+    } catch (error) {
+      removeCreatedPackageFiles(outputRoot, result.files.map(item => item.copied));
+      throw error;
+    }
+  }
 
+
+  try {
   // Copy master file to output directory
   const masterFileName = path.basename(filePath);
   const masterDestPath = copyFileIntoPackage(filePath, outputRoot, masterFileName, {
@@ -291,6 +327,7 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
         source: asset.source
       });
     } catch (e) {
+      if (!skipMissing || isParserAdmissionError(e)) throw e;
       console.error(`[packageMasterFile] Failed to copy ${asset.path}: ${e.message}`);
       result.assetsMissing.push({ path: asset.path, source: asset.source });
     }
@@ -332,6 +369,10 @@ async function packageMasterFile(filePath, outputDir, options = {}) {
   }
 
   return result;
+  } catch (error) {
+    removeCreatedPackageFiles(outputRoot, result.files.map(item => item.copied));
+    throw error;
+  }
 }
 
 module.exports = {

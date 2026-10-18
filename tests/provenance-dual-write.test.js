@@ -142,6 +142,14 @@ Module._resolveFilename = function patchedResolve(request, parent, ...rest) {
 
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, ...rest) {
+  // This suite replaces ZIP decoding with its synthetic unzip boundary. Preserve
+  // link-free fake containers there; real ZIP fixtures still use production OPC.
+  if (request === './parsers/ooxml-links') {
+    const actual = originalLoad.call(this, request, parent, ...rest);
+    return { ...actual, inspectLinks(buffer, documentPath) {
+      return buffer.subarray(0, 2).toString() === 'PK' ? actual.inspectLinks(buffer, documentPath) : [];
+    } };
+  }
   if (STUBS.has(request)) {
     return STUBS.get(request)();
   }
@@ -4252,16 +4260,17 @@ test('PowerPoint package extraction records deterministic media provenance and d
       }],
     });
     await callIpc('settings:update', 'includeDiagnosticReport', true);
+    await callIpc('settings:update', 'packageOutputLayoutMode', 'flat');
 
     const result = await callIpc('projects:package', project.id, outputDir);
     assertPackageResultShape(result);
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 2);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 3);
     assert.deepEqual(result.errors, []);
 
-    const destFolder = packageFolder(outputDir, 'PowerPoint Media Provenance');
+    const destFolder = result.folderPath;
     assert.equal(fs.readFileSync(path.join(destFolder, 'Deck.pptx'), 'utf8'), 'pptx container bytes');
     assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — image1.jpeg'), 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
     assert.equal(fs.readFileSync(path.join(destFolder, 'Deck — image2.png'), 'utf8'), 'PNG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
@@ -4304,7 +4313,7 @@ test('PowerPoint package extraction records deterministic media provenance and d
     assert.equal(manifest.scope, 'minimized_package_relevant');
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 2);
-    assert.equal(manifest.package.totalFiles, 1);
+    assert.equal(manifest.package.totalFiles, manifest.package.copiedCount + manifest.package.embeddedCount);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
@@ -4319,7 +4328,7 @@ test('PowerPoint package extraction records deterministic media provenance and d
     assertPackageResultShape(duplicateResult);
     assert.equal(duplicateResult.copiedCount, 1);
     assert.equal(duplicateResult.embeddedCount, 2);
-    assert.equal(duplicateResult.totalFiles, 1);
+    assert.equal(duplicateResult.totalFiles, 3);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
   } finally {
@@ -4793,9 +4802,10 @@ test('authoritative plan binds reviewed sources, PSD and presentation derivative
       derivedDesignGeneratorCount: 1,
       diagnosticsMetadataIncluded: false,
       outputLayoutMode: PACKAGE_OUTPUT_LAYOUT_MODES.FLAT,
+      portablePictures: false,
     });
     assert.deepEqual(firstReview.files.map(file => file.packageFolder), [
-      'Package root', 'Package root', 'Package root',
+      'Package root', 'Package root', 'Package root', 'Package root',
     ]);
     assert.equal(JSON.stringify(firstReview).includes(tmpRoot), false);
     assert.equal(JSON.stringify(firstReview).includes('Unrelated.ai'), false);
@@ -4876,6 +4886,7 @@ test('organized authoritative plan materializes every reviewed output at its bou
         ['Launch-Deck.pptx', 'PPTX'],
         ['aux.png', 'PNG'],
         ['_aux.png', 'PNG'],
+        ['Launch-Deck — image1.jpg', 'JPG'],
       ]
     );
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
@@ -9242,7 +9253,7 @@ test('visible inactivity reminder waits the full three hours before showing its 
     assert.equal(testMessageBoxes[0].message, '⏸ Still working on "Three Hour Inactivity Reminder"?');
     assert.equal(
       testMessageBoxes[0].detail,
-      "Crate hasn't detected any new design files in 3 hours. Would you like to keep watching or pause?"
+      "No new design files detected for 3 hours."
     );
     assert.deepEqual(testMessageBoxes[0].buttons, ['Keep Watching', 'Pause', 'Package Now']);
 
@@ -9663,7 +9674,7 @@ test('PowerPoint provenance stays internal when diagnostic report is disabled', 
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 2);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'PowerPoint Diagnostics Off')), false);
     assert.equal(fs.existsSync(manifestPath(outputDir, 'PowerPoint Diagnostics Off')), false);
@@ -10062,7 +10073,7 @@ test('PowerPoint provenance failure does not block package extraction success', 
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 2);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'PowerPoint Provenance Failure'), 'Deck — image1.jpeg'), 'utf8'), 'JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
   } finally {
@@ -10315,7 +10326,7 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 2);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 3);
     assert.deepEqual(result.errors, []);
 
     const destFolder = packageFolder(outputDir, 'Keynote Media Provenance');
@@ -10361,7 +10372,7 @@ test('Keynote package extraction records deterministic Data media provenance and
     assert.equal(manifest.scope, 'minimized_package_relevant');
     assert.equal(manifest.package.copiedCount, 1);
     assert.equal(manifest.package.embeddedCount, 2);
-    assert.equal(manifest.package.totalFiles, 1);
+    assert.equal(manifest.package.totalFiles, manifest.package.copiedCount + manifest.package.embeddedCount);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_INCLUDES_FILE).length, 1);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.PACKAGE_EXTRACTS_RESOURCE).length, 2);
     assert.equal(manifest.edges.filter(edge => edge.relationType === EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
@@ -10376,7 +10387,7 @@ test('Keynote package extraction records deterministic Data media provenance and
     assertPackageResultShape(duplicateResult);
     assert.equal(duplicateResult.copiedCount, 1);
     assert.equal(duplicateResult.embeddedCount, 2);
-    assert.equal(duplicateResult.totalFiles, 1);
+    assert.equal(duplicateResult.totalFiles, 3);
     fresh = await getProject(project.id);
     assert.equal(getProvenanceEdges(fresh, EDGE_TYPES.CONTAINER_EMBEDS_RESOURCE).length, 2);
   } finally {
@@ -10437,7 +10448,7 @@ test('Keynote package extraction recovers new pasted images when prior scan medi
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 3);
     assert.equal(result.embeddedCount, 3);
-    assert.equal(result.totalFiles, 3);
+    assert.equal(result.totalFiles, 6);
     assert.deepEqual(result.errors, []);
 
     const destFolder = packageFolder(outputDir, 'Keynote Pasted Image Package Refresh');
@@ -10500,7 +10511,7 @@ test('Keynote package extraction falls back to a unique safe tail for mojibake-l
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 2);
     assert.deepEqual(result.errors, []);
 
     const destFolder = packageFolder(outputDir, 'Keynote Mojibake Media');
@@ -10575,7 +10586,7 @@ test('Keynote package extraction recovers mixed mojibake tails without collapsin
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 2);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 3);
     assert.deepEqual(result.errors, []);
 
     const destFolder = packageFolder(outputDir, 'Keynote Mixed Mojibake Media');
@@ -10756,7 +10767,7 @@ test('Keynote provenance stays internal when diagnostic report is disabled', asy
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 2);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.existsSync(rootManifestPath(outputDir, 'Keynote Diagnostics Off')), false);
     assert.equal(fs.existsSync(manifestPath(outputDir, 'Keynote Diagnostics Off')), false);
@@ -10809,7 +10820,7 @@ test('Keynote provenance failure does not block package extraction success', asy
     assert.equal(result.success, true);
     assert.equal(result.copiedCount, 1);
     assert.equal(result.embeddedCount, 1);
-    assert.equal(result.totalFiles, 1);
+    assert.equal(result.totalFiles, 2);
     assert.deepEqual(result.errors, []);
     assert.equal(fs.readFileSync(path.join(packageFolder(outputDir, 'Keynote Provenance Failure'), 'Deck — photo.jpeg'), 'utf8'), 'KEYNOTE_JPEG_BINARY_SHOULD_NOT_LEAK'.repeat(40));
   } finally {
@@ -11325,7 +11336,7 @@ test('Skip Existing suppresses only baseline PowerPoint occurrences when later m
 
     const review = await callIpcRaw('projects:prepare-package-review', project.id, outputDir);
     assert.equal(review.materializable, true);
-    assert.deepEqual(review.files.map(file => file.name), ['Occurrence Deck.pptx']);
+    assert.deepEqual(review.files.map(file => file.name), ['Occurrence Deck.pptx', 'Occurrence Deck — image2.png']);
 
     const result = await callIpcRaw('projects:package', project.id, outputDir, review.token);
     assert.equal(result.success, true);
@@ -13759,7 +13770,8 @@ test('post-preflight PSD size growth keeps the baseline unresolved', async () =>
 
 test('post-preflight presentation extraction failure keeps the baseline unresolved', async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(originalHomedir(), 'crate-presentation-extraction-failure-test-'));
-  const originalReadFile = fs.promises.readFile;
+  const budgets = require('../parsers/admission-budgets');
+  const originalReadWithinBudget = budgets.readFileWithinBudget;
   let validationAttempts = 0;
   let extractionAttempts = 0;
   try {
@@ -13771,12 +13783,12 @@ test('post-preflight presentation extraction failure keeps the baseline unresolv
       }
       return { stdout: '', stderr: '' };
     });
-    fs.promises.readFile = async function failPresentationExtraction(filePath, ...args) {
+    budgets.readFileWithinBudget = function failPresentationExtraction(filePath, ...args) {
       if (path.resolve(filePath) === path.resolve(sourcePath)) {
         extractionAttempts++;
         throw new Error('forced post-preflight presentation read failure');
       }
-      return originalReadFile.call(fs.promises, filePath, ...args);
+      return originalReadWithinBudget(filePath, ...args);
     };
 
     const project = await createProject('Presentation extraction failure');
@@ -13791,7 +13803,7 @@ test('post-preflight presentation extraction failure keeps the baseline unresolv
     const review = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.equal(review.error, 'asset_baseline_scan_incomplete');
   } finally {
-    fs.promises.readFile = originalReadFile;
+    budgets.readFileWithinBudget = originalReadWithinBudget;
     setChildProcessHandler(null);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }

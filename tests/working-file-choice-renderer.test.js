@@ -39,16 +39,16 @@ async function fixture() {
   const controls = () => descendants(dom.elements['working-file-choices']).filter(node => node.tagName === 'BUTTON');
   const status = () => descendants(dom.elements['working-file-choices']).find(node => node.className === 'working-choice-status')?.textContent;
   const snapshot = () => JSON.stringify(evaluate('({projects:state.projects,workspace:state.assetWorkspace,token:state.packageReviewToken,selected:state.selectedProjectId})'));
-  const busy = () => { assert.ok(controls().length >= 5); assert.ok(controls().every(node => node.disabled)); assert.equal(status(), 'Verifying your choice…'); };
+  const busy = () => { assert.ok(controls().length >= 4); assert.ok(controls().every(node => node.disabled)); assert.equal(status(), 'Verifying your choice…'); };
   const available = () => {
     assert.equal(evaluate('workingFileChoiceOwner'), null);
     assert.equal(status(), '');
     const buttons = controls();
-    assert.equal(buttons.filter(node => node.textContent === 'Keep both')[0].disabled, false);
-    assert.equal(buttons.find(node => node.textContent === 'Use this instead of…').disabled, false);
+    assert.equal(buttons.filter(node => node.dataset.choice === 'keep-both')[0].disabled, false);
+    assert.equal(buttons.find(node => node.dataset.choice === 'replace').disabled, false);
     assert.equal(buttons.find(node => node.textContent === 'Retry verification').disabled, false);
-    assert.equal(buttons.filter(node => node.textContent === 'Keep both')[1].disabled, true, 'unsaved choice stays unready');
-    assert.ok(buttons.filter(node => node.textContent === 'Use this file').every(node => node.disabled), 'predecessor is never preselected');
+    assert.equal(buttons.filter(node => node.dataset.choice === 'keep-both')[1].disabled, true, 'unsaved choice stays unready');
+    assert.ok(buttons.filter(node => node.tagName === 'SELECT').every(node => node.disabled), 'predecessor is never preselected');
   };
   return { ...dom, renderer, projects, workspaces, calls, reads, toasts, evaluate, entry, start, controls, status, snapshot, busy, available,
     deferRead() { const read = deferred(); nextRead = read; return read; } };
@@ -107,7 +107,7 @@ for (const outcome of ['success','refusal','reject']) test(`chooser current ${ou
   if (outcome === 'reject') f.calls[0].reject(new Error('synthetic failure')); else f.calls[0].resolve({ success: outcome === 'success' });
   assert.equal(await pending, outcome === 'success'); assert.equal(f.evaluate('workingFileChoiceOwner'), null);
   assert.equal(f.toasts.length, 1); assert.equal(f.status(), '');
-  assert.ok(f.controls().filter(node => node.textContent === 'Keep both').every(node => node.disabled));
+  assert.ok(f.controls().filter(node => node.dataset.choice === 'keep-both').every(node => node.disabled));
   assert.ok(f.controls().filter(node => node.textContent === 'Retry verification').every(node => !node.disabled));
   assert.equal(f.evaluate('state.packageReviewToken'), null);
 });
@@ -140,6 +140,265 @@ test('chooser delayed success reconciles authoritative remaining choices without
   assert.equal(f.evaluate('state.assetWorkspace.workingFileChoices.choices.length'), 1);
   assert.equal(f.evaluate('state.assetWorkspace.workingFileChoices.choices[0].id'), 'unverified-a');
   assert.equal(f.controls().find(node => node.textContent === 'Retry verification').disabled, false);
-  assert.equal(f.controls().find(node => node.textContent === 'Keep both').disabled, true);
+  assert.equal(f.controls().find(node => node.dataset.choice === 'keep-both').disabled, true);
   assert.equal(f.evaluate('state.packageReviewToken'), null); assert.equal(f.elements['btn-confirm-package'].disabled, true);
+});
+
+for (const [reason, action, copy] of [
+  ['indesign-save-required', null, 'Resume Watch'],
+  ['indesign-live-unbound', 'Verify saved file', 'Save and close in InDesign'],
+  ['indesign-access-denied', 'Check again', 'Automation'],
+  ['indesign-query-failed', 'Check again', 'Check the app'],
+  ['indesign-saved-file-unverified', 'Verify saved file', 'file or links unverified'],
+]) test(`InDesign chooser ${reason} offers one supported next step`, async () => {
+  const f=await fixture();
+  const workspace=f.workspaces.get('a'); workspace.workingFileChoices.choices=[{...workspace.workingFileChoices.choices[1],reason}];
+  await f.renderer.renderFiles();
+  const descendants=node=>[node,...node.children.flatMap(descendants)];
+  const help=descendants(f.elements['working-file-choices']).find(node=>node.className==='working-source-detail');
+  assert.ok(help.textContent.includes(copy));
+  const enabled=f.controls().filter(node=>!node.disabled);
+  assert.deepEqual(enabled.map(node=>node.textContent),action?[action]:[]);
+  assert.ok(f.controls().filter(node=>['keep-both','replace'].includes(node.dataset.choice)).every(node=>node.disabled));
+  if(reason==='indesign-save-required') {
+    f.projects[0].status='watching';
+    // A watch-state-only transition must refresh the guidance, not remain stale.
+    f.renderer.renderWorkingFileChoices(f.projects[0],workspace);
+    const updated=descendants(f.elements['working-file-choices']).find(node=>node.className==='working-source-detail');
+    assert.equal(updated.textContent.startsWith('Save in InDesign'),true);
+    return;
+  }
+  enabled[0].focus();
+  const entry=f.evaluate('state.assetWorkspace.workingFileChoices.choices[0]');
+  const pending=f.renderer.submitWorkingFileChoice('a',entry,'retry',null);
+  assert.equal(f.calls.length,1); assert.equal(f.calls[0].payload.choice,'retry');
+  assert.equal(await f.renderer.submitWorkingFileChoice('a',entry,'retry',null),false);
+  assert.ok(f.controls().every(node=>node.disabled)); assert.equal(f.status(),'Verifying your choice…');
+  assert.equal(f.evaluate('state.packageReviewToken'),null);
+  assert.equal(f.document.activeElement.tagName,'H2');
+  f.calls[0].resolve({success:false}); await pending;
+  assert.equal(f.controls().filter(node=>!node.disabled).length,1);
+});
+
+const choiceTree = node => [node, ...(node.children || []).flatMap(choiceTree)];
+const choiceButtons = node => choiceTree(node).filter(el => el.tagName === 'BUTTON' && el.dataset.choice);
+test('picker approved simple flow names both outcomes without a dropdown', async () => {
+  const f=await fixture(); const region=f.elements['working-file-choices'];
+  assert.equal(choiceTree(region).some(el=>el.tagName==='SELECT'),false);
+  const buttons=choiceButtons(region);
+  assert.ok(buttons.some(el=>el.textContent==='Replace Prior.ai with New.ai'));
+  assert.ok(buttons.some(el=>el.textContent==='Keep Prior.ai and New.ai'));
+});
+test('picker approved ambiguous targets are independent named actions with no default', async () => {
+  const f=await fixture(), ws=f.workspaces.get('a');
+  ws.workingFileChoices.choices=[{...ws.workingFileChoices.choices[0],predecessors:[
+    {visualIdentity:'one',name:'Deck.ai',folder:'One › Work'},
+    {visualIdentity:'two',name:'Deck.ai',folder:'Two › Work'},
+    {visualIdentity:'other',name:'Other.ai',folder:'Work'},
+  ]}];
+  await f.renderer.renderFiles();
+  const buttons=choiceButtons(f.elements['working-file-choices']);
+  assert.equal(buttons.filter(el=>el.dataset.choice==='replace').length,3);
+  assert.equal(choiceTree(f.elements['working-file-choices']).some(el=>el.tagName==='SELECT'),false);
+  assert.equal(f.calls.length,0);
+  assert.ok(buttons.find(el=>el.dataset.predecessorIdentity==='one').getAttribute('aria-label').includes('One › Work'));
+  const target=buttons.find(el=>el.dataset.predecessorIdentity==='two'); target.click();
+  assert.deepEqual(f.calls[0].payload,{id:'choice-a',revision:'r1',choice:'replace',predecessorIdentity:'two'});
+  assert.ok(choiceButtons(f.elements['working-file-choices']).every(el=>el.disabled));
+  target.click(); assert.equal(f.calls.length,1);
+  f.calls[0].resolve({success:false}); await new Promise(resolve=>setTimeout(resolve,0));
+});
+async function mountedPickerFixture() {
+  const f=await fixture(),ws=f.workspaces.get('a');
+  f.renderer.window.crate.setWorkingSourceSelection=async()=>({success:false});
+  const source=(name,id,selection='selected')=>({name,ext:'.ai',appFamily:'illustrator',visualIdentity:id,visualRevision:id+'-v1',
+    protectedSource:true,projectRole:'source',sourceSelection:selection,selectionRevision:0,included:selection==='selected',
+    verificationStatus:'scanned',verificationRequired:true});
+  ws.files=[source('A.ai','A'),source('C.ai','C'),source('B.ai','B'),
+    {name:'image.png',ext:'.png',projectRole:'asset',visualIdentity:'image',visualRevision:'image-v1',included:true,assetOrigin:'added',currentWorkingSources:[{identity:'B',name:'B.ai'}]}];
+  ws.workingFileChoices={version:1,blocked:true,choices:[{id:'new-B',revision:'r1',ready:true,
+    source:{name:'B.ai',visualIdentity:'B'},predecessors:[{name:'A.ai',visualIdentity:'A'}]}]};
+  await f.renderer.renderFiles(); return f;
+}
+test('picker approved decision is in B row on both surfaces; authoritative replacement orders B first and mutes A through navigation/reload', async () => {
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');
+  for(const id of ['project-file-list','working-assets-list']) {
+    const row=f.elements[id].children.find(node=>node.dataset.renderKey==='visual:B');
+    assert.ok(row.querySelector('.working-file-choice'));
+    assert.equal(choiceButtons(row).filter(el=>el.dataset.choice==='replace').length,1);
+  }
+  assert.equal(choiceButtons(f.elements['working-file-choices']).length,0,'no separate decision column');
+  // This modeled bridge applies authoritative state only after a valid IPC request.
+  const button=choiceButtons(f.elements['project-file-list']).find(el=>el.dataset.choice==='replace');
+  button.click(); assert.equal(f.calls.length,1);button.click();assert.equal(f.calls.length,1);
+  ws.files.find(row=>row.visualIdentity==='A').sourceSelection='excluded';ws.files.find(row=>row.visualIdentity==='A').included=false;
+  ws.workingFileChoices={version:1,blocked:false,choices:[]};ws.workingSourceDisplayOrder=['B'];
+  f.calls[0].resolve({success:true}); await new Promise(resolve=>setTimeout(resolve,0));
+  async function verify() {
+    await f.renderer.renderFiles();
+    for(const id of ['project-file-list','working-assets-list']) {
+      const rows=f.elements[id].children;
+      assert.deepEqual(Array.from(rows,row=>row.dataset.renderKey),['visual:B','visual:C','visual:A']);
+      assert.ok(rows[0].classList.contains('is-selected-source'));assert.ok(rows[2].matches('.is-excluded'));
+      assert.equal(rows[2].classList.contains('is-selected-source'),false);
+      assert.ok(choiceTree(rows[2]).some(el=>el.tagName==='BUTTON'&&el.textContent==='Restore'));
+      assert.ok(rows[0].querySelector('.working-source-assets'));
+      assert.equal(choiceButtons(rows[0]).length,0);
+    }
+  }
+  await verify(); await f.renderer.switchTab('settings');await f.renderer.switchTab('current-project');await verify();
+  f.workspaces.set('a',clone(ws)); await verify();
+});
+for(const reason of ['working-file-dependencies-unverified','working-file-source-changed','saved-file-verification-required']) test(`picker approved ${reason} never substitutes generic Save advice`,async()=>{
+  const f=await fixture(),ws=f.workspaces.get('a');ws.workingFileChoices.choices=[{...ws.workingFileChoices.choices[0],ready:false,reason}];
+  await f.renderer.renderFiles();const guidance=choiceTree(f.elements['working-file-choices']).find(el=>el.className==='working-source-detail');
+  assert.ok(guidance);assert.equal(/save the file|resume watching/i.test(guidance.textContent),false);
+  assert.ok(choiceButtons(f.elements['working-file-choices']).filter(el=>['replace','keep-both'].includes(el.dataset.choice)).every(el=>el.disabled));
+});
+
+test('picker leaving the screen without choosing preserves decisions and sends no request',async()=>{
+  const f=await mountedPickerFixture(),before=f.snapshot();await f.renderer.switchTab('settings');await f.renderer.switchTab('current-project');
+  assert.equal(f.calls.length,0);assert.equal(f.snapshot(),before);
+  assert.equal(choiceButtons(f.elements['project-file-list']).filter(el=>el.dataset.choice==='replace').length,1);
+});
+test('picker detached stale named action cannot submit after revision changes',async()=>{
+  const f=await mountedPickerFixture(),old=choiceButtons(f.elements['project-file-list']).find(el=>el.dataset.choice==='replace');
+  f.workspaces.get('a').workingFileChoices.choices[0].revision='new-revision';await f.renderer.renderFiles();old.click();
+  assert.equal(f.calls.length,0);
+});
+test('picker same-named pair shows both safe folder labels in the named outcome',async()=>{
+  const f=await fixture(),ws=f.workspaces.get('a');ws.workingFileChoices.choices=[{...ws.workingFileChoices.choices[0],
+    source:{name:'Deck.ai',folder:'Two › Work'},predecessors:[{visualIdentity:'prior-a',name:'Deck.ai',folder:'One › Work'}]}];
+  await f.renderer.renderFiles();const button=choiceButtons(f.elements['working-file-choices']).find(el=>el.dataset.choice==='replace');
+  assert.ok(button.textContent.includes('One › Work'));assert.ok(button.textContent.includes('Two › Work'));
+});
+test('picker long filenames retain accessible named actions without redundant descriptions on both surfaces',async()=>{
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a'),name='A long filename — '.repeat(12)+'final.pptx';
+  ws.workingFileChoices.choices[0].source.name=name;ws.files.find(row=>row.visualIdentity==='B').name=name;await f.renderer.renderFiles();
+  for(const id of ['project-file-list','working-assets-list']) {
+    const row=f.elements[id].children.find(node=>node.dataset.workingSourceIdentity==='B');
+    const card=row.querySelector('.working-file-choice');assert.equal(card.querySelector('.working-source-detail'),null);
+    for(const button of choiceButtons(card)) {assert.equal(button.type,'button');assert.ok(button.getAttribute('aria-label').includes('final.pptx'));assert.ok(!button.getAttribute('aria-describedby'));}
+  }
+});
+test('picker shared assets remain standalone instead of guessing a parent from filenames',async()=>{
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');ws.files.find(row=>row.visualIdentity==='image').currentWorkingSources=[{identity:'B',name:'B.ai'},{identity:'C',name:'C.ai'}];
+  await f.renderer.renderFiles();
+  for(const id of ['project-file-list','working-assets-list']) {
+    const row=f.elements[id].children.find(node=>node.dataset.workingSourceIdentity==='B'),children=row.querySelector('.working-source-assets');
+    assert.ok(!children||children.classList.contains('hidden'));
+  }
+  assert.equal(f.evaluate('state.assetReviewLogicalItems.added.length'),1);
+});
+
+test('picker name labels reject paths, URLs and controls while retaining ordinary long basenames',async()=>{
+  const f=await fixture();for(const value of ['/private/Deck.ai','https://example.test/Deck.ai','bad\nname.ai','bad\\name.ai'])assert.equal(f.renderer.sanitizeWorkingFileChoiceName(value),null);
+  const name='x'.repeat(200)+'-final.ai';assert.equal(f.renderer.sanitizeWorkingFileChoiceName(name),name);
+  assert.equal(f.renderer.sanitizeWorkingFileChoiceName('x'.repeat(400)).length,255);
+});
+
+for (const surface of ['project-file-list', 'working-assets-list']) for (const outcome of ['refusal', 'reject'])
+test(`picker failed Retry ${outcome} retains keyboard focus after row replacement on ${surface}`, async () => {
+  const f=await mountedPickerFixture(), ws=f.workspaces.get('a');
+  if(surface==='working-assets-list') f.evaluate('state.assetReviewOpen=true');
+  ws.workingFileChoices.choices[0].ready=false;
+  ws.workingFileChoices.choices[0].reason='working-file-dependencies-unverified';
+  await f.renderer.renderFiles();
+  const row=()=>f.elements[surface].children.find(node=>node.dataset.workingSourceIdentity==='B');
+  const original=row(), retry=choiceButtons(original).find(node=>node.dataset.choice==='retry');
+  assert.ok(retry && !retry.disabled);retry.focus();assert.ok(f.document.activeElement===retry);
+  const pending=f.renderer.submitWorkingFileChoice('a',f.entry(),'retry',null);
+  ws.files.find(file=>file.visualIdentity==='B').verificationStatus='unverified';
+  ws.workingFileChoices.choices[0].revision='retry-r2';
+  if(outcome==='reject')f.calls[0].reject(new Error('synthetic Retry failure'));else f.calls[0].resolve({success:false});
+  assert.equal(await pending,false);
+  assert.ok(row()!==original,'verification refresh must replace the source row');
+  const heading=row().querySelector('.working-file-choice-question');
+  assert.ok(heading.isConnected);assert.ok(f.document.activeElement===heading,'focus stays at the same current choice on the same surface');
+  const nextRetry=choiceButtons(row()).find(node=>node.dataset.choice==='retry');
+  assert.ok(!nextRetry.disabled);assert.equal(heading.tabIndex,-1);
+  nextRetry.focus();assert.ok(f.document.activeElement===nextRetry,'keyboard continuation has a connected enabled action');
+  assert.equal(f.calls.length,1);assert.equal(f.evaluate('state.packageReviewToken'),null);
+});
+
+for (const change of ['decision-removed','source-removed','different-choice','duplicate-source','newer-focus','tab-retired'])
+test(`picker Retry focus restoration respects ${change} during reconciliation`, async () => {
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');
+  ws.workingFileChoices.choices[0].ready=false;await f.renderer.renderFiles();
+  const row=()=>f.elements['project-file-list'].children.find(node=>node.dataset.workingSourceIdentity==='B');
+  choiceButtons(row()).find(node=>node.dataset.choice==='retry').focus();
+  const pending=f.renderer.submitWorkingFileChoice('a',f.entry(),'retry',null);
+  const refresh=f.deferRead();f.calls[0].resolve({success:false});await Promise.resolve();await Promise.resolve();
+  const next=clone(ws);next.files.find(file=>file.visualIdentity==='B').verificationStatus='unverified';
+  if(change==='decision-removed')next.workingFileChoices.choices=[];
+  if(change==='source-removed') {next.files=next.files.filter(file=>file.visualIdentity!=='B');next.workingFileChoices.choices=[];}
+  if(change==='different-choice')next.workingFileChoices.choices[0].id='different-B';
+  if(change==='duplicate-source')next.files.push(clone(next.files.find(file=>file.visualIdentity==='B')));
+  let external;
+  if(change==='newer-focus'){external=f.document.querySelector('#btn-review-assets');external.focus();}
+  if(change==='tab-retired'){await f.renderer.switchTab('settings');external=f.tabs.find(tab=>tab.dataset.tab==='settings');external.focus();}
+  refresh.resolve(next);assert.equal(await pending,false);
+  if(external)assert.ok(f.document.activeElement===external,'newer focus/navigation wins');
+  else if(change==='decision-removed')assert.ok(f.document.activeElement===row(),'same source row is the fallback after decision removal');
+  else assert.ok(f.document.activeElement===f.document.body,'never guess another source, choice, or duplicate row');
+  assert.equal(f.calls.length,1);
+});
+for(const newerFocus of [false,true])test(`picker successful replacement restores source focus only for the current keyboard intent (${newerFocus})`,async()=>{
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');
+  const button=choiceButtons(f.elements['project-file-list']).find(node=>node.dataset.choice==='replace');button.focus();
+  const pending=f.renderer.submitWorkingFileChoice('a',f.entry(),'replace','A');
+  const external=f.document.querySelector('#btn-review-assets');if(newerFocus)external.focus();
+  ws.files.find(file=>file.visualIdentity==='A').sourceSelection='excluded';ws.workingFileChoices.choices=[];ws.workingSourceDisplayOrder=['B'];
+  f.calls[0].resolve({success:true});assert.equal(await pending,true);
+  const row=f.elements['project-file-list'].children.find(node=>node.dataset.workingSourceIdentity==='B');
+  assert.ok(f.document.activeElement===(newerFocus?external:row));assert.equal(f.calls.length,1);
+});
+
+test('picker fallback Retry retains its connected region heading through reconciliation',async()=>{
+  const f=await fixture(),retry=f.controls().find(node=>node.dataset.choice==='retry');retry.focus();
+  const pending=f.renderer.submitWorkingFileChoice('a',f.evaluate('state.assetWorkspace.workingFileChoices.choices[1]'),'retry',null);
+  f.workspaces.get('a').workingFileChoices.choices[1].revision='u2';
+  f.calls[0].resolve({success:false});assert.equal(await pending,false);
+  assert.ok(f.document.activeElement.isConnected);assert.equal(f.document.activeElement.tagName,'H2');
+  assert.ok(f.elements['working-file-choices'].contains(f.document.activeElement));
+});
+
+for(const surface of ['project-file-list','working-assets-list'])for(const outcome of ['success','refusal','reject'])
+test(`picker pre-existing duplicate rows preserve the activated second row during immediate busy rendering (${surface}, ${outcome})`,async()=>{
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');
+  if(surface==='working-assets-list')f.evaluate('state.assetReviewOpen=true');
+  ws.files.push(clone(ws.files.find(file=>file.visualIdentity==='B')));
+  ws.workingFileChoices.choices[0].ready=false;await f.renderer.renderFiles();
+  const rows=Array.from(f.elements[surface].children).filter(row=>row.dataset.workingSourceIdentity==='B');
+  assert.equal(rows.length,2,'normal authoritative projection renders both duplicate rows');
+  const first=rows[0],second=rows[1],retry=choiceButtons(second).find(node=>node.dataset.choice==='retry');
+  assert.ok(retry&&!retry.disabled);retry.focus();assert.ok(f.document.activeElement===retry);
+  const pending=f.renderer.submitWorkingFileChoice('a',f.entry(),'retry',null);
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0].payload.choice,'retry');
+  const expected=second.querySelector('.working-file-choice-question');
+  // Save immediate state, then settle the owned request even when reproduction fails.
+  const stayedInSecond=f.document.activeElement===expected;
+  const movedToFirst=first.contains(f.document.activeElement);
+  assert.ok(choiceButtons(first).every(node=>node.disabled));assert.ok(choiceButtons(second).every(node=>node.disabled));
+  if(outcome==='reject')f.calls[0].reject(new Error('synthetic duplicate-row Retry failure'));else f.calls[0].resolve({success:outcome==='success'});
+  assert.equal(await pending,outcome==='success');
+  assert.equal(movedToFirst,false,'busy rendering must not jump from the second duplicate row to the first');
+  assert.equal(stayedInSecond,true,'the exact mounted row is a safe synchronous focus anchor');
+  assert.equal(f.calls.length,1);assert.equal(f.evaluate('state.packageReviewToken'),null);
+});
+
+for(const surface of ['project-file-list','working-assets-list'])test(`picker immediate duplicate-row busy rendering respects newer synchronous focus (${surface})`,async()=>{
+  const f=await mountedPickerFixture(),ws=f.workspaces.get('a');
+  if(surface==='working-assets-list')f.evaluate('state.assetReviewOpen=true');
+  ws.files.push(clone(ws.files.find(file=>file.visualIdentity==='B')));ws.workingFileChoices.choices[0].ready=false;await f.renderer.renderFiles();
+  const rows=Array.from(f.elements[surface].children).filter(row=>row.dataset.workingSourceIdentity==='B');assert.equal(rows.length,2);
+  const second=rows[1],external=f.document.querySelector('#btn-review-assets');
+  choiceButtons(second).find(node=>node.dataset.choice==='retry').focus();
+  const replace=second.replaceChild.bind(second);
+  // Model a synchronous focus listener triggered by the focused card's removal.
+  second.replaceChild=(...args)=>{const result=replace(...args);external.focus();return result;};
+  const pending=f.renderer.submitWorkingFileChoice('a',f.entry(),'retry',null);
+  assert.ok(f.document.activeElement===external,'busy rendering must respect newer synchronous focus');
+  f.calls[0].resolve({success:false});assert.equal(await pending,false);
+  assert.ok(f.document.activeElement===external);assert.equal(f.calls.length,1);
 });

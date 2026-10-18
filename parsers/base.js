@@ -94,8 +94,9 @@ class BaseParser {
   deduplicateAssets(assets) {
     const seen = new Set();
     return assets.filter(a => {
-      if (seen.has(a.path)) return false;
-      seen.add(a.path);
+      const key = a.zipPath ? JSON.stringify([a.source, a.zipPath]) : a.path;
+      if (seen.has(key)) return false;
+      seen.add(key);
       return true;
     });
   }
