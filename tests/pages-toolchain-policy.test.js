@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { fingerprintTree, installedPackageRoots, validateVersionEdges } = require('../.codex/tools/cloudflare-pages/verify-toolchain.cjs');
+const { fingerprintTree, installedPackageRoots, validateVersionEdges, collectExpectedLockPaths } = require('../.codex/tools/cloudflare-pages/verify-toolchain.cjs');
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-pages-policy-'));
@@ -57,4 +57,20 @@ test('Pages dependency resolution checks a nested installed version before a hoi
   } };
   const roots = new Map(Object.keys(lock.packages).filter(Boolean).map(key => [key, key]));
   assert.throws(() => validateVersionEdges(lock, roots, (version, range) => version === range), /authentication failed/);
+});
+test('Pages lock proof retains declared neutral optional descendants and rejects an unrelated locked package', () => {
+  const manifest = { name: 'test-tools', version: '1.0.0', dependencies: { chooser: '1.0.0' } };
+  const entry = extra => ({ version: '1.0.0', resolved: 'https://registry.npmjs.org/test/-/test-1.0.0.tgz',
+    integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`, ...extra });
+  const lock = { lockfileVersion: 3, packages: {
+    '': { ...manifest },
+    'node_modules/chooser': entry({ optionalDependencies: { foreign: '1.0.0' } }),
+    'node_modules/foreign': entry({ os: ['linux'], dependencies: { neutral: '1.0.0' } }),
+    'node_modules/neutral': entry({ optional: true }),
+  } };
+  const proof = collectExpectedLockPaths(manifest, lock, 'darwin', 'arm64');
+  assert.deepEqual([...proof.installed].sort(), ['node_modules/chooser', 'node_modules/neutral']);
+  assert.equal(proof.all.size, 3);
+  lock.packages['node_modules/unrelated'] = entry({ optional: true });
+  assert.throws(() => collectExpectedLockPaths(manifest, lock, 'darwin', 'arm64'), /authentication failed/);
 });

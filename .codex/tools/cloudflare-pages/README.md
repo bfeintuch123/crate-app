@@ -17,6 +17,11 @@ explicit pinned Node executable and call `authenticateToolchain(toolRoot,
 cacheRoot)`. It authenticates every platform-reachable package against SHA-512
 registry cache bytes, names/versions/topology, complete regular-file inventory,
 full semver constraints, runtime identity and the committed manifest/lockfile.
+It proves every lock entry is reachable in the complete cross-platform graph,
+then requires exactly the platform-eligible installed set. This includes npm's
+retained platform-neutral optional descendants of foreign-platform parents;
+each retained package receives the same full archive-byte proof. Unreferenced
+lock entries and undeclared installed packages are rejected.
 It rejects extra packages, symlinks and drift. It returns the regular absolute
 `cliPath`, a bounded `summary`, and `recheck()`; it does not retrieve credentials
 or invoke Wrangler. No vendor module executes before the complete byte proof.

@@ -94,6 +94,48 @@ function validateVersionEdges(lock, roots, satisfies) {
     }
   }
 }
+function collectExpectedLockPaths(manifest, lock, platform, arch) {
+  requireCondition(verifier.rootLockMatchesSourceManifest(manifest, lock));
+  const allPaths = Object.keys(lock.packages).filter(Boolean), reachable = new Set(), queue = [''];
+  const validName = name => /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9_-][A-Za-z0-9._-]*$/u.test(name);
+  for (const lockPath of allPaths) {
+    requireCondition(lockPath.startsWith('node_modules/') &&
+      lockPath.slice('node_modules/'.length).split('/node_modules/').every(validName));
+    const metadata = lock.packages[lockPath];
+    requireCondition(metadata && typeof metadata === 'object' && !Array.isArray(metadata) && metadata.dev !== true &&
+      typeof metadata.version === 'string' && typeof metadata.resolved === 'string' &&
+      metadata.resolved.startsWith('https://registry.npmjs.org/') &&
+      typeof metadata.integrity === 'string' && /^sha512-[A-Za-z0-9+/]+={0,2}$/u.test(metadata.integrity));
+    const encoded = metadata.integrity.slice('sha512-'.length), bytes = Buffer.from(encoded, 'base64');
+    requireCondition(bytes.length === 64 && bytes.toString('base64') === encoded);
+  }
+  while (queue.length) {
+    const parent = queue.shift(), metadata = lock.packages[parent];
+    for (const section of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+      const entries = metadata[section] || {};
+      requireCondition(entries && typeof entries === 'object' && !Array.isArray(entries));
+      for (const [name, spec] of Object.entries(entries)) {
+        requireCondition(validName(name) && typeof spec === 'string');
+        const optional = section === 'optionalDependencies' || section === 'peerDependencies' && metadata.peerDependenciesMeta?.[name]?.optional === true;
+        const resolved = resolveLockPath(lock, parent, name);
+        if (!resolved) { requireCondition(optional); continue; }
+        if (!reachable.has(resolved)) { reachable.add(resolved); queue.push(resolved); }
+      }
+    }
+  }
+  // npm retains platform-neutral optional descendants of platform-specific
+  // packages. Prove the entire cross-platform lock graph first, then select
+  // eligible installed packages; never allow an unreferenced lock entry.
+  requireCondition(isDeepStrictEqual([...reachable].sort(), allPaths.sort()));
+  const matches = (values, actual) => {
+    if (values === undefined) return true;
+    requireCondition(Array.isArray(values) && values.length > 0 && new Set(values).size === values.length &&
+      values.every(value => typeof value === 'string' && /^!?[A-Za-z0-9._-]+$/u.test(value)));
+    return !values.includes(`!${actual}`) && (!values.some(value => !value.startsWith('!')) || values.includes(actual));
+  };
+  return { all: reachable, installed: new Set([...reachable].filter(key =>
+    matches(lock.packages[key].os, platform) && matches(lock.packages[key].cpu, arch))) };
+}
 function authenticateToolchain(toolRoot, cacheRoot) {
   requireCondition(process.platform === 'darwin' && process.arch === 'arm64' && process.version === 'v22.23.1');
   requireCondition(digest(regularBytes(process.execPath)) === NODE_SHA256);
@@ -107,12 +149,9 @@ function authenticateToolchain(toolRoot, cacheRoot) {
   const manifest = JSON.parse(regularBytes(path.join(toolRoot, 'package.json')));
   const lock = JSON.parse(regularBytes(path.join(toolRoot, 'package-lock.json')));
   requireCondition(isDeepStrictEqual(manifest.dependencies, { wrangler: '4.151.1' }) && manifest.private === true);
-  // Collection establishes topology/platform coverage only. Full version ranges,
-  // including prereleases, are checked separately using authenticated semver.
-  const reachable = verifier.collectReachableProductionLockPaths(manifest, lock, { platform: process.platform, arch: process.arch, verifyVersions: false });
-  requireCondition(reachable.valid);
+  const reachable = collectExpectedLockPaths(manifest, lock, process.platform, process.arch);
   const roots = installedPackageRoots(toolRoot);
-  requireCondition(isDeepStrictEqual([...roots.keys()].sort(), [...reachable.paths].sort()));
+  requireCondition(isDeepStrictEqual([...roots.keys()].sort(), [...reachable.installed].sort()));
   for (const [lockPath, packageRoot] of roots) {
     const metadata = lock.packages[lockPath], name = packageNameFromLockPath(lockPath);
     const installed = JSON.parse(regularBytes(path.join(packageRoot, 'package.json')));
@@ -125,7 +164,7 @@ function authenticateToolchain(toolRoot, cacheRoot) {
   requireCondition(roots.has('node_modules/semver') && fingerprintTree(toolRoot) === before);
   // No vendor module executes until every installed package has authenticated bytes.
   const semver = require(path.join(roots.get('node_modules/semver'), 'index.js'));
-  validateVersionEdges(lock, roots, semver.satisfies);
+  validateVersionEdges(lock, new Map([...reachable.all].map(key => [key, key])), semver.satisfies);
   for (const packageRoot of roots.values()) {
     const metadata = JSON.parse(regularBytes(path.join(packageRoot, 'package.json')));
     if (metadata.engines?.node) requireCondition(semver.satisfies(process.version, metadata.engines.node));
@@ -141,4 +180,4 @@ function authenticateToolchain(toolRoot, cacheRoot) {
   requireCondition(recheck());
   return { cliPath, recheck, summary: { packageCount: roots.size, wranglerVersion: '4.151.1', inventoryDigest: before, nodeSha256: NODE_SHA256 } };
 }
-module.exports = { authenticateToolchain, fingerprintTree, installedPackageRoots, validateVersionEdges };
+module.exports = { authenticateToolchain, fingerprintTree, installedPackageRoots, validateVersionEdges, collectExpectedLockPaths };
