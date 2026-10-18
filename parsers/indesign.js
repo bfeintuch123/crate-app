@@ -24,6 +24,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
+const { decodeXMLPath } = require('./xml-path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
@@ -114,7 +115,7 @@ class InDesignParser extends BaseParser {
           LINK_URI_REGEX.lastIndex = 0;
           let match;
           while ((match = LINK_URI_REGEX.exec(xmlContent)) !== null) {
-            const uri = match[1];
+            const uri = decodeXMLPath(match[1]);
             const assetPath = this.decodeFileURI(uri);
 
             if (assetPath && this.isUserPath(assetPath)) {

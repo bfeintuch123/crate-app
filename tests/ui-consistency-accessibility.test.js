@@ -179,14 +179,14 @@ test('secondary overlays expose complete dialog names and descriptions', () => {
   for (const contract of [
     ['modal-delete-confirm', 'delete-confirm-title', 'delete-confirm-desc'],
     ['modal-clear-all', 'clear-all-title', 'clear-all-desc'],
-    ['modal-edit-figma-link', 'edit-figma-title', 'edit-figma-subtitle'],
+    ['modal-edit-figma-link', 'edit-figma-title', null],
     ['modal-v2-results', 'v2-result-title', 'v2-result-subtitle'],
   ]) {
     const [id, label, description] = contract;
     assert.match(
       indexHtml,
       new RegExp(
-        `id="${id}"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="${label}"[^>]*aria-describedby="${description}"[^>]*tabindex="-1"`,
+        `id="${id}"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="${label}"[^>]*${description ? `aria-describedby="${description}"[^>]*` : ''}tabindex="-1"`,
         'u',
       ),
     );

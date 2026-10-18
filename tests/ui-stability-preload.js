@@ -77,6 +77,9 @@ function resetFixture() {
 }
 
 contextBridge.exposeInMainWorld('crate', {
+  // Synthetic signed-in state; no account service or credentials are used.
+  getAccount: async () => ({ revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'ui-fixture', email: 'fixture@example.test' }, message: '' }),
+  onAccountChanged: () => {},
   getProjects: async () => {
     metrics.getProjects += 1;
     return [clone(fixture.project)];

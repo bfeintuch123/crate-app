@@ -41,6 +41,7 @@ const {
   isChildProcessAdmissionError,
   isParserAdmissionError,
   parseArchiveListing,
+  readFileWithinBudget,
 } = require('./admission-budgets');
 const {
   ensureSafePackageDirectory,
@@ -216,6 +217,16 @@ class PowerPointParser extends BaseParser {
         encoding: 'utf8'
       });
 
+      if (ext === '.pptx') {
+        const source = readFileWithinBudget(filePath, ADMISSION_LIMITS.localParserFileBytes, PRESENTATION_ADMISSION_MESSAGE);
+        // A ZIP may have a prefix; inspect every validated container.
+        const { inspectLinks } = require('./ooxml-links');
+        for (const linkedPath of new Set(inspectLinks(source, filePath).map(link => link.resolvedPath))) {
+          let exists = false;
+          try { const stat = fs.lstatSync(linkedPath); exists = stat.isFile() && !stat.isSymbolicLink(); } catch (_) {}
+          this.appendAsset(assets, { path: linkedPath, source: 'pptx-linked', exists }, PRESENTATION_ADMISSION_MESSAGE);
+        }
+      }
       const entries = parseArchiveListing(listing, { message: PRESENTATION_ADMISSION_MESSAGE });
       for (const entry of entries) {
         const fileSize = entry.size;
@@ -260,14 +271,14 @@ class PowerPointParser extends BaseParser {
           size: fileSize
         }, PRESENTATION_ADMISSION_MESSAGE);
       }
-      assertEntriesWithinBudget(assets, {
+      assertEntriesWithinBudget(assets.filter(asset => asset.zipPath), {
         maxEntries: ADMISSION_LIMITS.presentationMediaEntries,
         maxEntryBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,
         maxTotalBytes: ADMISSION_LIMITS.presentationMediaBytes,
         message: PRESENTATION_ADMISSION_MESSAGE,
       });
     } catch (e) {
-      if (isParserAdmissionError(e)) throw e;
+      if (isParserAdmissionError(e) || e?.code === 'package_relationship_invalid') throw e;
       if (isChildProcessAdmissionError(e)) throw admissionError(PRESENTATION_ADMISSION_MESSAGE);
       const message = formatEmbeddedMediaInspectionFailure(filePath);
       console.error(`[PowerPointParser] ${message}`);
@@ -311,7 +322,7 @@ class PowerPointParser extends BaseParser {
       ADMISSION_LIMITS.archiveFileBytes,
       PRESENTATION_ADMISSION_MESSAGE
     );
-    assertEntriesWithinBudget(assets, {
+    assertEntriesWithinBudget(assets.filter(asset => asset.zipPath), {
       predicate: asset => Boolean(asset && asset.zipPath),
       maxEntries: ADMISSION_LIMITS.presentationMediaEntries,
       maxEntryBytes: ADMISSION_LIMITS.presentationMediaEntryBytes,

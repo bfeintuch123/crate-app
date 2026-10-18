@@ -22,6 +22,14 @@ Module._resolveFilename = function patchedResolve(request, parent, ...rest) {
 
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, ...rest) {
+  // These legacy archive fixtures mock unzip with non-ZIP placeholder bytes.
+  // Real ZIP fixtures always exercise the production relationship inspector.
+  if (request === './ooxml-links') {
+    const actual = originalLoad.call(this, request, parent, ...rest);
+    return { ...actual, inspectLinks(buffer, ...args) {
+      return buffer.subarray(0, 2).toString() === 'PK' ? actual.inspectLinks(buffer, ...args) : [];
+    } };
+  }
   if (STUBS.has(request)) {
     return STUBS.get(request)();
   }

@@ -689,7 +689,8 @@ body {
   outline-offset: 2px;
 }
 
-.asset-batch-button:disabled {
+.asset-batch-button:disabled,
+.asset-batch-button.primary:disabled {
   color: var(--gray-300);
   background: var(--gray-50);
   cursor: not-allowed;
@@ -711,8 +712,8 @@ body {
 }
 
 .asset-file-row.is-excluded .app-file-name {
-  color: var(--gray-400);
-  text-decoration: line-through;
+  color: #6b6060;
+  text-decoration: none;
 }
 
 .asset-panel-empty {
@@ -1050,6 +1051,13 @@ body {
 .asset-review-toolbar .asset-panel-actions { margin: 0; }
 .asset-batch-button.primary { background: var(--black); color: var(--white); }
 
+.asset-review-guidance {
+  margin: 8px 0;
+  color: var(--gray-600);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .asset-review-workspace .asset-workspace {
   margin-top: 8px;
   border: 0;
@@ -1326,9 +1334,9 @@ body {
 }
 
 .file-status-badge.excluded {
-  color: var(--gray-500);
-  background: var(--gray-50);
-  border: 1px solid var(--gray-200);
+  color: #8b3434;
+  background: #f8eaea;
+  border: 1px solid #dcb6b6;
 }
 
 .file-status-badge.recovery {
@@ -2227,6 +2235,24 @@ body {
 
 .modal-btn-danger:hover {
   background: #dc2626;
+}
+
+/* Keep the remove-confirmation actions geometrically identical. */
+#modal-delete-confirm .modal-actions > button {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 44px;
+  padding: 12px 20px;
+  border: 1.5px solid transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 18px;
+  text-align: center;
+}
+
+#modal-delete-confirm .modal-actions > .modal-btn-secondary {
+  border-color: var(--gray-200);
 }
 
 /* Success Modal */
@@ -3442,5 +3468,188 @@ body {
 .asset-review-workspace .asset-card-grid .required-dependency-action {
   grid-column: 4;
   grid-row: 1;
+  white-space: nowrap;
+}
+
+/* Explicit recovery of a changed continuation selection. */
+.working-source-recovery-detail { margin-top: 4px; color: var(--gray-500); font-size: 12px; line-height: 1.45; }
+.working-source-recovery-detail:focus { outline: 2px solid currentColor; outline-offset: 3px; }
+.working-source-recovery-action { flex-shrink: 0; padding: 5px 9px; border: 1px solid var(--gray-300); border-radius: 6px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.working-source-recovery-action:disabled { opacity: .5; cursor: default; }
+.working-source-recovery-action:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
+/* Watch facts remain separate from saved-file verification and selection. */
+.working-source-watch { margin-top: 5px; font-size: 12px; line-height: 1.4; color: var(--text-secondary, #666); overflow-wrap: anywhere; }
+.working-source-watch-summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; border-radius: 2px; }
+.working-source-watch[data-watch-status="cap-limited"] .working-source-watch-summary,
+.working-source-watch[data-watch-status="unavailable"] .working-source-watch-summary { font-weight: 600; }
+
+/* Approved Opus workspace: one review entry, quiet counts, source hierarchy. */
+#project-dashboard .project-dashboard-header { display: block; margin-bottom: 24px; }
+#project-dashboard .project-dashboard-header > div { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+#project-dashboard .app-project-name { margin: 0; }
+#project-dashboard .project-dashboard-status { padding: 5px 10px; border: 1px solid #bfe6c7; border-radius: 8px; background: #eef9f0; }
+.project-review-entry { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px 22px; margin-bottom: 22px; border: 1px solid #ecd48a; border-radius: 14px; background: linear-gradient(90deg, #fff6d9, #fff 80%); }
+.project-review-copy { min-width: 0; }
+.project-review-eyebrow { color: #806000; font-size: 12px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+#project-dashboard .project-dashboard-alert { width: auto; padding: 0; margin-top: 5px; border: 0; background: transparent; color: #171717; font-size: 18px; overflow-wrap: anywhere; }
+#project-review-detail { color: #666; font-size: 13px; line-height: 1.5; margin: 5px 0 0; }
+.project-review-entry .review-assets-button { flex: none; width: auto; margin: 0; padding: 12px 22px; border: 1px solid #8f6b00; border-radius: 10px; background: #f5c443; color: #221a00; font-weight: 700; }
+.project-review-entry .review-assets-button:hover { background: #efbc32; }
+.project-review-entry .review-assets-button:focus-visible { outline: 3px solid #584800; outline-offset: 3px; }
+#project-dashboard .asset-metric { min-height: 90px; padding: 16px; border-radius: 10px; }
+#project-dashboard .asset-metric strong { font-size: 30px; }
+#project-dashboard .asset-metric span { font-size: 13px; color: #333; }
+#project-dashboard .asset-metric.missing { display: grid; }
+.project-dashboard-primary, .project-dashboard-secondary { min-width: 0; }
+#project-dashboard .project-dashboard-action-row { margin-top: 28px; }
+#project-dashboard .project-dashboard-controls { margin-top: 16px; }
+#project-dashboard .asset-origin-summary { border-radius: 12px; background: #fff; }
+#asset-review-workspace .asset-review-toolbar { flex-wrap: wrap; align-items: center; gap: 10px; }
+#asset-review-workspace .asset-review-toolbar .asset-review-guidance { flex: 1 1 200px; margin: 0; }
+#pending-section .asset-panel-header { justify-content: flex-start; flex-wrap: wrap; gap: 10px; }
+.pending-package-note { color: #777; font-size: 12px; }
+#pending-section { border-color: #ecd48a; }
+#pending-batch-slot { margin: 0 0 10px; }
+#asset-review-workspace .working-file-list { max-height: none; overflow: visible; }
+#asset-review-workspace .working-source-assets { grid-column: 1 / -1; grid-row: auto; width: 100%; min-width: 0; border-top: 1px solid #ececef; border-left: 2px solid #d4d4d8; margin-top: 8px; }
+#asset-review-workspace .working-source-assets .asset-file-row { background: #fafafb; }
+#asset-review-workspace .working-source-assets .asset-file-copy { overflow: hidden; }
+#asset-review-workspace .working-source-assets .app-file-name { font-size: 13px; }
+#asset-review-workspace .working-source-assets .working-source-assets { display: none; }
+#asset-review-workspace .asset-review-footer { box-shadow: none; }
+@media (max-width: 1000px) {
+  .project-review-entry { flex-wrap: wrap; }
+  .project-review-entry .review-assets-button { min-height: 44px; }
+}
+#project-dashboard .working-file-list > .asset-file-row,
+#asset-review-workspace .working-file-list > .asset-file-row {
+  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; gap: 10px; align-items: center;
+}
+.working-file-list > .asset-file-row > .file-visual { grid-column: 1; grid-row: 1; }
+.working-file-list > .asset-file-row > .asset-file-copy { grid-column: 2; grid-row: 1; min-width: 0; }
+.working-file-list > .asset-file-row > .file-status-badge { grid-column: 3; grid-row: 1; }
+.working-file-list > .asset-file-row > .working-source-action { grid-column: 4; grid-row: 1; }
+.working-file-list > .asset-file-row > .working-source-watch { grid-column: 1 / -1; grid-row: auto; margin: 0; padding: 8px 8px 3px 46px; border-top: 1px solid #ececef; }
+#pending-file-list { border: 1px solid #ecd48a; border-radius: 10px; }
+#pending-section .asset-review-guidance { font-weight: 400; color: #666; }
+.review-empty-states { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; margin-top: 20px; }
+.review-empty-states > div { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border: 1px dashed #dcdce0; border-radius: 10px; color: #777; font-size: 12px; }
+.review-empty-states strong { color: #444; font-weight: 600; }
+#asset-review-workspace .working-source-assets { border: 0; box-shadow: inset 2px 0 #d4d4d8; }
+#pending-file-list { border: 0; box-shadow: inset 0 0 0 1px #ecd48a; }
+
+/* Keep package-level warnings distinct from pending filenames. */
+.project-package-warning { padding: 12px 16px; margin: -8px 0 20px; border-left: 3px solid #b87914; background: #fff8e7; color: #704810; font-size: 13px; line-height: 1.5; }
+.project-review-entry.is-clear { border-color: #e5e5e8; background: #fff; }
+.project-review-entry.is-clear .project-review-eyebrow { color: #666; }
+.nested-asset-origin { color: #555; font-weight: 600; flex-shrink: 0; }
+#existing-batch-slot .asset-review-guidance { font-weight: 400; }
+#existing-batch-slot { margin-bottom: 8px; }
+
+.working-choice-status { color: #555; font-size: 12px; }
+.asset-file-row.is-excluded { background: #f5f2f2; }
+.asset-file-row.is-excluded .app-file-visual { filter: saturate(.5); }
+.asset-file-row.is-excluded .working-source-action { opacity: 1; }
+
+
+/* Named choices share the new working file's row on both project surfaces. */
+.working-file-choices { border: 0; background: transparent; padding: 0; }
+.working-file-choice { grid-column: 1 / -1; min-width: 0; padding: 14px 4px 8px 46px; border-top: 1px solid #e8dfc3; }
+.working-file-choice-question { margin: 0 0 10px; font-size: 15px; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere; }
+.working-file-choice-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: stretch; gap: 10px; }
+.working-file-choice-actions.is-ambiguous { grid-template-columns: minmax(0,1fr); }
+.working-file-choice-action { min-height: 60px; height: auto; padding: 10px 14px; min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; background: #fff; border: 1px solid #bdb7a8; border-radius: 6px; color: #252525; font-size: 14px; font-weight: 600; line-height: 1.4; }
+.working-file-choice-detail { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: #555; }
+.working-file-choice-action:disabled { cursor: not-allowed; opacity: .6; }
+.working-file-choice-retry { margin-top: 10px; }
+.working-file-choice button:focus-visible, .working-file-choice-question:focus-visible, .working-file-list > .asset-file-row:focus-visible { outline: 2px solid #286447; outline-offset: 3px; }
+.working-file-list > .asset-file-row.has-working-choice { border: 1px solid #d7c68e; border-radius: 10px; background: #fffdf7; padding: 14px 16px; }
+.working-file-list > .asset-file-row.is-selected-source { border: 1px solid #9ccbab; border-left: 4px solid #2e7d4f; border-radius: 10px; background: #edf6ef; padding: 14px 16px; }
+.working-file-list > .asset-file-row.is-selected-source > .file-status-badge.protected { color: #1f6b3a; background: #fff; border-color: #9ccbab; }
+.working-file-list > .asset-file-row.is-selected-source > .file-visual { position: relative; }
+.working-file-list > .asset-file-row.is-selected-source > .file-visual::after { content: '✓'; position: absolute; right: -2px; bottom: -2px; border-radius: 50%; background: #2e7d4f; color: #fff; font-size: 11px; width: 16px; height: 16px; text-align: center; }
+.working-file-list > .asset-file-row.is-excluded { border: 1px solid #e0dcd0; border-left: 4px solid #ccc7bd; border-radius: 8px; background: #f2f0ea; padding: 8px 16px; }
+.file-status-badge.choice { color: #6b4e00; background: #fbf1cf; border: 1px solid #dcc67a; }
+.working-file-list .working-source-assets { grid-column: 1 / -1; padding: 10px 0 0 46px; min-width: 0; }
+#project-file-list { max-height: none; }
+@media (max-width: 1000px) {
+  .working-file-choice { padding-left: 0; }
+  .working-file-choice-actions { grid-template-columns: minmax(0,1fr); }
+  .working-file-list .working-source-assets { padding-left: 16px; }
+}
+
+.working-file-choices > .working-file-choice { border: 1px solid #d7c68e; border-radius: 10px; background: #fffdf7; padding: 16px; margin-bottom: 12px; }
+
+/* Nested dependencies use the virtualizer's 58px row contract on both surfaces.
+   The regular asset-card grid has a 112px preview track and cannot occupy it. */
+.working-file-list .working-source-assets.asset-virtual-list {
+  display: block;
+  position: relative;
+  max-height: 460px;
+  overflow: auto;
+  contain: strict;
+  margin: 10px 0 0 46px;
+  padding: 0;
+}
+.working-file-list .working-source-assets.asset-virtual-list::after {
+  content: '';
+  display: block;
+  height: var(--asset-review-logical-height, 0px);
+  pointer-events: none;
+}
+.working-file-list .working-source-assets.asset-virtual-list > .asset-file-row {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto 28px;
+  grid-template-rows: minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 58px;
+  min-height: 58px;
+  padding: 6px 8px;
+  border: 0;
+  border-top: 1px solid var(--gray-100);
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.76);
+}
+.working-file-list .working-source-assets.asset-virtual-list > .asset-file-row:first-child { border-top: 0; }
+.working-file-list .working-source-assets.asset-virtual-list .file-visual {
+  grid-column: 1;
+  grid-row: 1;
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  margin: 0;
+  background: var(--gray-50);
+}
+.working-file-list .working-source-assets.asset-virtual-list .asset-file-copy { grid-column: 2; grid-row: 1; min-width: 0; }
+.working-file-list .working-source-assets.asset-virtual-list .file-status-badge { grid-column: 3; grid-row: 1; align-self: center; justify-self: end; }
+.working-file-list .working-source-assets.asset-virtual-list .app-file-remove { position: static; grid-column: 4; grid-row: 1; z-index: auto; width: 28px; height: 28px; padding: 0; }
+.working-file-list .working-source-assets.asset-virtual-list .app-file-restore { grid-column: 4; grid-row: 1; align-self: center; justify-self: end; }
+.working-file-list .working-source-assets.asset-virtual-list > .asset-file-row:focus-visible { z-index: 1; outline: 2px solid var(--black); outline-offset: -2px; }
+@media (max-width: 1000px) {
+  .working-file-list .working-source-assets.asset-virtual-list { margin-left: 16px; }
+}
+/* Review's legacy width:100% must leave room for the nested indent as well. */
+#asset-review-workspace .working-source-assets.asset-virtual-list { width: auto; }
+/* Required-dependency explanations need their intrinsic action width. */
+.working-file-list .working-source-assets.asset-virtual-list > .asset-file-row.has-required-dependency {
+  grid-template-columns: 36px minmax(0, 1fr) auto auto;
+}
+.working-file-list .working-source-assets.asset-virtual-list .required-dependency-action {
+  grid-column: 4;
+  grid-row: 1;
+  white-space: nowrap;
+}
+/* Let origin text yield to badges and controls in narrow required rows. */
+.working-file-list .working-source-assets.asset-virtual-list > .has-required-dependency .file-origin { gap: min(4px, 10%); }
+.working-file-list .working-source-assets.asset-virtual-list > .has-required-dependency .file-origin-mark { flex: 0 1 22px; min-width: 0; }
+.working-file-list .working-source-assets.asset-virtual-list > .has-required-dependency .nested-asset-origin {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }

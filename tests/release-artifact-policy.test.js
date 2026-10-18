@@ -164,11 +164,14 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/figma.js',
   'parsers/indesign.js',
   'parsers/index.js',
+  'parsers/ooxml-links.js',
+  'parsers/xml-path.js',
   'parsers/package-safety.js',
   'parsers/package-transaction-worker.js',
   'parsers/powerpoint.js',
   'parsers/premiere.js',
   'parsers/psd.js',
+  'parsers/working-source-witness.js',
 ]);
 const REVIEWED_EXTERNAL_SOURCE_BOUND_ENTRIES = Object.freeze([
   Object.freeze({
