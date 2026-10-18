@@ -54,6 +54,14 @@ execFileStub[nodePromisify.custom] = async (command, args = []) => {
 
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, ...rest) {
+  // These legacy archive fixtures mock unzip with non-ZIP placeholder bytes.
+  // Real ZIP fixtures always exercise the production relationship inspector.
+  if (request === './ooxml-links') {
+    const actual = originalLoad.call(this, request, parent, ...rest);
+    return { ...actual, inspectLinks(buffer, ...args) {
+      return buffer.subarray(0, 2).toString() === 'PK' ? actual.inspectLinks(buffer, ...args) : [];
+    } };
+  }
   if (request === 'child_process') {
     return { execFile: execFileStub };
   }
@@ -187,8 +195,8 @@ test('normal raw-file parsers keep their linked-asset result shapes', async () =
       {
         parser: new PSDParser(),
         filePath: path.join(tmpRoot, 'project.psd'),
-        content: '/Users/crate-parser-normal/image.png',
-        expected: { path: '/Users/crate-parser-normal/image.png', source: 'psd-regex', exists: false },
+        content: require('ag-psd').writePsdBuffer({ width: 1, height: 1, linkedFiles: [{ id: '11111111-1111-4111-8111-111111111111', name: 'image.png', childDocumentID: '', linkedFile: { fullPath: '/Users/crate-parser-normal/image.png', originalPath: '/Users/crate-parser-normal/image.png', relativePath: '', name: 'image.png', fileSize: 1 } }] }),
+        expected: { path: '/Users/crate-parser-normal/image.png', source: 'psd-smartobject', exists: false },
       },
       {
         parser: new AfterEffectsParser(),

@@ -596,7 +596,6 @@
       <div class="account-welcome-content">
         <div class="account-welcome-brand">CRATE</div>
         <h1 id="welcome-account-title">Welcome to Crate</h1>
-        <p class="account-welcome-description">Your design projects, packaged.</p>
         <div class="account-welcome-status">
           <p id="welcome-account-state" role="status" aria-live="polite"></p>
           <p id="welcome-account-message"></p>
@@ -608,7 +607,6 @@
           <button class="modal-btn-secondary hidden" id="welcome-retry">Check connection</button>
           <button class="modal-btn-secondary hidden" id="welcome-signout">Sign out of Crate</button>
         </div>
-        <p class="account-local-note">Sign in to access your Crate workspace.</p>
       </div>
     </section>
 
@@ -643,7 +641,6 @@
         <div id="projects-empty" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
           <div class="app-empty-title">No projects yet</div>
-          <div class="app-empty-desc">Start a project or use Quick Package to gather files.</div>
           <button class="app-btn" id="btn-start-project">+ Start Project</button>
         </div>
 
@@ -658,7 +655,6 @@
         <!-- New Project Form -->
         <div id="new-project-form" class="hidden">
           <div class="app-label">New Project</div>
-          <div class="form-subtitle">Name your project &mdash; Crate will watch project dependencies while you work.</div>
           <div class="form-field">
             <label class="app-label" for="input-project-name">Project Name</label>
             <div class="form-input-wrap">
@@ -674,13 +670,12 @@
               </button>
               <div class="figma-section-body hidden" id="figma-section-body">
                 <label class="sr-only" for="input-figma-url">Figma file URL</label>
-                <input type="text" id="input-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="figma-section-help" style="width:100%;box-sizing:border-box;">
+                <input type="text" id="input-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
                 <label class="form-subtitle" for="input-figma-scope" style="display:block;margin-top:6px;">Scope</label>
-                <select id="input-figma-scope" class="settings-input" aria-describedby="figma-section-help" style="width:100%;">
+                <select id="input-figma-scope" class="settings-input" style="width:100%;">
                   <option value="current-page" selected>Current Page Only</option>
                   <option value="entire-file">Entire File</option>
                 </select>
-                <div class="figma-section-help" id="figma-section-help">Open your Figma page first, then copy the URL from your browser bar &mdash; that lets Crate scope to the page you are working on.</div>
                 <div class="figma-section-error hidden" id="figma-section-error" role="alert" aria-live="assertive" aria-atomic="true"></div>
               </div>
             </div>
@@ -692,9 +687,6 @@
           </div>
           <button class="app-btn" id="btn-create-project">&#9654; Start Watching</button>
           <button class="app-btn outline" id="btn-cancel-project" style="margin-top:8px;">Cancel</button>
-          <div class="privacy-hint">
-            &#x1F512; Crate only tracks files opened by design apps. It cannot see your browser, keyboard, or anything outside your project.
-          </div>
         </div>
 
       </div>
@@ -703,7 +695,6 @@
       <div class="tab-content" id="tab-quick-package">
         <div class="v2-quick-package">
           <div class="settings-section-title">Quick Package</div>
-          <div class="v2-desc">Drop a design file to trace and package all linked assets.</div>
           <div class="v2-drop-zone" id="v2-drop-zone">
             <div class="v2-drop-icon">&#x1F4E6;</div>
             <div class="v2-drop-text">Drop your master file here</div>
@@ -719,10 +710,10 @@
         <div id="files-no-project" class="app-empty">
           <div class="app-empty-icon">&#x1F4C2;</div>
           <div class="app-empty-title">No project selected</div>
-          <div class="app-empty-desc">Choose a project or start a new one.</div>
         </div>
 
         <div id="files-view" class="hidden">
+          <section id="working-file-choices" class="working-file-choices hidden" aria-label="New working files"></section>
           <div class="project-dashboard" id="project-dashboard">
             <header class="project-dashboard-header">
               <div>
@@ -732,32 +723,30 @@
                   <span class="app-status-text" id="files-status-text">Watching</span>
                 </div>
               </div>
-              <div class="project-dashboard-alert hidden" id="project-linking-alert" role="status" aria-live="polite" aria-atomic="true"></div>
             </header>
 
-            <div class="project-dashboard-controls">
-              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link" aria-label="Edit Figma link"></div>
-              <div id="files-figma-warning" class="figma-warning-card hidden" role="status" aria-live="polite" aria-atomic="true"></div>
-            </div>
+            <section class="project-review-entry" aria-label="Asset review">
+              <div class="project-review-copy" id="project-review-status" role="status" aria-live="polite" aria-atomic="true">
+                <div class="project-review-eyebrow" id="project-review-eyebrow">Project assets</div>
+                <div class="project-dashboard-alert" id="project-linking-alert"></div>
+                <p id="project-review-detail"></p>
+              </div>
+              <button type="button" class="app-btn review-assets-button" id="btn-review-assets">Review Assets</button>
+            </section>
+
+            <p id="project-package-warning" class="project-package-warning hidden" role="status" aria-live="polite" aria-atomic="true"></p>
 
             <div class="asset-metric-grid" aria-label="Asset summary">
               <div class="asset-metric existing"><strong id="metric-existing-count">0</strong><span>Existing</span></div>
-              <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added while working</span></div>
+              <div class="asset-metric added"><strong id="metric-added-count">0</strong><span>Added</span></div>
               <div class="asset-metric missing">
                 <div class="asset-metric-copy"><strong id="metric-missing-count">0</strong><span id="metric-missing-label">Needs Review</span></div>
-                <button type="button" class="app-btn review-assets-button" id="btn-review-assets" aria-describedby="metric-missing-count metric-missing-label">Review Assets</button>
               </div>
               <div class="asset-metric excluded"><strong id="metric-excluded-count">0</strong><span>Excluded</span></div>
             </div>
 
-            <div class="project-dashboard-action-row">
-              <section class="recent-assets" aria-labelledby="recent-assets-heading">
-                <h2 id="recent-assets-heading">Recently Found</h2>
-                <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
-              </section>
-            </div>
-
             <div class="project-dashboard-grid">
+              <div class="project-dashboard-primary">
               <section class="working-files-panel" id="project-file-section" aria-labelledby="project-file-heading">
                 <div class="asset-panel-header">
                   <h2 class="asset-panel-title" id="project-file-heading">Working Files</h2>
@@ -767,10 +756,25 @@
                 <div class="asset-file-list working-file-list" id="project-file-list" role="list"></div>
               </section>
 
+            <div class="project-dashboard-action-row">
+              <section class="recent-assets" aria-labelledby="recent-assets-heading">
+                <h2 id="recent-assets-heading">Recently Found</h2>
+                <div class="recent-assets-strip" id="recent-assets-list" role="list"></div>
+              </section>
+            </div>
+
+              </div>
+              <div class="project-dashboard-secondary">
               <aside class="asset-origin-summary" aria-labelledby="asset-origin-heading">
-                <h2 id="asset-origin-heading">Where Assets Came From</h2>
+                <h2 id="asset-origin-heading">Asset Sources</h2>
                 <dl id="asset-origin-list"></dl>
               </aside>
+            <div class="project-dashboard-controls">
+              <div id="files-figma-scope" class="figma-link-row" title="Edit Figma link" aria-label="Edit Figma link"></div>
+              <div id="files-figma-warning" class="figma-warning-card hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            </div>
+
+              </div>
             </div>
 
             <div class="project-package-actions">
@@ -780,38 +784,45 @@
           </div>
 
           <section class="asset-review-workspace hidden" id="asset-review-workspace" aria-labelledby="asset-review-heading">
-            <button type="button" class="asset-review-back" id="btn-review-assets-back">&lsaquo; Project Workspace</button>
             <div class="asset-review-header">
               <div>
                 <h1 id="asset-review-heading" tabindex="-1">Review Assets</h1>
-                <p>Crate automatically includes files it can confidently connect to this project. Review anything it could not verify.</p>
               </div>
               <label class="asset-review-search">
                 <span class="sr-only">Search assets</span>
-                <input type="search" id="asset-review-search" placeholder="Search by name or type">
+                <input type="search" id="asset-review-search" placeholder="Search">
               </label>
             </div>
 
             <div class="asset-review-filters" id="asset-review-filters" role="group" aria-label="Filter assets">
               <button type="button" class="asset-filter active" data-asset-filter="all" aria-pressed="true">All <span id="filter-count-all">0</span></button>
+              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Review <span id="filter-count-missing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="existing" aria-pressed="false">Existing <span id="filter-count-existing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="added" aria-pressed="false">Added <span id="filter-count-added">0</span></button>
-              <button type="button" class="asset-filter" data-asset-filter="missing" aria-pressed="false">Needs Review <span id="filter-count-missing">0</span></button>
               <button type="button" class="asset-filter" data-asset-filter="excluded" aria-pressed="false">Excluded <span id="filter-count-excluded">0</span></button>
             </div>
 
-            <div class="asset-review-toolbar">
-              <div id="asset-review-summary">0 assets</div>
-              <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
-                <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review">Add All</button>
-                <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review">Skip All</button>
-              </div>
-            </div>
-
             <div class="asset-workspace" id="file-list" aria-label="Project assets">
+              <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
+                <div class="asset-panel-header">
+                  <h2 class="asset-panel-title" id="pending-header">Needs Review</h2>
+                  <span class="asset-panel-count" id="pending-assets-count"></span>
+                  <span class="pending-package-note">Not in the package</span>
+                </div>
+                <div id="pending-batch-slot"></div>
+                <div id="pending-file-list" class="missing-asset-grid"></div>
+              </section>
+              <div class="asset-review-toolbar" id="asset-review-batch-controls">
+                <p id="asset-review-batch-reason" class="asset-review-guidance hidden" role="status" aria-live="polite"></p>
+                <div class="asset-panel-actions" aria-label="Review Before Packaging controls">
+                  <button type="button" class="asset-batch-button primary" id="btn-include-all-existing" aria-label="Add all assets needing review" aria-describedby="asset-review-batch-reason">Add All</button>
+                  <button type="button" class="asset-batch-button" id="btn-skip-all-existing" aria-label="Skip all assets needing review" aria-describedby="asset-review-batch-reason">Skip All</button>
+                </div>
+              </div>
+              <div id="existing-batch-slot"></div>
               <section class="asset-panel" id="working-assets-section" aria-labelledby="working-assets-heading">
                 <div class="asset-panel-header">
-                  <h2 class="asset-panel-title" id="working-assets-heading">Working Files</h2>
+                  <h2 class="asset-panel-title" id="working-assets-heading">Working Files and Assets</h2>
                   <span class="asset-panel-count" id="working-assets-count"></span>
                 </div>
                 <div class="asset-file-list working-file-list" id="working-assets-list" role="list"></div>
@@ -833,19 +844,18 @@
                 <div class="asset-file-list asset-card-grid" id="added-assets-list" role="list"></div>
               </section>
 
-              <section id="pending-section" class="asset-panel hidden" aria-labelledby="pending-header">
-                <div class="asset-panel-header">
-                  <h2 class="asset-panel-title" id="pending-header">Review Before Packaging</h2>
-                </div>
-                <div id="pending-file-list" class="missing-asset-grid"></div>
-              </section>
+
             </div>
 
+            <p id="asset-review-empty" class="asset-review-guidance hidden" role="status"></p>
+            <div class="review-empty-states" id="review-empty-states">
+              <div id="added-empty-tile"><strong>Added</strong> <span>0</span></div>
+              <div id="excluded-empty-tile"><strong>Excluded</strong> <span>0</span></div>
+            </div>
             <footer class="asset-review-footer">
               <span id="asset-review-footer-summary">0 assets included</span>
               <div>
-                <button type="button" class="modal-btn-secondary" id="btn-review-assets-cancel">Back</button>
-                <button type="button" class="modal-btn-primary" id="btn-review-assets-continue">Continue</button>
+                <button type="button" class="modal-btn-primary" id="btn-review-assets-continue">Back to Project</button>
               </div>
             </footer>
           </section>
@@ -856,28 +866,25 @@
       <div class="tab-content" id="tab-settings"><div class="settings-layout"><nav class="settings-navigation" aria-label="Settings"><h1 class="settings-nav-title">Settings</h1><div role="tablist" aria-label="Settings sections" aria-orientation="vertical"><p class="settings-nav-group">SETTINGS</p><button type="button" role="tab" class="settings-tab" id="settings-tab-general" data-settings-tab="general" aria-controls="settings-panel-general" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg><span>General</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-packaging" data-settings-tab="packaging" aria-controls="settings-panel-packaging" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5v9l-9 5-9-5V8Zm0 9 9-4M12 12 3 8m9 4v10M7 5.8l9 5"/></svg><span>Packaging</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-integrations" data-settings-tab="integrations" aria-controls="settings-panel-integrations" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0Zm6 10v4"/></svg><span>Integrations</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-privacy" data-settings-tab="privacy" aria-controls="settings-panel-privacy" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/></svg><span>Data and Privacy</span></button><p class="settings-nav-group">ACCOUNT</p><button type="button" role="tab" class="settings-tab" id="settings-tab-account" data-settings-tab="account" aria-controls="settings-panel-account" aria-selected="true" tabindex="0"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="9" r="3"/><path d="M6 19c0-6 12-6 12 0"/></svg><span>Account</span></button><button type="button" role="tab" class="settings-tab" id="settings-tab-billing" data-settings-tab="billing" aria-controls="settings-panel-billing" aria-selected="false" tabindex="-1"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></svg><span>Plans and Billing</span></button></div></nav><div class="settings-panels"><section class="settings-panel" role="tabpanel" id="settings-panel-general" aria-labelledby="settings-tab-general" tabindex="0" hidden><h2 class="settings-panel-title">General</h2><div class="settings-section"><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-notifications-label">Package alerts</div>
-              <div class="settings-desc" id="setting-notifications-desc">Get alerts when Crate notices a watched project has been idle.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-notifications" aria-labelledby="setting-notifications-label" aria-describedby="setting-notifications-desc">
+              <input type="checkbox" id="toggle-notifications" aria-labelledby="setting-notifications-label">
               <span class="toggle-slider"></span>
             </label>
           </div><div class="settings-row">
             <div class="settings-label-wrap">
-              <div class="settings-label" id="setting-existing-assets-notifications-label">Existing assets need review</div>
-              <div class="settings-desc" id="setting-existing-assets-notifications-desc">Show a notification when existing assets need an Include or Skip decision. Package alerts must also be on.</div>
+              <div class="settings-label" id="setting-existing-assets-notifications-label">Existing assets need review (requires Package Alerts)</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-existing-assets-notifications" aria-labelledby="setting-existing-assets-notifications-label" aria-describedby="setting-existing-assets-notifications-desc">
+              <input type="checkbox" id="toggle-existing-assets-notifications" aria-labelledby="setting-existing-assets-notifications-label">
               <span class="toggle-slider"></span>
             </label>
           </div><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-package-details-label">Show Package Details after packaging</div>
-              <div class="settings-desc" id="setting-package-details-desc">Shows a simple package summary after Crate gathers your files.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-package-details" aria-labelledby="setting-package-details-label" aria-describedby="setting-package-details-desc">
+              <input type="checkbox" id="toggle-package-details" aria-labelledby="setting-package-details-label">
               <span class="toggle-slider"></span>
             </label>
           </div></div></section><section class="settings-panel" role="tabpanel" id="settings-panel-packaging" aria-labelledby="settings-tab-packaging" tabindex="0" hidden><h2 class="settings-panel-title">Packaging</h2><div class="settings-section">
@@ -890,15 +897,13 @@
         </div><div class="settings-section"><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-package-folders-label">Organize packages by file type</div>
-              <div class="settings-desc" id="setting-package-folders-desc">Creates folders such as AI, PNG, and PDF. Turn this off to keep all files together.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-package-folders" aria-labelledby="setting-package-folders-label" aria-describedby="setting-package-folders-desc">
+              <input type="checkbox" id="toggle-package-folders" aria-labelledby="setting-package-folders-label">
               <span class="toggle-slider"></span>
             </label>
           </div></div><div class="settings-section">
           <div class="settings-section-title">Package Usage</div>
-          <div class="settings-desc quota-section-desc">Existing local package allowance. This is separate from account billing.</div>
           <div class="quota-state-list">
             <div class="quota-state-row">
               <div>
@@ -910,14 +915,12 @@
             <div class="quota-state-row">
               <div>
                 <div class="quota-state-title">Limit reached</div>
-                <div class="quota-state-copy">No output written when blocked</div>
               </div>
               <span class="quota-state-badge available" id="quota-limit-state">Available</span>
             </div>
           </div>
         </div><p class="settings-local-usage" id="footer-usage"></p></section><section class="settings-panel" role="tabpanel" id="settings-panel-integrations" aria-labelledby="settings-tab-integrations" tabindex="0" hidden><h2 class="settings-panel-title">Integrations</h2><div class="settings-section">
           <div class="settings-section-title">Figma Integration</div>
-          <div class="settings-desc" style="margin-bottom:12px;">Connect Figma, then add a Figma link inside a project.</div>
           <div id="figma-status">
             <div id="figma-connected" class="hidden">
               <div class="figma-status-row">
@@ -934,13 +937,8 @@
                   <span class="figma-tracking-value" id="figma-asset-count">0</span>
                 </div>
               </div>
-              <div class="figma-auto-info">
-                <div class="figma-auto-title">&#x2705; Project links enabled</div>
-                <div class="figma-auto-desc">Crate scans Figma links that you add to projects and captures approved assets.</div>
-              </div>
               <div id="figma-scan-status" class="figma-scan-status" role="status" aria-live="polite" aria-atomic="true" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
               <button class="app-btn outline" id="btn-figma-scan-now" aria-describedby="figma-scan-status" style="width:100%;margin-top:8px;">Scan Now</button>
-              <div class="settings-desc" style="margin-top:12px;">Link a Figma file from Project Workspace to add or change project Figma assets.</div>
               <button class="btn-danger-outline" id="btn-figma-disconnect" style="margin-top:12px;">Disconnect Figma</button>
             </div>
             <div id="figma-disconnected">
@@ -948,32 +946,20 @@
                 <span class="figma-status-dot"></span>
                 <span>Figma disconnected</span>
               </div>
-              <div class="figma-setup-steps">
-                <div class="figma-step">1. Go to <strong>figma.com/developers/api</strong></div>
-                <div class="figma-step">2. Generate a Personal Access Token</div>
-                <div class="figma-step">3. Paste it below &mdash; that's it!</div>
-              </div>
               <label class="sr-only" for="input-figma-token">Figma personal access token</label>
               <input type="password" class="settings-input" id="input-figma-token" placeholder="figd_xxxxxxxxxxxx" style="width:100%;box-sizing:border-box;">
               <button class="app-btn" id="btn-figma-connect" style="width:100%;margin-top:8px;">Reconnect Figma</button>
-              <div class="figma-benefit-hint">
-                Once connected, add Figma file URLs inside Project Workspace.
-              </div>
             </div>
-          </div>
-          <div class="privacy-hint" style="margin-top:12px;">
-            &#x1F512; Saved Figma connections are protected by macOS Keychain and stay on this Mac. Crate uses them only to request the Figma files and assets you link.
           </div>
         </div></section><section class="settings-panel" role="tabpanel" id="settings-panel-privacy" aria-labelledby="settings-tab-privacy" tabindex="0" hidden><h2 class="settings-panel-title">Data and Privacy</h2><div class="settings-section"><div class="settings-row">
             <div class="settings-label-wrap">
               <div class="settings-label" id="setting-diagnostics-label">Include diagnostic report in packages</div>
-              <div class="settings-desc" id="setting-diagnostics-desc">Diagnostics included in package output only when enabled. Creates a local diagnostics report under package output.</div>
             </div>
             <label class="toggle">
-              <input type="checkbox" id="toggle-diagnostic-report" aria-labelledby="setting-diagnostics-label" aria-describedby="setting-diagnostics-desc setting-diagnostics-hint">
+              <input type="checkbox" id="toggle-diagnostic-report" aria-labelledby="setting-diagnostics-label">
               <span class="toggle-slider"></span>
             </label>
-          </div><div class="diagnostics-hint" id="setting-diagnostics-hint">Diagnostics are not treated as design assets and are not added back as project files.</div></div><div class="settings-section">
+          </div></div><div class="settings-section">
           <div class="settings-section-title">Data</div>
           <button class="btn-danger-outline" id="btn-clear-all">Clear All Projects</button>
         </div></section><section class="settings-panel" role="tabpanel" id="settings-panel-account" aria-labelledby="settings-tab-account" tabindex="0" ><h2 class="settings-panel-title">Account</h2><section class="settings-section account-panel" aria-labelledby="account-title">
@@ -993,10 +979,9 @@
             <button class="modal-btn-secondary hidden" id="account-manage">Manage account ↗</button>
             <button class="modal-btn-secondary hidden" id="account-signout">Sign out of Crate</button>
           </div>
-          <p class="account-local-note">Your projects stay on this Mac when you sign out.</p>
         </section></section><section class="settings-panel" role="tabpanel" id="settings-panel-billing" aria-labelledby="settings-tab-billing" tabindex="0" hidden><h2 class="settings-panel-title">Plans and Billing</h2><section class="settings-section" aria-labelledby="billing-title">
           <h2 class="settings-section-title" id="billing-title">Coming later</h2>
-          <p>Plans and billing are coming later.</p>
+
         </section></section></div></div></div>
 
       <!-- Help Tab -->
@@ -1005,15 +990,6 @@
           <div class="settings-section-title">Help</div>
           <div class="help-card">
             <div class="help-card-title">Support</div>
-            <div class="settings-desc">Crate packages the files your design project depends on. For support, include your app version and a short description of what you expected to package.</div>
-          </div>
-          <div class="help-card">
-            <div class="help-card-title">Privacy</div>
-            <div class="settings-desc">Crate does not package unrelated Desktop, Downloads, package-output folders, tokens, Figma URLs, file keys, signed URLs, or private paths.</div>
-          </div>
-          <div class="help-card">
-            <div class="help-card-title">Figma</div>
-            <div class="settings-desc">Connect Figma in Settings, then add a Figma link from Project Workspace. Current Page Only is the default; Entire File is opt-in.</div>
           </div>
         </div>
       </div>
@@ -1026,12 +1002,11 @@
         <div class="modal-header-area">
           <div class="existing-assets-modal-app" id="existing-assets-modal-source">WORKING FILE</div>
           <div class="modal-title" id="existing-assets-modal-title">Existing assets found</div>
-          <div class="modal-subtitle" id="existing-assets-modal-copy">These assets were already in your working files. This choice applies to all existing assets in the project, including any not shown here. Files you add while working stay separate.</div>
+          <div class="modal-subtitle" id="existing-assets-modal-copy">All existing assets · Working files unchanged</div>
         </div>
         <div class="modal-body">
           <div class="existing-assets-modal-count" id="existing-assets-modal-count"></div>
           <div class="existing-assets-modal-list" id="existing-assets-modal-list" role="list"></div>
-          <div class="existing-assets-modal-note">You can change this choice later in Existing Assets. Working Files stay included.</div>
           <div class="modal-actions">
             <button class="modal-btn-secondary" id="btn-skip-existing-assets">Skip existing assets</button>
             <button class="modal-btn-primary" id="btn-include-existing-assets">Include existing assets</button>
@@ -1041,14 +1016,13 @@
     </div>
 
     <!-- Package Confirmation Modal -->
-    <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" aria-describedby="package-review-subtitle" tabindex="-1">
+    <div class="modal-overlay hidden" id="modal-package" role="dialog" aria-modal="true" aria-labelledby="package-review-title" tabindex="-1">
       <div class="modal package-review-modal">
         <div class="package-review-navigation">
           <button type="button" id="btn-back-package" class="package-review-back">← Back to selection</button>
         </div>
         <div class="modal-header-area">
           <div class="modal-title" id="package-review-title">Package Review</div>
-          <div class="modal-subtitle" id="package-review-subtitle">Confirm the visual summary before Crate creates the folder.</div>
         </div>
         <div class="modal-body">
           <div class="package-review-ready" id="package-review-ready">Ready to package</div>
@@ -1061,8 +1035,7 @@
           <div class="modal-review-message hidden" id="modal-package-review-message" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
           <div class="modal-reminder hidden" id="modal-presentation-reminder">
             <div class="modal-reminder-title">Save before packaging</div>
-            <div class="modal-reminder-copy">Save your PowerPoint or Keynote file before packaging so Crate can include embedded images and media.</div>
-            <div class="modal-reminder-note">Unsaved presentation changes may not be visible to Crate until the file is saved.</div>
+            <div class="modal-reminder-copy">Unsaved changes are not included.</div>
           </div>
           <div class="package-review-layout">
             <section class="package-review-assets" aria-labelledby="package-review-assets-heading">
@@ -1096,6 +1069,16 @@
                   <span class="toggle-slider"></span>
                 </label>
               </div>
+              <div class="package-review-organization hidden" id="package-portable-pictures-row">
+                <div class="settings-label-wrap">
+                  <div class="modal-naming-label" id="package-portable-pictures-label">Portable PowerPoint pictures</div>
+                  <div class="package-review-organization-status" id="package-portable-pictures-note">Embed copies; keep links. Moved links may need relinking.</div>
+                </div>
+                <label class="toggle">
+                  <input type="checkbox" id="toggle-package-portable-pictures" aria-labelledby="package-portable-pictures-label" aria-describedby="package-portable-pictures-note">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
               <div class="modal-naming-box">
                 <div class="modal-naming-label">Output Folder Name</div>
                 <div class="modal-naming-preview" id="modal-folder-name"></div>
@@ -1115,7 +1098,7 @@
       <div class="modal modal-centered">
         <div class="success-icon-wrap">&#x2705;</div>
         <div class="success-title" id="success-title">Package Complete</div>
-        <div class="success-desc" id="success-message">14 files gathered. Your project is ready.</div>
+        <div class="success-desc" id="success-message">14 files gathered.</div>
         <div class="success-path" id="success-path"></div>
         <details class="package-details hidden" id="package-details">
           <summary id="package-details-summary">Package Details</summary>
@@ -1157,7 +1140,7 @@
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title" id="upgrade-title">You've reached your package limit</div>
-          <div class="modal-subtitle" id="upgrade-subtitle">The package allowance for this Mac has been used. Plans and billing are coming later.</div>
+          <div class="modal-subtitle" id="upgrade-subtitle">Monthly package limit reached.</div>
         </div>
         <div class="modal-body">
           <button type="button" class="dismiss-link" id="btn-dismiss-upgrade">Close &middot; resets in <span id="upgrade-days-left">30</span> days</button>
@@ -1186,17 +1169,15 @@
     </div>
 
     <!-- Edit Figma Link Modal (per-project, Phase 2) -->
-    <div class="modal-overlay hidden" id="modal-edit-figma-link" role="dialog" aria-modal="true" aria-labelledby="edit-figma-title" aria-describedby="edit-figma-subtitle" tabindex="-1">
+    <div class="modal-overlay hidden" id="modal-edit-figma-link" role="dialog" aria-modal="true" aria-labelledby="edit-figma-title" tabindex="-1">
       <div class="modal">
         <div class="modal-header-area">
           <div class="modal-title" id="edit-figma-title">Edit Figma Link</div>
-          <div class="modal-subtitle" id="edit-figma-subtitle">Adjust the scope, or paste a new Figma URL to replace the current link.</div>
         </div>
         <div class="modal-body">
           <div class="form-field">
-            <label class="app-label" for="edit-figma-url">Replace Figma URL (optional)</label>
-            <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" aria-describedby="edit-figma-url-help" style="width:100%;box-sizing:border-box;">
-            <div class="form-subtitle" id="edit-figma-url-help" style="margin-top:6px;">Leave blank to keep the current link.</div>
+            <label class="app-label" for="edit-figma-url">Replace Figma URL (blank keeps current)</label>
+            <input type="text" id="edit-figma-url" class="settings-input" placeholder="https://www.figma.com/file/ABC123/My-File" style="width:100%;box-sizing:border-box;">
           </div>
           <div class="form-field">
             <label class="app-label" for="edit-figma-scope">Scope</label>
@@ -1219,7 +1200,7 @@
     <div class="modal-overlay hidden" id="modal-clear-all" role="dialog" aria-modal="true" aria-labelledby="clear-all-title" aria-describedby="clear-all-desc" tabindex="-1">
       <div class="modal modal-centered">
         <div class="confirm-title" id="clear-all-title">Remove all projects from Crate?</div>
-        <div class="confirm-desc" id="clear-all-desc">This does not delete any files from your computer. Your work stays safe.</div>
+        <div class="confirm-desc" id="clear-all-desc">The files on your computer are not affected.</div>
         <div class="modal-actions">
           <button class="modal-btn-secondary" id="btn-clear-all-cancel">Cancel</button>
           <button class="modal-btn-danger" id="btn-clear-all-confirm">Remove All</button>

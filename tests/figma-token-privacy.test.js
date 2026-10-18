@@ -223,14 +223,16 @@ test('shared Figma redactor handles long ambiguous input without exposing a priv
   assert.equal(output.includes('final.fig'), false);
 });
 
-test('renderer Figma token privacy hint accurately describes local storage and API usage', () => {
+test('renderer Figma token field remains private and explicitly labelled without stale storage claims', () => {
   const rendererHtml = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const parserSource = fs.readFileSync(path.join(__dirname, '..', 'parsers', 'figma.js'), 'utf8');
   const normalizedHtml = rendererHtml.replace(/\s+/g, ' ');
   const expectedHint = 'Saved Figma connections are protected by macOS Keychain and stay on this Mac. Crate uses them only to request the Figma files and assets you link.';
   const staleClaim = /never leaves\s+your computer/i;
 
-  assert.equal(normalizedHtml.includes(expectedHint), true);
+  assert.equal(normalizedHtml.includes(expectedHint), false);
+  assert.match(rendererHtml, /<label[^>]*for="input-figma-token"[^>]*>Figma personal access token<\/label>/u);
+  assert.match(rendererHtml, /<input[^>]*type="password"[^>]*id="input-figma-token"/u);
   assert.equal(staleClaim.test(rendererHtml), false);
   assert.equal(normalizedHtml.includes('~/.crate/figma-token'), false);
   assert.equal(parserSource.includes('~/.crate/figma-token'), false);

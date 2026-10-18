@@ -44,9 +44,7 @@ test('runtime UUID policy uses Node crypto without an external uuid dependency',
   assert.equal(Object.hasOwn(packageLock.packages[''].dependencies, 'uuid'), false);
   assert.equal(Object.hasOwn(packageLock.packages, 'node_modules/uuid'), false);
   assert.equal(mainSource.includes("require('uuid')"), false);
-  // Five project/file/review IDs, three working-source IDs, and four inherited
-  // continuation IDs: relocated receipt, changed-byte receipt, pair, and decision.
-  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 12);
+  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 18); // Admission, explicit-choice nonce, ledger recovery, verification retry IDs and InDesign observation epoch.
 });
 
 function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {

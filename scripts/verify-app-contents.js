@@ -17,11 +17,14 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'figma.js',
   'indesign.js',
   'index.js',
+  'ooxml-links.js',
+  'xml-path.js',
   'package-safety.js',
   'package-transaction-worker.js',
   'powerpoint.js',
   'premiere.js',
-  'psd.js'
+  'psd.js',
+  'working-source-witness.js'
 ]);
 
 const REQUIRED_ASAR_ENTRIES = Object.freeze([

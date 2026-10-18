@@ -1278,6 +1278,7 @@ test('package copy fails closed on reviewed symlink sources without copying targ
         linked: false,
         appFamily: 'illustrator',
         sourceName: null,
+        currentWorkingSources: [],
         assetOrigin: 'existing',
         projectRole: 'source',
         ...expectedDormantWorkingSourceFacts('source'),

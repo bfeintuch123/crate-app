@@ -1,0 +1,15 @@
+# Retained Remove IPC consistency — separate bounded exception
+
+Standing order SO-002; fix-only Clawpatch and crate-handoff. Bryant approved one bounded pass at 2026-10-13 14:32 UTC in Sentinel_77136a1c021881919f650c29c433cafd, answering Mack's explicit guard/regression/fresh-independent-and-Opus-review question. Prior reserves remain spent. Parent sequences fresh reviews after this sole writer freezes. No automatic follow-up pass.
+
+Input: frozen chooser-successor, branch codex/chooser-current-controls-20261013, base c5e8f2d0422d9b3d838796ed28ea217eda71953b, cumulative patch 915b5e64d19362253cd14de58f1128d813f1abb05649b3819b5d51d2631be34c. Verified 22 candidate, 42 evidence and 325 full-tree inventory entries. Opus report verified as 20b89a435905a421d032683cff7a3abda8564ccb57e5ff8d6812f1123526f399. Isolated successor codex/guard-unanswered-remove-20261013 inherits exact bytes; parent remains untouched.
+
+Production projects:remove-file could successfully delete a failed source with an unanswered choice, leaving its obligation orphaned. Before correction, executed production admission/scan/IPC regression reports retained:false, recoveryRequired:true. Narrow fix rechecks the current source's canonical choice record inside mutateProject after async removal-receipt lookup, rejecting unanswered removal with an instruction to Exclude. Existing receipt/account fencing and normal array success contract remain intact. No choices are rebuilt or retired; exclusion remains reversible.
+
+New regressions execute actual production IPC and modeled production renderer Exclude/Restore buttons, preserving unrelated choices, A/C/D/shared attribution and disk originals. Delayed receipt tests cover physical replacement, retry ownership, deleted project, activation, account clock/generation/identity and a late unanswered record. Ordinary failed first-source removal and asset exclude/restore remain available. Restore's harness scan reports scanned; this is controlled behavior, not native InDesign acceptance.
+
+Product/test delta is confined to main.js and tests/working-file-choice-ipc.test.js. Physical identity, dirty holds, Replace continuity, pruning, renderer, watcher options, parser, dependency/package policy, app routes and Olivia fixes remain unchanged. Native safe-save identity and Replace continuity are explicit QA questions. Premiere/After Effects ongoing Save As deferred after launch; Figma cloud multi-link excluded. Pruning was inspected but no concrete reachable defect established; no speculative change.
+
+Final verification and stopped handoff recorded in ../remove-evidence/HANDOFF.md. No commit, provider, reviewer dispatch, native app, installation, dependency mutation, release or outside-sandbox action. Supported pin failed once; no retry. Stop after this pass; parent owns fresh independent and actual Opus reviews.
+
+Terminal verification: focused 118/0; adjacent 558/0; aggregate 2932 pass / 4 fail / 2 skip; 2938 tests; 0 canceled; exit 1. All owned test execution completed. STOPPED, NOT READY; this exception consumed. See frozen source/evidence manifests and exact commands in remove-evidence.

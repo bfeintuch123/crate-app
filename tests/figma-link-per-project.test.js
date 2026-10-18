@@ -3798,6 +3798,29 @@ function existingDecisionSnapshot(count = 20) {
   }]);
 }
 
+function setDistinctDecisionFigmaDownloadResponse() {
+  // Different cloud image identities represent different bytes in these tests.
+  // Same-content exclusion is exercised separately below.
+  fetchHandler = async rawUrl => ({
+    ok: true, status: 200,
+    buffer: async () => Buffer.from('synthetic decision asset:' + String(rawUrl)),
+    json: async () => ({}),
+  });
+}
+
+function installDecisionFigmaScopeFixture(projectId) {
+  // Historical decision repair requires a tracked, connected page receipt.
+  // Do not inherit first-project startup/disconnected session state.
+  const project = fakeStoreInstance.data.projects.find(item => item.id === projectId);
+  const tracked = { key: 'FIG22', url: 'https://www.figma.com/file/FIG22/Brand-Cloud?page-id=1%3A1' };
+  project.figmaTrackedFiles = [tracked];
+  project.figmaSession = {
+    startedAt: project.watchStartedAt, scopeMode: 'current-page', teamIds: [], warnings: [],
+    trackedFiles: [{ ...tracked, scopeMode: 'current-page', lockStatus: 'locked',
+      lockedPageId: '1:1', lockedPageName: 'Page One' }],
+  };
+}
+
 function reloadDecisionTestStore() {
   fs.mkdirSync(path.dirname(fakeStoreInstance.path), { recursive: true, mode: 0o700 });
   fs.writeFileSync(fakeStoreInstance.path, JSON.stringify(fakeStoreInstance.data), { mode: 0o600 });
@@ -3841,7 +3864,8 @@ test('complete Figma refresh repairs an older Existing decision gap without gues
   for (const [baselineStatus, existingCount] of [['awaiting-first-scan', 1], ['empty', 1], ['empty', 2]]) {
     storedFigmaToken = null;
     const project = await createLinkedFigmaProject(`Figma older ${baselineStatus}`);
-    setFigmaDownloadResponse('synthetic');
+    installDecisionFigmaScopeFixture(project.id);
+    setDistinctDecisionFigmaDownloadResponse();
     nextFigmaScanResult = existingDecisionSnapshot(existingCount);
     await callIpc('figma:scan-project', project.id);
     const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
@@ -3869,9 +3893,10 @@ test('delayed first Figma assets honor prior decisions without overriding indivi
   for (const status of ['included', 'skipped', 'legacy-included']) {
     storedFigmaToken = null;
     const project = await createLinkedFigmaProject(`Prior ${status}`);
+    installDecisionFigmaScopeFixture(project.id);
     const stored = fakeStoreInstance.data.projects.find(item => item.id === project.id);
     stored.assetBaseline = { schemaVersion: 1, status, decision: status === 'skipped' ? 'skip' : 'include', establishedAt: 1 };
-    setFigmaDownloadResponse('synthetic');
+    setDistinctDecisionFigmaDownloadResponse();
     nextFigmaScanResult = existingDecisionSnapshot(2);
     await callIpc('figma:scan-project', project.id);
     let current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
@@ -3887,6 +3912,32 @@ test('delayed first Figma assets honor prior decisions without overriding indivi
     assert.deepEqual(current.excludedAssetKeys, exclusions);
     assert.equal(current.files.find(file => file.figmaAssetIdentity === 'initial-2').assetOrigin, 'added');
   }
+});
+
+
+test('Figma same-content new identity honors persisted individual exclusion and Restore', async () => {
+  storedFigmaToken = null;
+  const project = await createLinkedFigmaProject('Figma identical content exclusion');
+  installDecisionFigmaScopeFixture(project.id);
+  setFigmaDownloadResponse('intentionally identical cloud asset bytes');
+  nextFigmaScanResult = existingDecisionSnapshot(2);
+  assert.equal((await callIpc('figma:scan-project', project.id)).success, true);
+  let current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.equal(current.files.length, 2);
+  const excludedPath = current.files.find(file => file.figmaAssetIdentity === 'initial-0').path;
+  await callIpc('projects:remove-file', project.id, excludedPath);
+  reloadDecisionTestStore();
+  nextFigmaScanResult = existingDecisionSnapshot(3);
+  await callIpc('figma:scan-project', project.id);
+  current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(current.excludedAssetKeys, [excludedPath]);
+  assert.equal(current.files.some(file => file.figmaAssetIdentity === 'initial-2'), false,
+    'different cloud identity must not resurrect exact individually excluded content');
+  await callIpc('projects:remove-file', project.id, excludedPath);
+  await callIpc('figma:scan-project', project.id);
+  current = (await callIpc('projects:get-all')).find(item => item.id === project.id);
+  assert.deepEqual(current.excludedAssetKeys, []);
+  assert.equal(current.files.some(file => file.figmaAssetIdentity === 'initial-2'), true);
 });
 
 test('Figma asset scan records cloud resource materialization provenance after ledger add', async () => {

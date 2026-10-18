@@ -357,10 +357,22 @@ function collectGeometryDom(browser, args) {
       stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
     });
     let stdout = '', stderr = '', protocol = '', error = null, closeSent = false;
-    let bytes = 0;
+    let bytes = 0, settled = false;
+    const finish = (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
+      resolve({ status, signal, stdout, stderr, error });
+    };
     const fail = failure => {
+      if (settled) return;
       error ||= failure;
       child.kill('SIGKILL');
+      // Inherited browser pipes can outlive the child and withhold `close`.
+      // Release only this probe's streams and settle with the original failure.
+      for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) stream.destroy();
+      finish(null, 'SIGKILL');
     };
     const timer = setTimeout(() => {
       fail(Object.assign(new Error('Chrome geometry probe ETIMEDOUT'), { code: 'ETIMEDOUT' }));
@@ -401,12 +413,8 @@ function collectGeometryDom(browser, args) {
     for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) {
       stream.on('error', fail);
     }
-    child.on('error', failure => { error ||= failure; });
-    child.on('close', (status, signal) => {
-      clearTimeout(timer);
-      if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
-      resolve({ status, signal, stdout, stderr, error });
-    });
+    child.on('error', fail);
+    child.on('close', finish);
   });
 }
 
@@ -450,14 +458,14 @@ const probeResult = {
   stderr: '',
 };
 
-function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeError = false } = {}) {
+function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeError = false, closeOnKill = true } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.stdio = [null, child.stdout, child.stderr, new PassThrough(), new PassThrough()];
   const commands = [];
   const finish = (status, signal) => queueMicrotask(() => child.emit('close', status, signal));
-  child.kill = signal => { finish(null, signal); return true; };
+  child.kill = signal => { if (closeOnKill) finish(null, signal); return true; };
   child.stdio[3].on('data', chunk => {
     commands.push(chunk.toString());
     if (pipeError) child.stdio[3].emit('error', new Error('close pipe failed'));
@@ -507,6 +515,16 @@ test('geometry probe times out when completed DOM never gets a clean browser exi
   assert.equal(commands.length, 1);
   t.mock.timers.tick(30_000);
   await rejected;
+});
+
+test('geometry probe timeout settles and releases pipes even when kill never emits close', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { child } = mockGeometryBrowser(t, probeResult, { holdOpen: true, closeOnKill: false });
+  const rejected = assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /ETIMEDOUT/);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30_000);
+  await rejected;
+  assert.ok([child.stdout, child.stderr, child.stdio[3], child.stdio[4]].every(stream => stream.destroyed));
 });
 
 test('geometry probe rejects shutdown pipe errors despite completed DOM', async t => {
