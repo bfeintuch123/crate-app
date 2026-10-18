@@ -2755,6 +2755,8 @@ function baselineCases() {
     fs.writeFileSync(known, 'known fixture'); fs.writeFileSync(fresh, 'fresh fixture');
     const container = ['.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd'].includes(ext);
     const originalRead = fs.promises.readFile;
+    const budgets = require('../parsers/admission-budgets');
+    const originalBudgetRead = budgets.readFileWithinBudget;
     let phase = mode === 'zero' ? 'zero' : 'initial';
     setChildProcessHandler(({ command, args }) => {
       if (command !== '/usr/bin/unzip') return { stdout: '' };
@@ -2768,7 +2770,12 @@ function baselineCases() {
       }
       return { stdout: '' };
     });
-    if (!container) fs.writeFileSync(f.filePath, phase === 'zero' ? 'empty source' : known);
+    if (ext === '.pptx') writeLinkedPresentationArchive(f.filePath, phase === 'zero' ? null : known);
+    else if (!container) fs.writeFileSync(f.filePath, phase === 'zero' ? 'empty source' : known);
+    budgets.readFileWithinBudget = function controlledPresentationRead(file, ...args) {
+      if (ext === '.pptx' && phase === 'read-failure' && path.resolve(file) === f.filePath) throw new Error('F4 ordinary read refusal');
+      return originalBudgetRead.call(this, file, ...args);
+    };
     fs.promises.readFile = async function controlledExtractorRead(file, ...args) {
       if (phase === 'read-failure' && path.resolve(file) === f.filePath) throw new Error('F4 ordinary read refusal');
       return originalRead.call(fs.promises, file, ...args);
@@ -2801,7 +2808,7 @@ function baselineCases() {
       f.current().workingSourceSelections = {};
       assert.equal((await scan()).success, false, 'engaged verification still rejects extraction refusal');
       assert.equal(Object.values(f.current().workingSourceVerification)[0].status, 'failed');
-    } finally { fs.promises.readFile = originalRead; clearTrackedTimers(); }
+    } finally { budgets.readFileWithinBudget = originalBudgetRead; fs.promises.readFile = originalRead; clearTrackedTimers(); }
   }
 
   for (const ext of ['.sketch', '.afdesign', '.afphoto', '.afpub', '.pxd']) {
@@ -4578,6 +4585,7 @@ function baselineCases() {
     const content = mode === 'missing' || mode === 'native-missing' ? linkPath : (mode === 'unsupported' ? '../Required.png' : '');
     fs.writeFileSync(filePath, ext === '.ai' || ext === '.pdf'
       ? `%PDF-1.7\n${content}\n${mode === 'failed' ? '' : '%%EOF\n'}` : `synthetic saved route bytes\n${content}\n`);
+    if (ext === '.pptx') writeLinkedPresentationArchive(filePath, mode === 'missing' ? linkPath : null);
     const commands = [];
     setChildProcessHandler(({ kind, command, args }) => {
       if (mode === 'native-missing') {

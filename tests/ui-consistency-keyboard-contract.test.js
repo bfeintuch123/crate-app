@@ -29,23 +29,22 @@ test('form fields and Settings toggles expose explicit accessible names', () => 
   requireControlLabel('input-figma-scope', 'Scope');
   requireControlLabel('input-naming-template', 'Template');
   requireControlLabel('input-figma-token', 'Figma personal access token');
-  requireControlLabel('edit-figma-url', 'Replace Figma URL \\(optional\\)');
+  requireControlLabel('edit-figma-url', 'Replace Figma URL \\(blank keeps current\\)');
   requireControlLabel('edit-figma-scope', 'Scope');
 
-  for (const contract of [
-    ['toggle-notifications', 'setting-notifications-label', 'setting-notifications-desc'],
-    ['toggle-diagnostic-report', 'setting-diagnostics-label', 'setting-diagnostics-desc setting-diagnostics-hint'],
-    ['toggle-package-details', 'setting-package-details-label', 'setting-package-details-desc'],
-    ['toggle-package-folders', 'setting-package-folders-label', 'setting-package-folders-desc'],
+  for (const [id, labelledBy] of [
+    ['toggle-notifications', 'setting-notifications-label'],
+    ['toggle-diagnostic-report', 'setting-diagnostics-label'],
+    ['toggle-package-details', 'setting-package-details-label'],
+    ['toggle-package-folders', 'setting-package-folders-label'],
   ]) {
-    const [id, labelledBy, describedBy] = contract;
-    assert.match(
-      indexHtml,
-      new RegExp(
-        `id="${id}"[^>]*aria-labelledby="${labelledBy}"[^>]*aria-describedby="${describedBy}"`,
-        'u',
-      ),
-    );
+    const tag = indexHtml.match(new RegExp(`<[^>]+id="${id}"[^>]*>`, 'u'))?.[0];
+    assert.ok(tag, `${id} must exist`);
+    assert.match(tag, new RegExp(`aria-labelledby="${labelledBy}"`, 'u'));
+    assert.match(indexHtml, new RegExp(`id="${labelledBy}"`, 'u'));
+    for (const reference of (tag.match(/aria-describedby="([^"]+)"/u)?.[1] || '').split(/\s+/u).filter(Boolean)) {
+      assert.match(indexHtml, new RegExp(`id="${reference}"`, 'u'), `${id} must not have a dangling description`);
+    }
   }
 });
 

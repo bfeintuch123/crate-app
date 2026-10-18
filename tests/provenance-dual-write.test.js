@@ -3224,6 +3224,28 @@ test('helper Info.plist patch adds Apple Events usage before signing and is idem
   }
 });
 
+// Real container bytes let strict OOXML admission run before modeled media extraction.
+function writePresentationArchive(filePath, entries = [{ internalPath: 'ppt/presentation.xml', data: '<presentation/>' }]) {
+  const staging = fs.mkdtempSync(path.join(path.dirname(filePath), 'pptx-fixture-'));
+  try {
+    for (const { internalPath, data } of entries) {
+      const target = path.join(staging, internalPath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, data);
+    }
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    const result = realSpawnSync('/usr/bin/zip', ['-q', '-r', filePath, '.'], { cwd: staging });
+    assert.equal(result.status, 0, 'synthetic PPTX ZIP creation must succeed');
+  } finally { fs.rmSync(staging, { recursive: true, force: true }); }
+}
+
+function writeLinkedPresentationArchive(filePath, linkPath) {
+  const target = linkPath ? pathToFileURL(linkPath).href.replace(/&/g, '&amp;').replace(/"/g, '&quot;') : null;
+  writePresentationArchive(filePath, [{ internalPath: 'ppt/slides/_rels/slide1.xml.rels', data:
+    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${target ?
+      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${target}" TargetMode="External"/>` : ''}</Relationships>` }]);
+}
+
 function setPresentationUnzipFixture(mediaEntries, archiveName = 'deck.pptx', options = {}) {
   const byInternalPath = new Map(mediaEntries.map(entry => [entry.internalPath, entry]));
   const entryData = (entry) => Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data || '');
@@ -4340,7 +4362,7 @@ test('Quick Package consumes package quota only after successful packaging', asy
   const tmpRoot = makeTempDir();
   try {
     const deckPath = path.join(tmpRoot, 'Quick Quota Deck.pptx');
-    fs.writeFileSync(deckPath, Buffer.from('quick package pptx bytes'));
+    writePresentationArchive(deckPath, [{ internalPath: 'ppt/media/image1.jpeg', data: Buffer.from('QUICK_PACKAGE_QUOTA_IMAGE_BYTES'.repeat(40)) }]);
     setPowerPointUnzipFixture([{
       internalPath: 'ppt/media/image1.jpeg',
       data: Buffer.from('QUICK_PACKAGE_QUOTA_IMAGE_BYTES'.repeat(40)),
@@ -4367,7 +4389,7 @@ test('Quick Package consumes package quota only after successful packaging', asy
     assert.equal(fs.existsSync(quickPackageFolder(missingPath)), false);
 
     const continuedPath = path.join(tmpRoot, 'Continued Beta Quick Quota Deck.pptx');
-    fs.writeFileSync(continuedPath, Buffer.from('continued beta quick package pptx bytes'));
+    writePresentationArchive(continuedPath);
     storeInstance.set('usage.packagesThisMonth', 10);
     const continuedResult = await callIpc('v2:package-file', continuedPath);
     assert.equal(continuedResult.success, true);
@@ -4375,7 +4397,7 @@ test('Quick Package consumes package quota only after successful packaging', asy
     assert.equal(fs.existsSync(quickPackageFolder(continuedPath)), true);
 
     const limitPath = path.join(tmpRoot, 'Limit Quick Quota Deck.pptx');
-    fs.writeFileSync(limitPath, Buffer.from('limit quick package pptx bytes'));
+    writePresentationArchive(limitPath);
     storeInstance.set('usage.packagesThisMonth', 25);
     const limitResult = await callIpc('v2:package-file', limitPath);
     assert.equal(limitResult.error, 'limit_reached');
@@ -4394,8 +4416,8 @@ test('concurrent Quick Package requests share one main-process package lock', as
   const tmpRoot = makeTempDir();
   const firstPath = path.join(tmpRoot, 'First Concurrent Quick Package.pptx');
   const secondPath = path.join(tmpRoot, 'Second Concurrent Quick Package.pptx');
-  fs.writeFileSync(firstPath, Buffer.from('first concurrent quick package bytes'));
-  fs.writeFileSync(secondPath, Buffer.from('second concurrent quick package bytes'));
+  writePresentationArchive(firstPath);
+  writePresentationArchive(secondPath);
 
   try {
     storeInstance.set('usage.packagesThisMonth', 24);
@@ -4419,7 +4441,7 @@ test('normal and Quick Package share the same main-process package lock', async 
   const tmpRoot = makeTempDir();
   const quickPath = path.join(tmpRoot, 'Cross Flow Quick Package.pptx');
   const outputDir = path.join(tmpRoot, 'normal-output');
-  fs.writeFileSync(quickPath, Buffer.from('cross-flow quick package bytes'));
+  writePresentationArchive(quickPath);
   fs.mkdirSync(outputDir);
 
   try {
@@ -4470,7 +4492,7 @@ test('successful packaging increments the active month after reset rollover', as
   }
 
   const deckPath = path.join(tmpRoot, 'Month Rollover Quick Package.pptx');
-  fs.writeFileSync(deckPath, Buffer.from('month rollover quick package bytes'));
+  writePresentationArchive(deckPath);
 
   try {
     global.Date = MutableDate;

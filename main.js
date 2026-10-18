@@ -20938,7 +20938,9 @@ async function buildCanonicalPackageReviewManifest(projectId) {
       entryStatuses: entryStatuses.map((status, index) => unavailableOutputs.has(index) ? 'unavailable' : status),
       reviewedInputSignature, reviewedSettingsKey: packageSettingsKey, materializable: false,
     };
-    const excludedRequired = files.map(file => inferProjectFileRole(file) === 'asset' && isAssetReviewFileExcluded(currentProject, file));
+    const excludedRequired = files.map(file => inferProjectFileRole(file) === 'asset' &&
+      isAssetReviewFileExcluded(currentProject, file) &&
+      !membership.facts.get(getTrackedFileDedupKey(file))?.includedAsDependency);
     if (excludedRequired.some(Boolean)) return {
       project: currentProject, files, entries,
       entryStatuses: entryStatuses.map((status, index) => excludedRequired[index] ? 'unavailable' : status),
