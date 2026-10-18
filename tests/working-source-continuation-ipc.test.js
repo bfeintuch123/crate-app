@@ -686,7 +686,7 @@ function continuationCases() {
       if (mode === 'replacement') f.save('A.ai', ['Shared.png', 'AB.png']);
       const b = await recoveryRendererBridge(f);
       try {
-        assert.match(b.text(b.row()), /does not remove that requirement/);
+        assert.match(b.text(b.row()), /Required as an asset/);
         assert.equal(await b.activate('Exclude'), true);
         const a = (await callIpcRaw('projects:get-asset-workspace', f.id)).files.find(row => row.name === 'A.ai');
         assert.equal(a.sourceSelection, 'excluded'); assert.equal(a.includedAsDependency, true);
