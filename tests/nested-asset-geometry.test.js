@@ -22,7 +22,7 @@ const fixtureRequire = Object.assign(
 );
 const helpers = {
   require: fixtureRequire, __dirname, console, process, Buffer, URL,
-  setTimeout, clearTimeout, setImmediate, clearImmediate, module: { exports: {} },
+  setTimeout, clearTimeout, module: { exports: {} },
 };
 vm.createContext(helpers);
 vm.runInContext(fs.readFileSync(sharedPath, 'utf8'), helpers, { filename: sharedPath });
