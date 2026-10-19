@@ -3974,8 +3974,10 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     'Reject high-severity dependency findings',
     'Verify dependency lifecycle policy',
     'Check security verifier syntax',
+    'Install authenticated fixed Chrome for Testing',
     'Authenticate installed release verifier toolchain',
     'Run complete serial source suite',
+    'Verify fixed Chrome for Testing remained unchanged',
     'Reject pull-request whitespace errors',
     'Reject pushed whitespace errors',
   ]);
@@ -4098,6 +4100,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          node --check parsers/figma.js',
     '          node --check parsers/package-safety.js',
     '          node --check parsers/package-transaction-worker.js',
+    '          node --check scripts/ci-chrome.js',
     '          node --check scripts/install-approved-canvas-prebuild.js',
     '          node --check scripts/verify-app-contents.js',
     '          node --check scripts/verify-install-scripts.js',
@@ -4105,6 +4108,11 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '          node --check scripts/run-macos-release-proof.js',
     '          node --check scripts/version-crate-site-assets.js',
     '          node scripts/version-crate-site-assets.js --check',
+    '',
+  ].join('\n'));
+  assert.equal(workflowStepBlock(workflow, 'Install authenticated fixed Chrome for Testing'), [
+    '      - name: Install authenticated fixed Chrome for Testing',
+    '        run: node scripts/ci-chrome.js install "$RUNNER_TEMP/crate-ci-chrome"',
     '',
   ].join('\n'));
   assert.equal(workflowStepBlock(workflow, 'Authenticate installed release verifier toolchain'), [
@@ -4119,9 +4127,26 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     '      - name: Run complete serial source suite',
     '        env:',
     '          npm_config_cache: ${{ runner.temp }}/crate-npm-cache',
+    "          CRATE_UI_TEST_BROWSER_PIN: '1'",
+    '          CRATE_UI_TEST_BROWSER: ${{ runner.temp }}/crate-ci-chrome/payload/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
     '        run: node --test --test-concurrency=1 tests/*.test.js',
     '',
   ].join('\n'));
+  assert.equal(workflowStepBlock(workflow, 'Verify fixed Chrome for Testing remained unchanged'), [
+    '      - name: Verify fixed Chrome for Testing remained unchanged',
+    '        if: always()',
+    '        run: node scripts/ci-chrome.js verify "$RUNNER_TEMP/crate-ci-chrome"',
+    '',
+  ].join('\n'));
+  assert.equal(
+    workflow.indexOf('- name: Check security verifier syntax') <
+      workflow.indexOf('- name: Install authenticated fixed Chrome for Testing') &&
+      workflow.indexOf('- name: Install authenticated fixed Chrome for Testing') <
+        workflow.indexOf('- name: Run complete serial source suite') &&
+      workflow.indexOf('- name: Run complete serial source suite') <
+        workflow.indexOf('- name: Verify fixed Chrome for Testing remained unchanged'),
+    true
+  );
   for (const stepName of [
     'Check out source',
     'Scrub checkout credentials and map legacy gitlinks',
@@ -4132,6 +4157,7 @@ test('CI source gate is least privilege, pinned, serial, and release inert', () 
     'Reject high-severity dependency findings',
     'Verify dependency lifecycle policy',
     'Check security verifier syntax',
+    'Install authenticated fixed Chrome for Testing',
     'Authenticate installed release verifier toolchain',
     'Run complete serial source suite',
   ]) {
