@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const childProcess = require('child_process');
+const ciChrome = require('../scripts/ci-chrome');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 const Module = require('node:module');
@@ -80,6 +81,8 @@ const viewports = [
 ];
 
 function findBrowser() {
+  const pinned = ciChrome.pinnedBrowser();
+  if (pinned) return pinned;
   const candidates = [
     process.env.CRATE_UI_TEST_BROWSER,
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -357,6 +360,10 @@ const geometryBrowserIdentities = new Map();
 let geometryProbeSequence = 0;
 
 function geometryBrowserIdentity(browser) {
+  // Recheck the selected fixed artifact for every probe, not once per worker.
+  if (process.env.CRATE_UI_TEST_BROWSER_PIN === '1' && browser === process.env.CRATE_UI_TEST_BROWSER) {
+    return ciChrome.verifyIdentity(browser);
+  }
   if (geometryBrowserIdentities.has(browser)) return geometryBrowserIdentities.get(browser);
   const executable = typeof browser === 'string' ? path.basename(browser) : '';
   const identity = { family: /^(?:Google Chrome|google-chrome(?:-stable)?)$/.test(executable) ? 'chrome'
@@ -386,7 +393,13 @@ function geometryBrowserIdentity(browser) {
 }
 
 function collectGeometryDom(browser, args) {
-  const browserIdentity = geometryBrowserIdentity(browser);
+  let browserIdentity;
+  try { browserIdentity = geometryBrowserIdentity(browser); }
+  catch (error) {
+    return Promise.resolve({ status: null, signal: null, stdout: '', stderr: '', error, profileCleanupSafe: true });
+  }
+  const pinned = process.env.CRATE_UI_TEST_BROWSER_PIN === '1' && browser === process.env.CRATE_UI_TEST_BROWSER;
+  if (pinned) browserIdentity = { ...browserIdentity, verifiedBefore: true, verifiedAfter: false };
   const probe = ++geometryProbeSequence;
   return new Promise(resolve => {
     let child;
@@ -435,6 +448,10 @@ function collectGeometryDom(browser, args) {
       clearTimeout(timer);
       for (const pending of [pollTimer, cleanupTimer, termTimer, killTimer]) clearTimeout(pending);
       if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
+      if (pinned) {
+        try { ciChrome.verifyIdentity(browser); browserIdentity.verifiedAfter = true; }
+        catch (failure) { error ||= failure; }
+      }
       observeGroup('finish');
       const diagnostics = { ...receipt(), stages, bytes, stdoutBytes: Buffer.byteLength(stdout),
         htmlEndSeen: stdout.includes('</html>'), stdoutTailTag: stdout.match(/<\/?([a-z0-9-]+)[^>]*>\s*$/i)?.[1] || null,
@@ -804,6 +821,69 @@ test('geometry probe keeps timeout primary after a late clean exit and complete 
   assert.equal(result.error.code, 'ETIMEDOUT');
   assert.match(result.error.message, /geometry transport/);
   assert.equal(result.status, 0);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+function mockPinnedIdentity(t, verify) {
+  for (const [name, value] of Object.entries({ CRATE_UI_TEST_BROWSER_PIN: '1', CRATE_UI_TEST_BROWSER: 'fixture-browser' })) {
+    const previous = process.env[name];
+    process.env[name] = value;
+    t.after(() => { if (previous === undefined) delete process.env[name]; else process.env[name] = previous; });
+  }
+  return t.mock.method(ciChrome, 'verifyIdentity', verify);
+}
+
+test('geometry pinned identity failure refuses launch and permits unused profile cleanup', async t => {
+  mockPinnedIdentity(t, () => { throw new Error('CI_CHROME_IDENTITY_MISMATCH'); });
+  const spawn = t.mock.method(childProcess, 'spawn', () => { throw new Error('must not launch'); });
+  const result = await collectGeometryDom('fixture-browser', []);
+  assert.match(result.error.message, /CI_CHROME_IDENTITY_MISMATCH/);
+  assert.equal(result.profileCleanupSafe, true);
+  assert.equal(spawn.mock.callCount(), 0);
+});
+
+test('geometry pinned identity is checked before and after every probe without caching', async t => {
+  const identity = mockPinnedIdentity(t, () => ({ family: 'unknown', version: 'synthetic' }));
+  for (let index = 0; index < 2; index++) {
+    const { spawn, kill } = mockGeometryBrowser(t);
+    const result = await collectGeometryDom('fixture-browser', []);
+    spawn.mock.restore();
+    kill.mock.restore();
+    assert.equal(result.error, null);
+    assert.equal(result.diagnostics.browser.verifiedBefore, true);
+    assert.equal(result.diagnostics.browser.verifiedAfter, true);
+  }
+  assert.equal(identity.mock.callCount(), 4);
+});
+
+test('geometry pinned identity drift fails otherwise successful probes', async t => {
+  let checks = 0;
+  mockPinnedIdentity(t, () => {
+    if (++checks === 2) throw new Error('CI_CHROME_IDENTITY_MISMATCH');
+    return { family: 'unknown' };
+  });
+  mockGeometryBrowser(t);
+  const result = await collectGeometryDom('fixture-browser', []);
+  assert.match(result.error.message, /CI_CHROME_IDENTITY_MISMATCH/);
+  assert.equal(result.diagnostics.browser.verifiedAfter, false);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry pinned identity drift preserves an existing timeout and owned-group cleanup', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let checks = 0;
+  mockPinnedIdentity(t, () => {
+    if (++checks === 2) throw new Error('CI_CHROME_IDENTITY_MISMATCH');
+    return { family: 'unknown' };
+  });
+  const { finish } = mockGeometryBrowser(t, probeResult, { holdOpen: true, closeOnKill: false });
+  const running = collectGeometryDom('fixture-browser', []);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30_000);
+  finish(0, null);
+  const result = await running;
+  assert.equal(result.error.code, 'ETIMEDOUT');
+  assert.equal(result.diagnostics.browser.verifiedAfter, false);
   assert.equal(result.profileCleanupSafe, true);
 });
 

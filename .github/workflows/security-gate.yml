@@ -88,6 +88,7 @@ jobs:
           node --check parsers/figma.js
           node --check parsers/package-safety.js
           node --check parsers/package-transaction-worker.js
+          node --check scripts/ci-chrome.js
           node --check scripts/install-approved-canvas-prebuild.js
           node --check scripts/verify-app-contents.js
           node --check scripts/verify-install-scripts.js
@@ -95,6 +96,9 @@ jobs:
           node --check scripts/run-macos-release-proof.js
           node --check scripts/version-crate-site-assets.js
           node scripts/version-crate-site-assets.js --check
+
+      - name: Install authenticated fixed Chrome for Testing
+        run: node scripts/ci-chrome.js install "$RUNNER_TEMP/crate-ci-chrome"
 
       - name: Authenticate installed release verifier toolchain
         env:
@@ -105,7 +109,13 @@ jobs:
       - name: Run complete serial source suite
         env:
           npm_config_cache: ${{ runner.temp }}/crate-npm-cache
+          CRATE_UI_TEST_BROWSER_PIN: '1'
+          CRATE_UI_TEST_BROWSER: ${{ runner.temp }}/crate-ci-chrome/payload/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
         run: node --test --test-concurrency=1 tests/*.test.js
+
+      - name: Verify fixed Chrome for Testing remained unchanged
+        if: always()
+        run: node scripts/ci-chrome.js verify "$RUNNER_TEMP/crate-ci-chrome"
 
       - name: Reject pull-request whitespace errors
         if: github.event_name == 'pull_request'
