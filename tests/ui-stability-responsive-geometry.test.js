@@ -415,12 +415,12 @@ function collectGeometryDom(browser, args) {
       try { process.kill(-child.pid, 0); return 'present'; }
       catch (failure) { return failure.code === 'ESRCH' ? 'absent' : 'unknown'; }
     };
-    const observeGroup = point => {
-      if (groupObservations.length < 8) groupObservations.push({ point, ms: elapsed(), state: groupState() });
+    const observeGroup = (point, state = groupState()) => {
+      if (groupObservations.length < 8) groupObservations.push({ point, ms: elapsed(), state });
     };
     const receipt = () => ({ probe, runnerPid: process.pid, browser: browserIdentity,
       firstHtmlMs, htmlAfterError, firstMetricsMs, nativeExitMs, childCloseMs,
-      streams, groupObservations });
+      streams, groupObservations, status, signal, signals });
     const emitReceipt = (event, detail) => {
       // Fixed field names and numeric/enum metadata only; never emit browser
       // output, protocol frames, arguments, environment, URLs or private paths.
@@ -459,9 +459,13 @@ function collectGeometryDom(browser, args) {
       pollTimer = setTimeout(inspectTeardown, 25);
     };
     const signalOwnedGroup = value => {
-      if (settled || groupState() !== 'present') return;
+      if (settled) return;
+      const before = groupState();
+      observeGroup(`before-${value}`, before);
+      if (before !== 'present') return;
       try { process.kill(-child.pid, value); signals.push(value); stage(value); }
       catch (failure) { if (failure.code !== 'ESRCH') error ||= new Error('Chrome owned-group termination failed'); }
+      observeGroup(`after-${value}`);
       inspectTeardown();
     };
     const beginTeardown = () => {
@@ -734,6 +738,12 @@ test('geometry probe bounds escalation to SIGKILL on its owned group', async t =
   assert.deepEqual(groupSignals, ['SIGTERM', 'SIGKILL']);
   assert.equal(result.error, null);
   assert.equal(result.profileCleanupSafe, true);
+  const observations = result.diagnostics.groupObservations.filter(value => /^(before|after)-SIG/.test(value.point));
+  assert.deepEqual(observations.map(value => [value.point, value.state]), [
+    ['before-SIGTERM', 'present'], ['after-SIGTERM', 'present'],
+    ['before-SIGKILL', 'present'], ['after-SIGKILL', 'absent'],
+  ]);
+  assert.deepEqual(result.diagnostics.signals, groupSignals);
 });
 
 test('geometry probe keeps the original deadline active after clean exit without complete DOM', async t => {
