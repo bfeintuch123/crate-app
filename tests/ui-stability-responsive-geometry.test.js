@@ -353,7 +353,41 @@ function productionWorkingFilesFixture() {
 // original DOM/exit contract, then reap only this probe's owned process group
 // before callers may remove its profile. Neither teardown nor a late exit can
 // turn a timed-out probe into a success.
+const geometryBrowserIdentities = new Map();
+let geometryProbeSequence = 0;
+
+function geometryBrowserIdentity(browser) {
+  if (geometryBrowserIdentities.has(browser)) return geometryBrowserIdentities.get(browser);
+  const executable = typeof browser === 'string' ? path.basename(browser) : '';
+  const identity = { family: /^(?:Google Chrome|google-chrome(?:-stable)?)$/.test(executable) ? 'chrome'
+    : /^(?:Chromium|chromium(?:-browser)?)$/.test(executable) ? 'chromium' : 'unknown',
+  version: null, versionSource: 'unavailable', platform: process.platform, arch: process.arch, node: process.versions.node };
+  // Read only the selected macOS bundle's bounded metadata. Do not launch an
+  // extra browser or expose its path, command line, environment or plist text.
+  const bundle = typeof browser === 'string' && browser.match(/^(.*\.app)\/Contents\/MacOS\/[^/]+$/);
+  if (process.platform === 'darwin' && bundle) {
+    let descriptor;
+    try {
+      descriptor = fs.openSync(path.join(bundle[1], 'Contents', 'Info.plist'),
+        fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(descriptor);
+      if (stat.isFile() && stat.size <= 128 * 1024) {
+        const data = Buffer.alloc(stat.size + 1);
+        const size = fs.readSync(descriptor, data, 0, data.length, 0);
+        const version = data.subarray(0, size).toString('utf8')
+          .match(/<key>CFBundleShortVersionString<\/key>\s*<string>([0-9]{1,6}(?:\.[0-9]{1,6}){1,4})<\/string>/)?.[1];
+        if (version) { identity.version = version; identity.versionSource = 'selected-bundle-plist'; }
+      }
+    } catch (_) { /* Missing or non-XML metadata must not affect probe behavior. */ }
+    finally { if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch (_) { /* Diagnostic only. */ } } }
+  }
+  geometryBrowserIdentities.set(browser, identity);
+  return identity;
+}
+
 function collectGeometryDom(browser, args) {
+  const browserIdentity = geometryBrowserIdentity(browser);
+  const probe = ++geometryProbeSequence;
   return new Promise(resolve => {
     let child;
     try {
@@ -370,11 +404,30 @@ function collectGeometryDom(browser, args) {
     const outputs = [child.stdout, child.stderr, child.stdio[4]];
     const outputDrained = () => outputs.every(stream => stream.readableEnded);
     const startedAt = Date.now(), stages = [{ stage: 'spawn', ms: 0 }], signals = [];
+    const elapsed = () => Date.now() - startedAt;
+    const streams = Object.fromEntries(['stdout', 'stderr', 'protocol'].map(name => [name,
+      { bytes: 0, chunks: 0, firstDataMs: null, lastDataMs: null, eofMs: null }]));
+    const groupObservations = [];
+    let firstHtmlMs = null, htmlAfterError = null, firstMetricsMs = null, nativeExitMs = null, childCloseMs = null;
     const stage = name => { if (stages.length < 16) stages.push({ stage: name, ms: Date.now() - startedAt }); };
     const groupState = () => {
       if (!Number.isInteger(child.pid) || child.pid <= 0) return spawnFailed ? 'absent' : 'unknown';
       try { process.kill(-child.pid, 0); return 'present'; }
       catch (failure) { return failure.code === 'ESRCH' ? 'absent' : 'unknown'; }
+    };
+    const observeGroup = point => {
+      if (groupObservations.length < 8) groupObservations.push({ point, ms: elapsed(), state: groupState() });
+    };
+    const receipt = () => ({ probe, runnerPid: process.pid, browser: browserIdentity,
+      firstHtmlMs, htmlAfterError, firstMetricsMs, nativeExitMs, childCloseMs,
+      streams, groupObservations });
+    const emitReceipt = (event, detail) => {
+      // Fixed field names and numeric/enum metadata only; never emit browser
+      // output, protocol frames, arguments, environment, URLs or private paths.
+      if (browserIdentity.family !== 'unknown') {
+        try { console.log(`geometry-transport ${JSON.stringify({ event, ...detail })}`); }
+        catch (_) { /* A diagnostic sink must never replace the probe result. */ }
+      }
     };
     const finish = profileCleanupSafe => {
       if (settled) return;
@@ -382,12 +435,14 @@ function collectGeometryDom(browser, args) {
       clearTimeout(timer);
       for (const pending of [pollTimer, cleanupTimer, termTimer, killTimer]) clearTimeout(pending);
       if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
-      const diagnostics = { stages, bytes, stdoutBytes: Buffer.byteLength(stdout),
+      observeGroup('finish');
+      const diagnostics = { ...receipt(), stages, bytes, stdoutBytes: Buffer.byteLength(stdout),
         htmlEndSeen: stdout.includes('</html>'), stdoutTailTag: stdout.match(/<\/?([a-z0-9-]+)[^>]*>\s*$/i)?.[1] || null,
         exited, closeSent, signals, outputDrained: outputDrained(), profileCleanupSafe,
         stderrTail: stderr.slice(-2048).replaceAll(/[\r\n]+/g, ' ')
           .replaceAll(/(?:https?|file):\/\/\S+/g, '[url]')
           .replaceAll(/\/(?:Users|var|private|tmp)\/[^\s)]+/g, '[path]') };
+      emitReceipt('finish', { ...receipt(), failed: !!error, profileCleanupSafe, outputDrained: outputDrained() });
       if (error) error.message += `; geometry transport ${JSON.stringify(diagnostics)}`;
       for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) stream.destroy();
       if (!profileCleanupSafe) child.unref?.();
@@ -412,6 +467,7 @@ function collectGeometryDom(browser, args) {
     const beginTeardown = () => {
       if (settled || tearingDown) return;
       tearingDown = true; clearTimeout(timer); stage('teardown-start');
+      observeGroup('teardown-start');
       cleanupTimer = setTimeout(() => {
         error ||= new Error('Chrome geometry teardown could not be confirmed; private profile retained');
         stage('teardown-unconfirmed'); finish(false);
@@ -427,9 +483,13 @@ function collectGeometryDom(browser, args) {
       error ||= failure; beginTeardown();
     };
     const timer = setTimeout(() => {
+      observeGroup('operation-deadline');
       fail(Object.assign(new Error('Chrome geometry probe ETIMEDOUT'), { code: 'ETIMEDOUT' }));
     }, 30_000);
-    const accountBytes = chunk => {
+    const accountBytes = (chunk, name) => {
+      const stream = streams[name], time = elapsed();
+      stream.bytes += Buffer.byteLength(chunk); stream.chunks += 1;
+      stream.firstDataMs ??= time; stream.lastDataMs = time;
       bytes += Buffer.byteLength(chunk);
       if (bytes > 8 * 1024 * 1024) {
         fail(new Error('Chrome geometry probe exceeded output limit'));
@@ -441,9 +501,13 @@ function collectGeometryDom(browser, args) {
     child.stderr.setEncoding('utf8');
     child.stdio[4].setEncoding('utf8');
     child.stdout.on('data', chunk => {
-      if (!accountBytes(chunk)) return;
+      if (!accountBytes(chunk, 'stdout')) return;
       if (!stdout) stage('first-output');
       stdout += chunk;
+      if (firstHtmlMs === null && /<\/html>\s*$/.test(stdout)) {
+        firstHtmlMs = elapsed(); htmlAfterError = !!error;
+      }
+      if (firstMetricsMs === null && /<pre id="geometry-result">[^<]+<\/pre>/.test(stdout)) firstMetricsMs = elapsed();
       if (!error && !closeSent && /<\/html>\s*$/.test(stdout)) {
         stage('dom-complete');
         closeSent = true;
@@ -453,9 +517,9 @@ function collectGeometryDom(browser, args) {
         } else beginTeardown();
       }
     });
-    child.stderr.on('data', chunk => { if (accountBytes(chunk)) stderr += chunk; });
+    child.stderr.on('data', chunk => { if (accountBytes(chunk, 'stderr')) stderr += chunk; });
     child.stdio[4].on('data', chunk => {
-      if (!accountBytes(chunk)) return;
+      if (!accountBytes(chunk, 'protocol')) return;
       protocol += chunk;
       let end;
       while ((end = protocol.indexOf('\0')) !== -1) {
@@ -470,16 +534,26 @@ function collectGeometryDom(browser, args) {
     for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) {
       stream.on('error', fail);
     }
-    for (const stream of outputs) stream.on('end', () => { if (tearingDown) inspectTeardown(); });
+    for (const [index, name] of ['stdout', 'stderr', 'protocol'].entries()) outputs[index].on('end', () => {
+      streams[name].eofMs = elapsed();
+      if (tearingDown) inspectTeardown();
+    });
     child.on('error', failure => { spawnFailed = !Number.isInteger(child.pid); fail(failure); });
     const exitedNative = (code, nativeSignal) => {
       if (settled) return;
-      if (!exited) { exited = true; status = code; signal = nativeSignal; stage('native-exit'); }
+      if (!exited) {
+        exited = true; status = code; signal = nativeSignal; stage('native-exit');
+        nativeExitMs = elapsed(); observeGroup('native-exit');
+      }
       if (error || status !== 0 || signal !== null || /<\/html>\s*$/.test(stdout)) beginTeardown();
       if (tearingDown) inspectTeardown();
     };
     child.on('exit', exitedNative);
     child.on('close', (code, nativeSignal) => {
+      childCloseMs = elapsed();
+      // Safe cleanup can resolve at EOF before Node emits child close. Observe
+      // that later event separately instead of delaying or changing settlement.
+      if (settled) emitReceipt('child-close-after-finish', { probe, runnerPid: process.pid, childCloseMs });
       exitedNative(code, nativeSignal);
       if (!settled && !/<\/html>\s*$/.test(stdout)) fail(new Error('Chrome geometry DOM was incomplete'));
     });
@@ -721,6 +795,107 @@ test('geometry probe keeps timeout primary after a late clean exit and complete 
   assert.match(result.error.message, /geometry transport/);
   assert.equal(result.status, 0);
   assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry diagnostics distinguish HTML arriving after timeout without closing or accepting it', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const logs = [];
+  t.mock.method(console, 'log', value => logs.push(value));
+  const { child, finish, commands } = mockGeometryBrowser(t,
+    { ...probeResult, stdout: probeResult.stdout.replace('</html>', '') },
+    { holdOpen: true, closeOnKill: false, withholdClose: true, holdOutputPipes: true });
+  const running = collectGeometryDom('/synthetic/Google Chrome', ['file:///private/fixture?secret=never-log']);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30_000);
+  child.stdout.write('</html>');
+  child.stderr.write('file:///private/fixture?secret=never-log');
+  finish(0, null);
+  for (const stream of [child.stdout, child.stderr, child.stdio[4]]) stream.end();
+  const result = await running;
+  assert.equal(result.error.code, 'ETIMEDOUT');
+  assert.deepEqual(commands, [], 'late HTML must not change the existing Browser.close condition');
+  assert.equal(result.profileCleanupSafe, true);
+  assert.equal(result.diagnostics.htmlAfterError, true);
+  assert.equal(typeof result.diagnostics.firstHtmlMs, 'number');
+  assert.equal(typeof result.diagnostics.firstMetricsMs, 'number');
+  assert.equal(typeof result.diagnostics.nativeExitMs, 'number');
+  assert.ok(Object.values(result.diagnostics.streams).every(stream => stream.eofMs !== null));
+  const receipt = logs.find(value => value.includes('"event":"finish"'));
+  assert.ok(receipt.length < 4096, 'one receipt stays bounded');
+  assert.doesNotMatch(receipt, /private|fixture|secret|never-log|file:|stderrTail/);
+  assert.match(receipt, /"point":"operation-deadline"/);
+});
+
+test('geometry diagnostics distinguish late stderr EOF and child close after safe settlement', async t => {
+  const logs = [];
+  t.mock.method(console, 'log', value => logs.push(JSON.parse(value.slice('geometry-transport '.length))));
+  const { child } = mockGeometryBrowser(t, probeResult, { withholdClose: true, holdOutputPipes: true });
+  let resolved = false;
+  const running = collectGeometryDom('/synthetic/Google Chrome', []).then(result => { resolved = true; return result; });
+  await new Promise(setImmediate);
+  child.stdout.end(); child.stdio[4].end();
+  await new Promise(setImmediate);
+  assert.equal(resolved, false, 'native exit and other EOFs cannot replace stderr EOF');
+  child.stderr.end();
+  const result = await running;
+  assert.equal(result.error, null);
+  assert.equal(result.profileCleanupSafe, true);
+  assert.equal(result.diagnostics.htmlAfterError, false);
+  assert.equal(result.diagnostics.childCloseMs, null);
+  assert.ok(result.diagnostics.groupObservations.some(value => value.point === 'native-exit' && value.state === 'absent'));
+  assert.ok(Object.values(result.diagnostics.streams).every(stream => stream.eofMs !== null));
+  child.emit('close', 0, null);
+  const later = logs.find(value => value.event === 'child-close-after-finish');
+  assert.equal(later.probe, result.diagnostics.probe);
+  assert.equal(typeof later.childCloseMs, 'number');
+  assert.deepEqual(Object.keys(later).sort(), ['childCloseMs', 'event', 'probe', 'runnerPid']);
+});
+
+test('geometry diagnostics identify an open stderr pipe after the owned group is absent', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { child, groupSignals } = mockGeometryBrowser(t, probeResult, { withholdClose: true, holdOutputPipes: true });
+  const running = collectGeometryDom('fixture-browser', []);
+  await new Promise(setImmediate);
+  child.stdout.end(); child.stdio[4].end();
+  await new Promise(setImmediate);
+  t.mock.timers.tick(3000);
+  const result = await running;
+  assert.match(result.error.message, /teardown could not be confirmed/);
+  assert.equal(result.profileCleanupSafe, false);
+  assert.equal(result.diagnostics.streams.stderr.eofMs, null);
+  assert.equal(typeof result.diagnostics.streams.stdout.eofMs, 'number');
+  assert.equal(typeof result.diagnostics.streams.protocol.eofMs, 'number');
+  assert.ok(result.diagnostics.groupObservations.every(value => value.state === 'absent'));
+  assert.deepEqual(groupSignals, []);
+});
+
+test('geometry diagnostic sink failures cannot change clean probe success', async t => {
+  t.mock.method(console, 'log', () => { throw new Error('diagnostic sink unavailable'); });
+  mockGeometryBrowser(t);
+  const result = await collectGeometryDom('/synthetic/Google Chrome', []);
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry browser identity exposes only bounded numeric bundle version metadata', t => {
+  assert.equal(geometryBrowserIdentity(undefined).family, 'unknown');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-geometry-identity-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const contents = path.join(directory, 'Private Fixture.app', 'Contents');
+  fs.mkdirSync(contents, { recursive: true });
+  const plist = path.join(contents, 'Info.plist');
+  fs.writeFileSync(plist, '<key>Private</key><string>secret-never-log</string>'
+    + '<key>CFBundleShortVersionString</key><string>152.0.7977.83</string>');
+  const browserPath = path.join(contents, 'MacOS', 'Google Chrome');
+  const identity = geometryBrowserIdentity(browserPath);
+  assert.equal(identity.family, 'chrome');
+  assert.equal(identity.version, process.platform === 'darwin' ? '152.0.7977.83' : null);
+  assert.doesNotMatch(JSON.stringify(identity), /Private|Fixture|secret|never-log|\.app|Contents/);
+  fs.writeFileSync(plist, '<key>CFBundleShortVersionString</key><string>secret-never-log</string>');
+  assert.equal(geometryBrowserIdentity(path.join(contents, 'MacOS', 'Chromium')).version, null);
+  fs.writeFileSync(plist, 'x'.repeat(128 * 1024 + 1));
+  assert.equal(geometryBrowserIdentity(path.join(contents, 'MacOS', 'chromium')).version, null);
 });
 
 test('geometry probe fails and retains its profile when inherited output never reaches EOF', async t => {
