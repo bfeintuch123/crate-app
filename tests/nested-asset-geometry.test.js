@@ -22,7 +22,7 @@ const fixtureRequire = Object.assign(
 );
 const helpers = {
   require: fixtureRequire, __dirname, console, process, Buffer, URL,
-  setTimeout, clearTimeout, module: { exports: {} },
+  setTimeout, clearTimeout, setImmediate, clearImmediate, module: { exports: {} },
 };
 vm.createContext(helpers);
 vm.runInContext(fs.readFileSync(sharedPath, 'utf8'), helpers, { filename: sharedPath });
@@ -30,6 +30,7 @@ const browser = helpers.findBrowser();
 
 async function rendered(config) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-nested-geometry-'));
+  let profileCleanupSafe = true, primaryFailure;
   try {
     const base = helpers.productionWorkingFilesFixture();
     const cut = base.indexOf('<pre id="geometry-result">');
@@ -39,6 +40,7 @@ async function rendered(config) {
       + scenario.toString() + ')(' + JSON.stringify(config) + ')</script></body></html>';
     const file = path.join(directory, 'fixture.html');
     fs.writeFileSync(file, html);
+    profileCleanupSafe = false;
     const result = await helpers.collectGeometryDom(browser, [
       '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
       '--disable-background-networking', '--disable-component-update',
@@ -47,6 +49,7 @@ async function rendered(config) {
       `--window-size=${config.width},${config.height}`,
       '--dump-dom', new URL('file://' + file).href,
     ]);
+    profileCleanupSafe = result.profileCleanupSafe;
     assert.ifError(result.error);
     assert.equal(result.signal, null);
     assert.equal(result.status, 0, result.stderr);
@@ -55,8 +58,16 @@ async function rendered(config) {
     const data = JSON.parse(match[1].replaceAll('&quot;', '"').replaceAll('&amp;', '&'));
     assert.equal(data.error, undefined, JSON.stringify(data));
     return data;
+  } catch (failure) {
+    primaryFailure = failure; throw failure;
   } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
+    if (profileCleanupSafe) {
+      try { fs.rmSync(directory, { recursive: true, force: true }); }
+      catch (failure) {
+        if (!primaryFailure) throw failure;
+        primaryFailure.message += `; private profile cleanup failed (${failure.code || 'unknown'}), retained`;
+      }
+    }
   }
 }
 

@@ -349,30 +349,86 @@ function productionWorkingFilesFixture() {
   return html.replace('</body>', `<pre id="geometry-result"></pre><script src="app.js"></script><script>${probe}</script></body>`);
 }
 
-// Chrome may finish --dump-dom without exiting. Close only this isolated
-// browser through its private pipe, then require a clean native process exit.
+// A native exit and inherited-pipe close are different events. Require the
+// original DOM/exit contract, then reap only this probe's owned process group
+// before callers may remove its profile. Neither teardown nor a late exit can
+// turn a timed-out probe into a success.
 function collectGeometryDom(browser, args) {
   return new Promise(resolve => {
-    const child = childProcess.spawn(browser, [...args, '--remote-debugging-pipe'], {
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
-    });
+    let child;
+    try {
+      child = childProcess.spawn(browser, [...args, '--remote-debugging-pipe'], {
+        detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      resolve({ status: null, signal: null, stdout: '', stderr: '', error, profileCleanupSafe: true });
+      return;
+    }
     let stdout = '', stderr = '', protocol = '', error = null, closeSent = false;
-    let bytes = 0, settled = false;
-    const finish = (status, signal) => {
+    let bytes = 0, settled = false, tearingDown = false, exited = false, spawnFailed = false;
+    let status = null, signal = null, pollTimer, cleanupTimer, termTimer, killTimer, drainImmediate;
+    const startedAt = Date.now(), stages = [{ stage: 'spawn', ms: 0 }], signals = [];
+    const stage = name => { if (stages.length < 16) stages.push({ stage: name, ms: Date.now() - startedAt }); };
+    const groupState = () => {
+      if (!Number.isInteger(child.pid) || child.pid <= 0) return spawnFailed ? 'absent' : 'unknown';
+      try { process.kill(-child.pid, 0); return 'present'; }
+      catch (failure) { return failure.code === 'ESRCH' ? 'absent' : 'unknown'; }
+    };
+    const finish = profileCleanupSafe => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      for (const pending of [pollTimer, cleanupTimer, termTimer, killTimer]) clearTimeout(pending);
+      clearImmediate(drainImmediate);
       if (!error && !/<\/html>\s*$/.test(stdout)) error = new Error('Chrome geometry DOM was incomplete');
-      resolve({ status, signal, stdout, stderr, error });
+      const diagnostics = { stages, bytes, stdoutBytes: Buffer.byteLength(stdout),
+        htmlEndSeen: stdout.includes('</html>'), stdoutTailTag: stdout.match(/<\/?([a-z0-9-]+)[^>]*>\s*$/i)?.[1] || null,
+        exited, closeSent, signals, profileCleanupSafe,
+        stderrTail: stderr.slice(-2048).replaceAll(/[\r\n]+/g, ' ')
+          .replaceAll(/(?:https?|file):\/\/\S+/g, '[url]')
+          .replaceAll(/\/(?:Users|var|private|tmp)\/[^\s)]+/g, '[path]') };
+      if (error) error.message += `; geometry transport ${JSON.stringify(diagnostics)}`;
+      for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) stream.destroy();
+      if (!profileCleanupSafe) child.unref?.();
+      resolve({ status, signal, stdout, stderr, error, diagnostics, profileCleanupSafe });
+    };
+    const inspectTeardown = () => {
+      if (settled) return;
+      if ((exited || spawnFailed) && groupState() === 'absent') {
+        // Give already-buffered pipe data/errors one final event-loop turn;
+        // inherited pipes need not emit close after their process group is gone.
+        if (!drainImmediate) drainImmediate = setImmediate(() => {
+          drainImmediate = null;
+          if (groupState() === 'absent') { stage('teardown-complete'); finish(true); }
+          else inspectTeardown();
+        });
+        return;
+      }
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(inspectTeardown, 25);
+    };
+    const signalOwnedGroup = value => {
+      if (settled || groupState() !== 'present') return;
+      try { process.kill(-child.pid, value); signals.push(value); stage(value); }
+      catch (failure) { if (failure.code !== 'ESRCH') error ||= new Error('Chrome owned-group termination failed'); }
+      inspectTeardown();
+    };
+    const beginTeardown = () => {
+      if (settled || tearingDown) return;
+      tearingDown = true; clearTimeout(timer); stage('teardown-start');
+      cleanupTimer = setTimeout(() => {
+        error ||= new Error('Chrome geometry teardown could not be confirmed; private profile retained');
+        stage('teardown-unconfirmed'); finish(false);
+      }, 3000);
+      // The DOM/clean-main-exit success requirement remains in the caller.
+      // Residual descendants cannot withhold pipe close or race profile removal.
+      termTimer = setTimeout(() => signalOwnedGroup('SIGTERM'), 200);
+      killTimer = setTimeout(() => signalOwnedGroup('SIGKILL'), 800);
+      inspectTeardown();
     };
     const fail = failure => {
       if (settled) return;
-      error ||= failure;
-      child.kill('SIGKILL');
-      // Inherited browser pipes can outlive the child and withhold `close`.
-      // Release only this probe's streams and settle with the original failure.
-      for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) stream.destroy();
-      finish(null, 'SIGKILL');
+      error ||= failure; beginTeardown();
     };
     const timer = setTimeout(() => {
       fail(Object.assign(new Error('Chrome geometry probe ETIMEDOUT'), { code: 'ETIMEDOUT' }));
@@ -390,10 +446,15 @@ function collectGeometryDom(browser, args) {
     child.stdio[4].setEncoding('utf8');
     child.stdout.on('data', chunk => {
       if (!accountBytes(chunk)) return;
+      if (!stdout) stage('first-output');
       stdout += chunk;
       if (!error && !closeSent && /<\/html>\s*$/.test(stdout)) {
+        stage('dom-complete');
         closeSent = true;
-        child.stdio[3].write(JSON.stringify({ id: 1, method: 'Browser.close' }) + '\0');
+        if (!exited) {
+          stage('browser-close-sent');
+          child.stdio[3].write(JSON.stringify({ id: 1, method: 'Browser.close' }) + '\0', failure => { if (failure) fail(failure); });
+        } else beginTeardown();
       }
     });
     child.stderr.on('data', chunk => { if (accountBytes(chunk)) stderr += chunk; });
@@ -413,8 +474,18 @@ function collectGeometryDom(browser, args) {
     for (const stream of [child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) {
       stream.on('error', fail);
     }
-    child.on('error', fail);
-    child.on('close', finish);
+    child.on('error', failure => { spawnFailed = !Number.isInteger(child.pid); fail(failure); });
+    const exitedNative = (code, nativeSignal) => {
+      if (settled) return;
+      if (!exited) { exited = true; status = code; signal = nativeSignal; stage('native-exit'); }
+      if (error || status !== 0 || signal !== null || /<\/html>\s*$/.test(stdout)) beginTeardown();
+      if (tearingDown) inspectTeardown();
+    };
+    child.on('exit', exitedNative);
+    child.on('close', (code, nativeSignal) => {
+      exitedNative(code, nativeSignal);
+      if (!settled && !/<\/html>\s*$/.test(stdout)) fail(new Error('Chrome geometry DOM was incomplete'));
+    });
   });
 }
 
@@ -423,7 +494,9 @@ async function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
   const fixturePath = path.join(temporaryDirectory, 'fixture.html');
   fs.writeFileSync(fixturePath, html, 'utf8');
 
+  let profileCleanupSafe = true, primaryFailure;
   try {
+    profileCleanupSafe = false;
     const result = await collectGeometryDom(browser, [
       '--headless=new',
       '--disable-gpu',
@@ -439,14 +512,23 @@ async function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
       new URL(`file://${fixturePath}`).href,
     ]);
 
+    profileCleanupSafe = result.profileCleanupSafe;
     assert.ifError(result.error);
     assert.equal(result.signal, null, `browser terminated with ${result.signal}`);
     assert.equal(result.status, 0, result.stderr || `browser exited with ${result.status}`);
     const match = result.stdout.match(/<pre id="geometry-result">([^<]+)<\/pre>/);
     assert.ok(match, 'geometry probe must emit structured results');
     return JSON.parse(match[1].replaceAll('&quot;', '"').replaceAll('&amp;', '&'));
+  } catch (failure) {
+    primaryFailure = failure; throw failure;
   } finally {
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    if (profileCleanupSafe) {
+      try { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+      catch (failure) {
+        if (!primaryFailure) throw failure;
+        primaryFailure.message += `; private profile cleanup failed (${failure.code || 'unknown'}), retained`;
+      }
+    }
   }
 }
 
@@ -458,14 +540,30 @@ const probeResult = {
   stderr: '',
 };
 
-function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeError = false, closeOnKill = true } = {}) {
+function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeError = false, closeOnKill = true, withholdClose = false, lingeringGroup = false } = {}) {
   const child = new EventEmitter();
+  child.pid = 742000001;
+  let groupAlive = true;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.stdio = [null, child.stdout, child.stderr, new PassThrough(), new PassThrough()];
   const commands = [];
-  const finish = (status, signal) => queueMicrotask(() => child.emit('close', status, signal));
+  const finish = (status, signal) => queueMicrotask(() => {
+    if (!lingeringGroup) groupAlive = false;
+    child.emit('exit', status, signal);
+    if (!withholdClose) child.emit('close', status, signal);
+  });
   child.kill = signal => { if (closeOnKill) finish(null, signal); return true; };
+  const groupSignals = [];
+  const kill = t.mock.method(process, 'kill', (pid, signal) => {
+    assert.equal(pid, -child.pid, 'only the owned detached group may be inspected or signalled');
+    if (!groupAlive) throw Object.assign(new Error('group gone'), { code: 'ESRCH' });
+    if (signal !== 0) {
+      groupSignals.push(signal);
+      if (closeOnKill === true || closeOnKill === signal) { groupAlive = false; finish(null, signal); }
+    }
+    return true;
+  });
   child.stdio[3].on('data', chunk => {
     commands.push(chunk.toString());
     if (pipeError) child.stdio[3].emit('error', new Error('close pipe failed'));
@@ -473,6 +571,7 @@ function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeEr
   });
   const spawn = t.mock.method(childProcess, 'spawn', (_browser, args, options) => {
     assert.ok(args.includes('--remote-debugging-pipe'));
+    assert.equal(options.detached, true);
     assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe', 'pipe', 'pipe']);
     queueMicrotask(() => {
       if (result.error) child.emit('error', result.error);
@@ -482,7 +581,7 @@ function mockGeometryBrowser(t, result = probeResult, { holdOpen = false, pipeEr
     });
     return child;
   });
-  return { child, commands, spawn, finish };
+  return { child, commands, spawn, finish, groupSignals, kill };
 }
 
 for (const [label, failure, expected] of [
@@ -506,6 +605,79 @@ test('geometry probe explicitly closes completed DOM and accepts only clean exit
   assert.equal(spawn.mock.callCount(), 1);
 });
 
+test('geometry probe accepts clean native exit with complete DOM when inherited pipes withhold close', async t => {
+  const { child } = mockGeometryBrowser(t, probeResult, { withholdClose: true });
+  let closed = false;
+  child.on('close', () => { closed = true; });
+  const result = await collectGeometryDom('fixture-browser', []);
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0);
+  assert.equal(result.signal, null);
+  assert.equal(result.profileCleanupSafe, true);
+  assert.equal(closed, false);
+  assert.ok([child.stdout, child.stderr, child.stdio[3], child.stdio[4]].every(stream => stream.destroyed));
+});
+
+test('geometry probe waits for buffered DOM after native exit before accepting success', async t => {
+  const { child, finish } = mockGeometryBrowser(t, { ...probeResult, stdout: probeResult.stdout.replace('</html>', '') },
+    { holdOpen: true, withholdClose: true });
+  let resolved = false;
+  const running = collectGeometryDom('fixture-browser', []).then(result => { resolved = true; return result; });
+  await new Promise(setImmediate);
+  finish(0, null);
+  await new Promise(setImmediate);
+  assert.equal(resolved, false, 'native exit alone must not satisfy the DOM contract');
+  child.stdout.write('</html>');
+  const result = await running;
+  assert.equal(result.error, null);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry probe reaps the owned residual group before permitting profile cleanup', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { groupSignals } = mockGeometryBrowser(t, probeResult, { withholdClose: true, lingeringGroup: true });
+  let resolved = false;
+  const running = collectGeometryDom('fixture-browser', []).then(result => { resolved = true; return result; });
+  await new Promise(setImmediate);
+  assert.equal(resolved, false);
+  t.mock.timers.tick(200);
+  const result = await running;
+  assert.deepEqual(groupSignals, ['SIGTERM']);
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0, 'residual-group cleanup must not replace the main browser exit status');
+  assert.equal(result.signal, null);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry probe bounds escalation to SIGKILL on its owned group', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { groupSignals } = mockGeometryBrowser(t, probeResult, { withholdClose: true, lingeringGroup: true, closeOnKill: 'SIGKILL' });
+  const running = collectGeometryDom('fixture-browser', []);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(800);
+  const result = await running;
+  assert.deepEqual(groupSignals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(result.error, null);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry probe keeps the original deadline active after clean exit without complete DOM', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { finish } = mockGeometryBrowser(t, { ...probeResult, stdout: probeResult.stdout.replace('</html>', '') },
+    { holdOpen: true, withholdClose: true });
+  let resolved = false;
+  const running = collectGeometryDom('fixture-browser', []).then(result => { resolved = true; return result; });
+  await new Promise(setImmediate);
+  finish(0, null);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(29_999);
+  assert.equal(resolved, false);
+  t.mock.timers.tick(1);
+  const result = await running;
+  assert.equal(result.error.code, 'ETIMEDOUT');
+  assert.equal(result.profileCleanupSafe, true);
+});
+
 test('geometry probe times out when completed DOM never gets a clean browser exit', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { commands } = mockGeometryBrowser(t, probeResult, { holdOpen: true });
@@ -514,17 +686,88 @@ test('geometry probe times out when completed DOM never gets a clean browser exi
   await new Promise(setImmediate);
   assert.equal(commands.length, 1);
   t.mock.timers.tick(30_000);
+  t.mock.timers.tick(1000);
   await rejected;
 });
 
-test('geometry probe timeout settles and releases pipes even when kill never emits close', async t => {
+test('geometry probe retains the profile when owned-group teardown cannot be confirmed', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { child } = mockGeometryBrowser(t, probeResult, { holdOpen: true, closeOnKill: false });
+  const { child, spawn, groupSignals } = mockGeometryBrowser(t, probeResult, { holdOpen: true, closeOnKill: false });
   const rejected = assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /ETIMEDOUT/);
   await new Promise(setImmediate);
+  const profileArg = spawn.mock.calls[0].arguments[1].find(value => value.startsWith('--user-data-dir='));
+  const temporaryDirectory = path.dirname(profileArg.slice('--user-data-dir='.length));
+  // This test has no native browser; remove only its mock fixture after proving retention.
+  t.after(() => fs.rmSync(temporaryDirectory, { recursive: true, force: true }));
   t.mock.timers.tick(30_000);
+  t.mock.timers.tick(3000);
   await rejected;
+  assert.deepEqual(groupSignals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(fs.existsSync(temporaryDirectory), true);
   assert.ok([child.stdout, child.stderr, child.stdio[3], child.stdio[4]].every(stream => stream.destroyed));
+});
+
+test('geometry probe keeps timeout primary after a late clean exit and complete DOM', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { finish } = mockGeometryBrowser(t, probeResult, { holdOpen: true, closeOnKill: false, withholdClose: true });
+  const running = collectGeometryDom('fixture-browser', []);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30_000);
+  finish(0, null);
+  const result = await running;
+  assert.equal(result.error.code, 'ETIMEDOUT');
+  assert.match(result.error.message, /geometry transport/);
+  assert.equal(result.status, 0);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry probe fails closed when owned-group existence cannot be inspected', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { groupSignals, kill } = mockGeometryBrowser(t);
+  kill.mock.mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+  const running = collectGeometryDom('fixture-browser', []);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(3000);
+  const result = await running;
+  assert.match(result.error.message, /teardown could not be confirmed/);
+  assert.equal(result.profileCleanupSafe, false);
+  assert.deepEqual(groupSignals, []);
+});
+
+test('geometry probe latches the first error while draining shutdown pipes', async t => {
+  const { child } = mockGeometryBrowser(t, probeResult, { withholdClose: true });
+  const running = collectGeometryDom('fixture-browser', []);
+  queueMicrotask(() => child.stderr.emit('error', new Error('first pipe failure')));
+  queueMicrotask(() => child.stdio[4].emit('error', new Error('second pipe failure')));
+  const result = await running;
+  assert.match(result.error.message, /^first pipe failure/);
+  assert.doesNotMatch(result.error.message, /second pipe failure/);
+  assert.equal(result.profileCleanupSafe, true);
+});
+
+test('geometry probe treats synchronous spawn failure as safe to clean without signalling', async t => {
+  t.mock.method(childProcess, 'spawn', () => { throw new Error('spawn rejected'); });
+  const kill = t.mock.method(process, 'kill', () => { throw new Error('must not inspect another process'); });
+  const result = await collectGeometryDom('fixture-browser', []);
+  assert.match(result.error.message, /spawn rejected/);
+  assert.equal(result.profileCleanupSafe, true);
+  assert.equal(kill.mock.callCount(), 0);
+});
+
+test('geometry probe preserves the browser failure if profile removal also fails', async t => {
+  mockGeometryBrowser(t, { ...probeResult, status: 1 });
+  const remove = fs.rmSync;
+  let retained;
+  t.mock.method(fs, 'rmSync', directory => {
+    retained = directory;
+    throw Object.assign(new Error('mock profile still busy'), { code: 'ENOTEMPTY' });
+  });
+  t.after(() => { if (retained) remove(retained, { recursive: true, force: true }); });
+  await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), failure => {
+    assert.match(failure.message, /browser exited with 1/);
+    assert.match(failure.message, /private profile cleanup failed \(ENOTEMPTY\), retained/);
+    return true;
+  });
 });
 
 test('geometry probe rejects shutdown pipe errors despite completed DOM', async t => {
