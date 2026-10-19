@@ -25,7 +25,7 @@ replaceExactlyOnce('  captureProjectOperation,\n  runScanOnOpen',
   '  pauseWorkingPsdPublicationSource(wait) { const prepare = prepareWorkingPsdReconciliation, digest = getAddFilesCurrentSourceDigest; let prepared = false; prepareWorkingPsdReconciliation = async (...args) => { const result = await prepare(...args); prepared = true; return result; }; getAddFilesCurrentSourceDigest = async (...args) => { if (prepared) { prepared = false; await wait(); } return digest(...args); }; return () => { prepareWorkingPsdReconciliation = prepare; getAddFilesCurrentSourceDigest = digest; }; },\n' +
   '  forceWorkingPsdPendingAdmission() { const stage = stageLiveObservedFile; stageLiveObservedFile = (project, file, observation = {}) => stage(project, file, file.source === \'psd-embedded\' ? { ...observation, forcePending: true } : observation); return () => { stageLiveObservedFile = stage; }; },\n' +
   '  clearPsdParseDebounce(filePath) { psdParseDebounce.delete(filePath); },\n' +
-  '  pollPsForProject, pollLsofForProject, projectHasUnresolvedLocalAssetBaseline,\n' +
+  '  pollPsForProject, pollLsofForProject, runBackgroundWatcherOperation, projectHasUnresolvedLocalAssetBaseline,\n' +
   '  getIllustratorPollState(id) { return { scopeRevision: getIllustratorActivationScope(id)?.revision, inProgress: psInProgress.has(id) }; },\n' +
   '  getScannedPaths(id) { return [...(scannedDesignFiles.get(id) || [])]; },\n' +
   '  isWatcherGenerationCurrent(projectId, generation) { return getWatcherCoordinator(projectId).isCurrent(projectId, generation); },\n' +
@@ -792,21 +792,51 @@ function baselineCases() {
       }
     });
   }
-  for (const observation of ['pending-unsaved', 'independent-equal-assets-focus']) {
-    baselineTest(`v22 explicit integration negative ${observation}: ordinary DOC query cannot infer succession`, async () => {
+  async function observeNegativeFixture(f) {
+    const idle = () => {
+      const state = metadataTestHooks.getWatcherCoordinatorSnapshot(f.project.id);
+      return !state.running && state.pendingKinds.length === 0 &&
+        !metadataTestHooks.getIllustratorPollState(f.project.id).inProgress;
+    };
+    // Periodic polls can resolve as coalesced without reading this snapshot.
+    // Serialize this fixture's observations before changing its modeled DOCs
+    // or clearing timers that may still own a deferred observation.
+    await waitForCondition(idle, 'negative fixture observer did not become idle');
+    const result = await f.live();
+    assert.notEqual(result?.skipped, true, 'negative fixture observation was skipped');
+    await waitForCondition(idle, 'negative fixture observation did not finish');
+  }
+  for (const [observation, overlap] of [
+    ['pending-unsaved', false],
+    ['independent-equal-assets-focus', false],
+    ['pending-unsaved', true],
+  ]) {
+    baselineTest(`v22 explicit integration negative ${observation}${overlap ? ' with a busy observer' : ''}: ordinary DOC query cannot infer succession`, async () => {
       const f = await fixture({ sources: 2, sourceNames: ['A.ai', 'B.ai'], structuredLinks: false });
       const [a, b] = f.paths;
       fs.writeFileSync(b.source, fs.readFileSync(a.source));
       const current = () => storeInstance.data.projects.find(p => p.id === f.project.id);
+      let releasePredecessor, predecessor;
       try {
         manualDialogFor([a.source]);
         assert.ok(Array.isArray(await callIpcRaw('projects:add-files', f.project.id, crypto.randomUUID())));
         assert.equal((await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include')).success, true);
         const baseline = structuredClone(current().assetBaseline), aBytes = fs.readFileSync(a.source);
         f.state.opened = true; f.state.visible = 1;
-        await f.live(); clearTrackedTimers();
+        await observeNegativeFixture(f); clearTrackedTimers();
         f.state.visible = 2; f.state.modified = observation === 'pending-unsaved';
-        await f.live(); clearTrackedTimers();
+        if (overlap) {
+          const gate = deferred();
+          let entered = false;
+          releasePredecessor = () => gate.release();
+          predecessor = metadataTestHooks.runBackgroundWatcherOperation(f.project.id, 'live-app', async () => {
+            entered = true; await gate.promise;
+          });
+          await waitForCondition(() => entered, 'negative fixture predecessor did not start');
+          assert.equal(metadataTestHooks.getWatcherCoordinatorSnapshot(f.project.id).runningKind, 'live-app');
+          queueMicrotask(releasePredecessor);
+        }
+        await observeNegativeFixture(f); clearTrackedTimers();
         const bRow = current().files.find(row => row.path === b.source);
         if (observation === 'pending-unsaved') {
           assert.equal(bRow, undefined);
@@ -818,7 +848,7 @@ function baselineCases() {
           // Coexisting A stays open when B becomes current. Equal links and
           // a focus switch do not supply a path-transition pair or owner intent.
           f.paths.splice(0, 2, b, a);
-          await f.live(); clearTrackedTimers();
+          await observeNegativeFixture(f); clearTrackedTimers();
           assert.deepEqual((await metadataTestHooks.selectProjectFilesForPackaging(current()))
             .filter(row => row.ext === '.ai').map(row => row.name).sort(), ['A.ai', 'B.ai']);
         }
@@ -827,7 +857,11 @@ function baselineCases() {
         assert.equal(workspace.files.find(row => row.name === 'A.ai').sourceSelection, 'selected');
         assert.deepEqual(current().assetBaseline, baseline);
         assert.deepEqual(fs.readFileSync(a.source), aBytes);
-      } finally { await callIpcRaw('projects:pause', f.project.id); await f.cleanup(); }
+      } finally {
+        releasePredecessor?.();
+        if (predecessor) await predecessor;
+        await callIpcRaw('projects:pause', f.project.id); await f.cleanup();
+      }
     });
   }
   for (const invalidation of ['pause', 'project', 'account', 'reauthorize', 'revision', 'changed-bytes', 'missing']) {
