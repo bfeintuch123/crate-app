@@ -870,6 +870,64 @@ for (const acceptSecond of [true, false]) {
   });
 }
 
+test('actual worker root and layer receipts stay in their domains during repeated ordinary extraction', async t => {
+  assert.ok(agPsd, 'prepared ag-psd dependency required');
+  const h = harness(t);
+  const source = path.join(h.root, 'domain.psd');
+  const rootRecords = agPsd.readPsd(createSyntheticPsd(), {
+    skipLayerImageData: true, skipCompositeImageData: true,
+  }).linkedFiles;
+  const layerBytes = Buffer.from('layer-only embedded PSB bytes');
+  fs.writeFileSync(source, agPsd.writePsdBuffer({ width: 1, height: 1,
+    linkedFiles: rootRecords,
+    children: [{ name: 'layer carrier', linkedFiles: [
+      { id: '33333333-3333-4333-8333-333333333333', name: 'embedded.png', data: layerBytes },
+    ] }],
+  }));
+  const run = await h.start(source, 10000, 'domain');
+  const result = await run.promise;
+  const assets = run.transaction.promote();
+  const root = assets.find(asset => asset.psdResource.layerPath === null);
+  const layer = assets.find(asset => asset.psdResource.layerPath !== null);
+  assert.ok(root); assert.ok(layer);
+  const ordinaryRootRecords = agPsd.readPsd(fs.readFileSync(source), {
+    skipLayerImageData: true, skipCompositeImageData: true,
+  }).linkedFiles;
+  assert.ok(ordinaryRootRecords.some(record => record.linkedFile), 'the saved root inventory includes an external record');
+  const rootIndex = ordinaryRootRecords.findIndex(record => record.id === root.psdResource.producerId);
+  assert.ok(rootIndex >= 0);
+  assert.equal(root.psdResource.linkedIndex, rootIndex, 'worker root index equals the actual saved-byte parser order');
+  assert.equal(root.psdResource.originalName, ordinaryRootRecords[rootIndex].name);
+  assert.equal(layer.psdResource.linkedIndex, 0, 'layer index is local to its own carrier');
+  const project = { id: 'domain', files: assets.map(asset => ({ path: asset.filePath, source: asset.source,
+    psdResource: { ...asset.psdResource, parentPath: source, current: true } })), pendingFiles: [] };
+  run.transaction.accept(project); await run.finish();
+  h.context.readPsd = agPsd.readPsd;
+  h.context.getProjects = () => [project];
+  h.context.mutateProject = (_, mutate) => mutate(project);
+  h.context.invalidatePackageReviewForProject = () => {};
+  h.context.sendToRenderer = () => {};
+  vm.runInContext([
+    section('function normalizeTrackedFilePath(', 'function getFigmaAssetDedupKey('),
+    section('function psdBaselineFileIdentity(', 'function findPsdBaselineReceiptRow('),
+    section('function updatePsdExtractionReceiptHolds(', 'function retainReferencedPsdOutputs('),
+    section('async function extractPsdAssets(', '\n/**'),
+  ].join('\n'), h.context);
+  const initialNames = fs.readdirSync(run.extractDir).sort();
+  for (let scan = 0; scan < 3; scan++) {
+    let stages;
+    const ordinary = await h.context.extractPsdAssets(source, 'domain', () => true, {
+      strict: true, onOrdinaryPsdOutputs: outputs => { stages = outputs; },
+    });
+    assert.deepEqual(Array.from(ordinary, asset => asset.filePath), [root.filePath]);
+    assert.equal(stages.length, 0, 'ordinary root discovery neither mints root duplicates nor turns layer records into root records');
+    assert.deepEqual(fs.readdirSync(run.extractDir).sort(), initialNames);
+    assert.equal(fs.readFileSync(root.filePath, 'utf8'), 'embedded-worker-bytes');
+    assert.deepEqual(fs.readFileSync(layer.filePath), layerBytes);
+    assert.equal(root.sourceDigest, result.sourceDigest);
+  }
+});
+
 test('legacy PSD extraction retries a destination claimed after both name snapshots', async t => {
   let writes = 0;
   const bothStaged = deferred();
@@ -879,6 +937,8 @@ test('legacy PSD extraction retries a destination claimed after both name snapsh
     await bothStaged.promise;
   } } });
   h.context.readPsd = bytes => ({ linkedFiles: [{ name: 'shared.bin', data: bytes }] });
+  // This isolated concurrency fixture has no previously admitted project rows.
+  h.context.getProjects = () => [];
   vm.runInContext(section('async function extractPsdAssets(', '\n/**'), h.context);
   const a = path.join(h.root, 'a.psd'), b = path.join(h.root, 'b.psd');
   fs.writeFileSync(a, 'legacy a'); fs.writeFileSync(b, 'legacy b');
