@@ -4816,6 +4816,7 @@ test('authoritative plan binds reviewed sources, PSD and presentation derivative
       },
     ] });
 
+    await callIpc('settings:update', 'packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     await callIpc('settings:update', 'includeDiagnosticReport', false);
     const firstReview = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(firstReview.planSummary, {
@@ -19524,7 +19525,7 @@ test('Illustrator activation fails closed when the structured snapshot contains 
 
 // Both schedules use the same explicit choices and the same production startup
 // callback. Only its ordering relative to fresh review differs.
-async function createIllustratorActivationScopeFixture(t) {
+async function createIllustratorActivationScopeFixture(t, { deferSharedAcceptance = false } = {}) {
   const startup = metadataTestHooks.controlLiveAppStartupPoll();
   t.after(() => startup.restore());
   resetTestHomeWorkspace();
@@ -19591,7 +19592,7 @@ async function createIllustratorActivationScopeFixture(t) {
   manualDialogFor([b1Source, b2Source]);
   await callIpc('projects:add-files', project.id);
   fresh = await getProject(project.id);
-  for (const linkedPath of [b1Link, sharedLink]) {
+  for (const linkedPath of (deferSharedAcceptance ? [b1Link] : [b1Link, sharedLink])) {
     if (fresh.pendingFiles.some(file => file.path === linkedPath)) {
       await callIpc('projects:accept-pending', project.id, linkedPath);
       fresh = await getProject(project.id);
@@ -19612,6 +19613,17 @@ async function createIllustratorActivationScopeFixture(t) {
     { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
 
   await metadataTestHooks.waitForWatcherIdle(project.id);
+  if (deferSharedAcceptance) {
+    // The existing-assets include decision accepts this genuine Illustrator
+    // link after earlier polls, without a PNG source scan or scope admission.
+    fresh = await getProject(project.id);
+    const accepted = fresh.files.find(file => file.path === sharedLink);
+    assert.equal(accepted?.source, 'ai-linked');
+    assert.equal(accepted?.acceptedPending, true);
+    assert.equal(accepted?.acceptedPendingAppFamily, 'illustrator');
+    assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id)
+      .admittedDocumentPaths.includes(normalizeLedgerPathForTest(sharedLink)), false);
+  }
   return {
     project, startup, aSource, aLink, b1Source, b2Source, b1Link, b2Link, sharedLink, outputDir,
     async releaseStartup() {
@@ -19640,7 +19652,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
 });
 
 test('Illustrator activation scope refuses review when startup changes admitted membership during presentation', async t => {
-  const f = await createIllustratorActivationScopeFixture(t);
+  const f = await createIllustratorActivationScopeFixture(t, { deferSharedAcceptance: true });
   const gate = deferredScanBoundary();
   let restorePresentation = () => {}, completion, packageCalls = 0, reviewCalls = 0, reviewResult;
   t.after(async () => {
@@ -19680,14 +19692,14 @@ test('Illustrator activation scope refuses review when startup changes admitted 
   const tokensBefore = metadataTestHooks.getPackageReviewState();
   assert.equal(tokensBefore.tokens.length, 1);
   assert.deepEqual(tokensBefore.current, [[f.project.id, tokensBefore.tokens[0]]]);
-  const b2Asset = normalizeLedgerPathForTest(f.b2Link);
-  assert.equal(scopeBefore.admittedDocumentPaths.includes(b2Asset), false);
-  assert.equal(scopeBefore.allowedLinkedPaths.includes(b2Asset), true);
+  const transitionAsset = normalizeLedgerPathForTest(f.sharedLink);
+  assert.equal(scopeBefore.admittedDocumentPaths.includes(transitionAsset), false);
+  assert.equal(scopeBefore.allowedLinkedPaths.includes(transitionAsset), true);
 
   await f.releaseStartup();
   const scopeAfter = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id);
   assert.deepEqual(scopeAfter, {
-    ...scopeBefore, admittedDocumentPaths: [...scopeBefore.admittedDocumentPaths, b2Asset].sort(),
+    ...scopeBefore, admittedDocumentPaths: [...scopeBefore.admittedDocumentPaths, transitionAsset].sort(),
   });
   assert.equal(metadataTestHooks.getProjectOperationScope(f.project.id).revision, revisionBefore + 1);
   assert.notEqual(metadataTestHooks.getReviewedPackageInputSignature(f.project.id), signatureBefore);
