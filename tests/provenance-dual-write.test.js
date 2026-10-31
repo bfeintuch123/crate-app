@@ -19554,7 +19554,7 @@ async function createIllustratorActivationScopeFixture(t, { deferSharedAcceptanc
     if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       queryCount++;
-      return { stdout: `${rows.join('\n')}\n${rows.length === 3 ? 'COMPLETE\t1\t2' : 'COMPLETE\t3\t5'}\n` };
+      return { stdout: `${rows.join('\n')}\nCOMPLETE\t${rows.filter(row => row.startsWith('DOC\t')).length}\t${rows.filter(row => row.startsWith('LINK\t')).length}\n` };
     }
     return { stdout: '' };
   });
@@ -19575,19 +19575,19 @@ async function createIllustratorActivationScopeFixture(t, { deferSharedAcceptanc
     ...rows,
     `DOC\t${b1Source}\tB1_Project.ai\tfalse\ttrue`,
     `LINK\t${b1Source}\tB1_Project.ai\t${b1Link}\tfalse\ttrue`,
-    `LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`,
+    ...(!deferSharedAcceptance ? [`LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`] : []),
     `DOC\t${b2Source}\tB2_Project.ai\tfalse\tfalse`,
     `LINK\t${b2Source}\tB2_Project.ai\t${b2Link}\tfalse\tfalse`,
   ];
   await runTrackedIntervalCallbacks();
   fresh = await waitForProject(
     project.id,
-    item => [b1Source, b1Link, sharedLink, b2Source, b2Link]
+    item => [b1Source, b1Link, ...(!deferSharedAcceptance ? [sharedLink] : []), b2Source, b2Link]
       .every(filePath => [...item.files, ...item.pendingFiles].some(file => file.path === filePath)),
     5000
   );
   assert.equal(fresh.pendingFiles.some(file => file.path === aSource || file.path === aLink), false);
-  assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink), !deferSharedAcceptance);
 
   manualDialogFor([b1Source, b2Source]);
   await callIpc('projects:add-files', project.id);
@@ -19614,8 +19614,23 @@ async function createIllustratorActivationScopeFixture(t, { deferSharedAcceptanc
 
   await metadataTestHooks.waitForWatcherIdle(project.id);
   if (deferSharedAcceptance) {
-    // The existing-assets include decision accepts this genuine Illustrator
-    // link after earlier polls, without a PNG source scan or scope admission.
+    // Settle every existing accepted link through the real poll before the
+    // transition link is observed. B2 may carry ai-linked or scan-on-open
+    // provenance depending on which real observer supplied its file row.
+    await runTrackedIntervalCallbacks();
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    const settled = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    rows.push(`LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`);
+    await runTrackedIntervalCallbacks();
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink && file.source === 'ai-linked'), true);
+    const observed = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    assert.deepEqual(observed.admittedDocumentPaths, settled.admittedDocumentPaths,
+      'Observing an unaccepted Shared link must leave every settled admission unchanged');
+    assert.equal(observed.allowedLinkedPaths.includes(normalizeLedgerPathForTest(sharedLink)), true);
+    assert.equal(observed.admittedDocumentPaths.includes(normalizeLedgerPathForTest(sharedLink)), false);
+    assert.ok(await callIpc('projects:accept-pending', project.id, sharedLink));
     fresh = await getProject(project.id);
     const accepted = fresh.files.find(file => file.path === sharedLink);
     assert.equal(accepted?.source, 'ai-linked');
