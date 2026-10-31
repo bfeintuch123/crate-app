@@ -4858,6 +4858,110 @@ test('notarization logging and failures omit local app paths and tool diagnostic
   }
 });
 
+test('optional notarization Keychain selection preserves literal arguments and awaited staple guards', async () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+    process.env.CRATE_TEST_OUTPUT_ROOT || require('node:os').tmpdir(), 'crate-notary-keychain-'
+  )));
+  const keychain = path.join(root, "literal $(not-a-command) ; ' --keychain-profile other.keychain-db");
+  fs.writeFileSync(keychain, 'synthetic fixture; no credentials', { mode: 0o600 });
+  const context = {
+    appOutDir: root, electronPlatformName: 'darwin',
+    packager: { appInfo: { productFilename: 'Crate' } },
+  };
+  const events = [];
+  let finishSubmission;
+  const accepted = new Promise(resolve => { finishSubmission = resolve; });
+  const previousNamespaces = debug.disable();
+  debug.enable('crate-test:*,electron-notarize:*');
+  try {
+    const operation = notarizing(context, {
+      env: { CRATE_RELEASE_NOTARYTOOL_KEYCHAIN: keychain },
+      notarizeDebug: debug,
+      notarize: async options => {
+        events.push(['submit', options]);
+        assert.equal(debug.enabled('electron-notarize:notarytool'), false);
+        await accepted;
+      },
+      execFileSync: (command, args, options) => {
+        events.push([command, args, options]);
+        return Buffer.alloc(0);
+      },
+    });
+    assert.deepEqual(events, [['submit', {
+      tool: 'notarytool', appPath: path.join(root, 'Crate.app'),
+      keychainProfile: 'crate-release-notarytool', keychain,
+    }]]);
+    finishSubmission();
+    await operation;
+    assert.deepEqual(events.slice(1), [
+      ['/usr/bin/xcrun', ['stapler', 'staple', path.join(root, 'Crate.app')], { stdio: ['ignore', 'pipe', 'pipe'] }],
+      ['/usr/bin/xcrun', ['stapler', 'validate', path.join(root, 'Crate.app')], { stdio: ['ignore', 'pipe', 'pipe'] }],
+    ]);
+    assert.equal(debug.disable(), 'crate-test:*,electron-notarize:*');
+  } finally {
+    debug.enable(previousNamespaces);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('invalid optional notarization Keychain paths fail before submission without path disclosure', async () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+    process.env.CRATE_TEST_OUTPUT_ROOT || require('node:os').tmpdir(), 'crate-notary-invalid-'
+  )));
+  const file = path.join(root, 'synthetic.keychain-db');
+  fs.writeFileSync(file, 'synthetic fixture; no credentials', { mode: 0o600 });
+  const link = path.join(root, 'link.keychain-db');
+  fs.symlinkSync(file, link);
+  const parentLink = path.join(root, 'linked-parent');
+  fs.symlinkSync(root, parentLink, 'dir');
+  const unreadable = path.join(root, 'unreadable.keychain-db');
+  fs.writeFileSync(unreadable, 'synthetic fixture; no credentials', { mode: 0o000 });
+  let calls = 0;
+  try {
+    for (const keychain of ['', 'relative.keychain-db', '--keychain-profile other', null, 42,
+      path.join(root, 'missing.keychain-db'), root, link, unreadable, path.join(parentLink, 'synthetic.keychain-db'),
+      `${file}\n--password secret`, `${file}\u0000`, `${file}\t`, `${file}\u007f`]) {
+      await assert.rejects(notarizing({
+        appOutDir: root, electronPlatformName: 'darwin',
+        packager: { appInfo: { productFilename: 'Crate' } },
+      }, {
+        env: { CRATE_RELEASE_NOTARYTOOL_KEYCHAIN: keychain },
+        notarize: async () => { calls++; }, execFileSync: () => { calls++; },
+      }), error => error.message === '[notarize] Existing Keychain path is invalid or unavailable.' &&
+        error.stack === error.message && !error.message.includes(root) && !error.message.includes('secret'));
+    }
+    assert.equal(calls, 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('explicit Keychain submission and staple failures preserve refusal and diagnostic redaction', async () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(
+    process.env.CRATE_TEST_OUTPUT_ROOT || require('node:os').tmpdir(), 'crate-notary-refusal-'
+  )));
+  const keychain = path.join(root, 'private-synthetic.keychain-db');
+  fs.writeFileSync(keychain, 'synthetic fixture; no credentials', { mode: 0o600 });
+  const context = { appOutDir: root, electronPlatformName: 'darwin', packager: { appInfo: { productFilename: 'Crate' } } };
+  let stapleCalls = 0;
+  try {
+    await assert.rejects(notarizing(context, {
+      env: { CRATE_RELEASE_NOTARYTOOL_KEYCHAIN: keychain },
+      notarize: async () => { throw new Error(`private diagnostics ${keychain} secret`); },
+      execFileSync: () => { stapleCalls++; },
+    }), error => error.message === '[notarize] Signed app could not be submitted and accepted by Apple.' && error.stack === error.message);
+    assert.equal(stapleCalls, 0);
+    await assert.rejects(notarizing(context, {
+      env: { CRATE_RELEASE_NOTARYTOOL_KEYCHAIN: keychain },
+      notarize: async () => {},
+      execFileSync: (command, args) => {
+        stapleCalls++;
+        assert.equal(args[1], 'staple');
+        throw new Error(`private diagnostics ${keychain} secret`);
+      },
+    }), error => error.message === '[notarize] Accepted ticket could not be stapled and validated.' && error.stack === error.message);
+    assert.equal(stapleCalls, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('CODEOWNERS declares Crate review ownership for sensitive release-policy files', () => {
   const codeowners = fs.readFileSync(path.join(ROOT, '.github', 'CODEOWNERS'), 'utf8');
   const ownersByPath = new Map(codeowners.trim().split('\n').map(line => line.trim().split(/\s+/u)));

@@ -1,6 +1,7 @@
 'use strict';
 
 const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const NOTARYTOOL_KEYCHAIN_PROFILE = 'crate-release-notarytool';
@@ -32,6 +33,28 @@ function publicNotarizationError(message) {
   return error;
 }
 
+function resolveNotarytoolKeychain(env) {
+  const keychain = env.CRATE_RELEASE_NOTARYTOOL_KEYCHAIN;
+  if (keychain === undefined) return undefined;
+  try {
+    if (typeof keychain !== 'string' || !path.isAbsolute(keychain) ||
+        /[\u0000-\u001f\u007f]/u.test(keychain)) {
+      throw new Error('invalid keychain path');
+    }
+    const metadata = fs.lstatSync(keychain);
+    if (!metadata.isFile() || metadata.isSymbolicLink() ||
+        fs.realpathSync.native(keychain) !== keychain) {
+      throw new Error('invalid keychain file');
+    }
+    fs.accessSync(keychain, fs.constants.R_OK);
+    return keychain;
+  } catch (error) {
+    throw publicNotarizationError(
+      '[notarize] Existing Keychain path is invalid or unavailable.'
+    );
+  }
+}
+
 function resolveSignedAppPath(context) {
   try {
     if (!context || typeof context !== 'object') throw new Error('invalid context');
@@ -59,6 +82,7 @@ function resolveSignedAppPath(context) {
 async function notarizing(context, dependencies = {}) {
   const appPath = resolveSignedAppPath(context);
   if (!appPath) return;
+  const keychain = resolveNotarytoolKeychain(dependencies.env || process.env);
   const runFile = dependencies.execFileSync || execFileSync;
 
   console.log('[notarize] Submitting signed app to Apple...');
@@ -70,6 +94,7 @@ async function notarizing(context, dependencies = {}) {
         tool: 'notarytool',
         appPath,
         keychainProfile: NOTARYTOOL_KEYCHAIN_PROFILE,
+        ...(keychain === undefined ? {} : { keychain }),
       });
     }, runtime.notarizeDebug);
   } catch (error) {
