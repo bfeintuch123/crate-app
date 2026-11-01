@@ -47,30 +47,36 @@ contract explicitly. Original regression assertions and application guards are
 preserved. Earlier missing-cache refusal coverage was deliberately replaced by
 stronger recovery, exclusivity and retry assertions when recovery was authorized.
 
-Final local focused checks passed 251/251; adjacent checks passed 158/158.
-Selected PSD provenance checks had 90 passes and the same two retained baseline
-failures. The final aggregate result is reported in the PR validation receipt. The prior frozen candidate's complete serial suite
-had 3271 tests: 2958 pass, 311 fail and two skip. All 311 failures belong to the
-retained beta4-reproduced inventory; their individual causes are not all known
-or classified as environmental. The final aggregate must be assessed separately.
+Validation of the implementation at `cfa21469f7682657a37f41e1d7e5977d8bfae7d4`
+passed the complete 72-file Mac suite: 3,294 passed, zero failed and two existing
+skips. Protected exact-head CI run 41208470804 passed the same suite. A fresh
+2026-11-01 isolated Mac check passed 279/279 PSD, worker, watcher and release-policy
+tests after supplying the required task-owned tarball cache. The earlier 278/279
+cache-prerequisite failure is retained in evidence; source/assertions were
+unchanged. Local browser evidence
+uses the reviewed in-memory test-Keychain mode; it does not prove real-Keychain
+or native Adobe behavior. Older cloud failure counts are historical receipts,
+not the current passing candidate's result.
 An exploratory case-only parent-path fixture also fails on the prior candidate
 because the existing project identity framework folds path case; that broader
 identity policy is unchanged here.
 
-Package and lockfiles are unchanged. Refreshed candidate and unchanged beta4
-npm-audit records are identical: 14 affected package groups (two high, twelve
-moderate), including transitive affected chains, and twenty distinct advisory
-URLs. The older retained report listed three direct groups; the refreshed total
-must not be described as three. No dependency remediation or audit waiver occurs.
+High-severity dependency findings were addressed separately. Security
+PR #303 is now merged into `v2.4.x` at
+`1caafbf01d36dc01ab1046b8cae0bdd0bef0c3eb`: Electron 42.11.16, Undici
+6.29.1/7.30.1 and fast-uri 3.1.9. The high-severity audit gate passed; eleven
+moderate findings remain open. Package and lock files match that updated base;
+they are not unchanged against the original beta. This is not an audit waiver.
 
-Two independent supplemental source reviews found no remaining blocker on the
-final source. Actual Opus review supported the previous candidate with limits;
-it does not clear this newer head. The Grok main response identified a 4.7 build,
-but an automatic 4.6 title call, advertised unused search capability and token-cap
-deviation mean it is not counted as a fully compliant requested review. New-head
-external review remains open.
+Fresh cumulative Luna/high and distinct state-integrity source reviews found no
+demonstrated source blocker. Current exact-head CI and complete requested
+external-review receipts must be assessed after any branch or documentation
+update. A continuation tail alone is not a complete review. The proposed
+ordinary merge alone preserves implementation bytes. A new commit still
+requires its own protected CI and review binding.
 
-Protected exact-head CI, native macOS/Adobe/Electron and installed-build/visual
-validation remain separate gates. Linux fixtures and Node advanced IPC do not
-prove those workflows. This is a draft for review, not ready-for-review, merge,
-release or deployment clearance.
+These source results do not supply native macOS/Adobe behavior or stateful
+real-candidate visual evidence. Signed, notarized, installed-app QA belongs to
+the release gate. Required visuals and complete reviews must be checked on the
+final head before ready-for-review or merge. This note grants no merge, release
+or deployment clearance.
