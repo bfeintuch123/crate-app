@@ -592,7 +592,6 @@ async function runGeometryProbe(browser, width, height, html = fixtureHtml()) {
     const result = await collectGeometryDom(browser, [
       '--headless=new',
       '--disable-gpu',
-      '--no-sandbox',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-background-networking',

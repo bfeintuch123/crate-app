@@ -19524,7 +19524,7 @@ test('Illustrator activation fails closed when the structured snapshot contains 
 
 // Both schedules use the same explicit choices and the same production startup
 // callback. Only its ordering relative to fresh review differs.
-async function createIllustratorActivationScopeFixture(t) {
+async function createIllustratorActivationScopeFixture(t, { deferSharedAcceptance = false } = {}) {
   const startup = metadataTestHooks.controlLiveAppStartupPoll();
   t.after(() => startup.restore());
   resetTestHomeWorkspace();
@@ -19553,7 +19553,7 @@ async function createIllustratorActivationScopeFixture(t) {
     if (isIllustratorPgrepCheck({ kind, command, args })) return { stdout: '321\n' };
     if (isOsascriptInvocation({ kind, command, args }, 'crate-ai-active-session.applescript')) {
       queryCount++;
-      return { stdout: `${rows.join('\n')}\n${rows.length === 3 ? 'COMPLETE\t1\t2' : 'COMPLETE\t3\t5'}\n` };
+      return { stdout: `${rows.join('\n')}\nCOMPLETE\t${rows.filter(row => row.startsWith('DOC\t')).length}\t${rows.filter(row => row.startsWith('LINK\t')).length}\n` };
     }
     return { stdout: '' };
   });
@@ -19574,24 +19574,24 @@ async function createIllustratorActivationScopeFixture(t) {
     ...rows,
     `DOC\t${b1Source}\tB1_Project.ai\tfalse\ttrue`,
     `LINK\t${b1Source}\tB1_Project.ai\t${b1Link}\tfalse\ttrue`,
-    `LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`,
+    ...(!deferSharedAcceptance ? [`LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`] : []),
     `DOC\t${b2Source}\tB2_Project.ai\tfalse\tfalse`,
     `LINK\t${b2Source}\tB2_Project.ai\t${b2Link}\tfalse\tfalse`,
   ];
   await runTrackedIntervalCallbacks();
   fresh = await waitForProject(
     project.id,
-    item => [b1Source, b1Link, sharedLink, b2Source, b2Link]
+    item => [b1Source, b1Link, ...(!deferSharedAcceptance ? [sharedLink] : []), b2Source, b2Link]
       .every(filePath => [...item.files, ...item.pendingFiles].some(file => file.path === filePath)),
     5000
   );
   assert.equal(fresh.pendingFiles.some(file => file.path === aSource || file.path === aLink), false);
-  assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink), true);
+  assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink), !deferSharedAcceptance);
 
   manualDialogFor([b1Source, b2Source]);
   await callIpc('projects:add-files', project.id);
   fresh = await getProject(project.id);
-  for (const linkedPath of [b1Link, sharedLink]) {
+  for (const linkedPath of (deferSharedAcceptance ? [b1Link] : [b1Link, sharedLink])) {
     if (fresh.pendingFiles.some(file => file.path === linkedPath)) {
       await callIpc('projects:accept-pending', project.id, linkedPath);
       fresh = await getProject(project.id);
@@ -19612,6 +19612,32 @@ async function createIllustratorActivationScopeFixture(t) {
     { id: card.id, revision: card.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
 
   await metadataTestHooks.waitForWatcherIdle(project.id);
+  if (deferSharedAcceptance) {
+    // Settle every existing accepted link through the real poll before the
+    // transition link is observed. B2 may carry ai-linked or scan-on-open
+    // provenance depending on which real observer supplied its file row.
+    await runTrackedIntervalCallbacks();
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    const settled = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    rows.push(`LINK\t${b1Source}\tB1_Project.ai\t${sharedLink}\tfalse\ttrue`);
+    await runTrackedIntervalCallbacks();
+    await metadataTestHooks.waitForWatcherIdle(project.id);
+    fresh = await getProject(project.id);
+    assert.equal(fresh.pendingFiles.some(file => file.path === sharedLink && file.source === 'ai-linked'), true);
+    const observed = metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id);
+    assert.deepEqual(observed.admittedDocumentPaths, settled.admittedDocumentPaths,
+      'Observing an unaccepted Shared link must leave every settled admission unchanged');
+    assert.equal(observed.allowedLinkedPaths.includes(normalizeLedgerPathForTest(sharedLink)), true);
+    assert.equal(observed.admittedDocumentPaths.includes(normalizeLedgerPathForTest(sharedLink)), false);
+    assert.ok(await callIpc('projects:accept-pending', project.id, sharedLink));
+    fresh = await getProject(project.id);
+    const accepted = fresh.files.find(file => file.path === sharedLink);
+    assert.equal(accepted?.source, 'ai-linked');
+    assert.equal(accepted?.acceptedPending, true);
+    assert.equal(accepted?.acceptedPendingAppFamily, 'illustrator');
+    assert.equal(metadataTestHooks.getIllustratorActivationScopeSnapshot(project.id)
+      .admittedDocumentPaths.includes(normalizeLedgerPathForTest(sharedLink)), false);
+  }
   return {
     project, startup, aSource, aLink, b1Source, b2Source, b1Link, b2Link, sharedLink, outputDir,
     async releaseStartup() {
@@ -19640,7 +19666,7 @@ test('Illustrator activation scope excludes baseline A and admits B1/B2 with sha
 });
 
 test('Illustrator activation scope refuses review when startup changes admitted membership during presentation', async t => {
-  const f = await createIllustratorActivationScopeFixture(t);
+  const f = await createIllustratorActivationScopeFixture(t, { deferSharedAcceptance: true });
   const gate = deferredScanBoundary();
   let restorePresentation = () => {}, completion, packageCalls = 0, reviewCalls = 0, reviewResult;
   t.after(async () => {
@@ -19680,14 +19706,14 @@ test('Illustrator activation scope refuses review when startup changes admitted 
   const tokensBefore = metadataTestHooks.getPackageReviewState();
   assert.equal(tokensBefore.tokens.length, 1);
   assert.deepEqual(tokensBefore.current, [[f.project.id, tokensBefore.tokens[0]]]);
-  const b2Asset = normalizeLedgerPathForTest(f.b2Link);
-  assert.equal(scopeBefore.admittedDocumentPaths.includes(b2Asset), false);
-  assert.equal(scopeBefore.allowedLinkedPaths.includes(b2Asset), true);
+  const transitionAsset = normalizeLedgerPathForTest(f.sharedLink);
+  assert.equal(scopeBefore.admittedDocumentPaths.includes(transitionAsset), false);
+  assert.equal(scopeBefore.allowedLinkedPaths.includes(transitionAsset), true);
 
   await f.releaseStartup();
   const scopeAfter = metadataTestHooks.getIllustratorActivationScopeSnapshot(f.project.id);
   assert.deepEqual(scopeAfter, {
-    ...scopeBefore, admittedDocumentPaths: [...scopeBefore.admittedDocumentPaths, b2Asset].sort(),
+    ...scopeBefore, admittedDocumentPaths: [...scopeBefore.admittedDocumentPaths, transitionAsset].sort(),
   });
   assert.equal(metadataTestHooks.getProjectOperationScope(f.project.id).revision, revisionBefore + 1);
   assert.notEqual(metadataTestHooks.getReviewedPackageInputSignature(f.project.id), signatureBefore);

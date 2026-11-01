@@ -3,6 +3,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const crypto = require('node:crypto');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 
@@ -553,3 +555,300 @@ test('destination is a single labeled button at the top of Package Summary', () 
   assert.match(summary, /id="modal-dest-path"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(summary, /~\/Desktop\//);
 });
+
+// Characterization of the unchanged renderer, not a recovery implementation.
+// A deferred bridge models an outstanding request, not why a native picker
+// stalled. One real, unchanged PNG avoids conflating that wait with asset load.
+function setupStablePngPicker(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-picker-characterization-'));
+  const source = path.join(root, 'Stable.png');
+  // A 1x1 opaque black RGBA pixel with verified PNG chunk CRCs and zlib data.
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==', 'base64');
+  fs.writeFileSync(source, bytes, { flag: 'wx' });
+  const digest = () => crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+  const originalDigest = digest();
+  const file = {
+    path: source, name: 'Stable.png', ext: '.png', projectRole: 'asset', assetOrigin: 'existing',
+    visualIdentity: 'stable-png', visualRevision: 'stable-png-v1', status: 'ready', packageFolder: 'PNG',
+  };
+  const projects = ['picker-a', 'picker-b'].map(id => ({ id, name: id, files: [{ ...file }], pendingFiles: [] }));
+  const reviewFor = (project, token = `review-${project.id}`) => ({
+    projectId: project.id, files: project.files.map(row => ({ ...row })), token, materializable: true,
+  });
+  const snapshots = projects.map(project => JSON.stringify(project));
+  const requests = [], operations = [], toasts = [];
+  const calls = { pickers: 0, active: 0, peak: 0, packages: 0, scans: 0, projectReads: 0 };
+  const { document, elements } = createInteractiveRendererDom();
+  const renderer = loadRendererHelpers(document, { crate: {
+    getFileVisual: async () => null,
+    getProjects: async () => { calls.projectReads++; return projects; },
+    preparePackageReview: async id => reviewFor(projects.find(project => project.id === id)),
+    preScanSession: async () => { calls.scans++; return null; },
+    packageProject: async () => { calls.packages++; throw new Error('Unexpected package execution in picker characterization'); },
+    selectOutputFolder: () => {
+      const gate = deferred(), request = { gate, pending: true };
+      requests.push(request);
+      calls.pickers++; calls.active++; calls.peak = Math.max(calls.peak, calls.active);
+      return gate.promise.finally(() => { request.pending = false; calls.active--; });
+    },
+  } });
+  renderer.pickerProjects = projects;
+  vm.runInContext(`state.projects = pickerProjects; state.selectedProjectId = pickerProjects[0].id;
+    state.settings = { namingTemplate: '{Project}', packageOutputLayoutMode: 'by-extension-v1' };
+    state.packageOutputPath = null; accountStatus = { canUseWorkspace: true };`, renderer);
+  renderer.showToast = message => toasts.push(message);
+  renderer.setupEventListeners();
+  renderer.renderPackageReview(projects[0], reviewFor(projects[0]));
+  const read = expression => vm.runInContext(expression, renderer);
+  const start = (confirmation = false) => {
+    const operation = confirmation ? renderer.confirmPackage() : renderer.choosePackageDestination();
+    operations.push(operation);
+    return operation;
+  };
+  const assertStable = ({ scans = 0, packages = 0 } = {}) => {
+    assert.equal(digest(), originalDigest);
+    assert.deepEqual(projects.map(project => JSON.stringify(project)), snapshots);
+    assert.equal(read('state.projects.find(project => project.id === state.selectedProjectId).files.length'), 1);
+    assert.equal(calls.scans, scans, 'only explicitly expected synthetic scans are permitted');
+    assert.equal(calls.packages, packages);
+  };
+  const settle = (index, outcome) => {
+    if (outcome === 'rejected') requests[index].gate.reject(new Error('/private/stale-picker-error'));
+    else requests[index].gate.resolve(outcome === 'selected' ? path.join(root, `destination-${index}`) : null);
+  };
+  t.after(async () => {
+    // Resolve owned doubles only after observations; never strand a test promise.
+    for (const request of requests) if (request.pending) request.gate.resolve(null);
+    await Promise.allSettled(operations);
+    assert.equal(calls.active, 0);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { renderer, document, elements, projects, reviewFor, requests, calls, toasts, read, start, settle, assertStable, root };
+}
+
+test('destination characterization: an unanswered bridge blocks a stable single-PNG review', async t => {
+  const f = setupStablePngPicker(t);
+  let finished = false;
+  f.start().then(() => { finished = true; });
+  const owner = f.read('packageDestinationPicker');
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(finished, false, 'controlled request has no response, not a measured native timeout');
+  assert.equal(f.read('packageDestinationPicker'), owner);
+  assert.equal(f.elements['package-review-ready'].textContent, 'Ready to package');
+  assert.equal(f.elements['btn-change-dest'].textContent, 'Choosing…');
+  assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'true');
+  assert.equal(f.elements['btn-change-dest'].disabled, true);
+  assert.equal(f.elements['btn-confirm-package'].disabled, true);
+  await f.renderer.choosePackageDestination();
+  await f.renderer.confirmPackage();
+  assert.equal(f.calls.pickers, 1);
+  assert.equal(f.calls.active, 1);
+  assert.equal(f.calls.peak, 1);
+  f.assertStable();
+});
+
+for (const outcome of ['selected', 'cancelled', 'rejected']) {
+  test(`destination characterization: current ${outcome} reply clears waiting and permits one fresh picker`, async t => {
+    const f = setupStablePngPicker(t);
+    const pending = f.start();
+    f.settle(0, outcome);
+    await pending;
+    assert.equal(f.read('packageDestinationPicker'), null);
+    assert.equal(f.read('state.packageOutputPath'), outcome === 'selected' ? path.join(f.root, 'destination-0') : null);
+    assert.equal(f.read('state.packageReviewToken'), 'review-picker-a');
+    assert.equal(f.elements['btn-change-dest'].disabled, false);
+    assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'false');
+    assert.equal(f.elements['btn-confirm-package'].disabled, false);
+    assert.deepEqual(f.toasts, outcome === 'rejected' ? ['The folder picker could not open. Try again.'] : []);
+    const next = f.start();
+    await f.renderer.choosePackageDestination();
+    await f.renderer.confirmPackage();
+    assert.equal(f.calls.pickers, 2);
+    assert.equal(f.calls.active, 1);
+    assert.equal(f.calls.peak, 1);
+    f.settle(1, 'cancelled');
+    await next;
+    f.assertStable();
+  });
+}
+
+for (const navigation of ['back-reopen', 'project-navigation', 'same-project-reset']) {
+  for (const outcome of ['selected', 'cancelled', 'rejected']) {
+    test(`destination characterization: ${navigation} retains waiting then fences late ${outcome}`, async t => {
+      const f = setupStablePngPicker(t);
+      const pending = f.start();
+      const oldOwner = f.read('packageDestinationPicker');
+      let project = f.projects[0];
+      if (navigation === 'back-reopen') f.elements['btn-back-package'].click();
+      else {
+        if (navigation === 'project-navigation') project = f.projects[1];
+        f.renderer.setSelectedProject(project.id, { invalidate: navigation === 'same-project-reset' });
+      }
+      assert.equal(f.elements['modal-package'].classList.contains('hidden'), true);
+      const review = f.reviewFor(project, `fresh-${project.id}`);
+      assert.equal(await f.renderer.showPackageModal({ runPreScan: false, review }), true);
+      const session = f.read('packageReviewModalSessionId');
+      assert.equal(f.read('packageDestinationPicker'), oldOwner, 'navigation cannot silently release an outstanding bridge');
+      assert.equal(f.elements['package-review-ready'].textContent, 'Ready to package');
+      assert.equal(f.elements['btn-change-dest'].disabled, true);
+      assert.equal(f.elements['btn-confirm-package'].disabled, true);
+      await f.renderer.choosePackageDestination();
+      await f.renderer.confirmPackage();
+      assert.equal(f.calls.pickers, 1);
+      assert.equal(f.calls.peak, 1);
+      f.assertStable();
+      f.settle(0, outcome);
+      await pending;
+      assert.equal(f.read('state.selectedProjectId'), project.id);
+      assert.equal(f.read('state.packageOutputPath'), null, 'late success cannot install an obsolete destination');
+      assert.equal(f.read('state.packageReviewToken'), review.token);
+      assert.equal(f.read('packageReviewModalSessionId'), session);
+      assert.equal(f.elements['modal-package'].classList.contains('hidden'), false);
+      assert.equal(f.read('packageDestinationPicker'), null);
+      assert.equal(f.elements['btn-change-dest'].disabled, false);
+      assert.equal(f.elements['btn-confirm-package'].disabled, false);
+      assert.deepEqual(f.toasts, [], 'stale errors cannot overwrite the current interaction');
+      const fresh = f.start();
+      assert.equal(f.calls.pickers, 2);
+      assert.equal(f.calls.active, 1);
+      assert.equal(f.calls.peak, 1);
+      f.settle(1, 'cancelled');
+      await fresh;
+      f.assertStable();
+    });
+  }
+}
+
+test('destination characterization: unchanged project refresh does not retire or duplicate a pending picker', async t => {
+  const f = setupStablePngPicker(t);
+  const pending = f.start(), owner = f.read('packageDestinationPicker');
+  assert.equal(await f.renderer.refreshProjectState(f.projects[0].id), true);
+  assert.equal(f.calls.projectReads, 1);
+  assert.equal(f.read('packageDestinationPicker'), owner);
+  assert.equal(f.elements['btn-change-dest'].disabled, true);
+  assert.equal(f.elements['btn-confirm-package'].disabled, true);
+  await f.renderer.choosePackageDestination();
+  assert.equal(f.calls.pickers, 1);
+  f.assertStable();
+  f.settle(0, 'cancelled');
+  await pending;
+  assert.equal(f.elements['btn-confirm-package'].disabled, false);
+  f.assertStable();
+});
+
+// Approved guard behavior replaces the old two-request characterization.
+for (const boundary of ['project-navigation', 'same-project-reset', 'account-change']) {
+  for (const outcome of ['selected', 'cancelled', 'rejected']) {
+    test(`shared destination guard: fallback survives ${boundary} until late ${outcome} settles`, async t => {
+      const f = setupStablePngPicker(t);
+      const oldConfirmation = f.start(true);
+      const owner = f.read('packageDestinationPicker');
+      assert.ok(owner, 'confirmation fallback must acquire the shared owner');
+      assert.equal(f.calls.active, 1);
+      await f.renderer.choosePackageDestination();
+      await f.renderer.confirmPackage();
+      let project = f.projects[0];
+      if (boundary === 'project-navigation') {
+        project = f.projects[1];
+        f.renderer.setSelectedProject(project.id);
+      } else if (boundary === 'same-project-reset') {
+        f.renderer.setSelectedProject(project.id, { invalidate: true });
+      } else {
+        f.renderer.acceptAccountSnapshot({ revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'second-synthetic-account' } });
+      }
+      const review = f.reviewFor(project, `new-${boundary}`);
+      assert.equal(await f.renderer.showPackageModal({ runPreScan: false, review }), true);
+      const session = f.read('packageReviewModalSessionId');
+      assert.equal(f.read('packageDestinationPicker'), owner);
+      assert.equal(f.elements['btn-change-dest'].disabled, true);
+      assert.equal(f.elements['btn-confirm-package'].disabled, true);
+      assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'true');
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await f.renderer.choosePackageDestination();
+        await f.renderer.confirmPackage();
+      }
+      assert.equal(f.calls.pickers, 1);
+      assert.equal(f.calls.active, 1);
+      assert.equal(f.calls.peak, 1);
+      f.settle(0, outcome);
+      await oldConfirmation;
+      assert.equal(f.read('packageDestinationPicker'), null);
+      assert.equal(f.read('state.packageOutputPath'), null, 'retired fallback cannot install its old destination');
+      assert.equal(f.read('state.packageReviewToken'), review.token);
+      assert.equal(f.read('packageReviewModalSessionId'), session);
+      assert.equal(f.elements['modal-package'].classList.contains('hidden'), false);
+      assert.equal(f.elements['btn-change-dest'].disabled, false);
+      assert.equal(f.elements['btn-confirm-package'].disabled, false);
+      assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'false');
+      assert.deepEqual(f.toasts, []);
+      const currentPicker = f.start();
+      assert.equal(f.calls.active, 1);
+      assert.equal(f.calls.pickers, 2);
+      assert.equal(f.calls.peak, 1);
+      f.settle(1, 'selected');
+      await currentPicker;
+      assert.equal(f.read('state.packageOutputPath'), path.join(f.root, 'destination-1'));
+      f.assertStable();
+    });
+  }
+}
+
+for (const outcome of ['selected', 'cancelled', 'rejected']) {
+  test(`shared destination guard: current fallback ${outcome} releases ownership and can recover`, async t => {
+    const f = setupStablePngPicker(t);
+    // A synthetic changed-plan response stops after exercising confirmation's
+    // destination adoption; no filesystem package or backend authorization runs.
+    f.renderer.window.crate.packageProject = async () => {
+      f.calls.packages++;
+      return { error: 'package_review_changed', review: f.reviewFor(f.projects[0]) };
+    };
+    const pending = f.start(true);
+    assert.ok(f.read('packageDestinationPicker'));
+    assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'true');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await f.renderer.choosePackageDestination();
+      await f.renderer.confirmPackage();
+    }
+    assert.equal(f.calls.pickers, 1);
+    f.settle(0, outcome);
+    await pending;
+    assert.equal(f.read('packageDestinationPicker'), null);
+    assert.equal(f.read('packageReviewConfirmationInFlight'), false);
+    assert.equal(f.read('state.packageOutputPath'), outcome === 'selected' ? path.join(f.root, 'destination-0') : null);
+    assert.equal(f.elements['modal-package'].classList.contains('hidden'), false);
+    assert.equal(f.elements['btn-change-dest'].disabled, false);
+    assert.equal(f.elements['btn-confirm-package'].disabled, false);
+    assert.equal(f.elements['btn-change-dest'].getAttribute('aria-busy'), 'false');
+    const fresh = f.start();
+    assert.equal(f.calls.pickers, 2);
+    assert.equal(f.calls.active, 1);
+    assert.equal(f.calls.peak, 1);
+    f.settle(1, 'cancelled');
+    await fresh;
+    f.assertStable(outcome === 'selected' ? { scans: 1, packages: 1 } : {});
+  });
+}
+
+for (const entry of ['choose', 'confirmation']) {
+  test(`shared destination guard: synchronously throwing ${entry} bridge releases ownership`, async t => {
+    const f = setupStablePngPicker(t);
+    const realDouble = f.renderer.window.crate.selectOutputFolder;
+    f.renderer.window.crate.selectOutputFolder = () => { f.calls.pickers++; throw new Error('synthetic synchronous bridge failure'); };
+    await f.start(entry === 'confirmation');
+    assert.equal(f.read('packageDestinationPicker'), null);
+    assert.equal(f.read('packageReviewConfirmationInFlight'), false);
+    assert.equal(f.calls.pickers, 1);
+    assert.equal(f.calls.active, 0);
+    assert.equal(f.elements['btn-change-dest'].disabled, false);
+    assert.equal(f.elements['btn-confirm-package'].disabled, false);
+    f.renderer.window.crate.selectOutputFolder = realDouble;
+    const fresh = f.start(entry === 'confirmation');
+    assert.equal(f.calls.pickers, 2);
+    assert.equal(f.calls.active, 1);
+    assert.equal(f.calls.peak, 1);
+    f.settle(0, 'cancelled');
+    await fresh;
+    f.assertStable();
+  });
+}
