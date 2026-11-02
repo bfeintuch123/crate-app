@@ -15187,6 +15187,9 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
  * Complements the AppleScript/do-javascript approach — works even when
  * Photoshop is not running.
  */
+// A concurrent reader must not clear a hold for an output whose repair owner
+// can still discard it before caller acceptance. This set grants no authority.
+const pendingPsdRepairs = new Set();
 async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false;
   options.onOrdinaryPsdOutputs?.(invocationFiles);
   try {
@@ -15333,7 +15336,10 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
               }
             }
             if (!restoreTargets) {
-              updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
+              if (![...pendingPsdRepairs].some(stage =>
+                normalizeTrackedFilePath(stage.extractPath) === normalizeTrackedFilePath(matches[0].path))) {
+                updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
+              }
               discoveredPaths.push({ filePath: matches[0].path, source: 'psd-embedded',
                 embeddedOriginalName: lf.name || '', embeddedIndex, sourceDigest, outputDigest, psdExtractionReceipt });
               continue;
@@ -15354,11 +15360,13 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           outputDigest,
           psdExtractionReceipt,
           restoreTargets,
+          repairSourceSnapshot: restoreTargets ? repairSource : null,
           byteLength: data.length,
           identity: null,
           committed: false,
         };
         invocationFiles.push(staged);
+        if (restoreTargets) pendingPsdRepairs.add(staged);
         if (options.onOwnedPsdOutputs || restoreTargets) {
           const handle = await fs.promises.open(stagedPath,
             fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), OWNER_ONLY_FILE_MODE);
@@ -15414,7 +15422,8 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             throw error;
           }
           assertRepairSource();
-          updatePsdExtractionReceiptHolds(projectId, staged.restoreTargets, false, isCurrent);
+          // Keep the prior refusal until this caller accepts the repaired
+          // member. Extraction success alone does not retire cleanup ownership.
         }
         discoveredPaths.push({
           filePath: staged.extractPath,
@@ -16392,6 +16401,7 @@ function discardOwnedPsdRepair(stage) {
     } catch (_) { /* A replacement is never ours to remove. */ }
   }
   stage.committed = false;
+  pendingPsdRepairs.delete(stage);
 }
 
 function retainReferencedPsdOutputs(outputs, project) {
@@ -16409,8 +16419,26 @@ function retainReferencedPsdOutputs(outputs, project) {
   });
 }
 
-function finishBaselinePsdOutputs(outputs) {
+function finishBaselinePsdOutputs(outputs, projectId, isCurrent = () => false) {
   for (const stage of outputs) {
+    if (stage.restoreTargets && stage.accepted && stage.committed && isCurrent()) {
+      try {
+        // Recheck the exact source and final output used by this repair, after
+        // caller retention. No await separates these checks from the guarded
+        // canonical-row write, and stale work never writes into a new account.
+        assertPsdBaselineSnapshot(stage.repairSourceSnapshot);
+        if (fs.realpathSync(stage.psdExtractionReceipt.parentPath) !== stage.repairSourceSnapshot.realPath) {
+          throw new Error('asset_baseline_source_changed');
+        }
+        assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+        const stat = fs.lstatSync(stage.extractPath);
+        if (!isDirectCacheChild(stage.extractDir, stage.extractPath) || stat.isSymbolicLink() || stat.nlink !== 1 ||
+            !isAddFilesSourceIdentityCurrent(stat, stage.repairFinalIdentity) ||
+            stat.ctimeMs !== stage.repairFinalIdentity.ctimeMs) throw new Error('asset_baseline_psd_output_changed');
+        updatePsdExtractionReceiptHolds(projectId, stage.restoreTargets, false, isCurrent);
+      } catch (_) { /* Changed bytes, receipts or ownership retain the prior refusal. */ }
+    }
+    pendingPsdRepairs.delete(stage);
     if (!stage.committed || stage.accepted || !stage.identity) continue;
     if (stage.restoreTargets) { discardOwnedPsdRepair(stage); continue; }
     try {
@@ -16957,7 +16985,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         if (!baselineScan && operation?.current()) {
           retainReferencedPsdOutputs(baselinePsdOutputs, getProjects().find(project => project.id === projectId));
         }
-        finishBaselinePsdOutputs(baselinePsdOutputs);
+        finishBaselinePsdOutputs(baselinePsdOutputs, projectId, isCurrent);
       } catch (error) {
         dependableScanCompleted = false;
         throw error;
@@ -20045,7 +20073,7 @@ end tell`;
         retainReferencedPsdOutputs(outputs, current);
       }
     }
-    for (const outputs of ordinaryPsdOutputBatches) finishBaselinePsdOutputs(outputs);
+    for (const outputs of ordinaryPsdOutputBatches) finishBaselinePsdOutputs(outputs, projectId, operationCurrent);
     resumeWatcherCoordinatorAfterPackage(projectId);
     if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();

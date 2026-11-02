@@ -911,7 +911,7 @@ test('actual worker root and layer receipts stay in their domains during repeate
     section('function normalizeTrackedFilePath(', 'function getFigmaAssetDedupKey('),
     section('function psdBaselineFileIdentity(', 'function findPsdBaselineReceiptRow('),
     section('function updatePsdExtractionReceiptHolds(', 'function retainReferencedPsdOutputs('),
-    section('async function extractPsdAssets(', '\n/**'),
+    section('const pendingPsdRepairs = new Set();', '\n/**'),
   ].join('\n'), h.context);
   const initialNames = fs.readdirSync(run.extractDir).sort();
   for (let scan = 0; scan < 3; scan++) {
@@ -939,7 +939,7 @@ test('legacy PSD extraction retries a destination claimed after both name snapsh
   h.context.readPsd = bytes => ({ linkedFiles: [{ name: 'shared.bin', data: bytes }] });
   // This isolated concurrency fixture has no previously admitted project rows.
   h.context.getProjects = () => [];
-  vm.runInContext(section('async function extractPsdAssets(', '\n/**'), h.context);
+  vm.runInContext(section('const pendingPsdRepairs = new Set();', '\n/**'), h.context);
   const a = path.join(h.root, 'a.psd'), b = path.join(h.root, 'b.psd');
   fs.writeFileSync(a, 'legacy a'); fs.writeFileSync(b, 'legacy b');
   const [first, second] = await Promise.all([

@@ -301,7 +301,7 @@ const mainUnderTestPath = process.env.CRATE_MAIN_UNDER_TEST
 const originalMainLoader = Module._extensions['.js'];
 Module._extensions['.js'] = function loadMainForOrdinaryPsdCoverage(module, filename) {
   if (filename !== mainUnderTestPath) return originalMainLoader(module, filename);
-  return module._compile(fs.readFileSync(filename, 'utf8') + '\nmodule.exports.__psdSafetyHooks = { runScanOnOpen, mutateProject, getAccountSession() { return accountSession; }, getCrypto() { return crypto; }, interceptExtraction(wrapper) { const before = extractPsdAssets; extractPsdAssets = wrapper(before); return () => { extractPsdAssets = before; }; } };\n', filename);
+  return module._compile(fs.readFileSync(filename, 'utf8') + '\nmodule.exports.__psdSafetyHooks = { runScanOnOpen, mutateProject, getAccountSession() { return accountSession; }, getCrypto() { return crypto; }, getPsdScanState() { return { operations: workingSourceScanOperations.size, leases: workingSourceScanLeases.size, pendingRepairs: typeof pendingPsdRepairs === "undefined" ? 0 : pendingPsdRepairs.size }; }, getPsdScanLease() { return [...workingSourceScanLeases.values()][0]; }, getPrePackageScanState(projectId) { return { inFlight: scanInFlight.has(projectId), settlement: packageScanSettlements.has(projectId) }; }, getPrePackageAppTimeout() { return PRE_PACKAGE_APP_SCAN_TIMEOUT_MS; }, interceptExtraction(wrapper) { const before = extractPsdAssets; extractPsdAssets = wrapper(before); return () => { extractPsdAssets = before; }; } };\n', filename);
 };
 let psdSafetyHooks;
 try { psdSafetyHooks = require(mainUnderTestPath).__psdSafetyHooks; }
@@ -2935,6 +2935,436 @@ for (const winner of ['ordinary', 'pre-package']) for (const aliasParent of [fal
         originalClearTimeout(timeout); Object.values(release).forEach(fn => fn());
         await Promise.allSettled(Object.values(scans)); undo(); copy.mock.restore();
       }
+    });
+  });
+}
+
+// Adjudication-only cases: retain production algorithms, but model the store's
+// JSON serialization boundary rather than lending its persisted object graph.
+async function withAdjudicationClonedStore(t, body) {
+  const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  const get = storeInstance.get.bind(storeInstance), set = storeInstance.set.bind(storeInstance);
+  const observer = { afterProjectWrite: () => {} };
+  const read = t.mock.method(storeInstance, 'get', (...args) => clone(get(...args)));
+  const write = t.mock.method(storeInstance, 'set', (key, value) => {
+    const result = typeof key === 'object' ? set(clone(key)) : set(key, clone(value));
+    if (key === 'projects') observer.afterProjectWrite(clone(get('projects', [])));
+    return result;
+  });
+  try { await body(observer); }
+  finally { write.mock.restore(); read.mock.restore(); }
+}
+
+async function drainAdjudicationPsdScans() {
+  const deadline = process.hrtime.bigint() + 5_000_000_000n;
+  while (psdSafetyHooks.getPsdScanState().operations) {
+    assert.ok(process.hrtime.bigint() < deadline, 'real ordinary scan cleanup must settle');
+    await new Promise(resolve => originalSetTimeout(resolve, 1));
+  }
+}
+
+async function withTwoMissingHeldPsdRecords(suffix, body) {
+  const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+  await withOrdinaryPsdFixture('adjudication-' + suffix, async f => {
+    const payloads = [Buffer.from('first legitimate resource bytes'), Buffer.from('second legitimate resource bytes')];
+    fs.writeFileSync(f.source, actual.writePsdBuffer({ width: 1, height: 1, linkedFiles: [
+      { id: '11111111-1111-4111-8111-111111111111', name: 'First.psb', data: payloads[0] },
+      { id: '22222222-2222-4222-8222-222222222222', name: 'Second.psb', data: payloads[1] },
+    ] }));
+    currentPsdFixture = (buffer, options) => actual.readPsd(buffer, options);
+    assert.deepEqual(await f.scan(), { success: true });
+    const rows = f.rows().sort((a, b) => a.psdExtractionReceipt.linkedIndex - b.psdExtractionReceipt.linkedIndex);
+    assert.equal(rows.length, 2);
+    const originalName = f.current().name, detached = f.current();
+    detached.name = 'unpersisted clone edit';
+    assert.equal(f.current().name, originalName, 'get must not expose persisted aliases');
+    for (const row of rows) fs.writeFileSync(row.path, 'tampered bytes');
+    f.advance(); await f.scan(); await drainAdjudicationPsdScans();
+    assert.deepEqual(f.current().workingSourceRelationshipHolds.map(hold => hold.sourcePath).sort(), rows.map(row => row.path).sort(),
+      'both holds must be created by real failed receipt validation');
+    for (const row of rows) fs.unlinkSync(row.path);
+    f.advance();
+    const state = phase => ({ phase, projectStatus: f.current().status,
+      members: rows.map(row => ({ name: row.name, fileId: row.fileId || row.path,
+        exists: fs.existsSync(row.path),
+        held: (f.current().workingSourceRelationshipHolds || []).some(hold => hold.sourcePath === row.path),
+        digest: fs.existsSync(row.path) ? crypto.createHash('sha256').update(fs.readFileSync(row.path)).digest('hex') : null })),
+      cacheNames: fs.readdirSync(f.extractDir).sort(), scanState: psdSafetyHooks.getPsdScanState() });
+    await body(f, rows, payloads, state);
+  });
+}
+
+for (const route of ['ordinary', 'pre-package']) {
+  for (const retirement of ['second-verification', 'post-return', ...(route === 'ordinary' ? ['timeout', 'lease-cancelled'] : [])]) {
+    test(`adjudication: ${route} ${retirement} retains a hold when owned repair is discarded`, async t => {
+      await withAdjudicationClonedStore(t, async storeObserver => {
+        await withTwoMissingHeldPsdRecords(route + '-' + retirement, async (f, rows, payloads, state) => {
+          const trace = [state('missing-with-two-persisted-holds')];
+          let firstCleared = false, retired = false, lease;
+          const pause = phase => {
+            if (retired) return;
+            retired = true; trace.push(state(phase + '-before-pause'));
+            if (retirement === 'timeout' || retirement === 'lease-cancelled') {
+              lease = psdSafetyHooks.getPsdScanLease(); assert.ok(lease); assert.equal(lease.cancel(retirement === 'timeout' ? 'timeout' : 'cancelled'), true);
+            } else callIpcRaw('projects:pause', f.projectId);
+            trace.push(state(phase + '-after-pause'));
+          };
+          storeObserver.afterProjectWrite = projects => {
+            const project = projects.find(row => row.id === f.projectId);
+            if (!firstCleared && project && !(project.workingSourceRelationshipHolds || []).some(hold => hold.sourcePath === rows[0].path)) {
+              firstCleared = true; trace.push(state('first-hold-cleared'));
+            }
+          };
+          const open = fs.promises.open;
+          const opened = t.mock.method(fs.promises, 'open', async function(file, ...args) {
+            const handle = await open.call(fs.promises, file, ...args);
+            if (retirement !== 'post-return' && file === rows[1].path && !retired) {
+              assert.equal(fs.existsSync(rows[0].path), true, 'first repair is verified before second verification waits');
+              assert.equal(firstCleared, false, 'repair cannot clear its hold before caller acceptance');
+              // Leave the filesystem await pending while a separate event-loop
+              // turn delivers pause, rather than reentering a store write.
+              await new Promise((resolve, reject) => originalSetTimeout(() => {
+                try { pause(retirement + '-timer-event'); resolve(); } catch (error) { reject(error); }
+              }, 0));
+            }
+            return handle;
+          });
+          const undo = psdSafetyHooks.interceptExtraction(before => async (...args) => {
+            const result = await before(...args);
+            if (retirement === 'post-return' && args[0] === f.source) pause('post-return');
+            return result;
+          });
+          try {
+            if (route === 'ordinary') await f.scan(); else await callIpcRaw('projects:pre-package-scan', f.projectId);
+            trace.push(state('caller-return'));
+            await drainAdjudicationPsdScans();
+          } finally {
+            storeObserver.afterProjectWrite = () => {};
+            opened.mock.restore(); undo();
+          }
+          assert.equal(firstCleared, false); assert.equal(retired, true);
+          trace.push(state('cleanup-settled'));
+          const violation = !fs.existsSync(rows[0].path) && !(f.current().workingSourceRelationshipHolds || []).some(hold => hold.sourcePath === rows[0].path);
+          assert.equal(fs.existsSync(rows[0].path), false, 'retiring cleanup removes its unchanged owned repair');
+          const blocked = await callIpcRaw('projects:prepare-package-review', f.projectId);
+          assert.equal(blocked.materializable, false, 'missing output still blocks packaging');
+          const out = path.join(f.tmpRoot, 'after-retirement-out'); fs.mkdirSync(out);
+          const refused = await callIpc('projects:package', f.projectId, out);
+          assert.notEqual(refused?.success, true);
+          assert.deepEqual(fs.readdirSync(out), [], 'no substituted or partial package is written');
+          f.advance();
+          if (route === 'ordinary') await f.scan(); else await callIpcRaw('projects:pre-package-scan', f.projectId);
+          await drainAdjudicationPsdScans();
+          trace.push(state('fresh-paused-retry'));
+          assert.equal(f.rows().length, 2);
+          for (const [index, row] of rows.entries()) assert.deepEqual(fs.readFileSync(row.path), payloads[index]);
+          assert.deepEqual(f.current().workingSourceRelationshipHolds || [], []);
+          const retained = rows.map(row => fs.statSync(row.path).ino);
+          f.advance();
+          if (route === 'ordinary') await f.scan(); else await callIpcRaw('projects:pre-package-scan', f.projectId);
+          await drainAdjudicationPsdScans();
+          assert.deepEqual(rows.map(row => fs.statSync(row.path).ino), retained, 'retry is idempotent and keeps admitted locators');
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, true);
+          t.diagnostic(JSON.stringify({ route, retirement, violation, trace }));
+          // Keep the same durable-refusal invariant after all cleanup,
+          // package-refusal and retry observations have been collected.
+          assert.equal(violation, false, 'a removed repaired member must not lose its prior durable refusal');
+        });
+      });
+    });
+  }
+
+  test(`adjudication: ${route} accepts two repairs with cloned persisted reads and retries idempotently`, async t => {
+    await withAdjudicationClonedStore(t, async () => {
+      await withTwoMissingHeldPsdRecords('accepted-' + route, async (f, rows, payloads, state) => {
+        if (route === 'ordinary') assert.deepEqual(await f.scan(), { success: true });
+        else await callIpcRaw('projects:pre-package-scan', f.projectId);
+        await drainAdjudicationPsdScans();
+        const accepted = state('accepted');
+        assert.equal(f.rows().length, 2); assert.deepEqual(f.current().workingSourceRelationshipHolds || [], []);
+        for (const [index, row] of rows.entries()) assert.deepEqual(fs.readFileSync(row.path), payloads[index]);
+        const identity = rows.map(row => fs.statSync(row.path).ino);
+        f.advance();
+        if (route === 'ordinary') await f.scan(); else await callIpcRaw('projects:pre-package-scan', f.projectId);
+        await drainAdjudicationPsdScans();
+        assert.deepEqual(rows.map(row => fs.statSync(row.path).ino), identity);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, true);
+        const out = path.join(f.tmpRoot, 'accepted-out'); fs.mkdirSync(out);
+        const packed = await callIpc('projects:package', f.projectId, out);
+        assert.equal(packed.success, true); assert.equal(packed.copiedCount, 3);
+        for (const [index, row] of rows.entries()) assert.deepEqual(fs.readFileSync(path.join(packed.folderPath, row.name)), payloads[index]);
+        t.diagnostic(JSON.stringify({ route, accepted, packagedCount: packed.copiedCount }));
+      });
+    });
+  });
+}
+
+for (const route of ['ordinary', 'pre-package']) {
+  for (const change of ['output-edit', 'source-edit', 'receipt-row', 'account']) {
+    test(`repair acceptance: ${route} preserves refusal across ${change} after extraction`, async t => {
+      await withAdjudicationClonedStore(t, async () => {
+        await withTwoMissingHeldPsdRecords('acceptance-' + route + '-' + change, async (f, rows, payloads, state) => {
+          let changed = false, foreignProject;
+          const account = psdSafetyHooks.getAccountSession(), generation = account.generation;
+          const undo = psdSafetyHooks.interceptExtraction(before => async (...args) => {
+            const result = await before(...args);
+            if (!changed && args[0] === f.source) {
+              changed = true;
+              assert.ok(state('before-change').members.every(row => row.exists && row.held),
+                'all repairs still retain their holds before caller acceptance');
+              if (change === 'output-edit') fs.writeFileSync(rows[0].path, 'USER EDIT AFTER EXTRACTION');
+              if (change === 'source-edit') fs.writeFileSync(f.source, 'USER EDIT TO SAVED SOURCE');
+              if (change === 'receipt-row') {
+                const project = f.current();
+                project.files.find(row => row.path === rows[0].path).captureSessionId = 'new-observation-session';
+                f.persist(project);
+              }
+              if (change === 'account') {
+                account.generation++;
+                foreignProject = f.current(); foreignProject.name = 'Other synthetic account project';
+                f.persist(foreignProject);
+              }
+            }
+            return result;
+          });
+          try {
+            if (route === 'ordinary') await f.scan();
+            else if (change === 'account') await assert.rejects(callIpcRaw('projects:pre-package-scan', f.projectId), /Sign in to Crate/);
+            else await callIpcRaw('projects:pre-package-scan', f.projectId);
+            await drainAdjudicationPsdScans();
+          } finally { undo(); account.generation = generation; }
+          assert.equal(changed, true);
+          const held = new Set((f.current().workingSourceRelationshipHolds || []).map(hold => hold.sourcePath));
+          assert.ok(held.has(rows[0].path), 'changed evidence cannot release the exact prior hold');
+          if (change === 'output-edit') assert.equal(fs.readFileSync(rows[0].path, 'utf8'), 'USER EDIT AFTER EXTRACTION');
+          if (change === 'source-edit') {
+            assert.equal(fs.readFileSync(f.source, 'utf8'), 'USER EDIT TO SAVED SOURCE');
+            assert.ok(held.has(rows[1].path), 'changed parent bytes retain both refusals');
+          }
+          if (change === 'account') {
+            assert.deepEqual(f.current(), foreignProject, 'retired account cannot clear or rewrite the new account project');
+            assert.ok(rows.every(row => !fs.existsSync(row.path)), 'unchanged owned repairs are discarded on account retirement');
+          } else assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, false);
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 0);
+          t.diagnostic(JSON.stringify({ route, change, settled: state('settled') }));
+        });
+      });
+    });
+  }
+
+  for (const timeoutOwner of route === 'ordinary' ? [false, true] : [false]) {
+  test(`repair acceptance: ${route} concurrent reader cannot clear a retiring owner's holds (timeout: ${timeoutOwner})`, async t => {
+    await withAdjudicationClonedStore(t, async () => {
+      await withTwoMissingHeldPsdRecords('reader-' + route + '-' + timeoutOwner, async (f, rows, payloads, state) => {
+        let reached, release;
+        const ready = new Promise(resolve => { reached = resolve; });
+        const gate = new Promise(resolve => { release = resolve; });
+        let ownerArrived = false;
+        const undo = psdSafetyHooks.interceptExtraction(before => async (...args) => {
+          const result = await before(...args);
+          if (!ownerArrived && args[0] === f.source) {
+            ownerArrived = true; reached(); await gate;
+          }
+          return result;
+        });
+        const timeout = originalSetTimeout(() => { reached(); release(); }, 3000);
+        const owner = route === 'ordinary' ? f.scan() : callIpcRaw('projects:pre-package-scan', f.projectId);
+        try {
+          await ready; assert.equal(ownerArrived, true);
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 2);
+          if (timeoutOwner) {
+            assert.equal(psdSafetyHooks.getPsdScanLease().cancel('timeout'), true);
+            assert.deepEqual(await owner, { success: false, error: 'add_files_scan_timeout' });
+            assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 2,
+              'caller timeout returns while the extraction owner still awaits settlement');
+          }
+          f.advance();
+          if (route === 'ordinary') await callIpcRaw('projects:pre-package-scan', f.projectId); else await f.scan();
+          assert.ok(state('after-reader').members.every(row => row.exists && row.held),
+            'a borrower cannot release holds while the repair owner may discard its outputs');
+          if (!timeoutOwner) callIpcRaw('projects:pause', f.projectId);
+          release(); await owner; await drainAdjudicationPsdScans();
+          assert.ok(state('after-owner-retirement').members.every(row => !row.exists && row.held));
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 0);
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, false);
+          f.advance(); await f.scan(); await drainAdjudicationPsdScans();
+          for (const [index, row] of rows.entries()) assert.deepEqual(fs.readFileSync(row.path), payloads[index]);
+          assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+          assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, true);
+        } finally { release(); await owner; undo(); originalClearTimeout(timeout); }
+      });
+    });
+  });
+  }
+}
+
+// Provider adjudication: execute the full production phase helper and route.
+// Only dispatch the actual deadline callback and defer real asynchronous IO.
+function prePackageBoundary() {
+  let enter, release;
+  const ready = new Promise(resolve => { enter = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered = false;
+  return { ready, release, get entered() { return entered; },
+    async wait() { entered = true; enter(); await gate; }, signal: () => enter() };
+}
+async function drainPrePackageAdjudication(projectId) {
+  const end = process.hrtime.bigint() + 5_000_000_000n;
+  while (psdSafetyHooks.getPrePackageScanState(projectId).inFlight) {
+    assert.ok(process.hrtime.bigint() < end, 'phase settlement must retire the in-flight marker');
+    await new Promise(resolve => originalSetTimeout(resolve, 1));
+  }
+}
+
+for (const boundaryKind of ['second-verification', 'post-return', 'second-stage-write', 'second-stage-open', 'edited-first', 'same-bytes-first']) {
+  test(`pre-package phase adjudication: timeout at ${boundaryKind} cannot reopen hold/file split`, async t => {
+    await withAdjudicationClonedStore(t, async () => {
+      await withTwoMissingHeldPsdRecords('phase-' + boundaryKind, async (f, rows, payloads, state) => {
+        const boundary = prePackageBoundary(), trace = [];
+        let ownerStages, blocked = false, ownerSettled = false, deadline;
+        const stageState = phase => ({ ...state(phase), packageScan: psdSafetyHooks.getPrePackageScanState(f.projectId),
+          ownerSettled, stages: (ownerStages || []).map(stage => ({ name: path.basename(stage.extractPath),
+            committed: stage.committed, accepted: stage.accepted === true,
+            tempExists: fs.existsSync(stage.stagedPath), ownedIdentity: stage.identity,
+            repairFinalIdentity: stage.repairFinalIdentity || null })) });
+        const watch = originalSetTimeout(() => { boundary.signal(); boundary.release(); }, 5000);
+        const timer = global.setTimeout;
+        const capture = t.mock.method(global, 'setTimeout', function(fn, delay, ...args) {
+          const handle = timer(fn, delay, ...args);
+          if (delay === psdSafetyHooks.getPrePackageAppTimeout() && new Error().stack.includes('runPackageScanPhase')) {
+            assert.equal(deadline, undefined, 'only the app-phase deadline is captured');
+            deadline = { delay, fire: () => fn(...args) };
+          }
+          return handle;
+        });
+        const undo = psdSafetyHooks.interceptExtraction(before => async (...args) => {
+          const options = args[3];
+          if (args[0] === f.source && options.onOrdinaryPsdOutputs && !ownerStages) {
+            const publish = options.onOrdinaryPsdOutputs;
+            args[3] = { ...options, onOrdinaryPsdOutputs(outputs) { ownerStages = outputs; publish(outputs); } };
+            const result = await before(...args);
+            if (boundaryKind === 'post-return') await boundary.wait();
+            return result;
+          }
+          return before(...args);
+        });
+        const open = fs.promises.open;
+        const opened = t.mock.method(fs.promises, 'open', async function(file, ...args) {
+          const handle = await open.call(fs.promises, file, ...args);
+          const second = ownerStages?.find(stage => stage.extractPath === rows[1].path);
+          if (!blocked && boundaryKind === 'second-stage-open' && file === second?.stagedPath) {
+            blocked = true; await boundary.wait();
+          } else if (!blocked && boundaryKind === 'second-stage-write' && file === second?.stagedPath) {
+            blocked = true; const write = handle.writeFile.bind(handle);
+            handle.writeFile = async (...writeArgs) => { await boundary.wait(); return write(...writeArgs); };
+          } else if (!blocked && boundaryKind !== 'post-return' && boundaryKind !== 'second-stage-write' && file === rows[1].path) {
+            blocked = true; await boundary.wait();
+          }
+          return handle;
+        });
+        const owner = callIpcRaw('projects:pre-package-scan', f.projectId);
+        try {
+          await boundary.ready;
+          assert.equal(boundary.entered, true, 'the actual requested asynchronous boundary was reached');
+          assert.equal(ownerStages.length, 2); assert.ok(deadline); assert.equal(deadline.delay, 30000);
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 2);
+          assert.ok(stageState('before-timeout').members.every(member => member.held));
+          if (boundaryKind === 'edited-first' || boundaryKind === 'same-bytes-first') {
+            await new Promise(resolve => originalSetTimeout(resolve, 2));
+            fs.writeFileSync(rows[0].path, boundaryKind === 'edited-first' ? Buffer.from('USER MODIFIED CACHE BYTES') : payloads[0]);
+          }
+          trace.push(stageState('before-timeout'));
+          await new Promise(resolve => originalSetTimeout(() => { deadline.fire(); resolve(); }, 0));
+          const timedOut = await owner;
+          assert.equal(timedOut.error, 'package_scan_incomplete');
+          capture.mock.restore();
+          trace.push(stageState('caller-return-cleanup-complete'));
+          assert.equal(ownerSettled, false);
+          assert.deepEqual(psdSafetyHooks.getPrePackageScanState(f.projectId), { inFlight: true, settlement: true });
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 0,
+            'the registry can be empty while the timed-out phase is still settling');
+          assert.ok(ownerStages.every(stage => stage.committed === false && !stage.accepted),
+            'caller cleanup retires every old owner before a borrower can run');
+          assert.ok(stageState('after-cleanup').members.every(member => member.held), 'cleanup did not release prior refusal');
+          if (boundaryKind === 'edited-first' || boundaryKind === 'same-bytes-first') {
+            assert.equal(fs.existsSync(rows[0].path), true, 'changed final identity defeats deletion authority');
+          } else assert.ok(rows.every(row => !fs.existsSync(row.path)), 'unchanged committed repairs are removed before caller returns');
+          const competingPrePackage = await callIpcRaw('projects:pre-package-scan', f.projectId);
+          assert.equal(competingPrePackage.error, 'package_scan_incomplete');
+          assert.equal(competingPrePackage.diagnostics.failurePhase, 'pre-package-scan-in-flight');
+          f.advance(); await f.scan(); await drainAdjudicationPsdScans();
+          trace.push(stageState('ordinary-borrower-complete-before-old-settlement'));
+          const validRows = boundaryKind === 'edited-first' ? [rows[1]] : rows;
+          const beforeRelease = validRows.map(row => ({ dev: fs.statSync(row.path).dev, ino: fs.statSync(row.path).ino }));
+          if (boundaryKind === 'edited-first') {
+            assert.equal(fs.readFileSync(rows[0].path, 'utf8'), 'USER MODIFIED CACHE BYTES');
+            assert.deepEqual(f.current().workingSourceRelationshipHolds.map(hold => hold.sourcePath), [rows[0].path]);
+          } else assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+          // The phase remains a real package input scan until its work settles.
+          const review = callIpcRaw('projects:prepare-package-review', f.projectId);
+          for (let tick = 0; tick < 7; tick++) f.advance();
+          assert.equal((await review).error, 'package_scan_in_flight');
+          boundary.release(); await drainPrePackageAdjudication(f.projectId); ownerSettled = true;
+          trace.push(stageState('old-phase-settled'));
+          assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 0);
+          assert.deepEqual(validRows.map(row => ({ dev: fs.statSync(row.path).dev, ino: fs.statSync(row.path).ino })), beforeRelease,
+            'late old cleanup cannot delete or replace a borrower-validated output');
+          for (const row of validRows) assert.deepEqual(fs.readFileSync(row.path), payloads[rows.indexOf(row)]);
+          if (boundaryKind === 'edited-first') {
+            assert.equal(fs.readFileSync(rows[0].path, 'utf8'), 'USER MODIFIED CACHE BYTES');
+            assert.ok(f.current().workingSourceRelationshipHolds.some(hold => hold.sourcePath === rows[0].path));
+          }
+          const out = path.join(f.tmpRoot, 'phase-timeout-out'); fs.mkdirSync(out);
+          const refused = await callIpc('projects:package', f.projectId, out);
+          assert.notEqual(refused?.success, true); assert.deepEqual(fs.readdirSync(out), [], 'incomplete phase cannot ship bytes');
+          if (boundaryKind === 'edited-first') fs.writeFileSync(rows[0].path, payloads[0]);
+          f.advance();
+          const retried = await callIpcRaw('projects:pre-package-scan', f.projectId);
+          assert.equal(retried?.error, undefined); assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+          assert.deepEqual(fs.readdirSync(f.extractDir).sort(), rows.map(row => row.name).sort(), 'all old stage temporaries drain without duplicate outputs');
+          const packaged = await callIpc('projects:package', f.projectId, out);
+          assert.equal(packaged.success, true); assert.equal(packaged.copiedCount, 3);
+          for (const [index, row] of rows.entries()) assert.deepEqual(fs.readFileSync(path.join(packaged.folderPath, row.name)), payloads[index]);
+          trace.push(stageState('successful-retry'));
+          t.diagnostic(JSON.stringify({ boundaryKind, trace }));
+        } finally {
+          boundary.release(); await owner.catch(() => {}); await drainPrePackageAdjudication(f.projectId);
+          undo(); opened.mock.restore(); capture.mock.restore(); originalClearTimeout(watch);
+        }
+      });
+    });
+  });
+}
+
+for (const route of ['ordinary', 'pre-package']) {
+  test(`pre-package phase adjudication: ${route} accepted output retains hold until source validates`, async t => {
+    await withAdjudicationClonedStore(t, async () => {
+      await withTwoMissingHeldPsdRecords('unverifiable-' + route, async (f, rows, payloads, state) => {
+        const source = fs.readFileSync(f.source); let stages, changed = false;
+        const undo = psdSafetyHooks.interceptExtraction(before => async (...args) => {
+          const publish = args[3].onOrdinaryPsdOutputs;
+          args[3] = { ...args[3], onOrdinaryPsdOutputs(outputs) { stages = outputs; publish(outputs); } };
+          const result = await before(...args);
+          if (!changed) { changed = true; fs.writeFileSync(f.source, 'SAVED SOURCE CHANGED BEFORE ACCEPTANCE'); }
+          return result;
+        });
+        try {
+          if (route === 'ordinary') await f.scan(); else await callIpcRaw('projects:pre-package-scan', f.projectId);
+          await drainAdjudicationPsdScans();
+        } finally { undo(); }
+        assert.equal(changed, true); assert.equal(stages.length, 2);
+        assert.ok(stages.every(stage => stage.accepted === true));
+        assert.equal(psdSafetyHooks.getPsdScanState().pendingRepairs, 0);
+        assert.ok(state('accepted-unverifiable').members.every(member => member.exists && member.held));
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, false);
+        const inodes = rows.map(row => fs.statSync(row.path).ino);
+        fs.writeFileSync(f.source, source); f.advance();
+        await f.scan(); await drainAdjudicationPsdScans();
+        assert.deepEqual(f.current().workingSourceRelationshipHolds, []);
+        assert.deepEqual(rows.map(row => fs.statSync(row.path).ino), inodes);
+        assert.equal((await callIpcRaw('projects:prepare-package-review', f.projectId)).materializable, true);
+        t.diagnostic(JSON.stringify({ route, stagesAccepted: true, recovered: state('source-validated') }));
+      });
     });
   });
 }
