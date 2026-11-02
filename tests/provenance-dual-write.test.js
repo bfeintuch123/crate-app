@@ -4816,6 +4816,7 @@ test('authoritative plan binds reviewed sources, PSD and presentation derivative
       },
     ] });
 
+    await callIpc('settings:update', 'packageOutputLayoutMode', PACKAGE_OUTPUT_LAYOUT_MODES.FLAT);
     await callIpc('settings:update', 'includeDiagnosticReport', false);
     const firstReview = await callIpcRaw('projects:prepare-package-review', project.id);
     assert.deepEqual(firstReview.planSummary, {

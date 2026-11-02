@@ -35,6 +35,7 @@ test('CI browser file hashes reject symlinks, non-files, and oversized input', t
 test('CI browser tree binds content, permissions, inventory and internal framework links', t => {
   const root = temporary(t), file = path.join(root, 'engine');
   fs.writeFileSync(file, 'engine', { mode: 0o644 });
+  const originalMode = fs.statSync(file).mode & 0o777;
   fs.symlinkSync('engine', path.join(root, 'Current'));
   const original = ciChrome.treeHash(root);
   fs.writeFileSync(file, 'changed');
@@ -42,7 +43,7 @@ test('CI browser tree binds content, permissions, inventory and internal framewo
   fs.writeFileSync(file, 'engine');
   fs.chmodSync(file, 0o755);
   assert.notEqual(ciChrome.treeHash(root), original);
-  fs.chmodSync(file, 0o644);
+  fs.chmodSync(file, originalMode);
   fs.writeFileSync(path.join(root, 'extra'), 'extra');
   assert.notEqual(ciChrome.treeHash(root), original);
   fs.unlinkSync(path.join(root, 'extra'));

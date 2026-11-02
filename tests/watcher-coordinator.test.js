@@ -275,16 +275,20 @@ test('changed candidate causes one write and one renderer update in the harness'
 test('actual main mutateProject gate gives unchanged lsof polls zero writes', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   const mutateProjectSource = extractNamedFunction(main, 'mutateProject');
+  const psdHoldSources = ['isSimplePsdReceiptHold', 'capturePsdReceiptHeldMembers',
+    'retireRemovedPsdReceiptHolds', 'normalizeTrackedFilePath']
+    .map(name => extractNamedFunction(main, name)).join('\n');
   const projects = [syntheticProject()];
   let storeWrites = 0;
   const context = {
+    fs, path,
     getProjects: () => projects,
     normalizeAutoCaptureProjectState: () => {},
     normalizeProjectAssetReviewState: () => {},
     safelyEnsureProjectProvenance: () => {},
     store: { set: () => { storeWrites += 1; } },
   };
-  const mutateProject = vm.runInNewContext(`(${mutateProjectSource})`, context);
+  const mutateProject = vm.runInNewContext(`${psdHoldSources}\n(${mutateProjectSource})`, context);
   const lsofOutput = syntheticLsofOutput();
   assert.equal(projects[0].files.length, 267);
   assert.equal(lsofOutput.split('\n').length, 1778);

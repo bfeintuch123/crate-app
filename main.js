@@ -4076,7 +4076,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     if (!byPath.has(key) || !fs.existsSync(obligation.path) || (packagePaths && !packagePaths.has(key))) counts.missingRequiredReferences++;
   }
   if (project?.workingSourceRelationshipHolds !== undefined) {
-    const knownReasons = new Set(['psd-resource-identity-ambiguous', 'psd-resource-domain-changed',
+    const knownReasons = new Set(['psd-extraction-receipt-unverified', 'psd-resource-identity-ambiguous', 'psd-resource-domain-changed',
       'psd-resource-continuity-unverified', 'legacy-psd-object-association-unverified']);
     const includedSourcePaths = new Set(requiredByPath.keys());
     for (const file of files) if (facts.get(getTrackedFileDedupKey(file))?.included) {
@@ -9276,6 +9276,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
+  const heldPsdMembers = capturePsdReceiptHeldMembers(project);
   if (typeof clearFileVisualProjectCache === 'function') clearFileVisualProjectCache(projectId);
   // Background observers can legitimately return changed:false after running
   // their classification/provenance logic. The lsof and live-app observers
@@ -9293,6 +9294,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
     normalizeAutoCaptureProjectState(project);
     normalizeProjectAssetReviewState(project);
     safelyEnsureProjectProvenance(project);
+    retireRemovedPsdReceiptHolds(project, heldPsdMembers);
   }
   let shouldPersist = !persistIfChanged;
   if (persistIfChanged && trustResultChanged) {
@@ -10310,7 +10312,7 @@ function promoteEmbeddedPsdStage(stage, extractDir, usedNames, assertCurrentAndO
       fs.linkSync(stage.stagedPath, stage.extractPath);
       return;
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      if (error.code !== 'EEXIST' || stage.restoreTargets) throw error;
       stage.extractPath = path.join(extractDir, reserveUniqueName(stage.embeddedOriginalName, usedNames));
     }
   }
@@ -15185,7 +15187,11 @@ async function extractLinkedAssetsPhotoshop(filePath, options = {}) {
  * Complements the AppleScript/do-javascript approach — works even when
  * Photoshop is not running.
  */
+// A concurrent reader must not clear a hold for an output whose repair owner
+// can still discard it before caller acceptance. This set grants no authority.
+const pendingPsdRepairs = new Set();
 async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, options = {}) { const invocationFiles = []; let keepInvocationFiles = false;
+  options.onOrdinaryPsdOutputs?.(invocationFiles);
   try {
     // Guard: skip files larger than MAX_PARSE_FILE_SIZE to prevent OOM
     const stat = await fs.promises.stat(psdFilePath);
@@ -15197,6 +15203,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       return [];
     }
     let psd = null;
+    let sourceDigest = null;
     let workerResult = options.validatedPsdResult || null;
     if (workerResult) {
       const expectedIdentity = options.validatedPsdSourceIdentity || workerResult.sourceIdentity;
@@ -15211,6 +15218,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       const buf = options.sourceBuffer || await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
       psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+      sourceDigest = crypto.createHash('sha256').update(buf).digest('hex');
     }
     const discoveredPaths = [];
 
@@ -15257,13 +15265,88 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       const directoryIdentity = captureCacheDirectoryIdentity(extractDir, 'psd-extract-directory');
       options.onOwnedPsdOutputs?.(invocationFiles);
       const usedEmbeddedNames = new Set(fs.readdirSync(extractDir).map(name => name.toLowerCase()));
-      let baselineEmbeddedOrdinal = 0;
+      const project = getProjects().find(project => project.id === projectId);
+      const priorEmbeddedRows = [...(project?.files || []), ...(project?.pendingFiles || [])]
+        .filter(row => row.source === 'psd-embedded');
+      const embeddedRecords = [];
       for (const [embeddedIndex, lf] of linkedFiles.entries()) {
-        if (!isCurrent()) return [];
         if (!lf.data) continue;
-        const safeName = reserveUniqueName(lf.name, usedEmbeddedNames);
-        const extractPath = path.join(extractDir, safeName);
+        await new Promise(resolve => setImmediate(resolve));
+        if (!isCurrent()) return [];
+        const data = Buffer.isBuffer(lf.data) || lf.data instanceof Uint8Array ? lf.data : Buffer.from(lf.data);
+        const outputDigest = crypto.createHash('sha256').update(data).digest('hex');
+        const matches = options.onOwnedPsdOutputs ? [] : priorEmbeddedRows.filter(row => {
+          const receipt = row.psdExtractionReceipt || row.psdResource;
+          return receipt?.version === 1 && receipt.current !== false &&
+            normalizeTrackedFilePath(receipt.parentPath) === normalizeTrackedFilePath(psdFilePath) &&
+            receipt.sourceDigest === sourceDigest && receipt.layerPath === null &&
+            receipt.linkedIndex === embeddedIndex && receipt.originalName === (lf.name || '') &&
+            receipt.outputDigest === outputDigest;
+        });
+        // A later missing member owns its locator before an earlier fresh or
+        // declined same-name record allocates a new output. No legacy path or
+        // unrelated saved-source receipt can reserve a name here.
+        for (const row of matches) if (isDirectCacheChild(extractDir, row.path)) {
+          usedEmbeddedNames.add(path.basename(row.path).toLowerCase());
+        }
+        embeddedRecords.push({ lf, embeddedIndex, outputDigest, matches });
+      }
+      let repairSource = null;
+      const assertRepairSource = () => {
+        if (!repairSource || repairSource.digest !== sourceDigest ||
+            fs.realpathSync(psdFilePath) !== repairSource.realPath) throw new Error('asset_baseline_source_changed');
+        assertPsdBaselineSnapshot(repairSource);
+      };
+      let baselineEmbeddedOrdinal = 0;
+      for (const { lf, embeddedIndex, outputDigest, matches } of embeddedRecords) {
+        if (!isCurrent()) return [];
         const data = Buffer.from(lf.data);
+        const psdExtractionReceipt = { version: 1, parentPath: psdFilePath, sourceDigest,
+          layerPath: null, linkedIndex: embeddedIndex, originalName: lf.name || '', outputDigest };
+        let restoreTargets = null;
+        // A cache filename is an output locator, not a new Photoshop resource.
+        // Reuse only a project member bound to this exact saved source, record
+        // and bytes. Owned baseline stages retain their existing receipt flow.
+        if (!options.onOwnedPsdOutputs) {
+          if (matches.length) {
+            const targets = matches.map(row => ({ path: row.path, row: JSON.stringify(row) }));
+            try {
+              if (matches.length !== 1) throw new Error();
+              if (!isDirectCacheChild(extractDir, matches[0].path)) throw new Error();
+              const snapshot = await readPsdBaselineSnapshot(matches[0].path, isCurrent, directoryIdentity, data.length);
+              if (snapshot.digest !== outputDigest) throw new Error();
+              assertPsdBaselineSnapshot(snapshot);
+            } catch (error) {
+              if (!isCurrent()) return [];
+              if (error.code === 'ENOENT' && matches.length === 1 && isDirectCacheChild(extractDir, matches[0].path)) {
+                try {
+                  assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
+                  repairSource ||= await readPsdBaselineSnapshot(fs.realpathSync(psdFilePath), isCurrent);
+                  assertRepairSource();
+                  try { fs.lstatSync(matches[0].path); }
+                  catch (missing) { if (missing.code === 'ENOENT') restoreTargets = targets; }
+                } catch (_) { /* A changed source or cache never authorizes repair. */ }
+              }
+              if (!restoreTargets) {
+                updatePsdExtractionReceiptHolds(projectId, targets, true, isCurrent);
+                options.onOrdinaryScanFailure?.();
+                // A bad member cannot authorize a replacement or hide other
+                // linked/embedded discoveries from this same saved PSD.
+                continue;
+              }
+            }
+            if (!restoreTargets) {
+              if (![...pendingPsdRepairs].some(stage =>
+                normalizeTrackedFilePath(stage.extractPath) === normalizeTrackedFilePath(matches[0].path))) {
+                updatePsdExtractionReceiptHolds(projectId, targets, false, isCurrent);
+              }
+              discoveredPaths.push({ filePath: matches[0].path, source: 'psd-embedded',
+                embeddedOriginalName: lf.name || '', embeddedIndex, sourceDigest, outputDigest, psdExtractionReceipt });
+              continue;
+            }
+          }
+        }
+        const extractPath = restoreTargets ? restoreTargets[0].path : path.join(extractDir, reserveUniqueName(lf.name, usedEmbeddedNames));
         const stagedPath = safeCacheTempPath(extractPath);
         const staged = {
           stagedPath,
@@ -15274,12 +15357,17 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
           // The streamed parser numbers embedded records only. Preserve the
           // legacy index for other callers, but share its ordinal for receipts.
           embeddedIndex: options.onOwnedPsdOutputs ? baselineEmbeddedOrdinal++ : embeddedIndex,
-          outputDigest: crypto.createHash('sha256').update(data).digest('hex'),
+          outputDigest,
+          psdExtractionReceipt,
+          restoreTargets,
+          repairSourceSnapshot: restoreTargets ? repairSource : null,
+          byteLength: data.length,
           identity: null,
           committed: false,
         };
         invocationFiles.push(staged);
-        if (options.onOwnedPsdOutputs) {
+        if (restoreTargets) pendingPsdRepairs.add(staged);
+        if (options.onOwnedPsdOutputs || restoreTargets) {
           const handle = await fs.promises.open(stagedPath,
             fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), OWNER_ONLY_FILE_MODE);
           try {
@@ -15287,6 +15375,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
             staged.identity = { dev: opened.dev, ino: opened.ino };
             if (!isCurrent()) throw new Error('stale_project_operation');
             await handle.writeFile(data);
+            if (restoreTargets) staged.repairWriteIdentity = psdBaselineFileIdentity(fs.fstatSync(handle.fd));
             assertCacheFileDescriptorIdentity(handle.fd, stagedPath, directoryIdentity, 'psd-extract-file');
           } finally { await handle.close(); }
         } else {
@@ -15304,8 +15393,10 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
       if (!isCurrent()) return [];
       for (const staged of invocationFiles) {
         if (!isCurrent()) return [];
+        try {
         promoteEmbeddedPsdStage(staged, extractDir, usedEmbeddedNames, () => {
           if (!isCurrent()) throw new Error('add_files_parser_cancelled');
+          if (staged.restoreTargets) assertRepairSource();
           assertCacheDirectoryIdentity(directoryIdentity, 'psd-extract-directory');
           const stat = fs.lstatSync(staged.stagedPath);
           if (!isDirectCacheChild(extractDir, staged.stagedPath) || stat.isSymbolicLink() || !stat.isFile() ||
@@ -15319,14 +15410,37 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
         if (finalStat.isSymbolicLink() || !finalStat.isFile() || finalStat.dev !== staged.identity.dev || finalStat.ino !== staged.identity.ino) {
           throw cacheSafetyError('psd-extract-file', 'changed');
         }
+        if (staged.restoreTargets) {
+          if (!isAddFilesSourceIdentityCurrent(finalStat, staged.repairWriteIdentity)) throw new Error('asset_baseline_psd_output_changed');
+          staged.repairFinalIdentity = psdBaselineFileIdentity(finalStat);
+          try {
+            const restored = await readPsdBaselineSnapshot(staged.extractPath, isCurrent, directoryIdentity, staged.byteLength);
+            if (restored.digest !== staged.outputDigest || restored.identity.dev !== staged.identity.dev ||
+                restored.identity.ino !== staged.identity.ino) throw new Error('asset_baseline_psd_output_changed');
+          } catch (error) {
+            if (error.message !== 'stale_project_operation') staged.repairFinalIdentity = null;
+            throw error;
+          }
+          assertRepairSource();
+          // Keep the prior refusal until this caller accepts the repaired
+          // member. Extraction success alone does not retire cleanup ownership.
+        }
         discoveredPaths.push({
           filePath: staged.extractPath,
           source: 'psd-embedded',
           embeddedOriginalName: staged.embeddedOriginalName,
           embeddedIndex: staged.embeddedIndex,
-          sourceDigest: workerResult?.sourceDigest || null,
+          sourceDigest,
           outputDigest: staged.outputDigest,
+          psdExtractionReceipt: staged.psdExtractionReceipt,
         });
+        } catch (error) {
+          if (!staged.restoreTargets) throw error;
+          discardOwnedPsdRepair(staged);
+          if (!isCurrent()) return [];
+          updatePsdExtractionReceiptHolds(projectId, staged.restoreTargets, true, isCurrent);
+          options.onOrdinaryScanFailure?.();
+        }
       }
     }
 
@@ -15337,7 +15451,18 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     if (options.strict === true) throw e;
     options.onOrdinaryScanFailure?.();
     return [];
-  } finally { if (!keepInvocationFiles) for (const staged of invocationFiles) for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) { try { const stat = fs.lstatSync(cleanupPath), owned = staged.identity ? (stat.dev === staged.identity.dev && stat.ino === staged.identity.ino) : !options.onOwnedPsdOutputs; if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath); } catch (_) {} } }
+  } finally {
+    if (!keepInvocationFiles) for (const staged of invocationFiles) {
+      if (staged.restoreTargets) { discardOwnedPsdRepair(staged); continue; }
+      for (const cleanupPath of [staged.stagedPath, ...(staged.committed ? [staged.extractPath] : [])]) {
+        try {
+          const stat = fs.lstatSync(cleanupPath);
+          const owned = staged.identity ? stat.dev === staged.identity.dev && stat.ino === staged.identity.ino : !options.onOwnedPsdOutputs;
+          if (isDirectCacheChild(staged.extractDir, cleanupPath) && owned && !stat.isSymbolicLink() && stat.isFile()) fs.unlinkSync(cleanupPath);
+        } catch (_) {}
+      }
+    }
+  }
 }
 
 /**
@@ -15848,11 +15973,14 @@ function assertPsdBaselineSnapshot(snapshot) {
     throw new Error('asset_baseline_psd_output_changed');
   }
 }
-async function readPsdBaselineSnapshot(filePath, isCurrent, directory = null) {
+async function readPsdBaselineSnapshot(filePath, isCurrent, directory = null, expectedSize = null) {
   const check = () => { if (!isCurrent()) throw new Error('stale_project_operation'); };
   check();
   const initial = fs.lstatSync(filePath);
-  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error('asset_baseline_psd_output_changed');
+  if (initial.isSymbolicLink() || !initial.isFile() ||
+      (expectedSize !== null && (initial.size !== expectedSize || initial.nlink !== 1))) {
+    throw new Error('asset_baseline_psd_output_changed');
+  }
   const snapshot = { path: filePath, realPath: fs.realpathSync(filePath),
     identity: psdBaselineFileIdentity(initial), directory };
   assertPsdBaselineSnapshot(snapshot);
@@ -16131,9 +16259,188 @@ async function prepareWorkingPsdReconciliation(projectId, filePath, assets, link
   } };
 }
 
-function finishBaselinePsdOutputs(outputs) {
+function isSimplePsdReceiptHold(hold) {
+  return hold && hold.reason === 'psd-extraction-receipt-unverified' &&
+    typeof hold.sourcePath === 'string' && path.isAbsolute(hold.sourcePath) &&
+    hold.sourcePath.length <= 16384 && !hold.sourcePath.includes('\0') &&
+    Object.keys(hold).every(key => key === 'reason' || key === 'sourcePath');
+}
+
+function capturePsdReceiptHeldMembers(project) {
+  if (!Array.isArray(project.workingSourceRelationshipHolds)) return null;
+  const holds = project.workingSourceRelationshipHolds.filter(isSimplePsdReceiptHold);
+  if (!holds.length) return null;
+  const members = new Set([...(project.files || []), ...(project.pendingFiles || [])]
+    .map(row => row.path));
+  return new Set(holds
+    .map(hold => hold.sourcePath).filter(key => members.has(key)));
+}
+
+function retireRemovedPsdReceiptHolds(project, heldMembers) {
+  if (!heldMembers?.size || !Array.isArray(project.workingSourceRelationshipHolds)) return;
+  const members = [...(project.files || []), ...(project.pendingFiles || [])];
+  const rawPaths = new Set(members.map(row => row.path));
+  const removed = new Set([...heldMembers].filter(filePath => !rawPaths.has(filePath)));
+  if (!removed.size) return;
+  const retained = new Set(members.map(row => normalizeTrackedFilePath(row.path)));
+  const verification = project.workingSourceVerification;
+  if (verification !== undefined && (!verification || typeof verification !== 'object' || Array.isArray(verification))) return;
+  for (const record of Object.values(verification || {})) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return;
+    for (const field of ['requiredEmbeddedOutputs', 'requiredReferences']) {
+      if (record[field] === undefined) continue;
+      if (!Array.isArray(record[field]) || record[field].some(ref => !ref ||
+          typeof ref.path !== 'string' || !path.isAbsolute(ref.path))) return;
+      for (const ref of record[field]) retained.add(normalizeTrackedFilePath(ref.path));
+    }
+  }
+  // Retire only an existing, simple guard whose last canonical member just
+  // disappeared in this same write. Unknown/old orphan state and obligations
+  // remain conservative. This never touches the historical cache files.
+  project.workingSourceRelationshipHolds = project.workingSourceRelationshipHolds.filter(hold =>
+    !isSimplePsdReceiptHold(hold) || !removed.has(hold.sourcePath) ||
+    retained.has(normalizeTrackedFilePath(hold.sourcePath)));
+}
+
+function getPsdExtractionResourceIdentity(row, parents) {
+  if (row?.source !== 'psd-embedded') return null;
+  // Worker/baseline outputs have their own source-identity reconciliation;
+  // equal saved bytes must not erase its intentional replacement boundary.
+  const receipt = row.psdExtractionReceipt;
+  if (receipt?.version !== 1 || receipt.current === false || receipt.layerPath !== null ||
+      typeof receipt.parentPath !== 'string' || !path.isAbsolute(receipt.parentPath) ||
+      !/^[a-f0-9]{64}$/.test(receipt.sourceDigest) || !/^[a-f0-9]{64}$/.test(receipt.outputDigest) ||
+      !Number.isInteger(receipt.linkedIndex) || receipt.linkedIndex < 0 || typeof receipt.originalName !== 'string') return null;
+  if (!parents.has(receipt.parentPath)) {
+    try {
+      const stat = fs.statSync(receipt.parentPath);
+      parents.set(receipt.parentPath, stat.isFile() ? [normalizeTrackedFilePath(receipt.parentPath), stat.dev, stat.ino] : null);
+    } catch (_) { parents.set(receipt.parentPath, null); }
+  }
+  const parent = parents.get(receipt.parentPath);
+  return { parentAvailable: !!parent,
+    key: JSON.stringify([parent, receipt.sourceDigest, receipt.linkedIndex, receipt.originalName, receipt.outputDigest]) };
+}
+
+function refuseConcurrentPsdOutput(project, incoming) {
+  if (incoming.source !== 'psd-embedded' || !incoming.psdExtractionReceipt) return false;
+  const members = [...(project.files || []), ...(project.pendingFiles || [])];
+  if (members.some(row => row.path === incoming.path)) return false;
+  const parents = new Map();
+  const identity = getPsdExtractionResourceIdentity(incoming, parents);
+  if (!identity) return false;
+  // A saved parent may disappear after extraction. Without its identity this
+  // invocation cannot publish a fresh locator; the existing missing-source
+  // package gate remains in force, and a fresh retry can validate a return.
+  if (!identity.parentAvailable) return true;
+  const existing = members.filter(row =>
+    getPsdExtractionResourceIdentity(row, parents)?.key === identity.key &&
+    normalizeTrackedFilePath(row.path) !== normalizeTrackedFilePath(incoming.path));
+  if (!existing.length) return false;
+  // A parallel parser may have published after this parser's absence check.
+  // Do not add a second locator or assume the retained bytes are validated.
+  // Its next exact receipt/byte validation can clear this ordinary refusal.
+  const previous = project.workingSourceRelationshipHolds;
+  if (previous === undefined || Array.isArray(previous)) {
+    project.workingSourceRelationshipHolds = [...(previous || [])];
+    for (const row of existing) if (!project.workingSourceRelationshipHolds.some(hold =>
+      isSimplePsdReceiptHold(hold) && hold.sourcePath === row.path)) {
+      project.workingSourceRelationshipHolds.push({ reason: 'psd-extraction-receipt-unverified', sourcePath: row.path });
+    }
+  }
+  return true;
+}
+
+function updatePsdExtractionReceiptHolds(projectId, targets, invalid, isCurrent) {
+  const changed = mutateProject(projectId, project => {
+    if (!isCurrent()) return false;
+    const members = [...(project.files || []), ...(project.pendingFiles || [])];
+    const currentTargets = targets.filter(target => members.some(row => {
+      if (JSON.stringify(row) === target.row) return true;
+      if (!invalid) return false;
+      // Observation metadata can change during the awaited byte read. A
+      // refusal still belongs to that canonical resource, but never to a
+      // different row/locator/producer or to a retired receipt. Clearing a
+      // refusal retains the stricter whole-row validation fence.
+      const prior = JSON.parse(target.row);
+      const receipt = row.psdExtractionReceipt || row.psdResource;
+      const priorReceipt = prior.psdExtractionReceipt || prior.psdResource;
+      return row.source === 'psd-embedded' && row.source === prior.source &&
+        row.path === target.path && row.path === prior.path && row.fileId === prior.fileId &&
+        row.parentPsd === prior.parentPsd && receipt?.version === 1 && receipt.current !== false &&
+        JSON.stringify(receipt) === JSON.stringify(priorReceipt);
+    }));
+    if (!currentTargets.length || (!invalid && currentTargets.length !== targets.length)) return false;
+    const previous = project.workingSourceRelationshipHolds;
+    if (previous !== undefined && !Array.isArray(previous)) return false;
+    const paths = new Set(currentTargets.map(target => target.path));
+    const reason = 'psd-extraction-receipt-unverified';
+    const next = (previous || []).filter(hold => !hold || hold.reason !== reason ||
+      !paths.has(hold.sourcePath) || Object.keys(hold).some(key => key !== 'reason' && key !== 'sourcePath'));
+    if (invalid) for (const sourcePath of paths) next.push({ reason, sourcePath });
+    if (JSON.stringify(previous || []) === JSON.stringify(next)) return false;
+    project.workingSourceRelationshipHolds = next;
+    return true;
+  });
+  if (changed) {
+    invalidatePackageReviewForProject(projectId);
+    sendToRenderer('project:updated', { projectId });
+  }
+}
+
+function discardOwnedPsdRepair(stage) {
+  for (const filePath of [stage.stagedPath, ...(stage.committed ? [stage.extractPath] : [])]) {
+    try {
+      assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+      const stat = fs.lstatSync(filePath);
+      if (filePath === stage.extractPath && (!stage.repairFinalIdentity ||
+          !isAddFilesSourceIdentityCurrent(stat, stage.repairFinalIdentity) ||
+          stat.ctimeMs !== stage.repairFinalIdentity.ctimeMs)) continue;
+      if (isDirectCacheChild(stage.extractDir, filePath) && !stat.isSymbolicLink() && stat.isFile() &&
+          stat.dev === stage.identity?.dev && stat.ino === stage.identity?.ino) fs.unlinkSync(filePath);
+    } catch (_) { /* A replacement is never ours to remove. */ }
+  }
+  stage.committed = false;
+  pendingPsdRepairs.delete(stage);
+}
+
+function retainReferencedPsdOutputs(outputs, project) {
+  const paths = new Map();
+  for (const row of [...(project?.files || []), ...(project?.pendingFiles || [])]) {
+    const key = normalizeTrackedFilePath(row.path);
+    if (!paths.has(key)) paths.set(key, []);
+    paths.get(key).push(row.path);
+  }
+  for (const stage of outputs) stage.accepted ||= (paths.get(normalizeTrackedFilePath(stage.extractPath)) || []).some(filePath => {
+    try {
+      const stat = fs.statSync(filePath);
+      return stat.isFile() && stat.dev === stage.identity?.dev && stat.ino === stage.identity?.ino;
+    } catch (_) { return false; }
+  });
+}
+
+function finishBaselinePsdOutputs(outputs, projectId, isCurrent = () => false) {
   for (const stage of outputs) {
+    if (stage.restoreTargets && stage.accepted && stage.committed && isCurrent()) {
+      try {
+        // Recheck the exact source and final output used by this repair, after
+        // caller retention. No await separates these checks from the guarded
+        // canonical-row write, and stale work never writes into a new account.
+        assertPsdBaselineSnapshot(stage.repairSourceSnapshot);
+        if (fs.realpathSync(stage.psdExtractionReceipt.parentPath) !== stage.repairSourceSnapshot.realPath) {
+          throw new Error('asset_baseline_source_changed');
+        }
+        assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
+        const stat = fs.lstatSync(stage.extractPath);
+        if (!isDirectCacheChild(stage.extractDir, stage.extractPath) || stat.isSymbolicLink() || stat.nlink !== 1 ||
+            !isAddFilesSourceIdentityCurrent(stat, stage.repairFinalIdentity) ||
+            stat.ctimeMs !== stage.repairFinalIdentity.ctimeMs) throw new Error('asset_baseline_psd_output_changed');
+        updatePsdExtractionReceiptHolds(projectId, stage.restoreTargets, false, isCurrent);
+      } catch (_) { /* Changed bytes, receipts or ownership retain the prior refusal. */ }
+    }
+    pendingPsdRepairs.delete(stage);
     if (!stage.committed || stage.accepted || !stage.identity) continue;
+    if (stage.restoreTargets) { discardOwnedPsdRepair(stage); continue; }
     try {
       assertCacheDirectoryIdentity(stage.directoryIdentity, 'psd-extract-directory');
       const stat = fs.lstatSync(stage.extractPath);
@@ -16480,6 +16787,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       psdTransaction,
       sourceBuffer: validatedSource?.kind === 'psd-buffer-result' ? validatedSource.buffer : undefined,
       onOwnedPsdOutputs: baselineScan ? outputs => { baselinePsdOutputs = outputs; } : undefined,
+      onOrdinaryPsdOutputs: !baselineScan ? outputs => { baselinePsdOutputs = outputs; } : undefined,
       addFilesAttempt: options.addFilesAttempt,
       validatedPsdResult: validatedSource?.kind === 'psd-worker-result' ? validatedSource.result : undefined,
       validatedPsdSourceIdentity: validatedSource?.kind === 'psd-worker-result' ? validatedSource.sourceIdentity : undefined,
@@ -16547,6 +16855,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
           if ((reconciled && workingReconciliation.blocked) || reconciled?.retained ||
               acceptance?.items.some(item => item.asset === asset && item.previous)) continue;
           const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+          if (asset.psdExtractionReceipt) fileEntry.psdExtractionReceipt = asset.psdExtractionReceipt;
           if (asset.psdResource) {
             fileEntry.psdResource = reconciled?.resource || { ...asset.psdResource, parentPath: filePath };
             // A stable fileId is also the existing asset-exclusion identity.
@@ -16558,6 +16867,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
             }
             if (reconciled?.previous?.assetOrigin) fileEntry.assetOrigin = reconciled.previous.assetOrigin;
           }
+          if (refuseConcurrentPsdOutput(proj, fileEntry)) { changed = true; continue; }
           let baselineMetadataChanged = false;
           if (baselineScan) {
             fileEntry.assetOrigin = 'existing';
@@ -16620,8 +16930,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
       }
       if (psdRowsAccepted) {
         const acceptedProject = getProjects().find(proj => proj.id === projectId);
-        const acceptedPaths = new Set([...(acceptedProject.files || []), ...(acceptedProject.pendingFiles || [])].map(row => row.path));
-        for (const stage of baselinePsdOutputs) stage.accepted = acceptedPaths.has(stage.extractPath);
+        retainReferencedPsdOutputs(baselinePsdOutputs, acceptedProject);
         acceptance?.remember(acceptedProject);
       }
       if (psdResult && isCurrent()) {
@@ -16673,7 +16982,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     try {
       try {
         if (psdTransaction) await psdTransaction.finish();
-        finishBaselinePsdOutputs(baselinePsdOutputs);
+        if (!baselineScan && operation?.current()) {
+          retainReferencedPsdOutputs(baselinePsdOutputs, getProjects().find(project => project.id === projectId));
+        }
+        finishBaselinePsdOutputs(baselinePsdOutputs, projectId, isCurrent);
       } catch (error) {
         dependableScanCompleted = false;
         throw error;
@@ -18928,6 +19240,7 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   }
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
+  const ordinaryPsdOutputBatches = [];
   const stagePrePackageFile = (project, file, observation) => {
     if (!operationCurrent()) return null;
     const staged = stageLiveObservedFile(project, file, observation);
@@ -19302,12 +19615,15 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     const psdFiles = project.files.filter(f => f.ext === '.psd');
     for (const psdFile of psdFiles) {
       if (!fs.existsSync(psdFile.path)) continue;
-      const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent);
+      const psdAssets = await extractPsdAssets(psdFile.path, projectId, operationCurrent, {
+        onOrdinaryPsdOutputs: outputs => ordinaryPsdOutputBatches.push(outputs),
+      });
       if (!operationCurrent()) return;
       for (const asset of psdAssets) {
         const normalizedAssetPath = normalizeTrackedFilePath(asset.filePath);
         if (existingPaths.has(normalizedAssetPath) || pendingPaths.has(normalizedAssetPath)) continue;
         const fileEntry = buildAutoCaptureFileEntry(asset.filePath, asset.source);
+        if (asset.psdExtractionReceipt) fileEntry.psdExtractionReceipt = asset.psdExtractionReceipt;
         const staged = stagePrePackageFile(project, fileEntry, {
           relationshipSourcePath: psdFile.path,
           appFamily: 'photoshop',
@@ -19522,6 +19838,7 @@ end tell`;
       for (const f of scanFiles) {
         const key = getTrackedFileDedupKey(f);
         if (preScanExistingKeys.has(key)) continue;
+        if (refuseConcurrentPsdOutput(proj, f)) continue;
 
         if (!existingKeys.has(key)) {
           proj.files.push(f);
@@ -19540,6 +19857,7 @@ end tell`;
         const existPendingKeys = getTrackedFileKeySet(proj.pendingFiles);
         for (const f of scanPending) {
           const key = getTrackedFileDedupKey(f);
+          if (refuseConcurrentPsdOutput(proj, f)) continue;
           if (!existPendingKeys.has(key) && !existingKeys.has(key)) {
             proj.pendingFiles.push(f);
             existPendingKeys.add(key);
@@ -19551,6 +19869,9 @@ end tell`;
         const storedFile = proj.files.find(f => f.path === file.path && f.source === file.source);
         if (!storedFile) continue;
         recordPrePackageRecoverySessionObservation(proj, storedFile);
+      }
+      for (const outputs of ordinaryPsdOutputBatches) {
+        retainReferencedPsdOutputs(outputs, proj);
       }
       return { files: proj.files };
     });
@@ -19743,6 +20064,16 @@ end tell`;
     ...(figmaPackageError ? { error: figmaPackageError } : {}),
   };
   } finally {
+    // A regenerated legacy locator may already be a member without adding a
+    // row or running the merge. Retain it only while the same operation owns
+    // this account/project view; never adopt another account's membership.
+    if (operationCurrent() && ordinaryPsdOutputBatches.length) {
+      const current = getProjects().find(project => project.id === projectId);
+      for (const outputs of ordinaryPsdOutputBatches) {
+        retainReferencedPsdOutputs(outputs, current);
+      }
+    }
+    for (const outputs of ordinaryPsdOutputBatches) finishBaselinePsdOutputs(outputs, projectId, operationCurrent);
     resumeWatcherCoordinatorAfterPackage(projectId);
     if (!operation.current()) restoreFigmaPackageTransferBlock(projectId, previousFigmaPackageBlock);
     operation.close();
