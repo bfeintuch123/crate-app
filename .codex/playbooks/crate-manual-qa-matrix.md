@@ -36,7 +36,7 @@ These IDs are referenced by the canonical feature inventory. They identify proce
 Use a prompt like:
 
 ```text
-Use .codex/playbooks/crate-manual-qa-matrix.md to run or prepare Crate manual QA. Cover assigned workflows, expected package contents, expected provenance signals, expected exclusions, screenshots, recordings, pass/fail criteria, known limitations, and do not modify app code or release state.
+Use .codex/playbooks/crate-manual-qa-matrix.md to run or prepare Crate manual QA. Cover assigned workflows, expected and observed results, expected package contents, expected provenance signals, expected exclusions, inspected screenshots when appearance matters, optional recordings only when Bryant explicitly requests and approves them, pass/fail criteria, known limitations, and do not modify app code or release state.
 ```
 
 ## QA Principles
@@ -61,8 +61,9 @@ Before running workflows:
 - Confirm Figma scope setting where relevant.
 - Confirm cloud-drive files are available offline if needed.
 - Confirm external drives are mounted if used.
-- Start screen recording for each workflow.
-- Prepare screenshots of source setup, Crate choices, package output, and manifest review.
+- Prepare explicit workflow steps, expected outcomes and an observation record.
+- Recording is optional only when Bryant explicitly requests and approves it; no recording harness is required.
+- Prepare inspected screenshots when layout, appearance or readability is being checked, and when useful for source setup, Crate choices, package output or manifest review.
 
 ## Files Codex May Read
 - `AGENTS.md`
@@ -132,11 +133,14 @@ rg -n "[^[:ascii:]]" AGENTS.md .codex/playbooks
 ```
 
 ## Workflow Matrix
-For every workflow, collect:
+For every workflow, collect evidence bound to the tested revision and runtime.
+Identify synthetic fixtures and any simulated native/backend boundaries. Mark
+recording as not requested when applicable; do not collect media merely to fill
+a template. Collect:
 
-- setup screenshot
-- action recording
-- package output screenshot
+- source/setup description and inspected screenshots when appearance is relevant
+- action steps, expected and observed states, and functional assertions or a direct observation record
+- package output inventory or manifest summary, with inspected screenshots when appearance or readability is being judged
 - optional `Crate Diagnostics/crate-provenance.json` screenshot or redacted summary when diagnostic reports were enabled
 - pass/fail result
 - notes about expected exclusions and known limitations
@@ -696,7 +700,7 @@ Known limitations:
 - Schema v2 manifests are intentionally minimized; omitted private fields are expected and should not be reported as failures.
 
 ## Required Checks
-- Each selected workflow has setup, action, expected package contents, expected provenance signals, expected exclusions, screenshots/recordings, pass/fail criteria, and known limitations.
+- Each selected workflow has setup, action, expected and observed results, expected package contents, expected provenance signals, expected exclusions, required appearance evidence, pass/fail criteria, and known limitations. Optional approved media is listed only when collected.
 - Package output is preserved for each run.
 - Optional `Crate Diagnostics/crate-provenance.json` is inspected or marked unavailable.
 - Expected inclusions and exclusions are both reviewed.
@@ -745,7 +749,7 @@ npx wrangler pages deploy <directory>
 
 ## Definition Of Done
 - Selected workflows are run or marked not run with reasons.
-- Package outputs, manifests, screenshots, recordings, pass/fail status, known limitations, and privacy results are recorded.
+- Package outputs, manifests, required appearance evidence, optional media when collected, scenario results, pass/fail status, known limitations, and privacy results are recorded.
 - Any failures are routed to bug triage or another appropriate playbook.
 - Automated test gaps are stated.
 - No app code, tests, package files, release files, builds, tags, deploys, or dependencies are changed.
@@ -760,7 +764,7 @@ npx wrangler pages deploy <directory>
 - `Crate Diagnostics/crate-provenance.json` findings when diagnostics were enabled.
 - Expected inclusions and exclusions.
 - Privacy check results.
-- Screenshots and recordings collected.
+- Inspected screenshots for appearance checks, and any optional approved media collected (or marked not requested).
 - Known limitations.
 - Failures requiring triage.
 - Commands run and results.

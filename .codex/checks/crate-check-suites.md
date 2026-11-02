@@ -165,26 +165,31 @@ git diff --check
 
 The dependency-free browser geometry test may report an intentional environment skip when Chrome or Chromium is unavailable. That skip does not satisfy the Mac proof gate.
 
-Exact-head macOS evidence gate, using a dependency-complete approved worktree and an owner-only private evidence directory:
+Exact-head behavior and appearance checks must use a dependency-complete
+approved worktree, synthetic data and owner-only private evidence storage.
+Use source-bound rendered-browser checks for renderer geometry and state;
+use targeted native checks for the BrowserWindow minimum contract or other
+native behavior being claimed. Identify simulated boundaries explicitly.
+For stateful resizing, retain scenario steps, expected and observed results,
+and functional assertions or a direct observation record. Changes to appearance
+or readability require inspected before/after screenshots from a real running
+Crate candidate at the exact PR head. Browser assertions alone do not establish
+that appearance acceptance. Recording is optional only when Bryant
+explicitly requests and approves it; no recording harness is a prerequisite.
 
-```sh
-CRATE_UI_SHOW=1 \
-CRATE_UI_EVIDENCE_DIR=<approved-private-evidence-directory> \
-./node_modules/.bin/electron tests/ui-stability-electron-harness.js \
-  > <approved-private-evidence-directory>/geometry-report.json
-```
-
-The exact-head Mac gate must use synthetic data and confirm:
+The exact-head checks must confirm:
 
 - root, app shell, Current Project, files view, and Review Assets have no horizontal overflow;
 - sidebar/content, heading/search, summary/actions, cards, and footer do not intersect;
 - the responsive card-density modes remain readable;
 - search and active-filter state survive resizing;
 - resize alone triggers no project, workspace, or preview requests;
-- screenshots and the complete resize video are inspected and pass privacy review;
+- appearance checks have inspected screenshots and pass privacy review; stateful resize checks have explicit scenario results;
 - the minimum BrowserWindow decision follows measured usability rather than concealing broken geometry.
 
-Any UI-affecting commit after evidence capture makes that evidence stale.
+Any UI-affecting commit after evidence capture makes affected evidence stale;
+refresh it at the current head. Existing browser assertions, native-claim
+validation, CI, identity, sandbox and cleanup requirements are unchanged.
 
 ## release-gate-readonly
 
