@@ -4563,6 +4563,19 @@ function syncPackageDestinationControls() {
   if (confirmButton) confirmButton.disabled = Boolean(packageDestinationPicker) || packageReviewConfirmationInFlight || !state.packageReviewToken;
 }
 
+function acquirePackageDestinationPicker(operation) {
+  if (packageDestinationPicker) return false;
+  packageDestinationPicker = operation;
+  syncPackageDestinationControls();
+  return true;
+}
+
+function releasePackageDestinationPicker(operation) {
+  if (packageDestinationPicker !== operation) return;
+  packageDestinationPicker = null;
+  syncPackageDestinationControls();
+}
+
 async function choosePackageDestination() {
   const modal = $('#modal-package');
   if (packageDestinationPicker || packageReviewConfirmationInFlight || accountStatus.canUseWorkspace !== true ||
@@ -4585,8 +4598,7 @@ async function choosePackageDestination() {
   const focusAnchor = $('#btn-back-package');
   const restoreButtonFocus = document.activeElement === button;
   if (restoreButtonFocus) focusAnchor?.focus?.({ preventScroll: true });
-  packageDestinationPicker = operation;
-  syncPackageDestinationControls();
+  if (!acquirePackageDestinationPicker(operation)) return;
   try {
     const folder = await window.crate.selectOutputFolder();
     if (packageDestinationPicker !== operation || !isCurrent()) return;
@@ -4598,8 +4610,7 @@ async function choosePackageDestination() {
     if (packageDestinationPicker === operation && isCurrent()) showToast('The folder picker could not open. Try again.');
   } finally {
     if (packageDestinationPicker === operation) {
-      packageDestinationPicker = null;
-      syncPackageDestinationControls();
+      releasePackageDestinationPicker(operation);
       if (restoreButtonFocus && isCurrent() && document.activeElement === focusAnchor) button?.focus?.({ preventScroll: true });
     }
   }
@@ -5669,7 +5680,15 @@ async function confirmPackage() {
     // M5: Show folder picker FIRST (before progress modal) to avoid flicker on cancel
     let outputPath = state.packageOutputPath;
     if (!outputPath) {
-      outputPath = await window.crate.selectOutputFolder();
+      const pickerOperation = { confirmationId };
+      if (!acquirePackageDestinationPicker(pickerOperation)) return;
+      try {
+        outputPath = await window.crate.selectOutputFolder();
+      } finally {
+        // Navigation retires the result, not the native-bound request. Keep
+        // the shared owner until this bridge invocation actually settles.
+        releasePackageDestinationPicker(pickerOperation);
+      }
       if (!isCurrentConfirmation()) return;
       if (!outputPath) {
         if (isCurrentConfirmation()) openPackageReviewDialog();
@@ -5749,7 +5768,7 @@ async function confirmPackage() {
     packageReviewConfirmationInFlight = false;
     syncPackageReviewReturnControls();
     hidePackageProgressModal();
-    if (confirmButton) confirmButton.disabled = !state.packageReviewToken;
+    syncPackageDestinationControls();
   }
 }
 
