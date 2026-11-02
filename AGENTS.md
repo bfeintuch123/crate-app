@@ -128,27 +128,44 @@ Before merge:
 3. Inspect changed files.
 4. Run relevant tests.
 5. Check for unrelated watcher/package/parser changes.
-6. Classify user-visible impact and verify the required current visual evidence.
+6. Classify user-visible impact and verify exact-revision functional evidence and any required appearance checks.
 7. Summarize risks.
 8. Do not merge unless Bryant explicitly approves.
 
-## Visual PR Evidence
+## Functional and Visual PR Evidence
 
-UI-changing Crate PRs require sanitized, inspected visual evidence from a real
-running Crate candidate at the exact PR head. Use a short video for stateful
-flows; purely static layout, styling, typography, or spacing changes may use
-inspected before/after screenshots when video adds no meaningful value. A PR
-with no visible UI effect must say why.
+Crate PRs require evidence appropriate to the changed behavior and risk at the
+exact PR head. Stateful flows require explicit scenarios, expected and observed
+states, and functional assertions or a direct observation record. Identify the
+source revision, runtime, fixtures and execution level, including simulated
+native or backend boundaries. Source-bound browser evidence may establish
+renderer behavior; do not represent it as native or installed-app acceptance.
+
+Changes to layout, styling, typography or readability require sanitized,
+inspected visual evidence of the affected appearance, normally before/after
+screenshots from a real running Crate candidate at the exact PR head. Browser
+assertions alone do not establish that appearance acceptance. Native-specific
+behavior claims, including claims of native fixes, require targeted native
+evidence for the behavior claimed. A PR with no intended appearance change must
+say why.
+
+Screen recording and any particular recording harness are not merge
+prerequisites. Record only when Bryant explicitly requests and approves it.
+Missing recording infrastructure is not a correctness failure; failing required
+functional, appearance or safety checks still blocks advancement.
 
 Use only synthetic or explicitly approved test-safe fixtures. Capture only
 Crate and the minimum approved Finder surface; exclude customer or tester work,
 private filenames or paths, Figma links, credentials, notifications, unrelated
 apps, and desktop content. Disable audio unless it is the behavior under test.
-Any later UI-affecting commit makes earlier evidence stale and requires
-recapture.
+Bind evidence to the current PR head and refresh affected functional or
+appearance checks after relevant changes. Exact-head CI and independent-review
+requirements remain unchanged.
 
-Use the approved Crate Ops visual-evidence workflow for capture, validation,
-receipt handling, and publication. Prefer a verified GitHub
+When media is collected, use the approved Crate Ops visual-evidence workflow
+for capture, validation, receipt handling, and publication. Do not create a
+recording or media pipeline merely to fill a functional proof record. Prefer a
+verified GitHub
 attachment. If publication fails, retain the Crate Ops/Crabbox validation
 receipt and exact sanitized media metadata/hash, document the infrastructure
 blocker, and obtain Bryant's explicit exception; a durable public URL is
