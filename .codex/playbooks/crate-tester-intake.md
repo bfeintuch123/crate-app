@@ -100,13 +100,13 @@ Each assignment should state:
 - assets expected to be included
 - assets expected to be excluded
 - package output folder to preserve
-- screen recording and screenshot expectations
+- functional steps/results and inspected screenshot expectations when appearance matters; recording is optional only when explicitly requested and approved
 - what counts as a pass, fail, or unclear result
 
 ## Test Scenario Instructions
 Use these steps as the default structure:
 
-1. Start screen recording before opening or packaging the workflow.
+1. Record the tested revision/runtime, fixture scope, planned steps and expected/observed results. Identify simulated boundaries. Recording is optional only when Bryant explicitly requests and approves it; no recording harness is required. Inspect screenshots when appearance or readability is being judged.
 2. Show the source file, relevant page/artboard/slide, and expected source assets.
 3. Use the workflow naturally, including normal handoffs between Figma, Adobe apps, PowerPoint, Keynote, local folders, or cloud drives.
 4. Run Crate packaging using the assigned scope.
@@ -120,7 +120,7 @@ Use these steps as the default structure:
 The tester should not clean up, rename, or reorganize the package output before Bryant has had a chance to review it.
 
 ## Screen Recording Guidance
-Ask testers to record:
+Only when Bryant explicitly requests and approves recording, ask testers to record:
 
 - the start state before packaging
 - source app windows and relevant files
@@ -269,7 +269,7 @@ Use this template for each session:
 - Category:
 
 ## Artifacts
-- Screen recording:
+- Screen recording (only if explicitly requested and approved; otherwise not requested):
 - Screenshots:
 - Package output path or archive:
 - Crate Diagnostics/crate-provenance.json:
