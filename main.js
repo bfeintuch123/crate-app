@@ -5776,16 +5776,37 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const projectFiles = project.files;
   const projectPendingFiles = project.pendingFiles;
   const selectionSignature = getPackageSelectionInputSignature(project);
-  const packageFiles = await selectProjectFilesForPackaging(project);
-  const membership = getWorkingSourceMembership(project, packageFiles);
-  const presentedFiles = [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])];
-  const diskInput = captureWorkingSourcePresentationDiskInput(presentedFiles, membership);
   const illustratorScope = getIllustratorActivationScope(projectId);
   const cacheEpoch = getFileVisualProjectCacheEpoch(projectId);
   const cacheGeneration = fileVisualProjectCacheGeneration;
   const workspaceActivationToken = getActiveWatchingActivationToken(projectId);
   const workspaceSubscription = acceptedSourceWatchSubscriptions.get(projectId);
   const attribution = getCurrentWorkingFileAttribution(project);
+  const packageFiles = await selectProjectFilesForPackagingSnapshot(project);
+
+  // Filtering can await source-session evidence. Revalidate the exact state
+  // captured above before using its result or building presentation data.
+  const currentProjectAfterSelection = getProjects().find(item => item && item.id === projectId);
+  const selectionProjectionIsFresh = (
+    accountSession?.generation === workspaceAccountGeneration && accountSession?.canUseWorkspace() &&
+    getActiveWatchingActivationToken(projectId) === workspaceActivationToken &&
+    acceptedSourceWatchSubscriptions.get(projectId) === workspaceSubscription &&
+    getFileVisualProjectCacheEpoch(projectId) === cacheEpoch &&
+    fileVisualProjectCacheGeneration === cacheGeneration &&
+    project.files === projectFiles &&
+    project.pendingFiles === projectPendingFiles &&
+    selectionSignature === getPackageSelectionInputSignature(currentProjectAfterSelection) &&
+    getIllustratorActivationScope(projectId) === illustratorScope &&
+    currentProjectAfterSelection
+  );
+  if (!selectionProjectionIsFresh) {
+    if (accountSession?.generation !== workspaceAccountGeneration || !accountSession?.canUseWorkspace()) return null;
+    return retryCount < 2 ? getProjectAssetWorkspace(projectId, retryCount + 1) : null;
+  }
+
+  const membership = getWorkingSourceMembership(project, packageFiles);
+  const presentedFiles = [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])];
+  const diskInput = captureWorkingSourcePresentationDiskInput(presentedFiles, membership);
   const files = await Promise.all((scopedProject.files || []).map(async (file, sourceIndex) => ({
     ...(await createRendererFilePresentation(project, file, membership, attribution)),
     sourceIndex,
@@ -7475,6 +7496,10 @@ function deduplicatePackageSourceMastersForOutput(project, packageFiles) {
 
 async function selectProjectFilesForPackaging(project) {
   await refreshWorkingSourceVerification(project.id);
+  return selectProjectFilesForPackagingSnapshot(project);
+}
+
+async function selectProjectFilesForPackagingSnapshot(project) {
   const dedupedFiles = deduplicateFiles(getIllustratorScopedProjectView(project).files || []);
   const packageFiles = [];
   const membership = getWorkingSourceMembership(project);
