@@ -1147,6 +1147,57 @@ function getTrackedFileKeySet(files) {
     .filter(Boolean));
 }
 
+// Request-local indexes for the synchronous recent-file staging batches in
+// pre-package discovery. Their lifetime ends with this synchronous batch;
+// they never authorize a later package operation.
+function createLiveObservedFileStageContext(project) {
+  // This context is private to one synchronous packaging batch. Defaults at
+  // every other call site retain their fresh-read behavior.
+  const outputPaths = getKnownPackageOutputPaths();
+  const isExcluded = filePath => isAutoCaptureExcludedPath(filePath, [], outputPaths);
+  let scope;
+  return { project, isExcluded, scope: () => scope || (scope = buildProjectSessionScope(project, isExcluded)) };
+}
+
+function createLiveObservedFileStageIndex(project) {
+  const files = Array.isArray(project?.files) ? project.files : [];
+  const pendingFiles = Array.isArray(project?.pendingFiles) ? project.pendingFiles : [];
+  const firstFileByPath = new Map();
+  for (const file of [...files, ...pendingFiles]) {
+    const normalizedPath = normalizeTrackedFilePath(file && file.path);
+    if (normalizedPath && !firstFileByPath.has(normalizedPath)) firstFileByPath.set(normalizedPath, file);
+  }
+  return {
+    project,
+    context: createLiveObservedFileStageContext(project),
+    acceptedKeys: getTrackedFileKeySet(files),
+    pendingKeys: getTrackedFileKeySet(pendingFiles),
+    firstFileByPath,
+    protectedKeys: getLiveEvidenceProtectedKeys(project),
+  };
+}
+
+function updateLiveObservedFileStageIndex(index, project, fileEntry, staged) {
+  if (!index || index.project !== project || !staged?.changed) return index;
+  // The common broad-discovery case appends one previously absent pending
+  // candidate. Other mutations can remove/replace/deduplicate rows, so discard
+  // the derived view and rebuild it before the next candidate instead of
+  // trying to approximate those array semantics.
+  if (staged.decision !== LIVE_CAPTURE_DECISIONS.PENDING_CANDIDATE) return null;
+  const stagedFile = staged.file || fileEntry;
+  if (!staged.evidence?.weakBroadObserver ||
+      isTrustedSessionProjectFile(project, stagedFile, index.context.isExcluded)) return null;
+  const key = getTrackedFileDedupKey(stagedFile);
+  if (key) index.pendingKeys.add(key);
+  const normalizedPath = normalizeTrackedFilePath(stagedFile && stagedFile.path);
+  if (normalizedPath && !index.firstFileByPath.has(normalizedPath)) {
+    index.firstFileByPath.set(normalizedPath, stagedFile);
+    const evidenceKey = getLiveEvidenceKeyHash(normalizedPath);
+    if (evidenceKey) index.protectedKeys.add(evidenceKey);
+  }
+  return index;
+}
+
 function getAutoCapturePathSegments(filePath) {
   if (typeof filePath !== 'string' || !filePath.trim()) return [];
   return path.resolve(filePath.trim())
@@ -1201,7 +1252,7 @@ function rememberGeneratedPackageOutputPath(outputPath) {
   }
 }
 
-function isAutoCaptureExcludedPath(filePath, projects = getProjects()) {
+function isAutoCaptureExcludedPath(filePath, projects = getProjects(), outputPaths = null) {
   if (typeof filePath !== 'string' || !filePath.trim()) return true;
 
   const segments = getAutoCapturePathSegments(filePath);
@@ -1211,7 +1262,7 @@ function isAutoCaptureExcludedPath(filePath, projects = getProjects()) {
   if (lowerBase === PROVENANCE_MANIFEST_FILENAME.toLowerCase()) return true;
   if (lowerSegments.some(segment => AUTO_CAPTURE_PACKAGE_OUTPUT_FOLDER_NAMES.has(segment))) return true;
 
-  for (const outputPath of getKnownPackageOutputPaths(projects)) {
+  for (const outputPath of outputPaths || getKnownPackageOutputPaths(projects)) {
     if (isPathInsideOrEqual(outputPath, filePath)) return true;
   }
 
@@ -1403,9 +1454,9 @@ function isPersistedAcceptedWatcherSource(project, file) {
   )));
 }
 
-function isTrustedSessionProjectFile(project, file) {
+function isTrustedSessionProjectFile(project, file, isExcluded = isAutoCaptureExcludedPath) {
   if (!file || typeof file.path !== 'string' || !file.path.trim()) return false;
-  if (isAutoCaptureExcludedPath(file.path)) return false;
+  if (isExcluded(file.path)) return false;
   if (isExplicitUserCapturedFile(file)) return true;
   if (isAcceptedPendingCapturedFile(project, file)) return true;
   if (isSavedOrConfirmedProjectFile(file)) return true;
@@ -1445,7 +1496,7 @@ function getPrimaryDesignAppFamilyForExt(ext) {
   return null;
 }
 
-function buildProjectSessionScope(project) {
+function buildProjectSessionScope(project, isExcluded = isAutoCaptureExcludedPath) {
   const scope = {
     anchorPaths: new Set(),
     anchorDirs: [],
@@ -1458,7 +1509,7 @@ function buildProjectSessionScope(project) {
   ];
 
   for (const file of files) {
-    if (!isTrustedSessionProjectFile(project, file)) continue;
+    if (!isTrustedSessionProjectFile(project, file, isExcluded)) continue;
     const normalizedPath = normalizeTrackedFilePath(file.path);
     if (!normalizedPath) continue;
     scope.anchorPaths.add(normalizedPath);
@@ -1494,14 +1545,14 @@ function isRelationshipSourceSessionTrusted(project, sourcePath) {
   ));
 }
 
-function isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence = {}) {
+function isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence = {}, scopeProvider = null) {
   if (!project || !fileEntry || typeof fileEntry.path !== 'string') return false;
   if (evidence.explicitUserAdd || evidence.acceptedPending || isSavedOrConfirmedLiveEvidence(evidence)) return true;
   if (evidence.relationshipSourcePath && isRelationshipSourceSessionTrusted(project, evidence.relationshipSourcePath)) return true;
   if (evidence.sourceDocumentPath && isRelationshipSourceSessionTrusted(project, evidence.sourceDocumentPath)) return true;
 
   const normalizedPath = normalizeTrackedFilePath(fileEntry.path);
-  const scope = buildProjectSessionScope(project);
+  const scope = scopeProvider ? scopeProvider() : buildProjectSessionScope(project);
   if (normalizedPath && scope.anchorPaths.has(normalizedPath)) return true;
 
   if (evidence.sourceDocumentName) {
@@ -1532,16 +1583,16 @@ function isBroadObserverOnlyAcceptedFile(project, file) {
   return true;
 }
 
-function shouldKeepPendingFileForSession(project, file) {
+function shouldKeepPendingFileForSession(project, file, context = null) {
   if (!file || typeof file.path !== 'string' || !file.path.trim()) return false;
-  if (isAutoCaptureExcludedPath(file.path)) return false;
+  if ((context ? context.isExcluded : isAutoCaptureExcludedPath)(file.path)) return false;
   if (!isWeakBroadObserverFile(file)) return true;
   return isWeakBroadEvidenceSessionRelated(project, file, {
     source: getFileCaptureSource(file),
     policyReason: getFileCaptureReason(file),
     evidenceStrength: LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL,
     broadObserver: true,
-  });
+  }, context?.scope);
 }
 
 function demoteBroadObserverFileForReview(file) {
@@ -1611,8 +1662,9 @@ function clearPersistedCurrentSessionFilesystemEvidence(project) {
   return changed;
 }
 
-function normalizeAutoCaptureProjectState(project) {
+function normalizeAutoCaptureProjectState(project, stageContext = null) {
   if (!project || typeof project !== 'object') return false;
+  const context = stageContext?.project === project ? stageContext : null;
   let changed = clearPersistedCurrentSessionFilesystemEvidence(project);
 
   if (!Array.isArray(project.files)) {
@@ -1637,7 +1689,7 @@ function normalizeAutoCaptureProjectState(project) {
     project.pendingFiles = project.pendingFiles.filter(file => {
       const key = getTrackedFileDedupKey(file);
       if (!key || acceptedKeys.has(key) || seenPendingKeys.has(key)) return false;
-      if (!shouldKeepPendingFileForSession(project, file)) return false;
+      if (!shouldKeepPendingFileForSession(project, file, context)) return false;
       if (isWeakBroadObserverFile(file)) {
         const nameKey = `${getFileCaptureSource(file) || 'broad'}:${path.basename(file.path || file.name || '').toLowerCase()}`;
         if (seenWeakBroadPendingNames.has(nameKey)) return false;
@@ -2078,7 +2130,7 @@ function deriveLiveEvidenceStrength(fileEntry, evidence) {
   return LIVE_APP_EVIDENCE_STRENGTHS.BROAD_APP_SIGNAL;
 }
 
-function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedPath = '') {
+function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedPath = '', stageContext = null) {
   const liveEvidence = observation.liveEvidence && typeof observation.liveEvidence === 'object'
     ? observation.liveEvidence
     : {};
@@ -2157,7 +2209,7 @@ function normalizeLiveEvidence(project, fileEntry, observation = {}, normalizedP
     );
   evidence.evidenceKey = normalizedPath || normalizeTrackedFilePath(fileEntry && fileEntry.path);
   evidence.evidenceKeyHash = getLiveEvidenceKeyHash(evidence.evidenceKey);
-  evidence.sessionRelated = !evidence.weakBroadObserver || isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence);
+  evidence.sessionRelated = !evidence.weakBroadObserver || isWeakBroadEvidenceSessionRelated(project, fileEntry, evidence, stageContext?.scope);
   return evidence;
 }
 
@@ -2330,7 +2382,7 @@ function minimizeIgnoredLiveEvidenceLedgerEntry(entry) {
   delete entry.latest.sourceName;
 }
 
-function pruneLiveEvidenceLedger(project, extraProtectedKey = null) {
+function pruneLiveEvidenceLedger(project, extraProtectedKey = null, stageIndex = null) {
   if (!project || !project.liveEvidenceLedger || typeof project.liveEvidenceLedger !== 'object') return;
   if (Array.isArray(project.liveEvidenceLedger)) return;
   const ledger = project.liveEvidenceLedger;
@@ -2349,23 +2401,31 @@ function pruneLiveEvidenceLedger(project, extraProtectedKey = null) {
     return;
   }
 
-  const protectedKeys = getLiveEvidenceProtectedKeys(project, extraProtectedKey);
-  const evictable = entries
-    .map(([key, entry]) => ({
-      key,
-      entry,
-      priority: getLiveEvidencePrunePriority(entry, key, protectedKeys),
-      updatedAtMs: getLiveEvidenceUpdatedAtMs(entry),
-    }))
-    .sort((a, b) => (
-      a.priority - b.priority ||
-      a.updatedAtMs - b.updatedAtMs ||
-      a.key.localeCompare(b.key)
-    ));
+  const index = stageIndex?.project === project ? stageIndex : null;
+  const protectedKeys = index ? index.protectedKeys : getLiveEvidenceProtectedKeys(project, extraProtectedKey);
+  const addedExtraKey = !!(index && typeof extraProtectedKey === 'string' && extraProtectedKey &&
+    !protectedKeys.has(extraProtectedKey));
+  if (addedExtraKey) protectedKeys.add(extraProtectedKey);
+  try {
+    const evictable = entries
+      .map(([key, entry]) => ({
+        key,
+        entry,
+        priority: getLiveEvidencePrunePriority(entry, key, protectedKeys),
+        updatedAtMs: getLiveEvidenceUpdatedAtMs(entry),
+      }))
+      .sort((a, b) => (
+        a.priority - b.priority ||
+        a.updatedAtMs - b.updatedAtMs ||
+        a.key.localeCompare(b.key)
+      ));
 
-  const removeCount = entries.length - MAX_LIVE_EVIDENCE_CANDIDATES;
-  for (const item of evictable.slice(0, removeCount)) {
-    delete ledger.candidates[item.key];
+    const removeCount = entries.length - MAX_LIVE_EVIDENCE_CANDIDATES;
+    for (const item of evictable.slice(0, removeCount)) {
+      delete ledger.candidates[item.key];
+    }
+  } finally {
+    if (addedExtraKey) protectedKeys.delete(extraProtectedKey);
   }
   ledger.schemaVersion = 1;
   ledger.candidateLimit = MAX_LIVE_EVIDENCE_CANDIDATES;
@@ -2387,7 +2447,7 @@ function getLiveEvidenceLedger(project) {
   return project.liveEvidenceLedger;
 }
 
-function recordLiveEvidence(project, fileEntry, classification) {
+function recordLiveEvidence(project, fileEntry, classification, stageIndex = null) {
   if (!classification || !classification.evidence || !classification.evidenceSummary) return false;
   const previousLedger = project && project.liveEvidenceLedger;
   const previousCandidateLimit = previousLedger && previousLedger.candidateLimit;
@@ -2406,8 +2466,12 @@ function recordLiveEvidence(project, fileEntry, classification) {
   // Dirty editor state is a durable source obligation, independent of the
   // latest observation and the bounded evidence history. Only a trusted clean
   // document observation of this same physical source may discharge it.
-  const sourceFile = [...(project.files || []), ...(project.pendingFiles || [])].find(file =>
-    normalizeTrackedFilePath(file.path) === normalizeTrackedFilePath(fileEntry.path)) || fileEntry;
+  const index = stageIndex?.project === project ? stageIndex : null;
+  const normalizedFilePath = normalizeTrackedFilePath(fileEntry.path);
+  const sourceFile = index
+    ? (index.firstFileByPath.get(normalizedFilePath) || fileEntry)
+    : [...(project.files || []), ...(project.pendingFiles || [])].find(file =>
+      normalizeTrackedFilePath(file.path) === normalizedFilePath) || fileEntry;
   const routeKey = getAssetBaselineSourceRecoveryRouteKey(project, sourceFile);
   const identity = getExplicitWorkingFileIdentity(project, sourceFile);
   const holds = project.workingFileDirtyHolds;
@@ -2513,7 +2577,7 @@ function recordLiveEvidence(project, fileEntry, classification) {
   }
   ledger.candidates[key] = existing;
   ledger.updatedAt = existing.updatedAt;
-  pruneLiveEvidenceLedger(project, key);
+  pruneLiveEvidenceLedger(project, key, index);
   return true;
 }
 
@@ -2594,7 +2658,7 @@ function createAcceptedPendingFile(fileEntry) {
   return acceptedFile;
 }
 
-function classifyLiveObservedFile(project, fileEntry, observation = {}) {
+function classifyLiveObservedFile(project, fileEntry, observation = {}, stageIndex = null) {
   const normalizedPath = normalizeTrackedFilePath(fileEntry && fileEntry.path);
   if (!project || !fileEntry || !normalizedPath) {
     const evidence = normalizeLiveEvidence(project, fileEntry || {}, observation, normalizedPath);
@@ -2610,8 +2674,9 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
     };
   }
 
-  const evidence = normalizeLiveEvidence(project, fileEntry, observation, normalizedPath);
-  const excludedByGeneratedOutput = observation.projectCollection
+  const index = stageIndex?.project === project ? stageIndex : null;
+  const evidence = normalizeLiveEvidence(project, fileEntry, observation, normalizedPath, index?.context);
+  const excludedByGeneratedOutput = index ? index.context.isExcluded(fileEntry.path) : observation.projectCollection
     ? isAutoCaptureExcludedPath(fileEntry.path, observation.projectCollection)
     : isAutoCaptureExcludedPath(fileEntry.path);
   if (excludedByGeneratedOutput) {
@@ -2641,8 +2706,8 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   }
 
   const candidateKey = getTrackedFileDedupKey(fileEntry);
-  const acceptedKeys = getTrackedFileKeySet(project.files);
-  const pendingKeys = getTrackedFileKeySet(project.pendingFiles);
+  const acceptedKeys = index ? index.acceptedKeys : getTrackedFileKeySet(project.files);
+  const pendingKeys = index ? index.pendingKeys : getTrackedFileKeySet(project.pendingFiles);
 
   if (
     evidence.weakBroadObserver &&
@@ -2722,16 +2787,17 @@ function classifyLiveObservedFile(project, fileEntry, observation = {}) {
   };
 }
 
-function stageLiveObservedFile(project, fileEntry, observation = {}) {
+function stageLiveObservedFile(project, fileEntry, observation = {}, stageIndex = null) {
   observation = {
     ...observation,
     appFamily: getLiveCaptureAppFamily(fileEntry, observation) || 'generic',
     captureSessionId: observation.captureSessionId || project?.watchSessionId || null,
   };
   if (!isIllustratorScopedFileAllowed(project, fileEntry, observation)) return { decision: LIVE_CAPTURE_DECISIONS.IGNORE_EXCLUDED, changed: false, file: fileEntry, reason: 'illustrator-activation-scope', captureReason: 'illustrator-activation-scope', captureState: LIVE_CAPTURE_STATES.IGNORED, normalizedPath: normalizeTrackedFilePath(fileEntry && fileEntry.path) };
-  const classification = classifyLiveObservedFile(project, fileEntry, observation);
+  const index = stageIndex?.project === project ? stageIndex : null;
+  const classification = classifyLiveObservedFile(project, fileEntry, observation, index);
   const normalizedPath = classification.normalizedPath;
-  const evidenceChanged = recordLiveEvidence(project, fileEntry, classification);
+  const evidenceChanged = recordLiveEvidence(project, fileEntry, classification, index);
 
   if (classification.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
     const stagedFile = stripLiveCaptureMetadata(fileEntry);
@@ -9273,7 +9339,7 @@ function isDiagnosticManifestDestinationSafe(destFolder, relativePath = path.joi
 }
 
 // FIX 1 (C1): Atomic store helper — prevents read-mutate-write race conditions
-function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false } = {}) {
+function mutateProject(projectId, fn, { persistIfChanged = false, trustResultChanged = false, packageStageContext = false } = {}) {
   const projects = getProjects();
   const project = projects.find(p => p.id === projectId);
   if (!project) return null;
@@ -9292,7 +9358,7 @@ function mutateProject(projectId, fn, { persistIfChanged = false, trustResultCha
   const result = fn(project, projects);
   const resultChanged = !!(result && result.changed === true);
   if (!persistIfChanged || !trustResultChanged || resultChanged) {
-    normalizeAutoCaptureProjectState(project);
+    normalizeAutoCaptureProjectState(project, packageStageContext ? createLiveObservedFileStageContext(project) : null);
     normalizeProjectAssetReviewState(project);
     safelyEnsureProjectProvenance(project);
     retireRemovedPsdReceiptHolds(project, heldPsdMembers);
@@ -19208,18 +19274,32 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
 // For .fig files saved BEFORE the session, users should use "+ Add files".
 async function runPackageScanPhase(operation, timeoutMs, work, onTimeout = null) {
   let timeoutId = null;
-  const workResult = Promise.resolve().then(work).then(
-    () => ({ status: 'complete' }),
+  let expired = false;
+  const deadline = process.hrtime.bigint() + BigInt(timeoutMs) * 1_000_000n;
+  const expire = () => { expired = true; operation.close(); };
+  const budget = {
+    expired() {
+      if (!expired && process.hrtime.bigint() >= deadline) expire();
+      return expired;
+    },
+  };
+  const workResult = Promise.resolve().then(() => work(budget)).then(
+    () => {
+      // An overdue timer callback must never turn expired synchronous work
+      // into a successful discovery phase.
+      if (budget.expired()) return { status: 'timeout' };
+      return { status: 'complete' };
+    },
     error => ({ status: 'error', error })
   );
   const timeoutResult = new Promise(resolve => {
-    timeoutId = setTimeout(() => resolve({ status: 'timeout' }), timeoutMs);
+    timeoutId = setTimeout(() => { expire(); resolve({ status: 'timeout' }); }, timeoutMs);
   });
   const result = await Promise.race([workResult, timeoutResult]);
   if (timeoutId) clearTimeout(timeoutId);
   if (result.status === 'error') throw result.error;
   if (result.status === 'timeout') {
-    operation.close();
+    expire();
     if (typeof onTimeout === 'function') onTimeout(workResult);
     return false;
   }
@@ -19236,9 +19316,9 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   const operation = captureProjectOperation(projectId); if (!operation) return null;
   const operationCurrent = operation.current;
   const ordinaryPsdOutputBatches = [];
-  const stagePrePackageFile = (project, file, observation) => {
+  const stagePrePackageFile = (project, file, observation, stageIndex = null) => {
     if (!operationCurrent()) return null;
-    const staged = stageLiveObservedFile(project, file, observation);
+    const staged = stageLiveObservedFile(project, file, observation, stageIndex);
     if (staged?.changed) clearFileVisualProjectCache(projectId);
     return staged;
   };
@@ -19292,9 +19372,16 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     metadataFallbackCount: 0,
   };
   let metadataDiscoveryFailed = false;
+  const recentDiscoveryIdentities = new Map();
+  const recentSourceCurrent = file => {
+    const observed = recentDiscoveryIdentities.get(normalizeTrackedFilePath(file?.path));
+    if (observed === undefined) return true;
+    const current = getWorkingSourceDiskIdentity(file);
+    return !!observed && !!current && Object.keys(observed).every(key => observed[key] === current[key]);
+  };
 
   const discoveryStartedAt = Date.now();
-  const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async () => {
+  const discoveryComplete = await runPackageScanPhase(operation, PRE_PACKAGE_DISCOVERY_TIMEOUT_MS, async (budget) => {
   // v1.3.29: Live lsof pass at package time — captures .fig files currently open in Figma,
   // bypassing Spotlight indexing delay. Runs once synchronously before the scan loops.
   try {
@@ -19493,18 +19580,38 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
       spotlightRecentCandidateIndexes.has(candidateIndex);
   }
 
+  for (let index = 0; index < lastUsedCandidates.length; index++) {
+    if (budget.expired()) return;
+    if (recentLastUsedCandidates[index]) {
+      const candidate = lastUsedCandidates[index];
+      recentDiscoveryIdentities.set(candidate.normalizedFullPath, getWorkingSourceDiskIdentity({ path: candidate.fullPath }));
+    }
+  }
+  let recentStageIndex = null;
+  let recentCandidatesProcessed = 0;
   for (let candidateIndex = 0; candidateIndex < lastUsedCandidates.length; candidateIndex++) {
     if (!recentLastUsedCandidates[candidateIndex]) continue;
+    if (budget.expired()) return;
+    if (recentCandidatesProcessed++ % 32 === 0) {
+      // Discard every derived view before callbacks can mutate account,
+      // project, source identity or generated-output state.
+      recentStageIndex = null;
+      await new Promise(resolve => setImmediate(resolve));
+      if (budget.expired() || !operationCurrent()) return;
+    }
     const candidate = lastUsedCandidates[candidateIndex];
+    if (!recentSourceCurrent({ path: candidate.fullPath })) continue;
     const fileEntry = buildAutoCaptureFileEntry(candidate.fullPath, 'lastused-scan', {
       name: candidate.name,
       ext: candidate.ext,
     });
+    if (!recentStageIndex) recentStageIndex = createLiveObservedFileStageIndex(project);
     const staged = stagePrePackageFile(project, fileEntry, {
       forcePending: true,
       appFamily: 'generic',
       reason: 'pre-package-lastused-scan',
-    });
+    }, recentStageIndex);
+    recentStageIndex = updateLiveObservedFileStageIndex(recentStageIndex, project, fileEntry, staged);
     if (!staged || !staged.changed) continue;
     if (staged.decision === LIVE_CAPTURE_DECISIONS.DIRECT_ADD) {
       existingPaths.add(candidate.normalizedFullPath);
@@ -19833,7 +19940,7 @@ end tell`;
       for (const f of scanFiles) {
         const key = getTrackedFileDedupKey(f);
         if (preScanExistingKeys.has(key)) continue;
-        if (refuseConcurrentPsdOutput(proj, f)) continue;
+        if (!recentSourceCurrent(f) || refuseConcurrentPsdOutput(proj, f)) continue;
 
         if (!existingKeys.has(key)) {
           proj.files.push(f);
@@ -19852,7 +19959,7 @@ end tell`;
         const existPendingKeys = getTrackedFileKeySet(proj.pendingFiles);
         for (const f of scanPending) {
           const key = getTrackedFileDedupKey(f);
-          if (refuseConcurrentPsdOutput(proj, f)) continue;
+          if (!recentSourceCurrent(f) || refuseConcurrentPsdOutput(proj, f)) continue;
           if (!existPendingKeys.has(key) && !existingKeys.has(key)) {
             proj.pendingFiles.push(f);
             existPendingKeys.add(key);
@@ -19869,7 +19976,7 @@ end tell`;
         retainReferencedPsdOutputs(outputs, proj);
       }
       return { files: proj.files };
-    });
+    }, { packageStageContext: true });
     if (!operationCurrent()) return null;
     if (merged) {
       project.files = merged.files;
