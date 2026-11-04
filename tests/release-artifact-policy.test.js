@@ -164,6 +164,7 @@ const REVIEWED_SOURCE_BOUND_ENTRIES = Object.freeze([
   'parsers/figma.js',
   'parsers/indesign.js',
   'parsers/index.js',
+  'parsers/linked-asset-matcher.js',
   'parsers/ooxml-links.js',
   'parsers/xml-path.js',
   'parsers/package-safety.js',

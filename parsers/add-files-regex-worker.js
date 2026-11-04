@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024;
-const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+const { LINKED_ASSET_REGEX, extractLinkedAssetPaths } = require('./linked-asset-matcher');
 
 const REGEX_SOURCE_EXTENSIONS = new Set(['.ai', '.pdf', '.xd', '.ppt', '.fig']);
 
@@ -33,13 +33,7 @@ function assertDependableStructure(sourceBuffer, ext) {
 function extractLinkedAssetsFromBuffer(sourceBuffer, filePath, ext = '') {
   assertDependableStructure(sourceBuffer, ext);
   const content = sourceBuffer.toString('utf8');
-  const results = [];
-  let match;
-  while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
-    const linkedPath = match[0];
-    if (linkedPath !== filePath) results.push(linkedPath);
-  }
-  return results;
+  return extractLinkedAssetPaths(content, filePath);
 }
 
 function parseRegex(filePath) {

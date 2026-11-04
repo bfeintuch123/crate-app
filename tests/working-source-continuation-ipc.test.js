@@ -253,6 +253,14 @@ function continuationCases() {
     save('A.ai', ['Shared.png', 'AB.png']); save('B.ai', ['Shared.png', 'AB.png']);
     save('C.ai', ['Shared.png', 'C-only.png', ...(predecessorRequired ? ['A.ai'] : [])]);
     save('D.ai', ['Shared.png', 'D-only.png']);
+    // These observed roots model files saved after Watch starts. Establish
+    // recorded filesystem evidence before verification; coarse filesystem
+    // timestamps can otherwise precede the JavaScript session clock.
+    const sessionMtime = new Date(Math.max(Date.now(), f.stored().watchStartedAt || f.stored().createdAt) + 1);
+    for (const name of ['A.ai', 'B.ai', 'C.ai', 'D.ai']) {
+      fs.utimesSync(rows[name].path, sessionMtime, sessionMtime);
+    }
+
     f.stored().files = Object.values(rows); roundTripFakeStore();
     // Model an existing admitted scope, but execute the real scope and observed
     // source selectors below. This fixture does not prove native admission.

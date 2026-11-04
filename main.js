@@ -81,6 +81,7 @@ const {
 } = require('./parsers/figma-network');
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
+const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -15093,7 +15094,6 @@ async function extractLinkedAssets(filePath, options = {}) {
  */
 async function extractLinkedAssetsRegex(filePath, options = {}) {
   const strict = options.strict === true;
-  const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
   const results = [];
   try {
     if (options.validatedRegexResult && Array.isArray(options.validatedRegexResult.paths)) {
@@ -15116,12 +15116,7 @@ async function extractLinkedAssetsRegex(filePath, options = {}) {
     }
     const buf = suppliedBuffer || await fs.promises.readFile(filePath);
     const content = buf.toString('utf8');
-    let match;
-    while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
-      const linkedPath = match[0];
-      if (linkedPath === filePath) continue; // skip self-reference
-      results.push(linkedPath);
-    }
+    return extractLinkedAssetPaths(content, filePath);
   } catch (e) {
     if (strict) throw e;
     options.onOrdinaryScanFailure?.();
