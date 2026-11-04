@@ -1039,6 +1039,17 @@ const originalJavaScriptLoader = Module._extensions['.js'];
 Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filename) {
   if (filename !== mainModulePath) return originalJavaScriptLoader(module, filename);
   let source = fs.readFileSync(filename, 'utf8');
+  const workspaceSelectionAnchors = [
+    '  const packageFiles = await selectProjectFilesForPackagingSnapshot(project);',
+    '  const packageFiles = await selectProjectFilesForPackaging(project);',
+  ].filter(anchor => source.split(anchor).length - 1 === 1);
+  assert.equal(workspaceSelectionAnchors.length, 1, 'workspace attribution race source anchor');
+  source = source.replace(workspaceSelectionAnchors[0],
+    '  const workspaceSelectionGate = global.__crateWorkspaceFilterEvidenceGate;\n' +
+    '  if (workspaceSelectionGate?.beforeSelection && workspaceSelectionGate.projectId === projectId) {\n' +
+    '    await workspaceSelectionGate.wait();\n' +
+    '  }\n' +
+    workspaceSelectionAnchors[0]);
   const workspaceEvidenceGateAnchor = '    if (await shouldKeepObservedSourceFileForPackaging(file, project)) {';
   assert.equal(source.split(workspaceEvidenceGateAnchor).length - 1, 1, 'workspace race-test source anchor');
   source = source.replace(workspaceEvidenceGateAnchor,

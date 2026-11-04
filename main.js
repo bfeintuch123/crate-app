@@ -5781,7 +5781,6 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   const cacheGeneration = fileVisualProjectCacheGeneration;
   const workspaceActivationToken = getActiveWatchingActivationToken(projectId);
   const workspaceSubscription = acceptedSourceWatchSubscriptions.get(projectId);
-  const attribution = getCurrentWorkingFileAttribution(project);
   const packageFiles = await selectProjectFilesForPackagingSnapshot(project);
 
   // Filtering can await source-session evidence. Revalidate the exact state
@@ -5804,6 +5803,9 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
     return retryCount < 2 ? getProjectAssetWorkspace(projectId, retryCount + 1) : null;
   }
 
+  // Disk-dependent attribution must observe the same post-filter source state
+  // as membership and presentation. The selector can await while files change.
+  const attribution = getCurrentWorkingFileAttribution(currentProjectAfterSelection);
   const membership = getWorkingSourceMembership(project, packageFiles);
   const presentedFiles = [...(scopedProject.files || []), ...(scopedProject.pendingFiles || [])];
   const diskInput = captureWorkingSourcePresentationDiskInput(presentedFiles, membership);

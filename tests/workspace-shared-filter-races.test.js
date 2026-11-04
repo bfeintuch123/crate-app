@@ -11,6 +11,7 @@ const continuationSuite = path.join(__dirname, 'working-source-continuation-ipc.
 const raceNames = [
   'workspace shared filter retries after a selection change during its async evidence wait',
   'workspace shared filter fails closed if its project is deleted during the async evidence wait',
+  'workspace recomputes current attribution after a disk identity change during its async evidence wait',
   'workspace shared filter keeps same-stat source edits out of stale package reviews',
   'workspace refreshes once; package review and package finalization verify independently',
   'workspace discards an in-flight evidence projection after account loss and permits a fresh authorized request',

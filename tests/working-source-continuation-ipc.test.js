@@ -388,6 +388,88 @@ function continuationCases() {
     clearTrackedTimers();
   });
 
+  continuationTest('workspace recomputes current attribution after a disk identity change during its async evidence wait', { timeout: 20000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const sourcePath = f.rows['A.ai'].path;
+    const writeLinks = (name, linkedNames) => fs.writeFileSync(f.rows[name].path,
+      `%PDF-1.7\nsynthetic illustrator links ${linkedNames.map(link => f.rows[link].path).join(' and ')}\n%%EOF\n`);
+    writeLinks('A.ai', ['Shared.png', 'AB.png']);
+    writeLinks('C.ai', ['Shared.png', 'C-only.png']);
+    writeLinks('D.ai', ['Shared.png', 'D-only.png']);
+    for (const name of ['A.ai', 'C.ai', 'D.ai']) {
+      const row = f.rows[name], stat = fs.statSync(row.path), selection = metadataTestHooks.getWorkingSourceSelection(f.stored(), row);
+      const linkedNames = name === 'A.ai' ? ['Shared.png', 'AB.png'] : name === 'C.ai' ? ['Shared.png', 'C-only.png'] : ['Shared.png', 'D-only.png'];
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(), row);
+      f.stored().workingSourceVerification ||= {};
+      f.stored().workingSourceVerification[key] = {
+        status: 'scanned', attempt: `synthetic-${name}`, selectionRevision: selection.revision,
+        sourceFingerprint: crypto.createHash('sha256').update(fs.readFileSync(row.path)).digest('hex'),
+        sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs },
+        requiredReferences: linkedNames.map(link => ({ path: f.rows[link].path })), unresolved: [],
+      };
+      assert.ok(metadataTestHooks.getWorkingSourceVerification(f.stored(), row), `${name} has a current synthetic receipt`);
+    }
+    roundTripFakeStore();
+    const initialWorkspace = await callIpcRaw('projects:get-asset-workspace', f.id);
+    const initialShared = initialWorkspace.files.find(file => file.name === 'Shared.png');
+    assert.ok(initialShared);
+    assert.deepEqual(initialShared.currentWorkingSources.map(source => source.name).sort(), ['A.ai', 'C.ai', 'D.ai']);
+    const initialAb = initialWorkspace.files.find(file => file.name === 'AB.png');
+    assert.ok(initialAb.currentWorkingSources.some(source => source.name === 'A.ai'));
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: sourcePath, beforeSelection: true, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate(sourcePath);
+      await gatePromise;
+    } };
+    let workspacePromise;
+    try {
+      workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id);
+      const gatedPath = await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      assert.equal(gatedPath, sourcePath);
+      const oldStat = fs.statSync(sourcePath);
+      const selectionState = JSON.stringify(f.stored().workingSourceSelections);
+      fs.appendFileSync(sourcePath, '\nsynthetic identity-changing edit');
+      const changedMtimeMs = Math.max(Date.now() + 1000, oldStat.mtimeMs + 1000);
+      fs.utimesSync(sourcePath, changedMtimeMs / 1000, changedMtimeMs / 1000);
+      const newStat = fs.statSync(sourcePath);
+      assert.ok(newStat.size > oldStat.size);
+      assert.ok(newStat.mtimeMs > oldStat.mtimeMs);
+      assert.equal(JSON.stringify(f.stored().workingSourceSelections), selectionState, 'fixture edit changes disk bytes only');
+      assert.equal(metadataTestHooks.getWorkingSourceSelection(f.stored(), f.rows['A.ai']).state, 'selected');
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    const workspace = await workspacePromise;
+    assert.ok(workspace);
+    const shared = workspace.files.find(file => file.name === 'Shared.png');
+    const ab = workspace.files.find(file => file.name === 'AB.png');
+    assert.deepEqual(shared.currentWorkingSources.map(source => source.name).sort(), ['C.ai', 'D.ai']);
+    assert.deepEqual(ab.currentWorkingSources, []);
+    for (const name of ['A.ai', 'C.ai', 'D.ai']) {
+      assert.equal(workspace.files.find(file => file.name === name)?.sourceSelection, 'selected', `${name} owner selection remains intact`);
+    }
+    const renderer = require('./opus-renderer-helpers').loadProjectedWorkspace(await getProject(f.id), workspace);
+    const sharedRow = ['working-assets-list', 'existing-assets-list', 'added-assets-list']
+      .flatMap(id => renderer.elements[id].children)
+      .find(row => row.querySelector('.app-file-name')?.textContent === 'Shared.png');
+    assert.ok(sharedRow, 'renderer projects the shared asset row');
+    const origin = sharedRow.querySelector('.file-origin-label')?.textContent || '';
+    assert.doesNotMatch(origin, /A\.ai/);
+    assert.match(origin, /C\.ai.*D\.ai|D\.ai.*C\.ai/);
+    clearTrackedTimers();
+  });
+
   continuationTest('workspace shared filter keeps same-stat source edits out of stale package reviews', { timeout: 20000 }, async () => {
     const f = await multipleSelectedFixture();
     const sourcePath = f.rows['A.ai'].path;
