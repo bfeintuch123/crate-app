@@ -1038,7 +1038,26 @@ const mainModulePath = process.env.CRATE_MAIN_UNDER_TEST
 const originalJavaScriptLoader = Module._extensions['.js'];
 Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filename) {
   if (filename !== mainModulePath) return originalJavaScriptLoader(module, filename);
-  const source = fs.readFileSync(filename, 'utf8');
+  let source = fs.readFileSync(filename, 'utf8');
+  const workspaceSelectionAnchors = [
+    '  const packageFiles = await selectProjectFilesForPackagingSnapshot(project);',
+    '  const packageFiles = await selectProjectFilesForPackaging(project);',
+  ].filter(anchor => source.split(anchor).length - 1 === 1);
+  assert.equal(workspaceSelectionAnchors.length, 1, 'workspace attribution race source anchor');
+  source = source.replace(workspaceSelectionAnchors[0],
+    '  const workspaceSelectionGate = global.__crateWorkspaceFilterEvidenceGate;\n' +
+    '  if (workspaceSelectionGate?.beforeSelection && workspaceSelectionGate.projectId === projectId) {\n' +
+    '    await workspaceSelectionGate.wait();\n' +
+    '  }\n' +
+    workspaceSelectionAnchors[0]);
+  const workspaceEvidenceGateAnchor = '    if (await shouldKeepObservedSourceFileForPackaging(file, project)) {';
+  assert.equal(source.split(workspaceEvidenceGateAnchor).length - 1, 1, 'workspace race-test source anchor');
+  source = source.replace(workspaceEvidenceGateAnchor,
+    '    const workspaceEvidenceGate = global.__crateWorkspaceFilterEvidenceGate;\n' +
+    '    if (workspaceEvidenceGate && workspaceEvidenceGate.projectId === project.id && workspaceEvidenceGate.filePath === file.path) {\n' +
+    '      await workspaceEvidenceGate.wait();\n' +
+    '    }\n' +
+    workspaceEvidenceGateAnchor);
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
   controlLiveAppStartupPoll() {
@@ -1087,6 +1106,24 @@ module.exports.__crateMetadataTestHooks = {
     return () => { buildAuthoritativePackagePlan = prior; };
   },
   syncAcceptedSourceWatchSubscriptions, getWorkingSourceWatchCoverage, getProjectAssetWorkspace,
+  observeWorkspaceVerification(projectId, sourcePaths) {
+    const priorRefresh = refreshWorkingSourceVerification;
+    const priorDigest = getAddFilesCurrentSourceDigest;
+    const trace = { refreshCalls: 0, digestPaths: [] };
+    refreshWorkingSourceVerification = async (...args) => {
+      if (args[0] === projectId) trace.refreshCalls++;
+      return priorRefresh(...args);
+    };
+    getAddFilesCurrentSourceDigest = async (filePath, ...args) => {
+      if (sourcePaths.has(filePath)) trace.digestPaths.push(filePath);
+      return priorDigest(filePath, ...args);
+    };
+    return {
+      trace,
+      reset() { trace.refreshCalls = 0; trace.digestPaths.length = 0; },
+      restore() { refreshWorkingSourceVerification = priorRefresh; getAddFilesCurrentSourceDigest = priorDigest; },
+    };
+  },
   traceWatchCoverageOperations(projectId, trace) {
     const prior = captureProjectOperation;
     const snapshot = () => ({ scopeRevision: getIllustratorActivationScope(projectId)?.revision,

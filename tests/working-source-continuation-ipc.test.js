@@ -284,6 +284,352 @@ function continuationCases() {
     const roots = async () => (await selectNames()).filter(name => name.endsWith('.ai'));
     return { ...f, rows, choose, save, independent, aBytes, selectNames, roots };
   }
+  if (process.env.CRATE_WORKSPACE_FILTER_RACE_CHILD === '1') {
+  function findPackagedFile(root, fileName) {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      const entryPath = path.join(root, entry.name);
+      if (entry.isFile() && entry.name === fileName) return entryPath;
+      if (entry.isDirectory()) {
+        const nested = findPackagedFile(entryPath, fileName);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  }
+
+  continuationTest('workspace shared filter retries after a selection change during its async evidence wait', { timeout: 15000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const before = await callIpcRaw('projects:get-asset-workspace', f.id);
+    const row = before.files.find(file => file.name === 'A.ai');
+    assert.ok(row);
+    assert.equal(row.sourceSelection, 'selected');
+    assert.equal(before.semanticCounts.selectedWorkingSources, 3);
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: f.rows['A.ai'].path, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate(f.rows['A.ai'].path);
+      await gatePromise;
+    } };
+    let workspacePromise;
+    try {
+      workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id);
+      const gatedPath = await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      assert.equal(gatedPath, f.rows['A.ai'].path);
+      const excluded = await callIpcRaw('projects:set-working-source-selection', f.id, row.visualIdentity,
+        { action: 'exclude', expectedRevision: row.selectionRevision });
+      assert.equal(excluded.success, true, JSON.stringify(excluded));
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    const workspace = await workspacePromise;
+    assert.ok(workspace);
+    assert.equal(workspace.semanticCounts.selectedWorkingSources, 2);
+    assert.equal(workspace.files.find(file => file.name === 'A.ai').sourceSelection, 'excluded');
+    assert.deepEqual(await f.roots(), ['C.ai', 'D.ai']);
+
+    const review = await callIpcRaw('projects:prepare-package-review', f.id);
+    assert.equal(review.materializable, true, JSON.stringify(review));
+    const result = await callIpc('projects:package', f.id, path.join(TEST_HOME, 'Documents'));
+    assert.equal(result.success, true, JSON.stringify(result));
+    const copied = fs.readdirSync(result.folderPath, { recursive: true })
+      .filter(name => namesForCopy.has(path.basename(name)))
+      .map(name => path.basename(name)).sort();
+    assert.deepEqual(copied, await f.selectNames());
+    assert.equal(copied.includes('A.ai'), false);
+    const packagedC = findPackagedFile(result.folderPath, 'C.ai'), packagedD = findPackagedFile(result.folderPath, 'D.ai');
+    assert.ok(packagedC && packagedD);
+    assert.deepEqual(fs.readFileSync(packagedC), fs.readFileSync(f.rows['C.ai'].path));
+    assert.deepEqual(fs.readFileSync(packagedD), fs.readFileSync(f.rows['D.ai'].path));
+    clearTrackedTimers();
+  });
+
+  continuationTest('workspace shared filter fails closed if its project is deleted during the async evidence wait', { timeout: 15000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const before = await callIpcRaw('projects:get-asset-workspace', f.id);
+    assert.ok(before.files.some(file => file.name === 'A.ai'));
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: f.rows['A.ai'].path, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate(f.rows['A.ai'].path);
+      await gatePromise;
+    } };
+    let workspacePromise;
+    try {
+      workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id);
+      const gatedPath = await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      assert.equal(gatedPath, f.rows['A.ai'].path);
+      const deleted = await callIpcRaw('projects:delete', f.id);
+      assert.ok(Array.isArray(deleted));
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    assert.equal(await workspacePromise, null);
+    assert.equal((await callIpcRaw('projects:prepare-package-review', f.id)).error, 'not_found');
+    clearTrackedTimers();
+  });
+
+  continuationTest('workspace recomputes current attribution after a disk identity change during its async evidence wait', { timeout: 20000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const sourcePath = f.rows['A.ai'].path;
+    const writeLinks = (name, linkedNames) => fs.writeFileSync(f.rows[name].path,
+      `%PDF-1.7\nsynthetic illustrator links ${linkedNames.map(link => f.rows[link].path).join(' and ')}\n%%EOF\n`);
+    writeLinks('A.ai', ['Shared.png', 'AB.png']);
+    writeLinks('C.ai', ['Shared.png', 'C-only.png']);
+    writeLinks('D.ai', ['Shared.png', 'D-only.png']);
+    for (const name of ['A.ai', 'C.ai', 'D.ai']) {
+      const row = f.rows[name], stat = fs.statSync(row.path), selection = metadataTestHooks.getWorkingSourceSelection(f.stored(), row);
+      const linkedNames = name === 'A.ai' ? ['Shared.png', 'AB.png'] : name === 'C.ai' ? ['Shared.png', 'C-only.png'] : ['Shared.png', 'D-only.png'];
+      const key = metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(), row);
+      f.stored().workingSourceVerification ||= {};
+      f.stored().workingSourceVerification[key] = {
+        status: 'scanned', attempt: `synthetic-${name}`, selectionRevision: selection.revision,
+        sourceFingerprint: crypto.createHash('sha256').update(fs.readFileSync(row.path)).digest('hex'),
+        sourceIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs },
+        requiredReferences: linkedNames.map(link => ({ path: f.rows[link].path })), unresolved: [],
+      };
+      assert.ok(metadataTestHooks.getWorkingSourceVerification(f.stored(), row), `${name} has a current synthetic receipt`);
+    }
+    roundTripFakeStore();
+    const initialWorkspace = await callIpcRaw('projects:get-asset-workspace', f.id);
+    const initialShared = initialWorkspace.files.find(file => file.name === 'Shared.png');
+    assert.ok(initialShared);
+    assert.deepEqual(initialShared.currentWorkingSources.map(source => source.name).sort(), ['A.ai', 'C.ai', 'D.ai']);
+    const initialAb = initialWorkspace.files.find(file => file.name === 'AB.png');
+    assert.ok(initialAb.currentWorkingSources.some(source => source.name === 'A.ai'));
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: sourcePath, beforeSelection: true, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate(sourcePath);
+      await gatePromise;
+    } };
+    let workspacePromise;
+    try {
+      workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id);
+      const gatedPath = await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      assert.equal(gatedPath, sourcePath);
+      const oldStat = fs.statSync(sourcePath);
+      const selectionState = JSON.stringify(f.stored().workingSourceSelections);
+      fs.appendFileSync(sourcePath, '\nsynthetic identity-changing edit');
+      const changedMtimeMs = Math.max(Date.now() + 1000, oldStat.mtimeMs + 1000);
+      fs.utimesSync(sourcePath, changedMtimeMs / 1000, changedMtimeMs / 1000);
+      const newStat = fs.statSync(sourcePath);
+      assert.ok(newStat.size > oldStat.size);
+      assert.ok(newStat.mtimeMs > oldStat.mtimeMs);
+      assert.equal(JSON.stringify(f.stored().workingSourceSelections), selectionState, 'fixture edit changes disk bytes only');
+      assert.equal(metadataTestHooks.getWorkingSourceSelection(f.stored(), f.rows['A.ai']).state, 'selected');
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    const workspace = await workspacePromise;
+    assert.ok(workspace);
+    const shared = workspace.files.find(file => file.name === 'Shared.png');
+    const ab = workspace.files.find(file => file.name === 'AB.png');
+    assert.deepEqual(shared.currentWorkingSources.map(source => source.name).sort(), ['C.ai', 'D.ai']);
+    assert.deepEqual(ab.currentWorkingSources, []);
+    for (const name of ['A.ai', 'C.ai', 'D.ai']) {
+      assert.equal(workspace.files.find(file => file.name === name)?.sourceSelection, 'selected', `${name} owner selection remains intact`);
+    }
+    const renderer = require('./opus-renderer-helpers').loadProjectedWorkspace(await getProject(f.id), workspace);
+    const sharedRow = ['working-assets-list', 'existing-assets-list', 'added-assets-list']
+      .flatMap(id => renderer.elements[id].children)
+      .find(row => row.querySelector('.app-file-name')?.textContent === 'Shared.png');
+    assert.ok(sharedRow, 'renderer projects the shared asset row');
+    const origin = sharedRow.querySelector('.file-origin-label')?.textContent || '';
+    assert.doesNotMatch(origin, /A\.ai/);
+    assert.match(origin, /C\.ai.*D\.ai|D\.ai.*C\.ai/);
+    clearTrackedTimers();
+  });
+
+  continuationTest('workspace shared filter keeps same-stat source edits out of stale package reviews', { timeout: 20000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const sourcePath = f.rows['A.ai'].path;
+    const stableMtimeMs = Math.floor(Date.now() / 1000) * 1000 - 2000;
+    fs.utimesSync(sourcePath, stableMtimeMs / 1000, stableMtimeMs / 1000);
+    f.stored().watchStartedAt = stableMtimeMs - 1000;
+    roundTripFakeStore();
+    await f.choose('A.ai', 'exclude');
+    await f.choose('A.ai', 'restore');
+    const initialWorkspace = await callIpcRaw('projects:get-asset-workspace', f.id);
+    assert.ok(initialWorkspace.files.some(file => file.name === 'A.ai'));
+    const priorReview = await callIpcRaw('projects:prepare-package-review', f.id);
+    assert.ok(priorReview.token);
+
+    const oldBytes = fs.readFileSync(sourcePath);
+    const oldStat = fs.statSync(sourcePath);
+    const changedBytes = Buffer.from(oldBytes);
+    const headerOffset = changedBytes.indexOf(Buffer.from('%PDF-1.7'));
+    assert.notEqual(headerOffset, -1);
+    changedBytes[headerOffset + Buffer.byteLength('%PDF-1.')] = '8'.charCodeAt(0);
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: sourcePath, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate(sourcePath);
+      await gatePromise;
+    } };
+    let workspacePromise;
+    try {
+      workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id);
+      const gatedPath = await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      assert.equal(gatedPath, sourcePath);
+      fs.writeFileSync(sourcePath, changedBytes);
+      fs.utimesSync(sourcePath, stableMtimeMs / 1000, stableMtimeMs / 1000);
+      const newStat = fs.statSync(sourcePath);
+      assert.equal(newStat.size, oldStat.size);
+      assert.equal(newStat.mtimeMs, stableMtimeMs);
+      assert.equal(oldStat.mtimeMs, stableMtimeMs);
+      assert.notDeepEqual(fs.readFileSync(sourcePath), oldBytes);
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    const workspace = await workspacePromise;
+    assert.ok(workspace);
+    assert.ok(workspace.files.some(file => file.name === 'A.ai'));
+    assert.equal((await callIpcRaw('projects:package', f.id, TEST_HOME, priorReview.token)).error, 'package_review_changed');
+    const receipt = metadataTestHooks.getWorkingSourceVerification(f.stored(), f.rows['A.ai']);
+    assert.equal(receipt.status, 'stale');
+    assert.equal(receipt.sourceFingerprint, crypto.createHash('sha256').update(oldBytes).digest('hex'));
+    const blockedReview = await callIpcRaw('projects:prepare-package-review', f.id);
+    assert.equal(blockedReview.materializable, false, JSON.stringify(blockedReview));
+    assert.equal(blockedReview.token, undefined);
+    assert.deepEqual(fs.readdirSync(path.join(TEST_HOME, 'Documents')), [], 'refused stale package wrote no output');
+    clearTrackedTimers();
+  });
+
+  continuationTest('workspace refreshes once; package review and package finalization verify independently', { timeout: 20000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const sourceRows = ['A.ai', 'C.ai', 'D.ai'].map(name => f.rows[name]);
+    for (const row of sourceRows) {
+      const receipt = metadataTestHooks.getWorkingSourceVerification(f.stored(), row);
+      assert.ok(receipt && ['scanned', 'no-extractor'].includes(receipt.status));
+      assert.ok(receipt.sourceFingerprint);
+    }
+    const expectedPerWorkspace = process.env.CRATE_EXPECT_DUPLICATE_WORKSPACE_VERIFICATION === '1' ? 2 : 1;
+    const probe = metadataTestHooks.observeWorkspaceVerification(f.id, new Set(sourceRows.map(row => row.path)));
+    const assertVerificationCounts = expectedRefreshes => {
+      assert.equal(probe.trace.refreshCalls, expectedRefreshes);
+      assert.deepEqual(sourceRows.map(row => probe.trace.digestPaths.filter(filePath => filePath === row.path).length),
+        Array(sourceRows.length).fill(expectedRefreshes));
+    };
+    try {
+      const first = await metadataTestHooks.getProjectAssetWorkspace(f.id);
+      assert.ok(first);
+      assert.equal(first.semanticCounts.selectedWorkingSources, 3);
+      assertVerificationCounts(expectedPerWorkspace);
+
+      probe.reset();
+      const second = await metadataTestHooks.getProjectAssetWorkspace(f.id);
+      assert.ok(second);
+      assert.equal(second.semanticCounts.selectedWorkingSources, 3);
+      assertVerificationCounts(expectedPerWorkspace);
+
+      probe.reset();
+      const review = await callIpcRaw('projects:prepare-package-review', f.id);
+      assert.equal(review.materializable, true, JSON.stringify({ materializable: review.materializable, error: review.error }));
+      assertVerificationCounts(1);
+
+      const expectedPackageNames = await f.selectNames();
+      probe.reset();
+      const packaged = await callIpcRaw('projects:package', f.id, path.join(TEST_HOME, 'Documents'), review.token);
+      assert.equal(packaged.success, true, JSON.stringify({ success: packaged.success, error: packaged.error }));
+      // projects:package builds one canonical manifest before opening sources,
+      // then re-verifies it after staging before publishing the staged tree.
+      assertVerificationCounts(2);
+      const packagedNames = fs.readdirSync(packaged.folderPath, { recursive: true })
+        .filter(name => namesForCopy.has(path.basename(name)))
+        .map(name => path.basename(name)).sort();
+      assert.deepEqual(packagedNames, expectedPackageNames);
+      for (const name of ['A.ai', 'C.ai', 'D.ai']) {
+        const stagedPath = findPackagedFile(packaged.folderPath, name);
+        assert.ok(stagedPath, `${name} is present in final package`);
+        assert.deepEqual(fs.readFileSync(stagedPath), fs.readFileSync(f.rows[name].path));
+      }
+      assert.equal(findPackagedFile(packaged.folderPath, 'B.ai'), null, 'excluded source is absent from final package');
+    } finally { probe.restore(); clearTrackedTimers(); }
+  });
+
+  continuationTest('workspace discards an in-flight evidence projection after account loss and permits a fresh authorized request', { timeout: 20000 }, async () => {
+    const f = await multipleSelectedFixture();
+    const priorReview = await callIpcRaw('projects:prepare-package-review', f.id);
+    assert.equal(priorReview.materializable, true);
+    assert.equal(typeof priorReview.token, 'string');
+
+    let enterGate, releaseGate, entered = false;
+    const enteredPromise = new Promise(resolve => { enterGate = resolve; });
+    const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+    let gateTimeout;
+    global.__crateWorkspaceFilterEvidenceGate = { projectId: f.id, filePath: f.rows['A.ai'].path, wait: async () => {
+      if (entered) return;
+      entered = true;
+      enterGate();
+      await gatePromise;
+    } };
+    const startingGeneration = testAccountSession.generation;
+    const workspacePromise = metadataTestHooks.getProjectAssetWorkspace(f.id).then(value => ({ value }), error => ({ error }));
+    try {
+      await Promise.race([enteredPromise, new Promise((_, reject) => {
+        gateTimeout = setTimeout(() => reject(new Error('workspace selector did not reach source evidence')), 5000);
+      })]);
+      await testAccountSession.logout();
+      await testAccountSession.restore();
+      assert.notEqual(testAccountSession.generation, startingGeneration);
+      assert.equal(testAccountSession.canUseWorkspace(), true);
+      assert.equal(metadataTestHooks.getPackageReviewState().tokens.includes(priorReview.token), false);
+    } finally {
+      if (gateTimeout) clearTimeout(gateTimeout);
+      releaseGate();
+      delete global.__crateWorkspaceFilterEvidenceGate;
+    }
+
+    const stale = await workspacePromise;
+    assert.ifError(stale.error);
+    assert.equal(stale.value, null);
+    const projects = await callIpcRaw('projects:get-all');
+    assert.ok(projects.some(project => project.id === f.id), 'account change must not delete project data');
+    const fresh = await metadataTestHooks.getProjectAssetWorkspace(f.id);
+    assert.ok(fresh, 'a new request under the authorized account can rebuild the workspace');
+    clearTrackedTimers();
+  });
+  }
 
   continuationTest('multi-source real selectors Replace A with B preserve C/D and unique/shared dependency union', async () => {
     const f = await multipleSelectedFixture();
