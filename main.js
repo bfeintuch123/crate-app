@@ -19535,24 +19535,32 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
     catch (e) { return; }
     if (!operationCurrent()) return;
     entries.sort((left, right) => left.name.localeCompare(right.name));
+    // The output policy is stable only within this synchronous segment. Avoid
+    // rereading/normalizing the complete project store for every file, and
+    // discard this view before any callback can change generated outputs.
+    let outputPaths = null;
 
     for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
       const entry = entries[entryIndex];
       const fullPath = path.join(folder, entry.name);
       if (entry.name.startsWith('.')) continue;
       if (entry.isDirectory() && depth < 3) {
+        outputPaths = null;
         await collectLastUsedCandidates(fullPath, depth + 1);
         if (!operationCurrent()) return;
         continue;
       }
       if (!entry.isFile()) continue;
       const ext = path.extname(entry.name).toLowerCase();
-      if (!DESIGN_FILE_EXTENSIONS.has(ext) || isAutoCaptureExcludedPath(fullPath)) continue;
+      if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
+      if (!outputPaths) outputPaths = getKnownPackageOutputPaths();
+      if (isAutoCaptureExcludedPath(fullPath, [], outputPaths)) continue;
       const normalizedFullPath = normalizeTrackedFilePath(fullPath);
       if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
       lastUsedCandidates.push({ fullPath, name: entry.name, ext, normalizedFullPath });
       scanMetrics.candidateCount++;
       if (lastUsedCandidates.length % 256 === 0) {
+        outputPaths = null;
         await new Promise(resolve => setImmediate(resolve));
         if (!operationCurrent()) return;
       }
