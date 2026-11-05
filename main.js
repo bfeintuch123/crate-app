@@ -4479,14 +4479,15 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       const selections = { ...(project.workingSourceSelections || {}), [key]: selection };
       const verifications = { ...(project.workingSourceVerification || {}), [key]: {
         ...verification, status: request.action === 'exclude'
-          ? recoveryVerificationRequired ? 'stale' : verification?.status || 'unavailable' : 'pending',
+          ? recoveryVerificationRequired || verification?.status === 'pending' ? 'stale' : verification?.status || 'unavailable' : 'pending',
         selectionRevision: selection.revision, attempt,
         // Historical output receipts remain bound to their historical source
         // digest. Stale/pending status and null identity revoke current proof.
         sourceFingerprint: verification?.sourceFingerprint || null,
         sourceIdentity: recoveryVerificationRequired ? null : verification?.sourceIdentity || null,
         provider: verification?.provider || 'ordinary-scan', coverage: 'ordinary-route', version: 1,
-        reason: request.action === 'restore' || recoveryVerificationRequired ? 'verification-required' : verification?.reason || 'not-scanned',
+        reason: request.action === 'restore' || recoveryVerificationRequired ? 'verification-required'
+          : verification?.status === 'pending' ? 'scan-interrupted' : verification?.reason || 'not-scanned',
         requiredReferences: verification?.requiredReferences || [], unresolved: verification?.unresolved || [],
       } };
       const prospective = { ...project, workingSourceSelections: selections, workingSourceVerification: verifications };
@@ -4495,11 +4496,12 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       }
       project.workingSourceVerification = verifications;
       project.workingSourceSelections = selections;
-      workingSourceScanLeases.get(projectId + ':' + key)?.cancel('selection-changed');
-      return { success: true, selection, file, attempt };
+      const oldLease = workingSourceScanLeases.get(projectId + ':' + key);
+      return { success: true, selection, file, attempt, oldLease };
     });
     if (!result) return { success: false, error: 'not_found' };
     if (!result.success) return result;
+    result.oldLease?.cancel('selection-changed');
     invalidatePackageReviewForProject(projectId);
     syncAcceptedSourceWatchSubscriptions(projectId);
     reconcileProjectAssetBaselineScanSources(projectId, { allowPaused: true });
@@ -5327,7 +5329,11 @@ async function resolveWorkingSourceContinuation(projectId, request) {
       decision.predecessorSelectionRevision++; decision.successorSelectionRevision++;
       for (const [index, file] of [current.predecessor, current.successor].entries()) {
         const record = getWorkingSourceVerification(project, file);
-        if (record) verification[keysForPair[index]] = { ...record, selectionRevision: selections[keysForPair[index]].revision, attempt: crypto.randomUUID() };
+        if (record) verification[keysForPair[index]] = { ...record,
+          // A copied pending receipt has no producer for its new attempt. The
+          // old worker remains fenced and may still be draining independently.
+          ...(record.status === 'pending' ? { status: 'stale', reason: 'scan-interrupted' } : {}),
+          selectionRevision: selections[keysForPair[index]].revision, attempt: crypto.randomUUID() };
       }
     }
     const pair = { ...current.pair, revision: current.pair.revision + 1, decision };
