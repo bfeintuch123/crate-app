@@ -15083,7 +15083,7 @@ async function getAddFilesCurrentSourceDigest(filePath, scanLease, expectedIdent
     if (!isAddFilesSourceIdentityCurrent(await handle.stat(), identity)) changed();
     check();
     const hash = crypto.createHash('sha256');
-    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(identity.size, 1024 * 1024)));
     let offset = 0;
     while (offset < identity.size) {
       check();

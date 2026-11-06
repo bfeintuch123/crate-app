@@ -679,7 +679,7 @@ for (const kind of ['open', 'read']) {
   });
 }
 
-test('streaming digest handles partial reads, fixed scratch size, restored mtime mutations, growth and replacement', async t => {
+test('streaming digest handles partial reads, size-capped scratch, restored mtime mutations, growth and replacement', async t => {
   let largest = 0, reads = 0;
   const h = harness(t, { io: { async open(...args) {
     const handle = await fs.promises.open(...args), read = handle.read.bind(handle);
@@ -690,7 +690,7 @@ test('streaming digest handles partial reads, fixed scratch size, restored mtime
   const stat = fs.statSync(source), expected = h.context.getAddFilesSourceIdentity(stat);
   const digest = await h.context.getAddFilesCurrentSourceDigest(source, null, expected);
   assert.equal(digest, crypto.createHash('sha256').update(data).digest('hex'));
-  assert.equal(largest, 65536); assert.ok(reads > 20);
+  assert.equal(largest, Math.max(1, Math.min(data.length, 1024 * 1024))); assert.ok(reads > 20);
   data[0] = 8; fs.writeFileSync(source, data); fs.utimesSync(source, stat.atime, stat.mtime);
   const restored = h.context.getAddFilesSourceIdentity(fs.statSync(source));
   assert.notEqual(await h.context.getAddFilesCurrentSourceDigest(source, null, restored), digest);
@@ -777,7 +777,7 @@ test('slots remain held through later source hashing, including cancelled native
       const handle = await fs.promises.open(...args);
       if (args[1] === 'r') {
         const read = handle.read.bind(handle);
-        handle.read = async (...readArgs) => { assert.equal(readArgs[0].byteLength, 65536); if (++reads === 4) entered.resolve(); await blocked.promise; return read(...readArgs); };
+        handle.read = async (...readArgs) => { assert.equal(readArgs[0].byteLength, Math.min(200000, 1024 * 1024)); if (++reads === 4) entered.resolve(); await blocked.promise; return read(...readArgs); };
       }
       return handle;
     },
