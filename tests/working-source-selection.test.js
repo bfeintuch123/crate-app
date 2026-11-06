@@ -8,6 +8,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const os = require('node:os');
+const Module = require('node:module');
 const vm = require('node:vm');
 const { extractLinkedAssetsFromBuffer } = require('../parsers/add-files-regex-worker');
 const { runBoundedAddFilesScan } = require('../parsers/add-files-operation');
@@ -34,6 +36,11 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   let documentIdentityReader = () => null;
   let authorized = true;
   let epoch = 0;
+  let cloneStore = false;
+  let failNextStoreWrite = false;
+  let failAfterStoreWrite = false;
+  let afterStoreWrite = null;
+  let realStore = null;
   const context = vm.createContext({
     path, crypto,
     runBoundedAddFilesScan, ADD_FILES_SCAN_TIMEOUT_MS: 1000,
@@ -46,7 +53,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
       return { dev: 1, ino: 1, size: disk.get(filePath).length, mtimeMs: 0, ctimeMs: 0, isFile: () => true };
     } },
     getAddFilesSourceIdentity: stat => ({ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }),
-    getProjects: () => projects,
+    getProjects: () => realStore ? realStore.get('projects', []) : cloneStore ? structuredClone(projects) : projects,
     getTrackedFileDedupKey: file => file.path.toLowerCase(),
     normalizeTrackedFilePath: filePath => typeof filePath === 'string' ? filePath.toLowerCase() : '',
     isProjectAssetBaselineSource: file => file?.projectRole === 'source',
@@ -65,12 +72,19 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     captureProjectOperation: id => {
       const capturedEpoch = epoch;
       let open = true;
-      return { current: () => open && authorized && capturedEpoch === epoch && projects.some(p => p.id === id),
+      return { current: () => open && authorized && capturedEpoch === epoch && context.getProjects().some(p => p.id === id),
         close: () => { open = false; }, adoptScope: () => true };
     },
     mutateProject: (id, fn) => {
-      const project = projects.find(p => p.id === id);
-      return project ? fn(project) : null;
+      const next = cloneStore ? structuredClone(projects) : projects;
+      const project = next.find(p => p.id === id);
+      if (!project) return null;
+      const result = fn(project);
+      if (cloneStore && failNextStoreWrite) { failNextStoreWrite = false; throw new Error('synthetic-store-write-failed'); }
+      if (cloneStore) projects = next;
+      if (cloneStore && failAfterStoreWrite) { failAfterStoreWrite = false; throw new Error('synthetic-store-write-uncertain'); }
+      if (cloneStore && afterStoreWrite) { const callback = afterStoreWrite; afterStoreWrite = null; callback(); }
+      return result;
     },
     resolveProjectOwnedFileVisualRecord: (id, identity, project) =>
       (project?.files || []).find(file => identity === `${id}:${file.fileId}`),
@@ -80,7 +94,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     // separately exercises actual allocator and callback functions; this VM
     // neither creates subscriptions nor proves native event delivery.
     syncAcceptedSourceWatchSubscriptions: projectId => {
-      assert.equal(projects.find(project => project.id === projectId)?.status, 'paused');
+      assert.equal(context.getProjects().find(project => project.id === projectId)?.status, 'paused');
       watchSyncCalls.push({ projectId, watcherState: 'closed/no-watcher' });
     },
     sendToRenderer: (event, payload) => events.push({ event, payload }),
@@ -127,7 +141,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -141,11 +155,23 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
   };
   const project = { id: 'project-a', status: 'paused', files: [], excludedAssetKeys: [] };
   projects.push(project);
-  const command = (file, action, expectedRevision = api.getWorkingSourceSelection(projects[0], file).revision) =>
+  const command = (file, action, expectedRevision = api.getWorkingSourceSelection(context.getProjects()[0], file).revision) =>
     api.setWorkingSourceSelection(project.id, `${project.id}:${file.fileId}`, { action, expectedRevision });
   return { api, project, source, asset, disk, physical, command, events, invalidated, watchSyncCalls,
     reload() { projects = JSON.parse(JSON.stringify(projects)); return projects[0]; },
     replace(project) { projects = [project]; },
+    useClonedStore() { cloneStore = true; },
+    useRealStore(store) {
+      store.set('projects', projects); realStore = store;
+      Object.assign(context, { store, capturePsdReceiptHeldMembers: () => null,
+        clearFileVisualProjectCache() {}, normalizeAutoCaptureProjectState() {}, normalizeProjectAssetReviewState() {},
+        safelyEnsureProjectProvenance() {}, retireRemovedPsdReceiptHolds() {} });
+      vm.runInContext(between('function mutateProject(', '// FIX 2 (C2):'), context);
+    },
+    failNextStoreWrite() { failNextStoreWrite = true; },
+    failAfterStoreWrite() { failAfterStoreWrite = true; },
+    afterStoreWrite(callback) { afterStoreWrite = callback; },
+    snapshot() { return structuredClone(context.getProjects()[0]); },
     revoke() { authorized = false; },
     changeGeneration() { epoch++; },
     setDigestGate(callback) { digestGate = callback; },
@@ -360,6 +386,157 @@ test('current regex capability cannot distinguish empty complete proof from unsu
 });
 
 
+test('excluding pending verification preserves its evidence and rejects late completion before retry', async () => {
+  const f = fixture(), a = f.source('Original.ai');
+  f.project.files.push(a);
+  await f.command(a, 'exclude');
+  const gate = deferred();
+  f.setDigestGate(() => gate.promise);
+  const oldRestore = f.command(a, 'restore');
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, a);
+  const pending = f.project.workingSourceVerification[key];
+  const fingerprint = 'a'.repeat(64);
+  pending.sourceFingerprint = fingerprint;
+  pending.requiredReferences = [{ path: '/synthetic/linked.png' }];
+  pending.requiredEmbeddedOutputs = [{ path: '/synthetic/output.png', sourceDigest: fingerprint, outputDigest: 'b'.repeat(64) }];
+  pending.unresolved = [{ reason: 'unresolved-declared-reference' }];
+  f.project.workingFileDirtyHolds = { version: 1, records: { [key]: { version: 2, identities: [null] } } };
+  f.project.workingSourceRelationshipHolds = [{ reason: 'psd-extraction-receipt-unverified', sourcePath: a.path }];
+  const evidence = plain(pending), dirty = plain(f.project.workingFileDirtyHolds);
+  const holds = plain(f.project.workingSourceRelationshipHolds);
+  assert.equal((await f.command(a, 'exclude')).success, true);
+  const excluded = plain(f.project.workingSourceVerification[key]);
+  for (const field of ['requiredReferences', 'requiredEmbeddedOutputs', 'unresolved', 'sourceFingerprint', 'pendingReviewFacts']) {
+    assert.deepEqual(excluded[field], evidence[field]);
+  }
+  assert.equal(excluded.status, 'stale');
+  assert.equal(excluded.reason, 'scan-interrupted');
+  assert.notEqual(excluded.attempt, evidence.attempt);
+  assert.deepEqual(plain(f.project.workingFileDirtyHolds), dirty);
+  assert.deepEqual(plain(f.project.workingSourceRelationshipHolds), holds);
+  gate.resolve();
+  await oldRestore;
+  assert.deepEqual(plain(f.project.workingSourceVerification[key]), excluded);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, a).state, 'excluded');
+});
+
+test('Exclude cancels the old lease only after a cloned store accepts the new revision', async () => {
+  const f = fixture(), a = f.source('Original.ai');
+  f.project.files.push(a); f.useClonedStore();
+  await f.command(a, 'exclude');
+  const gate = deferred(); f.setDigestGate(() => gate.promise);
+  const restore = f.command(a, 'restore');
+  const pending = f.snapshot();
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(pending, a);
+  let cancellations = 0;
+  f.api.workingSourceScanLeases.set(`${f.project.id}:${key}`, { cancel: () => { cancellations++; } });
+  try {
+    f.failNextStoreWrite();
+    await assert.rejects(f.command(a, 'exclude'), /synthetic-store-write-failed/);
+    assert.deepEqual(f.snapshot(), pending);
+    assert.equal(cancellations, 0);
+    assert.equal((await f.command(a, 'exclude')).success, true);
+    assert.equal(cancellations, 1);
+    const excluded = f.snapshot();
+    assert.equal(excluded.workingSourceVerification[key].status, 'stale');
+    gate.resolve(); await restore;
+    assert.deepEqual(f.snapshot(), excluded);
+  } finally { gate.resolve(); await restore; }
+});
+
+test('an uncertain Exclude write leaves a committed receipt fenced from late completion', async () => {
+  const f = fixture(), a = f.source('Original.ai');
+  f.project.files.push(a); f.useClonedStore();
+  await f.command(a, 'exclude');
+  const gate = deferred(); f.setDigestGate(() => gate.promise);
+  const restore = f.command(a, 'restore');
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.snapshot(), a);
+  let cancellations = 0;
+  f.api.workingSourceScanLeases.set(`${f.project.id}:${key}`, { cancel: () => { cancellations++; } });
+  try {
+    f.failAfterStoreWrite();
+    await assert.rejects(f.command(a, 'exclude'), /synthetic-store-write-uncertain/);
+    const committed = f.snapshot();
+    assert.equal(committed.workingSourceVerification[key].status, 'stale');
+    assert.equal(cancellations, 0);
+    gate.resolve(); await restore;
+    assert.deepEqual(f.snapshot(), committed);
+  } finally { gate.resolve(); await restore; }
+});
+
+test('Exclude cancels only the lease captured before a reentrant replacement', async () => {
+  const f = fixture(), a = f.source('Original.ai');
+  f.project.files.push(a); f.useClonedStore();
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.snapshot(), a);
+  const leaseKey = `${f.project.id}:${key}`;
+  let oldCancelled = 0, newCancelled = 0;
+  f.api.workingSourceScanLeases.set(leaseKey, { cancel: () => { oldCancelled++; } });
+  f.afterStoreWrite(() => f.api.workingSourceScanLeases.set(leaseKey, { cancel: () => { newCancelled++; } }));
+  assert.equal((await f.command(a, 'exclude')).success, true);
+  assert.equal(oldCancelled, 1);
+  assert.equal(newCancelled, 0);
+});
+
+let electronStoreAvailable = true;
+try { require.resolve('electron-store'); } catch (_) { electronStoreAvailable = false; }
+function createSyntheticElectronStore(tmp) {
+  const originalLoad = Module._load;
+  let Store;
+  try {
+    Module._load = function(request, ...args) {
+      if (request === 'electron') return { app: { getPath: () => tmp, getVersion: () => '1.0.0' }, ipcMain: { on() {} } };
+      return originalLoad.call(this, request, ...args);
+    };
+    Store = require('electron-store');
+  } finally { Module._load = originalLoad; }
+  return new Store({ cwd: tmp, projectVersion: '1.0.0', configFileMode: 0o600 });
+}
+
+for (const mode of ['before-write', 'after-write', 'reentrant-change']) {
+  test(`Exclude with real Electron Store: ${mode}`, { skip: !electronStoreAvailable }, async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-receipt-store-'));
+    const store = createSyntheticElectronStore(tmp);
+    const f = fixture(), a = f.source('Original.ai'); f.project.files.push(a); f.useRealStore(store);
+    const gate = deferred();
+    try {
+      await f.command(a, 'exclude');
+      f.setDigestGate(() => gate.promise);
+      const restore = f.command(a, 'restore');
+      let before = f.snapshot();
+      const key = f.api.getAssetBaselineSourceRecoveryRouteKey(before, a);
+      const oldScan = mode === 'reentrant-change'
+        ? f.api.beginWorkingSourceScan(f.project.id, a.path, () => true, before.workingSourceVerification[key].attempt) : null;
+      if (oldScan) before = f.snapshot();
+      const leaseKey = `${f.project.id}:${key}`;
+      let oldCancelled = 0, newCancelled = 0;
+      f.api.workingSourceScanLeases.set(leaseKey, { cancel: () => { oldCancelled++; } });
+      const originalWrite = store._write;
+      if (mode !== 'reentrant-change') store._write = function(value) {
+        if (mode === 'before-write') throw new Error('synthetic-before-write');
+        originalWrite.call(this, value);
+        throw new Error('synthetic-after-write');
+      };
+      else store.events.once('change', () => {
+        assert.equal(f.api.publishWorkingSourceScan(oldScan, { status: 'scanned' }), false);
+        f.api.workingSourceScanLeases.set(leaseKey, { cancel: () => { newCancelled++; } });
+      });
+      if (mode === 'reentrant-change') {
+        assert.equal((await f.command(a, 'exclude')).success, true);
+        assert.equal(oldCancelled, 1); assert.equal(newCancelled, 0);
+      } else {
+        await assert.rejects(f.command(a, 'exclude'), new RegExp(`synthetic-${mode}`));
+        assert.equal(oldCancelled, 0);
+      }
+      store._write = originalWrite;
+      const after = f.snapshot();
+      if (mode === 'before-write') assert.deepEqual(after, before);
+      else assert.equal(after.workingSourceVerification[key].status, 'stale');
+      gate.resolve(); await restore;
+      if (mode !== 'before-write') assert.deepEqual(f.snapshot(), after);
+    } finally { gate.resolve(); fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+}
+
 test('legacy existing-asset exclusions retain their existing semantics until source selection is activated', async () => {
   const f = fixture();
   const source = f.source('Document.ai');
@@ -544,6 +721,33 @@ test('Replace commits one verified successor and retains the predecessor require
   assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 0);
   assert.equal((await f.api.selectProjectFilesForPackaging(f.project)).length, 3);
   assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, request)).error, 'continuation_stale');
+});
+
+test('Replace marks a copied pending predecessor stale and fences its late worker', async () => {
+  const f = continuationFixture();
+  const old = f.api.beginWorkingSourceScan(f.project.id, f.a.path, () => true);
+  const pending = f.project.workingSourceVerification[old.key];
+  const fingerprint = 'a'.repeat(64);
+  pending.sourceFingerprint = fingerprint;
+  pending.requiredReferences = [{ path: '/synthetic/linked.png' }];
+  pending.requiredEmbeddedOutputs = [{ path: '/synthetic/output.png', sourceDigest: fingerprint, outputDigest: 'b'.repeat(64) }];
+  pending.unresolved = [{ reason: 'unresolved-declared-reference' }];
+  const evidence = plain(pending);
+  f.project.workingFileDirtyHolds = { version: 1, records: { [old.key]: { version: 2, identities: [null] } } };
+  const dirty = plain(f.project.workingFileDirtyHolds);
+  const result = await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f));
+  assert.equal(result.success, true);
+  const copied = f.api.getWorkingSourceVerification(f.project, f.a);
+  assert.equal(copied.status, 'stale'); assert.equal(copied.reason, 'scan-interrupted');
+  assert.notEqual(copied.attempt, old.attempt);
+  for (const field of ['sourceFingerprint', 'requiredReferences', 'requiredEmbeddedOutputs', 'unresolved', 'pendingReviewFacts']) {
+    assert.deepEqual(plain(copied[field]), evidence[field]);
+  }
+  assert.deepEqual(plain(f.project.workingFileDirtyHolds), dirty);
+  const after = plain(f.project);
+  assert.equal(f.api.publishWorkingSourceScan(old, { status: 'scanned' }), false);
+  assert.equal(f.api.failWorkingSourceScan(old, { current: () => true }, 'scan-timeout'), false);
+  assert.deepEqual(plain(f.project), after);
 });
 
 test('Keep both and Not related persist without engaging or altering ordinary selection', async () => {

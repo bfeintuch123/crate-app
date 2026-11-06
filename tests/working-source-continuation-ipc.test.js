@@ -16,7 +16,7 @@ replaceOnce("const test = require('node:test');", "const continuationTest = requ
 replaceOnce("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))",
   "fs.mkdtempSync(path.join(process.env.CRATE_TEST_OUTPUT_ROOT || path.dirname(MAIN_UNDER_TEST_ROOT), 'continuation-synthetic-home-'))");
 replaceOnce('  captureProjectOperation,\n  runScanOnOpen',
-  '  recordWorkingSourceContinuationCandidate, refreshWorkingSourceLocators, getWorkingSourceSelection, getWorkingSourceVerification, getAssetBaselineSourceRecoveryRouteKey, pollPsForProjectCore, observeIllustratorWorkingSourceContinuation,\n  selectProjectFilesForPackaging, getIllustratorScopedProjectView, isObservedPrimarySourceFile, shouldKeepObservedSourceFileForPackaging,\n  expireDocumentIdentityCache() { for (const entry of workingSourceDocumentIdentityCache.values()) entry.expiresAt = 0; },\n  clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); },\n  seedSelectorScope(id, value) { illustratorActivationScopes.set(id, value); },\n  seedSnapshot(id, value) { illustratorContinuationSnapshots.set(id, value); }, readSnapshot(id) { return illustratorContinuationSnapshots.get(id); },\n  replacePollRefresh(fn) { const previous = applyLiveAppEvidenceRefresh; applyLiveAppEvidenceRefresh = fn; return previous; },\n  replacePollQuery(fn) { const previous = queryIllustratorActiveState; queryIllustratorActiveState = fn; return previous; },\n  captureProjectOperation,\n  runScanOnOpen');
+  '  recordWorkingSourceContinuationCandidate, refreshWorkingSourceLocators, getWorkingSourceSelection, getWorkingSourceVerification, getAssetBaselineSourceRecoveryRouteKey, beginWorkingSourceScan, publishWorkingSourceScan, pollPsForProjectCore, observeIllustratorWorkingSourceContinuation,\n  selectProjectFilesForPackaging, getIllustratorScopedProjectView, isObservedPrimarySourceFile, shouldKeepObservedSourceFileForPackaging,\n  expireDocumentIdentityCache() { for (const entry of workingSourceDocumentIdentityCache.values()) entry.expiresAt = 0; },\n  clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); },\n  seedSelectorScope(id, value) { illustratorActivationScopes.set(id, value); },\n  seedSnapshot(id, value) { illustratorContinuationSnapshots.set(id, value); }, readSnapshot(id) { return illustratorContinuationSnapshots.get(id); },\n  replacePollRefresh(fn) { const previous = applyLiveAppEvidenceRefresh; applyLiveAppEvidenceRefresh = fn; return previous; },\n  replacePollQuery(fn) { const previous = queryIllustratorActiveState; queryIllustratorActiveState = fn; return previous; },\n  captureProjectOperation,\n  runScanOnOpen');
 const compiled = new Module(harnessPath, module);
 replaceOnce('  runScanOnOpen, beginProjectAssetBaselineScan,',
   '  scanMeasurementState() { return { leases: workingSourceScanLeases, operations: workingSourceScanOperations }; },\n  getWatcherCoordinator,\n  runScanOnOpen, beginProjectAssetBaselineScan,');
@@ -1639,6 +1639,25 @@ function continuationCases() {
     const review = await callIpcRaw('projects:prepare-package-review', f.id);
     assert.equal(review.materializable, true);
     assert.equal(review.totalFiles, 3);
+  });
+  continuationTest('real IPC Replace interrupts a copied pending predecessor and rejects late publication', async () => {
+    const f = await fixture(), predecessor = f.files[0], successor = f.files[1];
+    const operation = metadataTestHooks.captureProjectOperation(f.id);
+    try {
+      const old = metadataTestHooks.beginWorkingSourceScan(f.id, predecessor.path, operation.current);
+      assert.ok(old);
+      assert.ok(metadataTestHooks.recordWorkingSourceContinuationCandidate(f.id, predecessor.path, successor.path));
+      const workspace = await callIpcRaw('projects:get-asset-workspace', f.id);
+      const result = await callIpcRaw('projects:resolve-working-source-continuation', f.id,
+        request(workspace.sourceContinuation.candidates[0], 'replace'));
+      assert.equal(result.success, true);
+      const record = metadataTestHooks.getWorkingSourceVerification(f.stored(), predecessor);
+      assert.equal(record.status, 'stale'); assert.equal(record.reason, 'scan-interrupted');
+      assert.notEqual(record.attempt, old.attempt);
+      const after = JSON.stringify(f.stored().workingSourceVerification);
+      assert.equal(metadataTestHooks.publishWorkingSourceScan(old, { status: 'scanned' }), false);
+      assert.equal(JSON.stringify(f.stored().workingSourceVerification), after);
+    } finally { operation.close(); clearTrackedTimers(); }
   });
   continuationTest('real IPC holds the selected original for an excluded successor and verifies explicit Replace before restoring it', async () => {
     const f = await fixture();
