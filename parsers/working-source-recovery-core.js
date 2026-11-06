@@ -1,6 +1,6 @@
 'use strict';
 
-// Scratch prototype only. The caller supplies read-only extraction primitives,
+// Result-only verification. The caller supplies read-only extraction primitives,
 // plus a current capability covering project/source identity and retry intent.
 // No project, receipt, store, baseline, admission, or publisher is accepted.
 const path = require('node:path');

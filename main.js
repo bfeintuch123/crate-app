@@ -4130,15 +4130,15 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const eligible = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
-    const persistedVerification = project.workingSourceVerification?.[getAssetBaselineSourceRecoveryRouteKey(project, file)];
+    const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
     // An untouched root with no concrete scan obligation keeps legacy readiness.
     // Known scan results and required roles consume their actual obligations,
     // never an invented demand for exhaustive inventory certification.
     const unscannedExcludedRole = verification?.status === 'unavailable' && verification.reason === 'not-scanned' &&
       !verification.sourceFingerprint && verification.requiredReferences.length === 0 && verification.unresolved.length === 0;
     const verificationRequired = (recoveryGuarded && eligible && source) || (engaged && eligible && ((selectedSource && (selection.revision > 0 ||
-      (!!persistedVerification && !unscannedExcludedRole))) ||
-      (includedAsDependency && !!persistedVerification && !unscannedExcludedRole)));
+      (persistedVerification && !unscannedExcludedRole))) ||
+      (includedAsDependency && persistedVerification && !unscannedExcludedRole)));
     let verificationStatus = selection?.state === 'invalid' ? 'invalid' : verification?.status || 'unavailable';
     if (verificationRequired && ['scanned', 'no-extractor'].includes(verification?.status) && !isWorkingSourceDiskIdentityCurrent(file, verification)) verificationStatus = 'stale';
     // Preserve the observer/scope veto for untouched, clean dormant roots.
@@ -4147,7 +4147,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       verification.unresolved.length === 0 && verification.requiredReferences.length === 0 &&
       (verification.requiredEmbeddedOutputs || []).length === 0;
     const retainedSourceIntent = selectedSource && (selection.revision > 0 ||
-      (!!persistedVerification && !unscannedExcludedRole && !dormantClean));
+      (persistedVerification && !unscannedExcludedRole && !dormantClean));
     const packageSelectionOmitted = (engaged || recoveryGuarded) && packageKeys && eligible &&
       (recoveryGuarded || includedAsDependency || retainedSourceIntent) && !packageKeys.has(getTrackedFileDedupKey(file));
     const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
@@ -4272,6 +4272,18 @@ function hasInvalidWorkingSourceReceipt(project, file) {
     !getWorkingSourceVerification(project, file);
 }
 
+// A retained recovery transaction owns this receipt, including when the active
+// receipt is absent. Ordinary producers must not create a competing receipt.
+function hasWorkingSourceRecoveryRecord(project, file) {
+  if (!hasWorkingSourceRecoveryHold(project)) return false;
+  const holds = getWorkingSourceRecoveryChoiceHolds(project);
+  return holds === null || holds.has(getAssetBaselineSourceRecoveryRouteKey(project, file));
+}
+
+function isWorkingSourceReceiptWriteBlocked(project, file) {
+  return hasWorkingSourceRecoveryRecord(project, file) || hasInvalidWorkingSourceReceipt(project, file);
+}
+
 function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = null, excludedPreparation = null) {
   const project = getProjects().find(item => item.id === projectId);
   const file = project?.files?.find(row => !isScanOnSaveEmbeddedPsdFile(row) &&
@@ -4279,7 +4291,7 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
   if (!file || !parentCurrent()) return null;
   const key = getAssetBaselineSourceRecoveryRouteKey(project, file), selection = getWorkingSourceSelection(project, file);
   const previous = getWorkingSourceVerification(project, file);
-  if (hasInvalidWorkingSourceReceipt(project, file)) return null;
+  if (isWorkingSourceReceiptWriteBlocked(project, file)) return null;
   const preparingExcluded = selection.state === 'excluded' && typeof excludedPreparation === 'function' && excludedPreparation(project, file) === true;
   if (selection.state === 'invalid' || (selection.state === 'excluded' && !preparingExcluded &&
     !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency)) return null;
@@ -4293,7 +4305,7 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
       latest.workingSourceVerification?.[key]?.attempt === attempt;
   };
   const reserved = mutateProject(projectId, latest => {
-    if (!parentCurrent() || hasInvalidWorkingSourceReceipt(latest, file)) return false;
+    if (!parentCurrent() || isWorkingSourceReceiptWriteBlocked(latest, file)) return false;
     latest.workingSourceVerification = { ...(latest.workingSourceVerification || {}), [key]: {
       ...previous, status: 'pending', selectionRevision: selection.revision, attempt,
       pendingReviewFacts: getDormantWorkingSourceReviewFacts(previous),
@@ -4340,7 +4352,7 @@ function publishWorkingSourceScan(scan, result) {
   const written = mutateProject(scan.projectId, project => {
     if (!scan.current()) return false;
     const row = project.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === scan.key);
-    if (!row || hasInvalidWorkingSourceReceipt(project, row)) return false;
+    if (!row || isWorkingSourceReceiptWriteBlocked(project, row)) return false;
     const previous = project.workingSourceVerification[scan.key];
     let published = result;
     if (['scanned', 'no-extractor'].includes(result.status) && result.sourceFingerprint &&
@@ -4374,7 +4386,7 @@ function failWorkingSourceScan(scan, operation, reason) {
   const changed = mutateProject(scan.projectId, project => {
     const record = project.workingSourceVerification?.[scan.key];
     const row = project.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === scan.key);
-    if (!operation.current() || record?.attempt !== scan.attempt || !row || hasInvalidWorkingSourceReceipt(project, row) ||
+    if (!operation.current() || record?.attempt !== scan.attempt || !row || isWorkingSourceReceiptWriteBlocked(project, row) ||
       getWorkingSourceSelection(project, row).revision !== scan.selectionRevision) return false;
     project.workingSourceVerification[scan.key] = { ...record, status: 'failed', reason, unresolved: [{ reason }] };
     return true;
@@ -4400,7 +4412,7 @@ async function refreshWorkingSourceVerification(projectId) {
       if (fresh) continue;
       const key = getAssetBaselineSourceRecoveryRouteKey(project, file);
       mutateProject(projectId, latest => {
-        if (!operation.current() || hasInvalidWorkingSourceReceipt(latest, file) || latest.workingSourceVerification?.[key]?.attempt !== record.attempt) return false;
+        if (!operation.current() || isWorkingSourceReceiptWriteBlocked(latest, file) || latest.workingSourceVerification?.[key]?.attempt !== record.attempt) return false;
         latest.workingSourceVerification[key] = { ...record, status: 'stale', reason: 'source-bytes-changed' };
         return true;
       });
@@ -4419,7 +4431,7 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
       return !!operation?.current() && !!project &&
         project.workingSourceVerification?.[key]?.attempt === attempt;
     };
-    if (!current() || hasInvalidWorkingSourceReceipt(getProjects().find(item => item.id === projectId), file)) return;
+    if (!current() || isWorkingSourceReceiptWriteBlocked(getProjects().find(item => item.id === projectId), file)) return;
     if (file.virtual === true || !SCAN_ON_OPEN_EXTENSIONS.has(path.extname(file.path || '').toLowerCase())) {
       const scan = beginWorkingSourceScan(projectId, file.path, current, attempt, excludedPreparation);
       if (file.virtual === true) {
@@ -4470,7 +4482,7 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
     const record = getProjects().find(item => item.id === projectId)?.workingSourceVerification?.[key];
     if (report.cancelled || report.outcomes.some(item => !item.success)) {
       mutateProject(projectId, project => {
-        if (!current() || hasInvalidWorkingSourceReceipt(project, file)) return false;
+        if (!current() || isWorkingSourceReceiptWriteBlocked(project, file)) return false;
         project.workingSourceVerification[key] = { ...record, status: 'failed',
           reason: path.extname(file.path || '').toLowerCase() === '.indd' && record?.status === 'failed'
             ? record.reason : report.outcomes[0]?.error || 'scan-cancelled' };
@@ -4523,8 +4535,23 @@ async function setWorkingSourceSelection(projectId, visualIdentity, request) {
       // Changed/missing A retains known dependency obligations, but none of its
       // old byte authority. A required asset still needs fresh verification.
       const verification = getWorkingSourceVerification(project, file);
+      if (hasWorkingSourceRecoveryRecord(project, file)) {
+        return { success: false, error: 'working_source_recovery_required' };
+      }
       if (hasInvalidWorkingSourceReceipt(project, file)) {
-        return { success: false, error: 'working_source_verification_invalid' };
+        // Owner selection is not verification. Preserve the opaque receipt
+        // exactly; Exclude can omit an unrequired root, never a dependency.
+        // Skip its recorded revision so changing intent cannot revive proof.
+        const raw = project.workingSourceVerification[key];
+        let revision = previous.revision + 1;
+        if (revision === raw?.selectionRevision) revision++;
+        if (!Number.isSafeInteger(revision)) return { success: false, error: 'working_source_selection_stale' };
+        const selection = { state: request.action === 'exclude' ? 'excluded' : 'selected',
+          reason: request.action === 'exclude' ? 'user-excluded' : null, revision };
+        const prospective = { ...project, workingSourceSelections: { ...(project.workingSourceSelections || {}), [key]: selection } };
+        if (getWorkingSourceVerification(prospective, file)) return { success: false, error: 'working_source_verification_invalid' };
+        project.workingSourceSelections = prospective.workingSourceSelections;
+        return { success: true, selection };
       }
       const recoveryVerificationRequired = recoverable && (!verification || !isWorkingSourceDiskIdentityCurrent(file, verification));
       const selection = { state: request.action === 'exclude' ? 'excluded' : 'selected',
@@ -4676,6 +4703,7 @@ function hasWorkingFileDirtyHold(project, file) {
 // Renderer contract is an allowlist, never raw extractor errors or paths.
 function getWorkingFileVerificationReason(project, source, receipt) {
   if (path.extname(source.path || '').toLowerCase() !== '.indd') {
+    if (hasInvalidWorkingSourceReceipt(project, source) && !hasWorkingSourceRecoveryRecord(project, source)) return 'working-source-evidence-retained';
     if (hasWorkingFileDirtyHold(project, source)) return 'working-file-save-required';
     if (receipt?.status === 'pending') return 'working-file-verification-pending';
     if (receipt && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
@@ -4815,16 +4843,12 @@ function getWorkingSourceRecoveryChoiceHolds(project) {
       typeof state.records !== 'object' || Object.keys(state).some(key=>!['version','records'].includes(key))) return null;
   const keys = new Set();
   for (const [key, record] of Object.entries(state.records)) {
-    const rows = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
-    if (!/^[a-f0-9]{64}$/.test(key) || rows.length !== 1 || !isWorkingSourceFile(rows[0]) || !record || record.version !== 1 || !['held','pending'].includes(record.status) ||
+    if (!/^[a-f0-9]{64}$/.test(key) || !record || record.version !== 1 || !['held','pending'].includes(record.status) ||
         Object.keys(record).some(field=>!['version','attempt','status','original','originalHash','identity','selectionRevision','reason'].includes(field)) ||
         !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(record.attempt||'') ||
         (record.reason !== undefined && record.reason !== 'verification-required') ||
         typeof record.identity !== 'string' || !/^[a-f0-9]{64}$/.test(record.identity) ||
-        !Number.isSafeInteger(record.selectionRevision) || record.selectionRevision < 0 ||
-        record.identity !== getExplicitWorkingFileIdentity(project,rows[0]) ||
-        record.selectionRevision !== getWorkingSourceSelection(project,rows[0]).revision ||
-        JSON.stringify(record.original) !== JSON.stringify(project.workingSourceVerification?.[key])) return null;
+        !Number.isSafeInteger(record.selectionRevision) || record.selectionRevision < 0) return null;
     const encoded = JSON.stringify(record.original);
     if (typeof encoded !== 'string' || encoded.length > 4*1024*1024 ||
         crypto.createHash('sha256').update(encoded).digest('hex') !== record.originalHash) return null;
@@ -5010,6 +5034,7 @@ async function resolveWorkingFileChoice(projectId, request) {
     if (!choice || (!choice.ready && request.choice !== 'retry') || !operation.current()) return { success: false, error: 'working_file_choice_stale' };
     const source = resolveProjectOwnedFileVisualRecord(projectId, choice.source.visualIdentity, project);
     if (request.choice === 'retry') {
+      if (hasWorkingSourceRecoveryRecord(project, source) && !hasInvalidWorkingSourceReceipt(project, source)) return { success: false, error: 'working_source_recovery_required' };
       if (hasInvalidWorkingSourceReceipt(project, source)) {
         if (path.extname(source.path || '').toLowerCase() !== '.indd') return { success: false, error: 'working_source_verification_invalid' };
         const recovered = await recoverInvalidInDesignReceipt(projectId, source, operation);
@@ -5026,7 +5051,7 @@ async function resolveWorkingFileChoice(projectId, request) {
       const reserved = mutateProject(projectId, current => {
         if (!operation.current() || !getWorkingFileChoicePresentation(current).choices.some(item =>
           item.id === request.id && item.revision === request.revision)) return false;
-        if (hasInvalidWorkingSourceReceipt(current, source)) return false;
+        if (isWorkingSourceReceiptWriteBlocked(current, source)) return false;
         const receipt = getWorkingSourceVerification(current, source);
         const selection = getWorkingSourceSelection(current, source);
         if (selection.state !== 'selected') return false;
@@ -5280,7 +5305,8 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
     const destinations = [...new Set((observedPaths || []).filter(locator => typeof locator === 'string' && path.isAbsolute(locator)))].slice(0, 128);
     for (const file of sources) {
       const key = getAssetBaselineSourceRecoveryRouteKey(project, file), previous = records[key], present = documentRecords.get(key);
-      if (hasInvalidWorkingSourceReceipt(project, file)) continue;
+      const guardKeys = getWorkingSourceRecoveryGuardKeys(project);
+      if (isWorkingSourceReceiptWriteBlocked(project, file) || guardKeys === null || guardKeys.has(key)) continue;
       if (present) {
         // An unavailable read is not an observed identity change. Retain a
         // verified ID only for this same physical file, including after cache
@@ -5310,8 +5336,8 @@ async function refreshWorkingSourceLocators(projectId, observedPaths = null, par
       const newKey = getAssetBaselineSourceRecoveryRouteKey(project, moved);
       // Logical PSD children require their separate producer reconciliation.
       // Keep their true old-path obligations instead of rewriting declarations.
-      if (hasInvalidWorkingSourceReceipt(project, file)) continue;
-      if (!newKey || selections[newKey] || Object.hasOwn(verification, newKey) || records[newKey] || choices[newKey] || Object.hasOwn(dirtyHolds, newKey) ||
+      if (isWorkingSourceReceiptWriteBlocked(project, file)) continue;
+      if (!newKey || hasWorkingSourceRecoveryRecord(project, moved) || guardKeys.has(newKey) || selections[newKey] || Object.hasOwn(verification, newKey) || records[newKey] || choices[newKey] || Object.hasOwn(dirtyHolds, newKey) ||
           project.files.some(row => isScanOnSaveEmbeddedPsdFile(row) && normalizeTrackedFilePath(row.parentPsd || row.path) === normalizeTrackedFilePath(file.path))) continue;
       // A pre-hold ledger can still veto this old locator. Preserve that
       // unbound buffer before moving the lookup keys; rename/rescan cannot
@@ -5569,7 +5595,7 @@ async function resolveWorkingSourceContinuation(projectId, request) {
     let project = getProjects().find(item => item.id === projectId), current = boundPair(project);
     if (!current) return { success: false, error: 'continuation_stale' };
     if (request.choice === 'replace') {
-      if ([current.predecessor, current.successor].some(file => hasInvalidWorkingSourceReceipt(project, file))) {
+      if ([current.predecessor, current.successor].some(file => isWorkingSourceReceiptWriteBlocked(project, file))) {
         return { success: false, error: 'working_source_verification_invalid' };
       }
       if (current.successorAdmission !== 'accepted') return { success: false, error: 'continuation_admission_required' };

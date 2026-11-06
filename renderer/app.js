@@ -4832,6 +4832,7 @@ function getWorkingFileVerificationGuidance(reason, project) {
       text: project.status === 'watching' ? 'Save in the app and keep the file open.'
         : 'Resume Watch; save in the app and keep the file open.', action: null,
     };
+    case 'working-source-evidence-retained': return { text: 'Verification evidence needs review. If this file is no longer needed, use Exclude in the file list. Its evidence stays saved. Packaging stays blocked if another working file needs it. Contact Crate support to use this file again.', action: null };
     case 'working-source-recovery-unsupported': return { text: 'Retained source evidence cannot be resolved by Retry. Contact Crate support before packaging. The evidence is preserved.', action: null };
     case 'working-source-recovery-identity-changed': return { text: 'This source changed after recovery began. Do not replace or remove its retained evidence. Contact Crate support to review the original source.', action: null };
     case 'working-file-source-changed': return { text: 'File changed. Verify again.', action: 'Retry verification' };

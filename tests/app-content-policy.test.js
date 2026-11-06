@@ -44,7 +44,7 @@ test('runtime UUID policy uses Node crypto without an external uuid dependency',
   assert.equal(Object.hasOwn(packageLock.packages[''].dependencies, 'uuid'), false);
   assert.equal(Object.hasOwn(packageLock.packages, 'node_modules/uuid'), false);
   assert.equal(mainSource.includes("require('uuid')"), false);
-  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 18); // Admission, explicit-choice nonce, ledger recovery, verification retry IDs and InDesign observation epoch.
+  assert.equal((mainSource.match(/\bcrypto\.randomUUID\(\)/gu) || []).length, 19); // Explicit receipt recovery attempt plus admission, explicit-choice nonce, ledger recovery, verification retry IDs and InDesign observation epoch.
 });
 
 function listJavaScriptFiles(rootDirectory, currentDirectory = rootDirectory) {
@@ -159,6 +159,7 @@ test('packaged-content policy accepts the required runtime and dependencies', ()
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/startup-phase-journal.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/account-config.json'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/diagnostic-summary.js'), true);
+  assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/working-source-recovery-core.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-credential-store.js'), true);
   assert.equal(REQUIRED_ASAR_ENTRIES.includes('/parsers/figma-redaction.js'), true);
   const result = inspectAsarEntries([

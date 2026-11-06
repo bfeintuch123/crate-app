@@ -6,7 +6,7 @@ const harnessPath = path.join(__dirname, 'provenance-dual-write.test.js');
 let harness = fs.readFileSync(harnessPath, 'utf8');
 harness = harness.replace("const test = require('node:test');", "const choiceTest = require('node:test'); const test = new Proxy(choiceTest, { apply() {} });");
 harness = harness.replace("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))", "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'choice-synthetic-home-'))");
-harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', '  refreshWorkingSourceLocators, clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); }, getAssetBaselineSourceRecoveryRouteKey, stageLiveObservedFile, mutateProject, pollPsForProject, readOwnerOnlyCacheFileSync, hardenOwnerOnlyCacheFileSync, ensurePresentationAssetsDir, getWorkingSourceSelection, getWorkingSourceVerification, getWorkingFileChoicePresentation, getWorkingSourceMembership,\n  captureProjectOperation,\n  runScanOnOpen');
+harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', '  getWorkingSourceRecoveryChoiceHolds, beginWorkingSourceScan, refreshWorkingSourceLocators, clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); }, getAssetBaselineSourceRecoveryRouteKey, stageLiveObservedFile, mutateProject, pollPsForProject, readOwnerOnlyCacheFileSync, hardenOwnerOnlyCacheFileSync, ensurePresentationAssetsDir, getWorkingSourceSelection, getWorkingSourceVerification, getWorkingFileChoicePresentation, getWorkingSourceMembership,\n  captureProjectOperation,\n  runScanOnOpen');
 harness = harness.replace('                  psd: fixture,', '                  psd: fixture, framing: require("../parsers/add-files-psd-worker").inspectPsdLinkFraming(fs.readFileSync(filePath)),');
 harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', `
   delayInDesignPublication(filePath) {
@@ -296,6 +296,73 @@ function cases() {
     roundTripFakeStore();
     assert.equal((await f.workspace()).workingFileChoices.choices.find(row=>row.source.name==='Other.ai').ready,false);
     assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);clearTrackedTimers();
+  });
+
+  async function ownerSelection(f, name, action) {
+    const row=(await f.workspace()).files.find(row=>row.name===name); assert.ok(row,name);
+    return callIpcRaw('projects:set-working-source-selection',f.id,row.visualIdentity,{action,expectedRevision:row.selectionRevision});
+  }
+  for(const mismatch of ['identity','selection','receipt','missing-receipt','missing-row','duplicate-row'])choiceTest(`round2 attributed ${mismatch} isolates unrelated choice and fences writers`,async()=>{
+    const f=await inDesignRecoveryFixture();await f.add('Other.ai');
+    const source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[{reason:'unresolved-declared-reference'}]};return true;});
+    assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+    const hold=structuredClone(f.stored().workingSourceRecovery);
+    if(mismatch==='identity'){fs.renameSync(f.target,f.target+'.old');fs.copyFileSync(f.target+'.old',f.target);}
+    metadataTestHooks.mutateProject(f.id,p=>{
+      if(mismatch==='selection')p.workingSourceSelections={...(p.workingSourceSelections||{}),[key]:{state:'selected',reason:null,revision:7}};
+      if(mismatch==='receipt')p.workingSourceVerification[key]={status:'bad',unresolved:[]};
+      if(mismatch==='missing-receipt')delete p.workingSourceVerification[key];
+      if(mismatch==='missing-row')p.files=p.files.filter(row=>row.path!==f.target);
+      if(mismatch==='duplicate-row')p.files.push({...source,fileId:'duplicate'});
+      return true;
+    });roundTripFakeStore();
+    const before=JSON.stringify(f.stored().workingSourceVerification);
+    assert.ok(metadataTestHooks.getWorkingSourceRecoveryChoiceHolds(f.stored()).has(key));
+    const other=(await f.workspace()).workingFileChoices.choices.find(row=>row.source.name==='Other.ai');
+    if(mismatch!=='missing-row')assert.equal(other.ready,true); // Existing choice ledger separately refuses a removed admitted member.
+    const card=await f.card();if(card)assert.equal((await f.resolve(card,'retry')).success,false);
+    assert.equal(metadataTestHooks.beginWorkingSourceScan(f.id,f.target,()=>true),null);
+    assert.equal(JSON.stringify(f.stored().workingSourceVerification),before);
+    assert.deepEqual(f.stored().workingSourceRecovery,hold);
+    assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
+    assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);clearTrackedTimers();
+  });
+  for(const kind of ['opaque','null','false','revision'])for(const required of [false,true])choiceTest(`round2 ${kind} non-InDesign selection preserves evidence required=${required}`,async()=>{
+    const f=await setup();await metadataTestHooks.waitForWatcherIdle(f.id);await callIpcRaw('projects:pause',f.id);clearTrackedTimers();
+    if(required){writeSyntheticAiFile(f.c,f.a);const op=metadataTestHooks.captureProjectOperation(f.id);try{await metadataTestHooks.runScanOnOpen(f.id,f.c,op.activationToken,op,{allowPausedBaseline:true,verifySelectedSource:true,establishBaseline:false});}finally{op.close();}}
+    const row=f.stored().files.find(row=>row.path===f.a),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),row);
+    const original=kind==='revision'?{...structuredClone(f.stored().workingSourceVerification[key]),selectionRevision:2}:kind==='null'?null:kind==='false'?false:{status:'bad',selectionRevision:2,requiredReferences:[{path:path.join(TEST_HOME,'Desktop','missing-obligation.png')}],unresolved:[{reason:'unknown-producer-obligation'}]};
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]=original;p.workingSourceSelections={...(p.workingSourceSelections||{}),[key]:{state:'selected',reason:null,revision:1}};return true;});
+    assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
+    assert.equal((await ownerSelection(f,'A.ai','exclude')).success,true);
+    assert.deepEqual(f.stored().workingSourceVerification[key],original);assert.equal(metadataTestHooks.getWorkingSourceVerification(f.stored(),row),null);
+    const excluded=await callIpcRaw('projects:prepare-package-review',f.id);assert.equal(excluded.materializable,!required,JSON.stringify(excluded));
+    roundTripFakeStore();assert.deepEqual(f.stored().workingSourceVerification[key],original);
+    assert.equal((await ownerSelection(f,'A.ai','restore')).success,true);
+    assert.deepEqual(f.stored().workingSourceVerification[key],original);
+    assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
+    assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);
+    if(excluded.token)assert.equal((await callIpcRaw('projects:package',f.id,TEST_HOME,excluded.token)).error,'package_review_stale');
+    for(let i=0;i<2;i++){
+      roundTripFakeStore();assert.equal((await ownerSelection(f,'A.ai','exclude')).success,true);
+      assert.deepEqual(f.stored().workingSourceVerification[key],original);assert.equal(metadataTestHooks.getWorkingSourceVerification(f.stored(),row),null);
+      assert.equal((await ownerSelection(f,'A.ai','restore')).success,true);
+      assert.deepEqual(f.stored().workingSourceVerification[key],original);assert.equal(metadataTestHooks.getWorkingSourceVerification(f.stored(),row),null);
+      assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
+    }
+    clearTrackedTimers();
+  });
+  choiceTest('round2 committed guard locator does not orphan retained evidence',async()=>{
+    const f=await inDesignRecoveryFixture(),source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[{path:f.shared}],unresolved:[]};return true;});f.state.mode='closed';
+    assert.equal((await f.resolve(await f.card(),'retry')).success,true);assert.equal((await f.resolve(await f.card(),'keep-both')).success,true);
+    await metadataTestHooks.refreshWorkingSourceLocators(f.id,[f.target]);
+    const before=structuredClone(f.stored());const destination=f.target.replace('.indd','-moved.indd');fs.renameSync(f.target,destination);
+    metadataTestHooks.clearDocumentIdentityCache();await metadataTestHooks.refreshWorkingSourceLocators(f.id,[destination]);
+    assert.ok(f.stored().files.some(row=>row.path===f.target));assert.ok(!f.stored().files.some(row=>row.path===destination));
+    assert.deepEqual(f.stored().workingSourceRecoveryGuards,before.workingSourceRecoveryGuards);assert.deepEqual(f.stored().workingSourceRecoveryHistory,before.workingSourceRecoveryHistory);
+    assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);clearTrackedTimers();
   });
 
 }
