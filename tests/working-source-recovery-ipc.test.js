@@ -6,7 +6,7 @@ const harnessPath = path.join(__dirname, 'provenance-dual-write.test.js');
 let harness = fs.readFileSync(harnessPath, 'utf8');
 harness = harness.replace("const test = require('node:test');", "const choiceTest = require('node:test'); const test = new Proxy(choiceTest, { apply() {} });");
 harness = harness.replace("fs.mkdtempSync(path.join(os.tmpdir(), 'crate-provenance-dual-write-home-'))", "fs.mkdtempSync(path.join(path.dirname(MAIN_UNDER_TEST_ROOT), 'choice-synthetic-home-'))");
-harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', '  getWorkingSourceRecoveryChoiceHolds, beginWorkingSourceScan, refreshWorkingSourceLocators, clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); }, getAssetBaselineSourceRecoveryRouteKey, stageLiveObservedFile, mutateProject, pollPsForProject, readOwnerOnlyCacheFileSync, hardenOwnerOnlyCacheFileSync, ensurePresentationAssetsDir, getWorkingSourceSelection, getWorkingSourceVerification, getWorkingFileChoicePresentation, getWorkingSourceMembership,\n  captureProjectOperation,\n  runScanOnOpen');
+harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', '  recoverInvalidInDesignReceipt, getWorkingSourceRecoveryChoiceHolds, beginWorkingSourceScan, refreshWorkingSourceLocators, clearDocumentIdentityCache() { workingSourceDocumentIdentityCache.clear(); }, getAssetBaselineSourceRecoveryRouteKey, stageLiveObservedFile, mutateProject, pollPsForProject, readOwnerOnlyCacheFileSync, hardenOwnerOnlyCacheFileSync, ensurePresentationAssetsDir, getWorkingSourceSelection, getWorkingSourceVerification, getWorkingFileChoicePresentation, getWorkingSourceMembership,\n  captureProjectOperation,\n  runScanOnOpen');
 harness = harness.replace('                  psd: fixture,', '                  psd: fixture, framing: require("../parsers/add-files-psd-worker").inspectPsdLinkFraming(fs.readFileSync(filePath)),');
 harness = harness.replace('  captureProjectOperation,\n  runScanOnOpen', `
   delayInDesignPublication(filePath) {
@@ -126,7 +126,7 @@ function cases() {
     const before=await f.card();f.state.mode='closed';await f.resolve(before,'retry');
     assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
     const review=await callIpcRaw('projects:prepare-package-review',f.id);assert.notEqual(review.materializable,true);
-    if(mode!=='missing-reference'){assert.deepEqual(f.stored().workingSourceVerification[key],raw);assert.ok(f.stored().workingSourceRecovery.records[key]);}
+    if(mode!=='missing-reference'){assert.deepEqual(f.stored().workingSourceVerification[key],raw);assert.equal(f.stored().workingSourceRecovery,undefined);}
     else assert.ok(f.stored().workingSourceVerification[key].requiredReferences.some(r=>r.path===raw.requiredReferences[0].path));
     clearTrackedTimers();
   });
@@ -183,7 +183,7 @@ function cases() {
       if(boundary!=='delete-receipt')assert.equal(JSON.stringify(f.stored().workingSourceVerification[key]),raw);
     }finally{release();await pending;testAccountSession.now=originalNow;await testAccountSession.restore();clearTrackedTimers();}
   });
-  for (const kind of ['pending-reference','pending-unresolved','pending-output','pending-empty','unknown-field','future-version','nested-reference','unknown-domain']) choiceTest(`reconstructed unsupported evidence ${kind} stays held without scanning`,async()=>{
+  for (const existing of [false,true]) for (const kind of ['pending-reference','pending-unresolved','pending-output','pending-empty','unknown-field','future-version','nested-reference','unknown-domain']) choiceTest(`unsupported evidence ${kind} existing=${existing} preserves owner exit or prior hold without scanning`,async()=>{
     const f=await inDesignRecoveryFixture(),source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
     const raw={status:'bad',requiredReferences:[],unresolved:[]};
     if(kind.startsWith('pending-'))raw.pendingReviewFacts=kind==='pending-reference'?{requiredReferences:[{path:path.join(TEST_HOME,'missing.png')}]}:kind==='pending-unresolved'?{unresolved:[{reason:'unknown'}]}:kind==='pending-output'?{requiredEmbeddedOutputs:[{path:path.join(TEST_HOME,'output.png')}]}:{};
@@ -191,16 +191,32 @@ function cases() {
     if(kind==='future-version')raw.version=2;
     if(kind==='nested-reference')raw.requiredReferences=[{path:f.shared,extra:'proof'}];
     if(kind==='unknown-domain')raw.unresolved=[{reason:'unresolved-declared-reference'}];
-    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]=raw;return true;});f.state.mode='closed';
-    const queries=f.state.queries,inventories=f.state.inventories;
-    for(let i=0;i<2;i++){
-      const prior=structuredClone(f.stored().workingSourceRecovery);
-      const result=await f.resolve(await f.card(),'retry');assert.equal(result.error,'working_source_recovery_unsupported');
-      assert.equal(f.state.queries,queries);assert.equal(f.state.inventories,inventories);
-      assert.deepEqual(f.stored().workingSourceVerification[key],raw);if(prior)assert.deepEqual(f.stored().workingSourceRecovery,prior);
-      assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);roundTripFakeStore();
+    if(existing){
+      // A prior-version hold is modeled with the same schema/hash/identity as
+      // a real failed supported transaction, retaining unsupported evidence.
+      metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad'};return true;});f.state.mode='denied';
+      assert.equal((await f.resolve(await f.card(),'retry')).success,false);
+      metadataTestHooks.mutateProject(f.id,p=>{const hold=p.workingSourceRecovery.records[key];hold.original=structuredClone(raw);hold.originalHash=require('node:crypto').createHash('sha256').update(JSON.stringify(raw)).digest('hex');return true;});
     }
-    assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);clearTrackedTimers();
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]=raw;return true;});f.state.mode='closed';
+    const queries=f.state.queries,inventories=f.state.inventories,prior=structuredClone(f.stored().workingSourceRecovery);
+    for(let i=0;i<2;i++){
+      const card=await f.card();assert.equal(card.reason,existing?'working-source-recovery-unsupported':'working-source-evidence-retained');
+      const result=await f.resolve(card,'retry');assert.equal(result.error,'working_source_recovery_unsupported');
+      assert.equal(f.state.queries,queries);assert.equal(f.state.inventories,inventories);
+      assert.deepEqual(f.stored().workingSourceVerification[key],raw);assert.deepEqual(f.stored().workingSourceRecovery,prior);
+      if(existing)assert.equal(metadataTestHooks.getWorkingSourceMembership(f.stored()).blocked,true);
+      assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);roundTripFakeStore();
+    }
+    const excluded=await ownerSelection(f,'Recovery.indd','exclude');assert.equal(excluded.success,!existing,JSON.stringify(excluded));
+    assert.deepEqual(f.stored().workingSourceVerification[key],raw);assert.deepEqual(f.stored().workingSourceRecovery,prior);
+    if(!existing){
+      assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);
+      assert.equal((await ownerSelection(f,'Recovery.indd','restore')).success,true);
+      assert.notEqual((await callIpcRaw('projects:prepare-package-review',f.id)).materializable,true);
+      assert.deepEqual(f.stored().workingSourceVerification[key],raw);assert.equal(f.stored().workingSourceRecovery,undefined);
+    }
+    clearTrackedTimers();
   });
   for(const mutation of ['identity','selection'])choiceTest(`reconstructed held Retry refuses ${mutation} rebind`,async()=>{
     const f=await inDesignRecoveryFixture(),source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
@@ -226,7 +242,7 @@ function cases() {
   for(const choice of ['keep-both','replace'])choiceTest(`reconstructed unrelated ${choice} during attributed hold`,async()=>{
     const f=await inDesignRecoveryFixture();const other=await f.add('Other.ai');
     const source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
-    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[{reason:'unresolved-declared-reference'}]};return true;});
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[]};return true;});f.state.mode='denied';
     assert.equal((await f.resolve(await f.card(),'retry')).success,false);roundTripFakeStore();
     const card=(await f.workspace()).workingFileChoices.choices.find(row=>row.source.name==='Other.ai');assert.equal(card.ready,true);assert.equal(card.replaceBlocked,true);
     const raw=structuredClone(f.stored().workingSourceVerification[key]);
@@ -288,7 +304,7 @@ function cases() {
   for(const malformed of ['null-identity','invalid-revision'])choiceTest(`malformed recovery attribution ${malformed} cannot unlock unrelated choices`,async()=>{
     const f=await inDesignRecoveryFixture();await f.add('Other.ai');
     const source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
-    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[{reason:'unresolved-declared-reference'}]};return true;});
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[]};return true;});f.state.mode='denied';
     assert.equal((await f.resolve(await f.card(),'retry')).success,false);
     assert.equal((await f.workspace()).workingFileChoices.choices.find(row=>row.source.name==='Other.ai').ready,true);
     metadataTestHooks.mutateProject(f.id,p=>{if(malformed==='null-identity')p.workingSourceRecovery.records[key].identity=null;else p.workingSourceRecovery.records[key].selectionRevision=-1;return true;});
@@ -305,7 +321,7 @@ function cases() {
   for(const mismatch of ['identity','selection','receipt','missing-receipt','missing-row','duplicate-row'])choiceTest(`round2 attributed ${mismatch} isolates unrelated choice and fences writers`,async()=>{
     const f=await inDesignRecoveryFixture();await f.add('Other.ai');
     const source=f.stored().files.find(row=>row.path===f.target),key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),source);
-    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[{reason:'unresolved-declared-reference'}]};return true;});
+    metadataTestHooks.mutateProject(f.id,p=>{p.workingSourceVerification[key]={status:'bad',requiredReferences:[],unresolved:[]};return true;});f.state.mode='denied';
     assert.equal((await f.resolve(await f.card(),'retry')).success,false);
     const hold=structuredClone(f.stored().workingSourceRecovery);
     if(mismatch==='identity'){fs.renameSync(f.target,f.target+'.old');fs.copyFileSync(f.target+'.old',f.target);}
@@ -321,7 +337,15 @@ function cases() {
     assert.ok(metadataTestHooks.getWorkingSourceRecoveryChoiceHolds(f.stored()).has(key));
     const other=(await f.workspace()).workingFileChoices.choices.find(row=>row.source.name==='Other.ai');
     if(mismatch!=='missing-row')assert.equal(other.ready,true); // Existing choice ledger separately refuses a removed admitted member.
-    const card=await f.card();if(card)assert.equal((await f.resolve(card,'retry')).success,false);
+    const card=await f.card();
+    if(mismatch==='duplicate-row'){
+      // Normal mutateProject deduplicates rows. Inject at the reservation seam
+      // to exercise a genuine duplicate, rather than claiming that fixture did.
+      f.stored().files.push({...source,fileId:'duplicate-reservation'});
+      assert.equal(f.stored().files.filter(row=>row.path===f.target).length,2);
+      const op=metadataTestHooks.captureProjectOperation(f.id);
+      try{assert.equal((await metadataTestHooks.recoverInvalidInDesignReceipt(f.id,source,op)).success,false);}finally{op.close();}
+    }else if(card)assert.equal((await f.resolve(card,'retry')).success,false);
     assert.equal(metadataTestHooks.beginWorkingSourceScan(f.id,f.target,()=>true),null);
     assert.equal(JSON.stringify(f.stored().workingSourceVerification),before);
     assert.deepEqual(f.stored().workingSourceRecovery,hold);

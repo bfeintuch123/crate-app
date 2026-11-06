@@ -4702,8 +4702,10 @@ function hasWorkingFileDirtyHold(project, file) {
 
 // Renderer contract is an allowlist, never raw extractor errors or paths.
 function getWorkingFileVerificationReason(project, source, receipt) {
-  if (path.extname(source.path || '').toLowerCase() !== '.indd') {
-    if (hasInvalidWorkingSourceReceipt(project, source) && !hasWorkingSourceRecoveryRecord(project, source)) return 'working-source-evidence-retained';
+  const inDesign = path.extname(source.path || '').toLowerCase() === '.indd';
+  if (hasInvalidWorkingSourceReceipt(project, source) && !hasWorkingSourceRecoveryRecord(project, source) &&
+      (!inDesign || hasUnsupportedInDesignRecoveryObligations(project.workingSourceVerification[getAssetBaselineSourceRecoveryRouteKey(project, source)]))) return 'working-source-evidence-retained';
+  if (!inDesign) {
     if (hasWorkingFileDirtyHold(project, source)) return 'working-file-save-required';
     if (receipt?.status === 'pending') return 'working-file-verification-pending';
     if (receipt && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
@@ -4886,7 +4888,7 @@ async function recoverInvalidInDesignReceipt(projectId, source, operation) {
   };
   const validState = state => state && state.version === 1 && state.records && typeof state.records === 'object' &&
     !Array.isArray(state.records) && !Object.keys(state).some(k => k !== 'version' && k !== 'records');
-  let reservation, preparedReservation, replacementHash = null;
+  let reservation, preparedReservation, replacementHash = null, unsupported = false;
   try {
     reservation = mutateProject(projectId, project => {
       if (!operation.current() || !canonical(project) || !hasInvalidWorkingSourceReceipt(project, source) ||
@@ -4909,8 +4911,13 @@ async function recoverInvalidInDesignReceipt(projectId, source, operation) {
           (prior.reason !== undefined && prior.reason !== 'verification-required') ||
           prior.originalHash !== originalHash || digest(prior.original) !== originalHash ||
           prior.identity !== identity || prior.selectionRevision !== selection.revision)) return null;
-      if (prior && hasUnsupportedInDesignRecoveryObligations(raw)) return prior;
-      const record = { version: 1, attempt, status: hasUnsupportedInDesignRecoveryObligations(raw) ? 'held' : 'pending', original: JSON.parse(encoded), originalHash,
+      if (hasUnsupportedInDesignRecoveryObligations(raw)) {
+        // Retry must not remove an available owner Exclude exit. Existing
+        // holds stay intact; unsupported evidence never starts a new one.
+        unsupported = true;
+        return prior || null;
+      }
+      const record = { version: 1, attempt, status: 'pending', original: JSON.parse(encoded), originalHash,
         identity, selectionRevision: selection.revision };
       preparedReservation = JSON.parse(encode(record));
       project.workingSourceRecovery = { version: 1, records: { ...(state?.records || {}), [key]: record } };
@@ -4923,7 +4930,7 @@ async function recoverInvalidInDesignReceipt(projectId, source, operation) {
         stored.originalHash === digest(latest.workingSourceVerification?.[key]) && stored.originalHash === digest(stored.original)) reservation = stored;
     else return { success: false, error: 'working_source_recovery_persistence_uncertain' };
   }
-  if (!reservation) return { success: false, error: 'working_source_verification_invalid' };
+  if (!reservation) return { success: false, error: unsupported ? 'working_source_recovery_unsupported' : 'working_source_verification_invalid' };
   reservation = JSON.parse(encode(reservation));
   invalidatePackageReviewForProject(projectId);
   if (hasUnsupportedInDesignRecoveryObligations(reservation.original)) return { success: false, error: 'working_source_recovery_unsupported' };
