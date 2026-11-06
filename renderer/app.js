@@ -4832,6 +4832,8 @@ function getWorkingFileVerificationGuidance(reason, project) {
       text: project.status === 'watching' ? 'Save in the app and keep the file open.'
         : 'Resume Watch; save in the app and keep the file open.', action: null,
     };
+    case 'working-source-recovery-unsupported': return { text: 'Retained source evidence cannot be resolved by Retry. Contact Crate support before packaging. The evidence is preserved.', action: null };
+    case 'working-source-recovery-identity-changed': return { text: 'This source changed after recovery began. Do not replace or remove its retained evidence. Contact Crate support to review the original source.', action: null };
     case 'working-file-source-changed': return { text: 'File changed. Verify again.', action: 'Retry verification' };
     case 'working-file-dependencies-unverified': return { text: 'Linked assets unverified. Check availability, then retry.', action: 'Retry verification' };
     case 'working-file-verification-pending': return { text: 'Verification pending. Wait or retry.', action: 'Retry verification' };
@@ -4886,7 +4888,8 @@ function createWorkingFileChoiceCard(project, entry) {
   help.id = `working-choice-help-${++workingFileChoiceDescriptionSequence}`;
   const guidance = getWorkingFileVerificationGuidance(entry.reason, project);
   help.textContent = guidance.text;
-  if (!entry.ready) card.appendChild(help);
+  if (entry.ready && entry.replaceBlocked) help.textContent = 'Keep both is available. Replace and packaging remain blocked by retained source evidence.';
+  if (!entry.ready || entry.replaceBlocked) card.appendChild(help);
   const actions = document.createElement('div');
   actions.className = `working-file-choice-actions${predecessors.length > 1 ? ' is-ambiguous' : ''}`;
   actions.setAttribute('role', 'group'); actions.setAttribute('aria-label', `Working-file decision for ${name}`);
@@ -4894,7 +4897,7 @@ function createWorkingFileChoiceCard(project, entry) {
   const addAction = (label, detail, choice, prior = null) => {
     const button = document.createElement('button'); button.type = 'button'; button.className = 'working-source-action working-file-choice-action';
     button.dataset.choice = choice; if (prior) button.dataset.predecessorIdentity = prior.visualIdentity;
-    button.textContent = label; button.disabled = disabled; if (!entry.ready) button.setAttribute('aria-describedby', help.id);
+    button.textContent = label; button.disabled = disabled || (choice === 'replace' && entry.replaceBlocked === true); if (!entry.ready || entry.replaceBlocked) button.setAttribute('aria-describedby', help.id);
     const duplicateName = prior && predecessors.filter(item => item.name === prior.name).length > 1;
     const folder = duplicateName && prior.folder ? sanitizeRendererSourceName(prior.folder) : '';
     button.setAttribute('aria-label', label + (folder ? ` · ${folder}` : ''));
@@ -4988,7 +4991,7 @@ async function submitWorkingFileChoice(projectId, entry, choice, predecessorIden
   if (!project || state.selectedProjectId !== projectId || !accountStatus.canUseWorkspace || workingFileChoiceOwner || activeModalLease ||
       (choice === 'recover' ? !contract?.recoveryRequired || entry.revision !== contract.recoveryRevision
         : !currentEntry || (choice !== 'retry' && !currentEntry.ready)) || typeof window.crate?.resolveWorkingFileChoice !== 'function' ||
-      (choice === 'replace' && !currentEntry.predecessors.some(item => item.visualIdentity === predecessorIdentity)) ||
+      (choice === 'replace' && (currentEntry.replaceBlocked === true || !currentEntry.predecessors.some(item => item.visualIdentity === predecessorIdentity))) ||
       !['keep-both', 'replace', 'retry', 'recover'].includes(choice)) return false;
   const owner = { account: accountWorkspaceEpoch, selection: projectSelectionEpoch, tab: tabNavigationEpoch };
   const current = () => owner.account === accountWorkspaceEpoch && owner.selection === projectSelectionEpoch &&
