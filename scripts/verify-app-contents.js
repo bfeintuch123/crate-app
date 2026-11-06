@@ -25,6 +25,7 @@ const RUNTIME_PARSER_FILES = Object.freeze([
   'powerpoint.js',
   'premiere.js',
   'psd.js',
+  'working-source-recovery-core.js',
   'working-source-witness.js'
 ]);
 

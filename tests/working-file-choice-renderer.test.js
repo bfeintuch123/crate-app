@@ -402,3 +402,10 @@ for(const surface of ['project-file-list','working-assets-list'])test(`picker im
   f.calls[0].resolve({success:false});assert.equal(await pending,false);
   assert.ok(f.document.activeElement===external);assert.equal(f.calls.length,1);
 });
+
+test('retained invalid evidence explains owner Exclude without offering futile Retry',async()=>{
+  const f=await fixture(),ws=f.workspaces.get('a');ws.workingFileChoices.choices=[{...ws.workingFileChoices.choices[0],ready:false,reason:'working-source-evidence-retained'}];
+  await f.renderer.renderFiles();const guidance=choiceTree(f.elements['working-file-choices']).find(el=>el.className==='working-source-detail');
+  assert.match(guidance.textContent,/Exclude in the file list/);assert.match(guidance.textContent,/evidence stays saved/);
+  assert.equal(choiceButtons(f.elements['working-file-choices']).some(el=>el.dataset.choice==='retry'),false);
+});
