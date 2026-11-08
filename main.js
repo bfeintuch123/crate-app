@@ -10850,6 +10850,7 @@ const FIGMA_POLL_INTERVAL_MS = 60000; // 60 seconds
 const FIGMA_RATE_LIMIT_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes
 const PACKAGE_SCAN_WAIT_TIMEOUT_MS = 30000;
 const PRE_PACKAGE_DISCOVERY_TIMEOUT_MS = 8000;
+const PRE_PACKAGE_COLLECTION_READDIR_BATCH = 64;
 const PRE_PACKAGE_APP_SCAN_TIMEOUT_MS = 30000;
 // Keep a narrow overlap between incremental polls so a just-added image ref can't
 // fall behind a hard since-cutoff while Figma's file metadata/tree finishes updating.
@@ -19928,35 +19929,63 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
   // kMDItemLastUsedDate, not mtime. Removing the .fig skip lets this
   // scan catch those imports. Dedup via existingPaths prevents doubles.
   const lastUsedCandidates = [];
-  const collectLastUsedCandidates = async (folder, depth) => {
-    let entries;
-    try { entries = await fs.promises.readdir(folder, { withFileTypes: true }); }
-    catch (e) { return; }
-    if (!operationCurrent()) return;
-    entries.sort((left, right) => left.name.localeCompare(right.name));
+  // Every await needs a full ownership check, which rereads the complete
+  // project store. Awaiting once per directory therefore made large stores
+  // exhaust the discovery deadline. Read a batch of directories per await
+  // instead, then list files in the original depth-first, name-sorted order.
+  const listCollectionFiles = async (rootFolder) => {
+    const root = { folder: rootFolder, depth: 0, entries: null, children: new Map() };
+    let level = [root];
+    while (level.length > 0) {
+      const nextLevel = [];
+      for (let start = 0; start < level.length; start += PRE_PACKAGE_COLLECTION_READDIR_BATCH) {
+        const batch = level.slice(start, start + PRE_PACKAGE_COLLECTION_READDIR_BATCH);
+        await Promise.all(batch.map(async node => {
+          try { node.entries = await fs.promises.readdir(node.folder, { withFileTypes: true }); }
+          catch (e) { node.entries = null; }
+        }));
+        if (!operationCurrent()) return null;
+        for (const node of batch) {
+          if (!node.entries) continue;
+          node.entries.sort((left, right) => left.name.localeCompare(right.name));
+          for (const entry of node.entries) {
+            if (entry.name.startsWith('.') || !entry.isDirectory() || node.depth >= 3) continue;
+            const child = { folder: path.join(node.folder, entry.name), depth: node.depth + 1, entries: null, children: new Map() };
+            node.children.set(entry.name, child);
+            nextLevel.push(child);
+          }
+        }
+      }
+      level = nextLevel;
+    }
+    const files = [];
+    const listFiles = node => {
+      for (const entry of node.entries || []) {
+        if (entry.name.startsWith('.')) continue;
+        const child = node.children.get(entry.name);
+        if (child) listFiles(child);
+        else if (entry.isFile()) files.push({ fullPath: path.join(node.folder, entry.name), name: entry.name });
+      }
+    };
+    listFiles(root);
+    return files;
+  };
+
+  for (const dir of scanDirs) {
+    const files = fs.existsSync(dir) ? await listCollectionFiles(dir) : [];
+    if (!files) return;
     // The output policy is stable only within this synchronous segment. Avoid
     // rereading/normalizing the complete project store for every file, and
     // discard this view before any callback can change generated outputs.
     let outputPaths = null;
-
-    for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
-      const entry = entries[entryIndex];
-      const fullPath = path.join(folder, entry.name);
-      if (entry.name.startsWith('.')) continue;
-      if (entry.isDirectory() && depth < 3) {
-        outputPaths = null;
-        await collectLastUsedCandidates(fullPath, depth + 1);
-        if (!operationCurrent()) return;
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      const ext = path.extname(entry.name).toLowerCase();
+    for (const { fullPath, name } of files) {
+      const ext = path.extname(name).toLowerCase();
       if (!DESIGN_FILE_EXTENSIONS.has(ext)) continue;
       if (!outputPaths) outputPaths = getKnownPackageOutputPaths();
       if (isAutoCaptureExcludedPath(fullPath, [], outputPaths)) continue;
       const normalizedFullPath = normalizeTrackedFilePath(fullPath);
       if (existingPaths.has(normalizedFullPath) || pendingPaths.has(normalizedFullPath)) continue;
-      lastUsedCandidates.push({ fullPath, name: entry.name, ext, normalizedFullPath });
+      lastUsedCandidates.push({ fullPath, name, ext, normalizedFullPath });
       scanMetrics.candidateCount++;
       if (lastUsedCandidates.length % 256 === 0) {
         outputPaths = null;
@@ -19964,10 +19993,6 @@ registerTrustedIpcHandler('projects:pre-package-scan', async (event, projectId) 
         if (!operationCurrent()) return;
       }
     }
-  };
-
-  for (const dir of scanDirs) {
-    if (fs.existsSync(dir)) await collectLastUsedCandidates(dir, 0);
     if (!operationCurrent()) return;
   }
 
