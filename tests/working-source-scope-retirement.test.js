@@ -172,6 +172,53 @@ function scopeRetirementCases() {
     assert.deepEqual(f.receipt(), c, 'stale B never overwrites completed C');
   });
 
+  // Real routes build their own operation facades; each must let its own
+  // stranded receipt retire after a foreign scope change.
+  async function withForeignAdmissionAt(f, linkPath, sourcePath, run) {
+    const originalAccess = fs.promises.access;
+    let armed = true, hookError = null, observed = null;
+    const receiptFor = () => {
+      const project = f.stored(), row = project.files.find(file => file.path === sourcePath);
+      return row && project.workingSourceVerification?.[metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(project, row)];
+    };
+    fs.promises.access = async function accessForTest(target, ...args) {
+      if (armed && path.resolve(String(target)) === path.resolve(linkPath)) {
+        armed = false;
+        try { observed = structuredClone(receiptFor()); admitForeignSource(f); } catch (error) { hookError = error; }
+      }
+      return originalAccess.call(fs.promises, target, ...args);
+    };
+    try {
+      await run();
+      await waitForCondition(() => !armed && metadataTestHooks.scanOperationCount() === 0, 'route scan reached its link check and drained', 10000);
+      if (hookError) throw hookError;
+      return { observed, after: receiptFor() };
+    } finally {
+      fs.promises.access = originalAccess;
+      clearTrackedTimers();
+    }
+  }
+
+  for (const route of ['add-files', 'file-change']) {
+    scopeTest(`${route} route retires its own stranded receipt after a foreign scope change`, { timeout: 30000 }, async () => {
+      const f = await scopeFixture();
+      let sourcePath = f.rows['B.ai'].path, linkPath = f.link, run = () => emitWatcher('change', sourcePath);
+      if (route === 'add-files') {
+        sourcePath = path.join(f.dir, 'C.ai'); linkPath = path.join(f.dir, 'C-link.png');
+        fs.writeFileSync(linkPath, 'synthetic C link');
+        writeSyntheticAiFile(sourcePath, linkPath);
+        manualDialogFor([sourcePath]);
+        run = () => callIpcRaw('projects:add-files', f.id, 'scope_retirement_add_files');
+      }
+      const { observed, after } = await withForeignAdmissionAt(f, linkPath, sourcePath, run);
+      assert.equal(observed?.status, 'pending', 'the route reserved its receipt before the foreign change');
+      assert.equal(after.status, 'failed');
+      assert.equal(after.reason, 'scan-interrupted');
+      assert.equal(after.attempt, observed.attempt);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.id)).token, undefined);
+    });
+  }
+
   const negatives = {
     account: async () => { testAccountSession.invalidate(); },
     'project paused': async f => { await callIpcRaw('projects:pause', f.id); },

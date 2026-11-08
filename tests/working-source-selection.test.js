@@ -1200,6 +1200,19 @@ test('scope retirement refuses a newer completed owner and an invalid selection'
   assert.deepEqual(s.record(), s.pending);
 });
 
+test('scope retirement: a throwing owner check returns without writing or escaping', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => { throw new Error('synthetic-owner-check'); }), 'not-retired');
+  assert.deepEqual(r.record(), r.pending);
+  assert.equal(r.store.sets, sets);
+  const s = retirementFixture();
+  let calls = 0;
+  s.store.beforeCommit = () => { throw new Error('synthetic-before-commit'); };
+  // Calls: initial check, failed write, then the readback check throws.
+  assert.equal(s.api.retireInterruptedWorkingSourceScan(s.scan, () => { if (++calls === 3) throw new Error('synthetic-owner-check'); return true; }), 'not-retired');
+  assert.deepEqual(s.record(), s.pending);
+});
+
 test('scope retirement keeps a full unresolved list valid', () => {
   const r = retirementFixture();
   const full = Array.from({ length: 128 }, () => ({ reason: 'declared-reference-unresolved' }));

@@ -4422,11 +4422,10 @@ function retireInterruptedWorkingSourceScan(scan, ownerCurrent) {
     sendToRenderer('project:updated', { projectId: scan.projectId });
     return 'retired';
   };
-  let latest;
-  try { latest = read(); } catch (_) { return 'not-retired'; }
+  try { if (!owned(read())) return 'not-retired'; } catch (_) { return 'not-retired'; }
   // A store setter can throw after committing. Read back before the one retry;
   // the retry rechecks every guard inside the mutation.
-  for (let tries = 0; tries < 2 && owned(latest); tries++) {
+  for (let tries = 0; tries < 2; tries++) {
     try {
       return mutateProject(scan.projectId, project => {
         if (!owned(project)) return false;
@@ -4438,8 +4437,10 @@ function retireInterruptedWorkingSourceScan(scan, ownerCurrent) {
         return true;
       }) ? finish() : 'not-retired';
     } catch (_) {
+      let latest;
       try { latest = read(); } catch (_) { return 'uncertain'; }
       if (retired(latest)) return finish();
+      try { if (!owned(latest)) return 'not-retired'; } catch (_) { return 'not-retired'; }
     }
   }
   return 'not-retired';
@@ -18479,6 +18480,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   );
   const initialWatcherOperation = {
     current: () => capturedInitialOperation.current() && coordinatorCurrent(),
+    currentIgnoringScope: () => capturedInitialOperation.currentIgnoringScope() && coordinatorCurrent(),
     adoptScope(scope) {
       if (!coordinatorCurrent()) return false;
       return capturedInitialOperation.adoptScope(scope) && coordinatorCurrent();
@@ -18791,6 +18793,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         );
         const operation = {
           current: operationCurrent,
+          currentIgnoringScope: () => capturedOperation.currentIgnoringScope() && coordinatorCurrent() && watchEventCurrent(filePath),
           adoptScope(scope) {
             if (!coordinatorCurrent()) return false;
             return capturedOperation.adoptScope(scope) && coordinatorCurrent();
@@ -18959,6 +18962,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       const scopedChild = captureProjectOperation(projectId);
       const childOperation = {
         current: () => isCurrent() && !!scopedChild?.current(),
+        currentIgnoringScope: () => isCurrent() && scopedChild?.currentIgnoringScope() === true,
         adoptScope: scope => isCurrent() && !!scopedChild?.adoptScope(scope),
       };
 
@@ -19521,6 +19525,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     },
     current() {
       return !cancelled && baseOperation.current();
+    },
+    currentIgnoringScope() {
+      return !cancelled && baseOperation.currentIgnoringScope();
     },
     adoptScope(scope) {
       return !cancelled && baseOperation.adoptScope(scope);
