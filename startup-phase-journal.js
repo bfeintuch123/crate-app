@@ -47,6 +47,65 @@ function applyDesktopWindowMinimum(browserWindow) {
   }
 }
 
+// Crate's layout is designed at 100% page zoom. Electron saves page zoom per
+// page URL in the profile, so a level set by an earlier build would otherwise
+// return on every launch and in recreated windows.
+const STANDARD_PAGE_ZOOM_LEVEL = 0;
+
+function resetStandardPageZoom(webContents) {
+  if (
+    !webContents ||
+    (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed()) ||
+    typeof webContents.setZoomLevel !== 'function'
+  ) return false;
+
+  try {
+    webContents.setZoomLevel(STANDARD_PAGE_ZOOM_LEVEL);
+    // Electron already disables pinch (visual) zoom by default; keep it explicit.
+    if (typeof webContents.setVisualZoomLevelLimits === 'function') {
+      const limits = webContents.setVisualZoomLevelLimits(1, 1);
+      if (limits && typeof limits.catch === 'function') limits.catch(() => {});
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyStandardPageZoom(browserWindow) {
+  const webContents = browserWindow && browserWindow.webContents;
+  if (!webContents || typeof webContents.on !== 'function') return false;
+
+  // did-navigate fires once each page load (including reloads) has committed
+  // and the frame is live, which is when Electron applies the saved level.
+  webContents.on('did-navigate', () => {
+    resetStandardPageZoom(webContents);
+  });
+  return true;
+}
+
+// Electron's default application menu minus Actual Size, Zoom In and Zoom Out.
+// Their Cmd+0, Cmd+Plus and Cmd+Minus shortcuts are the only keyboard route to
+// page zoom in Electron, so omitting the roles removes those shortcuts too.
+function buildStandardApplicationMenuTemplate(platform = process.platform) {
+  return [
+    ...(platform === 'darwin' ? [{ role: 'appMenu' }] : []),
+    { role: 'fileMenu' },
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    { role: 'windowMenu' },
+  ];
+}
+
 function installDesktopWindowMinimum(appModule) {
   if (
     !appModule ||
@@ -58,6 +117,7 @@ function installDesktopWindowMinimum(appModule) {
   desktopWindowMinimumApps.add(appModule);
   appModule.on('browser-window-created', (_event, browserWindow) => {
     applyDesktopWindowMinimum(browserWindow);
+    applyStandardPageZoom(browserWindow);
   });
   return true;
 }
@@ -253,8 +313,11 @@ module.exports = {
   STARTUP_PHASE_JOURNAL_MODE,
   STARTUP_PHASES,
   applyDesktopWindowMinimum,
+  applyStandardPageZoom,
+  buildStandardApplicationMenuTemplate,
   createStartupPhaseJournal,
   desktopWindowMinimumInstalled,
   getWatchRecoveryPhase,
   installDesktopWindowMinimum,
+  resetStandardPageZoom,
 };

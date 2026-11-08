@@ -8,6 +8,7 @@ const {
   nativeImage,
   Notification,
   utilityProcess,
+  Menu,
 } = require('electron');
 const { AccountSession } = require('./account-session');
 const { AccountCredentialStore } = require('./account-credential-store');
@@ -23,6 +24,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   DESKTOP_WINDOW_MINIMUM,
+  buildStandardApplicationMenuTemplate,
   createStartupPhaseJournal,
   getWatchRecoveryPhase,
 } = require('./startup-phase-journal');
@@ -24559,6 +24561,14 @@ app.whenReady().then(async () => {
           click: () => app.quit()
         }
       ]));
+    }
+
+    // Replace Electron's default menu so page zoom stays at 100%. Only the
+    // page zoom items are removed; Edit, Reload and the rest stay standard.
+    try {
+      Menu.setApplicationMenu(Menu.buildFromTemplate(buildStandardApplicationMenuTemplate()));
+    } catch (e) {
+      console.error('[app-menu] failed to install application menu:', redactFigmaLogText(e && e.message));
     }
 
     scheduleMainWindowStartupRetries();
