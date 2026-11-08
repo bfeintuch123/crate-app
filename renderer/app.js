@@ -449,6 +449,9 @@ function getRendererItemSignature(item) {
     ext: item.ext || '',
     appFamily: item.appFamily || '',
     sourceName: sanitizeRendererSourceName(item.sourceName) || '',
+    // The Needs Save row reason reads these, so a retained row must redraw when they change.
+    sourceSaveRequired: item.sourceSaveRequired === true,
+    sourceSaveSourceName: sanitizeRendererSourceName(item.sourceSaveSourceName) || '',
     assetOrigin: item.assetOrigin || '',
     projectRole: item.projectRole || '',
     protectedSource: item.protectedSource === true,
@@ -747,7 +750,10 @@ async function reconcileAddFilesRendererState(operation, selectionEpoch, selecti
   const reconciliation = (async () => {
     const projects = await getAccountCurrentProjects();
     if (!isCurrent()) return false;
+    const previous = state.projects.find(item => item.id === operation.projectId);
     state.projects = Array.isArray(projects) ? projects : [];
+    // Withdraw a save request this snapshot already contradicts before the read.
+    retireContradictedNeedsSave(operation.projectId, previous, true);
     if (!isCurrent()) return false;
     await renderFiles({ isCurrent });
     return isCurrent();
@@ -4079,7 +4085,8 @@ function getSourceSaveCopy(project, items) {
     title,
     reminderTitle,
     reminder: 'Save your changes, then return to Crate so it can check them.',
-    guidance: `${unsaved} Save your changes in ${appPhrase}, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.`,
+    // Never promise the outcome: saved Illustrator links can stay in Needs Review.
+    guidance: `${unsaved} Save your changes in ${appPhrase}, then return to Crate so it can check them.`,
   };
 }
 

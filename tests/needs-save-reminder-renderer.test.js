@@ -107,7 +107,7 @@ test('genuine Needs Save shows one in-app reminder plus Review Assets guidance w
   assert.equal(f.visible(), true);
   assert.equal(f.reminderText(), STABLE_WATCHING);
   assert.equal(f.guidanceVisible(), true);
-  assert.equal(f.guidanceText(), 'Save your file to include these assets Unsaved changes in Brochure.indd. Save your changes in InDesign, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.');
+  assert.equal(f.guidanceText(), 'Save your file to include these assets Unsaved changes in Brochure.indd. Save your changes in InDesign, then return to Crate so it can check them.');
   await tick();
   assert.equal(f.status(), spoken(STABLE_WATCHING));
   assert.equal(f.el('needs-save-reminder').contains(f.document.activeElement), false, 'showing never moves focus');
@@ -166,9 +166,9 @@ test('mixed states, multiple files and apps, and unknown app names stay accurate
   assert.equal(f.reminderText(), STABLE_WATCHING, 'the reminder makes no count, document or app claim');
   assert.match(f.guidanceText(), /Unsaved changes in 2 files\./);
   const copy = items => f.renderer.getSourceSaveCopy(f.projects[0], items);
-  assert.match(copy([{ sourceSaveAppFamily: 'mystery-app', sourceSaveSourceName: 'X.doc' }]).guidance, /Save your changes in the app, then return to Crate\./);
+  assert.match(copy([{ sourceSaveAppFamily: 'mystery-app', sourceSaveSourceName: 'X.doc' }]).guidance, /Save your changes in the app, then return to Crate so it can check them\./);
   assert.match(copy([{ sourceSaveAppFamily: 'illustrator' }, { sourceSaveAppFamily: 'indesign' }, { sourceSaveAppFamily: 'photoshop' }]).guidance,
-    /Save your changes in each app, then return to Crate\./);
+    /Save your changes in each app, then return to Crate so it can check them\./);
   assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Poster.ai' }]).title, 'Save your file to include this asset');
   assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: '/private/Poster.ai' }]).guidance.includes('/private'), false);
   // Without a name from the qualifying observation, never fall back to the row's first source.
@@ -399,7 +399,7 @@ const spoken = text => text.replace('assets Save', 'assets. Save');
 
 test('the reminder is one stable instruction for any count, document or app; guidance keeps the names', async () => {
   for (const [rows, pending, guidance] of [
-    [[rawRow('a', 'poster.png')], [needsSave('a', 'poster.png', 0, 'illustrator', 'Poster.ai')], /Unsaved changes in Poster\.ai\. Save your changes in Illustrator, then return to Crate\./],
+    [[rawRow('a', 'poster.png')], [needsSave('a', 'poster.png', 0, 'illustrator', 'Poster.ai')], /Unsaved changes in Poster\.ai\. Save your changes in Illustrator, then return to Crate so it can check them\./],
     [[rawRow('a', 'ai.png'), rawRow('a', 'indd.png')],
       [needsSave('a', 'ai.png', 0, 'illustrator', 'Poster.ai'), needsSave('a', 'indd.png', 1, 'indesign', 'Brochure.indd')], /Unsaved changes in 2 files\./],
     [[rawRow('a', 'x.png'), rawRow('a', 'y.png')],
@@ -767,6 +767,79 @@ test('a flagged row names the same document as the save guidance', async () => {
   // Unflagged Needs Save rows keep their existing copy.
   assert.equal(f.evaluate("getPendingFileReason({ captureState: 'needs-save', captureEvidence: { sourceName: 'Poster A.ai' } })"),
     'Linked asset observed from Poster A.ai. Save to make package-ready.');
+});
+
+// The reasons actually rendered in the Needs Review list (retained rows included).
+function renderedReasons(f) {
+  const out = [];
+  const walk = node => {
+    if (!node) return;
+    if (typeof node.className === 'string' && node.className.split(/\s+/).includes('pending-file-reason')) out.push(node.textContent);
+    for (const child of node.children || []) walk(child);
+  };
+  walk(f.el('pending-file-list'));
+  return out;
+}
+
+test('a retained row redraws its save reason when the qualifying observation changes or clears', async () => {
+  const f = await fixture();
+  const flagged = name => presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign', sourceSaveSourceName: name });
+  f.set('a', [rawRow('a', 'hero.png')], [flagged('Poster A.indd')]);
+  await f.refresh();
+  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Poster A.indd. Save to make package-ready.']);
+  f.set('a', [rawRow('a', 'hero.png')], [flagged('Draft B.indd')]);
+  await f.refresh();
+  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Draft B.indd. Save to make package-ready.'], 'no superseded document name');
+  f.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0)]);
+  await f.refresh();
+  assert.equal(renderedReasons(f).some(text => /Unsaved changes/.test(text)), false, 'no unsaved claim after the flag clears');
+  assert.equal(f.guidanceVisible(), false);
+});
+
+test('Add Files reconciliation that leaves nothing unsaved withdraws the reminder before its read returns', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.visible(), true);
+  f.set('a', [], []);
+  const held = f.deferRead();
+  f.evaluate("activeAddFilesOperation = { projectId: 'a' }; testReconcile = reconcileAddFilesRendererState(activeAddFilesOperation, projectSelectionEpoch, projectSelectionIntentEpoch)");
+  await tick(5);
+  assert.equal(f.evaluate('state.projects[0].pendingFiles.length'), 0, 'the new snapshot is installed');
+  assert.equal(f.visible(), false, 'no save request outlives the snapshot that contradicts it');
+  assert.equal(f.guidanceVisible(), false);
+  assert.equal(f.status(), '');
+  held.resolve({ projectId: 'a', files: [], pendingFiles: [] });
+  await tick();
+  assert.equal(f.visible(), false);
+});
+
+test('Add Files reconciliation with the same unsaved evidence keeps the reminder steady', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  const held = f.deferRead();
+  f.evaluate("activeAddFilesOperation = { projectId: 'a' }; testReconcile = reconcileAddFilesRendererState(activeAddFilesOperation, projectSelectionEpoch, projectSelectionIntentEpoch)");
+  await tick(5);
+  assert.equal(f.visible(), true, 'bounded current-project refresh: no hide');
+  held.resolve(clone(f.workspaces.get('a')));
+  await tick();
+  assert.equal(f.visible(), true);
+  assert.equal(f.status(), 'spoken');
+});
+
+test('save guidance never promises that saving moves Illustrator links out of Needs Review', async () => {
+  for (const [app, file] of [['illustrator', 'Poster.ai'], ['indesign', 'Brochure.indd']]) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.png')], [needsSave('a', 'hero.png', 0, app, file)]);
+    await f.refresh();
+    const label = app === 'illustrator' ? 'Illustrator' : 'InDesign';
+    assert.equal(f.guidanceText(), `Save your file to include this asset Unsaved changes in ${file}. Save your changes in ${label}, then return to Crate so it can check them.`);
+    assert.equal(/out of Needs Review|moves the assets/.test(f.guidanceText()), false);
+  }
 });
 
 test('missing pending list nodes return no items instead of throwing', async () => {
