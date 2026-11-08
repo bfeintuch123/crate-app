@@ -4065,14 +4065,20 @@ function getSourceSaveCopy(project, items) {
   const watching = project?.status === 'watching';
   const unsaved = files.length === 1 ? `Unsaved changes in ${files[0]}.`
     : files.length > 1 ? `Unsaved changes in ${files.length} files.` : 'Unsaved changes found.';
+  // The reminder is one stable instruction: no count, document or app claim, so a
+  // bounded current-project refresh can never make it wrong. Review Assets keeps
+  // the specifics, painted from the same authoritative items as its rows.
+  // Packaging also checks saved files, so never claim checks happen only while watching.
+  const reminderTitle = 'Save your changes to include the affected assets';
   if (!watching) {
-    // Packaging also checks saved files, so never claim checks happen only while watching.
-    const resume = `Save your changes in ${appPhrase}. Resume watching so Crate can check the saved files.`;
-    return { title, reminder: resume, guidance: `${unsaved} ${resume}` };
+    const resume = 'Resume watching so Crate can check the saved files.';
+    return { title, reminderTitle, reminder: `Save your changes. ${resume}`,
+      guidance: `${unsaved} Save your changes in ${appPhrase}. ${resume}` };
   }
   return {
     title,
-    reminder: `Save your changes in ${appPhrase}, then return to Crate so it can check them.`,
+    reminderTitle,
+    reminder: 'Save your changes, then return to Crate so it can check them.',
     guidance: `${unsaved} Save your changes in ${appPhrase}, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.`,
   };
 }
@@ -4147,19 +4153,21 @@ function retireContradictedNeedsSave(projectId, previous, ownUpdate) {
   return statusChanged || ownUpdate;
 }
 
-function renderNeedsSaveReminder(project, items, announce) {
+// shown: the reminder just went from hidden to visible. Otherwise the live region
+// is written only when the spoken text changes or a modal deferred it, so
+// identical text is never spoken again, even when new items arrive.
+function renderNeedsSaveReminder(project, items, shown) {
   const copy = getSourceSaveCopy(project, items);
   const title = $('#needs-save-reminder-title');
   const detail = $('#needs-save-reminder-detail');
-  if (title) title.textContent = copy.title;
+  if (title) title.textContent = copy.reminderTitle;
   if (detail) detail.textContent = copy.reminder;
-  // A pending announcement always speaks the latest copy, and changed copy
-  // (such as a new watching state) replaces what the live region last said.
-  const message = `${copy.title}. ${copy.reminder}`;
+  // A pending announcement always speaks the latest copy.
+  const message = `${copy.reminderTitle}. ${copy.reminder}`;
   const changed = message !== needsSaveReminder.message;
   needsSaveReminder.message = message;
   const status = $('#needs-save-reminder-status');
-  if (!status || !(announce || changed)) return;
+  if (!status || !(shown || changed || needsSaveReminder.pendingAnnouncement)) return;
   // Clear first so an identical later message is announced again.
   status.textContent = '';
   const generation = ++needsSaveReminder.announcement;
@@ -4221,7 +4229,7 @@ function syncNeedsSaveReminder(project, items) {
   const fresh = [...keys].filter(key => !entry.seen.has(key));
   if (needsSaveReminder.visibleProjectId === project.id) {
     fresh.forEach(key => entry.seen.add(key));
-    renderNeedsSaveReminder(project, items, fresh.length > 0 || needsSaveReminder.pendingAnnouncement);
+    renderNeedsSaveReminder(project, items, false);
     return;
   }
   const reminder = $('#needs-save-reminder');

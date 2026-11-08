@@ -105,11 +105,11 @@ test('genuine Needs Save shows one in-app reminder plus Review Assets guidance w
   f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'logo.png')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'logo.png', 1)]);
   await f.refresh();
   assert.equal(f.visible(), true);
-  assert.equal(f.reminderText(), 'Save your file to include these assets Save your changes in InDesign, then return to Crate so it can check them.');
+  assert.equal(f.reminderText(), STABLE_WATCHING);
   assert.equal(f.guidanceVisible(), true);
   assert.equal(f.guidanceText(), 'Save your file to include these assets Unsaved changes in Brochure.indd. Save your changes in InDesign, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.');
   await tick();
-  assert.equal(f.status(), 'Save your file to include these assets. Save your changes in InDesign, then return to Crate so it can check them.');
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
   assert.equal(f.el('needs-save-reminder').contains(f.document.activeElement), false, 'showing never moves focus');
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const markup = html.slice(html.indexOf('id="needs-save-reminder-status"') - 40, html.indexOf('id="btn-needs-save-dismiss"') + 120);
@@ -163,12 +163,12 @@ test('mixed states, multiple files and apps, and unknown app names stay accurate
     presented('a', 'review.png', 2),
   ]);
   await f.refresh();
-  assert.equal(f.reminderText(), 'Save your files to include these assets Save your changes in Illustrator and InDesign, then return to Crate so it can check them.');
+  assert.equal(f.reminderText(), STABLE_WATCHING, 'the reminder makes no count, document or app claim');
   assert.match(f.guidanceText(), /Unsaved changes in 2 files\./);
   const copy = items => f.renderer.getSourceSaveCopy(f.projects[0], items);
-  assert.equal(copy([{ sourceSaveAppFamily: 'mystery-app', sourceSaveSourceName: 'X.doc' }]).reminder, 'Save your changes in the app, then return to Crate so it can check them.');
-  assert.equal(copy([{ sourceSaveAppFamily: 'illustrator' }, { sourceSaveAppFamily: 'indesign' }, { sourceSaveAppFamily: 'photoshop' }]).reminder,
-    'Save your changes in each app, then return to Crate so it can check them.');
+  assert.match(copy([{ sourceSaveAppFamily: 'mystery-app', sourceSaveSourceName: 'X.doc' }]).guidance, /Save your changes in the app, then return to Crate\./);
+  assert.match(copy([{ sourceSaveAppFamily: 'illustrator' }, { sourceSaveAppFamily: 'indesign' }, { sourceSaveAppFamily: 'photoshop' }]).guidance,
+    /Save your changes in each app, then return to Crate\./);
   assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Poster.ai' }]).title, 'Save your file to include this asset');
   assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: '/private/Poster.ai' }]).guidance.includes('/private'), false);
   // Without a name from the qualifying observation, never fall back to the row's first source.
@@ -214,21 +214,22 @@ test('repeated refreshes do not repeat it; dismissal and Escape stick until a ge
   assert.equal(f.visible(), false);
 });
 
-test('links arriving during an active scan update a visible reminder and re-announce once', async () => {
+test('links arriving during an active scan keep the visible reminder steady and update the note', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   await f.refresh();
   await tick();
-  assert.match(f.reminderText(), /this asset/);
+  assert.match(f.guidanceText(), /this asset/);
   f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'new.jpg')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'new.jpg', 1)]);
   await f.refresh();
   assert.equal(f.visible(), true);
-  assert.match(f.reminderText(), /these assets/);
-  assert.equal(f.status(), '', 'cleared before re-announcing');
+  assert.equal(f.reminderText(), STABLE_WATCHING);
+  assert.match(f.guidanceText(), /these assets/);
+  assert.equal(f.status(), spoken(STABLE_WATCHING), 'never cleared for identical text');
   await tick();
-  assert.match(f.status(), /these assets/);
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
   await f.refresh();
-  assert.match(f.status(), /these assets/, 'an unchanged refresh does not re-announce');
+  assert.equal(f.status(), spoken(STABLE_WATCHING), 'an unchanged refresh does not re-announce');
 });
 
 test('a successful save clears it; failed verification keeps or drops it only by evidence; re-entry re-arms', async () => {
@@ -262,11 +263,11 @@ test('project switching, reopening a project, paused copy and stale overlapping 
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   f.set('b', [rawRow('b', 'cover.jpg')], [needsSave('b', 'cover.jpg', 0, 'illustrator', 'Cover.ai')]);
   await f.refresh();
-  assert.match(f.reminderText(), /InDesign/);
+  assert.match(f.guidanceText(), /InDesign/);
   f.evaluate("setSelectedProject('b')");
   assert.equal(f.visible(), false, 'switching projects hides the other project reminder');
   await f.refresh();
-  assert.match(f.reminderText(), /Illustrator/);
+  assert.match(f.guidanceText(), /Illustrator/);
   f.el('btn-needs-save-dismiss').click();
   f.evaluate("setSelectedProject('a')");
   await f.refresh();
@@ -288,14 +289,14 @@ test('project switching, reopening a project, paused copy and stale overlapping 
   f.projects[1].status = 'paused';
   f.set('b', [rawRow('b', 'new-cover.jpg')], [needsSave('b', 'new-cover.jpg', 0, 'illustrator', 'Cover.ai')]);
   await f.refresh();
-  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in Illustrator. Resume watching so Crate can check the saved files.');
+  assert.equal(f.reminderText(), STABLE_PAUSED);
   assert.equal(f.guidanceText(), 'Save your file to include this asset Unsaved changes in Cover.ai. Save your changes in Illustrator. Resume watching so Crate can check the saved files.');
 });
 
 test('a Projects watch/pause click never leaves stale status copy; fresh evidence restores it', async () => {
   const f = await fixture();
-  const watchingCopy = 'Save your file to include this asset Save your changes in InDesign, then return to Crate so it can check them.';
-  const pausedCopy = 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.';
+  const watchingCopy = STABLE_WATCHING;
+  const pausedCopy = STABLE_PAUSED;
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   await f.refresh();
   assert.equal(f.reminderText(), watchingCopy);
@@ -316,7 +317,7 @@ test('a Projects watch/pause click never leaves stale status copy; fresh evidenc
   assert.equal(f.guidanceText(), 'Save your file to include this asset Unsaved changes in Brochure.indd. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
   assert.equal(/only while watching/.test(f.guidanceText()), false, 'packaging also checks saved files');
   await tick();
-  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+  assert.equal(f.status(), spoken(STABLE_PAUSED));
 
   await toggle();
   assert.equal(f.evaluate('state.projects[0].status'), 'watching');
@@ -348,7 +349,7 @@ test('starting another project from Projects suspends the selected project remin
   assert.equal(f.status(), '');
   await f.renderer.switchTab('current-project');
   assert.equal(f.visible(), true);
-  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+  assert.equal(f.reminderText(), STABLE_PAUSED);
 });
 
 test('a pause finishing after returning to Current Project updates the announced copy once', async () => {
@@ -356,7 +357,7 @@ test('a pause finishing after returning to Current Project updates the announced
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   await f.refresh();
   await tick();
-  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign, then return to Crate so it can check them.');
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
   const gate = f.gatePause();
   await f.renderer.switchTab('projects');
   f.el('project-rows').children[0].querySelector('.project-pill').click();
@@ -364,8 +365,8 @@ test('a pause finishing after returning to Current Project updates the announced
   gate.resolve();
   await tick();
   assert.equal(f.evaluate('state.projects[0].status'), 'paused');
-  const paused = 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.';
-  assert.equal(f.reminderText(), paused.replace('asset. Save', 'asset Save'));
+  const paused = spoken(STABLE_PAUSED);
+  assert.equal(f.reminderText(), STABLE_PAUSED);
   assert.equal(f.status(), paused, 'the live region never keeps superseded copy');
   // An identical refresh does not re-announce.
   f.el('needs-save-reminder-status').textContent = 'spoken';
@@ -387,6 +388,54 @@ test('dismissing from another tab never moves focus to a control in the hidden w
     assert.equal(f.visible(), false, how);
     assert.notEqual(f.document.activeElement, f.el('btn-review-assets'), `${how}: Review Assets is not rendered on Settings`);
   }
+});
+
+// Stable save instruction: the reminder makes no count, document or app claim, so a
+// bounded current-project refresh can never make it wrong; the rows and the Review
+// Assets note keep naming documents from the same authoritative items.
+const STABLE_WATCHING = 'Save your changes to include the affected assets Save your changes, then return to Crate so it can check them.';
+const STABLE_PAUSED = 'Save your changes to include the affected assets Save your changes. Resume watching so Crate can check the saved files.';
+const spoken = text => text.replace('assets Save', 'assets. Save');
+
+test('the reminder is one stable instruction for any count, document or app; guidance keeps the names', async () => {
+  for (const [rows, pending, guidance] of [
+    [[rawRow('a', 'poster.png')], [needsSave('a', 'poster.png', 0, 'illustrator', 'Poster.ai')], /Unsaved changes in Poster\.ai\. Save your changes in Illustrator, then return to Crate\./],
+    [[rawRow('a', 'ai.png'), rawRow('a', 'indd.png')],
+      [needsSave('a', 'ai.png', 0, 'illustrator', 'Poster.ai'), needsSave('a', 'indd.png', 1, 'indesign', 'Brochure.indd')], /Unsaved changes in 2 files\./],
+    [[rawRow('a', 'x.png'), rawRow('a', 'y.png')],
+      [needsSave('a', 'x.png', 0, 'illustrator', null), needsSave('a', 'y.png', 1, 'illustrator', 'Poster B.ai')], /^Save .* Unsaved changes found\./],
+  ]) {
+    const f = await fixture();
+    f.set('a', rows, pending);
+    await f.refresh();
+    assert.equal(f.reminderText(), STABLE_WATCHING);
+    assert.match(f.guidanceText(), guidance);
+    await tick();
+    assert.equal(f.status(), spoken(STABLE_WATCHING));
+    for (const text of [f.reminderText(), f.status()]) assert.equal(/Illustrator|InDesign|Poster|Brochure|this asset|these assets|your file/.test(text), false, text);
+  }
+  const g = await fixture({ status: 'paused' });
+  g.set('a', [rawRow('a', 'poster.png')], [needsSave('a', 'poster.png', 0, 'illustrator', 'Poster.ai')]);
+  await g.refresh();
+  assert.equal(g.reminderText(), STABLE_PAUSED);
+  assert.equal(g.guidanceText().endsWith('Unsaved changes in Poster.ai. Save your changes in Illustrator. Resume watching so Crate can check the saved files.'), true);
+  for (const text of [g.reminderText(), g.guidanceText()]) assert.equal(/only while watching/.test(text), false);
+});
+
+test('a new flagged item while the stable reminder is visible updates history without re-announcing', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'new.jpg')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'new.jpg', 1, 'illustrator', 'Poster.ai')]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.visible(), true);
+  assert.equal(f.reminderText(), STABLE_WATCHING);
+  assert.equal(f.status(), 'spoken', 'identical text is never spoken again');
+  assert.equal(f.evaluate("needsSaveReminder.projects.get('a').seen.has('vis-a-new.jpg')"), true);
+  assert.match(f.guidanceText(), /Unsaved changes in 2 files\./, 'the note follows the rows');
 });
 
 test('modals defer it, account changes reset it, and Review opens Needs Review', async () => {
@@ -463,7 +512,7 @@ test('closing a modal resumes a deferred reminder without another refresh', asyn
   await tick(10);
   assert.equal(f.visible(), true);
   await tick();
-  assert.match(f.status(), /this asset/);
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
 });
 
 test('a project list replaced behind a modal suspends the visible reminder when the modal closes', async () => {
@@ -496,7 +545,7 @@ test('suspending also withdraws the Review Assets save guidance until fresh evid
   assert.match(f.guidanceText(), /Resume watching so Crate can check the saved files\.$/);
 });
 
-test('items arriving behind a modal while the reminder is visible are announced after it closes', async () => {
+test('items arriving behind a modal while the reminder is visible are recorded after it closes without repeating identical text', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   await f.refresh();
@@ -506,11 +555,14 @@ test('items arriving behind a modal while the reminder is visible are announced 
   await f.refresh();
   await tick();
   assert.equal(f.evaluate("needsSaveReminder.projects.get('a').seen.has('vis-a-new.jpg')"), false, 'not consumed while inert');
-  assert.match(f.status(), /this asset/, 'no announcement into the inert region');
+  assert.equal(f.status(), spoken(STABLE_WATCHING), 'no announcement into the inert region');
+  f.el('needs-save-reminder-status').textContent = 'spoken';
   f.renderer.hidePackageLimitModal({ restoreFocus: false });
   await tick(10);
   await tick();
-  assert.match(f.status(), /these assets/);
+  assert.equal(f.evaluate("needsSaveReminder.projects.get('a').seen.has('vis-a-new.jpg')"), true, 'recorded once usable');
+  assert.equal(f.status(), 'spoken', 'identical text is not spoken again');
+  assert.match(f.guidanceText(), /these assets/);
 });
 
 test('a delayed announcement speaks the latest copy, not a superseded one', async () => {
@@ -521,7 +573,7 @@ test('a delayed announcement speaks the latest copy, not a superseded one', asyn
   f.set('a', [rawRow('a', 'indd.png')], [needsSave('a', 'indd.png', 1 - 1, 'indesign', 'Brochure.indd')]);
   await f.refresh();
   await tick();
-  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign, then return to Crate so it can check them.');
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
   f.el('btn-needs-save-dismiss').click();
   await tick();
   assert.equal(f.status(), '');
@@ -601,7 +653,7 @@ test('a modal opening during the announcement delay announces once it closes', a
   f.renderer.hidePackageLimitModal({ restoreFocus: false });
   await tick(10);
   await tick();
-  assert.match(f.status(), /this asset/);
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
 });
 
 test('resume after a modal uses the current workspace even when it was replaced', async () => {
@@ -686,8 +738,8 @@ test('another project refresh that changes the selected project status re-checks
   held.resolve(clone(f.workspaces.get('a')));
   await tick();
   assert.equal(f.visible(), true, 'still unsaved: restored from the fresh read');
-  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.');
-  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+  assert.equal(f.reminderText(), STABLE_PAUSED);
+  assert.equal(f.status(), spoken(STABLE_PAUSED));
 });
 
 test('an unchanged Current Project refresh during a scan updates the reminder in place without re-announcing', async () => {
