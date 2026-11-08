@@ -4113,7 +4113,10 @@ function getNeedsSaveReminderEntry(projectId) {
 // The visible reminder must never outlive the authoritative data behind it.
 // Suspension is neither a dismissal nor a resolution.
 function suspendNeedsSaveReminder(projectId) {
-  if (!projectId || needsSaveReminder.visibleProjectId !== projectId) return;
+  if (!projectId) return;
+  // The save guidance shares this evidence; the next authoritative render redraws it.
+  if (state.selectedProjectId === projectId) $('#pending-save-guidance')?.classList.add('hidden');
+  if (needsSaveReminder.visibleProjectId !== projectId) return;
   const entry = needsSaveReminder.projects.get(projectId);
   hideNeedsSaveReminder();
   if (entry) entry.suspended = true;
@@ -4150,10 +4153,16 @@ function renderNeedsSaveReminder(project, items, announce) {
 function resumeNeedsSaveReminder() {
   const last = needsSaveReminder.last;
   const workspace = state.assetWorkspace;
-  if (!last || last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
+  if (!last) return;
+  if (last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
       state.selectedProjectId !== last.project.id ||
       state.projects.find(item => item.id === last.project.id) !== last.project ||
-      workspace?.projectId !== last.project.id || displayOnlyAssetWorkspaces.has(workspace)) return;
+      workspace?.projectId !== last.project.id || displayOnlyAssetWorkspaces.has(workspace)) {
+    // Its evidence was superseded (for example, the project list was re-read
+    // behind a modal): never leave a visible reminder bound to it.
+    suspendNeedsSaveReminder(last.project.id);
+    return;
+  }
   // Another authoritative read may have replaced the workspace object for the
   // same project and selection; evaluate that current projection.
   const items = workspace === last.workspace ? last.items

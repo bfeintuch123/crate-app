@@ -466,6 +466,36 @@ test('closing a modal resumes a deferred reminder without another refresh', asyn
   assert.match(f.status(), /this asset/);
 });
 
+test('a project list replaced behind a modal suspends the visible reminder when the modal closes', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.visible(), true);
+  f.el('modal-upgrade').classList.remove('hidden');
+  // A flow such as package review re-reads the project list while the modal is open.
+  f.evaluate('state.projects = state.projects.map(project => ({ ...project }))');
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  assert.equal(f.visible(), false, 'a reminder bound to a superseded project never stays up');
+  await f.refresh();
+  assert.equal(f.visible(), true, 'fresh evidence that it is still unsaved restores it');
+});
+
+test('suspending also withdraws the Review Assets save guidance until fresh evidence', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.guidanceVisible(), true);
+  assert.match(f.guidanceText(), /return to Crate/);
+  await f.renderer.switchTab('projects');
+  f.el('project-rows').children[0].querySelector('.project-pill').click();
+  await tick();
+  assert.equal(f.guidanceVisible(), false, 'no watching guidance survives the pause');
+  await f.renderer.switchTab('current-project');
+  assert.equal(f.guidanceVisible(), true);
+  assert.match(f.guidanceText(), /Resume watching so Crate can check the saved files\.$/);
+});
+
 test('items arriving behind a modal while the reminder is visible are announced after it closes', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
