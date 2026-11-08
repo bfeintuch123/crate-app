@@ -3653,3 +3653,19 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Needs Save: dark in-app notice matching the toast treatment; persistent and dismissible. */
+.needs-save-reminder { position: fixed; left: 50%; bottom: 60px; transform: translateX(-50%); z-index: 90; display: flex; align-items: center; gap: 10px; width: max-content; max-width: min(560px, calc(100% - 32px)); padding: 10px 10px 10px 18px; background: #1f2937; color: #fff; border-radius: 8px; font-size: 12px; line-height: 1.45; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+.needs-save-reminder-copy { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.needs-save-reminder-copy strong { display: block; font-weight: 600; }
+.needs-save-reminder-action { flex: none; min-height: 28px; padding: 5px 12px; border: 0; border-radius: 6px; background: #fff; color: #1f2937; font-size: 12px; font-weight: 600; cursor: pointer; }
+.needs-save-reminder-dismiss { flex: none; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #fff; font-size: 18px; line-height: 1; cursor: pointer; }
+.needs-save-reminder-dismiss:hover { background: rgba(255,255,255,.14); }
+.needs-save-reminder button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+.pending-save-guidance { margin: 0 0 10px; padding: 10px 12px; border: 1px solid #ecd48a; border-left: 4px solid #c99a1e; border-radius: 8px; background: #fffbeb; color: #3f3a2a; font-size: 12px; line-height: 1.5; }
+.pending-save-guidance-title { display: block; color: #252525; font-size: 13px; font-weight: 600; }
+.pending-save-guidance-detail { margin: 2px 0 0; overflow-wrap: anywhere; }
+@media (max-width: 520px) {
+  .needs-save-reminder { flex-wrap: wrap; }
+  .needs-save-reminder-copy { flex-basis: 100%; }
+}

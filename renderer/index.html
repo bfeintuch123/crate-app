@@ -809,6 +809,10 @@
                   <span class="asset-panel-count" id="pending-assets-count"></span>
                   <span class="pending-package-note">Not in the package</span>
                 </div>
+                <div id="pending-save-guidance" class="pending-save-guidance hidden" role="note" aria-labelledby="pending-save-guidance-title">
+                  <strong id="pending-save-guidance-title" class="pending-save-guidance-title"></strong>
+                  <p id="pending-save-guidance-detail" class="pending-save-guidance-detail"></p>
+                </div>
                 <div id="pending-batch-slot"></div>
                 <div id="pending-file-list" class="missing-asset-grid"></div>
               </section>
@@ -994,6 +998,16 @@
         </div>
       </div>
     </div>
+      <!-- Needs Save reminder: same dark in-app notice style as the toast, but persistent until dismissed or resolved. -->
+      <p id="needs-save-reminder-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+      <div id="needs-save-reminder" class="needs-save-reminder hidden" role="region" aria-labelledby="needs-save-reminder-title">
+        <div class="needs-save-reminder-copy">
+          <strong id="needs-save-reminder-title"></strong>
+          <span id="needs-save-reminder-detail"></span>
+        </div>
+        <button type="button" class="needs-save-reminder-action" id="btn-needs-save-review" aria-label="Review assets that need a save">Review</button>
+        <button type="button" class="needs-save-reminder-dismiss" id="btn-needs-save-dismiss" aria-label="Dismiss save reminder">&times;</button>
+      </div>
     </main>
 
     <!-- Existing Assets Decision Modal -->

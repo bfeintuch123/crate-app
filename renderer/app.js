@@ -652,6 +652,7 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
 
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
+  hideNeedsSaveReminder();
   assetReviewBatchProjection = null;
   reconcileCurrentAssetReviewBatchControls();
   workingSourceActions.clear();
@@ -1693,6 +1694,7 @@ async function renderFiles(renderOptions = {}) {
   }
 
   if (!state.selectedProjectId) {
+    hideNeedsSaveReminder();
     setActiveFileVisualProject(null);
     setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div>';
@@ -1704,6 +1706,7 @@ async function renderFiles(renderOptions = {}) {
 
   const project = state.projects.find(p => p.id === state.selectedProjectId);
   if (!project) {
+    hideNeedsSaveReminder();
     setActiveFileVisualProject(null);
     setAssetReviewProject(null);
     noProject.innerHTML = '<div class="app-empty-icon">&#x1F4C2;</div><div class="app-empty-title">No project selected</div>';
@@ -1718,6 +1721,7 @@ async function renderFiles(renderOptions = {}) {
 
   // Show empty state when project is packaged or not actively watching
   if (project.status === 'packaged') {
+    hideNeedsSaveReminder();
     noProject.innerHTML = '<p style="color:#9ca3af;font-size:13px;text-align:center;padding:32px 16px;">Project packaged</p>';
     noProject.classList.remove('hidden');
     filesView.classList.add('hidden');
@@ -1860,7 +1864,8 @@ async function renderFiles(renderOptions = {}) {
   if (isTabActive('projects')) renderProjectRows();
 
   // Pending files (Tier 2)
-  renderPendingFiles(project, assetWorkspace.pendingFiles);
+  const sourceSaveItems = renderPendingFiles(project, assetWorkspace.pendingFiles);
+  if (authoritative) syncNeedsSaveReminder(project, sourceSaveItems);
 
   // Persistent project asset workspace
   renderAssetWorkspace(project, {
@@ -3938,12 +3943,14 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
 
   const pending = composePendingReviewFiles(project, presentedPendingFiles);
   pending.forEach(getRendererItemKey);
+  const sourceSaveItems = getSourceSaveItems(project, pending);
+  renderSourceSaveGuidance(project, sourceSaveItems);
 
   if (pending.length === 0) {
     section.classList.add('hidden');
     resetVirtualAssetList(list);
     reconcileKeyedList(list, [], () => null);
-    return;
+    return sourceSaveItems;
   }
 
   section.classList.remove('hidden');
@@ -4004,6 +4011,172 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
   };
   list.__assetReviewAllItems = pending;
   renderVirtualAssetList(list, pending, buildPendingRow);
+  return sourceSaveItems;
+}
+
+// ===== Needs Save reminder =====
+// Presentation only. Main marks a pending row sourceSaveRequired solely from a
+// trusted live-app observation that its source document has unsaved changes;
+// timeouts, unsupported or missing files and general review never qualify.
+// Nothing here changes capture, verification, Retry or packaging.
+const NEEDS_SAVE_REMINDER_COOLDOWN_MS = 2 * 60 * 1000;
+const needsSaveReminder = { account: null, projects: new Map(), visibleProjectId: null };
+
+function getSourceSaveItems(project, pending) {
+  const workspace = state.assetWorkspace;
+  if (!project || !workspace || workspace.projectId !== project.id || displayOnlyAssetWorkspaces.has(workspace) ||
+      !Array.isArray(workspace.pendingFiles) || !Array.isArray(pending)) return [];
+  // Only the authoritative presentation can carry the flag; raw records never do.
+  const flagged = new Set(workspace.pendingFiles
+    .filter(row => row && row.sourceSaveRequired === true && row.excluded !== true)
+    .map(getFileVisualIdentity).filter(Boolean));
+  return pending.filter(file => file && file.sourceSaveRequired === true && file.excluded !== true &&
+    getPendingCaptureState(file) === 'needs-save' && flagged.has(getFileVisualIdentity(file)));
+}
+
+function getSourceSaveCopy(project, items) {
+  const labels = items.map(file => PENDING_APP_LABELS[file.sourceSaveAppFamily] || null);
+  const apps = [...new Set(labels.filter(Boolean))];
+  const appPhrase = labels.includes(null) || apps.length === 0 ? 'the app'
+    : apps.length === 1 ? apps[0] : apps.length === 2 ? `${apps[0]} and ${apps[1]}` : 'each app';
+  const files = [...new Set(items.map(file => sanitizeRendererSourceName(file.sourceName)).filter(Boolean))];
+  const title = items.length === 1 ? 'Save your file to include this asset'
+    : `Save your ${files.length > 1 ? 'files' : 'file'} to include these assets`;
+  const watching = project?.status === 'watching';
+  const nextStep = watching ? 'then return to Crate.' : 'then resume watching.';
+  const unsaved = files.length === 1 ? `Unsaved changes in ${files[0]}.`
+    : files.length > 1 ? `Unsaved changes in ${files.length} files.` : 'Unsaved changes found.';
+  const check = watching
+    ? 'Crate checks the saved file and moves assets it can confirm out of Needs Review.'
+    : 'Crate checks saved files only while watching.';
+  return {
+    title,
+    reminder: `Save your changes in ${appPhrase}, ${nextStep}`,
+    guidance: `${unsaved} Save your changes in ${appPhrase}, ${nextStep} ${check}`,
+  };
+}
+
+function renderSourceSaveGuidance(project, items) {
+  const guidance = $('#pending-save-guidance');
+  if (!guidance) return;
+  if (!items.length) {
+    guidance.classList.add('hidden');
+    return;
+  }
+  const copy = getSourceSaveCopy(project, items);
+  const title = $('#pending-save-guidance-title');
+  const detail = $('#pending-save-guidance-detail');
+  if (title) title.textContent = copy.title;
+  if (detail) detail.textContent = copy.guidance;
+  guidance.classList.remove('hidden');
+}
+
+function resetNeedsSaveReminder() {
+  hideNeedsSaveReminder();
+  needsSaveReminder.projects.clear();
+  needsSaveReminder.account = accountWorkspaceEpoch;
+}
+
+function getNeedsSaveReminderEntry(projectId) {
+  if (needsSaveReminder.account !== accountWorkspaceEpoch) resetNeedsSaveReminder();
+  let entry = needsSaveReminder.projects.get(projectId);
+  if (!entry) needsSaveReminder.projects.set(projectId, entry = { seen: new Set(), lastShownAt: null });
+  return entry;
+}
+
+function renderNeedsSaveReminder(project, items, announce) {
+  const copy = getSourceSaveCopy(project, items);
+  const title = $('#needs-save-reminder-title');
+  const detail = $('#needs-save-reminder-detail');
+  if (title) title.textContent = copy.title;
+  if (detail) detail.textContent = copy.reminder;
+  const status = $('#needs-save-reminder-status');
+  if (!status || !announce) return;
+  // Clear first so an identical later message is announced again.
+  status.textContent = '';
+  const message = `${copy.title}. ${copy.reminder}`;
+  setTimeout(() => {
+    if (needsSaveReminder.visibleProjectId === project.id) status.textContent = message;
+  }, 50);
+}
+
+// Called only with an authoritative workspace for the selected project.
+function syncNeedsSaveReminder(project, items) {
+  if (!project || accountStatus.canUseWorkspace !== true) {
+    hideNeedsSaveReminder();
+    return;
+  }
+  const entry = getNeedsSaveReminderEntry(project.id);
+  if (needsSaveReminder.visibleProjectId && needsSaveReminder.visibleProjectId !== project.id) hideNeedsSaveReminder();
+  const keys = new Set(items.map(getFileVisualIdentity).filter(Boolean));
+  // A saved, excluded or skipped item re-arms only if it later needs a save again.
+  for (const key of [...entry.seen]) if (!keys.has(key)) entry.seen.delete(key);
+  if (!keys.size) {
+    hideNeedsSaveReminder();
+    return;
+  }
+  const fresh = [...keys].filter(key => !entry.seen.has(key));
+  if (needsSaveReminder.visibleProjectId === project.id) {
+    fresh.forEach(key => entry.seen.add(key));
+    renderNeedsSaveReminder(project, items, fresh.length > 0);
+    return;
+  }
+  // Defer behind modals so the announcement is not lost; the items stay unseen.
+  if (!fresh.length || hasModalInteraction()) return;
+  fresh.forEach(key => entry.seen.add(key));
+  const now = Date.now();
+  // Review Assets guidance remains; the pop-up does not repeat within the cooldown.
+  if (entry.lastShownAt !== null && now - entry.lastShownAt < NEEDS_SAVE_REMINDER_COOLDOWN_MS) return;
+  const reminder = $('#needs-save-reminder');
+  if (!reminder) return;
+  entry.lastShownAt = now;
+  needsSaveReminder.visibleProjectId = project.id;
+  reminder.classList.remove('hidden');
+  renderNeedsSaveReminder(project, items, true);
+}
+
+function hideNeedsSaveReminder() {
+  const reminder = $('#needs-save-reminder');
+  const status = $('#needs-save-reminder-status');
+  needsSaveReminder.visibleProjectId = null;
+  if (status) status.textContent = '';
+  if (!reminder || reminder.classList.contains('hidden')) return;
+  const hadFocus = reminder.contains(document.activeElement);
+  reminder.classList.add('hidden');
+  if (!hadFocus) return;
+  const fallback = [$('#btn-review-assets'), document.querySelector('.app-tab[data-tab="current-project"]')]
+    .find(accountFocusAvailable);
+  if (fallback) fallback.focus();
+  else document.activeElement?.blur?.();
+}
+
+async function reviewNeedsSaveAssets() {
+  const projectId = needsSaveReminder.visibleProjectId;
+  hideNeedsSaveReminder();
+  if (!projectId || hasModalInteraction() || accountStatus.canUseWorkspace !== true ||
+      state.selectedProjectId !== projectId) return;
+  const selection = projectSelectionEpoch, account = accountWorkspaceEpoch;
+  if (!isTabActive('current-project')) await switchTab('current-project');
+  if (selection !== projectSelectionEpoch || account !== accountWorkspaceEpoch || state.selectedProjectId !== projectId ||
+      hasModalInteraction() || !isTabActive('current-project')) return;
+  state.assetReviewFilter = 'missing';
+  state.assetReviewQuery = '';
+  const search = $('#asset-review-search');
+  if (search) search.value = '';
+  openAssetReviewWorkspace();
+}
+
+function initializeNeedsSaveReminder() {
+  const reminder = $('#needs-save-reminder');
+  if (!reminder) return;
+  $('#btn-needs-save-review')?.addEventListener('click', () => { void reviewNeedsSaveAssets(); });
+  $('#btn-needs-save-dismiss')?.addEventListener('click', hideNeedsSaveReminder);
+  reminder.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation?.();
+    hideNeedsSaveReminder();
+  });
 }
 
 // ===== Account (workspace access requires a verified session) =====
@@ -4075,6 +4248,7 @@ function acceptAccountSnapshot(snapshot) {
   accountStatus = snapshot;
   if (!snapshot.canUseWorkspace || previousId !== snapshot.identity?.id) {
     accountWorkspaceEpoch++;
+    resetNeedsSaveReminder();
     projectCreationFollowUpRead?.detach();
     detachProjectCreationRecoveryRead();
   }
@@ -5823,6 +5997,7 @@ async function confirmClearAll() {
 function setupEventListeners() {
   if (rendererEventListenersBound) return;
   rendererEventListenersBound = true;
+  initializeNeedsSaveReminder();
 
   // Tab switching
   $$('.app-tab').forEach(tab => {

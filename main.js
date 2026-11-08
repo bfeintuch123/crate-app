@@ -6190,6 +6190,35 @@ async function createRendererFilePresentation(project, file, membership = getWor
   };
 }
 
+// Review Assets save reminder. Presentation-only: it never changes capture,
+// admission, verification or packaging. Only the newest trusted live-app
+// observation that the source document itself has unsaved changes qualifies.
+// Link-only, unknown, broad, timeout, unsupported, missing or general-review
+// evidence never does, and the app family comes from the fixed observer.
+const SOURCE_SAVE_REMINDER_OBSERVER_APPS = new Map([
+  [LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION, 'illustrator'],
+  [LIVE_APP_OBSERVER_METHODS.PHOTOSHOP_LIVE_SCRIPT, 'photoshop'],
+  [LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT, 'indesign'],
+]);
+const SOURCE_SAVE_REMINDER_STRENGTHS = new Set([
+  LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
+  LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
+]);
+function getPendingSourceSaveReminder(project, file) {
+  if (!project || !file || file.captureState !== LIVE_CAPTURE_STATES.NEEDS_SAVE ||
+      typeof file.path !== 'string' || !file.path || isAssetReviewFileExcluded(project, file)) return null;
+  const evidenceKey = getLiveEvidenceKeyHash(normalizeTrackedFilePath(file.path));
+  const ledgerLatest = evidenceKey ? project.liveEvidenceLedger?.candidates?.[evidenceKey]?.latest : null;
+  // The ledger records every semantic change; a pending row keeps its first
+  // decoration, so a later clean observation must win over stale row evidence.
+  const evidence = ledgerLatest && typeof ledgerLatest === 'object' ? ledgerLatest
+    : (file.captureEvidence && typeof file.captureEvidence === 'object' ? file.captureEvidence : null);
+  if (!evidence || evidence.documentModified !== true || evidence.needsSave !== true ||
+      !SOURCE_SAVE_REMINDER_STRENGTHS.has(evidence.evidenceStrength)) return null;
+  const appFamily = SOURCE_SAVE_REMINDER_OBSERVER_APPS.get(evidence.observerMethod);
+  return appFamily ? { sourceSaveRequired: true, sourceSaveAppFamily: appFamily } : null;
+}
+
 // Display-only order from committed, still-current owner decisions. This never
 // changes membership, verification, original file order or mutation authority.
 function getWorkingSourceDisplayOrder(project) {
@@ -6259,6 +6288,7 @@ async function getProjectAssetWorkspace(projectId, retryCount = 0) {
   })));
   const pendingFiles = await Promise.all((scopedProject.pendingFiles || []).map(async (file, sourceIndex) => ({
     ...(await createRendererFilePresentation(project, file, membership, attribution)),
+    ...getPendingSourceSaveReminder(project, file),
     sourceIndex,
   })));
   const visualRecords = new Map();

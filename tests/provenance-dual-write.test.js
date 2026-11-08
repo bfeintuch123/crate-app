@@ -18073,6 +18073,126 @@ test('InDesign modified live document and links remain needs-save until saved', 
   ], 'InDesign unsaved live session pending files');
 });
 
+test('Review Assets save reminder marks only trusted unsaved-source Needs Save items', async () => {
+  resetTestHomeWorkspace();
+  const desktop = path.join(TEST_HOME, 'Desktop');
+  const file = name => path.join(desktop, name);
+  const paths = {
+    unsavedDoc: file('save-reminder-doc.indd'),
+    unsavedLink: file('save-reminder-link.png'),
+    spoofedFamily: file('save-reminder-spoofed.png'),
+    photoshopLink: file('save-reminder-photoshop.png'),
+    unknownState: file('save-reminder-unknown.indd'),
+    staleRow: file('save-reminder-stale.png'),
+    generalReview: file('save-reminder-review.png'),
+    savedLinkAwaitingParser: file('save-reminder-awaiting-parser.png'),
+    excluded: file('save-reminder-excluded.png'),
+    timeoutRetained: file('save-reminder-timeout.png'),
+  };
+  for (const filePath of Object.values(paths)) fs.writeFileSync(filePath, 'synthetic save reminder bytes');
+  // Rows belong to the current watch session, so the project starts first.
+  const project = await createProject('Save reminder classification');
+  const trusted = (observerMethod, evidenceStrength, documentModified, extra = {}) => ({
+    schemaVersion: 1, source: 'app-opened', observerMethod, evidenceStrength, captureRecommendation: 'needs-save',
+    reason: 'unsaved-source-needs-save', needsSave: true, documentModified, sourceName: 'Synthetic Source.indd', ...extra,
+  });
+  const pending = (filePath, captureState, captureEvidence, source = 'app-opened') => ({
+    ...makePendingFile(filePath, source), captureState, captureReason: captureEvidence?.reason || 'needs-save',
+    captureEvidence: { state: captureState, ...captureEvidence },
+  });
+  const rows = [
+    pending(paths.unsavedDoc, 'needs-save', trusted('indesign-live-applescript', 'structured-app-document', true, { appFamily: 'indesign' })),
+    pending(paths.unsavedLink, 'needs-save', trusted('indesign-live-applescript', 'structured-app-link', true, { appFamily: 'indesign' }), 'indd-poll'),
+    pending(paths.spoofedFamily, 'needs-save', trusted('illustrator-active-session', 'structured-app-link', true, { appFamily: 'photoshop' }), 'ai-linked'),
+    // Photoshop link polling has no document-modified signal.
+    pending(paths.photoshopLink, 'needs-save', { ...trusted('photoshop-live-script', 'structured-app-link', undefined, { appFamily: 'photoshop' }), documentModified: undefined }, 'ps-poll'),
+    pending(paths.unknownState, 'needs-save', trusted('indesign-live-applescript', 'structured-app-document', null, { appFamily: 'indesign' })),
+    pending(paths.staleRow, 'needs-save', trusted('indesign-live-applescript', 'structured-app-link', true, { appFamily: 'indesign' }), 'indd-poll'),
+    pending(paths.generalReview, 'pending', { ...trusted('indesign-live-applescript', 'structured-app-link', true), needsSave: false, captureRecommendation: 'pending' }, 'indd-poll'),
+    pending(paths.savedLinkAwaitingParser, 'needs-save', trusted('indesign-live-applescript', 'structured-app-link', false, { appFamily: 'indesign' }), 'indd-poll'),
+    pending(paths.excluded, 'needs-save', trusted('indesign-live-applescript', 'structured-app-link', true, { appFamily: 'indesign' }), 'indd-poll'),
+    // A retained verification/timeout reason is not an unsaved-document observation.
+    pending(paths.timeoutRetained, 'needs-save', { ...trusted('indesign-live-applescript', 'structured-app-link', null), reason: 'working-file-verification-pending' }, 'indd-poll'),
+  ];
+  const ledger = { schemaVersion: 1, candidates: {} };
+  const now = Date.now();
+  for (const row of rows) {
+    const [key, entry] = makeLiveEvidenceLedgerEntry(row.path, row.captureState, now, { latest: row.captureEvidence });
+    ledger.candidates[key] = entry;
+  }
+  // A newer clean observation supersedes the first decoration retained by the row.
+  ledger.candidates[liveEvidenceKeyForTest(paths.staleRow)].latest.documentModified = false;
+  await setProjectFiles(project.id, { pendingFiles: rows, liveEvidenceLedger: ledger });
+  storeInstance.data.projects.find(item => item.id === project.id).excludedAssetKeys = [paths.excluded];
+  metadataTestHooks.clearFileVisualProjectCache();
+
+  const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+  assert.ok(workspace, 'authoritative workspace');
+  const byName = new Map(workspace.pendingFiles.map(row => [row.name, row]));
+  const flagged = workspace.pendingFiles.filter(row => row.sourceSaveRequired === true).map(row => row.name).sort();
+  assert.deepEqual(flagged, ['save-reminder-doc.indd', 'save-reminder-link.png', 'save-reminder-spoofed.png'].sort());
+  assert.equal(byName.get('save-reminder-doc.indd').sourceSaveAppFamily, 'indesign');
+  assert.equal(byName.get('save-reminder-link.png').sourceSaveAppFamily, 'indesign');
+  assert.equal(byName.get('save-reminder-spoofed.png').sourceSaveAppFamily, 'illustrator', 'family comes from the fixed observer');
+  for (const name of ['save-reminder-photoshop.png', 'save-reminder-unknown.indd', 'save-reminder-stale.png',
+    'save-reminder-review.png', 'save-reminder-awaiting-parser.png', 'save-reminder-excluded.png', 'save-reminder-timeout.png']) {
+    const row = byName.get(name);
+    if (name === 'save-reminder-excluded.png' && !row) continue;
+    assert.ok(row, `${name} stays presented`);
+    assert.equal(Object.hasOwn(row, 'sourceSaveRequired'), false, `${name} must not request a save`);
+    assert.equal(Object.hasOwn(row, 'sourceSaveAppFamily'), false, `${name} must not name a save app`);
+  }
+  assertTextExcludes(JSON.stringify(workspace.pendingFiles), [desktop, TEST_HOME], 'save reminder presentation');
+  // Presentation only: nothing about the stored capture records changed.
+  const stored = await getProject(project.id);
+  assert.equal(stored.pendingFiles.find(row => row.path === paths.unsavedDoc).captureState, 'needs-save');
+  assert.equal(stored.pendingFiles.some(row => Object.hasOwn(row, 'sourceSaveRequired')), false);
+});
+
+test('InDesign unsaved live session requests a save until a trusted saved observation clears it', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'save-reminder-live.indd');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'save-reminder-live-linked.jpg');
+  fs.writeFileSync(sourcePath, 'indd bytes');
+  fs.writeFileSync(linkedPath, 'linked bytes');
+  let modified = 'true';
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) {
+      return { stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' };
+    }
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+      return {
+        stdout: [
+          `DOC\t${sourcePath}\t${path.basename(sourcePath)}\t${modified}\ttrue`,
+          `LINK\t${sourcePath}\t${path.basename(sourcePath)}\t${linkedPath}\t${modified}\ttrue`,
+        ].join('\n') + '\n',
+      };
+    }
+    return { stdout: '' };
+  });
+
+  const project = await createProject('Save reminder live InDesign');
+  await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const first = await callIpcRaw('projects:get-asset-workspace', project.id);
+  assert.deepEqual(first.pendingFiles.map(row => [row.name, row.sourceSaveRequired, row.sourceSaveAppFamily]).sort(), [
+    [path.basename(sourcePath), true, 'indesign'],
+    [path.basename(linkedPath), true, 'indesign'],
+  ].sort());
+
+  // Repeated identical watcher observations keep the same opaque identities.
+  await runTrackedIntervalCallbacks(1);
+  const repeated = await callIpcRaw('projects:get-asset-workspace', project.id);
+  assert.deepEqual(repeated.pendingFiles.map(row => row.visualIdentity).sort(), first.pendingFiles.map(row => row.visualIdentity).sort());
+  assert.ok(repeated.pendingFiles.every(row => row.sourceSaveRequired === true));
+
+  modified = 'false';
+  await runTrackedIntervalCallbacks(1);
+  await waitForProject(project.id, item => item.pendingFiles.length === 0, 5000);
+  const saved = await callIpcRaw('projects:get-asset-workspace', project.id);
+  assert.equal(saved.pendingFiles.some(row => row.sourceSaveRequired === true), false);
+  assert.deepEqual(saved.files.map(row => row.name).sort(), [path.basename(sourcePath), path.basename(linkedPath)].sort());
+});
+
 test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
   const first = await createProject('Single watcher A');
   const firstWatcher = watcherRecords[watcherRecords.length - 1];
