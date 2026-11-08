@@ -57,6 +57,10 @@ async function fixture({ status = 'watching' } = {}) {
   };
   const renderer = scope.loadRendererHelpers(dom.document, { crate: {
     getSettings: async () => ({}), getFigmaStatus: async () => ({}),
+    // Real watch/pause bridges: the Projects pill replaces state.projects from getProjects.
+    pauseProject: async id => { projects.find(item => item.id === id).status = 'paused'; },
+    startWatching: async id => { projects.find(item => item.id === id).status = 'watching'; },
+    getProjects: async () => clone(projects),
     getAssetWorkspace: async id => {
       if (failReads) throw new Error('synthetic workspace unavailable');
       if (nextRead) { const read = nextRead; nextRead = null; return read.promise; }
@@ -277,8 +281,50 @@ test('project switching, reopening a project, paused copy and stale overlapping 
   f.projects[1].status = 'paused';
   f.set('b', [rawRow('b', 'new-cover.jpg')], [needsSave('b', 'new-cover.jpg', 0, 'illustrator', 'Cover.ai')]);
   await f.refresh();
-  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in Illustrator, then resume watching so Crate can check them.');
-  assert.match(f.guidanceText(), /Crate checks saved files only while watching\./);
+  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in Illustrator. Resume watching so Crate can check the saved files.');
+  assert.equal(f.guidanceText(), 'Save your file to include this asset Unsaved changes in Cover.ai. Save your changes in Illustrator. Resume watching so Crate can check the saved files.');
+});
+
+test('a Projects watch/pause click never leaves stale status copy; fresh evidence restores it', async () => {
+  const f = await fixture();
+  const watchingCopy = 'Save your file to include this asset Save your changes in InDesign, then return to Crate so it can check them.';
+  const pausedCopy = 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.';
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.reminderText(), watchingCopy);
+  const toggle = async (expectVisible = true) => {
+    await f.renderer.switchTab('projects');
+    assert.equal(f.visible(), expectVisible, 'the notice is app-wide, so it shows on Projects');
+    f.el('project-rows').children[0].querySelector('.project-pill').click();
+    await tick();
+  };
+
+  await toggle();
+  assert.equal(f.evaluate('state.projects[0].status'), 'paused', 'the real click replaced project state');
+  assert.equal(f.visible(), false, 'a watching-only request never outlives the project state it described');
+  assert.equal(f.status(), '');
+  await f.renderer.switchTab('current-project');
+  assert.equal(f.visible(), true, 'still unsaved and never dismissed: restored despite the cooldown');
+  assert.equal(f.reminderText(), pausedCopy);
+  assert.equal(f.guidanceText(), 'Save your file to include this asset Unsaved changes in Brochure.indd. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+  assert.equal(/only while watching/.test(f.guidanceText()), false, 'packaging also checks saved files');
+  await tick();
+  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+
+  await toggle();
+  assert.equal(f.evaluate('state.projects[0].status'), 'watching');
+  assert.equal(f.visible(), false);
+  await f.renderer.switchTab('current-project');
+  assert.equal(f.reminderText(), watchingCopy);
+
+  // A dismissal survives a toggle; the guidance still follows the new status.
+  f.el('btn-needs-save-dismiss').click();
+  assert.equal(f.visible(), false);
+  await toggle(false);
+  assert.equal(f.evaluate('state.projects[0].status'), 'paused');
+  await f.renderer.switchTab('current-project');
+  assert.equal(f.visible(), false, 'a dismissed reminder stays dismissed');
+  assert.match(f.guidanceText(), /Resume watching so Crate can check the saved files\.$/);
 });
 
 test('modals defer it, account changes reset it, and Review opens Needs Review', async () => {

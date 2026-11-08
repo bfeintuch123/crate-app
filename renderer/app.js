@@ -951,6 +951,9 @@ function renderProjectRows() {
           state.projects = await getAccountCurrentProjects();
           if (isTabActive('projects')) renderProjects();
           if (state.selectedProjectId === project.id && isTabActive('current-project')) await renderFiles();
+          // No Current Project render re-checks the evidence now; the next one
+          // restores the reminder with copy for the new watching state.
+          else if (state.selectedProjectId === project.id) suspendNeedsSaveReminder(project.id);
         }, pillText);
       } catch (error) {
         logRendererError(`${action} failed`, error);
@@ -4057,14 +4060,15 @@ function getSourceSaveCopy(project, items) {
   const watching = project?.status === 'watching';
   const unsaved = files.length === 1 ? `Unsaved changes in ${files[0]}.`
     : files.length > 1 ? `Unsaved changes in ${files.length} files.` : 'Unsaved changes found.';
-  const check = watching
-    ? 'When Crate can check the saved file, it moves the assets it confirms out of Needs Review.'
-    : 'Crate checks saved files only while watching.';
+  if (!watching) {
+    // Packaging also checks saved files, so never claim checks happen only while watching.
+    const resume = `Save your changes in ${appPhrase}. Resume watching so Crate can check the saved files.`;
+    return { title, reminder: resume, guidance: `${unsaved} ${resume}` };
+  }
   return {
     title,
-    reminder: watching ? `Save your changes in ${appPhrase}, then return to Crate so it can check them.`
-      : `Save your changes in ${appPhrase}, then resume watching so Crate can check them.`,
-    guidance: `${unsaved} Save your changes in ${appPhrase}, then ${watching ? 'return to Crate' : 'resume watching'}. ${check}`,
+    reminder: `Save your changes in ${appPhrase}, then return to Crate so it can check them.`,
+    guidance: `${unsaved} Save your changes in ${appPhrase}, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.`,
   };
 }
 
