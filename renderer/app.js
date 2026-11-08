@@ -653,6 +653,7 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
   hideNeedsSaveReminder();
+  withdrawSourceSaveGuidance();
   assetReviewBatchProjection = null;
   reconcileCurrentAssetReviewBatchControls();
   workingSourceActions.clear();
@@ -948,7 +949,10 @@ function renderProjectRows() {
       try {
         await runRendererAction(`watch:${project.id}`, pill, busyLabel, async () => {
           await window.crate[action](project.id);
+          const selectedId = state.selectedProjectId;
+          const previous = state.projects.find(item => item.id === selectedId);
           state.projects = await getAccountCurrentProjects();
+          retireContradictedNeedsSave(selectedId, previous, selectedId === project.id);
           if (isTabActive('projects')) renderProjects();
           // Starting one project pauses any other, so the replaced list supersedes
           // the selected project whichever pill was clicked. Off Current Project
@@ -4095,6 +4099,7 @@ function clearNeedsSaveRecheck() {
 
 function resetNeedsSaveReminder() {
   hideNeedsSaveReminder();
+  withdrawSourceSaveGuidance();
   clearNeedsSaveRecheck();
   needsSaveReminder.projects.clear();
   needsSaveReminder.last = null;
@@ -4115,11 +4120,31 @@ function getNeedsSaveReminderEntry(projectId) {
 function suspendNeedsSaveReminder(projectId) {
   if (!projectId) return;
   // The save guidance shares this evidence; the next authoritative render redraws it.
-  if (state.selectedProjectId === projectId) $('#pending-save-guidance')?.classList.add('hidden');
+  if (state.selectedProjectId === projectId) withdrawSourceSaveGuidance();
   if (needsSaveReminder.visibleProjectId !== projectId) return;
   const entry = needsSaveReminder.projects.get(projectId);
   hideNeedsSaveReminder();
   if (entry) entry.suspended = true;
+}
+
+// Selection, account or evidence changes withdraw the note; a user dismissal of
+// the reminder does not, because the guidance it describes is still current.
+function withdrawSourceSaveGuidance() {
+  $('#pending-save-guidance')?.classList.add('hidden');
+}
+
+// After state.projects is replaced: a snapshot that already contradicts the
+// selected project's save request (its status changed, or its own update left
+// nothing unsaved) retires it before any read. Unchanged evidence keeps updating
+// in place, so scans neither flicker nor re-announce. Returns whether it changed.
+function retireContradictedNeedsSave(projectId, previous, ownUpdate) {
+  if (!projectId) return false;
+  const current = state.projects.find(item => item.id === projectId);
+  const statusChanged = previous?.status !== current?.status;
+  const unsaved = Array.isArray(current?.pendingFiles) &&
+    current.pendingFiles.some(row => getPendingCaptureState(row) === 'needs-save');
+  if (statusChanged || (ownUpdate && !unsaved)) suspendNeedsSaveReminder(projectId);
+  return statusChanged || ownUpdate;
 }
 
 function renderNeedsSaveReminder(project, items, announce) {
@@ -4167,6 +4192,7 @@ function resumeNeedsSaveReminder() {
   // same project and selection; evaluate that current projection.
   const items = workspace === last.workspace ? last.items
     : getSourceSaveItems(last.project, composePendingReviewFiles(last.project, workspace.pendingFiles));
+  renderSourceSaveGuidance(last.project, items);
   syncNeedsSaveReminder(last.project, items);
 }
 
@@ -6588,18 +6614,26 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
     refreshGeneration !== projectRefreshGeneration ||
     !projectListReadIsCurrent(projectListRead)
   ) return false;
-  if (state.selectedProjectId && projectIds.has(state.selectedProjectId)) {
+  const selectedId = state.selectedProjectId;
+  const previous = selectedId ? state.projects.find(item => item.id === selectedId) : null;
+  const nextProjects = Array.isArray(projects) ? projects : [];
+  // Another project's update can still change the selected one (starting a
+  // project pauses any other), so a status change counts as its own update.
+  const selectedChanged = !!selectedId && (projectIds.has(selectedId) ||
+    previous?.status !== nextProjects.find(item => item.id === selectedId)?.status);
+  if (selectedChanged) {
     // Retire both cached and in-flight workspace facts before rendering new
     // inventory. The next Current Project visit obtains a fresh projection.
     assetWorkspaceRequestId += 1;
     assetWorkspaceProjectSnapshot = null;
   }
-  state.projects = Array.isArray(projects) ? projects : [];
+  state.projects = nextProjects;
+  retireContradictedNeedsSave(selectedId, previous, !!selectedId && projectIds.has(selectedId));
   reconcileCurrentAssetReviewBatchControls();
   if (isTabActive('projects')) renderProjects();
-  if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
+  if (selectedChanged && isTabActive('current-project')) {
     renderFiles();
-  } else if (state.selectedProjectId && projectIds.has(state.selectedProjectId)) {
+  } else if (selectedChanged) {
     // No Current Project render will re-check the evidence now.
     suspendNeedsSaveReminder(state.selectedProjectId);
   }

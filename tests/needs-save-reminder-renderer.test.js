@@ -617,6 +617,93 @@ test('resume after a modal uses the current workspace even when it was replaced'
   assert.equal(f.visible(), true);
 });
 
+test('a clean replacement workspace behind a modal also withdraws the save guidance on resume', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.guidanceVisible(), true);
+  f.el('modal-upgrade').classList.remove('hidden');
+  f.evaluate("state.assetWorkspace = { projectId: 'a', files: [], pendingFiles: [] }");
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  assert.equal(f.visible(), false);
+  assert.equal(f.guidanceVisible(), false, 'guidance follows the same current evidence as the reminder');
+});
+
+test('project and account changes withdraw the previous save guidance before the next read', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.guidanceVisible(), true);
+  const held = f.deferRead();
+  f.evaluate("setSelectedProject('b')");
+  const pending = f.refresh();
+  assert.equal(f.guidanceVisible(), false, 'no guidance naming the previous project document');
+  held.resolve(clone(f.workspaces.get('b')));
+  await pending;
+
+  const g = await fixture();
+  g.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await g.refresh();
+  assert.equal(g.guidanceVisible(), true);
+  g.evaluate("acceptAccountSnapshot({revision:2,state:'signed_in',canUseWorkspace:true,identity:{id:'B'}})");
+  assert.equal(g.guidanceVisible(), false, 'an account change never keeps the previous account guidance');
+});
+
+test('a Current Project refresh that leaves no unsaved rows retires the reminder before the read returns', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.visible(), true);
+  const next = f.projects.map(project => ({ ...project }));
+  next[0].pendingFiles = [];
+  f.renderer.testNext = next;
+  const held = f.deferRead();
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+  assert.equal(f.visible(), false, 'the saved project no longer shows a save request');
+  assert.equal(f.guidanceVisible(), false);
+  assert.equal(f.status(), '');
+  held.resolve({ projectId: 'a', files: [], pendingFiles: [] });
+  await tick();
+  assert.equal(f.visible(), false);
+});
+
+test('another project refresh that changes the selected project status re-checks it on Current Project', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  assert.match(f.reminderText(), /then return to Crate/);
+  const next = f.projects.map(project => ({ ...project }));
+  next[0].status = 'paused';
+  next[1].status = 'watching';
+  f.renderer.testNext = next;
+  const held = f.deferRead();
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['b']), projectListReadEpoch)");
+  assert.equal(f.visible(), false, 'no watching copy for a project that is now paused');
+  assert.equal(f.status(), '');
+  held.resolve(clone(f.workspaces.get('a')));
+  await tick();
+  assert.equal(f.visible(), true, 'still unsaved: restored from the fresh read');
+  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+});
+
+test('an unchanged Current Project refresh during a scan updates the reminder in place without re-announcing', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  f.renderer.testNext = f.projects.map(project => ({ ...project }));
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+  assert.equal(f.visible(), true, 'no flicker for unchanged evidence');
+  await tick();
+  assert.equal(f.visible(), true);
+  assert.equal(f.status(), 'spoken', 'no repeat announcement');
+});
+
 test('a flagged row names the same document as the save guidance', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceName: 'Poster A.ai',
