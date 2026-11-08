@@ -18087,6 +18087,7 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
     generalReview: file('save-reminder-review.png'),
     savedLinkAwaitingParser: file('save-reminder-awaiting-parser.png'),
     excluded: file('save-reminder-excluded.png'),
+    photoshopModified: file('save-reminder-photoshop-modified.png'),
     timeoutRetained: file('save-reminder-timeout.png'),
   };
   for (const filePath of Object.values(paths)) fs.writeFileSync(filePath, 'synthetic save reminder bytes');
@@ -18106,6 +18107,8 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
     pending(paths.spoofedFamily, 'needs-save', trusted('illustrator-active-session', 'structured-app-link', true, { appFamily: 'photoshop' }), 'ai-linked'),
     // Photoshop link polling has no document-modified signal.
     pending(paths.photoshopLink, 'needs-save', { ...trusted('photoshop-live-script', 'structured-app-link', undefined, { appFamily: 'photoshop' }), documentModified: undefined }, 'ps-poll'),
+    // Even a modified bit on the Photoshop observer cannot name or prove an owning document.
+    pending(paths.photoshopModified, 'needs-save', trusted('photoshop-live-script', 'structured-app-link', true, { appFamily: 'photoshop' }), 'ps-poll'),
     pending(paths.unknownState, 'needs-save', trusted('indesign-live-applescript', 'structured-app-document', null, { appFamily: 'indesign' })),
     pending(paths.staleRow, 'needs-save', trusted('indesign-live-applescript', 'structured-app-link', true, { appFamily: 'indesign' }), 'indd-poll'),
     pending(paths.generalReview, 'pending', { ...trusted('indesign-live-applescript', 'structured-app-link', true), needsSave: false, captureRecommendation: 'pending' }, 'indd-poll'),
@@ -18145,7 +18148,7 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
   assert.equal(Object.hasOwn(byName.get('save-reminder-spoofed.png'), 'sourceSaveSourceName'), false,
     'no reminder document name without one from the qualifying observation');
   assert.equal(byName.get('save-reminder-doc.indd').sourceSaveSourceName, 'Brochure.indd', 'unsafe names are not used');
-  for (const name of ['save-reminder-photoshop.png', 'save-reminder-unknown.indd', 'save-reminder-stale.png',
+  for (const name of ['save-reminder-photoshop.png', 'save-reminder-photoshop-modified.png', 'save-reminder-unknown.indd', 'save-reminder-stale.png',
     'save-reminder-review.png', 'save-reminder-awaiting-parser.png', 'save-reminder-excluded.png', 'save-reminder-timeout.png']) {
     const row = byName.get(name);
     if (name === 'save-reminder-excluded.png' && !row) continue;

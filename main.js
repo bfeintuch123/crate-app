@@ -6194,14 +6194,15 @@ async function createRendererFilePresentation(project, file, membership = getWor
 // admission, verification or packaging. Only the newest trusted live-app
 // observation that the source document itself has unsaved changes qualifies.
 // A structured app link qualifies only when the same observation reports its
-// containing document as modified. Unknown, link-only (for example Photoshop
-// smart-object paths, which carry no owning document or saved state), broad,
-// timeout, unsupported, missing or general-review evidence never does. The app
-// family comes from the fixed observer and the document name, if any, from the
-// same qualifying observation (never from the row's first decoration).
+// containing document as modified. Only the Illustrator and InDesign observers
+// report per-document modified state. Photoshop's live script reports linked
+// smart-object paths with no owning document or saved state, so it is not an
+// eligible observer. Unknown, broad, timeout, unsupported, missing or
+// general-review evidence never qualifies. The app family comes from the fixed
+// observer and the document name, if any, from the same qualifying observation
+// (never from the row's first decoration).
 const SOURCE_SAVE_REMINDER_OBSERVER_APPS = new Map([
   [LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION, 'illustrator'],
-  [LIVE_APP_OBSERVER_METHODS.PHOTOSHOP_LIVE_SCRIPT, 'photoshop'],
   [LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT, 'indesign'],
 ]);
 const SOURCE_SAVE_REMINDER_STRENGTHS = new Set([

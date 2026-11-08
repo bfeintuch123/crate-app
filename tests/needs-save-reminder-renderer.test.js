@@ -45,6 +45,16 @@ async function fixture({ status = 'watching' } = {}) {
   const projects = ['a', 'b'].map(id => ({ id, name: `Project ${id}`, status, files: [], pendingFiles: [], excludedAssetKeys: [] }));
   const workspaces = new Map(projects.map(project => [project.id, { projectId: project.id, files: [], pendingFiles: [] }]));
   let nextRead = null, failReads = false;
+  const longTimers = [];
+  const timerOverrides = {
+    setTimeout: (fn, ms, ...args) => {
+      if (ms < 60_000) return setTimeout(fn, ms, ...args);
+      const timer = { fn, ms, cancelled: false };
+      longTimers.push(timer);
+      return timer;
+    },
+    clearTimeout: timer => (longTimers.includes(timer) ? (timer.cancelled = true) : clearTimeout(timer)),
+  };
   const renderer = scope.loadRendererHelpers(dom.document, { crate: {
     getSettings: async () => ({}), getFigmaStatus: async () => ({}),
     getAssetWorkspace: async id => {
@@ -52,7 +62,7 @@ async function fixture({ status = 'watching' } = {}) {
       if (nextRead) { const read = nextRead; nextRead = null; return read.promise; }
       return clone(workspaces.get(id));
     },
-  } }, { Date: FakeDate });
+  } }, { Date: FakeDate, ...timerOverrides });
   renderer.testProjects = projects;
   vm.runInContext("state.projects=testProjects; setSelectedProject('a'); accountStatus={revision:1,state:'signed_in',canUseWorkspace:true,identity:{id:'A'}};", renderer);
   renderer.setupEventListeners();
@@ -73,6 +83,8 @@ async function fixture({ status = 'watching' } = {}) {
     guidanceText: () => `${el('pending-save-guidance-title').textContent} ${el('pending-save-guidance-detail').textContent}`,
     status: () => el('needs-save-reminder-status').textContent,
     deferRead() { const read = deferred(); nextRead = read; return read; },
+    fireLongTimers() { for (const timer of longTimers.splice(0)) if (!timer.cancelled) timer.fn(); },
+    pendingLongTimers: () => longTimers.filter(timer => !timer.cancelled).length,
     failReads(value) { failReads = value; },
   };
 }
@@ -316,9 +328,9 @@ test('an item flagged during the cooldown still pops up once the cooldown ends',
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
   await f.refresh();
   assert.equal(f.visible(), false, 'quiet during the cooldown');
-  assert.notEqual(f.evaluate('needsSaveReminder.recheckTimer'), null, 'a re-check is scheduled for the end of the cooldown');
+  assert.equal(f.pendingLongTimers(), 1, 'a re-check is scheduled for the end of the cooldown');
   FakeDate.current += 2 * 60_000;
-  f.renderer.resumeNeedsSaveReminder();
+  f.fireLongTimers();
   assert.equal(f.visible(), true, 'the timer re-check shows it without a new watcher event');
   f.el('btn-needs-save-dismiss').click();
   // An ordinary refresh after the cooldown also shows an item left unseen.
@@ -397,4 +409,95 @@ test('Escape outside the reminder dismisses it except while typing or under a mo
   f.el('modal-upgrade').classList.add('hidden');
   assert.equal(escape(f.document.body).prevented, true);
   assert.equal(f.visible(), false);
+});
+
+
+test('an off-tab project refresh suspends a visible reminder until fresh authoritative data', async () => {
+  for (const stillUnsaved of [false, true]) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    assert.equal(f.visible(), true);
+    await f.renderer.switchTab('settings');
+    // The live poll confirms the save (or not) while Settings is open.
+    const next = f.projects.map(project => ({ ...project }));
+    f.renderer.testNext = next;
+    f.set('a', stillUnsaved ? [rawRow('a', 'hero.jpg')] : [], stillUnsaved ? [needsSave('a', 'hero.jpg', 0)] : []);
+    next[0].pendingFiles = f.projects[0].pendingFiles;
+    f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+    assert.equal(f.visible(), false, 'no save request outlives the data it was based on');
+    await f.renderer.switchTab('current-project');
+    assert.equal(f.visible(), stillUnsaved, stillUnsaved ? 'still unsaved: shown again' : 'saved: stays hidden');
+  }
+});
+
+test('an unavailable workspace read suspends the reminder without resolving or re-arming it', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  f.failReads(true);
+  await f.refresh();
+  assert.equal(f.visible(), false);
+  assert.equal(f.guidanceVisible(), false);
+  assert.equal(f.evaluate("needsSaveReminder.projects.get('a').seen.has('vis-a-hero.jpg')"), true, 'unavailable is not resolved');
+  f.failReads(false);
+  await f.refresh();
+  assert.equal(f.visible(), true, 'restored inside the cooldown because it was never dismissed');
+  // A dismissal survives an unavailable read.
+  f.el('btn-needs-save-dismiss').click();
+  f.failReads(true);
+  await f.refresh();
+  f.failReads(false);
+  FakeDate.current += 3 * 60_000;
+  await f.refresh();
+  assert.equal(f.visible(), false);
+});
+
+test('a modal opening during the announcement delay announces once it closes', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  f.el('modal-upgrade').classList.remove('hidden');
+  await tick();
+  assert.equal(f.status(), '', 'nothing announced into the inert region');
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  await tick();
+  assert.match(f.status(), /this asset/);
+});
+
+test('resume after a modal uses the current workspace even when it was replaced', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  f.el('modal-upgrade').classList.remove('hidden');
+  await f.refresh();
+  assert.equal(f.visible(), false);
+  // Another read swaps the workspace object for the same project and selection.
+  f.evaluate('state.assetWorkspace = JSON.parse(JSON.stringify(state.assetWorkspace))');
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  assert.equal(f.visible(), true);
+});
+
+test('a flagged row names the same document as the save guidance', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceName: 'Poster A.ai',
+    sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Draft B.ai' })]);
+  await f.refresh();
+  const reason = f.evaluate('getPendingFileReason(composePendingReviewFiles(state.projects[0], state.assetWorkspace.pendingFiles)[0])');
+  assert.equal(reason.includes('Draft B.ai'), true);
+  assert.equal(reason.includes('Poster A.ai'), false);
+  // Unflagged Needs Save rows keep their existing copy.
+  assert.equal(f.evaluate("getPendingFileReason({ captureState: 'needs-save', captureEvidence: { sourceName: 'Poster A.ai' } })"),
+    'Linked asset observed from Poster A.ai. Save to make package-ready.');
+});
+
+test('missing pending list nodes return no items instead of throwing', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  const saved = f.document.querySelector;
+  f.document.querySelector = selector => selector === '#pending-section' ? null : saved(selector);
+  let items;
+  try { items = f.evaluate('renderPendingFiles(state.projects[0], [])'); } finally { f.document.querySelector = saved; }
+  assert.ok(Array.isArray(items) && items.length === 0);
 });

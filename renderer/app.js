@@ -1866,6 +1866,7 @@ async function renderFiles(renderOptions = {}) {
   // Pending files (Tier 2)
   const sourceSaveItems = renderPendingFiles(project, assetWorkspace.pendingFiles);
   if (authoritative) syncNeedsSaveReminder(project, sourceSaveItems);
+  else suspendNeedsSaveReminder(project.id);
 
   // Persistent project asset workspace
   renderAssetWorkspace(project, {
@@ -3912,6 +3913,8 @@ function getPendingFileReason(file) {
   const appLabel = getPendingAppLabel(file);
 
   if (stateValue === 'needs-save') {
+    const unsavedSourceName = file?.sourceSaveRequired === true ? sanitizeRendererSourceName(file.sourceSaveSourceName) : null;
+    if (unsavedSourceName) return `Unsaved changes in ${unsavedSourceName}. Save to make package-ready.`;
     const safeSourceName = sanitizeRendererSourceName(evidence.sourceName);
     if (safeSourceName) return `Linked asset observed from ${safeSourceName}. Save to make package-ready.`;
     if (appLabel) return `Observed in ${appLabel}. Save to make package-ready.`;
@@ -3938,7 +3941,7 @@ function createFileRow(file) {
 function renderPendingFiles(project, presentedPendingFiles = null) {
   const section = $('#pending-section');
   const list = $('#pending-file-list');
-  if (!section || !list) return;
+  if (!section || !list) return [];
   setAssetReviewProject(project.id);
 
   const pending = composePendingReviewFiles(project, presentedPendingFiles);
@@ -4024,7 +4027,7 @@ const needsSaveReminder = {
   account: null, projects: new Map(), visibleProjectId: null,
   // Last authoritative input, so a modal close or cooldown end can re-check
   // without a new read. Bound to the exact workspace/project/selection objects.
-  last: null, recheckTimer: null, announcement: 0, message: '',
+  last: null, recheckTimer: null, announcement: 0, message: '', pendingAnnouncement: false,
 };
 
 function getSourceSaveItems(project, pending) {
@@ -4096,8 +4099,19 @@ function resetNeedsSaveReminder() {
 function getNeedsSaveReminderEntry(projectId) {
   if (needsSaveReminder.account !== accountWorkspaceEpoch) resetNeedsSaveReminder();
   let entry = needsSaveReminder.projects.get(projectId);
-  if (!entry) needsSaveReminder.projects.set(projectId, entry = { seen: new Set(), lastShownAt: null });
+  // suspended: shown, never dismissed, then hidden because its evidence became
+  // stale or unavailable. Fresh authoritative evidence restores or resolves it.
+  if (!entry) needsSaveReminder.projects.set(projectId, entry = { seen: new Set(), lastShownAt: null, suspended: false });
   return entry;
+}
+
+// The visible reminder must never outlive the authoritative data behind it.
+// Suspension is neither a dismissal nor a resolution.
+function suspendNeedsSaveReminder(projectId) {
+  if (!projectId || needsSaveReminder.visibleProjectId !== projectId) return;
+  const entry = needsSaveReminder.projects.get(projectId);
+  hideNeedsSaveReminder();
+  if (entry) entry.suspended = true;
 }
 
 function renderNeedsSaveReminder(project, items, announce) {
@@ -4114,21 +4128,29 @@ function renderNeedsSaveReminder(project, items, announce) {
   status.textContent = '';
   const generation = ++needsSaveReminder.announcement;
   const account = accountWorkspaceEpoch, selection = projectSelectionEpoch;
+  needsSaveReminder.pendingAnnouncement = false;
   setTimeout(() => {
-    if (generation === needsSaveReminder.announcement && needsSaveReminder.visibleProjectId === project.id &&
-        account === accountWorkspaceEpoch && selection === projectSelectionEpoch && !hasModalInteraction()) {
-      status.textContent = needsSaveReminder.message;
-    }
+    if (generation !== needsSaveReminder.announcement || needsSaveReminder.visibleProjectId !== project.id ||
+        account !== accountWorkspaceEpoch || selection !== projectSelectionEpoch) return;
+    // A modal made the notice inert first: announce once the app is usable again.
+    if (hasModalInteraction()) needsSaveReminder.pendingAnnouncement = true;
+    else status.textContent = needsSaveReminder.message;
   }, 50);
 }
 
 // Re-run the last authoritative evaluation only if nothing it was bound to changed.
 function resumeNeedsSaveReminder() {
   const last = needsSaveReminder.last;
+  const workspace = state.assetWorkspace;
   if (!last || last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
-      last.workspace !== state.assetWorkspace || state.selectedProjectId !== last.project.id ||
-      state.projects.find(item => item.id === last.project.id) !== last.project) return;
-  syncNeedsSaveReminder(last.project, last.items);
+      state.selectedProjectId !== last.project.id ||
+      state.projects.find(item => item.id === last.project.id) !== last.project ||
+      workspace?.projectId !== last.project.id || displayOnlyAssetWorkspaces.has(workspace)) return;
+  // Another authoritative read may have replaced the workspace object for the
+  // same project and selection; evaluate that current projection.
+  const items = workspace === last.workspace ? last.items
+    : getSourceSaveItems(last.project, composePendingReviewFiles(last.project, workspace.pendingFiles));
+  syncNeedsSaveReminder(last.project, items);
 }
 
 // Called only with an authoritative workspace for the selected project.
@@ -4146,6 +4168,7 @@ function syncNeedsSaveReminder(project, items) {
   // A saved, excluded or skipped item re-arms only if it later needs a save again.
   for (const key of [...entry.seen]) if (!keys.has(key)) entry.seen.delete(key);
   if (!keys.size) {
+    entry.suspended = false;
     hideNeedsSaveReminder();
     return;
   }
@@ -4155,7 +4178,17 @@ function syncNeedsSaveReminder(project, items) {
   const fresh = [...keys].filter(key => !entry.seen.has(key));
   if (needsSaveReminder.visibleProjectId === project.id) {
     fresh.forEach(key => entry.seen.add(key));
-    renderNeedsSaveReminder(project, items, fresh.length > 0);
+    renderNeedsSaveReminder(project, items, fresh.length > 0 || needsSaveReminder.pendingAnnouncement);
+    return;
+  }
+  const reminder = $('#needs-save-reminder');
+  if (entry.suspended && reminder) {
+    // Still unsaved and never dismissed: restore it (not a new pop-up for cooldown).
+    entry.suspended = false;
+    fresh.forEach(key => entry.seen.add(key));
+    needsSaveReminder.visibleProjectId = project.id;
+    reminder.classList.remove('hidden');
+    renderNeedsSaveReminder(project, items, true);
     return;
   }
   if (!fresh.length) return;
@@ -4168,7 +4201,6 @@ function syncNeedsSaveReminder(project, items) {
     }, entry.lastShownAt + NEEDS_SAVE_REMINDER_COOLDOWN_MS - now + 50);
     return;
   }
-  const reminder = $('#needs-save-reminder');
   if (!reminder) return;
   fresh.forEach(key => entry.seen.add(key));
   entry.lastShownAt = now;
@@ -4182,6 +4214,7 @@ function hideNeedsSaveReminder() {
   const status = $('#needs-save-reminder-status');
   needsSaveReminder.visibleProjectId = null;
   needsSaveReminder.announcement += 1;
+  needsSaveReminder.pendingAnnouncement = false;
   if (status) status.textContent = '';
   if (!reminder || reminder.classList.contains('hidden')) return;
   const hadFocus = reminder.contains(document.activeElement);
@@ -6548,6 +6581,9 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
   if (isTabActive('projects')) renderProjects();
   if (state.selectedProjectId && projectIds.has(state.selectedProjectId) && isTabActive('current-project')) {
     renderFiles();
+  } else if (state.selectedProjectId && projectIds.has(state.selectedProjectId)) {
+    // No Current Project render will re-check the evidence now.
+    suspendNeedsSaveReminder(state.selectedProjectId);
   }
   return true;
 }
