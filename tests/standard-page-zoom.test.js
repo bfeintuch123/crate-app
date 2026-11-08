@@ -204,13 +204,19 @@ test('main process installs the zoom-free menu before creating the main window',
 
   const readyStart = mainSource.indexOf('app.whenReady().then(async () => {');
   const readySource = mainSource.slice(readyStart);
-  const menuInstall = readySource.indexOf(
-    'Menu.setApplicationMenu(Menu.buildFromTemplate(buildStandardApplicationMenuTemplate()));',
+  const menuInstall = readySource.search(
+    /Menu\.setApplicationMenu\(\s*Menu\.buildFromTemplate\(\s*buildStandardApplicationMenuTemplate\(\)\s*\)\s*\)/,
   );
+  const firstStartupStep = readySource.indexOf('configureFigmaCredentialStorage()');
   const windowCreate = readySource.indexOf('createMainWindow();');
   assert.notEqual(readyStart, -1);
   assert.notEqual(menuInstall, -1, 'ready handler must install the standard application menu');
+  assert.notEqual(firstStartupStep, -1);
   assert.notEqual(windowCreate, -1);
+  assert.ok(
+    menuInstall < firstStartupStep,
+    'menu must be installed before other startup steps, so their failures cannot leave the default zoom items',
+  );
   assert.ok(menuInstall < windowCreate, 'menu must be installed before the main window is created');
 });
 

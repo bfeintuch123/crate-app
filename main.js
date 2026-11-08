@@ -24542,6 +24542,16 @@ app.whenReady().then(async () => {
     return;
   }
 
+  // Replace Electron's default menu so page zoom stays at 100%. Only the
+  // page zoom items are removed; Edit, Reload and the rest stay standard.
+  // Install it first and on its own, so a later startup failure cannot
+  // leave Electron's default zoom items in place.
+  try {
+    Menu.setApplicationMenu(Menu.buildFromTemplate(buildStandardApplicationMenuTemplate()));
+  } catch (e) {
+    console.error('[app-menu] failed to install application menu:', redactFigmaLogText(e && e.message));
+  }
+
   try {
     startupPhaseJournal.mark(
       configureFigmaCredentialStorage()
@@ -24561,14 +24571,6 @@ app.whenReady().then(async () => {
           click: () => app.quit()
         }
       ]));
-    }
-
-    // Replace Electron's default menu so page zoom stays at 100%. Only the
-    // page zoom items are removed; Edit, Reload and the rest stay standard.
-    try {
-      Menu.setApplicationMenu(Menu.buildFromTemplate(buildStandardApplicationMenuTemplate()));
-    } catch (e) {
-      console.error('[app-menu] failed to install application menu:', redactFigmaLogText(e && e.message));
     }
 
     scheduleMainWindowStartupRetries();
