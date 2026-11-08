@@ -954,17 +954,18 @@ function renderProjectRows() {
       const busyLabel = project.status === 'watching' ? 'Pausing…' : 'Starting…';
       try {
         await runRendererAction(`watch:${project.id}`, pill, busyLabel, async () => {
-          await window.crate[action](project.id);
+          // What the selected project showed before the click.
           const selectedId = state.selectedProjectId;
-          const previous = state.projects.find(item => item.id === selectedId);
+          const previous = { status: state.projects.find(item => item.id === selectedId)?.status };
+          await window.crate[action](project.id);
           state.projects = await getAccountCurrentProjects();
-          retireContradictedNeedsSave(selectedId, previous, selectedId === project.id);
+          // Starting one project pauses any other, so check the selected project
+          // whichever pill was clicked. Off Current Project nothing re-checks its
+          // evidence now: suspend only if it changed; the next render restores it.
+          const selectedChanged = retireContradictedNeedsSave(selectedId, previous, selectedId === project.id);
           if (isTabActive('projects')) renderProjects();
-          // Starting one project pauses any other, so the replaced list supersedes
-          // the selected project whichever pill was clicked. Off Current Project
-          // nothing re-checks its evidence now; the next render restores the reminder.
           if (state.selectedProjectId && isTabActive('current-project')) await renderFiles();
-          else if (state.selectedProjectId) suspendNeedsSaveReminder(state.selectedProjectId);
+          else if (selectedChanged) suspendNeedsSaveReminder(selectedId);
         }, pillText);
       } catch (error) {
         logRendererError(`${action} failed`, error);

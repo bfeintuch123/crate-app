@@ -352,6 +352,25 @@ test('starting another project from Projects suspends the selected project remin
   assert.equal(f.reminderText(), STABLE_PAUSED);
 });
 
+test('starting another project that leaves the selected project unchanged keeps its reminder steady', async () => {
+  const f = await fixture({ status: 'paused' });
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.reminderText(), STABLE_PAUSED);
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  await f.renderer.switchTab('projects');
+  f.el('project-rows').children[1].querySelector('.project-pill').click();
+  await tick();
+  assert.deepEqual(f.evaluate('state.projects.map(item => item.status)'), ['paused', 'watching'], 'a was already paused');
+  assert.equal(f.visible(), true, 'nothing about a changed, so its reminder stays');
+  assert.equal(f.status(), 'spoken');
+  await f.renderer.switchTab('current-project');
+  await tick();
+  assert.equal(f.visible(), true);
+  assert.equal(f.status(), 'spoken', 'no repeat announcement of unchanged text');
+});
+
 test('a pause finishing after returning to Current Project updates the announced copy once', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
