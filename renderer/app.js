@@ -4020,7 +4020,12 @@ function renderPendingFiles(project, presentedPendingFiles = null) {
 // timeouts, unsupported or missing files and general review never qualify.
 // Nothing here changes capture, verification, Retry or packaging.
 const NEEDS_SAVE_REMINDER_COOLDOWN_MS = 2 * 60 * 1000;
-const needsSaveReminder = { account: null, projects: new Map(), visibleProjectId: null };
+const needsSaveReminder = {
+  account: null, projects: new Map(), visibleProjectId: null,
+  // Last authoritative input, so a modal close or cooldown end can re-check
+  // without a new read. Bound to the exact workspace/project/selection objects.
+  last: null, recheckTimer: null, announcement: 0, message: '',
+};
 
 function getSourceSaveItems(project, pending) {
   const workspace = state.assetWorkspace;
@@ -4039,20 +4044,24 @@ function getSourceSaveCopy(project, items) {
   const apps = [...new Set(labels.filter(Boolean))];
   const appPhrase = labels.includes(null) || apps.length === 0 ? 'the app'
     : apps.length === 1 ? apps[0] : apps.length === 2 ? `${apps[0]} and ${apps[1]}` : 'each app';
-  const files = [...new Set(items.map(file => sanitizeRendererSourceName(file.sourceName)).filter(Boolean))];
-  const title = items.length === 1 ? 'Save your file to include this asset'
-    : `Save your ${files.length > 1 ? 'files' : 'file'} to include these assets`;
+  // Name a document only from the qualifying observation, and only when every
+  // item has one; otherwise stay generic rather than guess.
+  const names = items.map(file => sanitizeRendererSourceName(file.sourceSaveSourceName));
+  const files = names.includes(null) ? [] : [...new Set(names)];
+  const count = items.length === 1 ? 'this asset' : 'these assets';
+  const title = files.length === 1 ? `Save your file to include ${count}`
+    : files.length > 1 ? `Save your files to include ${count}` : `Save your changes to include ${count}`;
   const watching = project?.status === 'watching';
-  const nextStep = watching ? 'then return to Crate.' : 'then resume watching.';
   const unsaved = files.length === 1 ? `Unsaved changes in ${files[0]}.`
     : files.length > 1 ? `Unsaved changes in ${files.length} files.` : 'Unsaved changes found.';
   const check = watching
-    ? 'Crate checks the saved file and moves assets it can confirm out of Needs Review.'
+    ? 'When Crate can check the saved file, it moves the assets it confirms out of Needs Review.'
     : 'Crate checks saved files only while watching.';
   return {
     title,
-    reminder: `Save your changes in ${appPhrase}, ${nextStep}`,
-    guidance: `${unsaved} Save your changes in ${appPhrase}, ${nextStep} ${check}`,
+    reminder: watching ? `Save your changes in ${appPhrase}, then return to Crate so it can check them.`
+      : `Save your changes in ${appPhrase}, then resume watching so Crate can check them.`,
+    guidance: `${unsaved} Save your changes in ${appPhrase}, then ${watching ? 'return to Crate' : 'resume watching'}. ${check}`,
   };
 }
 
@@ -4071,9 +4080,16 @@ function renderSourceSaveGuidance(project, items) {
   guidance.classList.remove('hidden');
 }
 
+function clearNeedsSaveRecheck() {
+  if (needsSaveReminder.recheckTimer !== null) clearTimeout(needsSaveReminder.recheckTimer);
+  needsSaveReminder.recheckTimer = null;
+}
+
 function resetNeedsSaveReminder() {
   hideNeedsSaveReminder();
+  clearNeedsSaveRecheck();
   needsSaveReminder.projects.clear();
+  needsSaveReminder.last = null;
   needsSaveReminder.account = accountWorkspaceEpoch;
 }
 
@@ -4090,14 +4106,29 @@ function renderNeedsSaveReminder(project, items, announce) {
   const detail = $('#needs-save-reminder-detail');
   if (title) title.textContent = copy.title;
   if (detail) detail.textContent = copy.reminder;
+  // A pending announcement always speaks the latest copy.
+  needsSaveReminder.message = `${copy.title}. ${copy.reminder}`;
   const status = $('#needs-save-reminder-status');
   if (!status || !announce) return;
   // Clear first so an identical later message is announced again.
   status.textContent = '';
-  const message = `${copy.title}. ${copy.reminder}`;
+  const generation = ++needsSaveReminder.announcement;
+  const account = accountWorkspaceEpoch, selection = projectSelectionEpoch;
   setTimeout(() => {
-    if (needsSaveReminder.visibleProjectId === project.id) status.textContent = message;
+    if (generation === needsSaveReminder.announcement && needsSaveReminder.visibleProjectId === project.id &&
+        account === accountWorkspaceEpoch && selection === projectSelectionEpoch && !hasModalInteraction()) {
+      status.textContent = needsSaveReminder.message;
+    }
   }, 50);
+}
+
+// Re-run the last authoritative evaluation only if nothing it was bound to changed.
+function resumeNeedsSaveReminder() {
+  const last = needsSaveReminder.last;
+  if (!last || last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
+      last.workspace !== state.assetWorkspace || state.selectedProjectId !== last.project.id ||
+      state.projects.find(item => item.id === last.project.id) !== last.project) return;
+  syncNeedsSaveReminder(last.project, last.items);
 }
 
 // Called only with an authoritative workspace for the selected project.
@@ -4107,6 +4138,9 @@ function syncNeedsSaveReminder(project, items) {
     return;
   }
   const entry = getNeedsSaveReminderEntry(project.id);
+  clearNeedsSaveRecheck();
+  needsSaveReminder.last = { project, items, workspace: state.assetWorkspace,
+    account: accountWorkspaceEpoch, selection: projectSelectionEpoch };
   if (needsSaveReminder.visibleProjectId && needsSaveReminder.visibleProjectId !== project.id) hideNeedsSaveReminder();
   const keys = new Set(items.map(getFileVisualIdentity).filter(Boolean));
   // A saved, excluded or skipped item re-arms only if it later needs a save again.
@@ -4115,20 +4149,28 @@ function syncNeedsSaveReminder(project, items) {
     hideNeedsSaveReminder();
     return;
   }
+  // Behind a blocking modal the reminder is inert and unannounced: leave new
+  // items unseen; closing the modal re-runs this check.
+  if (hasModalInteraction()) return;
   const fresh = [...keys].filter(key => !entry.seen.has(key));
   if (needsSaveReminder.visibleProjectId === project.id) {
     fresh.forEach(key => entry.seen.add(key));
     renderNeedsSaveReminder(project, items, fresh.length > 0);
     return;
   }
-  // Defer behind modals so the announcement is not lost; the items stay unseen.
-  if (!fresh.length || hasModalInteraction()) return;
-  fresh.forEach(key => entry.seen.add(key));
+  if (!fresh.length) return;
   const now = Date.now();
-  // Review Assets guidance remains; the pop-up does not repeat within the cooldown.
-  if (entry.lastShownAt !== null && now - entry.lastShownAt < NEEDS_SAVE_REMINDER_COOLDOWN_MS) return;
+  if (entry.lastShownAt !== null && now - entry.lastShownAt < NEEDS_SAVE_REMINDER_COOLDOWN_MS) {
+    // Not repeated within the cooldown, but not consumed either: re-check when it ends.
+    needsSaveReminder.recheckTimer = setTimeout(() => {
+      needsSaveReminder.recheckTimer = null;
+      resumeNeedsSaveReminder();
+    }, entry.lastShownAt + NEEDS_SAVE_REMINDER_COOLDOWN_MS - now + 50);
+    return;
+  }
   const reminder = $('#needs-save-reminder');
   if (!reminder) return;
+  fresh.forEach(key => entry.seen.add(key));
   entry.lastShownAt = now;
   needsSaveReminder.visibleProjectId = project.id;
   reminder.classList.remove('hidden');
@@ -4139,6 +4181,7 @@ function hideNeedsSaveReminder() {
   const reminder = $('#needs-save-reminder');
   const status = $('#needs-save-reminder-status');
   needsSaveReminder.visibleProjectId = null;
+  needsSaveReminder.announcement += 1;
   if (status) status.textContent = '';
   if (!reminder || reminder.classList.contains('hidden')) return;
   const hadFocus = reminder.contains(document.activeElement);
@@ -4167,14 +4210,16 @@ async function reviewNeedsSaveAssets() {
 }
 
 function initializeNeedsSaveReminder() {
-  const reminder = $('#needs-save-reminder');
-  if (!reminder) return;
+  if (!$('#needs-save-reminder')) return;
   $('#btn-needs-save-review')?.addEventListener('click', () => { void reviewNeedsSaveAssets(); });
   $('#btn-needs-save-dismiss')?.addEventListener('click', hideNeedsSaveReminder);
-  reminder.addEventListener('keydown', event => {
-    if (event.key !== 'Escape') return;
+  // Non-modal notice: Escape dismisses it from anywhere in the app, except in a
+  // text field, an account panel, or while a modal owns the keyboard.
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || event.defaultPrevented || needsSaveReminder.visibleProjectId === null ||
+        hasModalInteraction()) return;
+    if (event.target?.closest?.('input, textarea, select, [contenteditable="true"], .account-panel, .account-welcome')) return;
     event.preventDefault();
-    event.stopPropagation?.();
     hideNeedsSaveReminder();
   });
 }
@@ -4491,6 +4536,8 @@ const PACKAGE_REVIEW_DIAGNOSTIC_PHASES = new Set([
 
 function setModalBackgroundState(blocked) {
   const shouldBlock = Boolean(blocked) || accountStatus.canUseWorkspace === false || getVisibleBlockingModalIds().length > 0;
+  // A save reminder deferred behind a modal resumes once the app is usable again.
+  if (!shouldBlock && needsSaveReminder.last) setTimeout(resumeNeedsSaveReminder, 0);
   for (const id of ['app-sidebar', 'app-main']) {
     const element = $(`#${id}`);
     if (!element) continue;

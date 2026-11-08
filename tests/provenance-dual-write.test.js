@@ -18122,6 +18122,12 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
   }
   // A newer clean observation supersedes the first decoration retained by the row.
   ledger.candidates[liveEvidenceKeyForTest(paths.staleRow)].latest.documentModified = false;
+  // The newest qualifying observation names the document to save; the row's first
+  // decoration may name a different, already saved document.
+  ledger.candidates[liveEvidenceKeyForTest(paths.unsavedLink)].latest.sourceName = 'Draft B.indd';
+  delete ledger.candidates[liveEvidenceKeyForTest(paths.spoofedFamily)].latest.sourceName;
+  ledger.candidates[liveEvidenceKeyForTest(paths.unsavedDoc)].latest.sourceName = '/private/Unsafe.indd';
+  ledger.candidates[liveEvidenceKeyForTest(paths.unsavedDoc)].latest.sourceDocumentName = 'Brochure.indd';
   await setProjectFiles(project.id, { pendingFiles: rows, liveEvidenceLedger: ledger });
   storeInstance.data.projects.find(item => item.id === project.id).excludedAssetKeys = [paths.excluded];
   metadataTestHooks.clearFileVisualProjectCache();
@@ -18134,6 +18140,11 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
   assert.equal(byName.get('save-reminder-doc.indd').sourceSaveAppFamily, 'indesign');
   assert.equal(byName.get('save-reminder-link.png').sourceSaveAppFamily, 'indesign');
   assert.equal(byName.get('save-reminder-spoofed.png').sourceSaveAppFamily, 'illustrator', 'family comes from the fixed observer');
+  assert.equal(byName.get('save-reminder-link.png').sourceSaveSourceName, 'Draft B.indd');
+  assert.equal(byName.get('save-reminder-link.png').sourceName, 'Synthetic Source.indd', 'row label is unchanged');
+  assert.equal(Object.hasOwn(byName.get('save-reminder-spoofed.png'), 'sourceSaveSourceName'), false,
+    'no reminder document name without one from the qualifying observation');
+  assert.equal(byName.get('save-reminder-doc.indd').sourceSaveSourceName, 'Brochure.indd', 'unsafe names are not used');
   for (const name of ['save-reminder-photoshop.png', 'save-reminder-unknown.indd', 'save-reminder-stale.png',
     'save-reminder-review.png', 'save-reminder-awaiting-parser.png', 'save-reminder-excluded.png', 'save-reminder-timeout.png']) {
     const row = byName.get(name);

@@ -6193,8 +6193,12 @@ async function createRendererFilePresentation(project, file, membership = getWor
 // Review Assets save reminder. Presentation-only: it never changes capture,
 // admission, verification or packaging. Only the newest trusted live-app
 // observation that the source document itself has unsaved changes qualifies.
-// Link-only, unknown, broad, timeout, unsupported, missing or general-review
-// evidence never does, and the app family comes from the fixed observer.
+// A structured app link qualifies only when the same observation reports its
+// containing document as modified. Unknown, link-only (for example Photoshop
+// smart-object paths, which carry no owning document or saved state), broad,
+// timeout, unsupported, missing or general-review evidence never does. The app
+// family comes from the fixed observer and the document name, if any, from the
+// same qualifying observation (never from the row's first decoration).
 const SOURCE_SAVE_REMINDER_OBSERVER_APPS = new Map([
   [LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION, 'illustrator'],
   [LIVE_APP_OBSERVER_METHODS.PHOTOSHOP_LIVE_SCRIPT, 'photoshop'],
@@ -6216,7 +6220,9 @@ function getPendingSourceSaveReminder(project, file) {
   if (!evidence || evidence.documentModified !== true || evidence.needsSave !== true ||
       !SOURCE_SAVE_REMINDER_STRENGTHS.has(evidence.evidenceStrength)) return null;
   const appFamily = SOURCE_SAVE_REMINDER_OBSERVER_APPS.get(evidence.observerMethod);
-  return appFamily ? { sourceSaveRequired: true, sourceSaveAppFamily: appFamily } : null;
+  if (!appFamily) return null;
+  const sourceName = sanitizeRendererSourceName(evidence.sourceName) || sanitizeRendererSourceName(evidence.sourceDocumentName);
+  return { sourceSaveRequired: true, sourceSaveAppFamily: appFamily, ...(sourceName ? { sourceSaveSourceName: sourceName } : {}) };
 }
 
 // Display-only order from committed, still-current owner decisions. This never

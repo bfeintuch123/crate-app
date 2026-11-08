@@ -28,7 +28,7 @@ function presented(projectId, name, sourceIndex, extra = {}) {
     excluded: false, visualIdentity: `vis-${projectId}-${name}`, visualRevision: `rev-${name}`, sourceIndex, ...extra };
 }
 const needsSave = (projectId, name, index, app = 'indesign', sourceName = 'Brochure.indd') =>
-  presented(projectId, name, index, { sourceSaveRequired: true, sourceSaveAppFamily: app, sourceName });
+  presented(projectId, name, index, { sourceSaveRequired: true, sourceSaveAppFamily: app, sourceName, sourceSaveSourceName: sourceName });
 
 class FakeDate extends Date {
   static current = 1_000_000;
@@ -82,11 +82,11 @@ test('genuine Needs Save shows one in-app reminder plus Review Assets guidance w
   f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'logo.png')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'logo.png', 1)]);
   await f.refresh();
   assert.equal(f.visible(), true);
-  assert.equal(f.reminderText(), 'Save your file to include these assets Save your changes in InDesign, then return to Crate.');
+  assert.equal(f.reminderText(), 'Save your file to include these assets Save your changes in InDesign, then return to Crate so it can check them.');
   assert.equal(f.guidanceVisible(), true);
-  assert.equal(f.guidanceText(), 'Save your file to include these assets Unsaved changes in Brochure.indd. Save your changes in InDesign, then return to Crate. Crate checks the saved file and moves assets it can confirm out of Needs Review.');
+  assert.equal(f.guidanceText(), 'Save your file to include these assets Unsaved changes in Brochure.indd. Save your changes in InDesign, then return to Crate. When Crate can check the saved file, it moves the assets it confirms out of Needs Review.');
   await tick();
-  assert.equal(f.status(), 'Save your file to include these assets. Save your changes in InDesign, then return to Crate.');
+  assert.equal(f.status(), 'Save your file to include these assets. Save your changes in InDesign, then return to Crate so it can check them.');
   assert.equal(f.el('needs-save-reminder').contains(f.document.activeElement), false, 'showing never moves focus');
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
   const markup = html.slice(html.indexOf('id="needs-save-reminder-status"') - 40, html.indexOf('id="btn-needs-save-dismiss"') + 120);
@@ -140,14 +140,20 @@ test('mixed states, multiple files and apps, and unknown app names stay accurate
     presented('a', 'review.png', 2),
   ]);
   await f.refresh();
-  assert.equal(f.reminderText(), 'Save your files to include these assets Save your changes in Illustrator and InDesign, then return to Crate.');
+  assert.equal(f.reminderText(), 'Save your files to include these assets Save your changes in Illustrator and InDesign, then return to Crate so it can check them.');
   assert.match(f.guidanceText(), /Unsaved changes in 2 files\./);
   const copy = items => f.renderer.getSourceSaveCopy(f.projects[0], items);
-  assert.equal(copy([{ sourceSaveAppFamily: 'mystery-app', sourceName: 'X.doc' }]).reminder, 'Save your changes in the app, then return to Crate.');
+  assert.equal(copy([{ sourceSaveAppFamily: 'mystery-app', sourceSaveSourceName: 'X.doc' }]).reminder, 'Save your changes in the app, then return to Crate so it can check them.');
   assert.equal(copy([{ sourceSaveAppFamily: 'illustrator' }, { sourceSaveAppFamily: 'indesign' }, { sourceSaveAppFamily: 'photoshop' }]).reminder,
-    'Save your changes in each app, then return to Crate.');
-  assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceName: 'Poster.ai' }]).title, 'Save your file to include this asset');
-  assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceName: '/private/Poster.ai' }]).guidance.includes('/private'), false);
+    'Save your changes in each app, then return to Crate so it can check them.');
+  assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Poster.ai' }]).title, 'Save your file to include this asset');
+  assert.equal(copy([{ sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: '/private/Poster.ai' }]).guidance.includes('/private'), false);
+  // Without a name from the qualifying observation, never fall back to the row's first source.
+  const unnamed = copy([{ sourceSaveAppFamily: 'illustrator', sourceName: 'Poster A.ai' }, { sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Poster B.ai' }]);
+  assert.equal(unnamed.guidance.includes('Poster A.ai'), false);
+  assert.equal(unnamed.guidance.includes('Poster B.ai'), false, 'one name cannot speak for an unnamed item');
+  assert.match(unnamed.guidance, /^Unsaved changes found\./);
+  assert.equal(unnamed.title, 'Save your changes to include these assets');
 });
 
 test('repeated refreshes do not repeat it; dismissal and Escape stick until a genuinely new change', async () => {
@@ -177,7 +183,7 @@ test('repeated refreshes do not repeat it; dismissal and Escape stick until a ge
   f.el('btn-needs-save-review').focus();
   assert.equal(f.el('needs-save-reminder').contains(f.document.activeElement), true);
   let prevented = false;
-  f.el('needs-save-reminder').dispatchEvent({ type: 'keydown', key: 'Escape', preventDefault: () => { prevented = true; }, stopPropagation: () => {} });
+  f.document.listeners.keydown({ type: 'keydown', key: 'Escape', target: f.document.activeElement, defaultPrevented: false, preventDefault: () => { prevented = true; } });
   assert.equal(prevented, true);
   assert.equal(f.visible(), false);
   assert.equal(f.el('needs-save-reminder').contains(f.document.activeElement), false);
@@ -259,7 +265,7 @@ test('project switching, reopening a project, paused copy and stale overlapping 
   f.projects[1].status = 'paused';
   f.set('b', [rawRow('b', 'new-cover.jpg')], [needsSave('b', 'new-cover.jpg', 0, 'illustrator', 'Cover.ai')]);
   await f.refresh();
-  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in Illustrator, then resume watching.');
+  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in Illustrator, then resume watching so Crate can check them.');
   assert.match(f.guidanceText(), /Crate checks saved files only while watching\./);
 });
 
@@ -286,4 +292,109 @@ test('modals defer it, account changes reset it, and Review opens Needs Review',
   assert.equal(f.evaluate('state.assetReviewFilter'), 'missing');
   assert.equal(f.evaluate('state.assetReviewOpen'), true);
   assert.equal(f.evaluate("isTabActive('current-project')"), true);
+});
+
+
+test('guidance names only the document from the qualifying observation', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceName: 'Poster A.ai',
+    sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Draft B.ai' })]);
+  await f.refresh();
+  assert.match(f.guidanceText(), /Unsaved changes in Draft B\.ai\./);
+  assert.equal(f.guidanceText().includes('Poster A.ai'), false);
+});
+
+test('an item flagged during the cooldown still pops up once the cooldown ends', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  f.el('btn-needs-save-dismiss').click();
+  // Saved, then flagged again inside the cooldown.
+  f.set('a', [], []);
+  await f.refresh();
+  FakeDate.current += 20_000;
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.visible(), false, 'quiet during the cooldown');
+  assert.notEqual(f.evaluate('needsSaveReminder.recheckTimer'), null, 'a re-check is scheduled for the end of the cooldown');
+  FakeDate.current += 2 * 60_000;
+  f.renderer.resumeNeedsSaveReminder();
+  assert.equal(f.visible(), true, 'the timer re-check shows it without a new watcher event');
+  f.el('btn-needs-save-dismiss').click();
+  // An ordinary refresh after the cooldown also shows an item left unseen.
+  f.set('a', [], []);
+  await f.refresh();
+  FakeDate.current += 10_000;
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.equal(f.visible(), false);
+  FakeDate.current += 3 * 60_000;
+  await f.refresh();
+  assert.equal(f.visible(), true);
+});
+
+test('closing a modal resumes a deferred reminder without another refresh', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  f.el('modal-upgrade').classList.remove('hidden');
+  await f.refresh();
+  assert.equal(f.visible(), false);
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  assert.equal(f.visible(), true);
+  await tick();
+  assert.match(f.status(), /this asset/);
+});
+
+test('items arriving behind a modal while the reminder is visible are announced after it closes', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  f.el('modal-upgrade').classList.remove('hidden');
+  f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'new.jpg')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'new.jpg', 1)]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.evaluate("needsSaveReminder.projects.get('a').seen.has('vis-a-new.jpg')"), false, 'not consumed while inert');
+  assert.match(f.status(), /this asset/, 'no announcement into the inert region');
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  await tick();
+  assert.match(f.status(), /these assets/);
+});
+
+test('a delayed announcement speaks the latest copy, not a superseded one', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'ai.png'), rawRow('a', 'indd.png')],
+    [needsSave('a', 'ai.png', 0, 'illustrator', 'Poster.ai'), needsSave('a', 'indd.png', 1, 'indesign', 'Brochure.indd')]);
+  await f.refresh();
+  f.set('a', [rawRow('a', 'indd.png')], [needsSave('a', 'indd.png', 1 - 1, 'indesign', 'Brochure.indd')]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign, then return to Crate so it can check them.');
+  f.el('btn-needs-save-dismiss').click();
+  await tick();
+  assert.equal(f.status(), '');
+});
+
+test('Escape outside the reminder dismisses it except while typing or under a modal', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  const escape = target => {
+    const event = { type: 'keydown', key: 'Escape', target, defaultPrevented: false, prevented: false };
+    event.preventDefault = () => { event.prevented = true; };
+    f.document.listeners.keydown(event);
+    return event;
+  };
+  const search = f.el('asset-review-search');
+  search.closest = selector => selector.includes('input') ? search : null;
+  assert.equal(escape(search).prevented, false);
+  assert.equal(f.visible(), true, 'Escape in a text field is left to that field');
+  f.el('modal-upgrade').classList.remove('hidden');
+  assert.equal(escape(f.document.body).prevented, false);
+  assert.equal(f.visible(), true, 'modals own Escape');
+  f.el('modal-upgrade').classList.add('hidden');
+  assert.equal(escape(f.document.body).prevented, true);
+  assert.equal(f.visible(), false);
 });
