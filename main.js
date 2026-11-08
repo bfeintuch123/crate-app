@@ -4297,13 +4297,13 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
     !getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(file))?.includedAsDependency)) return null;
   if (attempt && previous?.attempt !== attempt) return null;
   attempt ||= crypto.randomUUID();
-  const current = () => {
-    if (!parentCurrent()) return false;
-    const latest = getProjects().find(item => item.id === projectId);
+  // Same source row, selection revision and attempt as this reservation.
+  const ownsReceipt = latest => {
     const row = latest?.files?.find(item => getAssetBaselineSourceRecoveryRouteKey(latest, item) === key);
     return !!row && (!preparingExcluded || excludedPreparation(latest, row) === true) && getWorkingSourceSelection(latest, row).revision === selection.revision &&
       latest.workingSourceVerification?.[key]?.attempt === attempt;
   };
+  const current = () => parentCurrent() && ownsReceipt(getProjects().find(item => item.id === projectId));
   const reserved = mutateProject(projectId, latest => {
     if (!parentCurrent() || isWorkingSourceReceiptWriteBlocked(latest, file)) return false;
     latest.workingSourceVerification = { ...(latest.workingSourceVerification || {}), [key]: {
@@ -4317,7 +4317,7 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
   });
   if (!reserved) return null;
   if (hasWorkingSourceSelectionState(project)) invalidatePackageReviewForProject(projectId);
-  return { projectId, key, attempt, selectionRevision: selection.revision, file, current,
+  return { projectId, key, attempt, selectionRevision: selection.revision, file, current, ownsReceipt,
     previousReviewFacts: getDormantWorkingSourceReviewFacts(previous) };
 }
 
@@ -4393,6 +4393,61 @@ function failWorkingSourceScan(scan, operation, reason) {
   });
   if (changed) { invalidatePackageReviewForProject(scan.projectId); sendToRenderer('project:updated', { projectId: scan.projectId }); }
   return !!changed;
+}
+
+// A different source's legitimate admission can revise the Illustrator scope
+// after this scan reserved its receipt. The scan then drains without publishing,
+// and its receipt would stay "pending" forever. Retire only that exact owned
+// pending receipt as a non-success. Keep its references, unresolved and
+// embedded-output obligations and source fingerprint, so packaging stays blocked
+// until a genuine re-scan. ownerCurrent must prove everything except the scope
+// revision: account, status, generation, activation and lease.
+// Only once working-file selection is engaged, where the receipt is shown and
+// gates packaging. A dormant project's stale scan still writes nothing, as
+// before; a receipt it leaves pending is replaced only when that same file is
+// later excluded or scanned again.
+// Returns 'retired', 'not-retired', or 'uncertain' when the store is unreadable.
+function retireInterruptedWorkingSourceScan(scan, ownerCurrent) {
+  const reason = 'scan-interrupted';
+  const owned = project => {
+    const row = project?.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === scan.key);
+    return !!row && hasWorkingSourceSelectionState(project) && ownerCurrent() && scan.ownsReceipt(project) &&
+      project.workingSourceVerification[scan.key].status === 'pending' &&
+      getWorkingSourceSelection(project, row).state !== 'invalid' &&
+      !isWorkingSourceReceiptWriteBlocked(project, row) && !!getWorkingSourceVerification(project, row);
+  };
+  const retired = project => {
+    const record = project?.workingSourceVerification?.[scan.key];
+    return record?.attempt === scan.attempt && record.status === 'failed' && record.reason === reason;
+  };
+  const read = () => getProjects().find(item => item.id === scan.projectId);
+  const finish = () => {
+    invalidatePackageReviewForProject(scan.projectId);
+    sendToRenderer('project:updated', { projectId: scan.projectId });
+    return 'retired';
+  };
+  try { if (!owned(read())) return 'not-retired'; } catch (_) { return 'not-retired'; }
+  // A store setter can throw after committing. Read back before the one retry;
+  // the retry rechecks every guard inside the mutation.
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      return mutateProject(scan.projectId, project => {
+        if (!owned(project)) return false;
+        const record = project.workingSourceVerification[scan.key];
+        const next = { ...record, status: 'failed', reason,
+          unresolved: record.unresolved.length < 128 ? [...record.unresolved, { reason }] : record.unresolved };
+        delete next.pendingReviewFacts;
+        project.workingSourceVerification = { ...project.workingSourceVerification, [scan.key]: next };
+        return true;
+      }) ? finish() : 'not-retired';
+    } catch (_) {
+      let latest;
+      try { latest = read(); } catch (_) { return 'uncertain'; }
+      if (retired(latest)) return finish();
+      try { if (!owned(latest)) return 'not-retired'; } catch (_) { return 'not-retired'; }
+    }
+  }
+  return 'not-retired';
 }
 
 async function refreshWorkingSourceVerification(projectId) {
@@ -7103,6 +7158,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
                   current: () => operation.current() && scanLease.current(),
                   onCancel: scanLease.onCancel,
                   adoptScope: scope => operation.adoptScope(scope) && scanLease.current(),
+                  currentIgnoringScope: () => operation.currentIgnoringScope?.() === true,
                 },
                 { ...scanOptions, addFilesScanLease: scanLease, addFilesAttempt: scanLease }
               );
@@ -10625,6 +10681,9 @@ function captureProjectOperation(projectId) {
       return baseCurrent() && (activationToken === null ||
         illustratorActivationScopes.get(projectId)?.revision === scopeRevision);
     },
+    // Account, status, generation and activation only. Used solely to retire an
+    // owned pending receipt as a non-success; never to publish results.
+    currentIgnoringScope: baseCurrent,
     adoptScope(scope) {
       if (activationToken === null) return baseCurrent();
       if (!baseCurrent() || illustratorActivationScopes.get(projectId) !== scope ||
@@ -14447,6 +14506,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     refreshOperation = {
       ...capturedOperation,
       current: () => capturedOperation.current() && coordinatorCurrent(),
+      currentIgnoringScope: () => capturedOperation.currentIgnoringScope() && coordinatorCurrent(),
       adoptScope: scope => coordinatorCurrent() && capturedOperation.adoptScope(scope) && coordinatorCurrent(),
     };
     if (!refreshOperation.current()) return;
@@ -16881,7 +16941,8 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
     try {
       const outcome = await runBoundedAddFilesScan(lease => runScanOnOpen(projectId, filePath, activationToken,
         { activationToken, current: () => operation.current() && lease.current(), onCancel: lease.onCancel,
-          adoptScope: scope => operation.adoptScope(scope) && lease.current() },
+          adoptScope: scope => operation.adoptScope(scope) && lease.current(),
+          currentIgnoringScope: () => operation.currentIgnoringScope?.() === true },
         { ...options, workingSourceLease: lease, addFilesAttempt: path.extname(filePath).toLowerCase() === '.psd' &&
           hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId)) ? lease : undefined,
           addFilesScanLease: lease }),
@@ -17405,11 +17466,20 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
         await completeProjectAssetBaselineScan(baselineScan, dependableScanCompleted, isCurrent);
       }
     } finally {
+      const ownsLease = !!leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease;
       workingSourceScanOperations.delete(scanLifecycle);
-      if (leaseKey && workingSourceScanLeases.get(leaseKey) === scanLease) workingSourceScanLeases.delete(leaseKey);
+      if (ownsLease) workingSourceScanLeases.delete(leaseKey);
       if (workingScan?.current() && !dependableScanCompleted) publishWorkingSourceScan(workingScan, {
         status: 'failed', reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed',
         unresolved: [{ reason: ext === '.indd' ? scanFailureReason : 'ordinary-scan-failed' }] });
+      // Only the Illustrator scope moved: retire this scan's own pending receipt.
+      // A timed-out or replaced lease, or any other changed guard, keeps it as is.
+      else if (workingScan && ownsLease && retireInterruptedWorkingSourceScan(workingScan, () =>
+        (scanLease.state === 'active' || scanLease.reason === 'stale-project-operation') &&
+        isBoundWatchingActivationCurrent(projectId, activationToken) &&
+        operation?.currentIgnoringScope?.() === true) === 'uncertain') {
+        console.warn('[crate] scan-on-open: interrupted receipt retirement uncertain');
+      }
       if (ownsOperation) operation?.close();
     }
   }
@@ -18416,6 +18486,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
   );
   const initialWatcherOperation = {
     current: () => capturedInitialOperation.current() && coordinatorCurrent(),
+    currentIgnoringScope: () => capturedInitialOperation.currentIgnoringScope() && coordinatorCurrent(),
     adoptScope(scope) {
       if (!coordinatorCurrent()) return false;
       return capturedInitialOperation.adoptScope(scope) && coordinatorCurrent();
@@ -18728,6 +18799,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
         );
         const operation = {
           current: operationCurrent,
+          currentIgnoringScope: () => capturedOperation.currentIgnoringScope() && coordinatorCurrent() && watchEventCurrent(filePath),
           adoptScope(scope) {
             if (!coordinatorCurrent()) return false;
             return capturedOperation.adoptScope(scope) && coordinatorCurrent();
@@ -18896,6 +18968,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
       const scopedChild = captureProjectOperation(projectId);
       const childOperation = {
         current: () => isCurrent() && !!scopedChild?.current(),
+        currentIgnoringScope: () => isCurrent() && scopedChild?.currentIgnoringScope() === true,
         adoptScope: scope => isCurrent() && !!scopedChild?.adoptScope(scope),
       };
 
@@ -19458,6 +19531,9 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
     },
     current() {
       return !cancelled && baseOperation.current();
+    },
+    currentIgnoringScope() {
+      return !cancelled && baseOperation.currentIgnoringScope();
     },
     adoptScope(scope) {
       return !cancelled && baseOperation.adoptScope(scope);

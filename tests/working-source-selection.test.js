@@ -141,7 +141,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -1116,3 +1116,189 @@ test('S2 identity upgrades retain the original resolved pair and distinct replac
   assert.equal(Object.keys(f.project.workingSourceContinuations.pairs).length, 2);
   assert.equal(f.api.getWorkingSourceContinuationPresentation(f.project).candidates.length, 1);
 });
+
+// A scan whose Illustrator scope moved drains without publishing. These cases
+// exercise only the retirement of its own pending receipt, including store
+// setters that throw before or after committing (Conf-like fresh reads).
+function confLikeStore() {
+  let data = {};
+  const store = { sets: 0, beforeCommit: null, afterCommit: null, failReads: false,
+    get(key, fallback) {
+      if (store.failReads) throw new Error('synthetic-store-read-failed');
+      return structuredClone(Object.hasOwn(data, key) ? data[key] : fallback);
+    },
+    set(key, value) {
+      store.sets++;
+      const before = store.beforeCommit; store.beforeCommit = null; if (before) before();
+      data = { ...data, [key]: structuredClone(value) };
+      const after = store.afterCommit; store.afterCommit = null; if (after) after();
+    },
+    raw() { return data; } };
+  return store;
+}
+
+function retirementFixture(store = confLikeStore()) {
+  const f = fixture(), source = f.source('Interrupted.ai');
+  f.project.files.push(source);
+  f.project.workingSourceSelections = {};
+  const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, source);
+  f.project.workingSourceVerification = { [key]: { status: 'scanned', selectionRevision: 0, attempt: 'prior-attempt',
+    provider: 'ordinary-ai', coverage: 'ordinary-route', version: 1, reason: 'ordinary-scan-finished', inventoryStatus: 'unverified',
+    requiredReferences: [{ path: '/Users/synthetic/Linked.png' }], unresolved: [{ reason: 'declared-reference-unresolved' }],
+    sourceFingerprint: 'b'.repeat(64), sourceIdentity: { dev: 1, ino: 1, size: 15, mtimeMs: 0, ctimeMs: 0 },
+    requiredEmbeddedOutputs: [{ path: '/Users/synthetic/Embedded.png', sourceDigest: 'b'.repeat(64), outputDigest: 'c'.repeat(64) }] } };
+  f.useRealStore(store);
+  const prior = structuredClone(store.get('projects')[0].workingSourceVerification[key]);
+  const scan = f.api.beginWorkingSourceScan(f.project.id, source.path, () => true);
+  assert.ok(scan);
+  const record = () => store.get('projects')[0].workingSourceVerification[key];
+  assert.equal(record().status, 'pending');
+  return { ...f, store, scan, key, prior, record, pending: structuredClone(record()) };
+}
+
+function assertRetired(r) {
+  const record = r.record();
+  assert.equal(record.status, 'failed');
+  assert.equal(record.reason, 'scan-interrupted');
+  assert.equal(record.attempt, r.scan.attempt);
+  assert.deepEqual(record.requiredReferences, r.prior.requiredReferences);
+  assert.deepEqual(record.requiredEmbeddedOutputs, r.prior.requiredEmbeddedOutputs);
+  assert.deepEqual(record.unresolved, [...r.prior.unresolved, { reason: 'scan-interrupted' }]);
+  assert.equal(record.sourceFingerprint, r.prior.sourceFingerprint);
+  assert.deepEqual(record.sourceIdentity, r.prior.sourceIdentity);
+  assert.equal(Object.hasOwn(record, 'pendingReviewFacts'), false);
+  assert.ok(r.api.getWorkingSourceVerification(r.store.get('projects')[0], r.project.files[0]), 'retired receipt stays valid');
+}
+
+test('scope retirement helper exists', () => {
+  assert.equal(typeof fixture().api.retireInterruptedWorkingSourceScan, 'function');
+});
+
+test('scope retirement retires exactly its own pending receipt and keeps evidence', () => {
+  const r = retirementFixture();
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'retired');
+  assertRetired(r);
+  assert.ok(r.invalidated.includes(r.project.id));
+  assert.ok(r.events.some(event => event.event === 'project:updated'));
+});
+
+test('scope retirement refuses when the owner is no longer current, without writing', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => false), 'not-retired');
+  assert.deepEqual(r.record(), r.pending);
+  assert.equal(r.store.sets, sets);
+});
+
+test('scope retirement refuses a newer completed owner and an invalid selection', () => {
+  const r = retirementFixture();
+  const newer = { ...r.prior, attempt: 'completed-c' };
+  r.store.raw().projects[0].workingSourceVerification[r.key] = newer;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'not-retired');
+  assert.deepEqual(r.record(), newer);
+  const s = retirementFixture();
+  s.store.raw().projects[0].workingSourceSelections = [];
+  assert.equal(s.api.retireInterruptedWorkingSourceScan(s.scan, () => true), 'not-retired');
+  assert.deepEqual(s.record(), s.pending);
+});
+
+test('scope retirement: a throwing owner check returns without writing or escaping', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => { throw new Error('synthetic-owner-check'); }), 'not-retired');
+  assert.deepEqual(r.record(), r.pending);
+  assert.equal(r.store.sets, sets);
+  const s = retirementFixture();
+  let calls = 0;
+  s.store.beforeCommit = () => { throw new Error('synthetic-before-commit'); };
+  // Calls: initial check, failed write, then the readback check throws.
+  assert.equal(s.api.retireInterruptedWorkingSourceScan(s.scan, () => { if (++calls === 3) throw new Error('synthetic-owner-check'); return true; }), 'not-retired');
+  assert.deepEqual(s.record(), s.pending);
+});
+
+test('scope retirement leaves a dormant project untouched, as other stale scans do', () => {
+  const r = retirementFixture(), sets = r.store.sets, events = r.events.length;
+  delete r.store.raw().projects[0].workingSourceSelections;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'not-retired');
+  assert.deepEqual(r.record(), r.pending);
+  assert.equal(r.store.sets, sets);
+  assert.equal(r.events.slice(events).some(event => event.event === 'project:updated'), false);
+});
+
+test('scope retirement keeps a full unresolved list valid', () => {
+  const r = retirementFixture();
+  const full = Array.from({ length: 128 }, () => ({ reason: 'declared-reference-unresolved' }));
+  r.store.raw().projects[0].workingSourceVerification[r.key].unresolved = full;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'retired');
+  assert.deepEqual(r.record().unresolved, full);
+  assert.ok(r.api.getWorkingSourceVerification(r.store.get('projects')[0], r.project.files[0]));
+});
+
+test('scope retirement: a write that throws before committing is reread, rechecked and retried once', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  r.store.beforeCommit = () => { throw new Error('synthetic-before-commit'); };
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'retired');
+  assertRetired(r);
+  assert.equal(r.store.sets, sets + 2);
+});
+
+test('scope retirement: a write that commits then throws is confirmed by readback with no second write', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  r.store.afterCommit = () => { throw new Error('synthetic-after-commit'); };
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'retired');
+  assertRetired(r);
+  assert.equal(r.store.sets, sets + 1);
+});
+
+test('scope retirement: a newer owner seen at readback is never overwritten', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  const newer = { ...r.pending, attempt: 'newer-c' };
+  r.store.beforeCommit = () => { r.store.raw().projects[0].workingSourceVerification[r.key] = newer; throw new Error('synthetic-before-commit'); };
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'not-retired');
+  assert.deepEqual(r.record(), newer);
+  assert.equal(r.store.sets, sets + 1);
+});
+
+test('scope retirement: a replacement between readback and retry is refused inside the retry', () => {
+  const r = retirementFixture();
+  const newer = { ...r.pending, attempt: 'newer-c' };
+  let calls = 0;
+  r.store.beforeCommit = () => { throw new Error('synthetic-before-commit'); };
+  // Calls: initial check, failed write, readback check (replace here), retry.
+  const result = r.api.retireInterruptedWorkingSourceScan(r.scan, () => {
+    if (++calls === 3) r.store.raw().projects[0].workingSourceVerification[r.key] = newer;
+    return true;
+  });
+  assert.equal(calls, 4);
+  assert.equal(result, 'not-retired');
+  assert.deepEqual(r.record(), newer);
+});
+
+test('scope retirement: an unreadable store after a failed write reports uncertainty without another write', () => {
+  const r = retirementFixture(), sets = r.store.sets;
+  r.store.afterCommit = () => { r.store.failReads = true; throw new Error('synthetic-after-commit'); };
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'uncertain');
+  assert.equal(r.store.sets, sets + 1);
+  r.store.failReads = false;
+  assertRetired(r);
+});
+
+for (const mode of ['before-write', 'after-write']) {
+  test(`scope retirement with real Electron Store: ${mode}`, { skip: !electronStoreAvailable }, () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-retire-store-'));
+    try {
+      const store = createSyntheticElectronStore(tmp);
+      const r = retirementFixture(store);
+      const originalWrite = store._write;
+      let writes = 0;
+      store._write = function(value) {
+        writes++;
+        if (writes === 1 && mode === 'before-write') throw new Error('synthetic-before-write');
+        originalWrite.call(this, value);
+        if (writes === 1) throw new Error('synthetic-after-write');
+      };
+      assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'retired');
+      store._write = originalWrite;
+      assertRetired(r);
+      assert.equal(writes, mode === 'before-write' ? 2 : 1);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+}
