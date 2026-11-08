@@ -4403,8 +4403,9 @@ function failWorkingSourceScan(scan, operation, reason) {
 // until a genuine re-scan. ownerCurrent must prove everything except the scope
 // revision: account, status, generation, activation and lease.
 // Only once working-file selection is engaged, where the receipt is shown and
-// gates packaging. A dormant project's stale scan still writes nothing; engaging
-// selection already replaces a leftover pending receipt.
+// gates packaging. A dormant project's stale scan still writes nothing, as
+// before; a receipt it leaves pending is replaced only when that same file is
+// later excluded or scanned again.
 // Returns 'retired', 'not-retired', or 'uncertain' when the store is unreadable.
 function retireInterruptedWorkingSourceScan(scan, ownerCurrent) {
   const reason = 'scan-interrupted';

@@ -239,7 +239,7 @@ function scopeRetirementCases() {
           await change(f);
           snapshot = structuredClone(f.receipt());
         });
-        assert.deepEqual(f.receipt(), snapshot, `scan B wrote nothing after ${name} changed`);
+        assert.deepEqual(f.receipt(), snapshot, `scan B left its receipt unchanged after ${name} changed`);
         if (!['selection revision'].includes(name)) {
           assert.equal(f.receipt().status, 'pending', 'documented follow-up: this orphan stays pending in the strict scope-only fix');
           assert.equal(f.receipt().attempt, observed.attempt);
