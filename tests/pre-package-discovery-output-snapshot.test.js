@@ -17,12 +17,11 @@ source = once(source, '  captureProjectOperation,\n  runScanOnOpen',
 global.__discoveryInstrument = text => {
   const retirementMutant = process.env.CRATE_DISCOVERY_RETIREMENT_MUTANT;
   if (retirementMutant) {
-    const start = text.indexOf('  const collectLastUsedCandidates = async (folder, depth) => {');
-    const end = text.indexOf('\n  for (const dir of scanDirs)', start);
+    const start = text.indexOf('  const listCollectionFiles = async (rootFolder) => {');
+    const end = text.indexOf('\n  const recentLastUsedCandidates', start);
     assert.ok(start >= 0 && end > start, 'retirement mutant scope drift');
     const anchors = {
-      readdir: ["    if (!operationCurrent()) return;\n    entries.sort", '    entries.sort'],
-      child: ["        await collectLastUsedCandidates(fullPath, depth + 1);\n        if (!operationCurrent()) return;", '        await collectLastUsedCandidates(fullPath, depth + 1);'],
+      readdir: ["        if (!operationCurrent()) return null;\n        for (const node of batch) {", '        for (const node of batch) {'],
       yield: ["        await new Promise(resolve => setImmediate(resolve));\n        if (!operationCurrent()) return;", '        await new Promise(resolve => setImmediate(resolve));'],
     };
     assert.ok(Object.hasOwn(anchors, retirementMutant), 'unknown retirement mutant');
@@ -32,7 +31,7 @@ global.__discoveryInstrument = text => {
   }
   if (process.env.CRATE_DISCOVERY_NAIVE_CONTROL === '1') {
     const resets = /^ {8}outputPaths = null;\n/gm;
-    assert.equal([...text.matchAll(resets)].length, 2, 'naive-cache control anchor drift');
+    assert.equal([...text.matchAll(resets)].length, 1, 'naive-cache control anchor drift');
     text = text.replace(resets, '');
   }
   text = once(text, '  const lastUsedCandidates = [];', "  global.__discoveryMark('traversal');\n  const lastUsedCandidates = [];");
@@ -141,7 +140,10 @@ function cases() {
     try {
       const result = await callIpcRaw('projects:pre-package-scan', f.p.id);
       assert.equal(changed, true); assert.equal(result.error, undefined);
-      assert.equal(f.receipt().candidateCount, 1, 'the pre-await candidate remains counted; later siblings must use the refreshed policy');
+      // Directory reads all finish before any candidate is filtered, so no
+      // candidate is judged by the pre-await policy; the earlier sibling is now
+      // excluded too.
+      assert.equal(f.receipt().candidateCount, 0, 'every candidate must use the output policy refreshed after the nested directory await');
     } finally { fs.promises.readdir = readdir; await f.cleanup(); }
   });
   for (const mode of ['status', 'account']) discoveryTest(`traversal yield retains live ${mode} retirement`, async () => {
