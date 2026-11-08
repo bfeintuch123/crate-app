@@ -4402,12 +4402,15 @@ function failWorkingSourceScan(scan, operation, reason) {
 // embedded-output obligations and source fingerprint, so packaging stays blocked
 // until a genuine re-scan. ownerCurrent must prove everything except the scope
 // revision: account, status, generation, activation and lease.
+// Only once working-file selection is engaged, where the receipt is shown and
+// gates packaging. A dormant project's stale scan still writes nothing; engaging
+// selection already replaces a leftover pending receipt.
 // Returns 'retired', 'not-retired', or 'uncertain' when the store is unreadable.
 function retireInterruptedWorkingSourceScan(scan, ownerCurrent) {
   const reason = 'scan-interrupted';
   const owned = project => {
     const row = project?.files?.find(file => getAssetBaselineSourceRecoveryRouteKey(project, file) === scan.key);
-    return !!row && ownerCurrent() && scan.ownsReceipt(project) &&
+    return !!row && hasWorkingSourceSelectionState(project) && ownerCurrent() && scan.ownsReceipt(project) &&
       project.workingSourceVerification[scan.key].status === 'pending' &&
       getWorkingSourceSelection(project, row).state !== 'invalid' &&
       !isWorkingSourceReceiptWriteBlocked(project, row) && !!getWorkingSourceVerification(project, row);
@@ -14501,6 +14504,7 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     refreshOperation = {
       ...capturedOperation,
       current: () => capturedOperation.current() && coordinatorCurrent(),
+      currentIgnoringScope: () => capturedOperation.currentIgnoringScope() && coordinatorCurrent(),
       adoptScope: scope => coordinatorCurrent() && capturedOperation.adoptScope(scope) && coordinatorCurrent(),
     };
     if (!refreshOperation.current()) return;

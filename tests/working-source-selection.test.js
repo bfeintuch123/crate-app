@@ -1140,6 +1140,7 @@ function confLikeStore() {
 function retirementFixture(store = confLikeStore()) {
   const f = fixture(), source = f.source('Interrupted.ai');
   f.project.files.push(source);
+  f.project.workingSourceSelections = {};
   const key = f.api.getAssetBaselineSourceRecoveryRouteKey(f.project, source);
   f.project.workingSourceVerification = { [key]: { status: 'scanned', selectionRevision: 0, attempt: 'prior-attempt',
     provider: 'ordinary-ai', coverage: 'ordinary-route', version: 1, reason: 'ordinary-scan-finished', inventoryStatus: 'unverified',
@@ -1211,6 +1212,15 @@ test('scope retirement: a throwing owner check returns without writing or escapi
   // Calls: initial check, failed write, then the readback check throws.
   assert.equal(s.api.retireInterruptedWorkingSourceScan(s.scan, () => { if (++calls === 3) throw new Error('synthetic-owner-check'); return true; }), 'not-retired');
   assert.deepEqual(s.record(), s.pending);
+});
+
+test('scope retirement leaves a dormant project untouched, as other stale scans do', () => {
+  const r = retirementFixture(), sets = r.store.sets, events = r.events.length;
+  delete r.store.raw().projects[0].workingSourceSelections;
+  assert.equal(r.api.retireInterruptedWorkingSourceScan(r.scan, () => true), 'not-retired');
+  assert.deepEqual(r.record(), r.pending);
+  assert.equal(r.store.sets, sets);
+  assert.equal(r.events.slice(events).some(event => event.event === 'project:updated'), false);
 });
 
 test('scope retirement keeps a full unresolved list valid', () => {
