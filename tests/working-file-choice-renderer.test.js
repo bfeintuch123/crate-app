@@ -413,12 +413,12 @@ test('retained invalid evidence explains owner Exclude without offering futile R
 // Verification reasons are backend allowlist tokens. Copy must state only what
 // the receipt proves: no format/version claims and no destructive instruction.
 const VERIFICATION_COPY = [
-  ['working-file-verification-timed-out', 'Verification timed out before links could be checked. Try again.'],
+  ['working-file-verification-timed-out', 'Verification timed out. Try again.'],
   ['working-file-source-unavailable', 'Crate can’t find or read this file. Check that it’s available, then try again.'],
   ['working-file-verification-failed', 'Verification couldn’t finish. Try again.'],
   ['working-file-link-records-unrecognized', 'Some link records in this file weren’t recognized, so its links can’t be verified. Packaging stays blocked.'],
   ['working-file-link-records-unreadable', 'Some link records in this file couldn’t be read completely, so its links can’t be verified. Packaging stays blocked.'],
-  ['working-file-link-coverage-limit', 'This file has more link data than Crate can verify. Packaging stays blocked.'],
+  ['working-file-link-coverage-limit', 'This file reached a verification limit, so its links can’t be fully verified. Packaging stays blocked.'],
   ['working-file-source-changed', 'File changed. Verify again.'],
 ];
 for (const [reason, copy] of VERIFICATION_COPY) test(`picker ${reason} explains the verified reason, keeps Retry and blocks choices`, async () => {

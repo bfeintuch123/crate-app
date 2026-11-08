@@ -97,18 +97,23 @@ test('missing or unreadable source reports availability before any receipt fallb
   assert.equal(f.reason(failed), 'working-file-source-unavailable');
   assert.equal(f.reason(f.verified()), 'working-file-source-unavailable');
   assert.equal(f.reason(null), 'working-file-source-unavailable');
+  // A source-unavailable receipt for a file that stats now is not live proof
+  // that it is missing; its writer also covers other failed scans.
   const g = fixture();
   assert.equal(g.reason({ ...g.retried(g.verified()), status: 'failed', reason: 'source-unavailable',
-    unresolved: [{ reason: 'source-unavailable' }] }), 'working-file-source-unavailable');
+    unresolved: [{ reason: 'source-unavailable' }] }), 'working-file-verification-failed');
 });
 
-test('proven file changes say the file changed, including stale bytes under the same stat identity', () => {
+test('only a recorded identity mismatch says the file changed', () => {
   const f = fixture();
   const scanned = f.verified();
-  assert.equal(f.reason({ ...scanned, status: 'stale', reason: 'source-bytes-changed' }), 'working-file-source-changed');
-  assert.equal(f.reason({ ...f.retried(scanned), status: 'failed', reason: 'source-bytes-changed' }), 'working-file-source-changed');
+  // Refresh and scan routes also write these labels after digest read errors.
+  assert.equal(f.reason({ ...scanned, status: 'stale', reason: 'source-bytes-changed' }), 'saved-file-verification-required');
+  assert.equal(f.reason({ ...f.retried(scanned), status: 'failed', reason: 'source-bytes-changed' }), 'working-file-verification-failed');
+  assert.equal(f.reason({ ...scanned, status: 'failed', reason: 'source-bytes-changed' }), 'working-file-verification-failed');
   f.disk.get(f.source.path).size = 8192;
   assert.equal(f.reason(scanned), 'working-file-source-changed', 'recorded identity no longer matches');
+  assert.equal(f.reason({ ...scanned, status: 'stale', reason: 'source-bytes-changed' }), 'working-file-source-changed');
   assert.equal(f.reason({ ...scanned, status: 'failed', reason: 'ordinary-scan-failed' }), 'working-file-source-changed');
 });
 
@@ -123,6 +128,10 @@ test('format findings name only what was observed and keep precedence', () => {
   assert.equal(f.reason(withIssues('coverage-limit')), 'working-file-link-coverage-limit');
   assert.equal(f.reason(withIssues('unresolved-external')), 'working-file-dependencies-unverified');
   assert.equal(f.reason(withIssues('wire-parsed-record-disagreement')), 'working-file-dependencies-unverified');
+  // Worker catch-alls stay generic; they are not promoted to a format claim.
+  assert.equal(f.reason(withIssues('unsupported-or-malformed-framing')), 'working-file-dependencies-unverified');
+  assert.equal(f.reason(withIssues('wire-coverage-not-examined')), 'working-file-dependencies-unverified');
+  assert.equal(f.reason({ ...withIssues('unsupported-link-form'), status: 'stale' }), 'saved-file-verification-required');
   // Findings bound to other bytes are not reported as this file's format.
   const unbound = { ...withIssues('unsupported-link-form'), status: 'incomplete', sourceIdentity: null };
   assert.equal(f.reason(unbound), 'saved-file-verification-required');

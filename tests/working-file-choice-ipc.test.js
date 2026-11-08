@@ -1445,9 +1445,11 @@ function cases() {
     const timer=global.setTimeout, pause=ms=>new Promise(resolve=>timer(resolve,ms));
     // The established harness scales only the production 30 s scan deadline.
     global.setTimeout=(callback,delay,...args)=>timer(callback,delay===30000?250:delay,...args);
-    let held=true,release=()=>{},gate=null;
+    let held=true,release=()=>{},gate=null,inflight=0;
     const hold=()=>{held=true;gate=new Promise(resolve=>{release=resolve;});};
-    const unpause=metadataTestHooks.pausePsdExtraction(async()=>{if(held)await gate;});
+    const unpause=metadataTestHooks.pausePsdExtraction(async()=>{if(!held)return;inflight++;try{await gate;}finally{inflight--;}});
+    // Barrier: every held extraction has resumed, then its retired scan drains.
+    const drain=async()=>{held=false;release();while(inflight)await pause(5);await pause(50);};
     hold();
     try {
       const b=await f.add('B.psd');
@@ -1457,7 +1459,7 @@ function cases() {
       let current=await card();
       assert.equal(receipt().status,'failed');assert.equal(receipt().reason,'scan-timeout');
       assert.equal(current.ready,false);assert.equal(current.reason,'working-file-verification-timed-out');
-      held=false;release();await pause(100);
+      await drain();
       assert.equal(receipt().status,'failed','timed-out scan cannot publish late');
       assert.equal((await card()).reason,'working-file-verification-timed-out');
       // Normal verification is unaffected once the scan can finish.
@@ -1487,7 +1489,7 @@ function cases() {
         assert.equal((await f.resolve(current,'keep-both')).success,false,'choices stay disabled');
         assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
       }
-      held=false;release();await pause(100);
+      await drain();
       assert.equal(receipt().reason,'add_files_scan_timeout','stale attempts cannot overwrite the current receipt');
       assert.equal((await f.resolve(await card(),'retry')).success,true);
       current=await card();assert.equal(current.ready,true);assert.equal(current.reason,null);

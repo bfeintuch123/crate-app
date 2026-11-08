@@ -4836,13 +4836,13 @@ function getWorkingFileVerificationGuidance(reason, project) {
     case 'working-source-recovery-unsupported': return { text: 'Retained source evidence cannot be resolved by Retry. Contact Crate support before packaging. The evidence is preserved.', action: null };
     case 'working-source-recovery-identity-changed': return { text: 'This source changed after recovery began. Do not replace or remove its retained evidence. Contact Crate support to review the original source.', action: null };
     case 'working-file-source-changed': return { text: 'File changed. Verify again.', action: 'Retry verification' };
-    case 'working-file-verification-timed-out': return { text: 'Verification timed out before links could be checked. Try again.', action: 'Retry verification' };
+    case 'working-file-verification-timed-out': return { text: 'Verification timed out. Try again.', action: 'Retry verification' };
     case 'working-file-source-unavailable': return { text: 'Crate can’t find or read this file. Check that it’s available, then try again.', action: 'Retry verification' };
     case 'working-file-verification-failed': return { text: 'Verification couldn’t finish. Try again.', action: 'Retry verification' };
     // Format findings describe some records only and may persist across Retry.
     case 'working-file-link-records-unrecognized': return { text: 'Some link records in this file weren’t recognized, so its links can’t be verified. Packaging stays blocked.', action: 'Retry verification' };
     case 'working-file-link-records-unreadable': return { text: 'Some link records in this file couldn’t be read completely, so its links can’t be verified. Packaging stays blocked.', action: 'Retry verification' };
-    case 'working-file-link-coverage-limit': return { text: 'This file has more link data than Crate can verify. Packaging stays blocked.', action: 'Retry verification' };
+    case 'working-file-link-coverage-limit': return { text: 'This file reached a verification limit, so its links can’t be fully verified. Packaging stays blocked.', action: 'Retry verification' };
     case 'working-file-dependencies-unverified': return { text: 'Linked assets unverified. Check availability, then retry.', action: 'Retry verification' };
     case 'working-file-verification-pending': return { text: 'Verification pending. Wait or retry.', action: 'Retry verification' };
     default: return { text: 'Saved file and links unverified. Check availability, then retry.', action: 'Retry verification' };

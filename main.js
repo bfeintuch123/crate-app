@@ -4773,11 +4773,11 @@ function getWorkingFileVerificationReason(project, source, receipt) {
     if (!getWorkingSourceDiskIdentity(source)) return 'working-file-source-unavailable';
     if (!receipt) return 'saved-file-verification-required';
     if (receipt.status === 'failed' && WORKING_FILE_VERIFICATION_TIMEOUT_REASONS.has(receipt.reason)) return 'working-file-verification-timed-out';
-    if (receipt.status === 'failed' && receipt.reason === 'source-unavailable') return 'working-file-source-unavailable';
-    if (receipt.status === 'stale' || receipt.reason === 'source-bytes-changed' ||
-        (receipt.sourceIdentity && !isWorkingSourceDiskIdentityCurrent(source, receipt))) return 'working-file-source-changed';
+    // Only a recorded identity that differs proves a change. Stale and
+    // source-bytes-changed labels are also written for digest read failures.
+    if (receipt.sourceIdentity && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
     if (receipt.status === 'failed') return 'working-file-verification-failed';
-    if (!isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'saved-file-verification-required';
+    if (receipt.status === 'stale' || !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'saved-file-verification-required';
     // Receipts keep only bounded reason codes, never the record version. These
     // name what was observed; they do not claim the whole file is unsupported.
     const unresolved = new Set(receipt.unresolved.map(item => item.reason));
