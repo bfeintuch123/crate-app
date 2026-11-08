@@ -950,10 +950,11 @@ function renderProjectRows() {
           await window.crate[action](project.id);
           state.projects = await getAccountCurrentProjects();
           if (isTabActive('projects')) renderProjects();
-          if (state.selectedProjectId === project.id && isTabActive('current-project')) await renderFiles();
-          // No Current Project render re-checks the evidence now; the next one
-          // restores the reminder with copy for the new watching state.
-          else if (state.selectedProjectId === project.id) suspendNeedsSaveReminder(project.id);
+          // Starting one project pauses any other, so the replaced list supersedes
+          // the selected project whichever pill was clicked. Off Current Project
+          // nothing re-checks its evidence now; the next render restores the reminder.
+          if (state.selectedProjectId && isTabActive('current-project')) await renderFiles();
+          else if (state.selectedProjectId) suspendNeedsSaveReminder(state.selectedProjectId);
         }, pillText);
       } catch (error) {
         logRendererError(`${action} failed`, error);
@@ -4124,10 +4125,13 @@ function renderNeedsSaveReminder(project, items, announce) {
   const detail = $('#needs-save-reminder-detail');
   if (title) title.textContent = copy.title;
   if (detail) detail.textContent = copy.reminder;
-  // A pending announcement always speaks the latest copy.
-  needsSaveReminder.message = `${copy.title}. ${copy.reminder}`;
+  // A pending announcement always speaks the latest copy, and changed copy
+  // (such as a new watching state) replaces what the live region last said.
+  const message = `${copy.title}. ${copy.reminder}`;
+  const changed = message !== needsSaveReminder.message;
+  needsSaveReminder.message = message;
   const status = $('#needs-save-reminder-status');
-  if (!status || !announce) return;
+  if (!status || !(announce || changed)) return;
   // Clear first so an identical later message is announced again.
   status.textContent = '';
   const generation = ++needsSaveReminder.announcement;
@@ -4224,8 +4228,9 @@ function hideNeedsSaveReminder() {
   const hadFocus = reminder.contains(document.activeElement);
   reminder.classList.add('hidden');
   if (!hadFocus) return;
-  const fallback = [$('#btn-review-assets'), document.querySelector('.app-tab[data-tab="current-project"]')]
-    .find(accountFocusAvailable);
+  // Review Assets is only rendered while Project Workspace is the active tab.
+  const fallback = [isTabActive('current-project') && $('#btn-review-assets'),
+    document.querySelector('.app-tab[data-tab="current-project"]')].find(accountFocusAvailable);
   if (fallback) fallback.focus();
   else document.activeElement?.blur?.();
 }

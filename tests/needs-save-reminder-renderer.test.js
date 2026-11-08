@@ -44,7 +44,7 @@ async function fixture({ status = 'watching' } = {}) {
   for (const id of ['needs-save-reminder', 'pending-save-guidance']) node(id).classList.add('hidden');
   const projects = ['a', 'b'].map(id => ({ id, name: `Project ${id}`, status, files: [], pendingFiles: [], excludedAssetKeys: [] }));
   const workspaces = new Map(projects.map(project => [project.id, { projectId: project.id, files: [], pendingFiles: [] }]));
-  let nextRead = null, failReads = false;
+  let nextRead = null, failReads = false, pauseGate = null;
   const longTimers = [];
   const timerOverrides = {
     setTimeout: (fn, ms, ...args) => {
@@ -58,8 +58,14 @@ async function fixture({ status = 'watching' } = {}) {
   const renderer = scope.loadRendererHelpers(dom.document, { crate: {
     getSettings: async () => ({}), getFigmaStatus: async () => ({}),
     // Real watch/pause bridges: the Projects pill replaces state.projects from getProjects.
-    pauseProject: async id => { projects.find(item => item.id === id).status = 'paused'; },
-    startWatching: async id => { projects.find(item => item.id === id).status = 'watching'; },
+    pauseProject: async id => {
+      if (pauseGate) await pauseGate.promise;
+      projects.find(item => item.id === id).status = 'paused';
+    },
+    // Mirrors main's activateSingleWatchingProject: starting one pauses any other.
+    startWatching: async id => {
+      for (const item of projects) item.status = item.id === id ? 'watching' : item.status === 'watching' ? 'paused' : item.status;
+    },
     getProjects: async () => clone(projects),
     getAssetWorkspace: async id => {
       if (failReads) throw new Error('synthetic workspace unavailable');
@@ -87,6 +93,7 @@ async function fixture({ status = 'watching' } = {}) {
     guidanceText: () => `${el('pending-save-guidance-title').textContent} ${el('pending-save-guidance-detail').textContent}`,
     status: () => el('needs-save-reminder-status').textContent,
     deferRead() { const read = deferred(); nextRead = read; return read; },
+    gatePause() { pauseGate = deferred(); return pauseGate; },
     fireLongTimers() { for (const timer of longTimers.splice(0)) if (!timer.cancelled) timer.fn(); },
     pendingLongTimers: () => longTimers.filter(timer => !timer.cancelled).length,
     failReads(value) { failReads = value; },
@@ -325,6 +332,61 @@ test('a Projects watch/pause click never leaves stale status copy; fresh evidenc
   await f.renderer.switchTab('current-project');
   assert.equal(f.visible(), false, 'a dismissed reminder stays dismissed');
   assert.match(f.guidanceText(), /Resume watching so Crate can check the saved files\.$/);
+});
+
+test('starting another project from Projects suspends the selected project reminder it paused', async () => {
+  const f = await fixture();
+  f.projects[1].status = 'paused';
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  assert.match(f.reminderText(), /then return to Crate/);
+  await f.renderer.switchTab('projects');
+  f.el('project-rows').children[1].querySelector('.project-pill').click();
+  await tick();
+  assert.deepEqual(f.evaluate('state.projects.map(item => item.status)'), ['paused', 'watching'], 'starting b paused the selected project a');
+  assert.equal(f.visible(), false, 'the selected project reminder never keeps copy for a superseded status');
+  assert.equal(f.status(), '');
+  await f.renderer.switchTab('current-project');
+  assert.equal(f.visible(), true);
+  assert.equal(f.reminderText(), 'Save your file to include this asset Save your changes in InDesign. Resume watching so Crate can check the saved files.');
+});
+
+test('a pause finishing after returning to Current Project updates the announced copy once', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  assert.equal(f.status(), 'Save your file to include this asset. Save your changes in InDesign, then return to Crate so it can check them.');
+  const gate = f.gatePause();
+  await f.renderer.switchTab('projects');
+  f.el('project-rows').children[0].querySelector('.project-pill').click();
+  await f.renderer.switchTab('current-project');
+  gate.resolve();
+  await tick();
+  assert.equal(f.evaluate('state.projects[0].status'), 'paused');
+  const paused = 'Save your file to include this asset. Save your changes in InDesign. Resume watching so Crate can check the saved files.';
+  assert.equal(f.reminderText(), paused.replace('asset. Save', 'asset Save'));
+  assert.equal(f.status(), paused, 'the live region never keeps superseded copy');
+  // An identical refresh does not re-announce.
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  await f.refresh();
+  await tick();
+  assert.equal(f.status(), 'spoken');
+});
+
+test('dismissing from another tab never moves focus to a control in the hidden workspace', async () => {
+  for (const how of ['button', 'escape']) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    await f.renderer.switchTab('settings');
+    assert.equal(f.visible(), true);
+    f.el('btn-needs-save-dismiss').focus();
+    if (how === 'button') f.el('btn-needs-save-dismiss').click();
+    else f.document.listeners.keydown({ type: 'keydown', key: 'Escape', target: f.document.activeElement, defaultPrevented: false, preventDefault() {} });
+    assert.equal(f.visible(), false, how);
+    assert.notEqual(f.document.activeElement, f.el('btn-review-assets'), `${how}: Review Assets is not rendered on Settings`);
+  }
 });
 
 test('modals defer it, account changes reset it, and Review opens Needs Review', async () => {
