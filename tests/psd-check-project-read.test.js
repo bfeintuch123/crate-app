@@ -329,7 +329,7 @@ function checkReadCases() {
 
   // Watcher events for new or moved files arrive on their own turns, between
   // checks. A newly added design file is admitted exactly as before.
-  withProbe('detection: a new design file and a moved link reported by the watcher during a scan', {}, async probe => {
+  withProbe('detection: a new design file and a moved link image reported by the watcher during a scan', {}, async probe => {
     const added = await addPsdProject(probe, { links: 10 });
     await settleBaseline(added.project.id);
     const project = stored(added.project.id);
@@ -347,19 +347,34 @@ function checkReadCases() {
         const stats = { ...fs.statSync(newDesign), mtimeMs: project.watchStartedAt + 1, birthtimeMs: project.watchStartedAt + 1,
           isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false };
         events.push(emitWatcherWithStats('add', newDesign, stats));
-        events.push(emitWatcher('unlink', added.linkPaths[0]).catch(() => {}));
-        events.push(emitWatcher('add', moved).catch(() => {}));
+        // Crate subscribes to add/change only (no unlink handler): a move reaches
+        // the watcher as an add at the new path.
+        events.push(emitWatcher('add', moved));
       };
     } });
     await Promise.all(events);
     await metadataTestHooks.waitForWatcherIdle(added.project.id);
     await runTrackedIntervalCallbacks();
     const state = outcome(added.project.id, added.psdPath);
-    console.log('PSD_CHECK_READ_WATCHER ' + JSON.stringify({ result: result.verificationStatus || result.error, receipt: state.receipt,
+    const latest = stored(added.project.id);
+    const row = latest.files.find(file => file.path === added.psdPath);
+    const receiptPaths = (metadataTestHooks.getWorkingSourceVerification(latest, row).requiredReferences || []).map(ref => ref.path);
+    const movedOutcome = {
+      receiptKeepsOldPath: receiptPaths.includes(added.linkPaths[0]),
+      receiptHasMovedPath: receiptPaths.includes(moved),
+      fileRows: latest.files.filter(file => [added.linkPaths[0], moved].includes(file.path)).map(file => file.path === moved ? 'moved' : 'old'),
+      pendingRows: latest.pendingFiles.filter(file => [added.linkPaths[0], moved].includes(file.path)).map(file => file.path === moved ? 'moved' : 'old'),
+    };
+    console.log('PSD_CHECK_READ_WATCHER ' + JSON.stringify({ result: result.verificationStatus || result.error, receipt: state.receipt, movedOutcome,
       newDesign: state.files.includes('New_During_Scan.ai') ? 'file' : state.pending.includes('New_During_Scan.ai') ? 'pending' : 'absent' }));
     assert.equal(state.files.includes('New_During_Scan.ai') || state.pending.includes('New_During_Scan.ai'), true,
       'the new design file is admitted after the scan');
     assert.equal(state.receipt.refs.length, 10);
+    // Existing gap, unchanged from b1ed6fb and documented, not fixed here: a link
+    // image moved outside Photoshop is not relocated by this scan. The receipt
+    // keeps the path the PSD still declares, and an image add event is not an
+    // admission path.
+    assert.deepEqual(movedOutcome, { receiptKeepsOldPath: true, receiptHasMovedPath: false, fileRows: ['old'], pendingRows: [] });
     assert.equal(state.leases, 0);
     await callIpcRaw('projects:pause', added.project.id);
   });
@@ -467,9 +482,10 @@ function checkReadCases() {
     withProbe(`fences: ${name} between checks stops the Restore scan before publication`, {}, async probe => {
       const added = await addPsdProject(probe, { links: 10 });
       await settleBaseline(added.project.id);
-      if (name === 'scope' && !metadataTestHooks.hasIllustratorActivationScope(added.project.id)) {
-        // The scope revision is only bound when an activation scope exists.
-        return;
+      if (name === 'scope') {
+        // The scope revision is bound only when an activation scope exists; this
+        // fixture must have one, or the scope fence would not be exercised.
+        assert.equal(metadataTestHooks.hasIllustratorActivationScope(added.project.id), true, 'activation scope present');
       }
       await exclude(added.project.id, added.psdPath);
       let pending = null, landedAt = null;
@@ -530,7 +546,7 @@ function checkReadCases() {
     assert.equal(injected, 30);
     // b1ed6fb re-reads inside the same check and stops at 30; one read per check
     // sees a write made after that read at the very next check (31).
-    assert.ok(probe.checks === 30 || probe.checks === 31, `stopped by the next check at the latest (${probe.checks})`);
+    assert.equal(probe.checks, metadataTestHooks.projectCheckRead ? 31 : 30, 'the disclosed one-check delay, and no later');
     assert.notEqual(result.verificationStatus, 'scanned');
     assert.notEqual(state.receipt?.status, 'scanned');
     assert.equal(state.leases, 0);
