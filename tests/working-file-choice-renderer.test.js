@@ -409,3 +409,64 @@ test('retained invalid evidence explains owner Exclude without offering futile R
   assert.match(guidance.textContent,/Exclude in the file list/);assert.match(guidance.textContent,/evidence stays saved/);
   assert.equal(choiceButtons(f.elements['working-file-choices']).some(el=>el.dataset.choice==='retry'),false);
 });
+
+// Verification reasons are backend allowlist tokens. Copy must state only what
+// the receipt proves: no format/version claims and no destructive instruction.
+const VERIFICATION_COPY = [
+  ['working-file-verification-timed-out', 'Verification timed out. Try again.'],
+  ['working-file-source-unavailable', 'Crate can’t find or read this file. Check that it’s available, then try again.'],
+  ['working-file-verification-failed', 'Verification couldn’t finish. Try again.'],
+  ['working-file-link-records-unrecognized', 'Some link records in this file weren’t recognized, so its links can’t be verified. Packaging stays blocked.'],
+  ['working-file-link-records-unreadable', 'Some link records in this file couldn’t be read completely, so its links can’t be verified. Packaging stays blocked.'],
+  ['working-file-link-coverage-limit', 'This file reached a verification limit, so its links can’t be fully verified. Packaging stays blocked.'],
+  ['working-file-source-changed', 'File changed. Verify again.'],
+];
+for (const [reason, copy] of VERIFICATION_COPY) test(`picker ${reason} explains the verified reason, keeps Retry and blocks choices`, async () => {
+  const f = await fixture(), ws = f.workspaces.get('a');
+  ws.workingFileChoices.choices = [{ ...ws.workingFileChoices.choices[0], ready: false, reason }];
+  await f.renderer.renderFiles();
+  const region = f.elements['working-file-choices'];
+  const help = choiceTree(region).find(el => el.className === 'working-source-detail');
+  assert.equal(help.textContent, copy);
+  if (reason !== 'working-file-source-changed') assert.doesNotMatch(help.textContent, /changed/i);
+  assert.doesNotMatch(help.textContent, /Photoshop|version|\bv?8\b|unsupported file|not supported|delete|recreate|support|upload|diagnos/i);
+  if (/link-records|coverage-limit/.test(reason)) assert.doesNotMatch(help.textContent, /try again/i, 'format findings may persist across Retry');
+  const buttons = choiceButtons(region), retry = buttons.find(el => el.dataset.choice === 'retry');
+  assert.equal(retry.textContent, 'Retry verification'); assert.equal(retry.disabled, false);
+  assert.equal(retry.getAttribute('aria-describedby'), help.id);
+  for (const button of buttons.filter(el => ['replace', 'keep-both'].includes(el.dataset.choice))) {
+    assert.equal(button.disabled, true); assert.equal(button.getAttribute('aria-describedby'), help.id);
+  }
+});
+
+test('picker unknown future reason keeps the existing generic copy and Retry', async () => {
+  const f = await fixture(), ws = f.workspaces.get('a');
+  ws.workingFileChoices.choices = [{ ...ws.workingFileChoices.choices[0], ready: false, reason: 'unknown-future-reason' }];
+  await f.renderer.renderFiles();
+  const help = choiceTree(f.elements['working-file-choices']).find(el => el.className === 'working-source-detail');
+  assert.equal(help.textContent, 'Saved file and links unverified. Check availability, then retry.');
+  assert.ok(choiceButtons(f.elements['working-file-choices']).some(el => el.dataset.choice === 'retry'));
+});
+
+for (const [error, expected] of [
+  ['continuation_verification_required', 'Not verified yet. See the details on the working file.'],
+  ['working_file_choice_stale', 'The files changed or could not be verified. Review the current files before choosing again.'],
+  ['working_source_identity_unavailable', 'The files changed or could not be verified. Review the current files before choosing again.'],
+]) test(`Retry ${error} toast does not assert an unproven change`, async () => {
+  const f = await fixture(), ws = f.workspaces.get('a');
+  ws.workingFileChoices.choices = [{ ...ws.workingFileChoices.choices[1], reason: 'working-file-verification-timed-out' }];
+  await f.renderer.renderFiles();
+  const entry = f.evaluate('state.assetWorkspace.workingFileChoices.choices[0]');
+  const pending = f.renderer.submitWorkingFileChoice('a', entry, 'retry', null);
+  assert.equal(f.calls[0].payload.choice, 'retry');
+  f.calls[0].resolve({ success: false, error }); assert.equal(await pending, false);
+  assert.deepEqual(f.toasts, [expected]);
+  const retry = choiceButtons(f.elements['working-file-choices']).find(el => el.dataset.choice === 'retry');
+  assert.equal(retry.disabled, false, 'Retry stays available after a failed attempt');
+});
+
+test('non-Retry verification refusal keeps its existing toast', async () => {
+  const f = await fixture(); const pending = f.start();
+  f.calls[0].resolve({ success: false, error: 'continuation_verification_required' }); assert.equal(await pending, false);
+  assert.deepEqual(f.toasts, ['The files changed or could not be verified. Review the current files before choosing again.']);
+});

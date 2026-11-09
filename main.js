@@ -4760,6 +4760,9 @@ function hasWorkingFileDirtyHold(project, file) {
 }
 
 // Renderer contract is an allowlist, never raw extractor errors or paths.
+// A failed receipt's reason belongs to its own attempt: Retry and each scan
+// reservation replace it, unlike the inherited unresolved list.
+const WORKING_FILE_VERIFICATION_TIMEOUT_REASONS = new Set(['scan-timeout', 'add_files_scan_timeout']);
 function getWorkingFileVerificationReason(project, source, receipt) {
   const inDesign = path.extname(source.path || '').toLowerCase() === '.indd';
   if (hasInvalidWorkingSourceReceipt(project, source) && !hasWorkingSourceRecoveryRecord(project, source) &&
@@ -4767,8 +4770,23 @@ function getWorkingFileVerificationReason(project, source, receipt) {
   if (!inDesign) {
     if (hasWorkingFileDirtyHold(project, source)) return 'working-file-save-required';
     if (receipt?.status === 'pending') return 'working-file-verification-pending';
-    if (receipt && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
-    if (receipt?.unresolved?.length) return 'working-file-dependencies-unverified';
+    // Explicit failure evidence precedes the identity fallback. Retry clears the
+    // saved identity before scanning, so a cleared identity is not a change.
+    if (!getWorkingSourceDiskIdentity(source)) return 'working-file-source-unavailable';
+    if (!receipt) return 'saved-file-verification-required';
+    if (receipt.status === 'failed' && WORKING_FILE_VERIFICATION_TIMEOUT_REASONS.has(receipt.reason)) return 'working-file-verification-timed-out';
+    // Only a recorded identity that differs proves a change. Stale and
+    // source-bytes-changed labels are also written for digest read failures.
+    if (receipt.sourceIdentity && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
+    if (receipt.status === 'failed') return 'working-file-verification-failed';
+    if (receipt.status === 'stale' || !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'saved-file-verification-required';
+    // Receipts keep only bounded reason codes, never the record version. These
+    // name what was observed; they do not claim the whole file is unsupported.
+    const unresolved = new Set(receipt.unresolved.map(item => item.reason));
+    if (unresolved.has('unsupported-link-form')) return 'working-file-link-records-unrecognized';
+    if (unresolved.has('unresolved-link-record-framing') || unresolved.has('unexplained-link-tail')) return 'working-file-link-records-unreadable';
+    if (unresolved.has('reference-coverage-limit') || unresolved.has('coverage-limit')) return 'working-file-link-coverage-limit';
+    if (unresolved.size) return 'working-file-dependencies-unverified';
     return 'saved-file-verification-required';
   }
   if (hasWorkingFileDirtyHold(project, source)) return 'indesign-save-required';
