@@ -751,10 +751,7 @@ async function reconcileAddFilesRendererState(operation, selectionEpoch, selecti
   const reconciliation = (async () => {
     const projects = await getAccountCurrentProjects();
     if (!isCurrent()) return false;
-    const previous = state.projects.find(item => item.id === operation.projectId);
     state.projects = Array.isArray(projects) ? projects : [];
-    // Withdraw a save request this snapshot already contradicts before the read.
-    retireContradictedNeedsSave(operation.projectId, previous, true);
     if (!isCurrent()) return false;
     await renderFiles({ isCurrent });
     return isCurrent();
@@ -955,18 +952,12 @@ function renderProjectRows() {
       const busyLabel = project.status === 'watching' ? 'Pausing…' : 'Starting…';
       try {
         await runRendererAction(`watch:${project.id}`, pill, busyLabel, async () => {
-          // What the selected project showed before the click.
-          const selectedId = state.selectedProjectId;
-          const previous = { status: state.projects.find(item => item.id === selectedId)?.status };
           await window.crate[action](project.id);
+          // Replacing the list re-checks the selected project's save request, so a
+          // pause caused by starting another project withdraws it here too.
           state.projects = await getAccountCurrentProjects();
-          // Starting one project pauses any other, so check the selected project
-          // whichever pill was clicked. Off Current Project nothing re-checks its
-          // evidence now: suspend only if it changed; the next render restores it.
-          const selectedChanged = retireContradictedNeedsSave(selectedId, previous, selectedId === project.id);
           if (isTabActive('projects')) renderProjects();
           if (state.selectedProjectId && isTabActive('current-project')) await renderFiles();
-          else if (selectedChanged) suspendNeedsSaveReminder(selectedId);
         }, pillText);
       } catch (error) {
         logRendererError(`${action} failed`, error);
@@ -3933,8 +3924,9 @@ function getPendingFileReason(file) {
       // Name only the qualifying observation; never fall back to a historical source.
       const unsavedSourceName = sanitizeRendererSourceName(file.sourceSaveSourceName);
       const unsavedApp = PENDING_APP_LABELS[file.sourceSaveAppFamily] || null;
-      if (unsavedSourceName) return `Unsaved changes in ${unsavedSourceName}. Save to make package-ready.`;
-      return unsavedApp ? `Unsaved changes in ${unsavedApp}. Save to make package-ready.` : 'Unsaved changes found. Save to make package-ready.';
+      // Never promise the outcome: saved Illustrator links can stay in Needs Review.
+      const where = unsavedSourceName || unsavedApp;
+      return `${where ? `Unsaved changes in ${where}.` : 'Unsaved changes found.'} Save your changes so Crate can check it.`;
     }
     const safeSourceName = sanitizeRendererSourceName(evidence.sourceName);
     if (safeSourceName) return `Linked asset observed from ${safeSourceName}. Save to make package-ready.`;
@@ -4051,6 +4043,21 @@ const needsSaveReminder = {
   last: null, recheckTimer: null, announcement: 0, message: '', pendingAnnouncement: false,
 };
 
+// Every replacement of the project list re-checks the save request (see
+// reconcileNeedsSaveWithProjects), so no replacement path can leave it stale.
+{
+  let projects = state.projects;
+  Object.defineProperty(state, 'projects', {
+    enumerable: true,
+    configurable: true,
+    get: () => projects,
+    set: value => {
+      projects = value;
+      reconcileNeedsSaveWithProjects();
+    },
+  });
+}
+
 function getSourceSaveItems(project, pending) {
   const workspace = state.assetWorkspace;
   if (!project || !workspace || workspace.projectId !== project.id || displayOnlyAssetWorkspaces.has(workspace) ||
@@ -4153,25 +4160,30 @@ function withdrawSourceSaveGuidance() {
   $('#pending-save-guidance')?.classList.add('hidden');
 }
 
-// After state.projects is replaced: a snapshot that already contradicts the
-// selected project's save request (its status changed, or its own update left
-// nothing unsaved) retires it before any read. Unchanged evidence keeps updating
-// in place, so scans neither flicker nor re-announce. Returns whether it changed.
-function retireContradictedNeedsSave(projectId, previous, ownUpdate) {
-  if (!projectId) return false;
-  const current = state.projects.find(item => item.id === projectId);
-  const statusChanged = previous?.status !== current?.status;
-  const unsaved = Array.isArray(current?.pendingFiles) &&
-    current.pendingFiles.some(row => getPendingCaptureState(row) === 'needs-save');
-  if (statusChanged || (ownUpdate && !unsaved)) suspendNeedsSaveReminder(projectId);
+// One rule for every replacement of state.projects (watcher refresh, watch/pause,
+// Add Files, batch decisions, package review, recovery, ...). Returns the selected
+// project's current object when its snapshot still supports the last authoritative
+// save request: same status the copy was drawn for, and at least one flagged item
+// still an unsaved row. Otherwise null.
+function getNeedsSaveEvidenceProject(last) {
+  const current = state.projects.find(item => item.id === last.project.id);
+  if (!current || current.status !== last.status) return null;
+  if (!last.items.length) return current;
+  const unsaved = (Array.isArray(current.pendingFiles) ? current.pendingFiles : [])
+    .filter(row => getPendingCaptureState(row) === 'needs-save');
+  return last.items.some(item => unsaved.some(row => !item.path || row.path === item.path)) ? current : null;
+}
+
+// Runs in the same turn as every state.projects assignment: a contradicted request
+// is withdrawn before any read; an unchanged one follows the new object, with no
+// hide, no repaint and no announcement.
+function reconcileNeedsSaveWithProjects() {
   const last = needsSaveReminder.last;
-  if (!statusChanged && !ownUpdate && current && last?.project.id === projectId &&
-      last.account === accountWorkspaceEpoch && last.selection === projectSelectionEpoch) {
-    // Proven unchanged: follow the replacement object so a later resume does not
-    // mistake it for superseded evidence. A raw replacement never reaches here.
-    last.project = current;
-  }
-  return statusChanged || ownUpdate;
+  if (!last || last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
+      state.selectedProjectId !== last.project.id) return;
+  const current = getNeedsSaveEvidenceProject(last);
+  if (current) last.project = current;
+  else suspendNeedsSaveReminder(last.project.id);
 }
 
 // shown: the reminder just went from hidden to visible. Otherwise the live region
@@ -4208,15 +4220,15 @@ function resumeNeedsSaveReminder() {
   const last = needsSaveReminder.last;
   const workspace = state.assetWorkspace;
   if (!last) return;
-  if (last.account !== accountWorkspaceEpoch || last.selection !== projectSelectionEpoch ||
-      state.selectedProjectId !== last.project.id ||
-      state.projects.find(item => item.id === last.project.id) !== last.project ||
-      workspace?.projectId !== last.project.id || displayOnlyAssetWorkspaces.has(workspace)) {
-    // Its evidence was superseded (for example, the project list was re-read
-    // behind a modal): never leave a visible reminder bound to it.
+  const current = last.account === accountWorkspaceEpoch && last.selection === projectSelectionEpoch &&
+    state.selectedProjectId === last.project.id && workspace?.projectId === last.project.id &&
+    !displayOnlyAssetWorkspaces.has(workspace) ? getNeedsSaveEvidenceProject(last) : null;
+  if (!current) {
+    // Its evidence was superseded: never leave a visible reminder bound to it.
     suspendNeedsSaveReminder(last.project.id);
     return;
   }
+  last.project = current;
   // Another authoritative read may have replaced the workspace object for the
   // same project and selection; evaluate that current projection.
   const items = workspace === last.workspace ? last.items
@@ -4233,7 +4245,7 @@ function syncNeedsSaveReminder(project, items) {
   }
   const entry = getNeedsSaveReminderEntry(project.id);
   clearNeedsSaveRecheck();
-  needsSaveReminder.last = { project, items, workspace: state.assetWorkspace,
+  needsSaveReminder.last = { project, items, workspace: state.assetWorkspace, status: project.status,
     account: accountWorkspaceEpoch, selection: projectSelectionEpoch };
   if (needsSaveReminder.visibleProjectId && needsSaveReminder.visibleProjectId !== project.id) hideNeedsSaveReminder();
   const keys = new Set(items.map(getFileVisualIdentity).filter(Boolean));
@@ -6657,7 +6669,6 @@ function applyProjectRefresh(projects, refreshGeneration, projectIds, projectLis
     assetWorkspaceProjectSnapshot = null;
   }
   state.projects = nextProjects;
-  retireContradictedNeedsSave(selectedId, previous, !!selectedId && projectIds.has(selectedId));
   reconcileCurrentAssetReviewBatchControls();
   if (isTabActive('projects')) renderProjects();
   if (selectedChanged && isTabActive('current-project')) {

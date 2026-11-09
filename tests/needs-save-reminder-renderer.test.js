@@ -44,7 +44,8 @@ async function fixture({ status = 'watching' } = {}) {
   for (const id of ['needs-save-reminder', 'pending-save-guidance']) node(id).classList.add('hidden');
   const projects = ['a', 'b'].map(id => ({ id, name: `Project ${id}`, status, files: [], pendingFiles: [], excludedAssetKeys: [] }));
   const workspaces = new Map(projects.map(project => [project.id, { projectId: project.id, files: [], pendingFiles: [] }]));
-  let nextRead = null, failReads = false, pauseGate = null;
+  const heldReads = [];
+  let failReads = false, pauseGate = null;
   const longTimers = [];
   const timerOverrides = {
     setTimeout: (fn, ms, ...args) => {
@@ -69,7 +70,7 @@ async function fixture({ status = 'watching' } = {}) {
     getProjects: async () => clone(projects),
     getAssetWorkspace: async id => {
       if (failReads) throw new Error('synthetic workspace unavailable');
-      if (nextRead) { const read = nextRead; nextRead = null; return read.promise; }
+      if (heldReads.length) return heldReads.shift().promise;
       return clone(workspaces.get(id));
     },
   } }, { Date: FakeDate, ...timerOverrides });
@@ -92,7 +93,7 @@ async function fixture({ status = 'watching' } = {}) {
     reminderText: () => `${el('needs-save-reminder-title').textContent} ${el('needs-save-reminder-detail').textContent}`,
     guidanceText: () => `${el('pending-save-guidance-title').textContent} ${el('pending-save-guidance-detail').textContent}`,
     status: () => el('needs-save-reminder-status').textContent,
-    deferRead() { const read = deferred(); nextRead = read; return read; },
+    deferRead() { const read = deferred(); heldReads.push(read); return read; },
     gatePause() { pauseGate = deferred(); return pauseGate; },
     fireLongTimers() { for (const timer of longTimers.splice(0)) if (!timer.cancelled) timer.fn(); },
     pendingLongTimers: () => longTimers.filter(timer => !timer.cancelled).length,
@@ -534,19 +535,33 @@ test('closing a modal resumes a deferred reminder without another refresh', asyn
   assert.equal(f.status(), spoken(STABLE_WATCHING));
 });
 
-test('a project list replaced behind a modal suspends the visible reminder when the modal closes', async () => {
-  const f = await fixture();
-  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
-  await f.refresh();
-  assert.equal(f.visible(), true);
-  f.el('modal-upgrade').classList.remove('hidden');
-  // A flow such as package review re-reads the project list while the modal is open.
-  f.evaluate('state.projects = state.projects.map(project => ({ ...project }))');
-  f.renderer.hidePackageLimitModal({ restoreFocus: false });
-  await tick(10);
-  assert.equal(f.visible(), false, 'a reminder bound to a superseded project never stays up');
-  await f.refresh();
-  assert.equal(f.visible(), true, 'fresh evidence that it is still unsaved restores it');
+test('any project-list replacement is checked against the reminder evidence in the same turn', async () => {
+  // Raw assignments stand in for every replacement path (package review behind a modal,
+  // Add All/Skip All, delete, Figma link edits, recovery): one rule covers them all.
+  for (const variant of ['unchanged', 'saved', 'status', 'missing']) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    await tick();
+    f.el('needs-save-reminder-status').textContent = 'spoken';
+    f.el('modal-upgrade').classList.remove('hidden');
+    const next = {
+      unchanged: 'state.projects.map(project => ({ ...project }))',
+      saved: "state.projects.map(project => project.id === 'a' ? { ...project, pendingFiles: [] } : { ...project })",
+      status: "state.projects.map(project => project.id === 'a' ? { ...project, status: 'paused' } : { ...project })",
+      missing: "state.projects.filter(project => project.id !== 'a')",
+    }[variant];
+    f.evaluate(`state.projects = ${next}`);
+    const kept = variant === 'unchanged';
+    assert.equal(f.visible(), kept, `${variant}: decided in the same turn`);
+    assert.equal(f.guidanceVisible(), kept, variant);
+    assert.equal(f.status(), kept ? 'spoken' : '', variant);
+    f.renderer.hidePackageLimitModal({ restoreFocus: false });
+    await tick(10);
+    await tick();
+    assert.equal(f.visible(), kept, `${variant}: an unrelated modal close changes nothing`);
+    assert.equal(f.status(), kept ? 'spoken' : '', `${variant}: no repeat announcement`);
+  }
 });
 
 test('suspending also withdraws the Review Assets save guidance until fresh evidence', async () => {
@@ -805,10 +820,10 @@ test('a retained row redraws its save reason when the qualifying observation cha
   const flagged = name => presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign', sourceSaveSourceName: name });
   f.set('a', [rawRow('a', 'hero.png')], [flagged('Poster A.indd')]);
   await f.refresh();
-  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Poster A.indd. Save to make package-ready.']);
+  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Poster A.indd. Save your changes so Crate can check it.']);
   f.set('a', [rawRow('a', 'hero.png')], [flagged('Draft B.indd')]);
   await f.refresh();
-  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Draft B.indd. Save to make package-ready.'], 'no superseded document name');
+  assert.deepEqual(renderedReasons(f), ['Unsaved changes in Draft B.indd. Save your changes so Crate can check it.'], 'no superseded document name');
   f.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0)]);
   await f.refresh();
   assert.equal(renderedReasons(f).some(text => /Unsaved changes/.test(text)), false, 'no unsaved claim after the flag clears');
@@ -902,7 +917,7 @@ test('a flagged row without a usable qualifying name never names a historical do
       ...(name === undefined ? {} : { sourceSaveSourceName: name }) });
     f.set('a', [rawRow('a', 'hero.png')], [flagged]);
     await f.refresh();
-    assert.deepEqual(renderedReasons(f), ['Unsaved changes in Illustrator. Save to make package-ready.'], String(name));
+    assert.deepEqual(renderedReasons(f), ['Unsaved changes in Illustrator. Save your changes so Crate can check it.'], String(name));
     assert.match(f.guidanceText(), /Unsaved changes found\./);
     for (const text of [...renderedReasons(f), f.guidanceText()]) assert.equal(/Brochure|Poster|someone/.test(text), false, text);
   }
@@ -910,13 +925,94 @@ test('a flagged row without a usable qualifying name never names a historical do
   const g = await fixture();
   g.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign', sourceSaveSourceName: 'Draft.indd' })]);
   await g.refresh();
-  assert.deepEqual(renderedReasons(g), ['Unsaved changes in Draft.indd. Save to make package-ready.']);
+  assert.deepEqual(renderedReasons(g), ['Unsaved changes in Draft.indd. Save your changes so Crate can check it.']);
   g.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign' })]);
   await g.refresh();
-  assert.deepEqual(renderedReasons(g), ['Unsaved changes in InDesign. Save to make package-ready.']);
+  assert.deepEqual(renderedReasons(g), ['Unsaved changes in InDesign. Save your changes so Crate can check it.']);
   // Unflagged Needs Save rows keep their existing historical copy.
   assert.equal(g.evaluate("getPendingFileReason({ captureState: 'needs-save', captureEvidence: { sourceName: 'Poster A.ai' } })"),
     'Linked asset observed from Poster A.ai. Save to make package-ready.');
+});
+
+test('a modal closing while the selected project own refresh read is in flight never hides or re-announces it', async () => {
+  for (const via of ['refresh', 'add-files']) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    await tick();
+    f.el('needs-save-reminder-status').textContent = 'spoken';
+    const held = f.deferRead();
+    if (via === 'refresh') {
+      f.renderer.testNext = f.projects.map(project => ({ ...project }));
+      f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+    } else {
+      f.evaluate("activeAddFilesOperation = { projectId: 'a' }; testReconcile = reconcileAddFilesRendererState(activeAddFilesOperation, projectSelectionEpoch, projectSelectionIntentEpoch)");
+      await tick(5);
+    }
+    f.el('modal-upgrade').classList.remove('hidden');
+    f.renderer.hidePackageLimitModal({ restoreFocus: false });
+    await tick(10);
+    assert.equal(f.visible(), true, `${via}: same project, status and unsaved rows`);
+    assert.equal(f.guidanceVisible(), true, via);
+    assert.equal(f.status(), 'spoken', via);
+    held.resolve(clone(f.workspaces.get('a')));
+    await tick();
+    assert.equal(f.visible(), true, via);
+    assert.equal(f.status(), 'spoken', `${via}: the finished read does not announce it again`);
+  }
+});
+
+test('out-of-order workspace reads never repaint or re-announce from the superseded one', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0, 'indesign', 'Brochure.indd')]);
+  await f.refresh();
+  await tick();
+  f.el('needs-save-reminder-status').textContent = 'spoken';
+  const first = f.deferRead();
+  const second = f.deferRead();
+  f.renderer.testNext = f.projects.map(project => ({ ...project }));
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+  f.renderer.testNext = f.projects.map(project => ({ ...project }));
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+  second.resolve({ projectId: 'a', files: [], pendingFiles: [needsSave('a', 'hero.jpg', 0, 'indesign', 'Newest.indd')] });
+  await tick();
+  first.resolve({ projectId: 'a', files: [], pendingFiles: [needsSave('a', 'hero.jpg', 0, 'illustrator', 'Superseded.ai')] });
+  await tick();
+  assert.equal(f.visible(), true);
+  assert.match(f.guidanceText(), /Newest\.indd/);
+  assert.equal(/Superseded/.test(f.guidanceText() + renderedReasons(f).join(' ')), false);
+  assert.equal(f.status(), 'spoken');
+});
+
+test('a cooldown re-check survives an unchanged project-list replacement', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  f.el('btn-needs-save-dismiss').click();
+  FakeDate.current += 20_000;
+  f.set('a', [rawRow('a', 'hero.jpg'), rawRow('a', 'new.jpg')], [needsSave('a', 'hero.jpg', 0), needsSave('a', 'new.jpg', 1)]);
+  await f.refresh();
+  assert.equal(f.visible(), false, 'quiet during the cooldown');
+  assert.equal(f.pendingLongTimers(), 1);
+  // Another project's update replaces the list; nothing about a changed.
+  f.evaluate('state.projects = state.projects.map(project => ({ ...project }))');
+  FakeDate.current += 2 * 60_000;
+  f.fireLongTimers();
+  assert.equal(f.visible(), true, 'the genuinely new item still reminds once the cooldown ends');
+});
+
+test('a flagged row tells the user to save without promising a package-ready result', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.png'), rawRow('a', 'logo.png')], [
+    presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Draft.ai' }),
+    presented('a', 'logo.png', 1, { sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator' }),
+  ]);
+  await f.refresh();
+  assert.deepEqual(renderedReasons(f), [
+    'Unsaved changes in Draft.ai. Save your changes so Crate can check it.',
+    'Unsaved changes in Illustrator. Save your changes so Crate can check it.',
+  ]);
+  assert.equal(renderedReasons(f).some(text => /package-ready/.test(text)), false);
 });
 
 test('missing pending list nodes return no items instead of throwing', async () => {
