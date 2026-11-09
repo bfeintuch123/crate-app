@@ -14364,10 +14364,15 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
   const previousContinuationSnapshot = illustratorContinuationSnapshots.get(projectId);
   let continuationObserved = false;
   // Any reminder change in this poll (presence or the ledger's modified state)
-  // tells the renderer to re-read once, unless a staged refresh already did.
+  // tells the renderer to re-read once. Only where this poll may still publish:
+  // with nothing to stage, or after its own refresh stayed current.
   const sourceSaveReminderContext = captureSourceSaveReminderContext(projectId, activationToken, watcherGeneration);
   const sourceSaveReminderBefore = getSourceSaveReminderSignature(projectId);
-  let sourceSaveReminderRefreshed = false;
+  const notifySourceSaveReminderChange = () => {
+    if (sourceSaveReminderContext.current() && getSourceSaveReminderSignature(projectId) !== sourceSaveReminderBefore) {
+      sendProjectFileStateToRenderer(projectId, activationToken);
+    }
+  };
 
   try {
     const liveEvidenceRecords = [];
@@ -14657,8 +14662,11 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       console.log(`[crate][live-app] Polled active app evidence for project ${projectId}: ${polledApps.join(', ')} (${liveEvidenceRecords.length} records)`);
     }
 
+    if (liveEvidenceRecords.length === 0) {
+      notifySourceSaveReminderChange();
+      return;
+    }
     if (
-      liveEvidenceRecords.length === 0 ||
       !isActiveWatchingProject(projectId, activationToken) ||
       (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
     ) return;
@@ -14676,7 +14684,8 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     if (!refreshOperation.current()) return;
     const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation);
     if (refreshResult.cancelled || !refreshOperation.current()) return;
-    if (refreshResult.stagedCount > 0) sourceSaveReminderRefreshed = true;
+    // A staged refresh already told the renderer to re-read.
+    if (!(refreshResult.stagedCount > 0)) notifySourceSaveReminderChange();
     observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
     continuationObserved = true;
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
@@ -14701,12 +14710,6 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     console.error('[crate][live-app] pollPsForProject error:', redactFigmaLogText(e && e.message));
   } finally {
     refreshOperation?.close();
-    try {
-      if (!sourceSaveReminderRefreshed && sourceSaveReminderContext.current() &&
-          getSourceSaveReminderSignature(projectId) !== sourceSaveReminderBefore) sendProjectFileStateToRenderer(projectId, activationToken);
-    } catch (e) {
-      console.error('[crate][live-app] save reminder refresh error:', redactFigmaLogText(e && e.message));
-    }
     if (!continuationObserved && previousContinuationSnapshot) clearIllustratorContinuationSnapshot(projectId, activationToken, previousContinuationSnapshot);
     if (activationToken === null || watchingActivationTokens.get(projectId) === activationToken) psInProgress.delete(projectId);
   }
