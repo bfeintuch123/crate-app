@@ -4146,6 +4146,14 @@ function getNeedsSaveReminderEntry(projectId) {
 // Suspension is neither a dismissal nor a resolution.
 function suspendNeedsSaveReminder(projectId) {
   if (!projectId) return;
+  // Withdrawn evidence is discarded, never reused: a modal close or cooldown
+  // re-check cannot restore it. Only a fresh authoritative read (renderFiles ->
+  // syncNeedsSaveReminder) records new evidence. Seen and dismissal history live
+  // on the project entry and are untouched.
+  if (needsSaveReminder.last?.project.id === projectId) {
+    needsSaveReminder.last = null;
+    clearNeedsSaveRecheck();
+  }
   // The save guidance shares this evidence; the next authoritative render redraws it.
   if (state.selectedProjectId === projectId) withdrawSourceSaveGuidance();
   if (needsSaveReminder.visibleProjectId !== projectId) return;

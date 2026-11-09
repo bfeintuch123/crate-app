@@ -1015,6 +1015,59 @@ test('a flagged row tells the user to save without promising a package-ready res
   assert.equal(renderedReasons(f).some(text => /package-ready/.test(text)), false);
 });
 
+test('contradicted evidence never comes back from a later compatible replacement without a fresh read', async () => {
+  for (const dismissed of [false, true]) {
+    const f = await fixture();
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    await tick();
+    if (dismissed) f.el('btn-needs-save-dismiss').click();
+    assert.equal(f.guidanceVisible(), true);
+    f.evaluate("state.projects = state.projects.map(project => project.id === 'a' ? { ...project, status: 'paused' } : { ...project })");
+    assert.equal(f.visible(), false);
+    assert.equal(f.guidanceVisible(), false);
+    // The status flips back with no workspace read, then a modal closes and the cooldown re-check fires.
+    f.evaluate("state.projects = state.projects.map(project => project.id === 'a' ? { ...project, status: 'watching' } : { ...project })");
+    f.el('modal-upgrade').classList.remove('hidden');
+    f.renderer.hidePackageLimitModal({ restoreFocus: false });
+    await tick(10);
+    FakeDate.current += 3 * 60_000;
+    f.fireLongTimers();
+    await tick();
+    assert.equal(f.visible(), false, `dismissed=${dismissed}: invalidated evidence is never reused`);
+    assert.equal(f.guidanceVisible(), false, `dismissed=${dismissed}: the note waits for a fresh read too`);
+    assert.equal(f.status(), '');
+    // Only a fresh authoritative read revalidates; dismissal history is untouched.
+    await f.refresh();
+    await tick();
+    assert.equal(f.guidanceVisible(), true);
+    assert.equal(f.visible(), !dismissed, dismissed ? 'a dismissal still sticks' : 'restored from fresh evidence');
+    if (!dismissed) assert.equal(f.status(), spoken(STABLE_WATCHING));
+  }
+});
+
+test('an off-tab suspension stays hidden through a modal close until a fresh read', async () => {
+  const f = await fixture();
+  f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+  await f.refresh();
+  await tick();
+  await f.renderer.switchTab('settings');
+  f.renderer.testNext = f.projects.map(project => ({ ...project }));
+  f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+  assert.equal(f.visible(), false);
+  f.el('modal-upgrade').classList.remove('hidden');
+  f.renderer.hidePackageLimitModal({ restoreFocus: false });
+  await tick(10);
+  await tick();
+  assert.equal(f.visible(), false, 'a modal close is not a fresh read');
+  assert.equal(f.guidanceVisible(), false);
+  assert.equal(f.status(), '', 'and announces nothing');
+  await f.renderer.switchTab('current-project');
+  await tick();
+  assert.equal(f.visible(), true, 'the fresh read restores it, inside the cooldown, as a suspension not a dismissal');
+  assert.equal(f.status(), spoken(STABLE_WATCHING));
+});
+
 test('missing pending list nodes return no items instead of throwing', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
