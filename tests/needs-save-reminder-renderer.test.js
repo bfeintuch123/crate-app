@@ -861,6 +861,64 @@ test('save guidance never promises that saving moves Illustrator links out of Ne
   }
 });
 
+test('an unchanged selected project replaced by another project update survives an unrelated modal close', async () => {
+  for (const via of ['pill', 'refresh']) {
+    const f = await fixture({ status: 'paused' });
+    f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+    await f.refresh();
+    await tick();
+    f.el('needs-save-reminder-status').textContent = 'spoken';
+    if (via === 'pill') {
+      await f.renderer.switchTab('projects');
+      f.el('project-rows').children[1].querySelector('.project-pill').click();
+      await tick();
+      // Stay on Projects: no Current Project render rebinds the reminder before the modal closes.
+    } else {
+      f.renderer.testNext = f.projects.map(project => ({ ...project }));
+      f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['b']), projectListReadEpoch)");
+    }
+    assert.notEqual(f.evaluate("state.projects.find(item => item.id === 'a')"), f.projects[0], `${via}: a's object was replaced`);
+    assert.equal(f.visible(), true, via);
+    // An unrelated modal opens and closes; nothing about a changed.
+    f.el('modal-upgrade').classList.remove('hidden');
+    f.renderer.hidePackageLimitModal({ restoreFocus: false });
+    await tick(10);
+    await tick();
+    assert.equal(f.visible(), true, `${via}: proven-unchanged evidence is not withdrawn`);
+    assert.equal(f.guidanceVisible(), true, via);
+    assert.equal(f.status(), 'spoken', `${via}: no repeat announcement`);
+    await f.renderer.switchTab('current-project');
+    await tick();
+    assert.equal(f.visible(), true, via);
+    assert.equal(f.status(), 'spoken', `${via}: still no repeat announcement after the next read`);
+  }
+});
+
+test('a flagged row without a usable qualifying name never names a historical document', async () => {
+  for (const name of [undefined, '/Users/someone/Poster.ai', 'file:Poster.ai']) {
+    const f = await fixture();
+    // The raw row's first decoration names Brochure.indd; the qualifying Illustrator observation has no usable name.
+    const flagged = presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator',
+      ...(name === undefined ? {} : { sourceSaveSourceName: name }) });
+    f.set('a', [rawRow('a', 'hero.png')], [flagged]);
+    await f.refresh();
+    assert.deepEqual(renderedReasons(f), ['Unsaved changes in Illustrator. Save to make package-ready.'], String(name));
+    assert.match(f.guidanceText(), /Unsaved changes found\./);
+    for (const text of [...renderedReasons(f), f.guidanceText()]) assert.equal(/Brochure|Poster|someone/.test(text), false, text);
+  }
+  // A retained row that loses its qualifying name repaints without falling back.
+  const g = await fixture();
+  g.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign', sourceSaveSourceName: 'Draft.indd' })]);
+  await g.refresh();
+  assert.deepEqual(renderedReasons(g), ['Unsaved changes in Draft.indd. Save to make package-ready.']);
+  g.set('a', [rawRow('a', 'hero.png')], [presented('a', 'hero.png', 0, { sourceSaveRequired: true, sourceSaveAppFamily: 'indesign' })]);
+  await g.refresh();
+  assert.deepEqual(renderedReasons(g), ['Unsaved changes in InDesign. Save to make package-ready.']);
+  // Unflagged Needs Save rows keep their existing historical copy.
+  assert.equal(g.evaluate("getPendingFileReason({ captureState: 'needs-save', captureEvidence: { sourceName: 'Poster A.ai' } })"),
+    'Linked asset observed from Poster A.ai. Save to make package-ready.');
+});
+
 test('missing pending list nodes return no items instead of throwing', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);

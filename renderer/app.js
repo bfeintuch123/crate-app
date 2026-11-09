@@ -452,6 +452,7 @@ function getRendererItemSignature(item) {
     // The Needs Save row reason reads these, so a retained row must redraw when they change.
     sourceSaveRequired: item.sourceSaveRequired === true,
     sourceSaveSourceName: sanitizeRendererSourceName(item.sourceSaveSourceName) || '',
+    sourceSaveAppFamily: item.sourceSaveAppFamily || '',
     assetOrigin: item.assetOrigin || '',
     projectRole: item.projectRole || '',
     protectedSource: item.protectedSource === true,
@@ -3928,8 +3929,13 @@ function getPendingFileReason(file) {
   const appLabel = getPendingAppLabel(file);
 
   if (stateValue === 'needs-save') {
-    const unsavedSourceName = file?.sourceSaveRequired === true ? sanitizeRendererSourceName(file.sourceSaveSourceName) : null;
-    if (unsavedSourceName) return `Unsaved changes in ${unsavedSourceName}. Save to make package-ready.`;
+    if (file?.sourceSaveRequired === true) {
+      // Name only the qualifying observation; never fall back to a historical source.
+      const unsavedSourceName = sanitizeRendererSourceName(file.sourceSaveSourceName);
+      const unsavedApp = PENDING_APP_LABELS[file.sourceSaveAppFamily] || null;
+      if (unsavedSourceName) return `Unsaved changes in ${unsavedSourceName}. Save to make package-ready.`;
+      return unsavedApp ? `Unsaved changes in ${unsavedApp}. Save to make package-ready.` : 'Unsaved changes found. Save to make package-ready.';
+    }
     const safeSourceName = sanitizeRendererSourceName(evidence.sourceName);
     if (safeSourceName) return `Linked asset observed from ${safeSourceName}. Save to make package-ready.`;
     if (appLabel) return `Observed in ${appLabel}. Save to make package-ready.`;
@@ -4158,6 +4164,13 @@ function retireContradictedNeedsSave(projectId, previous, ownUpdate) {
   const unsaved = Array.isArray(current?.pendingFiles) &&
     current.pendingFiles.some(row => getPendingCaptureState(row) === 'needs-save');
   if (statusChanged || (ownUpdate && !unsaved)) suspendNeedsSaveReminder(projectId);
+  const last = needsSaveReminder.last;
+  if (!statusChanged && !ownUpdate && current && last?.project.id === projectId &&
+      last.account === accountWorkspaceEpoch && last.selection === projectSelectionEpoch) {
+    // Proven unchanged: follow the replacement object so a later resume does not
+    // mistake it for superseded evidence. A raw replacement never reaches here.
+    last.project = current;
+  }
   return statusChanged || ownUpdate;
 }
 
