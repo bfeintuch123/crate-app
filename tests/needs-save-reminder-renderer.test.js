@@ -1068,6 +1068,76 @@ test('an off-tab suspension stays hidden through a modal close until a fresh rea
   assert.equal(f.status(), spoken(STABLE_WATCHING));
 });
 
+// Lifecycle matrix: every starting state crossed with every transition, checked together.
+// Expectations come from the owner-approved rules: once per item, dismissal sticks, a
+// project switch never repeats an already-shown item, suspension is not a dismissal, and
+// only a fresh authoritative read for the current context can restore a withdrawn request.
+test('reminder lifecycle matrix: starting states x transitions', async () => {
+  const W = spoken(STABLE_WATCHING), P = spoken(STABLE_PAUSED);
+  const setStatus = (f, id, status) => f.evaluate(`state.projects = state.projects.map(p => p.id === '${id}' ? { ...p, status: '${status}' } : { ...p })`);
+  const freshRead = async f => { await f.renderer.switchTab('current-project'); await f.refresh(); await tick(); };
+  const starts = {
+    shown: async () => {},
+    dismissed: async f => { f.el('btn-needs-save-dismiss').click(); },
+    'suspended-offtab': async f => {
+      await f.renderer.switchTab('settings');
+      f.renderer.testNext = f.projects.map(project => ({ ...project }));
+      f.evaluate("applyProjectRefresh(testNext, projectRefreshGeneration, new Set(['a']), projectListReadEpoch)");
+    },
+    'suspended-status': async f => { setStatus(f, 'a', 'paused'); f.projects[0].status = 'paused'; },
+  };
+  const transitions = {
+    'switch-and-return': async f => {
+      f.evaluate("setSelectedProject('b')"); await freshRead(f);
+      f.evaluate("setSelectedProject('a')"); await freshRead(f);
+    },
+    'modal-close': async f => {
+      f.el('modal-upgrade').classList.remove('hidden');
+      f.renderer.hidePackageLimitModal({ restoreFocus: false });
+      await tick(10); await tick();
+    },
+    'cooldown-timer': async f => { FakeDate.current += 3 * 60_000; f.fireLongTimers(); await tick(); },
+    'unchanged-replacement': async f => { f.evaluate('state.projects = state.projects.map(project => ({ ...project }))'); await tick(); },
+    'fresh-read': async f => { await freshRead(f); },
+    'contradictory-replacement': async f => { setStatus(f, 'a', 'paused'); await tick(); },
+  };
+  // [reminder visible, live region, Review Assets note visible] after the transition.
+  // 'kept' = the live region was not rewritten.
+  const expected = {
+    shown: { 'switch-and-return': [false, '', true], 'modal-close': [true, 'kept', true], 'cooldown-timer': [true, 'kept', true],
+      'unchanged-replacement': [true, 'kept', true], 'fresh-read': [true, 'kept', true], 'contradictory-replacement': [false, '', false] },
+    dismissed: { 'switch-and-return': [false, '', true], 'modal-close': [false, 'kept', true], 'cooldown-timer': [false, 'kept', true],
+      'unchanged-replacement': [false, 'kept', true], 'fresh-read': [false, 'kept', true], 'contradictory-replacement': [false, 'kept', false] },
+    'suspended-offtab': { 'switch-and-return': [false, '', true], 'modal-close': [false, '', false], 'cooldown-timer': [false, '', false],
+      'unchanged-replacement': [false, '', false], 'fresh-read': [true, W, true], 'contradictory-replacement': [false, '', false] },
+    'suspended-status': { 'switch-and-return': [false, '', true], 'modal-close': [false, '', false], 'cooldown-timer': [false, '', false],
+      'unchanged-replacement': [false, '', false], 'fresh-read': [true, P, true], 'contradictory-replacement': [false, '', false] },
+  };
+  const failures = [];
+  for (const [startName, start] of Object.entries(starts)) {
+    for (const [name, transition] of Object.entries(transitions)) {
+      const f = await fixture();
+      f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);
+      await f.refresh();
+      await tick();
+      await start(f);
+      const status = f.el('needs-save-reminder-status');
+      status.textContent = status.textContent ? 'spoken' : status.textContent;
+      const before = status.textContent;
+      await transition(f);
+      const [visible, region, note] = expected[startName][name];
+      const want = region === 'kept' ? before : region;
+      const got = [f.visible(), f.status(), f.guidanceVisible()];
+      if (got[0] !== visible || got[1] !== want || got[2] !== note) {
+        failures.push(`${startName} -> ${name}: visible ${got[0]} (want ${visible}), live "${got[1]}" (want "${want}"), note ${got[2]} (want ${note})`);
+      }
+      // Whatever happened, the evidence behind any visible reminder must be current and unrepeated history must hold.
+      if (f.visible()) assert.equal(f.evaluate("needsSaveReminder.last && needsSaveReminder.last.project.id"), 'a');
+    }
+  }
+  assert.deepEqual(failures, []);
+});
+
 test('missing pending list nodes return no items instead of throwing', async () => {
   const f = await fixture();
   f.set('a', [rawRow('a', 'hero.jpg')], [needsSave('a', 'hero.jpg', 0)]);

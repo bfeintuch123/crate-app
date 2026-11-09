@@ -654,6 +654,13 @@ function setSelectedProject(projectId, { invalidate = false, restoreFocus = true
     } catch (_) {}
   }
 
+  // Leaving a project consumes its reminder like any shown one (once per item), so
+  // a suspension does not outlive the switch and repeat it on return. Seen and
+  // dismissal history are kept.
+  if (state.selectedProjectId && state.selectedProjectId !== nextProjectId) {
+    const leaving = needsSaveReminder.projects.get(state.selectedProjectId);
+    if (leaving) leaving.suspended = false;
+  }
   state.selectedProjectId = nextProjectId;
   projectSelectionEpoch += 1;
   hideNeedsSaveReminder();
