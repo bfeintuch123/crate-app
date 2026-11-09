@@ -1332,9 +1332,32 @@ function productionQuickPackageResultsFixture() {
         await show(success);
         openFolder.disabled = true;
         const disabledMetrics = measure();
+        // Diagnostic only: CI read the enabled background here; record why.
+        const disabledComputed = getComputedStyle(openFolder);
+        const diagnostics = {
+          matchesDisabled: openFolder.matches(':disabled'),
+          hasDisabledAttribute: openFolder.hasAttribute('disabled'),
+          matchesHover: openFolder.matches(':hover'),
+          background: disabledComputed.backgroundColor,
+          color: disabledComputed.color,
+          opacity: disabledComputed.opacity,
+          transition: disabledComputed.transitionProperty + ' ' + disabledComputed.transitionDuration,
+          animations: openFolder.getAnimations().map(animation => ({
+            type: animation.constructor.name, property: animation.transitionProperty || null, playState: animation.playState,
+          })),
+          disabledRules: Array.from(document.styleSheets)
+            .flatMap(sheet => { try { return Array.from(sheet.cssRules); } catch { return []; } })
+            .filter(rule => rule.selectorText && rule.selectorText.includes('.modal-btn-primary:disabled'))
+            .map(rule => rule.style.background || rule.style.backgroundColor),
+          grayToken: getComputedStyle(document.documentElement).getPropertyValue('--gray-300').trim(),
+          userAgent: navigator.userAgent,
+          media: ['(prefers-reduced-motion: reduce)', '(prefers-color-scheme: dark)', '(forced-colors: active)',
+            '(prefers-contrast: more)', '(hover: hover)'].filter(query => matchMedia(query).matches),
+        };
         openFolder.focus();
         const disabled = {
           metrics: disabledMetrics,
+          diagnostics,
           takesFocus: document.activeElement === openFolder,
           clickOpens: (openFolder.click(), opened.length),
           stillOpen: !modal.classList.contains('hidden'),
@@ -1439,6 +1462,7 @@ test('production renderer sizes Quick Package Complete Done exactly like Open Fo
     assert.equal(metrics.keyboard.doneVisuallyFirst, true, `${label}: Tab order matches visual order`);
     assert.equal(metrics.keyboard.openFolderFocusable, true, `${label}: Open Folder is keyboard focusable`);
     assert.equal(metrics.keyboard.escapeCloses, true, `${label}: Escape closes through Done without opening the folder`);
+    console.log(`# quick-package-disabled-diagnostics ${label} ${JSON.stringify(metrics.disabled.diagnostics)}`);
     near(metrics.disabled.metrics.done.width, metrics.disabled.metrics.open.width, 0.5, `${label}: disabled Open Folder keeps equal width`);
     near(metrics.disabled.metrics.done.height, metrics.disabled.metrics.open.height, 0.5, `${label}: disabled Open Folder keeps equal height`);
     assert.notEqual(metrics.disabled.metrics.openStyle.background, 'rgb(17, 17, 17)', `${label}: disabled Open Folder keeps the disabled style`);
