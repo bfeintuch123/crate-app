@@ -1279,6 +1279,19 @@ function productionQuickPackageResultsFixture() {
             actionsOverflowX: (actions => actions.scrollWidth - actions.clientWidth)(modal.querySelector('.modal-actions')),
             doneStyle: style(done), openStyle: style(openFolder),
             disabled: [done.disabled, openFolder.disabled],
+            actionsBox: box(modal.querySelector('.modal-actions')),
+            stats: Array.from(modal.querySelectorAll('.v2-result-stat')).map(stat => {
+              const textBox = element => {
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                return box(range);
+              };
+              return {
+                box: box(stat),
+                label: textBox(stat.querySelector('.v2-result-stat-label')),
+                value: textBox(stat.querySelector('.v2-result-stat-value')),
+              };
+            }),
           };
         };
         const results = [];
@@ -1449,11 +1462,25 @@ test('production renderer sizes Quick Package Complete Done exactly like Open Fo
         assert.ok(result.done.right + ring <= result.clipRight, `${label}: Done focus ring is not clipped on the right`);
       }
       assert.equal(result.doneStyle.background, 'rgba(0, 0, 0, 0)', `${label}: Done stays secondary`);
-      assert.notEqual(result.doneStyle.borderColor, 'rgba(0, 0, 0, 0)', `${label}: Done keeps its outline`);
+      // Done keeps the shipped .modal-btn-secondary colours (gray-200 outline, gray-500 label).
+      assert.equal(result.doneStyle.borderColor, 'rgb(229, 231, 235)', `${label}: Done keeps the gray-200 outline`);
+      assert.equal(result.doneStyle.color, 'rgb(107, 114, 128)', `${label}: Done keeps the gray-500 label`);
       assert.equal(result.openStyle.background, 'rgb(17, 17, 17)', `${label}: Open Folder stays primary`);
       assert.equal(result.openStyle.color, 'rgb(255, 255, 255)', `${label}: Open Folder label stays white`);
       assert.equal(result.doneStyle.borderWidth, result.openStyle.borderWidth, `${label}: equal border box`);
       assert.equal(result.doneStyle.fontSize, result.openStyle.fontSize, `${label}: equal label size`);
+      // Each count is centered under its label, and the pair is centered over the full-width actions.
+      assert.equal(result.stats.length, 2, `${label}: two result stats`);
+      for (const [index, stat] of result.stats.entries()) {
+        near(stat.label.left + stat.label.width / 2, stat.box.left + stat.box.width / 2, 1, `${label}: stat ${index} label centered in its column`);
+        near(stat.value.left + stat.value.width / 2, stat.box.left + stat.box.width / 2, 1, `${label}: stat ${index} count centered under its label`);
+        assert.ok(stat.label.bottom <= stat.value.top + 0.5, `${label}: stat ${index} label stays above its count`);
+        assert.ok(stat.label.left >= stat.box.left - 0.5 && stat.label.right <= stat.box.right + 0.5, `${label}: stat ${index} label fits its column`);
+      }
+      near(result.stats[0].box.width, result.stats[1].box.width, 0.5, `${label}: stat columns share the width equally`);
+      near((result.stats[0].box.left + result.stats[0].box.width / 2 + result.stats[1].box.left + result.stats[1].box.width / 2) / 2,
+        result.actionsBox.left + result.actionsBox.width / 2, 1, `${label}: stats centered over the actions`);
+      near(result.stats[0].label.top, result.stats[1].label.top, 0.5, `${label}: stat labels share a baseline row`);
     }
     const [success, missingAssets, longNames] = metrics.results;
     assert.equal(success.missingItems, 0);
