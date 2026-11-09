@@ -6214,10 +6214,12 @@ function getPendingSourceSaveReminder(project, file) {
       typeof file.path !== 'string' || !file.path || isAssetReviewFileExcluded(project, file)) return null;
   const evidenceKey = getLiveEvidenceKeyHash(normalizeTrackedFilePath(file.path));
   const ledgerLatest = evidenceKey ? project.liveEvidenceLedger?.candidates?.[evidenceKey]?.latest : null;
-  // The ledger records every semantic change; a pending row keeps its first
-  // decoration, so a later clean observation must win over stale row evidence.
-  const evidence = ledgerLatest && typeof ledgerLatest === 'object' ? ledgerLatest
-    : (file.captureEvidence && typeof file.captureEvidence === 'object' ? file.captureEvidence : null);
+  // Only the current ledger observation can show a document is still unsaved. A
+  // pending row keeps its first decoration, and pruning can evict a newer clean
+  // observation, so never fall back to the row's own evidence. Unknown current
+  // evidence suppresses only this reminder; the row stays in Needs Review and no
+  // capture, verification or package safeguard depends on it.
+  const evidence = ledgerLatest && typeof ledgerLatest === 'object' && !Array.isArray(ledgerLatest) ? ledgerLatest : null;
   if (!evidence || evidence.documentModified !== true || evidence.needsSave !== true ||
       !SOURCE_SAVE_REMINDER_STRENGTHS.has(evidence.evidenceStrength)) return null;
   const appFamily = SOURCE_SAVE_REMINDER_OBSERVER_APPS.get(evidence.observerMethod);

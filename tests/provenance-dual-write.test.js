@@ -1060,6 +1060,7 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
     workspaceEvidenceGateAnchor);
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
+  pruneLiveEvidenceLedger, getPendingSourceSaveReminder,
   controlLiveAppStartupPoll() {
     const priorSchedule = scheduleWatcherStartupTimer, priorPoll = pollPsForProject;
     const scheduled = [];
@@ -18161,6 +18162,83 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
   const stored = await getProject(project.id);
   assert.equal(stored.pendingFiles.find(row => row.path === paths.unsavedDoc).captureState, 'needs-save');
   assert.equal(stored.pendingFiles.some(row => Object.hasOwn(row, 'sourceSaveRequired')), false);
+});
+
+test('Needs Save reminder requires a current ledger observation and never revives a stale row decoration', async () => {
+  const { pruneLiveEvidenceLedger, getPendingSourceSaveReminder } = metadataTestHooks;
+  const desktop = path.join(TEST_HOME, 'Desktop');
+  const trusted = (documentModified, extra = {}) => ({
+    schemaVersion: 1, source: 'app-opened', observerMethod: 'illustrator-active-session', evidenceStrength: 'structured-app-link',
+    captureRecommendation: 'needs-save', reason: 'unsaved-source-needs-save', needsSave: true, documentModified,
+    sourceName: 'Poster.ai', appFamily: 'illustrator', ...extra,
+  });
+  const pendingRow = (filePath, captureEvidence, source = 'ai-linked') => ({
+    ...makePendingFile(filePath, source), captureState: 'needs-save', captureReason: 'needs-save',
+    captureEvidence: { state: 'needs-save', ...captureEvidence },
+  });
+  const target = path.join(desktop, 'reminder-provenance-target.png');
+  // The row keeps its first decoration: an unsaved Illustrator link.
+  const targetRow = pendingRow(target, trusted(true));
+  const targetKey = liveEvidenceKeyForTest(target);
+  const project = (ledger, rows = [targetRow]) => ({ id: 'reminder-provenance', files: [], excludedAssetKeys: [], pendingFiles: rows, liveEvidenceLedger: ledger });
+  const entry = (filePath, latest, observedAtMs) => makeLiveEvidenceLedgerEntry(filePath, 'needs-save', observedAtMs, { latest });
+
+  // Real pruning: once more than 500 protected entries exist, the oldest needs-save entry, here the
+  // target whose newer observation says it was saved, is evicted. The stale first decoration must not
+  // bring the reminder back.
+  const now = Date.now();
+  const fillers = Array.from({ length: 505 }, (_, i) => pendingRow(path.join(desktop, `reminder-provenance-filler-${i}.png`),
+    { ...trusted(undefined, { observerMethod: 'photoshop-live-script', appFamily: 'photoshop' }), documentModified: undefined }, 'ps-poll'));
+  const pruned = { schemaVersion: 1, candidates: {} };
+  const [savedKey, savedEntry] = entry(target, { ...targetRow.captureEvidence, documentModified: false }, now - 3_600_000);
+  pruned.candidates[savedKey] = savedEntry;
+  for (const row of fillers) { const [k, e] = entry(row.path, row.captureEvidence, now); pruned.candidates[k] = e; }
+  const prunedProject = project(pruned, [targetRow, ...fillers]);
+  assert.equal(getPendingSourceSaveReminder(prunedProject, targetRow), null, 'the current saved observation wins');
+  pruneLiveEvidenceLedger(prunedProject);
+  assert.equal(Object.hasOwn(prunedProject.liveEvidenceLedger.candidates, targetKey), false, 'precondition: pruning evicted it');
+  assert.equal(getPendingSourceSaveReminder(prunedProject, targetRow), null, 'eviction never revives the stale first decoration');
+
+  // Missing or unusable current evidence: no reminder, whatever the row decoration says.
+  for (const [label, ledger] of [
+    ['no ledger', undefined],
+    ['malformed ledger', []],
+    ['no candidates', { schemaVersion: 1 }],
+    ['no entry for the row', { schemaVersion: 1, candidates: {} }],
+    ['entry without latest', { schemaVersion: 1, candidates: { [targetKey]: { evidenceKey: targetKey } } }],
+    ['non-object latest', { schemaVersion: 1, candidates: { [targetKey]: { evidenceKey: targetKey, latest: 'needs-save' } } }],
+    ['array latest', { schemaVersion: 1, candidates: { [targetKey]: { evidenceKey: targetKey, latest: [trusted(true)] } } }],
+  ]) {
+    assert.equal(getPendingSourceSaveReminder(project(ledger), targetRow), null, label);
+  }
+
+  // A fresh qualifying observation still requests the save and names its own document.
+  const fresh = { schemaVersion: 1, candidates: {} };
+  const [freshKey, freshEntry] = entry(target, { ...trusted(true), sourceName: 'Poster Final.ai' }, now);
+  fresh.candidates[freshKey] = freshEntry;
+  assert.deepEqual(getPendingSourceSaveReminder(project(fresh), targetRow),
+    { sourceSaveRequired: true, sourceSaveAppFamily: 'illustrator', sourceSaveSourceName: 'Poster Final.ai' });
+
+  // End to end through the authoritative workspace: a newly observed asset with a current
+  // observation is flagged, and a row whose current observation is unavailable is not.
+  // InDesign live evidence keeps this outside the Illustrator activation-scope filter.
+  const indesign = documentModified => trusted(documentModified, { observerMethod: 'indesign-live-applescript', appFamily: 'indesign', sourceName: 'Brochure.indd' });
+  resetTestHomeWorkspace();
+  const newAsset = path.join(desktop, 'reminder-provenance-new.png');
+  const orphan = path.join(desktop, 'reminder-provenance-orphan.png');
+  for (const filePath of [newAsset, orphan]) fs.writeFileSync(filePath, 'synthetic reminder provenance bytes');
+  const created = await createProject('Reminder provenance');
+  const rows = [pendingRow(newAsset, indesign(true), 'indd-poll'), pendingRow(orphan, indesign(true), 'indd-poll')];
+  const ledger = { schemaVersion: 1, candidates: {} };
+  const [newKey, newEntry] = entry(newAsset, rows[0].captureEvidence, Date.now());
+  ledger.candidates[newKey] = newEntry;
+  await setProjectFiles(created.id, { pendingFiles: rows, liveEvidenceLedger: ledger });
+  metadataTestHooks.clearFileVisualProjectCache();
+  const workspace = await callIpcRaw('projects:get-asset-workspace', created.id);
+  const flagged = new Map(workspace.pendingFiles.map(row => [row.name, row.sourceSaveRequired === true]));
+  assert.equal(flagged.get('reminder-provenance-new.png'), true, 'a fresh observation of a new asset still reminds');
+  assert.equal(flagged.get('reminder-provenance-orphan.png'), false, 'unknown current evidence does not');
+  assert.equal(workspace.pendingFiles.length, 2, 'both rows stay in Needs Review; only the reminder is suppressed');
 });
 
 test('InDesign unsaved live session requests a save until a trusted saved observation clears it', async () => {
