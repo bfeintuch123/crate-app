@@ -1050,6 +1050,10 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
     '    await workspaceSelectionGate.wait();\n' +
     '  }\n' +
     workspaceSelectionAnchors[0]);
+  const liveRefreshGateAnchor = 'async function applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords = [], activationToken = null, parentOperation = null) {';
+  assert.equal(source.split(liveRefreshGateAnchor).length - 1, 1, 'live evidence refresh gate anchor');
+  source = source.replace(liveRefreshGateAnchor,
+    `${liveRefreshGateAnchor}\n  if (global.__crateLiveRefreshGate) await global.__crateLiveRefreshGate(projectId);\n`);
   const workspaceEvidenceGateAnchor = '    if (await shouldKeepObservedSourceFileForPackaging(file, project)) {';
   assert.equal(source.split(workspaceEvidenceGateAnchor).length - 1, 1, 'workspace race-test source anchor');
   source = source.replace(workspaceEvidenceGateAnchor,
@@ -18540,6 +18544,134 @@ for (const mode of ['unchanged context', 'account generation', 'account identity
     }
   });
 }
+
+test('Needs Save reminder ignores a complete snapshot from a poll whose evidence refresh was cancelled, then delivers it from the next current poll', async () => {
+  resetTestHomeWorkspace();
+  const doc = path.join(TEST_HOME, 'Desktop', 'cancelled-refresh-reminder.ai');
+  const link = path.join(TEST_HOME, 'Desktop', 'cancelled-refresh-reminder.png');
+  writeSyntheticAiFile(doc);
+  fs.writeFileSync(link, 'synthetic png');
+  const box = { phase: 'open', bump: false, projectId: null, bumps: 0 };
+  // Retire the operation scope inside the evidence refresh, before any mutation.
+  global.__crateLiveRefreshGate = async projectId => {
+    if (!box.bump || projectId !== box.projectId) return;
+    metadataTestHooks.getProjectOperationScope(box.projectId).revision += 1;
+    box.bumps += 1;
+  };
+  setIllustratorOpenedAfterActivationHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return { stdout: '123\n' };
+    if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: 'Adobe Illustrator\n' };
+    // During the retired poll Photoshop reports the link, so the closed snapshot
+    // still has a record to refresh (the refresh is what gets cancelled).
+    if (request.kind === 'exec' && String(request.command).includes('Adobe Photoshop')) return { stdout: box.bump ? 'Adobe Photoshop\n' : '' };
+    if (isOsascriptInvocation(request, 'crate-ps-poll.applescript')) return { stdout: `${link}\n` };
+    if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+      return box.phase === 'closed' ? { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' }
+        : { stdout: `DOC\t${doc}\tcancelled-refresh-reminder.ai\ttrue\ttrue\nLINK\t${doc}\tcancelled-refresh-reminder.ai\t${link}\ttrue\ttrue\nCOMPLETE\t1\t1\n` };
+    }
+    return { stdout: '' };
+  });
+  const startup = metadataTestHooks.controlLiveAppStartupPoll();
+  const project = await createProject('Cancelled refresh reminder');
+  box.projectId = project.id;
+  try {
+    try { await startup.release(); } finally { await startup.restore(); }
+    const poll = () => metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    const flags = () => {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      return stored.pendingFiles.map(row => !!metadataTestHooks.getPendingSourceSaveReminder(stored, row));
+    };
+    const sends = () => testRendererEvents.filter(event => event.channel === 'files:pending' && event.data?.projectId === project.id).length;
+    const safetyState = () => {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      return JSON.stringify({ rows: stored.pendingFiles.map(row => [row.path, row.captureState, row.captureReason]).sort(),
+        holds: Object.keys(stored.workingFileDirtyHolds?.records || {}).sort() });
+    };
+    assert.deepEqual(flags(), [true, true], 'precondition: both rows request a save');
+    const safetyBefore = safetyState();
+
+    box.phase = 'closed'; box.bump = true;
+    let before = sends();
+    await poll();
+    assert.equal(box.bumps, 1, 'the refresh was retired once');
+    assert.deepEqual(flags(), [true, true], 'a snapshot from a retired poll withdraws nothing');
+    assert.equal(sends() - before, 0, 'a retired poll emits nothing');
+    assert.equal(safetyState(), safetyBefore, 'rows and dirty holds are unchanged');
+
+    box.bump = false;
+    before = sends();
+    await poll();
+    assert.deepEqual(flags(), [false, false], 'the next current poll withdraws both reminders');
+    assert.equal(sends() - before, 1, 'and tells the renderer once');
+    before = sends();
+    await poll();
+    assert.equal(sends() - before, 0, 'an unchanged snapshot does not refresh again');
+
+    box.phase = 'open';
+    before = sends();
+    await poll();
+    assert.deepEqual(flags(), [true, true], 'reopening the unsaved document restores the reminder');
+    assert.equal(sends() - before, 1);
+    assert.equal(safetyState(), safetyBefore, 'rows and dirty holds are unchanged throughout');
+  } finally {
+    delete global.__crateLiveRefreshGate;
+    await startup.restore();
+  }
+});
+
+test('Needs Save reminder ignores a nothing-to-stage snapshot whose operation scope changed during the native call', async () => {
+  resetTestHomeWorkspace();
+  const doc = path.join(TEST_HOME, 'Desktop', 'scope-moved-reminder.ai');
+  const link = path.join(TEST_HOME, 'Desktop', 'scope-moved-reminder.png');
+  writeSyntheticAiFile(doc);
+  fs.writeFileSync(link, 'synthetic png');
+  const box = { phase: 'open', bump: false, projectId: null, bumps: 0 };
+  setIllustratorOpenedAfterActivationHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return { stdout: '123\n' };
+    if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: 'Adobe Illustrator\n' };
+    if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+      if (box.bump && box.projectId) {
+        metadataTestHooks.getProjectOperationScope(box.projectId).revision += 1;
+        box.bumps += 1; box.bump = false;
+      }
+      return box.phase === 'closed' ? { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' }
+        : { stdout: `DOC\t${doc}\tscope-moved-reminder.ai\ttrue\ttrue\nLINK\t${doc}\tscope-moved-reminder.ai\t${link}\ttrue\ttrue\nCOMPLETE\t1\t1\n` };
+    }
+    return { stdout: '' };
+  });
+  const startup = metadataTestHooks.controlLiveAppStartupPoll();
+  const project = await createProject('Scope moved reminder');
+  box.projectId = project.id;
+  try {
+    try { await startup.release(); } finally { await startup.restore(); }
+    const poll = () => metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    const flags = () => {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      return stored.pendingFiles.map(row => !!metadataTestHooks.getPendingSourceSaveReminder(stored, row));
+    };
+    const events = () => testRendererEvents.filter(event => event.data?.projectId === project.id &&
+      ['project:updated', 'files:updated', 'files:pending'].includes(event.channel)).length;
+    assert.deepEqual(flags(), [true, true], 'precondition: both rows request a save');
+
+    box.phase = 'closed'; box.bump = true;
+    let before = events();
+    await poll();
+    assert.equal(box.bumps, 1, 'the scope changed during the native call');
+    assert.equal(events() - before, 0, 'a superseded snapshot emits nothing');
+    assert.deepEqual(flags(), [true, true], 'and withdraws nothing');
+
+    before = events();
+    await poll();
+    assert.deepEqual(flags(), [false, false], 'the next current poll withdraws both reminders');
+    assert.equal(testRendererEvents.slice(-2).some(event => event.channel === 'files:pending' && event.data?.projectId === project.id), true);
+    assert.ok(events() - before >= 1, 'and tells the renderer');
+    before = events();
+    await poll();
+    assert.equal(events() - before, 0, 'an unchanged snapshot does not refresh again');
+  } finally {
+    await startup.restore();
+  }
+});
 
 test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
   const first = await createProject('Single watcher A');
