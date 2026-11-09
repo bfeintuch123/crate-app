@@ -1331,6 +1331,9 @@ function productionQuickPackageResultsFixture() {
         // Disabled state (not produced by the current flow) keeps geometry and native disabled behavior.
         await show(success);
         openFolder.disabled = true;
+        // Read the settled disabled style: under prefers-reduced-motion the app's
+        // reduced-motion rule turns every state change into a 0.01ms transition.
+        for (const animation of openFolder.getAnimations()) animation.finish();
         const disabledMetrics = measure();
         // Diagnostic only: CI read the enabled background here; record why.
         const disabledComputed = getComputedStyle(openFolder);
