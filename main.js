@@ -4303,7 +4303,13 @@ function beginWorkingSourceScan(projectId, filePath, parentCurrent, attempt = nu
     return !!row && (!preparingExcluded || excludedPreparation(latest, row) === true) && getWorkingSourceSelection(latest, row).revision === selection.revision &&
       latest.workingSourceVerification?.[key]?.attempt === attempt;
   };
-  const current = () => parentCurrent() && ownsReceipt(getProjects().find(item => item.id === projectId));
+  // A per-check read is not used while preparing an excluded source, so the
+  // Replace capability callback always receives a fresh project.
+  const current = (read = null) => {
+    if (!parentCurrent(read)) return false;
+    const checkRead = read && !preparingExcluded ? projectCheckReadFor(read, projectId) : null;
+    return ownsReceipt(checkRead ? checkRead.project : getProjects().find(item => item.id === projectId));
+  };
   const reserved = mutateProject(projectId, latest => {
     if (!parentCurrent() || isWorkingSourceReceiptWriteBlocked(latest, file)) return false;
     latest.workingSourceVerification = { ...(latest.workingSourceVerification || {}), [key]: {
@@ -4481,9 +4487,10 @@ async function verifyRestoredWorkingSource(projectId, file, attempt, operation, 
   workingSourceScanOperations.add(lifecycle);
   try {
     const key = getAssetBaselineSourceRecoveryRouteKey({ id: projectId }, file);
-    const current = () => {
-      const project = getProjects().find(item => item.id === projectId);
-      return !!operation?.current() && !!project &&
+    const current = (read = null) => {
+      const checkRead = read ? projectCheckReadFor(read, projectId) : null;
+      const project = checkRead ? checkRead.project : getProjects().find(item => item.id === projectId);
+      return !!operation?.current(read) && !!project &&
         project.workingSourceVerification?.[key]?.attempt === attempt;
     };
     if (!current() || isWorkingSourceReceiptWriteBlocked(getProjects().find(item => item.id === projectId), file)) return;
@@ -4758,6 +4765,9 @@ function hasWorkingFileDirtyHold(project, file) {
 }
 
 // Renderer contract is an allowlist, never raw extractor errors or paths.
+// A failed receipt's reason belongs to its own attempt: Retry and each scan
+// reservation replace it, unlike the inherited unresolved list.
+const WORKING_FILE_VERIFICATION_TIMEOUT_REASONS = new Set(['scan-timeout', 'add_files_scan_timeout']);
 function getWorkingFileVerificationReason(project, source, receipt) {
   const inDesign = path.extname(source.path || '').toLowerCase() === '.indd';
   if (hasInvalidWorkingSourceReceipt(project, source) && !hasWorkingSourceRecoveryRecord(project, source) &&
@@ -4765,8 +4775,23 @@ function getWorkingFileVerificationReason(project, source, receipt) {
   if (!inDesign) {
     if (hasWorkingFileDirtyHold(project, source)) return 'working-file-save-required';
     if (receipt?.status === 'pending') return 'working-file-verification-pending';
-    if (receipt && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
-    if (receipt?.unresolved?.length) return 'working-file-dependencies-unverified';
+    // Explicit failure evidence precedes the identity fallback. Retry clears the
+    // saved identity before scanning, so a cleared identity is not a change.
+    if (!getWorkingSourceDiskIdentity(source)) return 'working-file-source-unavailable';
+    if (!receipt) return 'saved-file-verification-required';
+    if (receipt.status === 'failed' && WORKING_FILE_VERIFICATION_TIMEOUT_REASONS.has(receipt.reason)) return 'working-file-verification-timed-out';
+    // Only a recorded identity that differs proves a change. Stale and
+    // source-bytes-changed labels are also written for digest read failures.
+    if (receipt.sourceIdentity && !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'working-file-source-changed';
+    if (receipt.status === 'failed') return 'working-file-verification-failed';
+    if (receipt.status === 'stale' || !isWorkingSourceDiskIdentityCurrent(source, receipt)) return 'saved-file-verification-required';
+    // Receipts keep only bounded reason codes, never the record version. These
+    // name what was observed; they do not claim the whole file is unsupported.
+    const unresolved = new Set(receipt.unresolved.map(item => item.reason));
+    if (unresolved.has('unsupported-link-form')) return 'working-file-link-records-unrecognized';
+    if (unresolved.has('unresolved-link-record-framing') || unresolved.has('unexplained-link-tail')) return 'working-file-link-records-unreadable';
+    if (unresolved.has('reference-coverage-limit') || unresolved.has('coverage-limit')) return 'working-file-link-coverage-limit';
+    if (unresolved.size) return 'working-file-dependencies-unverified';
     return 'saved-file-verification-required';
   }
   if (hasWorkingFileDirtyHold(project, source)) return 'indesign-save-required';
@@ -7155,7 +7180,7 @@ async function runBoundedScanOnOpenQueue(projectId, sourcePaths, activationToken
                 activationToken,
                 {
                   activationToken,
-                  current: () => operation.current() && scanLease.current(),
+                  current: read => operation.current(read) && scanLease.current(read),
                   onCancel: scanLease.onCancel,
                   adoptScope: scope => operation.adoptScope(scope) && scanLease.current(),
                   currentIgnoringScope: () => operation.currentIgnoringScope?.() === true,
@@ -8318,8 +8343,12 @@ function incrementPackageUsage() {
 
 // v2.4.2: Validated accessor — always returns an array even if store is corrupted/missing
 function getProjects() {
+  return readProjectsFromStore().projects;
+}
+
+function readProjectsFromStore() {
   const val = store.get('projects', []);
-  if (!Array.isArray(val)) return [];
+  if (!Array.isArray(val)) return { projects: [], normalized: false };
 
   let changed = false;
   for (const project of val) {
@@ -8331,7 +8360,39 @@ function getProjects() {
     clearFileVisualProjectCache();
     store.set('projects', val);
   }
-  return val;
+  return { projects: val, normalized: changed };
+}
+
+// One fresh project read shared by the read-only liveness predicates evaluated
+// inside a single synchronous PSD transaction check. The check opens it, passes
+// it explicitly and closes it before returning, so it never crosses an await,
+// a callback turn, a store write or publication; a closed or foreign read is
+// ignored and the predicate reads the store itself. It exposes only the checked
+// project and the sole Watching project id. Account, lease and timer,
+// activation, scope, digest and file identity checks stay live. When acquiring
+// the read ran a normalizer write-back, it is not shared: every predicate then
+// reads fresh, exactly as without a read.
+const projectCheckReads = new WeakSet();
+
+function openProjectCheckRead(projectId) {
+  const { projects, normalized } = readProjectsFromStore();
+  if (normalized) return null;
+  const project = projects.find(item => item && item.id === projectId);
+  const watching = projects.filter(item => item && item.status === 'watching');
+  let open = true;
+  const read = Object.freeze({
+    projectId,
+    get open() { return open; },
+    get project() { return open ? project : undefined; },
+    get soleWatchingProjectId() { return open && watching.length === 1 ? watching[0].id : undefined; },
+    close() { open = false; },
+  });
+  projectCheckReads.add(read);
+  return read;
+}
+
+function projectCheckReadFor(read, projectId) {
+  return projectCheckReads.has(read) && read.open && read.projectId === projectId ? read : null;
 }
 
 function safelyEnsureProjectProvenance(project) {
@@ -10609,10 +10670,12 @@ function repairPersistedWatchingProjects() {
   return retainedProject;
 }
 
-function isActiveWatchingProject(projectId, activationToken = null) {
+function isActiveWatchingProject(projectId, activationToken = null, read = null) {
   if (activationToken !== null && watchingActivationTokens.get(projectId) !== activationToken) {
     return false;
   }
+  const checkRead = read ? projectCheckReadFor(read, projectId) : null;
+  if (checkRead) return checkRead.soleWatchingProjectId === projectId;
   const watchingProjects = getProjects().filter(project => project && project.status === 'watching');
   return watchingProjects.length === 1 && watchingProjects[0].id === projectId;
 }
@@ -10625,8 +10688,8 @@ function getActiveWatchingActivationToken(projectId) {
   return activationToken;
 }
 
-function isBoundWatchingActivationCurrent(projectId, activationToken) {
-  return activationToken === null || isActiveWatchingProject(projectId, activationToken);
+function isBoundWatchingActivationCurrent(projectId, activationToken, read = null) {
+  return activationToken === null || isActiveWatchingProject(projectId, activationToken, read);
 }
 
 // Generic change events historically follow fresh accepted-source state, not a
@@ -10658,7 +10721,7 @@ function captureProjectOperation(projectId) {
     : null;
   let scopeRevision = illustratorActivationScopes.get(projectId)?.revision;
   let open = true;
-  const baseCurrent = () => {
+  const baseCurrent = (read = null) => {
     if (!open) return false;
     try {
       assertAccountCurrent();
@@ -10667,7 +10730,8 @@ function captureProjectOperation(projectId) {
       open = false;
       return false;
     }
-    const latest = getProjects().find(item => item && item.id === projectId);
+    const checkRead = read ? projectCheckReadFor(read, projectId) : null;
+    const latest = checkRead ? checkRead.project : getProjects().find(item => item && item.id === projectId);
     const currentToken = latest?.status === 'watching'
       ? watchingActivationTokens.get(projectId) ?? null
       : null;
@@ -10677,8 +10741,8 @@ function captureProjectOperation(projectId) {
   return {
     activationToken,
     close() { open = false; },
-    current() {
-      return baseCurrent() && (activationToken === null ||
+    current(read = null) {
+      return baseCurrent(read) && (activationToken === null ||
         illustratorActivationScopes.get(projectId)?.revision === scopeRevision);
     },
     // Account, status, generation and activation only. Used solely to retire an
@@ -14810,7 +14874,7 @@ function acquireAddFilesPsdTransferSlot(scanLease) {
   });
 }
 
-function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSlot) {
+function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSlot, openCheckRead = null) {
   const sessionId = crypto.randomBytes(16).toString('hex');
   const extractDir = path.join(os.tmpdir(), 'crate-psd-extract-' + projectId);
   const stages = [];
@@ -14836,8 +14900,16 @@ function createAddFilesPsdTransaction(projectId, scanLease, isCurrent, releaseSl
   let pendingIO = Promise.resolve();
   let terminal = false;
   let retirement = null;
+  // Runs per worker message and before each ack. One optional project read is
+  // shared by this synchronous check's predicates and closed before it returns.
   const check = () => {
-    if (terminal || !scanLease.current() || !isCurrent()) throw new Error('add_files_parser_cancelled');
+    if (terminal) throw new Error('add_files_parser_cancelled');
+    const read = openCheckRead ? openCheckRead() : null;
+    try {
+      if (!scanLease.current(read) || !isCurrent(read)) throw new Error('add_files_parser_cancelled');
+    } finally {
+      read?.close();
+    }
   };
   const invalid = () => { throw new Error('asset_baseline_psd_worker_invalid_result'); };
   const validInteger = value => Number.isSafeInteger(value) && value >= 0;
@@ -16940,7 +17012,7 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   if (!options.addFilesAttempt && !options.workingSourceLease) {
     try {
       const outcome = await runBoundedAddFilesScan(lease => runScanOnOpen(projectId, filePath, activationToken,
-        { activationToken, current: () => operation.current() && lease.current(), onCancel: lease.onCancel,
+        { activationToken, current: read => operation.current(read) && lease.current(read), onCancel: lease.onCancel,
           adoptScope: scope => operation.adoptScope(scope) && lease.current(),
           currentIgnoringScope: () => operation.currentIgnoringScope?.() === true },
         { ...options, workingSourceLease: lease, addFilesAttempt: path.extname(filePath).toLowerCase() === '.psd' &&
@@ -16954,14 +17026,21 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
   const scanLease = options.addFilesAttempt || options.workingSourceLease;
   let baselineScan = null;
   let workingScan = null;
-  const parentCurrent = () => isBoundWatchingActivationCurrent(projectId, activationToken) && !!operation?.current();
+  // An optional per-check project read (openProjectCheckRead) is passed through
+  // explicitly; every caller without one reads the store as before.
+  const parentCurrent = (read = null) => isBoundWatchingActivationCurrent(projectId, activationToken, read) &&
+    !!operation?.current(read);
   // A dormant side receipt must not retire a legitimate legacy baseline scan.
   // Engagement or an explicit Restore still binds publication to its exact
   // verification attempt, including engagement that occurs during this scan.
-  const isCurrent = () => parentCurrent() && (!workingScan ||
+  const checkedProject = read => {
+    const checkRead = read ? projectCheckReadFor(read, projectId) : null;
+    return checkRead ? checkRead.project : getProjects().find(project => project.id === projectId);
+  };
+  const isCurrent = (read = null) => parentCurrent(read) && (!workingScan ||
     (!options.workingSourceAttempt && options.verifySelectedSource !== true &&
-      !hasWorkingSourceSelectionState(getProjects().find(project => project.id === projectId))) ||
-    workingScan.current()) &&
+      !hasWorkingSourceSelectionState(checkedProject(read))) ||
+    workingScan.current(read)) &&
     (!baselineScan || (!baselineScan.cancelled && assetBaselineScans.get(projectId) === baselineScan.state));
   const ext = path.extname(filePath).toLowerCase();
   if (!SCAN_ON_OPEN_EXTENSIONS.has(ext)) { if (ownsOperation) operation?.close(); return; }
@@ -17021,7 +17100,10 @@ async function runScanOnOpen(projectId, filePath, activationToken = null, operat
 
   if (ext === '.psd' && options.addFilesAttempt) {
     const releaseSlot = await acquireAddFilesPsdTransferSlot(options.addFilesAttempt);
-    try { psdTransaction = createAddFilesPsdTransaction(projectId, options.addFilesAttempt, isCurrent, releaseSlot); }
+    try {
+      psdTransaction = createAddFilesPsdTransaction(projectId, options.addFilesAttempt, isCurrent, releaseSlot,
+        () => openProjectCheckRead(projectId));
+    }
     catch (error) { releaseSlot(); throw error; }
   }
   console.log(`[crate] scan-on-open: scanning ${path.basename(filePath)}`);
@@ -19529,8 +19611,8 @@ registerTrustedIpcHandler('projects:add-files', async (event, projectId, request
       cancelled = true;
       baseOperation.close();
     },
-    current() {
-      return !cancelled && baseOperation.current();
+    current(read = null) {
+      return !cancelled && baseOperation.current(read);
     },
     currentIgnoringScope() {
       return !cancelled && baseOperation.currentIgnoringScope();

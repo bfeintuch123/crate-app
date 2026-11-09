@@ -4836,6 +4836,13 @@ function getWorkingFileVerificationGuidance(reason, project) {
     case 'working-source-recovery-unsupported': return { text: 'Retained source evidence cannot be resolved by Retry. Contact Crate support before packaging. The evidence is preserved.', action: null };
     case 'working-source-recovery-identity-changed': return { text: 'This source changed after recovery began. Do not replace or remove its retained evidence. Contact Crate support to review the original source.', action: null };
     case 'working-file-source-changed': return { text: 'File changed. Verify again.', action: 'Retry verification' };
+    case 'working-file-verification-timed-out': return { text: 'Verification timed out. Try again.', action: 'Retry verification' };
+    case 'working-file-source-unavailable': return { text: 'Crate can’t find or read this file. Check that it’s available, then try again.', action: 'Retry verification' };
+    case 'working-file-verification-failed': return { text: 'Verification couldn’t finish. Try again.', action: 'Retry verification' };
+    // Format findings describe some records only and may persist across Retry.
+    case 'working-file-link-records-unrecognized': return { text: 'Some link records in this file weren’t recognized, so its links can’t be verified. Packaging stays blocked.', action: 'Retry verification' };
+    case 'working-file-link-records-unreadable': return { text: 'Some link records in this file couldn’t be read completely, so its links can’t be verified. Packaging stays blocked.', action: 'Retry verification' };
+    case 'working-file-link-coverage-limit': return { text: 'This file reached a verification limit, so its links can’t be fully verified. Packaging stays blocked.', action: 'Retry verification' };
     case 'working-file-dependencies-unverified': return { text: 'Linked assets unverified. Check availability, then retry.', action: 'Retry verification' };
     case 'working-file-verification-pending': return { text: 'Verification pending. Wait or retry.', action: 'Retry verification' };
     default: return { text: 'Saved file and links unverified. Check availability, then retry.', action: 'Retry verification' };
@@ -5006,7 +5013,10 @@ async function submitWorkingFileChoice(projectId, entry, choice, predecessorIden
       predecessorIdentity: choice === 'replace' ? predecessorIdentity : null });
     if (!current()) return false;
     showToast(result?.success ? (choice === 'retry' ? 'Saved file verified. Choose what to keep.' : choice === 'recover' ? 'Review the recovered working-file decisions.' : 'Working-file choice saved.')
-      : result?.error === 'working_file_saved_observation_required' ? 'Save in the app and resume watching to obtain a fresh saved-file observation.' : 'The files changed or could not be verified. Review the current files before choosing again.');
+      : result?.error === 'working_file_saved_observation_required' ? 'Save in the app and resume watching to obtain a fresh saved-file observation.'
+        // A finished Retry that is still unverified reports its reason on the card.
+        : choice === 'retry' && result?.error === 'continuation_verification_required' ? 'Not verified yet. See the details on the working file.'
+        : 'The files changed or could not be verified. Review the current files before choosing again.');
     return result?.success === true;
   } catch (_) { if (current()) showToast('The choice could not be saved. Review the current files and try again.'); return false; }
   finally {
