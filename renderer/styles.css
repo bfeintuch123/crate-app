@@ -529,6 +529,18 @@ body {
   margin-bottom: 16px;
 }
 
+/* New-project status line: standard 8px below Cancel. While a project-creation
+   outcome is being recovered, it opens a 16px group with the 8px-spaced
+   "Check saved projects" button below it. */
+#project-creation-status {
+  margin-top: 8px;
+}
+
+#project-creation-status.is-recovery-status {
+  margin-top: 16px;
+  margin-bottom: 0;
+}
+
 /* ===== Privacy Hint ===== */
 .privacy-hint {
   font-size: 10px;
@@ -3083,6 +3095,7 @@ body {
 #btn-figma-scan-now,
 #btn-figma-connect,
 #btn-create-project,
+#btn-retry-project-recovery,
 #btn-confirm-package,
 #btn-cancel-package {
   min-height: 40px;
@@ -3113,6 +3126,7 @@ body {
 .v2-drop-zone .app-btn,
 #btn-create-project,
 #btn-cancel-project,
+#btn-retry-project-recovery,
 #btn-package,
 #btn-add-files,
 #btn-figma-scan-now,

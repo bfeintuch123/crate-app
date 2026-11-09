@@ -7744,6 +7744,94 @@ function settledRecoveryFixture(t) {
   };
 }
 const recoveryTurn = () => new Promise(setImmediate);
+const RECOVERY_UNCONFIRMED_STATUS = 'Crate couldn’t confirm whether this project was saved. Crate will check your saved projects so you can see if it’s there.';
+
+async function unconfirmedRecovery(t) {
+  // Production path: main rejects the settled create for a sign-in, and the
+  // automatic saved-project read then fails, leaving the recovery button.
+  const f = settledRecoveryFixture(t); const creating = f.start(); f.reject(new Error('Sign in to Crate to use your workspace.'));
+  await recoveryTurn(); f.reads[0].reject(new Error('read failed')); await recoveryTurn();
+  const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
+  return { f, creating, retry, status: f.elements['project-creation-status'],
+    projectsTab: f.document.querySelector('.app-tab[data-tab="projects"]'),
+    otherTab: f.document.querySelector('.app-tab[data-tab="current-project"]') };
+}
+
+test('2A recovery: unconfirmed result keeps creation locked and offers only a saved-project check', async t => {
+  const { f, retry, status } = await unconfirmedRecovery(t);
+  f.assertLocked('reconciling');
+  for (const id of ['btn-cancel-project', 'input-project-name']) assert.equal(f.elements[id].disabled, true, id);
+  assert.equal(f.elements['btn-create-project'].textContent, '▶ Start Watching');
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(retry.type, 'button'); assert.equal(retry.className, 'app-btn');
+  assert.equal(retry.textContent, 'Check saved projects'); assert.equal(retry.disabled, false);
+  assert.equal(retry.getAttribute('aria-describedby'), 'project-creation-status');
+  assert.equal(retry.getAttribute('aria-busy'), 'false');
+  assert.equal(status.textContent, RECOVERY_UNCONFIRMED_STATUS);
+  assert.equal(status.getAttribute('role'), 'status'); assert.equal(status.getAttribute('aria-live'), 'polite');
+  assert.equal(status.classList.contains('is-recovery-status'), true);
+  assert.equal(f.reads.length, 1); assert.equal(f.creates(), 1);
+  assert.equal(f.document.activeElement, f.document.body, 'automatic recovery does not move focus');
+});
+
+for (const outcome of ['found', 'not-found']) test(`2A recovery: ${outcome} check unlocks to saved projects without repeating createProject`, async t => {
+  const { f, creating, retry, status, projectsTab } = await unconfirmedRecovery(t);
+  retry.focus(); retry.click(); await recoveryTurn();
+  assert.equal(f.reads.length, 2); f.assertLocked('reconciling');
+  assert.equal(retry.disabled, true); assert.equal(retry.textContent, 'Checking…'); assert.equal(retry.getAttribute('aria-busy'), 'true');
+  assert.equal(status.textContent, 'Checking your saved projects…');
+  assert.equal(status.classList.contains('is-recovery-status'), true);
+  const projects = outcome === 'found' ? f.list() : [{ id: 'selected', files: [] }];
+  f.reads[1].resolve(projects); await creating; await recoveryTurn();
+  assert.equal(f.evaluate('projectCreationPhase'), 'idle');
+  assert.equal(f.creates(), 1, 'recovery never repeats createProject'); assert.equal(f.reads.length, 2);
+  assert.deepEqual(JSON.parse(f.evaluate('JSON.stringify(state.projects)')), projects);
+  assert.equal(status.textContent, 'Review your saved projects before starting another.');
+  assert.equal(status.classList.contains('is-recovery-status'), false);
+  assert.equal(retry.classList.contains('hidden'), true);
+  assert.equal(f.elements['new-project-form'].classList.contains('hidden'), true, 'the saved projects list is shown');
+  assert.equal(f.elements['btn-create-project'].disabled, false);
+  assert.equal(f.elements['btn-create-project'].textContent, '▶ Start Watching');
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(f.document.activeElement, projectsTab, 'focus moves to Projects instead of the hidden form');
+});
+
+for (const failure of ['error', 'deadline']) test(`2A recovery: ${failure} on a user check returns focus to Check saved projects`, async t => {
+  const { f, retry, status } = await unconfirmedRecovery(t);
+  retry.focus(); retry.click(); await recoveryTurn();
+  // Chromium moves focus off a button once it becomes disabled.
+  f.document.activeElement = f.document.body;
+  if (failure === 'error') f.reads[1].reject(new Error('read failed')); else f.fire(10000);
+  await recoveryTurn();
+  f.assertLocked('reconciling'); assert.equal(f.creates(), 1);
+  assert.equal(retry.disabled, false); assert.equal(retry.textContent, 'Check saved projects');
+  assert.equal(retry.getAttribute('aria-busy'), 'false');
+  assert.equal(status.textContent, RECOVERY_UNCONFIRMED_STATUS);
+  assert.equal(f.document.activeElement, retry);
+});
+
+test('2A recovery: settling never takes focus the user moved elsewhere', async t => {
+  const failed = await unconfirmedRecovery(t);
+  failed.retry.click(); await recoveryTurn();
+  failed.otherTab.focus(); failed.f.reads[1].reject(new Error('read failed')); await recoveryTurn();
+  assert.equal(failed.f.document.activeElement, failed.otherTab);
+  failed.retry.click(); await recoveryTurn();
+  failed.otherTab.focus(); failed.f.reads[2].resolve(failed.f.list()); await recoveryTurn();
+  assert.equal(failed.f.evaluate('projectCreationPhase'), 'idle');
+  assert.equal(failed.f.document.activeElement, failed.otherTab);
+});
+
+test('2A recovery spacing and busy state stay off ordinary project-creation messages', async t => {
+  const f = settledRecoveryFixture(t); const creating = f.start();
+  const status = f.elements['project-creation-status'];
+  assert.equal(status.textContent, 'Starting project. Please wait.');
+  assert.equal(status.classList.contains('is-recovery-status'), false);
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'true', 'creating is the busy create state');
+  f.reject(new Error('transport disappeared')); await creating;
+  f.assertLocked('unresolved'); assert.match(status.textContent, /Restart Crate before trying again/);
+  assert.equal(status.classList.contains('is-recovery-status'), false);
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+});
 
 for (const id of [1, 2]) test(`recovery matrix 01: pending create remains exclusive across identity ${id}`, async t => {
   const f = settledRecoveryFixture(t); const creating = f.start();
@@ -7861,10 +7949,13 @@ for (const failure of ['error', 'deadline', 'invalid-list']) test(`recovery matr
   await recoveryTurn(); f.assertLocked('reconciling');
   const retry = f.elements['new-project-form'].children.find(child => child.id === 'btn-retry-project-recovery');
   assert.ok(retry); assert.equal(retry.disabled, false); assert.equal(retry.classList.contains('hidden'), false);
-  assert.equal(retry.textContent, 'Check saved projects again');
+  assert.equal(retry.textContent, 'Check saved projects');
   assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false');
+  assert.equal(f.elements['project-creation-status'].textContent, RECOVERY_UNCONFIRMED_STATUS);
   retry.click(); retry.click(); await recoveryTurn();
   assert.equal(f.reads.length, 2, 'double retry coalesces'); f.assertLocked('reconciling');
+  assert.equal(retry.textContent, 'Checking…'); assert.equal(retry.getAttribute('aria-busy'), 'true');
+  assert.equal(f.elements['btn-create-project'].getAttribute('aria-busy'), 'false', 'Start Watching is disabled, not busy');
   f.reads[1].resolve(f.list()); await creating; await recoveryTurn(); f.assertRecovered();
   if (failure === 'deadline') { f.reads[0].resolve([{ id: 'late', files: [] }]); await recoveryTurn(); f.assertRecovered(); }
   assert.equal(f.snapshots.length, 0);

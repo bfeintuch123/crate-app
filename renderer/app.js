@@ -1029,6 +1029,7 @@ let projectCreationAttemptId = 0;
 let projectCreationRecoveryRead = null;
 let projectCreationFollowUpRead = null;
 let projectCreationRecoveryRetry = null;
+let projectCreationRecoveryFocusPending = false;
 const PROJECT_RECOVERY_READ_TIMEOUT_MS = 10_000;
 
 function projectListReadIsCurrent(epoch) {
@@ -1045,7 +1046,6 @@ function getProjectCreationStatus() {
     status = document.createElement('div');
     status.id = 'project-creation-status';
     status.className = 'form-subtitle';
-    status.style.marginTop = '8px';
     $('#new-project-form').appendChild(status);
   }
   status.setAttribute('role', 'status');
@@ -1068,13 +1068,14 @@ function setProjectCreationPhase(phase) {
   if (createButton) {
     const atCap = state.projects.length >= MAX_PROJECTS;
     createButton.disabled = locked || atCap;
-    createButton.textContent = phase === 'reconciling'
-      ? (busy ? 'Checking projects\u2026' : 'Check saved projects to continue')
-      : phase === 'creating'
+    // While recovery is checking saved projects, Start Watching stays disabled
+    // under its own label; the recovery button carries the busy state.
+    createButton.textContent = phase === 'creating'
       ? 'Starting\u2026'
       : (phase === 'unresolved' ? 'Restart Crate to continue' : '\u25B6 Start Watching');
-    createButton.setAttribute('aria-busy', busy ? 'true' : 'false');
+    createButton.setAttribute('aria-busy', phase === 'creating' ? 'true' : 'false');
   }
+  if (phase === 'creating' || phase === 'unresolved') projectCreationRecoveryFocusPending = false;
 
   const cancelButton = $('#btn-cancel-project');
   if (cancelButton) cancelButton.disabled = locked;
@@ -1094,8 +1095,33 @@ function setProjectCreationPhase(phase) {
   if (projectCreationRecoveryRetry) {
     projectCreationRecoveryRetry.classList.toggle('hidden', phase !== 'reconciling');
     projectCreationRecoveryRetry.disabled = phase !== 'reconciling' || busy || !accountStatus.canUseWorkspace;
+    projectCreationRecoveryRetry.textContent = busy && phase === 'reconciling' ? 'Checking…' : 'Check saved projects';
+    projectCreationRecoveryRetry.setAttribute('aria-busy', busy && phase === 'reconciling' ? 'true' : 'false');
   }
+  // Recovery spacing groups the status line with the recovery button only;
+  // other project-creation messages keep the standard status spacing.
+  $('#project-creation-status')?.classList.toggle('is-recovery-status', phase === 'reconciling');
   if (phase === 'creating') setProjectCreationStatus('Starting project. Please wait.');
+}
+
+// A user-activated recovery check returns focus once it settles, but only if
+// focus was lost while the button was disabled or the form was hidden.
+function isProjectCreationFocusLost() {
+  const active = document.activeElement;
+  return !active || active === document.body || active.disabled === true || !!active.closest?.('.hidden');
+}
+
+function settleProjectCreationRecoveryFocus() {
+  if (!projectCreationRecoveryFocusPending) return;
+  if (projectCreationPhase === 'reconciling') {
+    const retry = projectCreationRecoveryRetry;
+    if (!retry || projectCreationRecoveryRead || retry.disabled) return;
+    projectCreationRecoveryFocusPending = false;
+    if (isProjectCreationFocusLost()) retry.focus();
+    return;
+  }
+  projectCreationRecoveryFocusPending = false;
+  if (projectCreationPhase === 'idle' && isProjectCreationFocusLost()) $('.app-tab[data-tab="projects"]')?.focus();
 }
 
 function detachProjectCreationRecoveryRead() {
@@ -1118,11 +1144,15 @@ function renderProjectCreationRecovery() {
     const button = document.createElement('button');
     button.id = 'btn-retry-project-recovery';
     button.type = 'button';
-    button.className = 'btn btn-secondary';
-    button.textContent = 'Check saved projects again';
+    button.className = 'app-btn';
+    button.textContent = 'Check saved projects';
     button.style.marginTop = '8px';
+    button.setAttribute('aria-describedby', 'project-creation-status');
     button.addEventListener('click', () => {
-      if (!button.disabled) void requestProjectCreationRecovery();
+      if (button.disabled) return;
+      // Reads saved projects only; the original create is never repeated.
+      projectCreationRecoveryFocusPending = true;
+      void requestProjectCreationRecovery();
     });
     getProjectCreationStatus();
     $('#new-project-form').appendChild(button);
@@ -1130,9 +1160,9 @@ function renderProjectCreationRecovery() {
   }
   setProjectCreationPhase('reconciling');
   setProjectCreationStatus(projectCreationRecoveryRead
-    ? 'Checking saved projects before you can start another.'
+    ? 'Checking your saved projects…'
     : accountStatus.canUseWorkspace
-    ? 'Saved projects could not be checked. Check again before starting another.'
+    ? 'Crate couldn’t confirm whether this project was saved. Crate will check your saved projects so you can see if it’s there.'
     : 'Sign in to check saved projects before starting another.');
 }
 
@@ -1181,6 +1211,7 @@ function requestProjectCreationRecovery() {
         finishProjectCreationAttempt();
         setProjectCreationStatus('Review your saved projects before starting another.');
         renderProjects();
+        settleProjectCreationRecoveryFocus();
       }
     } finally {
       clearTimeout(owner.timer);
@@ -1191,6 +1222,7 @@ function requestProjectCreationRecovery() {
         const retry = owner.requestedAgain && accountStatus.canUseWorkspace;
         renderProjectCreationRecovery();
         if (retry) await requestProjectCreationRecovery();
+        else settleProjectCreationRecoveryFocus();
       }
     }
   })();
