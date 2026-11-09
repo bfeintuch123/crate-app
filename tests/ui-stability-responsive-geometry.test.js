@@ -1187,3 +1187,328 @@ test('geometry probe keeps its output bound and rejects oversized DOM', async t 
   mockGeometryBrowser(t, { ...probeResult, stdout: 'x'.repeat(8 * 1024 * 1024 + 1) });
   await assert.rejects(runGeometryProbe('fixture-browser', 1100, 760, '<!doctype html>'), /exceeded output limit/);
 });
+
+function productionQuickPackageResultsFixture() {
+  // Real Quick Package results markup, styles, renderer handlers, and the
+  // source-bound modal focus/keyboard script. Only openFolder IPC is replaced,
+  // and every displayed name and path is synthetic.
+  const modalScript = rendererIndex.match(/<script>(\(\(\) => \{\s*const modalConfigs[\s\S]*?)<\/script>/u);
+  assert.ok(modalScript, 'renderer/index.html must contain the source-bound modal focus script');
+  const html = rendererIndex
+    .replace(/<meta http-equiv="Content-Security-Policy"[^>]+>/u, '')
+    .replace(/<link[^>]+https:\/\/fonts\.googleapis\.com[^>]+>/u, '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gu, '')
+    .replace('<head>', `<head><base href="${new URL(`file://${rendererDir}/`).href}">`);
+  const probe = String.raw`
+    document.removeEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const settle = () => new Promise(resolve => queueMicrotask(resolve));
+        const opened = [];
+        window.crate = { openFolder: folderPath => { opened.push(folderPath); return Promise.resolve(); } };
+        setupEventListeners();
+        accountStatus = { revision: 1, state: 'signed_in', canUseWorkspace: true, identity: { id: 'geometry-account' }, message: '' };
+        renderAccount();
+        for (const tab of document.querySelectorAll('.app-tab')) tab.classList.toggle('active', tab.dataset.tab === 'quick-package');
+        for (const panel of document.querySelectorAll('.tab-content')) panel.classList.toggle('active', panel.id === 'tab-quick-package');
+        const browse = document.querySelector('#btn-v2-browse');
+        const modal = document.querySelector('#modal-v2-results');
+        const panel = modal.querySelector('.modal');
+        const done = document.querySelector('#btn-v2-done');
+        const openFolder = document.querySelector('#btn-v2-open-folder');
+        const outputDir = '/Users/synthetic-designer/Desktop/Crate Quick Packages/Synthetic_Quick_Package_Master';
+        const longStem = 'Synthetic_Client_Brand_Refresh_Hero_Banner_Final_Final_Approved_Round_3_Revised_Extended_Name_For_Wrapping';
+        const missing = name => ({ path: '/Users/synthetic-designer/Synthetic Links/' + name });
+        const scenarios = [
+          ['success', { masterFile: '/Users/synthetic-designer/Desktop/Synthetic_Quick_Package_Master.indd', assetsFound: 12, assetsCopied: 12, assetsMissing: [], outputDir }],
+          ['missing-assets', { masterFile: '/Users/synthetic-designer/Desktop/Synthetic_Quick_Package_Master.indd', assetsFound: 12, assetsCopied: 11, assetsMissing: [missing('Missing_Synthetic_Image.tif')], outputDir }],
+          ['long-names', {
+            masterFile: '/Users/synthetic-designer/Desktop/' + longStem + '_Master_Layout_2026-11-08.indd',
+            assetsFound: 1234, assetsCopied: 1194,
+            assetsMissing: Array.from({ length: 40 }, (_, index) => missing(longStem + '_Missing_Linked_Image_' + index + '.tif')),
+            outputDir,
+          }],
+        ];
+        const box = element => {
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+        };
+        const labelOffset = element => {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const label = range.getBoundingClientRect();
+          const button = element.getBoundingClientRect();
+          return {
+            x: (label.left + label.width / 2) - (button.left + button.width / 2),
+            y: (label.top + label.height / 2) - (button.top + button.height / 2),
+            fits: label.left >= button.left && label.right <= button.right,
+          };
+        };
+        const key = (target, keyName, shiftKey = false) => {
+          target.dispatchEvent(new KeyboardEvent('keydown', { key: keyName, shiftKey, bubbles: true, cancelable: true }));
+        };
+        let uncaught = 0;
+        window.addEventListener('error', event => { uncaught += 1; event.preventDefault(); });
+        const show = async result => {
+          browse.focus();
+          const shown = showV2Results(result);
+          await settle();
+          return shown;
+        };
+        const measure = () => {
+          const panelStyle = getComputedStyle(panel);
+          const panelBox = box(panel);
+          const style = element => {
+            const computed = getComputedStyle(element);
+            return {
+              background: computed.backgroundColor, color: computed.color,
+              borderColor: computed.borderTopColor, borderWidth: computed.borderTopWidth,
+              fontSize: computed.fontSize, fontWeight: computed.fontWeight,
+            };
+          };
+          return {
+            order: Array.from(modal.querySelector('.modal-actions').children).map(child => child.id),
+            done: box(done), open: box(openFolder),
+            doneLabel: labelOffset(done), openLabel: labelOffset(openFolder),
+            contentLeft: panelBox.left + panel.clientLeft + parseFloat(panelStyle.paddingLeft) + parseFloat(getComputedStyle(panel.querySelector('.modal-body')).paddingLeft),
+            contentRight: panelBox.left + panel.clientLeft + panel.clientWidth - parseFloat(panelStyle.paddingRight) - parseFloat(getComputedStyle(panel.querySelector('.modal-body')).paddingRight),
+            clipLeft: panelBox.left + panel.clientLeft,
+            clipRight: panelBox.left + panel.clientLeft + panel.clientWidth,
+            panelScrolls: panel.scrollHeight > panel.clientHeight,
+            panelOverflowX: panel.scrollWidth - panel.clientWidth,
+            actionsOverflowX: (actions => actions.scrollWidth - actions.clientWidth)(modal.querySelector('.modal-actions')),
+            doneStyle: style(done), openStyle: style(openFolder),
+            disabled: [done.disabled, openFolder.disabled],
+            actionsBox: box(modal.querySelector('.modal-actions')),
+            stats: Array.from(modal.querySelectorAll('.v2-result-stat')).map(stat => {
+              const textBox = element => {
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                return box(range);
+              };
+              return {
+                box: box(stat),
+                label: textBox(stat.querySelector('.v2-result-stat-label')),
+                value: textBox(stat.querySelector('.v2-result-stat-value')),
+              };
+            }),
+          };
+        };
+        const results = [];
+        for (const [name, result] of scenarios) {
+          const shown = await show(result);
+          const metrics = measure();
+          const initialFocus = document.activeElement?.id || null;
+          const focusRing = (() => {
+            const computed = getComputedStyle(done);
+            return { visible: done.matches(':focus-visible'), width: parseFloat(computed.outlineWidth) || 0, offset: parseFloat(computed.outlineOffset) || 0 };
+          })();
+          // Bring the actions into view in a scrolling panel before checking reachability.
+          openFolder.scrollIntoView({ block: 'nearest' });
+          const openBox = box(openFolder);
+          const panelBox = box(panel);
+          const openReachable = openBox.top >= panelBox.top && openBox.bottom <= panelBox.bottom;
+          results.push({
+            name, shown, initialFocus, focusRing, openReachable,
+            missingItems: modal.querySelectorAll('.v2-result-missing-item').length,
+            ...metrics,
+          });
+          done.click();
+          await settle();
+        }
+
+        // Keyboard: sequential focus order follows the visual top-to-bottom order,
+        // and Escape closes through Done without opening the folder.
+        const success = scenarios[0][1];
+        const keyboard = {};
+        await show(success);
+        keyboard.initial = document.activeElement?.id || null;
+        keyboard.sequentialOrder = Array.from(modal.querySelectorAll('button'))
+          .filter(button => button.tabIndex >= 0 && !button.disabled)
+          .map(button => button.id);
+        keyboard.doneVisuallyFirst = done.getBoundingClientRect().bottom <= openFolder.getBoundingClientRect().top;
+        openFolder.focus();
+        keyboard.openFolderFocusable = document.activeElement === openFolder;
+        done.focus();
+        // Observation only: the shared inline focus-trap helper throws in real Chromium
+        // (getComputedStyle(document)), so its scripted wrap and focus restore are a
+        // separate pre-existing defect outside this change.
+        key(done, 'Tab', true);
+        keyboard.observedShiftTabWrap = document.activeElement === openFolder;
+        done.focus();
+        key(done, 'Escape');
+        await settle();
+        keyboard.escapeCloses = modal.classList.contains('hidden') && opened.length === 0;
+        keyboard.observedFocusRestore = document.activeElement?.id || null;
+
+        // Disabled state (not produced by the current flow) keeps geometry and native disabled behavior.
+        await show(success);
+        openFolder.disabled = true;
+        // Read the settled disabled style: under prefers-reduced-motion the app's
+        // reduced-motion rule turns every state change into a 0.01ms transition.
+        for (const animation of openFolder.getAnimations()) animation.finish();
+        const disabledMetrics = measure();
+        // Diagnostic only: CI read the enabled background here; record why.
+        const disabledComputed = getComputedStyle(openFolder);
+        const diagnostics = {
+          matchesDisabled: openFolder.matches(':disabled'),
+          hasDisabledAttribute: openFolder.hasAttribute('disabled'),
+          matchesHover: openFolder.matches(':hover'),
+          background: disabledComputed.backgroundColor,
+          color: disabledComputed.color,
+          opacity: disabledComputed.opacity,
+          transition: disabledComputed.transitionProperty + ' ' + disabledComputed.transitionDuration,
+          animations: openFolder.getAnimations().map(animation => ({
+            type: animation.constructor.name, property: animation.transitionProperty || null, playState: animation.playState,
+          })),
+          disabledRules: Array.from(document.styleSheets)
+            .flatMap(sheet => { try { return Array.from(sheet.cssRules); } catch { return []; } })
+            .filter(rule => rule.selectorText && rule.selectorText.includes('.modal-btn-primary:disabled'))
+            .map(rule => rule.style.background || rule.style.backgroundColor),
+          grayToken: getComputedStyle(document.documentElement).getPropertyValue('--gray-300').trim(),
+          userAgent: navigator.userAgent,
+          media: ['(prefers-reduced-motion: reduce)', '(prefers-color-scheme: dark)', '(forced-colors: active)',
+            '(prefers-contrast: more)', '(hover: hover)'].filter(query => matchMedia(query).matches),
+        };
+        openFolder.focus();
+        const disabled = {
+          metrics: disabledMetrics,
+          diagnostics,
+          takesFocus: document.activeElement === openFolder,
+          clickOpens: (openFolder.click(), opened.length),
+          stillOpen: !modal.classList.contains('hidden'),
+        };
+        openFolder.disabled = false;
+        done.click();
+        await settle();
+
+        // Actions: Done closes without opening; Open Folder opens the output folder and closes.
+        await show(success);
+        done.click();
+        await settle();
+        const doneCloses = modal.classList.contains('hidden') && opened.length === 0;
+        await show(success);
+        openFolder.click();
+        await settle();
+        const openFolderOpensAndCloses = modal.classList.contains('hidden') && opened.length === 1 && opened[0] === outputDir;
+        await show({ ...success, outputDir: '' });
+        openFolder.click();
+        await settle();
+        const openFolderWithoutOutputCloses = modal.classList.contains('hidden') && opened.length === 1;
+        const reopens = await show(success);
+        done.click();
+        await settle();
+
+        const otherActionsDirection = ['modal-clear-all', 'modal-edit-figma-link']
+          .map(id => getComputedStyle(document.querySelector('#' + id + ' .modal-actions')).flexDirection);
+        document.querySelector('#geometry-result').textContent = JSON.stringify({
+          results, keyboard, disabled, doneCloses, openFolderOpensAndCloses,
+          openFolderWithoutOutputCloses, reopens, otherActionsDirection, devicePixelRatio: window.devicePixelRatio, uncaught,
+        });
+      } catch (error) {
+        document.querySelector('#geometry-result').textContent = JSON.stringify({ error: error.message });
+      }
+    });
+  `;
+  return html.replace('</body>', `<pre id="geometry-result"></pre><script src="app.js"></script><script>${modalScript[1]}</script><script>${probe}</script></body>`);
+}
+
+test('production renderer sizes Quick Package Complete Done exactly like Open Folder', {
+  skip: browser ? false : 'Chrome or Chromium is not available in this environment',
+  timeout: 120_000,
+}, async () => {
+  const near = (actual, expected, tolerance, message) => {
+    assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: ${actual} vs ${expected}`);
+  };
+  // 1100x732 is the content area of the 1100x760 minimum window in the audit capture.
+  const windows = [
+    [DESKTOP_WINDOW_MINIMUM.width, DESKTOP_WINDOW_MINIMUM.height],
+    [DESKTOP_WINDOW_MINIMUM.width, DESKTOP_WINDOW_MINIMUM.height - 28],
+    [1440, 900],
+    [1920, 1200],
+  ];
+  for (const [width, height] of windows) {
+    const metrics = await runGeometryProbe(browser, width, height, productionQuickPackageResultsFixture());
+    assert.equal(metrics.error, undefined);
+    assert.equal(metrics.devicePixelRatio, 1, 'standard 100% zoom');
+    assert.equal(metrics.results.length, 3);
+    for (const result of metrics.results) {
+      const label = `${width}x${height} ${result.name}`;
+      assert.equal(result.shown, true, `${label}: results modal must open`);
+      assert.equal(result.initialFocus, 'btn-v2-done', `${label}: Done keeps initial focus`);
+      assert.deepEqual(result.order, ['btn-v2-done', 'btn-v2-open-folder'], `${label}: action order`);
+      assert.deepEqual(result.disabled, [false, false], `${label}: both actions stay enabled`);
+      near(result.done.width, result.open.width, 0.5, `${label}: equal width`);
+      near(result.done.height, result.open.height, 0.5, `${label}: equal height`);
+      near(result.done.left, result.open.left, 0.5, `${label}: left edges aligned`);
+      near(result.done.right, result.open.right, 0.5, `${label}: right edges aligned`);
+      near(result.open.left, result.contentLeft, 0.5, `${label}: actions start at the modal content edge`);
+      near(result.open.right, result.contentRight, 0.5, `${label}: actions end at the modal content edge`);
+      assert.ok(result.done.bottom <= result.open.top, `${label}: Done stays above Open Folder`);
+      assert.ok(result.done.height >= 44, `${label}: 44px minimum target`);
+      for (const [name, offset] of [['Done', result.doneLabel], ['Open Folder', result.openLabel]]) {
+        near(offset.x, 0, 1, `${label}: ${name} label centered horizontally`);
+        near(offset.y, 0, 1, `${label}: ${name} label centered vertically`);
+        assert.equal(offset.fits, true, `${label}: ${name} label fits inside the button`);
+      }
+      // A long unbreakable subtitle can already overflow the clipped panel on the base;
+      // that subtitle wrapping is a separate decision. The action row must never overflow.
+      assert.ok(result.actionsOverflowX <= 0, `${label}: action row must not overflow horizontally`);
+      if (result.name !== 'long-names') assert.ok(result.panelOverflowX <= 0, `${label}: modal must not overflow horizontally`);
+      assert.equal(result.openReachable, true, `${label}: Open Folder can be scrolled fully into view`);
+      if (result.focusRing.visible) {
+        const ring = result.focusRing.width + result.focusRing.offset;
+        assert.ok(result.done.left - ring >= result.clipLeft, `${label}: Done focus ring is not clipped on the left`);
+        assert.ok(result.done.right + ring <= result.clipRight, `${label}: Done focus ring is not clipped on the right`);
+      }
+      assert.equal(result.doneStyle.background, 'rgba(0, 0, 0, 0)', `${label}: Done stays secondary`);
+      // Done keeps the shipped .modal-btn-secondary colours (gray-200 outline, gray-500 label).
+      assert.equal(result.doneStyle.borderColor, 'rgb(229, 231, 235)', `${label}: Done keeps the gray-200 outline`);
+      assert.equal(result.doneStyle.color, 'rgb(107, 114, 128)', `${label}: Done keeps the gray-500 label`);
+      assert.equal(result.openStyle.background, 'rgb(17, 17, 17)', `${label}: Open Folder stays primary`);
+      assert.equal(result.openStyle.color, 'rgb(255, 255, 255)', `${label}: Open Folder label stays white`);
+      assert.equal(result.doneStyle.borderWidth, result.openStyle.borderWidth, `${label}: equal border box`);
+      assert.equal(result.doneStyle.fontSize, result.openStyle.fontSize, `${label}: equal label size`);
+      // Each count is centered under its label, and the pair is centered over the full-width actions.
+      assert.equal(result.stats.length, 2, `${label}: two result stats`);
+      for (const [index, stat] of result.stats.entries()) {
+        near(stat.label.left + stat.label.width / 2, stat.box.left + stat.box.width / 2, 1, `${label}: stat ${index} label centered in its column`);
+        near(stat.value.left + stat.value.width / 2, stat.box.left + stat.box.width / 2, 1, `${label}: stat ${index} count centered under its label`);
+        assert.ok(stat.label.bottom <= stat.value.top + 0.5, `${label}: stat ${index} label stays above its count`);
+        assert.ok(stat.label.left >= stat.box.left - 0.5 && stat.label.right <= stat.box.right + 0.5, `${label}: stat ${index} label fits its column`);
+      }
+      near(result.stats[0].box.width, result.stats[1].box.width, 0.5, `${label}: stat columns share the width equally`);
+      near((result.stats[0].box.left + result.stats[0].box.width / 2 + result.stats[1].box.left + result.stats[1].box.width / 2) / 2,
+        result.actionsBox.left + result.actionsBox.width / 2, 1, `${label}: stats centered over the actions`);
+      near(result.stats[0].label.top, result.stats[1].label.top, 0.5, `${label}: stat labels share a baseline row`);
+    }
+    const [success, missingAssets, longNames] = metrics.results;
+    assert.equal(success.missingItems, 0);
+    assert.equal(missingAssets.missingItems, 1);
+    assert.equal(longNames.missingItems, 40);
+    const label = `${width}x${height}`;
+    assert.equal(metrics.keyboard.initial, 'btn-v2-done', `${label}: Done keeps initial focus`);
+    assert.deepEqual(metrics.keyboard.sequentialOrder, ['btn-v2-done', 'btn-v2-open-folder'], `${label}: Tab order matches action order`);
+    assert.equal(metrics.keyboard.doneVisuallyFirst, true, `${label}: Tab order matches visual order`);
+    assert.equal(metrics.keyboard.openFolderFocusable, true, `${label}: Open Folder is keyboard focusable`);
+    assert.equal(metrics.keyboard.escapeCloses, true, `${label}: Escape closes through Done without opening the folder`);
+    console.log(`# quick-package-disabled-diagnostics ${label} ${JSON.stringify(metrics.disabled.diagnostics)}`);
+    near(metrics.disabled.metrics.done.width, metrics.disabled.metrics.open.width, 0.5, `${label}: disabled Open Folder keeps equal width`);
+    near(metrics.disabled.metrics.done.height, metrics.disabled.metrics.open.height, 0.5, `${label}: disabled Open Folder keeps equal height`);
+    assert.notEqual(metrics.disabled.metrics.openStyle.background, 'rgb(17, 17, 17)', `${label}: disabled Open Folder keeps the disabled style`);
+    assert.equal(metrics.disabled.takesFocus, false, `${label}: disabled Open Folder does not take focus`);
+    assert.equal(metrics.disabled.clickOpens, 0, `${label}: disabled Open Folder does not open the folder`);
+    assert.equal(metrics.disabled.stillOpen, true, `${label}: disabled Open Folder does not close the modal`);
+    assert.equal(metrics.doneCloses, true, `${label}: Done closes without opening the folder`);
+    assert.equal(metrics.openFolderOpensAndCloses, true, `${label}: Open Folder opens the output folder and closes`);
+    assert.equal(metrics.openFolderWithoutOutputCloses, true, `${label}: Open Folder without an output folder only closes`);
+    assert.equal(metrics.reopens, true, `${label}: modal lease is released after closing`);
+    assert.deepEqual(metrics.otherActionsDirection, ['row', 'row'], `${label}: other modal action rows are unchanged`);
+    console.log(`# quick-package-geometry ${label} ${JSON.stringify(metrics.results.map(result => ({
+      name: result.name, done: [result.done.width, result.done.height], open: [result.open.width, result.open.height],
+      panelOverflowX: result.panelOverflowX, panelScrolls: result.panelScrolls, focusRing: result.focusRing,
+    })))} observed=${JSON.stringify({
+      shiftTabWrap: metrics.keyboard.observedShiftTabWrap, focusRestore: metrics.keyboard.observedFocusRestore, uncaught: metrics.uncaught,
+    })}`);
+  }
+});

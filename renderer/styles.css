@@ -2757,6 +2757,46 @@ body {
   white-space: nowrap;
 }
 
+/* Quick Package Complete: center each count under its label, and the pair over the full-width actions. */
+#modal-v2-results .v2-result-stats {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  column-gap: 16px;
+}
+
+#modal-v2-results .v2-result-stat {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+/* Quick Package Complete: stack Done above Open Folder as equal full-width rows. */
+#modal-v2-results .modal-actions {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+
+#modal-v2-results .modal-actions > button {
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  margin: 0;
+  padding: 12px 20px;
+  border: 1.5px solid transparent;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 18px;
+  text-align: center;
+}
+
+#modal-v2-results .modal-actions > .modal-btn-secondary {
+  border-color: var(--gray-200);
+}
+
 /* ===== Expandable File List (v2.5.0) ===== */
 .file-list-toggle {
   display: flex;
