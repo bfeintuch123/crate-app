@@ -141,7 +141,7 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
-  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null})', context);
+  api = vm.runInContext('({getWorkingSourceSelection, getWorkingSourceVerification, getWorkingSourceMembership, setWorkingSourceSelection, resolveWorkingFileChoice, getAssetBaselineSourceRecoveryRouteKey, selectProjectFilesForPackaging, beginWorkingSourceScan, collectWorkingSourceScanEvidence, publishWorkingSourceScan, failWorkingSourceScan, workingSourceScanLeases, workingSourceScanOperations, getWorkingSourceDiskIdentity, recordWorkingSourceContinuationCandidate, resolveWorkingSourceContinuation, getWorkingSourceContinuationPresentation, observeIllustratorWorkingSourceContinuation, refreshWorkingSourceLocators, retireInterruptedWorkingSourceScan: typeof retireInterruptedWorkingSourceScan === "function" ? retireInterruptedWorkingSourceScan : null, refreshWorkingSourceVerification, getWorkingFileVerificationReason})', context);
   const source = (name, fileId = name) => {
     const file = { path: `/Users/synthetic/${name}`, name, fileId, ext: path.extname(name), projectRole: 'source' };
     disk.set(file.path, Buffer.from('%PDF-1.7\n%%EOF\n'));
@@ -1302,3 +1302,23 @@ for (const mode of ['before-write', 'after-write']) {
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 }
+
+test('refresh digest read failure is not reported as a file change; a real identity change is', async () => {
+  const f = fixture(), a = f.source('Original.ai');
+  f.project.files.push(a);
+  await f.command(a, 'exclude'); await f.command(a, 'restore');
+  const reason = () => f.api.getWorkingFileVerificationReason(f.project, a, f.api.getWorkingSourceVerification(f.project, a));
+  assert.equal(f.api.getWorkingSourceVerification(f.project, a).status, 'scanned');
+  // Same stat identity; the digest read fails (synthetic EIO).
+  f.setDigestGate(async () => { throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' }); });
+  await f.api.refreshWorkingSourceVerification(f.project.id);
+  const stale = f.api.getWorkingSourceVerification(f.project, a);
+  assert.equal(stale.status, 'stale'); assert.equal(stale.reason, 'source-bytes-changed');
+  assert.ok(f.api.getWorkingSourceDiskIdentity(a), 'file still present');
+  assert.notEqual(reason(), 'working-file-source-changed');
+  assert.equal(reason(), 'saved-file-verification-required');
+  // A recorded identity that no longer matches is independent proof of change.
+  f.setDigestGate(null);
+  f.disk.set(a.path, Buffer.from('%PDF-1.7\nchanged synthetic bytes\n%%EOF\n'));
+  assert.equal(reason(), 'working-file-source-changed');
+});
