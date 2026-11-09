@@ -1062,6 +1062,7 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
 module.exports.__crateMetadataTestHooks = {
   pruneLiveEvidenceLedger, getPendingSourceSaveReminder,
   forgetSourceSaveReminderPresence(projectId) { sourceSaveReminderPresence.delete(projectId); },
+  hasSourceSaveReminderPresence(projectId) { return sourceSaveReminderPresence.has(projectId); },
   controlLiveAppStartupPoll() {
     const priorSchedule = scheduleWatcherStartupTimer, priorPoll = pollPsForProject;
     const scheduled = [];
@@ -18321,12 +18322,18 @@ test('Needs Save reminder is withdrawn when a complete InDesign snapshot no long
   // Reminder presentation only: rows, the ledger's unsaved observations and the
   // durable dirty holds that block packaging are never erased by an absence.
   const withoutTime = value => { const copy = { ...value }; delete copy.observedAt; return copy; };
+  // Keys are computed while every file exists: normalization resolves symlinks
+  // (for example /var -> /private/var) only for paths that are still on disk.
+  const ledgerKeys = [docA, linkA, docB, linkB].map(liveEvidenceKeyForTest);
   const safetyState = async () => {
     const stored = await getProject(project.id);
     return JSON.stringify({
       pending: stored.pendingFiles.map(row => [row.path, row.captureState, row.captureReason]).sort(),
       files: stored.files.length,
-      ledger: [docA, linkA, docB, linkB].map(filePath => withoutTime(stored.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(filePath)].latest)),
+      ledger: ledgerKeys.map(key => {
+        assert.ok(stored.liveEvidenceLedger.candidates[key], 'every unsaved observation stays in the ledger');
+        return withoutTime(stored.liveEvidenceLedger.candidates[key].latest);
+      }),
       holds: Object.entries(stored.workingFileDirtyHolds?.records || {}).map(([key, hold]) => [key, hold.identities.length > 0]).sort(),
     });
   };
@@ -18344,6 +18351,11 @@ test('Needs Save reminder is withdrawn when a complete InDesign snapshot no long
   response = { stdout: [...docRows(docB, linkB), 'END\t2\t1\t1\t0'].join('\n') + '\n' };
   await poll();
   assert.deepEqual(await flagged(), all, 'a snapshot whose counts disagree keeps every reminder');
+  // A relative DOC path satisfies the completeness check but not the path parser.
+  response = { stdout: [`DOC\t${docA}\t${path.basename(docA)}\ttrue\ttrue\t0`,
+    `DOC\tDesktop/${path.basename(docB)}\t${path.basename(docB)}\ttrue\ttrue\t0`, 'END\t2\t0\t0\t0'].join('\n') + '\n' };
+  await poll();
+  assert.deepEqual(await flagged(), all, 'a row whose path cannot be parsed never reads as a closed document');
 
   // Closing A with Discard: a complete snapshot reporting only B withdraws A's reminders only.
   let sendsBefore = pendingSends();
@@ -18382,6 +18394,9 @@ test('Needs Save reminder is withdrawn when a complete InDesign snapshot no long
   response = { stdout: complete([[docA, linkA]]) };
   await poll();
   assert.deepEqual(await flagged(), all.filter(entry => entry.endsWith(`:${path.basename(docA)}`)), 'reopened unsaved document requests a save again');
+  assert.equal(metadataTestHooks.hasSourceSaveReminderPresence(project.id), true);
+  await callIpcRaw('projects:delete-all');
+  assert.equal(metadataTestHooks.hasSourceSaveReminderPresence(project.id), false, 'deleting all projects forgets their snapshots');
 });
 
 test('Needs Save reminder is withdrawn when a complete Illustrator snapshot or app exit no longer reports the unsaved document', async () => {
@@ -18427,7 +18442,104 @@ test('Needs Save reminder is withdrawn when a complete Illustrator snapshot or a
   running = false;
   await poll();
   assert.deepEqual(await flagged(), [], 'a successful process listing without Illustrator withdraws the reminder');
+  assert.equal(metadataTestHooks.hasSourceSaveReminderPresence(project.id), true);
+  await callIpcRaw('projects:delete', project.id);
+  assert.equal(metadataTestHooks.hasSourceSaveReminderPresence(project.id), false, 'deleting the project forgets its snapshots');
 });
+
+test('Needs Save reminder changes from a modified-state-only update refresh the renderer once', async () => {
+  resetTestHomeWorkspace();
+  const doc = path.join(TEST_HOME, 'Desktop', 'modified-only-reminder.ai');
+  const link = path.join(TEST_HOME, 'Desktop', 'modified-only-reminder.png');
+  writeSyntheticAiFile(doc);
+  fs.writeFileSync(link, 'synthetic png');
+  let modified = 'false';
+  setIllustratorOpenedAfterActivationHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return { stdout: '123\n' };
+    if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) {
+      return { stdout: `DOC\t${doc}\tmodified-only-reminder.ai\t${modified}\ttrue\nLINK\t${doc}\tmodified-only-reminder.ai\t${link}\t${modified}\ttrue\nCOMPLETE\t1\t1\n` };
+    }
+    return { stdout: '' };
+  });
+  const startup = metadataTestHooks.controlLiveAppStartupPoll();
+  const project = await createProject('Modified-only reminder');
+  try { await startup.release(); } finally { await startup.restore(); }
+  const poll = () => metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+  const linkFlag = () => {
+    const stored = storeInstance.data.projects.find(item => item.id === project.id);
+    const row = stored.pendingFiles.find(item => item.path === link);
+    assert.ok(row, 'the saved document\'s link stays in Needs Review');
+    return !!metadataTestHooks.getPendingSourceSaveReminder(stored, row);
+  };
+  const sends = () => testRendererEvents.filter(event => event.channel === 'files:pending' && event.data?.projectId === project.id).length;
+  assert.equal(linkFlag(), false, 'precondition: a saved document requests no save');
+  for (const [state, expected] of [['true', true], ['false', false]]) {
+    modified = state;
+    const before = sends();
+    await poll();
+    assert.equal(linkFlag(), expected, `modified=${state} changes the reminder`);
+    assert.equal(sends() - before, 1, `modified=${state}: the renderer is told to re-read once`);
+    const unchanged = sends();
+    await poll();
+    assert.equal(sends(), unchanged, `modified=${state}: an unchanged poll does not refresh again`);
+  }
+});
+
+for (const mode of ['unchanged context', 'account generation', 'account identity', 'package drain', 'project pause']) {
+  test(`Needs Save reminder in-flight complete snapshot with ${mode}`, async () => {
+    resetTestHomeWorkspace();
+    const doc = path.join(TEST_HOME, 'Desktop', 'in-flight-reminder.indd');
+    const link = path.join(TEST_HOME, 'Desktop', 'in-flight-reminder.png');
+    for (const filePath of [doc, link]) fs.writeFileSync(filePath, 'synthetic in-flight bytes');
+    const open = `DOC\t${doc}\tin-flight-reminder.indd\ttrue\ttrue\t1\nLINK\t${doc}\tin-flight-reminder.indd\t${link}\ttrue\ttrue\nEND\t1\t1\t1\t0\n`;
+    let hold = false;
+    const gate = deferredScanBoundary();
+    setChildProcessHandler(({ kind, command, args }) => {
+      if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) return { stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' };
+      if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) {
+        return hold ? gate.wait().then(() => ({ stdout: 'END\t0\t0\t0\t0\n' })) : { stdout: open };
+      }
+      return { stdout: '' };
+    });
+    const startup = metadataTestHooks.controlLiveAppStartupPoll();
+    const project = await createProject('In-flight reminder');
+    try { await startup.release(); } finally { await startup.restore(); }
+    const flags = () => {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      return stored.pendingFiles.map(row => !!metadataTestHooks.getPendingSourceSaveReminder(stored, row));
+    };
+    assert.deepEqual(flags(), [true, true], 'precondition: both rows request a save');
+    const safetyState = () => {
+      const stored = storeInstance.data.projects.find(item => item.id === project.id);
+      return JSON.stringify({ rows: stored.pendingFiles, ledger: stored.liveEvidenceLedger, holds: stored.workingFileDirtyHolds });
+    };
+    const safetyBefore = safetyState();
+    hold = true;
+    const running = metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+    await gate.started;
+    const generation = testAccountSession.generation, status = testAccountSession.status;
+    let drain = null;
+    try {
+      if (mode === 'account generation') testAccountSession.invalidate();
+      if (mode === 'account identity') testAccountSession.status = { ...status, identity: { id: 'changed-during-native-query' } };
+      if (mode === 'package drain') drain = metadataTestHooks.pauseWatcherCoordinatorForPackage(project.id);
+      if (mode === 'project pause') await callIpcRaw('projects:pause', project.id);
+      gate.release();
+      await running;
+      if (drain) await drain;
+      assert.equal(safetyState(), safetyBefore, 'rows, ledger and dirty holds are unchanged');
+      // Read under the new generation (as the app would) and under the original
+      // identity, so only a recorded snapshot could change the result.
+      testAccountSession.status = status;
+      assert.deepEqual(flags(), mode === 'unchanged context' ? [false, false] : [true, true],
+        mode === 'unchanged context' ? 'a current complete snapshot withdraws both reminders' : 'a superseded snapshot withdraws nothing');
+    } finally {
+      gate.release();
+      testAccountSession.generation = generation; testAccountSession.status = status;
+      if (mode === 'package drain') metadataTestHooks.resumeWatcherCoordinatorAfterPackage(project.id);
+    }
+  });
+}
 
 test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
   const first = await createProject('Single watcher A');
