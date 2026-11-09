@@ -6209,6 +6209,35 @@ const SOURCE_SAVE_REMINDER_STRENGTHS = new Set([
   LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_DOCUMENT,
   LIVE_APP_EVIDENCE_STRENGTHS.STRUCTURED_APP_LINK,
 ]);
+// Presentation-only presence from the newest COMPLETE successful native snapshot
+// per project and observer (an Illustrator process listing without the app counts
+// as a complete empty snapshot). In memory only: it is never persisted and never
+// consulted by capture, admission, verification, dirty holds or packaging. Failed,
+// partial or unconfirmed observations leave it unchanged; it is fenced by account
+// generation, and without one the current ledger observation alone decides.
+const sourceSaveReminderPresence = new Map();
+function getSourceSaveReminderSignature(projectId) {
+  const project = getProjects().find(item => item && item.id === projectId);
+  return JSON.stringify((project?.pendingFiles || []).map(file => getPendingSourceSaveReminder(project, file)));
+}
+// Returns true when the recorded snapshot changed any pending row's reminder.
+function recordCompleteSourceSaveReminderSnapshot(projectId, observerMethod, observedPaths) {
+  if (typeof projectId !== 'string' || !SOURCE_SAVE_REMINDER_OBSERVER_APPS.has(observerMethod)) return false;
+  const keys = new Set();
+  for (const observedPath of observedPaths) {
+    const normalized = normalizeTrackedFilePath(observedPath);
+    const key = normalized && getLiveEvidenceKeyHash(normalized);
+    if (key) keys.add(key);
+  }
+  const byObserver = sourceSaveReminderPresence.get(projectId) || new Map();
+  const previous = byObserver.get(observerMethod);
+  if (previous && previous.account === accountSession?.generation && previous.keys.size === keys.size &&
+      [...keys].every(key => previous.keys.has(key))) return false;
+  const before = getSourceSaveReminderSignature(projectId);
+  byObserver.set(observerMethod, { account: accountSession?.generation, keys });
+  sourceSaveReminderPresence.set(projectId, byObserver);
+  return before !== getSourceSaveReminderSignature(projectId);
+}
 function getPendingSourceSaveReminder(project, file) {
   if (!project || !file || file.captureState !== LIVE_CAPTURE_STATES.NEEDS_SAVE ||
       typeof file.path !== 'string' || !file.path || isAssetReviewFileExcluded(project, file)) return null;
@@ -6224,6 +6253,11 @@ function getPendingSourceSaveReminder(project, file) {
       !SOURCE_SAVE_REMINDER_STRENGTHS.has(evidence.evidenceStrength)) return null;
   const appFamily = SOURCE_SAVE_REMINDER_OBSERVER_APPS.get(evidence.observerMethod);
   if (!appFamily) return null;
+  // A newer complete snapshot from the same observer that no longer reports this
+  // path (document closed or discarded, link removed, app quit) supersedes the
+  // ledger's historical unsaved claim for this reminder only.
+  const presence = sourceSaveReminderPresence.get(project.id)?.get(evidence.observerMethod);
+  if (presence && presence.account === accountSession?.generation && !presence.keys.has(evidenceKey)) return null;
   const sourceName = sanitizeRendererSourceName(evidence.sourceName) || sanitizeRendererSourceName(evidence.sourceDocumentName);
   return { sourceSaveRequired: true, sourceSaveAppFamily: appFamily, ...(sourceName ? { sourceSaveSourceName: sourceName } : {}) };
 }
@@ -14259,6 +14293,8 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
   let refreshOperation = null;
   const previousContinuationSnapshot = illustratorContinuationSnapshots.get(projectId);
   let continuationObserved = false;
+  // Set when a complete snapshot changed a reminder; the renderer re-reads once.
+  let sourceSaveReminderChanged = false;
 
   try {
     const liveEvidenceRecords = [];
@@ -14273,6 +14309,12 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       if (!getFreshActiveWatchingProject(projectId, activationToken)) return;
     }
     const illustratorRunning = illustratorQuery.running;
+    if (illustratorQuery.running === false || (illustratorRunning && !getIllustratorSnapshotFailureReason(illustratorQuery))) {
+      const activeState = illustratorQuery.activeState || {};
+      if (recordCompleteSourceSaveReminderSnapshot(projectId, LIVE_APP_OBSERVER_METHODS.ILLUSTRATOR_ACTIVE_SESSION, [
+        ...(activeState.documents || []).map(doc => doc?.documentPath), ...(activeState.links || []).map(link => link?.linkedPath),
+      ])) sourceSaveReminderChanged = true;
+    }
     logLiveAppDiagnostic(projectId, 'illustrator-running', `Illustrator running=${illustratorRunning ? 'true' : 'false'} for project ${projectId}`);
     recordLiveAppStatusBreadcrumb(projectId, 'illustrator', {
       pollFired: true,
@@ -14476,6 +14518,9 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
           parseDependableInDesignBaselineSnapshot(inddOut, null, { allowMissingSelectedSource: true });
           inDesignObservation.complete = true;
         } catch (_) { /* Partial observations may retain obligations, never clear them. */ }
+        if (inDesignObservation.complete && recordCompleteSourceSaveReminderSnapshot(projectId, LIVE_APP_OBSERVER_METHODS.INDESIGN_LIVE_APPLESCRIPT, [
+          ...inddActiveState.documents.map(doc => doc.documentPath), ...inddActiveState.links.map(link => link.linkedPath),
+        ])) sourceSaveReminderChanged = true;
         const inddDiagnostics = { skipped: {} };
         let inddRecords = createInDesignLiveEvidenceRecords(projectId, inddActiveState, project, inddDiagnostics, inDesignObservation);
         if (!inDesignObservation.complete) {
@@ -14536,7 +14581,10 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
       liveEvidenceRecords.length === 0 ||
       !isActiveWatchingProject(projectId, activationToken) ||
       (watcherGeneration !== null && !getWatcherCoordinator(projectId).isCurrent(projectId, watcherGeneration))
-    ) return;
+    ) {
+      if (sourceSaveReminderChanged) sendProjectFileStateToRenderer(projectId, activationToken);
+      return;
+    }
 
     const capturedOperation = captureProjectOperation(projectId);
     if (!capturedOperation) return;
@@ -14551,6 +14599,8 @@ async function pollPsForProjectCore(projectId, activationToken = null, watcherGe
     if (!refreshOperation.current()) return;
     const refreshResult = await applyLiveAppEvidenceRefresh(projectId, liveEvidenceRecords, activationToken, refreshOperation);
     if (refreshResult.cancelled || !refreshOperation.current()) return;
+    // A staged refresh already told the renderer to re-read.
+    if (sourceSaveReminderChanged && !(refreshResult.stagedCount > 0)) sendProjectFileStateToRenderer(projectId, activationToken);
     observeIllustratorWorkingSourceContinuation(projectId, activationToken, illustratorQuery);
     continuationObserved = true;
     for (const [appFamily, stagedCount] of refreshResult.stagedByApp || []) {
@@ -24135,6 +24185,7 @@ registerTrustedIpcHandler('projects:delete', (event, id) => {
   packageScanDiagnosticState.delete(id);
   stopWatching(id);
   illustratorActivationScopes.delete(id);
+  sourceSaveReminderPresence.delete(id);
   figmaScopeRevisions.delete(id);
   pendingFigmaScopeUpdates.delete(id);
   figmaPollingRestartAfterScopeUpdate.delete(id);

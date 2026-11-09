@@ -1061,6 +1061,7 @@ Module._extensions['.js'] = function loadMainWithMetadataTestHooks(module, filen
   return module._compile(`${source}
 module.exports.__crateMetadataTestHooks = {
   pruneLiveEvidenceLedger, getPendingSourceSaveReminder,
+  forgetSourceSaveReminderPresence(projectId) { sourceSaveReminderPresence.delete(projectId); },
   controlLiveAppStartupPoll() {
     const priorSchedule = scheduleWatcherStartupTimer, priorPoll = pollPsForProject;
     const scheduled = [];
@@ -18094,6 +18095,9 @@ test('Review Assets save reminder marks only trusted unsaved-source Needs Save i
   for (const filePath of Object.values(paths)) fs.writeFileSync(filePath, 'synthetic save reminder bytes');
   // Rows belong to the current watch session, so the project starts first.
   const project = await createProject('Save reminder classification');
+  // The synthetic ledger below stands in for current observations; forget the
+  // harness's real snapshots (no app running) so they cannot supersede it.
+  metadataTestHooks.forgetSourceSaveReminderPresence(project.id);
   const trusted = (observerMethod, evidenceStrength, documentModified, extra = {}) => ({
     schemaVersion: 1, source: 'app-opened', observerMethod, evidenceStrength, captureRecommendation: 'needs-save',
     reason: 'unsaved-source-needs-save', needsSave: true, documentModified, sourceName: 'Synthetic Source.indd', ...extra,
@@ -18283,6 +18287,146 @@ test('InDesign unsaved live session requests a save until a trusted saved observ
   const saved = await callIpcRaw('projects:get-asset-workspace', project.id);
   assert.equal(saved.pendingFiles.some(row => row.sourceSaveRequired === true), false);
   assert.deepEqual(saved.files.map(row => row.name).sort(), [path.basename(sourcePath), path.basename(linkedPath)].sort());
+});
+
+test('Needs Save reminder is withdrawn when a complete InDesign snapshot no longer reports the unsaved document', async () => {
+  resetTestHomeWorkspace();
+  const desktop = path.join(TEST_HOME, 'Desktop');
+  const docA = path.join(desktop, 'closed-reminder-a.indd');
+  const linkA = path.join(desktop, 'closed-reminder-a-link.png');
+  const docB = path.join(desktop, 'closed-reminder-b.indd');
+  const linkB = path.join(desktop, 'closed-reminder-b-link.png');
+  for (const filePath of [docA, linkA, docB, linkB]) fs.writeFileSync(filePath, 'synthetic closed reminder bytes');
+  const docRows = (doc, link) => [`DOC\t${doc}\t${path.basename(doc)}\ttrue\ttrue\t1`, `LINK\t${doc}\t${path.basename(doc)}\t${link}\ttrue\ttrue`];
+  const complete = open => [...open.flatMap(([doc, link]) => docRows(doc, link)), `END\t${open.length}\t${open.length}\t${open.length}\t0`].join('\n') + '\n';
+  let response = { stdout: complete([[docA, linkA], [docB, linkB]]) };
+  setChildProcessHandler(({ kind, command, args }) => {
+    if (kind === 'exec' && command.includes("grep -i 'Adobe InDesign'")) return { stdout: '456 /Applications/Adobe InDesign.app/Contents/MacOS/Adobe InDesign\n' };
+    if (isOsascriptInvocation({ kind, command, args }, 'crate-indd-poll.applescript')) return response;
+    return { stdout: '' };
+  });
+  const startup = metadataTestHooks.controlLiveAppStartupPoll();
+  const project = await createProject('Closed InDesign reminder');
+  try { await startup.release(); } finally { await startup.restore(); }
+  const poll = () => metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+  const flagged = async () => {
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.pendingFiles.length, 4, 'every pending row stays in Needs Review');
+    return workspace.pendingFiles.filter(row => row.sourceSaveRequired === true).map(row => `${row.name}:${row.sourceSaveSourceName}`).sort();
+  };
+  const all = [`${path.basename(docA)}:${path.basename(docA)}`, `${path.basename(linkA)}:${path.basename(docA)}`,
+    `${path.basename(docB)}:${path.basename(docB)}`, `${path.basename(linkB)}:${path.basename(docB)}`].sort();
+  const onlyB = all.filter(entry => entry.endsWith(`:${path.basename(docB)}`));
+  assert.deepEqual(await flagged(), all, 'precondition: both unsaved documents and their links request a save');
+  // Reminder presentation only: rows, the ledger's unsaved observations and the
+  // durable dirty holds that block packaging are never erased by an absence.
+  const withoutTime = value => { const copy = { ...value }; delete copy.observedAt; return copy; };
+  const safetyState = async () => {
+    const stored = await getProject(project.id);
+    return JSON.stringify({
+      pending: stored.pendingFiles.map(row => [row.path, row.captureState, row.captureReason]).sort(),
+      files: stored.files.length,
+      ledger: [docA, linkA, docB, linkB].map(filePath => withoutTime(stored.liveEvidenceLedger.candidates[liveEvidenceKeyForTest(filePath)].latest)),
+      holds: Object.entries(stored.workingFileDirtyHolds?.records || {}).map(([key, hold]) => [key, hold.identities.length > 0]).sort(),
+    });
+  };
+  const safetyBefore = await safetyState();
+  assert.equal(Object.keys((await getProject(project.id)).workingFileDirtyHolds.records).length, 2, 'precondition: both documents hold packaging');
+  const pendingSends = () => testRendererEvents.filter(event => event.channel === 'files:pending' && event.data?.projectId === project.id).length;
+
+  // Failed and incomplete observations never withdraw a reminder.
+  response = { error: Object.assign(new Error('osascript timed out'), { stdout: '' }) };
+  await poll();
+  assert.deepEqual(await flagged(), all, 'a failed observation keeps every reminder');
+  response = { stdout: docRows(docB, linkB).join('\n') + '\n' };
+  await poll();
+  assert.deepEqual(await flagged(), all, 'a snapshot without its END row is incomplete and keeps every reminder');
+  response = { stdout: [...docRows(docB, linkB), 'END\t2\t1\t1\t0'].join('\n') + '\n' };
+  await poll();
+  assert.deepEqual(await flagged(), all, 'a snapshot whose counts disagree keeps every reminder');
+
+  // Closing A with Discard: a complete snapshot reporting only B withdraws A's reminders only.
+  let sendsBefore = pendingSends();
+  response = { stdout: complete([[docB, linkB]]) };
+  await poll();
+  assert.deepEqual(await flagged(), onlyB, 'the closed document and its link no longer request a save');
+  assert.equal(pendingSends(), sendsBefore + 1, 'one refresh tells the renderer the reminder changed');
+  sendsBefore = pendingSends();
+  await poll();
+  assert.equal(pendingSends(), sendsBefore, 'an unchanged snapshot does not refresh again');
+  assert.deepEqual(await flagged(), onlyB);
+  response = { stdout: docRows(docA, linkA).join('\n') + '\n' };
+  await poll();
+  assert.deepEqual(await flagged(), onlyB, 'incomplete evidence cannot re-establish a withdrawn reminder');
+
+  // Closing every document (and the source disappearing from disk) withdraws every reminder.
+  fs.rmSync(docB);
+  response = { stdout: 'END\t0\t0\t0\t0\n' };
+  await poll();
+  assert.deepEqual(await flagged(), [], 'no reminder after a complete snapshot with no open documents');
+  assert.equal(await safetyState(), safetyBefore, 'rows, ledger and dirty holds are unchanged');
+
+  // Account generation fence: a snapshot from another account session is ignored.
+  const storedProject = storeInstance.data.projects.find(item => item.id === project.id);
+  const storedA = storedProject.pendingFiles.find(row => row.path === docA);
+  assert.equal(metadataTestHooks.getPendingSourceSaveReminder(storedProject, storedA), null);
+  const generation = testAccountSession.generation;
+  try {
+    testAccountSession.generation = generation + 1;
+    assert.equal(metadataTestHooks.getPendingSourceSaveReminder(storedProject, storedA)?.sourceSaveRequired, true,
+      'an observation from another account session cannot withdraw the reminder');
+  } finally { testAccountSession.generation = generation; }
+
+  // Reopening A unsaved restores its reminder.
+  fs.writeFileSync(docB, 'synthetic closed reminder bytes');
+  response = { stdout: complete([[docA, linkA]]) };
+  await poll();
+  assert.deepEqual(await flagged(), all.filter(entry => entry.endsWith(`:${path.basename(docA)}`)), 'reopened unsaved document requests a save again');
+});
+
+test('Needs Save reminder is withdrawn when a complete Illustrator snapshot or app exit no longer reports the unsaved document', async () => {
+  resetTestHomeWorkspace();
+  const sourcePath = path.join(TEST_HOME, 'Desktop', 'closed-reminder.ai');
+  const linkedPath = path.join(TEST_HOME, 'Desktop', 'closed-reminder-link.png');
+  fs.writeFileSync(sourcePath, 'ai bytes');
+  fs.writeFileSync(linkedPath, 'png bytes');
+  const open = [`DOC\t${sourcePath}\tclosed-reminder.ai\ttrue\ttrue`, `LINK\t${sourcePath}\tclosed-reminder.ai\t${linkedPath}\ttrue\ttrue`, 'COMPLETE\t1\t1'].join('\n') + '\n';
+  let running = true, response = { stdout: open };
+  setIllustratorOpenedAfterActivationHandler(request => {
+    if (isIllustratorPgrepCheck(request)) return running ? { stdout: '123\n' } : { stdout: '' };
+    if (request.kind === 'execFile' && request.command === '/bin/ps') return { stdout: running ? 'Adobe Illustrator\n' : '/usr/sbin/cfprefsd\n' };
+    if (isOsascriptInvocation(request, 'crate-ai-active-session.applescript')) return response;
+    return { stdout: '' };
+  });
+  const project = await createProject('Closed Illustrator reminder');
+  await waitForProject(project.id, item => item.pendingFiles.length === 2, 5000);
+  const poll = () => metadataTestHooks.pollPsForProject(project.id, metadataTestHooks.getActiveWatchingActivationToken(project.id));
+  const flagged = async () => {
+    const workspace = await callIpcRaw('projects:get-asset-workspace', project.id);
+    assert.equal(workspace.pendingFiles.length, 2, 'both pending rows stay in Needs Review');
+    return workspace.pendingFiles.filter(row => row.sourceSaveRequired === true).map(row => row.name).sort();
+  };
+  const both = ['closed-reminder-link.png', 'closed-reminder.ai'];
+  assert.deepEqual(await flagged(), both, 'precondition: the unsaved document and its link request a save');
+
+  response = { error: Object.assign(new Error('osascript timed out'), { stdout: '' }) };
+  await poll();
+  assert.deepEqual(await flagged(), both, 'a failed observation keeps the reminder');
+  response = { stdout: `DOC\t${sourcePath}\tclosed-reminder.ai\ttrue\ttrue\n` };
+  await poll();
+  assert.deepEqual(await flagged(), both, 'a snapshot without its terminal row keeps the reminder');
+
+  response = { stdout: 'STATUS\tno-documents\nCOMPLETE\t0\t0\n' };
+  await poll();
+  assert.deepEqual(await flagged(), [], 'a complete snapshot without the document withdraws the reminder');
+
+  response = { stdout: open };
+  await poll();
+  assert.deepEqual(await flagged(), both, 'reopening the unsaved document restores the reminder');
+
+  running = false;
+  await poll();
+  assert.deepEqual(await flagged(), [], 'a successful process listing without Illustrator withdraws the reminder');
 });
 
 test('a superseded filesystem watcher cannot attribute its event to the paused project', async () => {
