@@ -1440,4 +1440,61 @@ function cases() {
     await callIpcRaw('projects:pause',f.id);clearTrackedTimers();
   });
 
+  choiceTest('Photoshop verification timeout is reported as a timeout through first scan and repeated Retry, retaining evidence', {timeout:30000}, async()=>{
+    const f=await setup();
+    const timer=global.setTimeout, pause=ms=>new Promise(resolve=>timer(resolve,ms));
+    // The established harness scales only the production 30 s scan deadline.
+    global.setTimeout=(callback,delay,...args)=>timer(callback,delay===30000?250:delay,...args);
+    let held=true,release=()=>{},gate=null,inflight=0;
+    const hold=()=>{held=true;gate=new Promise(resolve=>{release=resolve;});};
+    const unpause=metadataTestHooks.pausePsdExtraction(async()=>{if(!held)return;inflight++;try{await gate;}finally{inflight--;}});
+    // Barrier: every held extraction has resumed, then its retired scan drains.
+    const drain=async()=>{held=false;release();while(inflight)await pause(5);await pause(50);};
+    hold();
+    try {
+      const b=await f.add('B.psd');
+      const card=async()=>(await f.workspace()).workingFileChoices.choices.find(item=>item.source.name==='B.psd');
+      const receipt=()=>metadataTestHooks.getWorkingSourceVerification(f.stored(),f.stored().files.find(row=>row.path===b));
+      // Observed first-baseline case: the initial scan times out.
+      let current=await card();
+      assert.equal(receipt().status,'failed');assert.equal(receipt().reason,'scan-timeout');
+      assert.equal(current.ready,false);assert.equal(current.reason,'working-file-verification-timed-out');
+      await drain();
+      assert.equal(receipt().status,'failed','timed-out scan cannot publish late');
+      assert.equal((await card()).reason,'working-file-verification-timed-out');
+      // Normal verification is unaffected once the scan can finish.
+      assert.equal((await f.resolve(await card(),'retry')).success,true);
+      current=await card();assert.equal(current.ready,true);assert.equal(current.reason,null);
+      // Synthetic prior evidence, as the observed saved copy retained 50 references.
+      const references=Array.from({length:50},(_,index)=>({path:path.join(TEST_HOME,'Desktop','links','asset-'+index+'.png')}));
+      const key=metadataTestHooks.getAssetBaselineSourceRecoveryRouteKey(f.stored(),f.stored().files.find(row=>row.path===b));
+      metadataTestHooks.mutateProject(f.id,project=>{project.workingSourceVerification[key].requiredReferences=references;return true;});
+      const fingerprint=receipt().sourceFingerprint;assert.match(fingerprint,/^[a-f0-9]{64}$/);
+      const original=fs.readFileSync(b);
+      // Observed saved-copy case: Retry clears identity, then the scan times out.
+      hold();
+      for(let attempt=0;attempt<2;attempt++) {
+        const before=await card();
+        const pending=f.resolve(before,'retry');
+        await pause(20);
+        assert.equal((await f.resolve(before,'retry')).error,'working_file_choice_busy','overlapping Retry is refused');
+        const result=await pending;assert.equal(result.success,false);assert.equal(result.error,'continuation_verification_required');
+        const after=receipt();
+        assert.equal(after.status,'failed');assert.equal(after.reason,'add_files_scan_timeout');assert.equal(after.sourceIdentity,null);
+        assert.deepEqual(after.requiredReferences,references,'prior references are retained');
+        assert.equal(after.sourceFingerprint,fingerprint);
+        current=await card();
+        assert.equal(current.ready,false);assert.equal(current.reason,'working-file-verification-timed-out');
+        assert.notEqual(current.reason,'working-file-source-changed');
+        assert.equal((await f.resolve(current,'keep-both')).success,false,'choices stay disabled');
+        assert.equal((await callIpcRaw('projects:prepare-package-review',f.id)).error,'working_file_choice_required');
+      }
+      await drain();
+      assert.equal(receipt().reason,'add_files_scan_timeout','stale attempts cannot overwrite the current receipt');
+      assert.equal((await f.resolve(await card(),'retry')).success,true);
+      current=await card();assert.equal(current.ready,true);assert.equal(current.reason,null);
+      assert.deepEqual(fs.readFileSync(b),original,'verification never writes the source');
+      assert.equal((await f.resolve(current)).success,true);
+    } finally {held=false;release();unpause();global.setTimeout=timer;await pause(50);}
+  });
 }

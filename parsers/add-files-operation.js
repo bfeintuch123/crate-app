@@ -45,9 +45,11 @@ function createAddFilesScanLease(options = {}) {
     timeoutPromise,
     get state() { return state; },
     get reason() { return reason; },
-    current() {
+    // An optional per-check project read is forwarded unchanged; the parent
+    // decides whether it applies. Cancellation and the timer stay live here.
+    current(read) {
       if (state !== 'active') return false;
-      if (!parentCurrent()) {
+      if (!parentCurrent(read)) {
         cancel('stale-project-operation');
         return false;
       }
