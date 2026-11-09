@@ -27,6 +27,7 @@ test('main window uses normal macOS app lifecycle', async () => {
   const ipcHandlers = new Map();
   const ipcEventHandlers = new Map();
   const windows = [];
+  const applicationMenus = [];
   const trays = [];
   const intervals = new Set();
   const timeouts = new Set();
@@ -235,7 +236,10 @@ test('main window uses normal macOS app lifecycle', async () => {
     shell: { openPath: () => {} },
     nativeImage: { createFromPath: () => ({ resize: () => ({}) }), createEmpty: () => ({}) },
     Notification: class { static isSupported() { return false; } },
-    Menu: { buildFromTemplate: () => ({}) },
+    Menu: {
+      buildFromTemplate: template => ({ template }),
+      setApplicationMenu: menu => applicationMenus.push({ menu, windowsCreated: windows.length }),
+    },
   }));
   setStub('electron-store', () => FakeStore);
   setStub('os', () => ({ ...os, homedir: () => isolatedHome }));
@@ -297,6 +301,12 @@ test('main window uses normal macOS app lifecycle', async () => {
       'watch-recovery-complete',
       'ready-handler-complete',
     ]);
+
+    assert.equal(applicationMenus.length, 1, 'startup installs exactly one application menu');
+    assert.equal(applicationMenus[0].windowsCreated, 0, 'menu is installed before the main window exists');
+    const menuRoles = JSON.stringify(applicationMenus[0].menu.template).toLowerCase();
+    assert.match(menuRoles, /"role":"editmenu"/);
+    assert.doesNotMatch(menuRoles, /"role":"(?:resetzoom|zoomin|zoomout)"/);
 
     const cleanupDeadline = Date.now() + 1000;
     while (fs.existsSync(isolatedOrphanCache) && Date.now() < cleanupDeadline) {
