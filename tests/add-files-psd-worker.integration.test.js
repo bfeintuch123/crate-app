@@ -193,6 +193,45 @@ for (const mode of ['present', 'missing', 'pathless', 'alias', 'empty']) {
   });
 }
 
+// Photoshop 2026 writes long-form enum values (the enum key, e.g. 'warpStyle.custom')
+// instead of the historical code ('warpStyle.warpCustom'). ag-psd 30.x rejected them
+// inside the smart-object handlers and silently dropped placedLayer; 31.x reads them.
+function longFormSmartObjectPsd(placedId, linkedFiles) {
+  const descriptor = require('ag-psd/dist/descriptor');
+  const encode = descriptor.warpStyle.encode;
+  descriptor.warpStyle.encode = value => `warpStyle.${value || 'none'}`;
+  try {
+    return agPsd.writePsdBuffer({ width: 1, height: 1, children: [{ id: 9, name: 'Photoshop 2026 smart object',
+      placedLayer: { id: placedId, type: 'raster', transform: [0, 0, 1, 0, 1, 1, 0, 1], width: 1, height: 1 } }], linkedFiles });
+  } finally {
+    descriptor.warpStyle.encode = encode;
+  }
+}
+
+for (const outcome of ['matched', 'unresolved']) {
+  test(`actual parser keeps a Photoshop 2026 long-form smart object as a ${outcome} association`, async t => {
+    const h = harness(t);
+    const placedId = '33333333-3333-4333-8333-333333333333';
+    const target = path.join(h.root, 'external.png');
+    fs.writeFileSync(target, 'external bytes');
+    const linkedId = outcome === 'matched' ? placedId : '44444444-4444-4444-8444-444444444444';
+    const bytes = longFormSmartObjectPsd(placedId, [{ id: linkedId, name: 'external.png', childDocumentID: '',
+      linkedFile: { fileSize: 14, name: 'external.png', fullPath: target, originalPath: target, relativePath: '' } }]);
+    const wire = bytes.toString('latin1');
+    assert.ok(wire.includes('\u0000\u0000\u0000\u0006custom') && !wire.includes('warpCustom'), 'fixture must use the long-form enum');
+    const source = path.join(h.root, 'long-form.psd');
+    fs.writeFileSync(source, bytes);
+    const run = await h.start(source);
+    const inventory = (await run.promise).linkedInventory;
+    assert.deepEqual(Array.from(inventory.associations, item => [item.id, item.disposition]),
+      [[placedId, outcome === 'matched' ? 'matched-parsed-id' : 'unresolved-placed-id']]);
+    assert.equal(inventory.unresolved.some(item => item.reason === 'unresolved-placed-id'), outcome === 'unresolved');
+    assert.equal(inventory.references[0].rawPaths.fullPath, target);
+    assert.equal(inventory.status, 'incomplete');
+    await run.finish();
+  });
+}
+
 test('parsed-field double retains external requirement alongside bytes, duplicate IDs and orphan associations', async t => {
   const value = parsed([
     { id: 'same-id', name: 'cached.bin', linkedFile: { fullPath: '/missing/external.bin', originalPath: 'raw token' }, data: new Uint8Array(8) },
