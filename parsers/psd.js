@@ -12,7 +12,8 @@ class PSDParser extends BaseParser {
     const assets = [];
     let currentPath = null;
     const bytes = this.readFileBuffer(filePath);
-    const psd = readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true });
+    // Metadata-only read: the zero bitmap budget prevents document pattern decoding.
+    const psd = readPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
     await sendPsdRecords({ psd, framing: inspectPsdLinkFraming(bytes) }, async record => {
       if (record.type === 'record' && record.kind === 'linked-path') currentPath = '';
       else if (record.type === 'record') currentPath = null;

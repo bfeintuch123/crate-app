@@ -8105,6 +8105,9 @@ async function isFileOpenByDesignApp(filePath) {
 // Inactivity threshold — configurable constant
 const INACTIVITY_TIMEOUT_MS = 180 * 60 * 1000; // 3 hours
 const MAX_PARSE_FILE_SIZE = 300 * 1024 * 1024; // 300MB — guard against OOM on huge PSD/AI files
+// Every readPsd call is metadata-only. Each passes totalMemoryLimit: 0 inline
+// (some tests run isolated slices of this file) so ag-psd >= 31.0.2 never
+// decodes document patterns, which skipLayer/CompositeImageData do not prevent.
 const MAX_PROJECTS = 7;
 
 // Single instance lock
@@ -15511,7 +15514,7 @@ async function assertDependableAssetBaselineSource(filePath, options = {}) {
 
   if (ext === '.psd') {
     const buffer = await fs.promises.readFile(filePath);
-    readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
+    readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
     if (!isAddFilesSourceIdentityCurrent(await fs.promises.stat(filePath), getAddFilesSourceIdentity(stat))) {
       throw new Error('asset_baseline_source_changed');
     }
@@ -15763,7 +15766,7 @@ async function extractPsdAssets(psdFilePath, projectId, isCurrent = () => true, 
     } else {
       const buf = options.sourceBuffer || await fs.promises.readFile(psdFilePath);
       if (!isCurrent()) return [];
-      psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+      psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
       sourceDigest = crypto.createHash('sha256').update(buf).digest('hex');
     }
     const discoveredPaths = [];
@@ -17628,7 +17631,7 @@ async function runScanOnSave(projectId, psdFilePath, activationToken = null, ope
 
     const buf = await fs.promises.readFile(psdFilePath);
     if (!isCurrent()) return;
-    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+    const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
 
     const newEntries = [];
 
@@ -21401,7 +21404,7 @@ function readStablePsdForPackageReview(sourcePath, expectedFingerprint) {
     if (!packageReviewFingerprintsMatch(expectedFingerprint.source, serializePackageReviewStat(afterStat))) {
       throw new PackageReviewChangedError();
     }
-    descriptor = readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true });
+    descriptor = readPsd(buffer, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
   } finally {
     if (fd !== null) fs.closeSync(fd);
   }
@@ -22430,7 +22433,7 @@ async function writeEmbeddedPsdAssetToPackage(
     if (stat.size > BigInt(MAX_PARSE_FILE_SIZE)) throw new PackageReviewChangedError();
     return readReviewedPackageSourceBuffer(sourceHandle, stat.size);
   });
-  const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true });
+  const psd = readPsd(buf, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
   const match = findEmbeddedPsdLinkedFileMatch(file, psd.linkedFiles || []);
   if (!match || !packageReviewFingerprintsMatch(expectedResource, getEmbeddedPsdResourceFingerprint(match))) {
     throw new PackageReviewChangedError();
