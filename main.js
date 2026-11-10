@@ -84,6 +84,8 @@ const {
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
+const { decodeXMLPath } = require('./parsers/xml-path');
+const { fileUriToPath } = require('./parsers/file-uri');
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';
@@ -16140,8 +16142,25 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
         });
         // Look for LinkResourceURI attributes
         const uriRegex = /LinkResourceURI="([^"]*)"/gi;
+        // [start, end, admitted] for each attribute value, in text order.
+        const declaredSpans = [];
         let match;
         while ((match = uriRegex.exec(data)) !== null) {
+          const valueStart = match.index + match[0].length - 1 - match[1].length;
+          const declaredPath = fileUriToPath(match[1].includes('&') ? decodeXMLPath(match[1]) : match[1]);
+          if (declaredPath !== null) {
+            const admitted = declaredPath.startsWith('/Users/') || declaredPath.startsWith('/Volumes/');
+            declaredSpans.push(valueStart, valueStart + match[1].length, admitted);
+            if (admitted) {
+              results.push(declaredPath);
+            } else {
+              options.onUnresolvedDependency?.('unsupported-declared-link-uri');
+              if (options.ordinaryVerification) results.push(declaredPath);
+            }
+            continue;
+          }
+          // Values the shared reader does not accept keep their prior handling.
+          declaredSpans.push(valueStart, valueStart + match[1].length, false);
           if (match[1].slice(0, 5).toLowerCase() !== 'file:') {
             options.onUnresolvedDependency?.('unsupported-declared-link-uri');
             continue;
@@ -16159,9 +16178,17 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
           }
         }
         // Also try the regex approach for any raw absolute paths
-        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27<>]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27<>]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
+        let span = 0;
         while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
-          results.push(match[0]);
+          while (span < declaredSpans.length && declaredSpans[span + 1] <= match.index) span += 3;
+          if (span < declaredSpans.length && declaredSpans[span] <= match.index) {
+            // Inside an admitted declared link: a partial or still-encoded copy.
+            if (declaredSpans[span + 2]) continue;
+            results.push(match[0]);
+          } else {
+            results.push(match[0].includes('&') ? decodeXMLPath(match[0]) : match[0]);
+          }
         }
       } catch (e) {
         if (options.strict === true) throw e;
@@ -16201,7 +16228,7 @@ async function extractLinkedAssetsSketch(filePath, options = {}) {
           timeout: 8000, encoding: 'utf8'
         });
         // Scan for absolute file paths in JSON
-        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
         let match;
         while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
           results.push(match[0]);
@@ -16249,7 +16276,7 @@ async function extractLinkedAssetsAffinity(filePath, options = {}) {
         const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
           timeout: 8000, encoding: 'utf8'
         });
-        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
         let match;
         while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
           results.push(match[0]);
@@ -16298,7 +16325,7 @@ async function extractLinkedAssetsZipMedia(filePath, options = {}) {
   try {
     const buf = await fs.promises.readFile(filePath);
     const content = buf.toString('utf8');
-    const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+    const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
     let match;
     while ((match = LINKED_ASSET_REGEX.exec(content)) !== null) {
       if (match[0] === filePath) continue;
@@ -16339,7 +16366,7 @@ async function extractLinkedAssetsPxd(filePath, options = {}) {
         const { stdout: data } = await execFileAsync('/usr/bin/unzip', ['-p', filePath, entry], {
           timeout: 8000, encoding: 'utf8'
         });
-        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+        const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
         let match;
         while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
           results.push(match[0]);
@@ -18725,7 +18752,7 @@ async function startWatching(projectId, { preserveWatchStartedAt = false } = {})
 
           // Parse linked assets from any linkable design files found in the snapshot
           if (linkableForParse.length > 0) {
-            const LINKED_ASSET_REGEX_SNAPSHOT = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+            const LINKED_ASSET_REGEX_SNAPSHOT = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
             const linkedRegexFiles = [];
             for (const designFile of linkableForParse) {
               try {
@@ -20377,7 +20404,7 @@ end tell`;
   // v1.3.36: Extended from .ai-only to full Adobe suite + Affinity.
   // Pattern: if we parse the file format to extract links, those links are
   // always relevant — never filter by date.
-  const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff|woff2|mp4|mov|avi|webm)/gi;
+  const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27]+\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|afdesign|afphoto|afpub|indd|idml|sketch|fig|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
   const LINKABLE_EXTENSIONS = new Set(['.ai', '.indd', '.idml', '.psd', '.pdf', '.afdesign', '.afpub', '.afphoto']);
   const linkableFiles = project.files.filter(f => LINKABLE_EXTENSIONS.has(f.ext));
   if (linkableFiles.length > 0) {

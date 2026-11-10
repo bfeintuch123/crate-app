@@ -33,7 +33,7 @@ test('shared matcher grammar and production import stay bound to the frozen lega
 test('both callers preserve explicit output quirks, duplicates, order and self-skip', async () => {
   const cases = [
     ['', []], ['/Users/a.png', ['/Users/a.png']], ['/Users/.png', []],
-    ['/Users/a.psb', []], ['/Users/a.woff2', ['/Users/a.woff']],
+    ['/Users/a.psb', []], ['/Users/a.woff2', ['/Users/a.woff2']],
     ['/Users/a.png /Users/a.png', ['/Users/a.png', '/Users/a.png']],
     ['/Users/no.psb /Volumes/disk/b.png', ['/Users/no.psb /Volumes/disk/b.png']],
     ['/Users/a.png/Users/b.jpg', ['/Users/a.png', '/Users/b.jpg']],
@@ -42,6 +42,43 @@ test('both callers preserve explicit output quirks, duplicates, order and self-s
   ];
   for (const [input, expected] of cases) assert.deepEqual(await parity(Buffer.from(input)), expected);
   assert.deepEqual(await parity(Buffer.from('/Users/self.png /Users/other.png'), '/Users/self.png'), ['/Users/other.png']);
+});
+
+test('.woff2 and .woff both resolve whole through the shared matcher, worker and main', async () => {
+  const cases = [
+    ['/Users/a/Brand.woff2', ['/Users/a/Brand.woff2']],
+    ['/Users/a/Brand.woff', ['/Users/a/Brand.woff']],
+    ['/Users/a/Brand.WOFF2', ['/Users/a/Brand.WOFF2']],
+    ['/Users/a/Brand.woff2x', ['/Users/a/Brand.woff2']],
+    ['/Users/a/Brand.woffx', ['/Users/a/Brand.woff']],
+    ['/Volumes/disk/One.woff2 /Users/a/Two.woff', ['/Volumes/disk/One.woff2', '/Users/a/Two.woff']],
+  ];
+  for (const [input, expected] of cases) assert.deepEqual(await parity(Buffer.from(input)), expected);
+});
+
+test('no product link pattern lists woff before woff2, and every inline copy reads .woff2 whole', () => {
+  const files = ['main.js', ...fs.readdirSync(path.join(root, 'parsers')).filter(name => name.endsWith('.js')).map(name => path.join('parsers', name))];
+  let groups = 0;
+  for (const file of files) {
+    const source = fs.readFileSync(path.join(root, file), 'utf8');
+    for (const group of source.match(/\((?:[a-z0-9]+\|)+[a-z0-9]+\)/gi) || []) {
+      const names = group.slice(1, -1).split('|');
+      if (!names.includes('woff')) continue;
+      groups++;
+      assert.ok(names.includes('woff2') && names.indexOf('woff2') < names.indexOf('woff'), `${file}: ${group}`);
+    }
+  }
+  assert.equal(groups, 8, 'shared matcher plus seven inline main.js copies');
+  const inline = fs.readFileSync(path.join(root, 'main.js'), 'utf8')
+    .match(/const LINKED_ASSET_REGEX(?:_SNAPSHOT)? = \/.+\/gi;/g) || [];
+  assert.equal(inline.length, 7);
+  for (const line of inline) {
+    const literal = line.slice(line.indexOf('= /') + 3, line.lastIndexOf('/gi;'));
+    const regex = new RegExp(literal, 'gi');
+    assert.deepEqual('/Users/a/Brand.woff2'.match(regex), ['/Users/a/Brand.woff2'], line);
+    assert.deepEqual('/Users/a/Brand.woff'.match(regex), ['/Users/a/Brand.woff'], line);
+    assert.deepEqual('/Users/a/Brand.WOFF2x'.match(regex), ['/Users/a/Brand.WOFF2'], line);
+  }
 });
 
 test('every legacy extension and excluded separator keeps identical output in both callers', async () => {
