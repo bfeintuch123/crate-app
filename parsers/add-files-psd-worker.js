@@ -39,12 +39,13 @@ function parsePsd(filePath) {
 
   const sourceBuffer = fs.readFileSync(filePath);
   const sourceDigest = crypto.createHash('sha256').update(sourceBuffer).digest('hex');
-  // Metadata-only read. A zero bitmap budget keeps ag-psd >= 31.0.2 from
-  // decoding document patterns, which it would otherwise allocate here.
+  // Metadata-only read. No bitmap budget (-Infinity, not 0: a negative pattern
+  // size would otherwise raise a finite budget) keeps ag-psd from decoding
+  // document patterns, which it would otherwise allocate here.
   const psd = readPsd(sourceBuffer, {
     skipLayerImageData: true,
     skipCompositeImageData: true,
-    totalMemoryLimit: 0,
+    totalMemoryLimit: -Infinity,
   });
   return { psd, sourceIdentity: getSourceIdentity(stat), sourceDigest,
     framing: inspectPsdLinkFraming(sourceBuffer) };

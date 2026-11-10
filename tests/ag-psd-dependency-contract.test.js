@@ -2,7 +2,7 @@
 
 // Contract for the pinned ag-psd reader (GHSA-6w3r-6hpr-hp6p remediation).
 // Crate only reads PSD metadata. These tests pin the dependency, keep every
-// production read metadata-only with a zero bitmap budget, and record the
+// production read metadata-only with no bitmap budget, and record the
 // stricter 31.0.2+ layer/mask bounds as controlled failures.
 
 const test = require('node:test');
@@ -55,14 +55,16 @@ function layerPsd({ box, mask = null, version = 1, depth = 8 }) {
   return Buffer.concat([header({ version, depth }), section(layerInfo, large), imageData]);
 }
 
-// A global `Patt` block declaring a document pattern of width x height.
-function patternPsd(width, height) {
+// One global pattern block (`Patt`, or its `Pat2`/`Pat3` aliases) with bounds top/left/bottom/right.
+function patternBlock([top, left, bottom, right], key = 'Patt') {
   const body = Buffer.concat([u32(1), u32(3), i16(0), i16(0), u32(0), Buffer.from([0]), // version, RGB, x, y, name, id
-    u32(3), u32(0), u32(0), u32(0), u32(height), u32(width), u32(0), u32(0), u32(0)]); // VMAL bounds, no channels
+    u32(3), u32(0), u32(top), u32(left), u32(bottom), u32(right), u32(0), u32(0), u32(0)]); // VMAL bounds, no channels
   const pattern = Buffer.concat([u32(body.length), body, Buffer.alloc((4 - body.length % 4) % 4)]);
-  const block = Buffer.concat([Buffer.from('8BIMPatt'), u32(pattern.length), pattern, Buffer.alloc(pattern.length % 2)]);
-  return Buffer.concat([header(), section(Buffer.concat([u32(0), u32(0), block])), imageData]);
+  return Buffer.concat([Buffer.from('8BIM' + key), u32(pattern.length), pattern, Buffer.alloc(pattern.length % 2)]);
 }
+const patternBlocksPsd = blocks => Buffer.concat([header(), section(Buffer.concat([u32(0), u32(0), ...blocks])), imageData]);
+const patternsPsd = (...bounds) => patternBlocksPsd(bounds.map(bound => patternBlock(bound)));
+const patternPsd = (width, height) => patternsPsd([0, 0, height, width]);
 
 function tempFile(t, name, bytes) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crate-ag-psd-contract-'));
@@ -148,13 +150,13 @@ test('the advisory memory limit is enforced by the pinned reader', () => {
   assert.throws(() => realReadPsd(bytes, { useImageData: true, totalMemoryLimit: 1024 }), /Exceeded memory limit/);
 });
 
-test('every production readPsd call is metadata-only with a zero bitmap budget', () => {
+test('every production readPsd call is metadata-only with no bitmap budget', () => {
   const calls = readPsdCallsites();
   assert.deepEqual(calls.map(call => call.file).sort(),
     ['main.js', 'main.js', 'main.js', 'main.js', 'main.js', 'parsers/add-files-psd-worker.js', 'parsers/psd.js'],
     'a new readPsd callsite must be reviewed and added here');
   for (const call of calls) {
-    for (const option of [/skipLayerImageData: true/, /skipCompositeImageData: true/, /totalMemoryLimit: 0\b/]) {
+    for (const option of [/skipLayerImageData: true/, /skipCompositeImageData: true/, /totalMemoryLimit: -Infinity\b/]) {
       assert.match(call.text, option, `${call.file}:${call.line} ${call.text}`);
     }
   }
@@ -169,13 +171,27 @@ test('every production readPsd call is metadata-only with a zero bitmap budget',
   ]);
 });
 
-for (const [label, width, height] of [['large declared', 4000, 4000], ['1x1', 1, 1]]) {
+// An inverted-bounds pattern has a negative size. ag-psd adds it to a finite budget before
+// its allocation fails, so with a budget of 0 the next pattern could allocate that credit.
+const CREDIT = [0, 1000000, 1, 0]; // width -1,000,000 x height 1 => size -4,000,000
+const SPEND = [0, 0, 1000, 1000]; // 4,000,000 bytes
+// [label, fixture, control options, bytes the pinned reader decodes under that control]
+const PATTERN_CASES = [
+  ['large declared', () => patternPsd(4000, 4000), null, null],
+  ['1x1', () => patternPsd(1, 1), {}, [4]], // default 2 GiB budget
+  ['zero-size', () => patternsPsd([0, 0, 0, 0]), { totalMemoryLimit: 0 }, [0]],
+  ['inverted bounds then a real pattern', () => patternsPsd(CREDIT, SPEND), { totalMemoryLimit: 0 }, [4000000]],
+  ['Pat3 inverted bounds then a Pat2 pattern', () => patternBlocksPsd([patternBlock(CREDIT, 'Pat3'), patternBlock(SPEND, 'Pat2')]),
+    { totalMemoryLimit: 0 }, [4000000]],
+];
+
+for (const [label, build, control, decodedUnderControl] of PATTERN_CASES) {
   test(`document pattern (${label}) is never decoded by the production readers`, async t => {
-    const bytes = patternPsd(width, height);
-    assert.ok(bytes.length < 160);
-    // Control: the pinned reader decodes this pattern without Crate's budget.
-    if (width === 1) {
-      assert.equal(realReadPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true }).patterns.length, 1);
+    const bytes = build();
+    assert.ok(bytes.length < 256);
+    if (control) {
+      const decoded = realReadPsd(bytes, { skipLayerImageData: true, skipCompositeImageData: true, ...control });
+      assert.deepEqual(decoded.patterns.map(pattern => pattern.data.byteLength), decodedUnderControl);
     }
     const file = tempFile(t, 'pattern.psd', bytes);
     readCalls.length = 0;
@@ -185,13 +201,13 @@ for (const [label, width, height] of [['large declared', 4000, 4000], ['1x1', 1,
     assert.equal(await new PSDParser().extractAssets(file).then(assets => assets.length), 0);
     assert.equal(readCalls.length, 2);
     for (const call of readCalls) {
-      assert.deepEqual(call.options, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: 0 });
+      assert.deepEqual(call.options, { skipLayerImageData: true, skipCompositeImageData: true, totalMemoryLimit: -Infinity });
       assert.equal(decodedBytes(call.result), undefined);
     }
   });
 }
 
-test('the zero budget leaves linked metadata and embedded bytes unchanged', async t => {
+test('the bitmap budget leaves linked metadata and embedded bytes unchanged', async t => {
   const id = '11111111-1111-4111-8111-111111111111', embeddedId = '22222222-2222-4222-8222-222222222222';
   const bytes = agPsd.writePsdBuffer({ width: 2, height: 2,
     children: [{ name: 'group', children: [{ id: 7, name: 'smart', placedLayer: { id, type: 'raster', transform: [0, 0, 2, 0, 2, 2, 0, 2], width: 2, height: 2 } }] }],
