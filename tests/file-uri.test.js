@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { fileUriToPath } = require('../parsers/file-uri');
+const { fileUriToPath } = require('../parsers/xml-path');
 
 test('fileUriToPath reads the three local file URI forms and nothing else', () => {
   const cases = [
@@ -52,8 +52,8 @@ test('fileUriToPath reads the three local file URI forms and nothing else', () =
   for (const input of [undefined, null, 7, {}, ['file:/Users/a.png']]) assert.equal(fileUriToPath(input), null);
 });
 
-test('fileUriToPath is pure: no filesystem module or access', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'parsers', 'file-uri.js'), 'utf8');
+test('xml-path helpers are pure: no filesystem module or access', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'parsers', 'xml-path.js'), 'utf8');
   assert.doesNotMatch(source, /require\(/);
   assert.doesNotMatch(source, /\bfs\b|process\.|statSync|existsSync|realpath/);
 });

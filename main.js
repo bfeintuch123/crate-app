@@ -84,8 +84,7 @@ const {
 const { runBoundedAddFilesScan } = require('./parsers/add-files-operation');
 const { REGEX_SOURCE_EXTENSIONS } = require('./parsers/add-files-regex-worker');
 const { extractLinkedAssetPaths } = require('./parsers/linked-asset-matcher');
-const { decodeXMLPath } = require('./parsers/xml-path');
-const { fileUriToPath } = require('./parsers/file-uri');
+const { decodeXMLPath, fileUriToPath } = require('./parsers/xml-path');
 startupPhaseJournal.mark('dependencies-loaded');
 
 const PROVENANCE_MANIFEST_FILENAME = 'crate-provenance.json';

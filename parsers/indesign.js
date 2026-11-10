@@ -25,8 +25,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
-const { decodeXMLPath } = require('./xml-path');
-const { fileUriToPath } = require('./file-uri');
+const { decodeXMLPath, fileUriToPath } = require('./xml-path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');

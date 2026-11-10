@@ -39,7 +39,7 @@ function topLevelFunction(name) {
 function parserImports() {
   // The real top-level parser imports the evaluated bodies depend on.
   return mainSource.split('\n').filter(line =>
-    /^const \{[^}]*\} = require\('\.\/parsers\/(?:linked-asset-matcher|xml-path|file-uri|ooxml-links)'\);$/.test(line));
+    /^const \{[^}]*\} = require\('\.\/parsers\/(?:linked-asset-matcher|xml-path|ooxml-links)'\);$/.test(line));
 }
 
 function loadMain(names, extra = {}) {
