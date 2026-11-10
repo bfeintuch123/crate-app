@@ -6,7 +6,8 @@
  * IDML (InDesign Markup Language) files are ZIP archives containing XML.
  * Linked assets are referenced via LinkResourceURI attributes in the XML.
  *
- * Format: file:///Users/name/path/to/file.jpg (URI-encoded)
+ * Format: file:/abs, file:///abs or file://localhost/abs (URI-encoded). Which
+ * form InDesign itself writes is not verified here; all three are read.
  *
  * Key XML files inside IDML:
  *   - designmap.xml: document structure and references
@@ -24,7 +25,7 @@
 'use strict';
 
 const { BaseParser } = require('./base');
-const { decodeXMLPath } = require('./xml-path');
+const { decodeXMLPath, fileUriToPath } = require('./xml-path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
@@ -72,6 +73,9 @@ class InDesignParser extends BaseParser {
   async extractFromIDML(filePath) {
     const assets = [];
     let extractedXmlBytes = 0;
+    // One existence check per distinct path in this extraction; every link
+    // still goes through appendAsset, so admission budgets are unchanged.
+    const existence = new Map();
 
     assertFileWithinBudget(
       filePath,
@@ -119,7 +123,11 @@ class InDesignParser extends BaseParser {
             const assetPath = this.decodeFileURI(uri);
 
             if (assetPath && this.isUserPath(assetPath)) {
-              const exists = this.fileExists(assetPath);
+              let exists = existence.get(assetPath);
+              if (exists === undefined) {
+                exists = this.fileExists(assetPath);
+                existence.set(assetPath, exists);
+              }
               this.appendAsset(assets, {
                 path: assetPath,
                 source: 'idml-link',
@@ -172,16 +180,22 @@ class InDesignParser extends BaseParser {
   }
 
   /**
-   * Decode a file:// URI to an absolute path
+   * Decode a file URI to an absolute path
    *
-   * Handles:
-   *   - file:///Users/name/path/to/file.jpg
+   * Handles, through the shared reader used by watching:
+   *   - file:/Users/name/file.jpg, file:///Users/name/file.jpg and
+   *     file://localhost/Users/name/file.jpg
    *   - URL-encoded characters (%20 for space, etc.)
+   * Values the shared reader rejects keep this parser's earlier reading, so no
+   * path read before is lost.
    *
-   * @param {string} uri - The file:// URI
+   * @param {string} uri - The file URI, already XML-entity-decoded
    * @returns {string|null} - Decoded absolute path, or null if not a file URI
    */
   decodeFileURI(uri) {
+    const shared = fileUriToPath(uri);
+    if (shared !== null) return shared;
+
     if (!uri || !uri.startsWith('file://')) {
       return null;
     }
