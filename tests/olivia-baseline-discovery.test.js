@@ -3604,6 +3604,14 @@ function baselineCases() {
       assert.deepEqual(f.current().excludedAssetKeys, []);
       assert.equal(f.stored('Layer-01.png').keptAfterSourceExclusion, true);
       assert.equal((await f.row('Layer-01.png')).included, true);
+      // Restore reconciles the PSD outputs; the owner marker stays on the rows,
+      // so a second Exclude keeps them while their siblings leave again.
+      const restored = await f.setSelection('Art.psd', 'restore');
+      assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+      for (const name of ['Layer-00.png', 'Layer-01.png']) assert.equal(f.stored(name).keptAfterSourceExclusion, true, name);
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      for (const name of ['Layer-00.png', 'Layer-01.png']) assert.equal((await f.row(name)).included, true, name);
+      assert.equal((await f.row('Layer-02.png')).included, false);
       let review = await f.review();
       assert.equal(review.materializable, true, review.error || review.message);
       assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Layer-00.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
