@@ -4101,6 +4101,26 @@ function getWorkingSourceMembership(project, packageFiles = null) {
       }
     }
   }
+  // Assets reachable only from working files the owner explicitly excluded.
+  // Each working file governs its own closure; Replace history, invalid roots
+  // and excluded roots retained as dependencies contribute nothing here.
+  const unretainedExcludedRoots = new Set(), excludedOnlyPaths = new Set();
+  if (engaged) {
+    const sourcePaths = new Set(sources.map(file => normalizeTrackedFilePath(file.path)));
+    for (const root of sources) {
+      const selection = getWorkingSourceSelection(project, root), rootKey = normalizeTrackedFilePath(root.path);
+      if (selection.state === 'excluded' && selection.reason === 'user-excluded' && rootKey && !requiredByPath.has(rootKey)) {
+        unretainedExcludedRoots.add(rootKey);
+      }
+    }
+    const queue = [...unretainedExcludedRoots];
+    for (let index = 0; index < queue.length; index++) {
+      for (const [target] of edges.get(queue[index]) || []) {
+        if (sourcePaths.has(target) || requiredByPath.has(target) || excludedOnlyPaths.has(target)) continue;
+        excludedOnlyPaths.add(target); queue.push(target);
+      }
+    }
+  }
   for (const key of recoveryGuardKeys || []) {
     const matches = (project.files || []).filter(file=>getAssetBaselineSourceRecoveryRouteKey(project,file)===key);
     if (matches.length !== 1 || !isWorkingSourceFile(matches[0])) { recoveryGuardInvalid = true; continue; }
@@ -4129,7 +4149,21 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const selectedSource = source && selection.state === 'selected';
     const recoveryGuarded = recoveryGuardPaths.has(normalizeTrackedFilePath(file.path));
     const includedAsDependency = (engaged || recoveryGuarded) && requiredBy.length > 0;
-    const eligible = source ? (selectedSource || includedAsDependency) : (!isAssetReviewFileExcluded(project, file) || includedAsDependency);
+    // Withhold a dependency-captured asset only when its own evidence ties it to
+    // an explicitly excluded working file and nothing ties it to another file.
+    let excludedSourceOnly = false;
+    if (engaged && !source && !includedAsDependency && DEPENDENCY_CAPTURE_SOURCES.has(getFileCaptureSource(file))) {
+      const evidence = file.captureEvidence || {};
+      const producerKey = normalizeTrackedFilePath(evidence.relationshipSourcePath || evidence.sourceDocumentPath || file.assetBaselineSourcePath);
+      const logicalEmbedded = isScanOnSaveEmbeddedPsdFile(file);
+      const ownerKey = normalizeTrackedFilePath(logicalEmbedded ? file.parentPsd || file.path : file.path);
+      const owned = !!ownerKey && (excludedOnlyPaths.has(ownerKey) || (logicalEmbedded && unretainedExcludedRoots.has(ownerKey)));
+      const contradicted = !!producerKey && !unretainedExcludedRoots.has(producerKey) && !excludedOnlyPaths.has(producerKey);
+      excludedSourceOnly = owned && !contradicted;
+    }
+    const keptByOwner = isExplicitUserCapturedFile(file) || file.keptAfterSourceExclusion === true;
+    const eligible = source ? (selectedSource || includedAsDependency)
+      : ((!isAssetReviewFileExcluded(project, file) && !(excludedSourceOnly && !keptByOwner)) || includedAsDependency);
     const included = eligible && (!packageKeys || packageKeys.has(getTrackedFileDedupKey(file)));
     const verification = getWorkingSourceVerification(project, file);
     const persistedVerification = Object.hasOwn(project.workingSourceVerification || {}, getAssetBaselineSourceRecoveryRouteKey(project, file));
@@ -4155,7 +4189,7 @@ function getWorkingSourceMembership(project, packageFiles = null) {
     const unresolved = packageSelectionOmitted || selection?.state === 'invalid' || (verificationRequired &&
       (!verification || !['scanned', 'no-extractor'].includes(verificationStatus) || verification.unresolved.length > 0));
     facts.set(getTrackedFileDedupKey(file), { sourceSelection: selection?.state || null, selectionReason: selection?.reason || null,
-      selectionRevision: selection?.revision ?? null, includedAsDependency, included,
+      selectionRevision: selection?.revision ?? null, includedAsDependency, included, excludedSourceOnly,
       ...(selection?.state === 'invalid' && selection.reason === 'continuation-identity-changed' &&
         selection.revision < Number.MAX_SAFE_INTEGER &&
         canonicalSourceCounts.get(getAssetBaselineSourceRecoveryRouteKey(project, file)) === 1 ? { selectionRecovery: {
@@ -19467,14 +19501,25 @@ registerTrustedIpcHandler('projects:remove-file', async (event, projectId, fileI
       if (exclusionKey) {
         const priorExclusions = new Set(project.excludedAssetKeys || []);
         const fingerprint = getAssetReviewContentFingerprint(removedFile);
-        if (isAssetReviewFileExcluded(project, removedFile)) {
-          priorExclusions.delete(exclusionKey);
-          delete removedFile.individualContentExclusion;
-          if (fingerprint) removedFile.individualContentInclude = fingerprint;
+        // An asset withheld with its explicitly excluded working file presents
+        // as Excluded; Include records the owner's choice on the row itself.
+        const fact = hasWorkingSourceSelectionState(project)
+          ? getWorkingSourceMembership(project).facts.get(getTrackedFileDedupKey(removedFile)) : null;
+        const withheld = fact?.excludedSourceOnly === true &&
+          !(isExplicitUserCapturedFile(removedFile) || removedFile.keptAfterSourceExclusion === true);
+        const reviewExcluded = isAssetReviewFileExcluded(project, removedFile);
+        if (reviewExcluded || withheld) {
+          if (reviewExcluded) {
+            priorExclusions.delete(exclusionKey);
+            delete removedFile.individualContentExclusion;
+            if (fingerprint) removedFile.individualContentInclude = fingerprint;
+          }
+          if (fact?.excludedSourceOnly === true) removedFile.keptAfterSourceExclusion = true;
         } else {
           priorExclusions.add(exclusionKey);
           delete removedFile.individualContentInclude;
           if (fingerprint) removedFile.individualContentExclusion = fingerprint;
+          delete removedFile.keptAfterSourceExclusion;
         }
         project.excludedAssetKeys = [...priorExclusions];
         changed = true;

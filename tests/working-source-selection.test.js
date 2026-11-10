@@ -138,6 +138,13 @@ function fixture({ figmaScopeMode = 'entire-file' } = {}) {
     console: { log() {} },
   });
   vm.runInContext(
+    // Production capture-authority definitions used by working-source membership.
+    between('const EXPLICIT_USER_CAPTURE_SOURCES = new Set([', 'const STRONG_SESSION_LIVE_CAPTURE_REASONS') +
+    between('function getFileCaptureSource(', 'function getFileCaptureReason(') +
+    between('function hasExplicitUserAuthority(', 'function grantExplicitUserAuthority(') +
+    between('function isExplicitUserCapturedFile(', 'function isSavedOrConfirmedProjectFile(') +
+    between('function sanitizeLiveEvidenceText(', 'function sanitizeRendererSourceName(') +
+    between('const DEPENDENCY_CAPTURE_SOURCES = new Set([', 'function createAssetBaselineState(') +
     between('function getAssetBaselineSourceRecoveryRouteKey(', 'function getWorkingSourceSelection(') +
     between('function getWorkingSourceSelection(', 'function getAssetBaselineSourcePhysicalIdentityHash(') +
     between('async function selectProjectFilesForPackaging(', 'function isDesignAppFile(') , context);
@@ -1321,4 +1328,194 @@ test('refresh digest read failure is not reported as a file change; a real ident
   f.setDigestGate(null);
   f.disk.set(a.path, Buffer.from('%PDF-1.7\nchanged synthetic bytes\n%%EOF\n'));
   assert.equal(reason(), 'working-file-source-changed');
+});
+
+// Assets Crate admitted only as dependencies of a working file the owner
+// explicitly excluded leave automatic membership with that file.
+function dependencyAsset(f, name, extra = {}) {
+  return Object.assign(f.asset(name), { source: 'scan-on-open' }, extra);
+}
+async function scanWorkingFile(f, root, references) {
+  f.disk.set(root.path, Buffer.from(`%PDF-1.7\n${references.map(file => file.path).join('\n')}\n%%EOF\n`));
+  assert.equal((await f.command(root, 'exclude')).success, true);
+  assert.equal((await f.command(root, 'restore')).verificationStatus, 'scanned');
+}
+function membershipOf(f) { return f.api.getWorkingSourceMembership(f.snapshot()); }
+function factOf(f, file) { return membershipOf(f).facts.get(file.path.toLowerCase()); }
+async function selectedNames(f) { return (await f.api.selectProjectFilesForPackaging(f.snapshot())).map(file => file.name).sort(); }
+
+test('excluded working file withholds receipt-only and row-evidence dependency assets', async () => {
+  const f = fixture(), root = f.source('Art.ai'), kept = f.source('Poster.ai');
+  const receiptOnly = dependencyAsset(f, 'ReceiptOnly.png');
+  const evidenceOnly = dependencyAsset(f, 'EvidenceOnly.png', { source: 'ai-linked', captureEvidence: { relationshipSourcePath: root.path } });
+  f.project.files.push(root, kept, receiptOnly, evidenceOnly);
+  await scanWorkingFile(f, root, [receiptOnly]);
+  for (const file of [receiptOnly, evidenceOnly]) {
+    assert.equal(factOf(f, file).included, true);
+    assert.equal(factOf(f, file).excludedSourceOnly, false);
+  }
+  assert.equal((await f.command(root, 'exclude')).success, true);
+  for (const file of [receiptOnly, evidenceOnly]) {
+    const fact = factOf(f, file);
+    assert.equal(fact.included, false, file.name);
+    assert.equal(fact.excludedSourceOnly, true, file.name);
+    assert.equal(fact.includedAsDependency, false);
+    assert.deepEqual(plain(fact.requiredBy), []);
+  }
+  const membership = membershipOf(f);
+  assert.equal(membership.counts.excludedAssets, 2);
+  assert.equal(membership.counts.includedAssets, 0);
+  assert.equal(membership.blocked, false);
+  assert.deepEqual(await selectedNames(f), ['Poster.ai']);
+  assert.deepEqual(f.snapshot().excludedAssetKeys, [], 'withholding writes no asset exclusion intent');
+});
+
+test('a shared dependency stays required by the retained file and follows both files selection', async () => {
+  const f = fixture(), root = f.source('Art.ai'), kept = f.source('Poster.ai');
+  const shared = dependencyAsset(f, 'Shared.png');
+  f.project.files.push(root, kept, shared);
+  await scanWorkingFile(f, root, [shared]);
+  await scanWorkingFile(f, kept, [shared]);
+  await f.command(root, 'exclude');
+  let fact = factOf(f, shared);
+  assert.equal(fact.included, true); assert.equal(fact.includedAsDependency, true);
+  assert.equal(fact.excludedSourceOnly, false);
+  assert.deepEqual(plain(fact.requiredBy), ['Poster.ai']);
+  await f.command(kept, 'exclude');
+  fact = factOf(f, shared);
+  assert.equal(fact.included, false); assert.equal(fact.excludedSourceOnly, true);
+  assert.deepEqual(await selectedNames(f), []);
+  assert.equal((await f.command(kept, 'restore')).verificationStatus, 'scanned');
+  fact = factOf(f, shared);
+  assert.equal(fact.included, true); assert.equal(fact.includedAsDependency, true);
+  assert.deepEqual(plain(fact.requiredBy), ['Poster.ai']);
+  assert.deepEqual(await selectedNames(f), ['Poster.ai', 'Shared.png']);
+});
+
+test('deliberately included rows stay with an excluded working file', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const manual = { ...f.asset('Manual.png'), source: 'manual-browse' };
+  const granted = dependencyAsset(f, 'Granted.png', { explicitUserAuthority: { granted: true, source: 'manual-browse', method: 'projects:add-files' } });
+  const marked = dependencyAsset(f, 'Marked.png', { keptAfterSourceExclusion: true });
+  const withheld = dependencyAsset(f, 'Withheld.png');
+  f.project.files.push(root, manual, granted, marked, withheld);
+  await scanWorkingFile(f, root, [manual, granted, marked, withheld]);
+  await f.command(root, 'exclude');
+  assert.equal(factOf(f, manual).excludedSourceOnly, false, 'not dependency-captured');
+  for (const file of [granted, marked]) {
+    assert.equal(factOf(f, file).excludedSourceOnly, true, file.name);
+    assert.equal(factOf(f, file).included, true, file.name);
+  }
+  assert.equal(factOf(f, manual).included, true);
+  assert.equal(factOf(f, withheld).included, false);
+  assert.deepEqual(await selectedNames(f), ['Granted.png', 'Manual.png', 'Marked.png']);
+});
+
+test('Restore and re-Exclude round trip through reload is stable and keeps the owner marker', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const withheld = dependencyAsset(f, 'Withheld.png'), marked = dependencyAsset(f, 'Marked.png', { keptAfterSourceExclusion: true });
+  f.project.files.push(root, withheld, marked);
+  await scanWorkingFile(f, root, [withheld, marked]);
+  await f.command(root, 'exclude');
+  const excludedState = () => [factOf(f, withheld).included, factOf(f, marked).included, factOf(f, withheld).excludedSourceOnly];
+  assert.deepEqual(excludedState(), [false, true, true]);
+  f.reload();
+  assert.deepEqual(excludedState(), [false, true, true]);
+  assert.equal((await f.command(root, 'restore')).verificationStatus, 'scanned');
+  assert.equal(factOf(f, withheld).included, true); assert.equal(factOf(f, withheld).includedAsDependency, true);
+  assert.equal(factOf(f, withheld).excludedSourceOnly, false);
+  f.reload();
+  assert.equal(factOf(f, withheld).included, true);
+  await f.command(root, 'exclude');
+  f.reload();
+  assert.deepEqual(excludedState(), [false, true, true]);
+  assert.equal(f.snapshot().files.find(file => file.name === 'Marked.png').keptAfterSourceExclusion, true);
+  assert.equal(Object.hasOwn(f.snapshot().files.find(file => file.name === 'Withheld.png'), 'keptAfterSourceExclusion'), false);
+});
+
+test('Replace history and invalid selections keep their dependency assets as today', async () => {
+  const f = continuationFixture();
+  const replacedAsset = dependencyAsset(f, 'Replaced.png', { captureEvidence: { relationshipSourcePath: f.a.path } });
+  f.project.files.push(replacedAsset);
+  assert.equal((await f.api.resolveWorkingSourceContinuation(f.project.id, continuationRequest(f))).success, true);
+  assert.equal(f.api.getWorkingSourceSelection(f.project, f.a).reason, 'continuation-replaced');
+  assert.equal(factOf(f, replacedAsset).included, true);
+  assert.equal(factOf(f, replacedAsset).excludedSourceOnly, false);
+
+  const g = fixture(), root = g.source('Art.ai'), other = g.source('Other.ai');
+  const invalidAsset = dependencyAsset(g, 'Invalid.png', { captureEvidence: { relationshipSourcePath: root.path } });
+  g.project.files.push(root, other, invalidAsset);
+  await g.command(other, 'exclude');
+  g.project.workingSourceSelections[g.api.getAssetBaselineSourceRecoveryRouteKey(g.project, root)] = { state: 'excluded', reason: 'unknown', revision: 1 };
+  assert.equal(g.api.getWorkingSourceSelection(g.project, root).state, 'invalid');
+  assert.equal(factOf(g, invalidAsset).included, true);
+  assert.equal(factOf(g, invalidAsset).excludedSourceOnly, false);
+});
+
+test('independently observed rows and rows naming another producer stay', async () => {
+  const f = fixture(), root = f.source('Art.ai'), other = f.source('Other.ai');
+  const observed = { ...f.asset('Observed.png'), source: 'chokidar-add' };
+  const elsewhere = dependencyAsset(f, 'Elsewhere.png', { captureEvidence: { relationshipSourcePath: '/Users/synthetic/Unknown.ai' } });
+  const ownedByOther = dependencyAsset(f, 'OtherProducer.png', { source: 'psd-linked', assetBaselineSourcePath: other.path });
+  f.project.files.push(root, other, observed, elsewhere, ownedByOther);
+  await scanWorkingFile(f, root, [observed, elsewhere, ownedByOther]);
+  await f.command(other, 'exclude');
+  await f.command(root, 'exclude');
+  assert.equal(factOf(f, observed).excludedSourceOnly, false);
+  assert.equal(factOf(f, elsewhere).excludedSourceOnly, false);
+  for (const file of [observed, elsewhere]) assert.equal(factOf(f, file).included, true, file.name);
+  // Other.ai is also an explicitly excluded root; its own evidence ties the row to it.
+  assert.equal(factOf(f, ownedByOther).excludedSourceOnly, true);
+  await f.command(other, 'restore');
+  assert.equal(factOf(f, ownedByOther).included, true, 'evidence names a selected producer');
+});
+
+test('nested dependency documents follow the excluded root; a selected nested working file keeps itself', async () => {
+  const f = fixture(), root = f.source('Art.ai');
+  const child = dependencyAsset(f, 'Child.ai', { source: 'ai-linked', captureEvidence: { relationshipSourcePath: root.path } });
+  const nested = dependencyAsset(f, 'Nested.png', { source: 'ai-linked', captureEvidence: { relationshipSourcePath: child.path } });
+  const subSource = { ...f.source('Sub.ai'), captureEvidence: { relationshipSourcePath: root.path } };
+  const subAsset = dependencyAsset(f, 'SubAsset.png', { source: 'ai-linked', captureEvidence: { relationshipSourcePath: subSource.path } });
+  f.project.files.push(root, child, nested, subSource, subAsset);
+  await f.command(root, 'exclude');
+  for (const file of [child, nested]) {
+    assert.equal(factOf(f, file).included, false, file.name);
+    assert.equal(factOf(f, file).excludedSourceOnly, true, file.name);
+  }
+  assert.equal(factOf(f, subSource).sourceSelection, 'selected');
+  assert.equal(factOf(f, subSource).included, true);
+  assert.equal(factOf(f, subAsset).included, true);
+  assert.equal(factOf(f, subAsset).includedAsDependency, true);
+  assert.deepEqual(await selectedNames(f), ['Sub.ai', 'SubAsset.png']);
+});
+
+test('logical embedded children follow an unretained parent and stay with a retained one', async () => {
+  const f = fixture(), psd = f.source('Design.psd'), kept = f.source('Poster.ai');
+  // The VM dedup model keys by path; production keys logical rows by identity
+  // while their path is the parent PSD. Membership uses parentPsd as owner.
+  const logical = { path: '/Users/synthetic/Design.psd#Embedded.png', name: 'Embedded.png', fileId: 'logical', ext: '.png',
+    projectRole: 'asset', source: 'scan-on-save-embedded', embedded: true, parentPsd: psd.path, embeddedIndex: 0 };
+  f.project.files.push(psd, kept, logical);
+  await f.command(psd, 'exclude');
+  assert.equal(factOf(f, logical).excludedSourceOnly, true);
+  assert.equal(factOf(f, logical).included, false);
+  await scanWorkingFile(f, kept, [psd]);
+  assert.equal(factOf(f, psd).includedAsDependency, true);
+  assert.equal(factOf(f, logical).excludedSourceOnly, false);
+  assert.equal(factOf(f, logical).included, true);
+});
+
+test('a retained file rescan that newly references a withheld asset brings it back as required', async () => {
+  const f = fixture(), root = f.source('Art.ai'), kept = f.source('Poster.ai');
+  const asset = dependencyAsset(f, 'Shared.png', { captureEvidence: { relationshipSourcePath: root.path } });
+  f.project.files.push(root, kept, asset);
+  await scanWorkingFile(f, root, [asset]);
+  await scanWorkingFile(f, kept, []);
+  await f.command(root, 'exclude');
+  assert.equal(factOf(f, asset).included, false);
+  await scanWorkingFile(f, kept, [asset]);
+  const fact = factOf(f, asset);
+  assert.equal(fact.included, true); assert.equal(fact.includedAsDependency, true);
+  assert.equal(fact.excludedSourceOnly, false);
+  assert.deepEqual(plain(fact.requiredBy), ['Poster.ai']);
 });
