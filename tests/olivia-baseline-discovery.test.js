@@ -3337,9 +3337,17 @@ function baselineCases() {
         assert.equal(f.current().workingSourceSelections?.[logicalKey], undefined);
         assert.equal((await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'exclude', expectedRevision: 0 })).success, true);
+        // The logical child reads only the explicitly excluded parent: it is
+        // withheld with it. Owner Include keeps it; a second click excludes it.
+        child = (await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === logical.name);
+        assert.equal(child.included, false); assert.equal(child.excludedSourceOnly, true); assert.equal(child.excluded, false);
+        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
+        assert.equal(f.current().files.find(row => row.fileId === 'logical-child').keptAfterSourceExclusion, true);
+        assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).files.find(row => row.name === logical.name).included, true);
         // Asset exclusion is independent of source intent. A hidden logical row
         // must not intercept the physical parent's Restore scan by shared path.
         await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
+        assert.equal(Object.hasOwn(f.current().files.find(row => row.fileId === 'logical-child'), 'keptAfterSourceExclusion'), false);
         const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'restore', expectedRevision: 1 });
         assert.equal(restored.success, true);
@@ -3356,7 +3364,11 @@ function baselineCases() {
         await callIpcRaw('projects:set-working-source-selection', f.project.id,
           root.visualIdentity, { action: 'exclude', expectedRevision: 2 });
         ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
-        assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset retains concrete parent read hold');
+        assert.equal(ws.semanticCounts.relationshipHolds, 0, 'a logical asset withheld with its excluded parent leaves the hold dormant');
+        assert.ok(!(await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.fileId === 'logical-child'));
+        await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
+        ws = await callIpcRaw('projects:get-asset-workspace', f.project.id);
+        assert.equal(ws.semanticCounts.relationshipHolds, 1, 'owner-included logical asset retains concrete parent read hold');
         assert.ok((await metadataTestHooks.selectProjectFilesForPackaging(f.current())).some(row => row.fileId === 'logical-child'));
         await callIpcRaw('projects:remove-file', f.project.id, child.visualIdentity);
         assert.equal((await callIpcRaw('projects:get-asset-workspace', f.project.id)).semanticCounts.relationshipHolds, 0);
@@ -3439,6 +3451,176 @@ function baselineCases() {
         fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); },
     };
   }
+
+  // A PSD with distinct embedded PNG outputs, a link shared with a kept .ai and
+  // a PSD-only link. Exclude must leave the PSD-only closure out of the package.
+  async function excludedPsdAssetsFixture(outputCount = 6) {
+    const zlib = require('zlib');
+    const chunk = (type, data) => { const body = Buffer.concat([Buffer.from(type), data]); const out = Buffer.alloc(8 + data.length + 4);
+      out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(zlib.crc32(body) >>> 0, 8 + data.length); return out; };
+    const png = value => Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      chunk('IHDR', Buffer.from([0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0])),
+      chunk('IDAT', zlib.deflateSync(Buffer.from([0, value]))), chunk('IEND', Buffer.alloc(0))]);
+    const desk = name => path.join(TEST_HOME, 'Desktop', name);
+    const link = (id, name) => ({ id, name, childDocumentID: '', linkedFile: { fileSize: 1, name, fullPath: desk(name), originalPath: '', relativePath: '' } });
+    const outputNames = Array.from({ length: outputCount }, (_, i) => 'Layer-' + String(i).padStart(2, '0') + '.png');
+    const outputs = outputNames.map((name, i) => ({ id: '33333333-3333-4333-8333-' + String(i).padStart(12, '0'), name, data: png(i) }));
+    const actual = originalLoad.call(Module, 'ag-psd/dist/index.js', module);
+    resetTestHomeWorkspace(); setChildProcessHandler(() => ({ stdout: '' }));
+    const created = await createProject('Excluded PSD assets'); clearTrackedTimers();
+    const current = () => storeInstance.data.projects.find(p => p.id === created.id);
+    for (const [name, value] of [['Shared.png', 201], ['PsdOnly.png', 202], ['AiOnly.png', 203]]) fs.writeFileSync(desk(name), png(value));
+    const psdPath = desk('Art.psd'), aiPath = desk('Poster.ai');
+    fs.writeFileSync(psdPath, actual.writePsdBuffer({ width: 1, height: 1, children: [], linkedFiles: [...outputs,
+      link('44444444-4444-4444-8444-444444444441', 'Shared.png'), link('44444444-4444-4444-8444-444444444442', 'PsdOnly.png')] }));
+    fs.writeFileSync(aiPath, '%PDF-1.7\n' + desk('Shared.png') + '\n' + desk('AiOnly.png') + '\n%%EOF\n');
+    const originalStoreGet = storeInstance.get;
+    storeInstance.get = function clonedStoreGet(...args) {
+      const value = originalStoreGet.apply(this, args);
+      return value === undefined ? value : JSON.parse(JSON.stringify(value));
+    };
+    const originalTmpdir = os.tmpdir;
+    const privateTmp = fs.mkdtempSync(path.join(TEST_HOME, 'Documents', 'excluded-psd-assets-'));
+    os.tmpdir = () => privateTmp;
+    currentPsdFixture = 'actual-source-buffer';
+    const cleanup = () => { currentPsdFixture = { children: [], linkedFiles: [] }; os.tmpdir = originalTmpdir;
+      storeInstance.get = originalStoreGet; fs.rmSync(privateTmp, { recursive: true, force: true }); clearTrackedTimers(); };
+    try {
+      for (const filePath of [psdPath, aiPath]) {
+        manualDialogFor([filePath]); await callIpcRaw('projects:add-files', created.id);
+        if (current().assetBaseline.status === 'decision-required') await callIpcRaw('projects:set-existing-assets-decision', created.id, 'include');
+      }
+      for (let round = 0; round < 6; round++) {
+        const pending = (await callIpcRaw('projects:get-asset-workspace', created.id)).workingFileChoices?.choices || [];
+        if (!pending.length) break;
+        for (const entry of pending) {
+          assert.equal((await callIpcRaw('projects:resolve-working-file-choice', created.id,
+            { id: entry.id, revision: entry.revision, choice: 'keep-both', predecessorIdentity: null })).success, true);
+        }
+      }
+    } catch (error) { cleanup(); throw error; }
+    const workspace = () => callIpcRaw('projects:get-asset-workspace', created.id);
+    const row = async name => (await workspace()).files.find(file => file.name === name);
+    const setSelection = async (name, action) => {
+      const file = await row(name);
+      return callIpcRaw('projects:set-working-source-selection', created.id, file.visualIdentity, { action, expectedRevision: file.selectionRevision ?? 0 });
+    };
+    const out = desk('excluded-psd-out'); fs.mkdirSync(out, { recursive: true });
+    const review = () => callIpcRaw('projects:prepare-package-review', created.id, out);
+    const walk = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
+      entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+    return { project: created, current, psdPath, aiPath, outputNames, workspace, row, setSelection, review, walk, out, cleanup,
+      toggle: async name => callIpcRaw('projects:remove-file', created.id, (await row(name)).visualIdentity),
+      stored: name => current().files.find(file => file.name === name) };
+  }
+  const sortedNames = files => files.map(file => file.name).sort();
+
+  baselineTest('excluded PSD leaves its embedded outputs and PSD-only link out of review and package', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      const before = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png', 'Shared.png', 'AiOnly.png']) {
+        assert.equal(before.files.find(file => file.name === name)?.included, true, name);
+      }
+      assert.equal(f.stored('Layer-00.png').source, 'psd-embedded');
+      assert.equal(f.stored('PsdOnly.png').source, 'psd-linked');
+      const excluded = await f.setSelection('Art.psd', 'exclude');
+      assert.equal(excluded.success, true);
+      const ws = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png']) {
+        const file = ws.files.find(item => item.name === name);
+        assert.equal(file.included, false, name); assert.equal(file.excludedSourceOnly, true, name);
+        assert.equal(file.excluded, false, name); assert.equal(file.includedAsDependency, false, name);
+      }
+      const shared = ws.files.find(file => file.name === 'Shared.png');
+      assert.equal(shared.included, true); assert.equal(shared.includedAsDependency, true);
+      assert.equal(shared.excludedSourceOnly, false); assert.deepEqual(shared.requiredBy, ['Poster.ai']);
+      assert.equal(ws.files.find(file => file.name === 'AiOnly.png').included, true);
+      assert.deepEqual(ws.semanticCounts, { selectedWorkingSources: 1, excludedWorkingSources: 1, invalidWorkingSources: 0,
+        includedAssets: 2, excludedAssets: f.outputNames.length + 1, unresolvedVerification: 0, missingRequiredReferences: 0, relationshipHolds: 0 });
+      assert.deepEqual(excluded.semanticCounts, ws.semanticCounts);
+      assert.deepEqual(f.current().excludedAssetKeys || [], [], 'withholding writes no asset exclusion intent');
+      const review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Poster.ai', 'Shared.png']);
+      assert.equal(review.totalFiles, 3);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 3);
+      assert.deepEqual(packaged.errors || [], []);
+      assert.deepEqual(f.walk(packaged.folderPath).map(file => path.basename(file)).filter(name => name !== '.DS_Store').sort(),
+        ['AiOnly.png', 'Poster.ai', 'Shared.png']);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('excluded PSD rescan stays skipped and Restore brings back its outputs', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      const counts = (await f.workspace()).semanticCounts;
+      const rows = JSON.stringify(f.current().files);
+      const rescan = await metadataTestHooks.runScanOnSave(f.project.id, f.psdPath);
+      assert.equal(rescan.success, true); assert.equal(rescan.skipped, 'source-excluded');
+      assert.deepEqual((await f.workspace()).semanticCounts, counts);
+      assert.equal(JSON.stringify(f.current().files), rows);
+      // Restore before any package: the restored PSD and its outputs return.
+      const restored = await f.setSelection('Art.psd', 'restore');
+      assert.equal(restored.success, true); assert.equal(restored.verificationStatus, 'scanned');
+      const ws = await f.workspace();
+      for (const name of [...f.outputNames, 'PsdOnly.png']) {
+        const file = ws.files.find(item => item.name === name);
+        assert.equal(file.included, true, name); assert.equal(file.excludedSourceOnly, false, name);
+        assert.equal(file.includedAsDependency, true, name);
+      }
+      assert.equal(ws.semanticCounts.excludedAssets, 0);
+      const review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Art.psd', ...f.outputNames, 'Poster.ai', 'PsdOnly.png', 'Shared.png'].sort());
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, f.outputNames.length + 5);
+      assert.deepEqual(packaged.errors || [], []);
+    } finally { f.cleanup(); }
+  });
+
+  baselineTest('owner Include keeps a withheld PSD output; a second click explicitly excludes it', { timeout: 120000 }, async () => {
+    const f = await excludedPsdAssetsFixture();
+    try {
+      // Layer-01 is explicitly excluded first, then also withheld by Exclude.
+      await f.toggle('Layer-01.png');
+      assert.equal((f.current().excludedAssetKeys || []).length, 1);
+      assert.equal((await f.setSelection('Art.psd', 'exclude')).success, true);
+      assert.equal((await f.row('Layer-01.png')).excludedSourceOnly, true);
+      const keys = [...f.current().excludedAssetKeys];
+      await f.toggle('Layer-00.png');
+      assert.equal(f.stored('Layer-00.png').keptAfterSourceExclusion, true);
+      assert.deepEqual(f.current().excludedAssetKeys, keys, 'Include of a withheld row writes no exclusion key');
+      storeInstance.data.projects = JSON.parse(JSON.stringify(storeInstance.data.projects));
+      assert.equal(f.stored('Layer-00.png').keptAfterSourceExclusion, true, 'marker survives a store round trip');
+      let layer = await f.row('Layer-00.png');
+      assert.equal(layer.included, true); assert.equal(layer.excludedSourceOnly, true);
+      // One click includes a row that is both explicitly excluded and withheld.
+      await f.toggle('Layer-01.png');
+      assert.deepEqual(f.current().excludedAssetKeys, []);
+      assert.equal(f.stored('Layer-01.png').keptAfterSourceExclusion, true);
+      assert.equal((await f.row('Layer-01.png')).included, true);
+      let review = await f.review();
+      assert.equal(review.materializable, true, review.error || review.message);
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Layer-00.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+      await f.toggle('Layer-00.png');
+      assert.equal(Object.hasOwn(f.stored('Layer-00.png'), 'keptAfterSourceExclusion'), false);
+      assert.equal(f.current().excludedAssetKeys.length, 1);
+      layer = await f.row('Layer-00.png');
+      assert.equal(layer.included, false); assert.equal(layer.excluded, true);
+      review = await f.review();
+      assert.deepEqual(sortedNames(review.files), ['AiOnly.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+      const packaged = await callIpcRaw('projects:package', f.project.id, f.out, review.token);
+      assert.equal(packaged.success, true, packaged.error);
+      assert.equal(packaged.copiedCount, 4); assert.deepEqual(packaged.errors || [], []);
+      assert.deepEqual(f.walk(packaged.folderPath).map(file => path.basename(file)).filter(name => name !== '.DS_Store').sort(),
+        ['AiOnly.png', 'Layer-01.png', 'Poster.ai', 'Shared.png']);
+    } finally { f.cleanup(); }
+  });
 
   baselineTest('cycle2: PSD identical saves reuse one output and removal/empty retire exact membership', async () => {
     const objects = [{ id: psdId, name: 'Embedded.png', data: embeddedPng }];
