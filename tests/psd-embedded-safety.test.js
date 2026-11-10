@@ -515,6 +515,7 @@ function expectedDormantWorkingSourceFacts(role) {
     selectionRevision: role === 'source' ? 0 : null,
     includedAsDependency: false,
     included: true,
+    excludedSourceOnly: false,
     effectiveRole: role,
     verificationStatus: 'unavailable',
     verificationRequired: false,

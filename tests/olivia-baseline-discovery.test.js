@@ -2461,12 +2461,15 @@ function baselineCases() {
       assert.deepEqual(fs.readFileSync(f.paths[0].source), sourceBytes);
       assert.equal((await callIpcRaw('projects:package', f.project.id, TEST_HOME, previousReview.token)).error,
         'package_review_stale');
+      // The link was captured only as this excluded file's dependency, so it is
+      // withheld with it and an engaged project with nothing selected cannot issue.
       const assetOnly = await callIpcRaw('projects:prepare-package-review', f.project.id);
-      assert.equal(assetOnly.materializable, true);
-      assert.deepEqual(assetOnly.files.map(file => file.name), ['Link_0.png']);
+      assert.equal(assetOnly.materializable, false);
+      assert.deepEqual(assetOnly.files.map(file => file.name), []);
       assert.equal(assetOnly.semanticCounts.selectedWorkingSources, 0);
       assert.equal(assetOnly.semanticCounts.excludedWorkingSources, 1);
-      assert.equal(assetOnly.semanticCounts.includedAssets, 1);
+      assert.equal(assetOnly.semanticCounts.includedAssets, 0);
+      assert.equal(assetOnly.semanticCounts.excludedAssets, 1);
       await callIpcRaw('projects:set-existing-assets-decision', f.project.id, 'include');
       roundTripFakeStore();
       let current = await callIpcRaw('projects:get-asset-workspace', f.project.id);
@@ -2481,7 +2484,7 @@ function baselineCases() {
       const readmitted = current.files.find(file => file.name === 'Design_0.ai');
       assert.equal(readmitted.sourceSelection, 'excluded');
       assert.equal(readmitted.selectionReason, 'user-excluded');
-      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).files.length, 1);
+      assert.equal((await callIpcRaw('projects:prepare-package-review', f.project.id)).files.length, 0);
       const restored = await callIpcRaw('projects:set-working-source-selection', f.project.id, readmitted.visualIdentity,
         { action: 'restore', expectedRevision: readmitted.selectionRevision });
       assert.equal(restored.success, true);
@@ -4922,6 +4925,9 @@ function baselineCases() {
       currentPsdFixture = 'actual-source-buffer'; await f.save([object]);
       const holds = JSON.parse(JSON.stringify(f.current().workingSourceRelationshipHolds)); assert.equal(holds.length, 1);
       await callIpcRaw('projects:set-working-source-selection', f.project.id, f.source.visualIdentity, { action: 'exclude', expectedRevision: 0 });
+      ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 0, 'logical asset withheld with its excluded parent leaves the hold dormant');
+      // Owner Include keeps the logical asset; it then reads the excluded parent.
+      await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
       ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 1, 'included logical asset still reads parent');
       await callIpcRaw('projects:remove-file', f.project.id, metadataTestHooks.createProjectFileVisualIdentity(f.project.id, logical));
       ws = await callIpcRaw('projects:get-asset-workspace', f.project.id); assert.equal(ws.semanticCounts.relationshipHolds, 0);

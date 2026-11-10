@@ -1022,7 +1022,10 @@ function continuationCases() {
             for (const name of ['C.ai', 'D.ai', 'Shared.png', 'C-only.png', 'D-only.png']) assert.ok(names.includes(name), name);
             if (mode === 'demoted-B') {
               assert.equal(names.includes('B.ai'), false);
-              assert.equal(names.includes('AB.png'), true, 'independently accepted asset is preserved, not swept with the excluded role');
+              // AB.png was captured only as a dependency (ai-linked) and only the
+              // explicitly excluded A still records it: it is withheld, not deleted.
+              assert.equal(names.includes('AB.png'), false, 'dependency-only asset of the excluded working file is withheld');
+              assert.equal(f.stored().files.some(row => row.name === 'AB.png'), true, 'withheld asset row is preserved');
               assert.equal(f.stored().pendingFiles.some(row => row.name === 'B.ai'), true);
               assert.equal(f.stored().files.some(row => row.name === 'B.ai'), false);
             } else for (const name of ['B.ai', 'AB.png']) assert.ok(names.includes(name), name);
