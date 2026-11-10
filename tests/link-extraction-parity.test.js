@@ -322,3 +322,43 @@ test('IDML raw pass: matches inside an accepted declared link are dropped, other
   assert.deepEqual(await runWatchingIdml(outside, MODES.ordinary), { paths: [`${S}/x.png`], notes: ['unsupported-declared-link-uri'] });
   assert.deepEqual(await runWatchingIdml(outside, MODES.verify), { paths: [`/opt${S}/x.png`, `${S}/x.png`], notes: ['unsupported-declared-link-uri'] });
 });
+
+test('IDML raw pass: entity decoding is skipped for an entry that contains a CDATA section', async t => {
+  const dir = tempDir(t);
+  // Inside CDATA, &amp; is literal text, so the raw match is kept exactly as before.
+  const cdata = zipArchive(dir, '.idml', {
+    'Stories/Story_1.xml': spread(`<Content><![CDATA[${S}/R&amp;D/raw.png]]></Content>`, `<Content>${S}/Other&amp;Co/raw.png</Content>`),
+    'Stories/Story_2.xml': spread(`<Content>${S}/Plain&amp;Entry/raw.png</Content>`),
+  });
+  const result = await runWatchingIdml(cdata, MODES.ordinary);
+  // The guard is per entry: Story_1 keeps raw text, Story_2 is still decoded.
+  assert.deepEqual(sorted(result.paths), sorted([`${S}/R&amp;D/raw.png`, `${S}/Other&amp;Co/raw.png`, `${S}/Plain&Entry/raw.png`]));
+  assert.equal(result.paths.length, 3);
+  assert.deepEqual(result.notes, []);
+  // A declared link is decoded as an attribute value whether or not the entry has CDATA.
+  const declared = zipArchive(dir, '.idml', { 'Spreads/Spread_1.xml': spread('<Note><![CDATA[x]]></Note>', link(`file:${S}/R&amp;D/x.png`)) });
+  assert.deepEqual(await runWatchingIdml(declared, MODES.strict), { paths: [`${S}/R&D/x.png`], notes: [] });
+});
+
+test('Quick Package IDML checks existence at most once per distinct path while admitting every link', async t => {
+  const dir = tempDir(t);
+  const repeated = `file://${S}/repeated.png`;
+  const file = zipArchive(dir, '.idml', {
+    'Spreads/Spread_1.xml': spread(...Array.from({ length: 5 }, () => link(repeated)), link(`file:${S}/other.png`)),
+    'Spreads/Spread_2.xml': spread(...Array.from({ length: 5 }, () => link(repeated))),
+  });
+  const parser = new InDesignParser();
+  const checked = [];
+  let appended = 0;
+  const fileExists = parser.fileExists.bind(parser);
+  const appendAsset = parser.appendAsset.bind(parser);
+  parser.fileExists = candidate => { checked.push(candidate); return fileExists(candidate); };
+  parser.appendAsset = (...args) => { appended++; return appendAsset(...args); };
+  assert.deepEqual(Array.from(await parser.extractAssets(file), asset => [asset.path, asset.exists]),
+    [[`${S}/repeated.png`, false], [`${S}/other.png`, false]]);
+  assert.deepEqual(checked, [`${S}/repeated.png`, `${S}/other.png`]);
+  assert.equal(appended, 11, 'every link still passes through the admission budget');
+  // The memo is per extraction: a second extraction checks again.
+  await parser.extractAssets(file);
+  assert.equal(checked.length, 4);
+});

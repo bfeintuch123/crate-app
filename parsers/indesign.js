@@ -74,6 +74,9 @@ class InDesignParser extends BaseParser {
   async extractFromIDML(filePath) {
     const assets = [];
     let extractedXmlBytes = 0;
+    // One existence check per distinct path in this extraction; every link
+    // still goes through appendAsset, so admission budgets are unchanged.
+    const existence = new Map();
 
     assertFileWithinBudget(
       filePath,
@@ -121,7 +124,11 @@ class InDesignParser extends BaseParser {
             const assetPath = this.decodeFileURI(uri);
 
             if (assetPath && this.isUserPath(assetPath)) {
-              const exists = this.fileExists(assetPath);
+              let exists = existence.get(assetPath);
+              if (exists === undefined) {
+                exists = this.fileExists(assetPath);
+                existence.set(assetPath, exists);
+              }
               this.appendAsset(assets, {
                 path: assetPath,
                 source: 'idml-link',

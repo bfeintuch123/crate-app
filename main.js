@@ -16180,14 +16180,20 @@ async function extractLinkedAssetsIdml(filePath, options = {}) {
         // Also try the regex approach for any raw absolute paths
         const LINKED_ASSET_REGEX = /(?:\/Users\/|\/Volumes\/)[^\x00-\x1f\x22\x27<>]+?\.(jpg|jpeg|png|gif|webp|svg|pdf|eps|ai|psd|tiff|tif|heic|ttf|otf|woff2|woff|mp4|mov|avi|webm)/gi;
         let span = 0;
+        // CDATA keeps & literal, so an entry with CDATA keeps raw text as before.
+        // Checked once per entry, and only when a raw match contains &.
+        let entryHasCdata = null;
         while ((match = LINKED_ASSET_REGEX.exec(data)) !== null) {
           while (span < declaredSpans.length && declaredSpans[span + 1] <= match.index) span += 3;
           if (span < declaredSpans.length && declaredSpans[span] <= match.index) {
             // Inside an admitted declared link: a partial or still-encoded copy.
             if (declaredSpans[span + 2]) continue;
             results.push(match[0]);
+          } else if (match[0].includes('&')) {
+            if (entryHasCdata === null) entryHasCdata = data.includes('<![CDATA[');
+            results.push(entryHasCdata ? match[0] : decodeXMLPath(match[0]));
           } else {
-            results.push(match[0].includes('&') ? decodeXMLPath(match[0]) : match[0]);
+            results.push(match[0]);
           }
         }
       } catch (e) {
